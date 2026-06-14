@@ -3,3 +3,11 @@
 Cargo.lock
 .DS_Store
 .cargo/config.toml
+
+# editor backup / undo artifacts
+*~
+*.swp
+*.swo
+*~undo-tree~
+\#*\#
+.\#*
