@@ -1,0 +1,10 @@
+[package]
+name = "transport-embedded"
+description = "In-process transport: composes a kernel directly in the host process."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]

@@ -1,0 +1,6 @@
+# Local cross-repo development override — per developer; do NOT commit the live file.
+#
+# Copy this to .cargo/config.toml and point it at your local ikigai-core checkout.
+# Cargo's `paths` override redirects the crates.io `ikigai-core` dependency to the
+# local source while you develop both repos side by side.
+paths = ["../ikigai-core"]
