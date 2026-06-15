@@ -31,8 +31,12 @@ ikigai> describe urn:fn:toUpper             # META → text/turtle self-descript
     ik:id "toUpper" .
 ```
 
-Commands: `source <iri> [input]` (SOURCE; `input` → the `in` argument),
+Commands: `source <iri> [input]` (SOURCE; `input` is routed to the endpoint's
+**declared argument**, discovered from its self-description rather than assumed),
 `describe <iri> [type]` (META; `type` defaults to `text/turtle`), `help`, `quit`.
+So `toUpper` receives `input` as its `in` argument, while `echo` reads a binding
+captured from the IRI — pass *that* in the identifier (`source urn:demo:echo/hi`),
+and the REPL will say so if you try to pass it as a value.
 In the TUI, **↑/↓** recall input history, **PgUp/PgDn** scroll the transcript,
 **Esc** clears the line, and **Ctrl-C** / **Ctrl-D** exit. The demo space is
 composed in `transport-embedded`; a real host binds its own endpoints there.
