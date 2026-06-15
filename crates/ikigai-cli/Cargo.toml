@@ -20,6 +20,7 @@ quic = []  # native-only, not yet implemented
 [dependencies]
 ikigai-core = { workspace = true }
 futures = { workspace = true }
+serde_json = { workspace = true }
 transport-embedded = { path = "../transport-embedded", optional = true }
 
 # The full-screen TUI is native-only (crossterm). The browser frontend (ratzilla)
