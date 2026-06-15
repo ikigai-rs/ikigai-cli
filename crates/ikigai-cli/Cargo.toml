@@ -21,3 +21,9 @@ quic = []  # native-only, not yet implemented
 ikigai-core = { workspace = true }
 futures = { workspace = true }
 transport-embedded = { path = "../transport-embedded", optional = true }
+
+# The full-screen TUI is native-only (crossterm). The browser frontend (ratzilla)
+# lands in a later slice; on wasm the binary falls back to the line REPL.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+ratatui = "0.30.1"
+crossterm = "0.29.0"

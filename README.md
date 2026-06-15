@@ -10,11 +10,15 @@ This repository carries the transport dependencies, keeping
 ## Run it
 
 ```bash
-cargo run --bin ikigai          # starts the embedded REPL
+cargo run --bin ikigai          # full-screen TUI on a terminal
+cargo run --bin ikigai -- --plain   # line REPL (also used automatically when piped)
 ```
 
 You attach to an in-process kernel and issue one request per line. The response is
-the resolved representation's bytes, printed as text.
+the resolved representation's bytes. On an interactive terminal this is a
+full-screen [`ratatui`](https://ratatui.rs) REPL — a scrollback transcript above
+an input line; when output is piped or `--plain` is passed it falls back to a
+line-oriented REPL (handy for scripting). Both drive the same engine.
 
 ```
 ikigai> source urn:fn:toUpper resource-oriented computing
@@ -25,14 +29,13 @@ ikigai> describe urn:fn:toUpper             # META → text/turtle self-descript
 @prefix ik: <https://ikigai-rs.dev/ns#> .
 <urn:ikigai:endpoint:toUpper> a ik:Endpoint ;
     ik:id "toUpper" .
-ikigai> help
-ikigai> quit
 ```
 
 Commands: `source <iri> [input]` (SOURCE; `input` → the `in` argument),
 `describe <iri> [type]` (META; `type` defaults to `text/turtle`), `help`, `quit`.
-The demo space is composed in `transport-embedded`; a real host binds its own
-endpoints there.
+In the TUI, **↑/↓** recall input history, **PgUp/PgDn** scroll the transcript,
+**Esc** clears the line, and **Ctrl-C** / **Ctrl-D** exit. The demo space is
+composed in `transport-embedded`; a real host binds its own endpoints there.
 
 ## Transports (feature-gated)
 | crate | feature | targets |
