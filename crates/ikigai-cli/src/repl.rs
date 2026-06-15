@@ -8,6 +8,29 @@ use ikigai_core::Kernel;
 
 use crate::engine::{Action, Engine, HELP};
 
+/// Execute each command non-interactively, then return a process exit code
+/// (`1` if any command errored, else `0`). Output goes to stdout, errors to
+/// stderr — so `ikigai -c '…'` composes in a shell. A `quit` ends the batch.
+pub fn run_commands(kernel: Kernel, commands: &[String]) -> i32 {
+    let engine = Engine::new(kernel);
+    let mut code = 0;
+    for command in commands {
+        match engine.eval(command) {
+            Action::Output(entry) => match entry.result {
+                Ok(output) => println!("{output}"),
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    code = 1;
+                }
+            },
+            Action::Help => println!("{HELP}"),
+            Action::Quit => break,
+            Action::Noop => {}
+        }
+    }
+    code
+}
+
 /// Read-eval-print loop over the kernel until EOF or `quit`.
 pub fn run(kernel: Kernel) {
     let engine = Engine::new(kernel);
