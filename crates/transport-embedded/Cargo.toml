@@ -8,3 +8,5 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+ikigai-core = { workspace = true }
+ikigai-vocab = { workspace = true }
