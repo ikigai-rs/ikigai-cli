@@ -12,7 +12,12 @@ This repository carries the transport dependencies, keeping
 ```bash
 cargo run --bin ikigai          # full-screen TUI on a terminal
 cargo run --bin ikigai -- --plain   # line REPL (also used automatically when piped)
+cargo run --bin ikigai -- -c 'source urn:fn:toUpper hello'   # run and exit (one-shot)
 ```
+
+`-c '<command>'` runs a command non-interactively and exits — repeat it to run
+several in order (`-c '…' -c '…'`). Output goes to stdout, errors to stderr, and
+the exit code is non-zero if any command failed, so it composes in a shell.
 
 You attach to an in-process kernel and issue one request per line. The response is
 the resolved representation's bytes. On an interactive terminal this is a
