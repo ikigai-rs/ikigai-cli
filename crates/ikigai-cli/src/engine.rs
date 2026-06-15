@@ -19,6 +19,7 @@ use ikigai_core::{ArgRef, Capability, Description, InputSource, Iri, Kernel, Req
 pub const HELP: &str = "\
 commands:
   source <iri> [input]       SOURCE a resource; `input` is routed to its declared argument
+  source a [input] | b | c   pipeline: feed each stage's output into the next
   describe <iri> [type]      META a resource; `type` defaults to text/turtle
   list                       list the resources bound in the current space
   help                       show this help
@@ -27,6 +28,7 @@ commands:
 try:
   source urn:fn:toUpper resource-oriented computing
   source urn:demo:echo/hello
+  source urn:fn:toUpper hello | urn:fn:toUpper
   describe urn:fn:toUpper text/turtle";
 
 /// One evaluated request: the line the user typed and what came back.
@@ -84,10 +86,15 @@ impl Engine {
                 result: self.run_list(),
             }),
             "source" | "src" => {
-                let (target, input) = split_first_word(rest);
+                let result = if rest.contains('|') {
+                    self.run_pipeline(rest)
+                } else {
+                    let (target, input) = split_first_word(rest);
+                    self.run_source(target, input)
+                };
                 Action::Output(Entry {
                     input: line.to_string(),
-                    result: self.run_source(target, input),
+                    result,
                 })
             }
             "describe" | "desc" => {
@@ -103,6 +110,24 @@ impl Engine {
                 result: Err(format!("unknown command `{other}` (try `help`)")),
             }),
         }
+    }
+
+    /// Run a `|`-separated pipeline: source the first stage, then feed each
+    /// stage's output into the next as its input. The first stage is
+    /// `<iri> [input]`; later stages are bare IRIs (their input is the pipe).
+    ///
+    /// Each stage is just a `source`, so routing, the binding-only error, and
+    /// caching all come from [`run_source`](Self::run_source). (A literal `|` in
+    /// an IRI or input isn't supported yet — that needs a quoting parser, which
+    /// also gates `..` / fork-join.)
+    fn run_pipeline(&self, spec: &str) -> Result<String, String> {
+        let mut stages = spec.split('|');
+        let (first_iri, first_input) = split_first_word(stages.next().unwrap_or("").trim());
+        let mut value = self.run_source(first_iri, first_input)?;
+        for stage in stages {
+            value = self.run_source(stage.trim(), &value)?;
+        }
+        Ok(value)
     }
 
     /// `SOURCE` a resource, routing `input` to the endpoint's declared argument.
@@ -272,6 +297,42 @@ mod tests {
             output(builtin_engine().eval("source urn:fn:toUpper hi")).unwrap(),
             "HI"
         );
+    }
+
+    #[test]
+    fn pipeline_chains_output_into_the_next_stage() {
+        // `wrap` returns "[input]"; piping toUpper into it proves the value flows
+        // and is routed to wrap's argument.
+        let wrap = FnEndpoint::new("wrap", |inv: &Invocation<'_>| {
+            let s = inv.inline_str("in")?;
+            Ok(
+                Representation::new(ReprType::new("text/plain"), format!("[{s}]").into_bytes())
+                    .cacheable(),
+            )
+        });
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:fn:toUpper"), builtins::to_upper())
+            .bind(Exact::new("urn:test:wrap"), wrap);
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ));
+        assert_eq!(
+            output(engine.eval("source urn:fn:toUpper hi | urn:test:wrap")).unwrap(),
+            "[HI]"
+        );
+    }
+
+    #[test]
+    fn pipeline_propagates_a_stage_error() {
+        assert!(output(builtin_engine().eval("source urn:fn:toUpper hi | urn:fn:nope")).is_err());
+    }
+
+    #[test]
+    fn pipeline_into_binding_only_endpoint_errors() {
+        let err = output(builtin_engine().eval("source urn:fn:toUpper hi | urn:demo:echo/x"))
+            .unwrap_err();
+        assert!(err.contains("identifier"), "got: {err}");
     }
 
     #[test]

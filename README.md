@@ -44,6 +44,19 @@ Commands: `source <iri> [input]` (SOURCE; `input` is routed to the endpoint's
 So `toUpper` receives `input` as its `in` argument, while `echo` reads a binding
 captured from the IRI — pass *that* in the identifier (`source urn:demo:echo/hi`),
 and the REPL will say so if you try to pass it as a value.
+
+**Pipelines.** `source a [input] | b | c` feeds each stage's output into the next
+as its input (the first stage may take a literal input; later stages get the pipe):
+
+```
+ikigai> source urn:fn:toUpper hello | urn:fn:toUpper
+HELLO
+```
+
+Each stage is just a `source`, so input is routed to each endpoint's declared
+argument — and piping into a binding-only endpoint reports the same helpful error.
+(A literal `|` inside an IRI or input isn't supported yet; that needs a quoting
+parser, which will also bring `..` map and fork/join.)
 In the TUI, **↑/↓** recall input history, **PgUp/PgDn** scroll the transcript,
 **Esc** clears the line, and **Ctrl-C** / **Ctrl-D** exit. The demo space is
 composed in `transport-embedded`; a real host binds its own endpoints there.
