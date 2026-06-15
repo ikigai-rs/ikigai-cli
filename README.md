@@ -7,6 +7,33 @@ self-descriptions, and observe the cache.
 This repository carries the transport dependencies, keeping
 [`ikigai-core`](https://github.com/ikigai-rs/ikigai-core) lean and WebAssembly-friendly.
 
+## Run it
+
+```bash
+cargo run --bin ikigai          # starts the embedded REPL
+```
+
+You attach to an in-process kernel and issue one request per line. The response is
+the resolved representation's bytes, printed as text.
+
+```
+ikigai> source urn:fn:toUpper resource-oriented computing
+RESOURCE-ORIENTED COMPUTING
+ikigai> source urn:demo:echo/hello          # {message} captured during resolution
+hello
+ikigai> describe urn:fn:toUpper             # META → text/turtle self-description
+@prefix ik: <https://ikigai-rs.dev/ns#> .
+<urn:ikigai:endpoint:toUpper> a ik:Endpoint ;
+    ik:id "toUpper" .
+ikigai> help
+ikigai> quit
+```
+
+Commands: `source <iri> [input]` (SOURCE; `input` → the `in` argument),
+`describe <iri> [type]` (META; `type` defaults to `text/turtle`), `help`, `quit`.
+The demo space is composed in `transport-embedded`; a real host binds its own
+endpoints there.
+
 ## Transports (feature-gated)
 | crate | feature | targets |
 |-------|---------|---------|

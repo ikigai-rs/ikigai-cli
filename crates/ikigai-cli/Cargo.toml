@@ -13,8 +13,11 @@ path = "src/main.rs"
 
 [features]
 default = ["embedded"]
-embedded = []
-ipc = []   # native-only
-quic = []  # native-only
+embedded = ["dep:transport-embedded"]
+ipc = []   # native-only, not yet implemented
+quic = []  # native-only, not yet implemented
 
 [dependencies]
+ikigai-core = { workspace = true }
+futures = { workspace = true }
+transport-embedded = { path = "../transport-embedded", optional = true }
