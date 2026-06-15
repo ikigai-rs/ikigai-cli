@@ -20,6 +20,7 @@ pub const HELP: &str = "\
 commands:
   source <iri> [input]       SOURCE a resource; `input` is routed to its declared argument
   describe <iri> [type]      META a resource; `type` defaults to text/turtle
+  list                       list the resources bound in the current space
   help                       show this help
   quit                       exit
 
@@ -78,6 +79,10 @@ impl Engine {
         match cmd {
             "quit" | "exit" => Action::Quit,
             "help" | "?" => Action::Help,
+            "list" | "ls" => Action::Output(Entry {
+                input: line.to_string(),
+                result: self.run_list(),
+            }),
             "source" | "src" => {
                 let (target, input) = split_first_word(rest);
                 Action::Output(Entry {
@@ -126,6 +131,28 @@ impl Engine {
             }
         }
         self.run(request)
+    }
+
+    /// List the bindings of the kernel's root space (pattern → endpoint), or an
+    /// error if the space doesn't support enumeration.
+    fn run_list(&self) -> Result<String, String> {
+        let entries = self
+            .kernel
+            .entries()
+            .ok_or_else(|| "the current space does not support listing".to_string())?;
+        if entries.is_empty() {
+            return Ok("(no bindings)".to_string());
+        }
+        let width = entries
+            .iter()
+            .map(|entry| entry.pattern.chars().count())
+            .max()
+            .unwrap_or(0);
+        let lines: Vec<String> = entries
+            .iter()
+            .map(|entry| format!("{:<width$}  → {}", entry.pattern, entry.endpoint))
+            .collect();
+        Ok(lines.join("\n"))
     }
 
     /// `META` a resource, rendered to `ty`.
@@ -202,7 +229,7 @@ mod tests {
 
     use ikigai_core::{
         builtins, ArgSpec, EndpointSpace, Exact, FnEndpoint, Invocation, MetaRenderer, ReprType,
-        Representation, UriTemplate,
+        Representation, Rewrite, UriTemplate,
     };
 
     /// A minimal renderer that emits the description as JSON — what the embedded
@@ -245,6 +272,22 @@ mod tests {
             output(builtin_engine().eval("source urn:fn:toUpper hi")).unwrap(),
             "HI"
         );
+    }
+
+    #[test]
+    fn lists_the_bound_resources() {
+        let listing = output(builtin_engine().eval("list")).unwrap();
+        assert!(listing.contains("urn:fn:toUpper"));
+        assert!(listing.contains("toUpper"));
+        assert!(listing.contains("urn:demo:echo/{message}"));
+        assert!(listing.contains("echo"));
+    }
+
+    #[test]
+    fn list_on_a_non_enumerable_space_errors() {
+        let inner = Arc::new(EndpointSpace::new().bind(Exact::new("urn:x"), builtins::to_upper()));
+        let engine = Engine::new(Kernel::new(Arc::new(Rewrite::new(inner, |_iri| None))));
+        assert!(output(engine.eval("list")).is_err());
     }
 
     #[test]

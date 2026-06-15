@@ -38,7 +38,9 @@ ikigai> describe urn:fn:toUpper             # META → text/turtle self-descript
 
 Commands: `source <iri> [input]` (SOURCE; `input` is routed to the endpoint's
 **declared argument**, discovered from its self-description rather than assumed),
-`describe <iri> [type]` (META; `type` defaults to `text/turtle`), `help`, `quit`.
+`describe <iri> [type]` (META; `type` defaults to `text/turtle`),
+`list` (show the resources bound in the current space, pattern → endpoint),
+`help`, `quit`.
 So `toUpper` receives `input` as its `in` argument, while `echo` reads a binding
 captured from the IRI — pass *that* in the identifier (`source urn:demo:echo/hi`),
 and the REPL will say so if you try to pass it as a value.
