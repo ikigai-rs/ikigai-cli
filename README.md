@@ -41,16 +41,19 @@ Commands: `source <iri> [input]` (SOURCE; `input` is routed to the endpoint's
 `describe <iri> [type]` (META; `type` defaults to `text/turtle`),
 `list` (show the resources bound in the current space, pattern → endpoint),
 `help`, `quit`.
-So `toUpper` receives `input` as its `in` argument, while `echo` reads a binding
-captured from the IRI — pass *that* in the identifier (`source urn:demo:echo/hi`),
-and the REPL will say so if you try to pass it as a value.
+The demo space exercises every input style: `toUpper` / `reverseList` read the
+`in` argument; `wrap` reads a differently-named `text` argument; `echo` reads a
+`{message}` binding captured from the IRI. The routing follows each endpoint's
+self-description, so `source urn:demo:wrap hello` → `[hello]` lands the input in
+`text` (not `in`) — and passing a value to `echo` (`source urn:demo:echo/hi x`)
+reports that its parameter belongs in the identifier instead.
 
 **Pipelines.** `source a [input] | b | c` feeds each stage's output into the next
 as its input (the first stage may take a literal input; later stages get the pipe):
 
 ```
-ikigai> source urn:fn:toUpper hello | urn:fn:toUpper
-HELLO
+ikigai> source urn:fn:toUpper hi | urn:demo:wrap
+[HI]
 ```
 
 Each stage is just a `source`, so input is routed to each endpoint's declared

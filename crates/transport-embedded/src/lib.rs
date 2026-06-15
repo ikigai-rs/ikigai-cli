@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use ikigai_core::{
-    builtins, Description, EndpointSpace, Error, Exact, Kernel, MetaRenderer, ReprType,
-    Representation, Result, UriTemplate,
+    builtins, ArgSpec, Description, EndpointSpace, Error, Exact, FnEndpoint, Invocation, Kernel,
+    MetaRenderer, ReprType, Representation, Result, UriTemplate, Verb,
 };
 use ikigai_vocab::TurtleRenderer;
 
@@ -32,12 +32,39 @@ impl MetaRenderer for CliRenderer {
     }
 }
 
-/// Build an embedded kernel pre-bound with the built-in pure endpoints and a
+/// `wrap`: surrounds the `text` argument with square brackets. Its argument is
+/// deliberately named `text`, not `in`, so the REPL's self-description-driven
+/// routing is visible — `source urn:demo:wrap hi` works only because the contract
+/// says the input goes to `text`, and it makes pipelines show their work
+/// (`source urn:fn:toUpper hi | urn:demo:wrap` → `[HI]`).
+fn wrap_impl(inv: &Invocation<'_>) -> Result<Representation> {
+    let text = inv.inline_str("text")?;
+    Ok(Representation::new(
+        ReprType::new("text/plain").with_param("charset", "utf-8"),
+        format!("[{text}]").into_bytes(),
+    )
+    .cacheable())
+}
+
+fn wrap() -> FnEndpoint {
+    FnEndpoint::new("wrap", wrap_impl).with_description(
+        Description::new("wrap")
+            .title("Wrap")
+            .summary("Surrounds the `text` argument with square brackets.")
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .input(ArgSpec::new("text").summary("the text to wrap"))
+            .output("text/plain;charset=utf-8"),
+    )
+}
+
+/// Build an embedded kernel pre-bound with the demo endpoints and a
 /// self-description renderer (Turtle / plain text / JSON).
 ///
-/// `toUpper` / `reverseList` take their input from the `in` argument; `echo` is
-/// bound to a URI template and returns the `{message}` segment captured during
-/// resolution — so the space exercises both inline args and grammar bindings.
+/// The space deliberately exercises every input style: `toUpper` / `reverseList`
+/// read the `in` argument; `wrap` reads a differently-named `text` argument (so
+/// the contract-driven routing is visible); `echo` reads a `{message}` binding
+/// captured from the IRI.
 ///
 /// This is the demo space; a real host would compose its own endpoints here.
 pub fn kernel() -> Kernel {
@@ -45,6 +72,23 @@ pub fn kernel() -> Kernel {
     let space = EndpointSpace::new()
         .bind(Exact::new("urn:fn:toUpper"), builtins::to_upper())
         .bind(Exact::new("urn:fn:reverseList"), builtins::reverse_list())
+        .bind(Exact::new("urn:demo:wrap"), wrap())
         .bind(echo, builtins::echo());
     Kernel::with_meta_renderer(Arc::new(space), Arc::new(CliRenderer))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::executor::block_on;
+    use ikigai_core::{ArgRef, Capability, Iri, Request};
+
+    #[test]
+    fn wrap_routes_the_text_argument() {
+        let kernel = kernel();
+        let request = Request::new(Verb::Source, Iri::parse("urn:demo:wrap").unwrap())
+            .with_arg("text", ArgRef::Inline(b"hi".to_vec()));
+        let representation = block_on(kernel.issue(request, &Capability::root())).unwrap();
+        assert_eq!(representation.bytes, b"[hi]");
+    }
 }
