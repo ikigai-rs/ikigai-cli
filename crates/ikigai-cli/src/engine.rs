@@ -7,10 +7,12 @@
 //!
 //! `source` is self-description-driven: rather than assuming an `in` argument, it
 //! asks the target endpoint for its parameter contract (a `Meta` request rendered
-//! as `application/json`) and routes the input to the declared argument — so an
-//! endpoint that reads a differently-named argument, or only a grammar binding,
-//! is handled correctly. The contract is fetched through `issue`, so this works
-//! the same against a remote kernel.
+//! as `application/json`) and routes by it — so an endpoint that reads a
+//! differently-named argument, several arguments, or only a grammar binding is
+//! handled correctly. A `key=value` word names a declared argument; the
+//! positional text or piped value fills the one argument left unnamed. The
+//! contract is fetched through `issue`, so this works the same against a remote
+//! kernel.
 
 use futures::executor::block_on;
 use ikigai_core::{ArgRef, Capability, Description, InputSource, Iri, Kernel, Request, Verb};
@@ -19,6 +21,7 @@ use ikigai_core::{ArgRef, Capability, Description, InputSource, Iri, Kernel, Req
 pub const HELP: &str = "\
 commands:
   source <iri> [input]       SOURCE a resource; `input` is routed to its declared argument
+  source <iri> key=value …   name arguments; positional/pipe fills the one left unnamed
   source a [input] | b | c   pipeline: `|` pipes the whole output into the next stage
   source a [input] .. b      map: run `b` per newline-item of `a`'s output, rejoin
   source a | ( b ; c )       fork: fan the input to each branch, join their outputs
@@ -27,6 +30,10 @@ commands:
   help                       show this help
   quit                       exit
 
+arguments:
+  `key=value` sets an argument by name (`key` must be a declared argument of the
+  target); any other word is positional and fills the one argument left unnamed.
+
 quoting:
   wrap a word in \"…\" to keep `|`, `..`, `(`, `)`, `;`, or spaces literal inside an
   IRI or input; \\\" is a literal quote and \\\\ a literal backslash.
@@ -34,6 +41,8 @@ quoting:
 try:
   source urn:fn:toUpper resource-oriented computing
   source urn:demo:echo/hello
+  source urn:demo:greet greeting=Hello name=World
+  source urn:demo:greet Hello name=World
   source urn:fn:toUpper hello | urn:fn:toUpper
   source urn:fn:toUpper \"a | b\"
   source urn:demo:split \"a,b,c\" .. urn:fn:toUpper
@@ -56,18 +65,6 @@ pub enum Action {
     Quit,
     /// Empty line — do nothing.
     Noop,
-}
-
-/// Where a `source` input should go, decided from the target's self-description.
-enum ArgChoice {
-    /// Route the input to this declared argument name.
-    Named(String),
-    /// The endpoint's only parameter is a grammar binding — input belongs in the IRI.
-    BindingOnly,
-    /// Several arguments declared; the REPL can't pick one yet.
-    Ambiguous(Vec<String>),
-    /// No contract available — assume the conventional `in` argument.
-    Fallback,
 }
 
 /// Holds the kernel and turns input lines into [`Action`]s.
@@ -145,24 +142,15 @@ impl Engine {
         Ok(value)
     }
 
-    /// Run one stage. A `Source` is a `source` request; with an `incoming` value
-    /// it must be a bare IRI (the value is its input), without one it takes its
-    /// literal input. A `Fork` fans `incoming` to every branch and joins their
-    /// outputs with newlines (the same list convention `..` reads).
+    /// Run one stage. A `Source` is a `source` request; a `Fork` fans `incoming`
+    /// to every branch and joins their outputs with newlines (the same list
+    /// convention `..` reads).
     fn run_node(&self, node: &Node, incoming: Option<&str>) -> Result<String, String> {
         match node {
-            Node::Source(words) => match incoming {
-                // Top level: the literal is the input, and an absent one means
-                // "just source the resource" (so binding-only endpoints work).
-                None => {
-                    let (target, input) = stage_target_input(words)?;
-                    self.run_source(target, (!input.is_empty()).then_some(input.as_str()))
-                }
-                // A connector/fork always supplies a value — pass it through even
-                // when empty, so a blank list item (e.g. `split "a,,b"`) is an
-                // empty-string input rather than a dropped, no-argument request.
-                Some(value) => self.run_source(piped_stage_target(words)?, Some(value)),
-            },
+            Node::Source(words) => {
+                let (target, args) = words.split_first().ok_or("expected an IRI")?;
+                self.run_source(target, args, incoming)
+            }
             Node::Fork(branches) => {
                 let outputs = branches
                     .iter()
@@ -185,30 +173,97 @@ impl Engine {
         Ok(outputs.join("\n"))
     }
 
-    /// `SOURCE` a resource, routing `input` to the endpoint's declared argument.
-    /// `None` sources the resource with no by-value argument; `Some` routes the
-    /// value even when empty (an explicit empty input differs from no input).
-    fn run_source(&self, target: &str, input: Option<&str>) -> Result<String, String> {
+    /// `SOURCE` a resource. `args` are the stage's words after the IRI; a word
+    /// `key=value` is a named argument when `key` is a declared argument of the
+    /// target (discovered from its self-description), otherwise it is positional
+    /// text. The positional text — or `incoming`, the value flowing in from a
+    /// connector/fork — is routed to the one declared argument left unnamed.
+    fn run_source(
+        &self,
+        target: &str,
+        args: &[String],
+        incoming: Option<&str>,
+    ) -> Result<String, String> {
         let iri = parse_target(target)?;
-        let mut request = Request::new(Verb::Source, iri.clone());
-        if let Some(input) = input {
-            let value = ArgRef::Inline(input.as_bytes().to_vec());
-            match self.argument_choice(&iri) {
-                ArgChoice::Named(name) => request = request.with_arg(name, value),
-                ArgChoice::Fallback => request = request.with_arg("in", value),
-                ArgChoice::BindingOnly => {
-                    return Err(format!(
-                        "`{}` takes no by-value argument — its parameter is captured from the \
-                         identifier, so put the value in the IRI",
-                        iri.as_str()
-                    ));
+
+        // The contract is only needed to recognise named arguments and route the
+        // value; a bare `source <iri>` (no args, no pipe) skips the lookup.
+        let description = (!args.is_empty() || incoming.is_some())
+            .then(|| self.describe_struct(&iri))
+            .flatten();
+        let declared = declared_arguments(description.as_ref());
+
+        // Split args into named (`key=value` with a declared key) and positional.
+        let mut named: Vec<(&str, &str)> = Vec::new();
+        let mut positional: Vec<&str> = Vec::new();
+        for arg in args {
+            match arg.split_once('=') {
+                Some((key, value)) if declared.iter().any(|name| name == key) => {
+                    named.push((key, value))
                 }
-                ArgChoice::Ambiguous(names) => {
-                    return Err(format!(
-                        "`{}` accepts multiple arguments ({}); the REPL can't pick one yet",
-                        iri.as_str(),
-                        names.join(", ")
-                    ));
+                _ => positional.push(arg),
+            }
+        }
+        let positional = positional.join(" ");
+
+        // The value to route comes from the pipe xor the positional text — never
+        // both (a piped stage's input is the pipe, so a literal has nowhere else
+        // to go).
+        let value = match (incoming, positional.is_empty()) {
+            (Some(_), false) => {
+                return Err(format!(
+                    "`{}` takes its input from the pipe — drop the literal input",
+                    iri.as_str()
+                ))
+            }
+            (Some(value), true) => Some(value),
+            (None, false) => Some(positional.as_str()),
+            (None, true) => None,
+        };
+
+        let mut request = Request::new(Verb::Source, iri.clone());
+        for (name, value) in &named {
+            request = request.with_arg(*name, ArgRef::Inline(value.as_bytes().to_vec()));
+        }
+
+        if let Some(value) = value {
+            let value = ArgRef::Inline(value.as_bytes().to_vec());
+            match description {
+                // No contract: assume the conventional `in`, as before.
+                None => request = request.with_arg("in", value),
+                Some(ref description) => {
+                    let remaining: Vec<&str> = declared
+                        .iter()
+                        .map(String::as_str)
+                        .filter(|name| !named.iter().any(|(named, _)| named == name))
+                        .collect();
+                    match remaining.as_slice() {
+                        [name] => request = request.with_arg(*name, value),
+                        [] if description.inputs.is_empty() => {
+                            request = request.with_arg("in", value)
+                        }
+                        [] if declared.is_empty() => {
+                            return Err(format!(
+                                "`{}` takes no by-value argument — its parameter is captured \
+                                 from the identifier, so put the value in the IRI",
+                                iri.as_str()
+                            ))
+                        }
+                        [] => {
+                            return Err(format!(
+                                "`{}` has no argument left for the value — every declared \
+                                 argument is already set by name",
+                                iri.as_str()
+                            ))
+                        }
+                        many => {
+                            return Err(format!(
+                                "`{}` accepts multiple arguments ({}); name one with `key=value`",
+                                iri.as_str(),
+                                many.join(", ")
+                            ))
+                        }
+                    }
                 }
             }
         }
@@ -245,14 +300,6 @@ impl Engine {
         self.run(request)
     }
 
-    /// Decide where a `source` input should go from the target's contract.
-    fn argument_choice(&self, iri: &Iri) -> ArgChoice {
-        match self.describe_struct(iri) {
-            Some(description) => argument_for(&description),
-            None => ArgChoice::Fallback,
-        }
-    }
-
     /// Fetch a target's structured self-description via a `Meta` request rendered
     /// as `application/json`. `None` if it doesn't resolve or isn't JSON-renderable.
     fn describe_struct(&self, iri: &Iri) -> Option<Description> {
@@ -270,23 +317,19 @@ impl Engine {
     }
 }
 
-/// Choose the argument to route input to, given a target's declared inputs.
-fn argument_for(description: &Description) -> ArgChoice {
-    if description.inputs.is_empty() {
-        // Nothing declared — assume the conventional `in`, never worse than before.
-        return ArgChoice::Fallback;
-    }
-    let arguments: Vec<String> = description
-        .inputs
-        .iter()
-        .filter(|input| input.source == InputSource::Argument)
-        .map(|input| input.name.clone())
-        .collect();
-    match arguments.len() {
-        0 => ArgChoice::BindingOnly,
-        1 => ArgChoice::Named(arguments.into_iter().next().expect("len == 1")),
-        _ => ArgChoice::Ambiguous(arguments),
-    }
+/// The names of a target's declared by-value arguments, in declaration order.
+/// Binding inputs (captured from the IRI) and an absent contract yield none.
+fn declared_arguments(description: Option<&Description>) -> Vec<String> {
+    description
+        .map(|description| {
+            description
+                .inputs
+                .iter()
+                .filter(|input| input.source == InputSource::Argument)
+                .map(|input| input.name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// How a stage's output feeds the next stage.
@@ -497,29 +540,6 @@ impl Parser {
             self.peek(),
             None | Some(Token::Pipe | Token::Map | Token::Semi | Token::Close)
         )
-    }
-}
-
-/// The first stage of a pipeline: `<iri> [input]`. The target is the first word;
-/// the input is the remaining words rejoined with single spaces (quote a word to
-/// keep its own spacing). Empty when no IRI was given.
-fn stage_target_input(words: &[String]) -> Result<(&str, String), String> {
-    match words.split_first() {
-        Some((target, rest)) => Ok((target, rest.join(" "))),
-        None => Err("expected an IRI".to_string()),
-    }
-}
-
-/// A non-first ("piped") stage: its input comes from the pipe, so it must be a
-/// bare `<iri>` — exactly one word. Empty (`a | | b`) or carrying a literal input
-/// (`a | b extra`) is an error, since that input would have nowhere to go.
-fn piped_stage_target(words: &[String]) -> Result<&str, String> {
-    match words {
-        [] => Err("empty pipeline stage (a stray `|`?)".to_string()),
-        [target] => Ok(target),
-        [target, ..] => Err(format!(
-            "piped stage `{target}` takes its input from the pipe — drop the literal input"
-        )),
     }
 }
 
@@ -769,6 +789,112 @@ mod tests {
         ))
     }
 
+    /// An engine with a two-argument `greet` endpoint (`greeting` + `name`),
+    /// plus `toUpper`/`reverseList`, for exercising `name=value` routing.
+    fn greet_engine() -> Engine {
+        let greet = FnEndpoint::new("greet", |inv: &Invocation<'_>| {
+            let greeting = inv.inline_str("greeting")?;
+            let name = inv.inline_str("name")?;
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("{greeting}, {name}").into_bytes(),
+            )
+            .cacheable())
+        })
+        .with_description(
+            Description::new("greet")
+                .verb(Verb::Source)
+                .verb(Verb::Meta)
+                .input(ArgSpec::new("greeting"))
+                .input(ArgSpec::new("name"))
+                .output("text/plain"),
+        );
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:demo:greet"), greet)
+            .bind(Exact::new("urn:fn:toUpper"), builtins::to_upper())
+            .bind(Exact::new("urn:fn:reverseList"), builtins::reverse_list());
+        Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ))
+    }
+
+    #[test]
+    fn names_both_arguments() {
+        assert_eq!(
+            output(greet_engine().eval("source urn:demo:greet greeting=Hello name=World")).unwrap(),
+            "Hello, World"
+        );
+    }
+
+    #[test]
+    fn named_arguments_are_order_independent() {
+        assert_eq!(
+            output(greet_engine().eval("source urn:demo:greet name=World greeting=Hi")).unwrap(),
+            "Hi, World"
+        );
+    }
+
+    #[test]
+    fn positional_fills_the_one_unnamed_argument() {
+        // `name` is named; the positional `Hello` lands in the remaining `greeting`.
+        assert_eq!(
+            output(greet_engine().eval("source urn:demo:greet Hello name=World")).unwrap(),
+            "Hello, World"
+        );
+    }
+
+    #[test]
+    fn a_pipe_fills_the_one_unnamed_argument() {
+        // `greeting` is named; the piped value lands in the remaining `name`.
+        assert_eq!(
+            output(greet_engine().eval("source urn:fn:toUpper world | urn:demo:greet greeting=Hi"))
+                .unwrap(),
+            "Hi, WORLD"
+        );
+    }
+
+    #[test]
+    fn map_threads_items_through_a_fixed_named_argument() {
+        // `greeting` is pinned; `..` feeds each list item into the remaining `name`.
+        let out = output(
+            greet_engine().eval("source urn:fn:reverseList \"a\nb\" .. urn:demo:greet greeting=Hi"),
+        )
+        .unwrap();
+        assert_eq!(out, "Hi, b\nHi, a");
+    }
+
+    #[test]
+    fn equals_in_a_value_is_positional_when_the_key_is_not_declared() {
+        // `a` is not a declared argument of toUpper, so `a=b` is positional input.
+        assert_eq!(
+            output(greet_engine().eval("source urn:fn:toUpper a=b")).unwrap(),
+            "A=B"
+        );
+    }
+
+    #[test]
+    fn an_undeclared_key_is_treated_as_positional_text() {
+        // `bogus` isn't declared, so `bogus=x` is positional and fills `greeting`.
+        assert_eq!(
+            output(greet_engine().eval("source urn:demo:greet bogus=x name=World")).unwrap(),
+            "bogus=x, World"
+        );
+    }
+
+    #[test]
+    fn a_positional_value_with_two_unnamed_arguments_is_ambiguous() {
+        let err = output(greet_engine().eval("source urn:demo:greet Hello")).unwrap_err();
+        assert!(err.contains("name one with `key=value`"), "got: {err}");
+    }
+
+    #[test]
+    fn an_extra_value_when_all_arguments_are_named_errors() {
+        let err = output(greet_engine().eval("source urn:demo:greet greeting=Hi name=W extra"))
+            .unwrap_err();
+        assert!(err.contains("no argument left"), "got: {err}");
+    }
+
     #[test]
     fn map_applies_the_next_stage_per_item() {
         // reverseList flips the three lines; `..` then uppercases each independently.
@@ -956,19 +1082,20 @@ mod tests {
     }
 
     #[test]
-    fn argument_for_distinguishes_the_cases() {
-        let arg = Description::new("toUpper").input(ArgSpec::new("in"));
-        assert!(matches!(argument_for(&arg), ArgChoice::Named(n) if n == "in"));
+    fn declared_arguments_lists_only_by_value_inputs() {
+        // Only `Argument`-source inputs, in declaration order — bindings excluded.
+        let description = Description::new("x")
+            .input(ArgSpec::new("greeting"))
+            .input(ArgSpec::new("who").binding())
+            .input(ArgSpec::new("name"));
+        assert_eq!(
+            declared_arguments(Some(&description)),
+            vec!["greeting", "name"]
+        );
 
+        // A binding-only contract and an absent contract both yield no arguments.
         let binding = Description::new("echo").input(ArgSpec::new("message").binding());
-        assert!(matches!(argument_for(&binding), ArgChoice::BindingOnly));
-
-        let many = Description::new("x")
-            .input(ArgSpec::new("a"))
-            .input(ArgSpec::new("b"));
-        assert!(matches!(argument_for(&many), ArgChoice::Ambiguous(_)));
-
-        let undeclared = Description::new("x");
-        assert!(matches!(argument_for(&undeclared), ArgChoice::Fallback));
+        assert!(declared_arguments(Some(&binding)).is_empty());
+        assert!(declared_arguments(None).is_empty());
     }
 }
