@@ -129,6 +129,25 @@ Inside a quoted span, `\"` is a literal quote and `\\` a literal backslash. (`..
 is an operator only as a whole, unquoted word, so a dotted IRI like `urn:x/../y`
 needs no quoting; `|`, `(`, `)`, and `;` split even mid-word, so quote them to use
 them literally.) These three operators are parsed by one recursive-descent parser.
+
+**Cache visibility.** Every resolution reports how the kernel's representation
+cache served it: `computed` the first time (and cached for next time), `cached`
+when it came straight from the cache, or `uncacheable` for a result that opts out
+of caching and recomputes each time. A pipeline summarises its stages, so you can
+see partial reuse:
+
+```
+ikigai> source urn:fn:toUpper hi        (computed)
+HI
+ikigai> source urn:fn:toUpper hi        (cached)
+HI
+ikigai> source urn:fn:toUpper hi | urn:demo:wrap   (1 cached · 1 computed)
+[HI]
+```
+
+In the full-screen TUI the tag is dimmed after the prompt; in the line REPL it
+goes to stderr (prefixed `[…]`) so piped stdout stays clean.
+
 In the TUI, **↑/↓** recall input history, **PgUp/PgDn** scroll the transcript,
 **Esc** clears the line, and **Ctrl-C** / **Ctrl-D** exit. The demo space is
 composed in `transport-embedded`; a real host binds its own endpoints there.
