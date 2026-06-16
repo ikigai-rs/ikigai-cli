@@ -25,10 +25,15 @@ commands:
   help                       show this help
   quit                       exit
 
+quoting:
+  wrap a word in \"…\" to keep `|` or spaces literal inside an IRI or input;
+  \\\" is a literal quote and \\\\ a literal backslash.
+
 try:
   source urn:fn:toUpper resource-oriented computing
   source urn:demo:echo/hello
   source urn:fn:toUpper hello | urn:fn:toUpper
+  source urn:fn:toUpper \"a | b\"
   describe urn:fn:toUpper text/turtle";
 
 /// One evaluated request: the line the user typed and what came back.
@@ -85,18 +90,10 @@ impl Engine {
                 input: line.to_string(),
                 result: self.run_list(),
             }),
-            "source" | "src" => {
-                let result = if rest.contains('|') {
-                    self.run_pipeline(rest)
-                } else {
-                    let (target, input) = split_first_word(rest);
-                    self.run_source(target, input)
-                };
-                Action::Output(Entry {
-                    input: line.to_string(),
-                    result,
-                })
-            }
+            "source" | "src" => Action::Output(Entry {
+                input: line.to_string(),
+                result: self.run_pipeline(rest),
+            }),
             "describe" | "desc" => {
                 let (target, ty) = split_first_word(rest);
                 let ty = if ty.is_empty() { "text/turtle" } else { ty };
@@ -115,17 +112,20 @@ impl Engine {
     /// Run a `|`-separated pipeline: source the first stage, then feed each
     /// stage's output into the next as its input. The first stage is
     /// `<iri> [input]`; later stages are bare IRIs (their input is the pipe).
+    /// A single stage with no `|` is just a plain `source`.
     ///
-    /// Each stage is just a `source`, so routing, the binding-only error, and
-    /// caching all come from [`run_source`](Self::run_source). (A literal `|` in
-    /// an IRI or input isn't supported yet — that needs a quoting parser, which
-    /// also gates `..` / fork-join.)
+    /// The spec is split by [`lex_stages`], which honours `"…"` quoting so a
+    /// literal `|` (or whitespace) can appear inside an IRI or input. Each stage
+    /// is then just a `source`, so routing, the binding-only error, and caching
+    /// all come from [`run_source`](Self::run_source). (`..` map and fork/join
+    /// build on this same tokenizer.)
     fn run_pipeline(&self, spec: &str) -> Result<String, String> {
-        let mut stages = spec.split('|');
-        let (first_iri, first_input) = split_first_word(stages.next().unwrap_or("").trim());
-        let mut value = self.run_source(first_iri, first_input)?;
-        for stage in stages {
-            value = self.run_source(stage.trim(), &value)?;
+        let mut stages = lex_stages(spec)?.into_iter();
+        let first = stages.next().expect("lex_stages yields at least one stage");
+        let (target, input) = stage_target_input(&first)?;
+        let mut value = self.run_source(target, &input)?;
+        for words in stages {
+            value = self.run_source(piped_stage_target(&words)?, &value)?;
         }
         Ok(value)
     }
@@ -232,6 +232,92 @@ fn argument_for(description: &Description) -> ArgChoice {
     }
 }
 
+/// Split a pipeline spec into stages, each a list of words.
+///
+/// Stages are separated by top-level `|`; within a stage, words are split on
+/// whitespace. A `"…"` span keeps `|`, whitespace, and anything else literal
+/// (and is removed from the resulting word), so an IRI or input can contain
+/// them — `"a | b"` is one word holding a literal pipe. Inside a quote, `\"` is
+/// a literal quote and `\\` a literal backslash; any other `\x` is left as-is.
+///
+/// Always yields at least one stage (possibly with zero words, e.g. an empty
+/// line or a trailing `|`), so callers can treat the first stage as present and
+/// report empty stages themselves.
+fn lex_stages(spec: &str) -> Result<Vec<Vec<String>>, String> {
+    let mut stages = Vec::new();
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false; // started a word? distinguishes "" (a quoted empty) from no word
+    let mut chars = spec.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                in_word = true;
+                loop {
+                    match chars.next() {
+                        Some('\\') => match chars.next() {
+                            Some(e @ ('"' | '\\')) => word.push(e),
+                            Some(other) => {
+                                word.push('\\');
+                                word.push(other);
+                            }
+                            None => return Err("unterminated `\\` escape in quoted text".into()),
+                        },
+                        Some('"') => break,
+                        Some(ch) => word.push(ch),
+                        None => return Err("unterminated `\"` quote".into()),
+                    }
+                }
+            }
+            '|' => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+                stages.push(std::mem::take(&mut words));
+            }
+            c if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            c => {
+                in_word = true;
+                word.push(c);
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    stages.push(words);
+    Ok(stages)
+}
+
+/// The first stage of a pipeline: `<iri> [input]`. The target is the first word;
+/// the input is the remaining words rejoined with single spaces (quote a word to
+/// keep its own spacing). Empty when no IRI was given.
+fn stage_target_input(words: &[String]) -> Result<(&str, String), String> {
+    match words.split_first() {
+        Some((target, rest)) => Ok((target, rest.join(" "))),
+        None => Err("expected an IRI".to_string()),
+    }
+}
+
+/// A non-first ("piped") stage: its input comes from the pipe, so it must be a
+/// bare `<iri>` — exactly one word. Empty (`a | | b`) or carrying a literal input
+/// (`a | b extra`) is an error, since that input would have nowhere to go.
+fn piped_stage_target(words: &[String]) -> Result<&str, String> {
+    match words {
+        [] => Err("empty pipeline stage (a stray `|`?)".to_string()),
+        [target] => Ok(target),
+        [target, ..] => Err(format!(
+            "piped stage `{target}` takes its input from the pipe — drop the literal input"
+        )),
+    }
+}
+
 fn parse_target(target: &str) -> Result<Iri, String> {
     if target.is_empty() {
         return Err("expected an IRI".to_string());
@@ -321,6 +407,66 @@ mod tests {
             output(engine.eval("source urn:fn:toUpper hi | urn:test:wrap")).unwrap(),
             "[HI]"
         );
+    }
+
+    #[test]
+    fn quotes_keep_a_pipe_literal_in_the_input() {
+        // Without quoting this would split into two stages; the quotes make
+        // `a | b` a single literal input to toUpper.
+        assert_eq!(
+            output(builtin_engine().eval("source urn:fn:toUpper \"a | b\"")).unwrap(),
+            "A | B"
+        );
+    }
+
+    #[test]
+    fn quoted_input_preserves_internal_spacing() {
+        // Bare words rejoin with single spaces; a quoted word keeps its own.
+        assert_eq!(
+            output(builtin_engine().eval("source urn:fn:toUpper \"a   b\"")).unwrap(),
+            "A   B"
+        );
+    }
+
+    #[test]
+    fn piped_stage_with_a_literal_input_is_an_error() {
+        let err = output(builtin_engine().eval("source urn:fn:toUpper hi | urn:fn:toUpper x"))
+            .unwrap_err();
+        assert!(err.contains("from the pipe"), "got: {err}");
+    }
+
+    #[test]
+    fn a_stray_pipe_is_an_error() {
+        let err = output(builtin_engine().eval("source urn:fn:toUpper hi | | urn:fn:toUpper"))
+            .unwrap_err();
+        assert!(err.contains("empty pipeline stage"), "got: {err}");
+    }
+
+    #[test]
+    fn lex_stages_splits_and_unquotes() {
+        // Two stages; the quoted span holds a literal pipe and collapses to one word.
+        let stages = lex_stages("urn:fn:toUpper \"a | b\" | urn:demo:wrap").unwrap();
+        assert_eq!(
+            stages,
+            vec![
+                vec!["urn:fn:toUpper".to_string(), "a | b".to_string()],
+                vec!["urn:demo:wrap".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_stages_processes_escapes() {
+        let stages = lex_stages(r#"x "say \"hi\" \\ ok""#).unwrap();
+        assert_eq!(
+            stages,
+            vec![vec!["x".to_string(), r#"say "hi" \ ok"#.to_string()]]
+        );
+    }
+
+    #[test]
+    fn lex_stages_rejects_an_unterminated_quote() {
+        assert!(lex_stages("x \"unclosed").is_err());
     }
 
     #[test]
