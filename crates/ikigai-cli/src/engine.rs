@@ -152,11 +152,16 @@ impl Engine {
     fn run_node(&self, node: &Node, incoming: Option<&str>) -> Result<String, String> {
         match node {
             Node::Source(words) => match incoming {
+                // Top level: the literal is the input, and an absent one means
+                // "just source the resource" (so binding-only endpoints work).
                 None => {
                     let (target, input) = stage_target_input(words)?;
-                    self.run_source(target, &input)
+                    self.run_source(target, (!input.is_empty()).then_some(input.as_str()))
                 }
-                Some(value) => self.run_source(piped_stage_target(words)?, value),
+                // A connector/fork always supplies a value — pass it through even
+                // when empty, so a blank list item (e.g. `split "a,,b"`) is an
+                // empty-string input rather than a dropped, no-argument request.
+                Some(value) => self.run_source(piped_stage_target(words)?, Some(value)),
             },
             Node::Fork(branches) => {
                 let outputs = branches
@@ -181,10 +186,12 @@ impl Engine {
     }
 
     /// `SOURCE` a resource, routing `input` to the endpoint's declared argument.
-    fn run_source(&self, target: &str, input: &str) -> Result<String, String> {
+    /// `None` sources the resource with no by-value argument; `Some` routes the
+    /// value even when empty (an explicit empty input differs from no input).
+    fn run_source(&self, target: &str, input: Option<&str>) -> Result<String, String> {
         let iri = parse_target(target)?;
         let mut request = Request::new(Verb::Source, iri.clone());
-        if !input.is_empty() {
+        if let Some(input) = input {
             let value = ArgRef::Inline(input.as_bytes().to_vec());
             match self.argument_choice(&iri) {
                 ArgChoice::Named(name) => request = request.with_arg(name, value),
@@ -780,6 +787,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, "Y\nX");
+    }
+
+    #[test]
+    fn map_passes_blank_items_through_as_empty_input() {
+        // A blank line in the list (here the reversed middle of `a\n\nb`) must
+        // reach the stage as an empty input, not be dropped into a no-argument
+        // request that errors with "missing required argument".
+        let out = output(list_engine().eval("source urn:fn:toUpper \"a\n\nb\" .. urn:fn:toUpper"))
+            .unwrap();
+        assert_eq!(out, "A\n\nB");
     }
 
     #[test]
