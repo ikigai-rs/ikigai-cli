@@ -14,8 +14,12 @@
 //! contract is fetched through `issue`, so this works the same against a remote
 //! kernel.
 
+use std::cell::Cell;
+
 use futures::executor::block_on;
-use ikigai_core::{ArgRef, Capability, Description, InputSource, Iri, Kernel, Request, Verb};
+use ikigai_core::{
+    ArgRef, Capability, Description, Expiry, InputSource, Iri, Kernel, Request, Verb,
+};
 
 /// Help text shown by the `help` command (and the TUI's hint line links to it).
 pub const HELP: &str = "\
@@ -49,10 +53,66 @@ try:
   source urn:demo:split \"a,b,c\" | ( urn:fn:toUpper ; urn:fn:reverseList )
   describe urn:fn:toUpper text/turtle";
 
-/// One evaluated request: the line the user typed and what came back.
+/// One evaluated request: the line the user typed, what came back, and how the
+/// kernel's cache served it.
 pub struct Entry {
     pub input: String,
     pub result: Result<String, String>,
+    pub cache: CacheStats,
+}
+
+/// How one issued request was served by the kernel's representation cache.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CacheStatus {
+    /// Served from cache without recomputing.
+    Hit,
+    /// Computed now, and the result was cached for next time.
+    Miss,
+    /// Computed now; the result is not cacheable, so it recomputes every time.
+    Uncacheable,
+}
+
+/// A tally of the cache outcomes across the (possibly many) requests one input
+/// line issues — a pipeline stage, a fork branch, and a mapped item each count.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct CacheStats {
+    hits: u32,
+    misses: u32,
+    uncacheable: u32,
+}
+
+impl CacheStats {
+    fn record(&mut self, status: CacheStatus) {
+        match status {
+            CacheStatus::Hit => self.hits += 1,
+            CacheStatus::Miss => self.misses += 1,
+            CacheStatus::Uncacheable => self.uncacheable += 1,
+        }
+    }
+
+    /// A compact label for the outcome — `None` when nothing was issued (e.g.
+    /// `list`, `help`, or a command that errored before resolving). A single
+    /// request reads as one word; several stages summarise their mix.
+    pub fn label(&self) -> Option<String> {
+        match (self.hits, self.misses, self.uncacheable) {
+            (0, 0, 0) => None,
+            (1, 0, 0) => Some("cached".to_string()),
+            (0, 1, 0) => Some("computed".to_string()),
+            (0, 0, 1) => Some("uncacheable".to_string()),
+            _ => {
+                let mut parts = Vec::new();
+                let mut push = |n: u32, what: &str| {
+                    if n > 0 {
+                        parts.push(format!("{n} {what}"));
+                    }
+                };
+                push(self.hits, "cached");
+                push(self.misses, "computed");
+                push(self.uncacheable, "uncacheable");
+                Some(parts.join(" · "))
+            }
+        }
+    }
 }
 
 /// What the frontend should do with an evaluated line.
@@ -70,11 +130,18 @@ pub enum Action {
 /// Holds the kernel and turns input lines into [`Action`]s.
 pub struct Engine {
     kernel: Kernel,
+    /// Cache outcomes recorded by [`run`](Self::run) during the current `eval`.
+    /// Interior-mutable so the `&self` resolution path can tally without
+    /// threading an accumulator through every stage; the REPL is single-threaded.
+    cache: Cell<CacheStats>,
 }
 
 impl Engine {
     pub fn new(kernel: Kernel) -> Self {
-        Self { kernel }
+        Self {
+            kernel,
+            cache: Cell::new(CacheStats::default()),
+        }
     }
 
     /// Evaluate one input line.
@@ -83,30 +150,28 @@ impl Engine {
         if line.is_empty() {
             return Action::Noop;
         }
+        // Each `run` during this line accumulates into `self.cache`; reset it
+        // first, then read it back into the entry once the command has resolved.
+        self.cache.set(CacheStats::default());
         let (cmd, rest) = split_first_word(line);
+        let output = |this: &Self, result| {
+            Action::Output(Entry {
+                input: line.to_string(),
+                result,
+                cache: this.cache.get(),
+            })
+        };
         match cmd {
             "quit" | "exit" => Action::Quit,
             "help" | "?" => Action::Help,
-            "list" | "ls" => Action::Output(Entry {
-                input: line.to_string(),
-                result: self.run_list(),
-            }),
-            "source" | "src" => Action::Output(Entry {
-                input: line.to_string(),
-                result: self.run_pipeline(rest),
-            }),
+            "list" | "ls" => output(self, self.run_list()),
+            "source" | "src" => output(self, self.run_pipeline(rest)),
             "describe" | "desc" => {
                 let (target, ty) = split_first_word(rest);
                 let ty = if ty.is_empty() { "text/turtle" } else { ty };
-                Action::Output(Entry {
-                    input: line.to_string(),
-                    result: self.run_meta(target, ty),
-                })
+                output(self, self.run_meta(target, ty))
             }
-            other => Action::Output(Entry {
-                input: line.to_string(),
-                result: Err(format!("unknown command `{other}` (try `help`)")),
-            }),
+            other => output(self, Err(format!("unknown command `{other}` (try `help`)"))),
         }
     }
 
@@ -309,10 +374,30 @@ impl Engine {
         serde_json::from_slice(&representation.bytes).ok()
     }
 
-    /// Issue a request and decode the representation as UTF-8 text.
+    /// Issue a request, record how the cache served it, and decode the
+    /// representation as UTF-8 text.
+    ///
+    /// The kernel doesn't report hit-vs-miss directly, so we infer it: a hit
+    /// returns the cached representation without touching the cache, while a miss
+    /// that is cacheable inserts one entry. So with the result's own cacheability
+    /// (its [`Expiry`]) and the change in [`cache_len`](Kernel::cache_len) across
+    /// the single issue, the outcome is exact — a `Never` result whose issue grew
+    /// the cache was computed now, an unchanged cache means it was already there,
+    /// and an `Always` result is never cached at all.
     fn run(&self, request: Request) -> Result<String, String> {
+        let before = self.kernel.cache_len();
         let representation =
             block_on(self.kernel.issue(request, &Capability::root())).map_err(|e| e.to_string())?;
+        let status = if representation.expiry != Expiry::Never {
+            CacheStatus::Uncacheable
+        } else if self.kernel.cache_len() > before {
+            CacheStatus::Miss
+        } else {
+            CacheStatus::Hit
+        };
+        let mut stats = self.cache.get();
+        stats.record(status);
+        self.cache.set(stats);
         String::from_utf8(representation.bytes).map_err(|e| e.to_string())
     }
 }
@@ -600,6 +685,86 @@ mod tests {
             Action::Output(entry) => entry.result,
             _ => panic!("expected Action::Output"),
         }
+    }
+
+    fn entry(action: Action) -> Entry {
+        match action {
+            Action::Output(entry) => entry,
+            _ => panic!("expected Action::Output"),
+        }
+    }
+
+    #[test]
+    fn cache_reports_computed_then_cached() {
+        let engine = builtin_engine();
+        let first = entry(engine.eval("source urn:fn:toUpper hi"));
+        assert_eq!(first.cache.label().as_deref(), Some("computed"));
+        // Same request again: served from the cache without recomputing.
+        let second = entry(engine.eval("source urn:fn:toUpper hi"));
+        assert_eq!(second.cache.label().as_deref(), Some("cached"));
+        // A different input is a fresh computation.
+        let other = entry(engine.eval("source urn:fn:toUpper bye"));
+        assert_eq!(other.cache.label().as_deref(), Some("computed"));
+    }
+
+    #[test]
+    fn cache_reports_an_uncacheable_result() {
+        // No `.cacheable()` → `Expiry::Always` → never cached, recomputes each time.
+        let now = FnEndpoint::new("now", |_inv: &Invocation<'_>| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                b"tick".to_vec(),
+            ))
+        });
+        let space = EndpointSpace::new().bind(Exact::new("urn:fn:now"), now);
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ));
+        assert_eq!(
+            entry(engine.eval("source urn:fn:now"))
+                .cache
+                .label()
+                .as_deref(),
+            Some("uncacheable")
+        );
+        assert_eq!(
+            entry(engine.eval("source urn:fn:now"))
+                .cache
+                .label()
+                .as_deref(),
+            Some("uncacheable")
+        );
+    }
+
+    #[test]
+    fn cache_summarises_a_multi_stage_pipeline() {
+        let engine = list_engine();
+        let first = entry(engine.eval("source urn:fn:toUpper hi | urn:fn:reverseList"));
+        assert_eq!(first.cache.label().as_deref(), Some("2 computed"));
+        let second = entry(engine.eval("source urn:fn:toUpper hi | urn:fn:reverseList"));
+        assert_eq!(second.cache.label().as_deref(), Some("2 cached"));
+    }
+
+    #[test]
+    fn non_resolving_commands_have_no_cache_label() {
+        let engine = builtin_engine();
+        assert_eq!(entry(engine.eval("list")).cache.label(), None);
+        assert_eq!(entry(engine.eval("frobnicate")).cache.label(), None);
+    }
+
+    #[test]
+    fn cache_label_formats_single_and_mixed_outcomes() {
+        let mut stats = CacheStats::default();
+        assert_eq!(stats.label(), None);
+        stats.record(CacheStatus::Hit);
+        assert_eq!(stats.label().as_deref(), Some("cached"));
+        stats.record(CacheStatus::Miss);
+        stats.record(CacheStatus::Uncacheable);
+        assert_eq!(
+            stats.label().as_deref(),
+            Some("1 cached · 1 computed · 1 uncacheable")
+        );
     }
 
     #[test]

@@ -16,13 +16,19 @@ pub fn run_commands(kernel: Kernel, commands: &[String]) -> i32 {
     let mut code = 0;
     for command in commands {
         match engine.eval(command) {
-            Action::Output(entry) => match entry.result {
-                Ok(output) => println!("{output}"),
-                Err(err) => {
-                    eprintln!("error: {err}");
-                    code = 1;
+            Action::Output(entry) => {
+                match &entry.result {
+                    Ok(output) => println!("{output}"),
+                    Err(err) => {
+                        eprintln!("error: {err}");
+                        code = 1;
+                    }
                 }
-            },
+                // Cache outcome goes to stderr so stdout stays clean for pipes.
+                if let Some(label) = entry.cache.label() {
+                    eprintln!("[{label}]");
+                }
+            }
             Action::Help => println!("{HELP}"),
             Action::Quit => break,
             Action::Noop => {}
@@ -51,10 +57,16 @@ pub fn run(kernel: Kernel) {
         match engine.eval(&line) {
             Action::Quit => break,
             Action::Help => println!("{HELP}"),
-            Action::Output(entry) => match entry.result {
-                Ok(out) => println!("{out}"),
-                Err(err) => eprintln!("error: {err}"),
-            },
+            Action::Output(entry) => {
+                match &entry.result {
+                    Ok(out) => println!("{out}"),
+                    Err(err) => eprintln!("error: {err}"),
+                }
+                // Cache outcome goes to stderr so stdout stays clean for pipes.
+                if let Some(label) = entry.cache.label() {
+                    eprintln!("[{label}]");
+                }
+            }
             Action::Noop => {}
         }
     }

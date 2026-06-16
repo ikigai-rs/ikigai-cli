@@ -15,7 +15,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::engine::{Action, Engine, Entry, HELP};
+use crate::engine::{Action, CacheStats, Engine, Entry, HELP};
 
 /// How many transcript lines PgUp/PgDn move.
 const SCROLL_STEP: u16 = 5;
@@ -88,6 +88,7 @@ fn submit(state: &mut State, engine: &Engine) -> bool {
         Action::Help => state.transcript.push(Entry {
             input: line,
             result: Ok(HELP.to_string()),
+            cache: CacheStats::default(),
         }),
         Action::Output(entry) => state.transcript.push(entry),
         Action::Noop => {}
@@ -140,11 +141,16 @@ fn draw(frame: &mut Frame, state: &State) {
     frame.set_cursor_position(Position::new(cursor_x, chunks[2].y + 1));
 }
 
-/// Render the transcript as colored lines: cyan prompt, green output, red errors.
+/// Render the transcript as colored lines: cyan prompt, green output, red errors,
+/// with a dim cache-outcome tag (`cached` / `computed` / …) after the prompt.
 fn transcript_lines(transcript: &[Entry]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for entry in transcript {
-        lines.push(Line::from(format!("ikigai> {}", entry.input).cyan()));
+        let mut prompt = vec![format!("ikigai> {}", entry.input).cyan()];
+        if let Some(label) = entry.cache.label() {
+            prompt.push(format!("  ({label})").dim());
+        }
+        lines.push(Line::from(prompt));
         match &entry.result {
             Ok(out) => lines.extend(out.lines().map(|l| Line::from(l.to_string().green()))),
             Err(err) => lines.push(Line::from(format!("error: {err}").red())),
@@ -176,10 +182,12 @@ mod tests {
         state.transcript.push(Entry {
             input: "source urn:fn:toUpper hi".into(),
             result: Ok("line one\nline two".into()),
+            cache: CacheStats::default(),
         });
         state.transcript.push(Entry {
             input: "source urn:fn:nope".into(),
             result: Err("no endpoint resolved".into()),
+            cache: CacheStats::default(),
         });
         render(80, 5, &state); // transcript taller than the area → scrolled
         render(80, 24, &state);
