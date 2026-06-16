@@ -43,7 +43,8 @@ Commands: `source <iri> [input]` (SOURCE; `input` is routed to the endpoint's
 `help`, `quit`.
 The demo space exercises every input style: `toUpper` / `reverseList` read the
 `in` argument; `wrap` reads a differently-named `text` argument; `echo` reads a
-`{message}` binding captured from the IRI. The routing follows each endpoint's
+`{message}` binding captured from the IRI; `split` turns a comma-list into a
+newline list (a list producer for `..` map). The routing follows each endpoint's
 self-description, so `source urn:demo:wrap hello` → `[hello]` lands the input in
 `text` (not `in`) — and passing a value to `echo` (`source urn:demo:echo/hi x`)
 reports that its parameter belongs in the identifier instead.
@@ -59,16 +60,32 @@ ikigai> source urn:fn:toUpper hi | urn:demo:wrap
 Each stage is just a `source`, so input is routed to each endpoint's declared
 argument — and piping into a binding-only endpoint reports the same helpful error.
 
-**Quoting.** Wrap a word in `"…"` to keep `|` or whitespace literal inside an IRI
-or input, so a pipe can be data rather than a stage separator:
+**Map.** Where `|` pipes a stage's whole output into the next, `..` maps the next
+stage over the output's **newline-separated items**, running it once per item and
+rejoining with newlines. That newline-list is the convention `reverseList` and
+`split` already speak, so `..` threads a list endpoint through a per-item transform:
+
+```
+ikigai> source urn:demo:split "a,b,c" .. urn:fn:toUpper
+A
+B
+C
+```
+
+`|` and `..` compose freely — `split "c,b,a" | urn:fn:reverseList .. urn:demo:wrap`
+reverses the list as one value, then wraps each item: `[a]` / `[b]` / `[c]`.
+
+**Quoting.** Wrap a word in `"…"` to keep `|`, `..`, or whitespace literal inside
+an IRI or input, so a pipe (or a literal `..`) can be data rather than an operator:
 
 ```
 ikigai> source urn:fn:toUpper "a | b"
 A | B
 ```
 
-Inside a quoted span, `\"` is a literal quote and `\\` a literal backslash. This
-tokenizer is the foundation for `..` map and fork/join (still upcoming).
+Inside a quoted span, `\"` is a literal quote and `\\` a literal backslash. (`..`
+is an operator only as a whole, unquoted word, so a dotted IRI like `urn:x/../y`
+needs no quoting.) This tokenizer is the foundation for fork/join (still upcoming).
 In the TUI, **↑/↓** recall input history, **PgUp/PgDn** scroll the transcript,
 **Esc** clears the line, and **Ctrl-C** / **Ctrl-D** exit. The demo space is
 composed in `transport-embedded`; a real host binds its own endpoints there.

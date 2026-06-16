@@ -58,13 +58,45 @@ fn wrap() -> FnEndpoint {
     )
 }
 
+/// `split`: splits the `in` argument on commas (trimming each) into
+/// newline-separated items. It exists so the demo space has a *list producer*
+/// for the `..` map operator to iterate — `source urn:demo:split "a, b, c" ..
+/// urn:fn:toUpper` runs `toUpper` per item and rejoins (`A`/`B`/`C`). The
+/// newline-separated list is the same convention `reverseList` reads.
+fn split_impl(inv: &Invocation<'_>) -> Result<Representation> {
+    let input = inv.inline_str("in")?;
+    let items = input
+        .split(',')
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(Representation::new(
+        ReprType::new("text/plain").with_param("charset", "utf-8"),
+        items.into_bytes(),
+    )
+    .cacheable())
+}
+
+fn split() -> FnEndpoint {
+    FnEndpoint::new("split", split_impl).with_description(
+        Description::new("split")
+            .title("Split")
+            .summary("Splits the `in` argument on commas into newline-separated items.")
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .input(ArgSpec::new("in").summary("comma-separated items"))
+            .output("text/plain;charset=utf-8"),
+    )
+}
+
 /// Build an embedded kernel pre-bound with the demo endpoints and a
 /// self-description renderer (Turtle / plain text / JSON).
 ///
 /// The space deliberately exercises every input style: `toUpper` / `reverseList`
 /// read the `in` argument; `wrap` reads a differently-named `text` argument (so
 /// the contract-driven routing is visible); `echo` reads a `{message}` binding
-/// captured from the IRI.
+/// captured from the IRI; `split` produces a newline list, giving the `..` map
+/// operator something to iterate (`split … .. toUpper`).
 ///
 /// This is the demo space; a real host would compose its own endpoints here.
 pub fn kernel() -> Kernel {
@@ -73,6 +105,7 @@ pub fn kernel() -> Kernel {
         .bind(Exact::new("urn:fn:toUpper"), builtins::to_upper())
         .bind(Exact::new("urn:fn:reverseList"), builtins::reverse_list())
         .bind(Exact::new("urn:demo:wrap"), wrap())
+        .bind(Exact::new("urn:demo:split"), split())
         .bind(echo, builtins::echo());
     Kernel::with_meta_renderer(Arc::new(space), Arc::new(CliRenderer))
 }
@@ -90,5 +123,14 @@ mod tests {
             .with_arg("text", ArgRef::Inline(b"hi".to_vec()));
         let representation = block_on(kernel.issue(request, &Capability::root())).unwrap();
         assert_eq!(representation.bytes, b"[hi]");
+    }
+
+    #[test]
+    fn split_makes_a_newline_list_for_map() {
+        let kernel = kernel();
+        let request = Request::new(Verb::Source, Iri::parse("urn:demo:split").unwrap())
+            .with_arg("in", ArgRef::Inline(b"a, b ,c".to_vec()));
+        let representation = block_on(kernel.issue(request, &Capability::root())).unwrap();
+        assert_eq!(representation.bytes, b"a\nb\nc");
     }
 }
