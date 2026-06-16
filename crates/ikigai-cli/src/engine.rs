@@ -30,6 +30,7 @@ commands:
   source a [input] .. b      map: run `b` per newline-item of `a`'s output, rejoin
   source a | ( b ; c )       fork: fan the input to each branch, join their outputs
   describe <iri> [type]      META a resource; `type` defaults to text/turtle
+  cache <iri> [args]         report whether resolving it would hit the cache (no resolve)
   list                       list the resources bound in the current space
   help                       show this help
   quit                       exit
@@ -165,6 +166,7 @@ impl Engine {
             "quit" | "exit" => Action::Quit,
             "help" | "?" => Action::Help,
             "list" | "ls" => output(self, self.run_list()),
+            "cache" => output(self, self.run_cache(rest)),
             "source" | "src" => output(self, self.run_pipeline(rest)),
             "describe" | "desc" => {
                 let (target, ty) = split_first_word(rest);
@@ -238,17 +240,30 @@ impl Engine {
         Ok(outputs.join("\n"))
     }
 
-    /// `SOURCE` a resource. `args` are the stage's words after the IRI; a word
-    /// `key=value` is a named argument when `key` is a declared argument of the
-    /// target (discovered from its self-description), otherwise it is positional
-    /// text. The positional text — or `incoming`, the value flowing in from a
-    /// connector/fork — is routed to the one declared argument left unnamed.
+    /// `SOURCE` a resource and return its representation as text.
     fn run_source(
         &self,
         target: &str,
         args: &[String],
         incoming: Option<&str>,
     ) -> Result<String, String> {
+        let request = self.source_request(target, args, incoming)?;
+        self.run(request)
+    }
+
+    /// Build the `Source` [`Request`] for a stage without issuing it — shared by
+    /// `source` (which then runs it) and `cache` (which probes it). `args` are
+    /// the stage's words after the IRI; a word `key=value` is a named argument
+    /// when `key` is a declared argument of the target (discovered from its
+    /// self-description), otherwise it is positional text. The positional text —
+    /// or `incoming`, the value flowing in from a connector/fork — is routed to
+    /// the one declared argument left unnamed.
+    fn source_request(
+        &self,
+        target: &str,
+        args: &[String],
+        incoming: Option<&str>,
+    ) -> Result<Request, String> {
         let iri = parse_target(target)?;
 
         // The contract is only needed to recognise named arguments and route the
@@ -332,7 +347,32 @@ impl Engine {
                 }
             }
         }
-        self.run(request)
+        Ok(request)
+    }
+
+    /// Report whether resolving `spec` would be served from the cache, without
+    /// resolving it. `spec` is a single `<iri> [key=value …] [input]` — the same
+    /// surface as one `source` stage, but no pipelines (there's nothing to thread
+    /// through). Read-only except that naming arguments fetches the target's
+    /// contract (a `Meta`), which is itself cacheable.
+    fn run_cache(&self, spec: &str) -> Result<String, String> {
+        let pipeline = parse_spec(spec)?;
+        let words = match pipeline {
+            Pipeline {
+                first: Node::Source(words),
+                rest,
+            } if rest.is_empty() => words,
+            _ => {
+                return Err("`cache` checks a single resource — no `|`, `..`, or `( )`".to_string())
+            }
+        };
+        let (target, args) = words.split_first().ok_or("expected an IRI")?;
+        let request = self.source_request(target, args, None)?;
+        Ok(if self.kernel.is_cached(&request) {
+            "cached".to_string()
+        } else {
+            "not cached".to_string()
+        })
     }
 
     /// List the bindings of the kernel's root space (pattern → endpoint), or an
@@ -705,6 +745,49 @@ mod tests {
         // A different input is a fresh computation.
         let other = entry(engine.eval("source urn:fn:toUpper bye"));
         assert_eq!(other.cache.label().as_deref(), Some("computed"));
+    }
+
+    #[test]
+    fn cache_command_probes_without_resolving() {
+        let engine = builtin_engine();
+        // Not cached — and probing must not resolve/cache the target itself.
+        assert_eq!(
+            output(engine.eval("cache urn:fn:toUpper hi")).unwrap(),
+            "not cached"
+        );
+        assert_eq!(
+            output(engine.eval("cache urn:fn:toUpper hi")).unwrap(),
+            "not cached"
+        );
+        // After resolving, the same request is a hit.
+        output(engine.eval("source urn:fn:toUpper hi")).unwrap();
+        assert_eq!(
+            output(engine.eval("cache urn:fn:toUpper hi")).unwrap(),
+            "cached"
+        );
+        // A different argument identity is still a miss.
+        assert_eq!(
+            output(engine.eval("cache urn:fn:toUpper bye")).unwrap(),
+            "not cached"
+        );
+    }
+
+    #[test]
+    fn cache_command_rejects_a_pipeline() {
+        let err =
+            output(builtin_engine().eval("cache urn:fn:toUpper hi | urn:fn:toUpper")).unwrap_err();
+        assert!(err.contains("single resource"), "got: {err}");
+    }
+
+    #[test]
+    fn cache_command_carries_no_cache_tag() {
+        // The probe is not a resolution, so it reports no cache outcome of its own.
+        assert_eq!(
+            entry(builtin_engine().eval("cache urn:fn:toUpper hi"))
+                .cache
+                .label(),
+            None
+        );
     }
 
     #[test]
