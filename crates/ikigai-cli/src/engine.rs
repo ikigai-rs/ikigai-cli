@@ -21,14 +21,15 @@ commands:
   source <iri> [input]       SOURCE a resource; `input` is routed to its declared argument
   source a [input] | b | c   pipeline: `|` pipes the whole output into the next stage
   source a [input] .. b      map: run `b` per newline-item of `a`'s output, rejoin
+  source a | ( b ; c )       fork: fan the input to each branch, join their outputs
   describe <iri> [type]      META a resource; `type` defaults to text/turtle
   list                       list the resources bound in the current space
   help                       show this help
   quit                       exit
 
 quoting:
-  wrap a word in \"…\" to keep `|`, `..`, or spaces literal inside an IRI or input;
-  \\\" is a literal quote and \\\\ a literal backslash.
+  wrap a word in \"…\" to keep `|`, `..`, `(`, `)`, `;`, or spaces literal inside an
+  IRI or input; \\\" is a literal quote and \\\\ a literal backslash.
 
 try:
   source urn:fn:toUpper resource-oriented computing
@@ -36,6 +37,7 @@ try:
   source urn:fn:toUpper hello | urn:fn:toUpper
   source urn:fn:toUpper \"a | b\"
   source urn:demo:split \"a,b,c\" .. urn:fn:toUpper
+  source urn:demo:split \"a,b,c\" | ( urn:fn:toUpper ; urn:fn:reverseList )
   describe urn:fn:toUpper text/turtle";
 
 /// One evaluated request: the line the user typed and what came back.
@@ -111,44 +113,69 @@ impl Engine {
         }
     }
 
-    /// Run a pipeline: source the first stage, then feed each stage's output
-    /// into the next according to the connector between them — `|` passes the
-    /// whole output as the next stage's input, `..` maps the next stage over the
-    /// output's newline-separated items. The first stage is `<iri> [input]`;
-    /// later stages are bare IRIs (their input is the connector's). A single
-    /// stage is just a plain `source`.
+    /// Parse and run a pipeline. Stages are joined by connectors — `|` passes the
+    /// whole output into the next stage, `..` maps the next stage over the
+    /// output's newline-separated items — and a stage may be a `( a | b ; c )`
+    /// fork that fans the same input to each branch and joins their outputs.
     ///
-    /// The spec is split by [`lex_pipeline`], which honours `"…"` quoting so a
-    /// literal `|` (or whitespace, or `..`) can appear inside an IRI or input.
-    /// Each stage is just a `source`, so routing, the binding-only error, and
-    /// caching all come from [`run_source`](Self::run_source). (Fork/join builds
-    /// on this same tokenizer.)
+    /// The spec is parsed by [`parse_spec`], which honours `"…"` quoting so a
+    /// literal operator can appear inside an IRI or input. Every leaf is just a
+    /// `source`, so routing, the binding-only error, and caching all come from
+    /// [`run_source`](Self::run_source).
     fn run_pipeline(&self, spec: &str) -> Result<String, String> {
-        let mut stages = lex_pipeline(spec)?.into_iter();
-        let first = stages
-            .next()
-            .expect("lex_pipeline yields at least one stage");
-        let (target, input) = stage_target_input(&first.words)?;
-        let mut value = self.run_source(target, &input)?;
-        for stage in stages {
-            let target = piped_stage_target(&stage.words)?;
-            value = match stage.connector {
-                Connector::Pipe => self.run_source(target, &value)?,
-                Connector::Map => self.run_map(target, &value)?,
+        let pipeline = parse_spec(spec)?;
+        self.run_pipeline_node(&pipeline, None)
+    }
+
+    /// Run a parsed pipeline. `incoming` is the value flowing in from an enclosing
+    /// connector or fork — `None` at the top level, where the first stage takes
+    /// its literal input from the command line instead.
+    fn run_pipeline_node(
+        &self,
+        pipeline: &Pipeline,
+        incoming: Option<&str>,
+    ) -> Result<String, String> {
+        let mut value = self.run_node(&pipeline.first, incoming)?;
+        for step in &pipeline.rest {
+            value = match step.connector {
+                Connector::Pipe => self.run_node(&step.node, Some(&value))?,
+                Connector::Map => self.run_map(&step.node, &value)?,
             };
         }
         Ok(value)
     }
 
-    /// Map a stage over the newline-separated items of `value`: run the target
-    /// once per item and rejoin the outputs with newlines. This is the list
-    /// convention used across the kernel (e.g. `reverseList`), so `..` threads a
-    /// list endpoint's output through a per-item transform. An error on any item
-    /// aborts the whole map.
-    fn run_map(&self, target: &str, value: &str) -> Result<String, String> {
+    /// Run one stage. A `Source` is a `source` request; with an `incoming` value
+    /// it must be a bare IRI (the value is its input), without one it takes its
+    /// literal input. A `Fork` fans `incoming` to every branch and joins their
+    /// outputs with newlines (the same list convention `..` reads).
+    fn run_node(&self, node: &Node, incoming: Option<&str>) -> Result<String, String> {
+        match node {
+            Node::Source(words) => match incoming {
+                None => {
+                    let (target, input) = stage_target_input(words)?;
+                    self.run_source(target, &input)
+                }
+                Some(value) => self.run_source(piped_stage_target(words)?, value),
+            },
+            Node::Fork(branches) => {
+                let outputs = branches
+                    .iter()
+                    .map(|branch| self.run_pipeline_node(branch, incoming))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(outputs.join("\n"))
+            }
+        }
+    }
+
+    /// Map a stage over the newline-separated items of `value`: run the node once
+    /// per item (feeding the item in) and rejoin the outputs with newlines. This
+    /// is the list convention used across the kernel (e.g. `reverseList`), so `..`
+    /// threads a list through a per-item transform. An error on any item aborts.
+    fn run_map(&self, node: &Node, value: &str) -> Result<String, String> {
         let outputs = value
             .split('\n')
-            .map(|item| self.run_source(target, item))
+            .map(|item| self.run_node(node, Some(item)))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(outputs.join("\n"))
     }
@@ -264,64 +291,72 @@ enum Connector {
     Map,
 }
 
-/// A pipeline stage: the connector feeding it and its words. The first stage's
-/// connector is [`Connector::Pipe`] by convention (it has no predecessor).
+/// One stage of a pipeline.
 #[derive(Debug, PartialEq, Eq)]
-struct Stage {
-    connector: Connector,
-    words: Vec<String>,
+enum Node {
+    /// A `source` leaf: the first word is the IRI, the rest the literal input.
+    Source(Vec<String>),
+    /// A `( … ; … )` fork: each branch is run on the same input, outputs joined.
+    Fork(Vec<Pipeline>),
 }
 
-/// Split a pipeline spec into stages.
+/// A non-first stage and the connector that feeds it from the previous stage.
+#[derive(Debug, PartialEq, Eq)]
+struct Step {
+    connector: Connector,
+    node: Node,
+}
+
+/// A pipeline: a first stage followed by connector-fed stages. A branch of a
+/// fork is itself a `Pipeline`, so forks nest.
+#[derive(Debug, PartialEq, Eq)]
+struct Pipeline {
+    first: Node,
+    rest: Vec<Step>,
+}
+
+/// A lexical token. `Word` carries already-unquoted text.
+#[derive(Debug, PartialEq, Eq)]
+enum Token {
+    Word(String),
+    Pipe,  // |
+    Map,   // ..  (only as a whole, unquoted word)
+    Open,  // (
+    Close, // )
+    Semi,  // ;
+}
+
+/// Tokenise a pipeline spec.
 ///
-/// Stages are separated by top-level connectors: `|` (pipe) and a standalone
-/// `..` token (map). Within a stage, words are split on whitespace. A `"…"`
-/// span keeps `|`, whitespace, and anything else literal (and is removed from
-/// the resulting word), so an IRI or input can contain them — `"a | b"` is one
-/// word holding a literal pipe. Inside a quote, `\"` is a literal quote and `\\`
-/// a literal backslash; any other `\x` is left as-is.
-///
-/// `..` is a connector only as a whole, unquoted word (`a .. b`); a `..` inside
-/// a word (`urn:x/../y`) or quoted (`".."`) stays literal — unlike `|`, which
-/// splits even mid-word. This keeps the many IRIs and inputs that contain dots
-/// working without quoting.
-///
-/// Always yields at least one stage (possibly with zero words, e.g. an empty
-/// line or a trailing connector), so callers can treat the first stage as
-/// present and report empty stages themselves.
-fn lex_pipeline(spec: &str) -> Result<Vec<Stage>, String> {
-    let mut stages = vec![Stage {
-        connector: Connector::Pipe,
-        words: Vec::new(),
-    }];
+/// `|`, `(`, `)`, and `;` are operators that split even mid-word; `..` is an
+/// operator only as a whole, unquoted word (a `..` inside a word like
+/// `urn:x/../y` stays literal), since dots are common in IRIs while the others
+/// are not. A `"…"` span keeps any of them — and whitespace — literal and is
+/// removed from the resulting word (`"a | b"` is one `Word`); inside it `\"` is
+/// a literal quote and `\\` a literal backslash, any other `\x` left as-is.
+/// Quote a word to use any operator character, or a bare `..`, as literal data.
+fn tokenize(spec: &str) -> Result<Vec<Token>, String> {
+    let mut tokens = Vec::new();
     let mut word = String::new();
     let mut in_word = false; // started a word? distinguishes "" (a quoted empty) from no word
     let mut quoted = false; // did the current word include a quoted span? (then `..` is literal)
     let mut chars = spec.chars().peekable();
 
-    // Finish the current word: a standalone unquoted `..` opens a map stage,
-    // anything else is a word on the current stage.
-    macro_rules! flush_word {
-        () => {{
-            if in_word {
-                if !quoted && word == ".." {
+    // Finish the current word: a standalone unquoted `..` is the map operator,
+    // anything else is a `Word`.
+    let flush =
+        |tokens: &mut Vec<Token>, word: &mut String, in_word: &mut bool, quoted: &mut bool| {
+            if *in_word {
+                if !*quoted && word == ".." {
+                    tokens.push(Token::Map);
                     word.clear();
-                    stages.push(Stage {
-                        connector: Connector::Map,
-                        words: Vec::new(),
-                    });
                 } else {
-                    stages
-                        .last_mut()
-                        .expect("at least one stage")
-                        .words
-                        .push(std::mem::take(&mut word));
+                    tokens.push(Token::Word(std::mem::take(word)));
                 }
-                in_word = false;
-                quoted = false;
+                *in_word = false;
+                *quoted = false;
             }
-        }};
-    }
+        };
 
     while let Some(c) = chars.next() {
         match c {
@@ -344,36 +379,118 @@ fn lex_pipeline(spec: &str) -> Result<Vec<Stage>, String> {
                     }
                 }
             }
-            '|' => {
-                flush_word!();
-                stages.push(Stage {
-                    connector: Connector::Pipe,
-                    words: Vec::new(),
+            '|' | '(' | ')' | ';' => {
+                flush(&mut tokens, &mut word, &mut in_word, &mut quoted);
+                tokens.push(match c {
+                    '|' => Token::Pipe,
+                    '(' => Token::Open,
+                    ')' => Token::Close,
+                    _ => Token::Semi,
                 });
             }
-            c if c.is_whitespace() => flush_word!(),
+            c if c.is_whitespace() => flush(&mut tokens, &mut word, &mut in_word, &mut quoted),
             c => {
                 in_word = true;
                 word.push(c);
             }
         }
     }
-    // Final flush — same rule as the macro, but no state to reset afterwards.
-    if in_word {
-        if !quoted && word == ".." {
-            stages.push(Stage {
-                connector: Connector::Map,
-                words: Vec::new(),
+    flush(&mut tokens, &mut word, &mut in_word, &mut quoted);
+    Ok(tokens)
+}
+
+/// Parse a whole spec into a [`Pipeline`], rejecting trailing `)`/`;` that no
+/// `(` opened.
+fn parse_spec(spec: &str) -> Result<Pipeline, String> {
+    let mut parser = Parser {
+        tokens: tokenize(spec)?,
+        pos: 0,
+    };
+    let pipeline = parser.parse_pipeline()?;
+    match parser.peek() {
+        None => Ok(pipeline),
+        Some(Token::Close) => Err("unmatched `)`".to_string()),
+        Some(Token::Semi) => Err("`;` outside a `( … )` fork".to_string()),
+        Some(_) => Err("trailing input after the pipeline".to_string()),
+    }
+}
+
+/// Recursive-descent parser over a [`tokenize`]d spec.
+///
+/// Grammar: `pipeline := stage ((`|` | `..`) stage)*`, `stage := `(` pipeline
+/// (`;` pipeline)* `)` | word+`. A fork branch is a full pipeline, so forks and
+/// connectors nest.
+struct Parser {
+    tokens: Vec<Token>,
+    pos: usize,
+}
+
+impl Parser {
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.pos)
+    }
+
+    fn parse_pipeline(&mut self) -> Result<Pipeline, String> {
+        let first = self.parse_stage()?;
+        let mut rest = Vec::new();
+        while let Some(connector) = match self.peek() {
+            Some(Token::Pipe) => Some(Connector::Pipe),
+            Some(Token::Map) => Some(Connector::Map),
+            _ => None,
+        } {
+            self.pos += 1;
+            if self.at_stage_boundary() {
+                return Err("empty pipeline stage (a stray connector?)".to_string());
+            }
+            rest.push(Step {
+                connector,
+                node: self.parse_stage()?,
             });
-        } else {
-            stages
-                .last_mut()
-                .expect("at least one stage")
-                .words
-                .push(word);
+        }
+        Ok(Pipeline { first, rest })
+    }
+
+    fn parse_stage(&mut self) -> Result<Node, String> {
+        match self.peek() {
+            Some(Token::Open) => {
+                self.pos += 1;
+                let mut branches = vec![self.parse_pipeline()?];
+                while matches!(self.peek(), Some(Token::Semi)) {
+                    self.pos += 1;
+                    if self.at_stage_boundary() {
+                        return Err("empty fork branch (a stray `;`?)".to_string());
+                    }
+                    branches.push(self.parse_pipeline()?);
+                }
+                match self.peek() {
+                    Some(Token::Close) => {
+                        self.pos += 1;
+                        Ok(Node::Fork(branches))
+                    }
+                    _ => Err("unclosed `(` in a fork".to_string()),
+                }
+            }
+            Some(Token::Word(_)) => {
+                let mut words = Vec::new();
+                while let Some(Token::Word(w)) = self.peek() {
+                    words.push(w.clone());
+                    self.pos += 1;
+                }
+                Ok(Node::Source(words))
+            }
+            Some(Token::Close) => Err("empty fork branch or group `()`".to_string()),
+            _ => Err("expected an IRI".to_string()),
         }
     }
-    Ok(stages)
+
+    /// True when the next token can't begin a stage (end, a connector, or a fork
+    /// delimiter) — used to catch a connector or `;` with nothing after it.
+    fn at_stage_boundary(&self) -> bool {
+        matches!(
+            self.peek(),
+            None | Some(Token::Pipe | Token::Map | Token::Semi | Token::Close)
+        )
+    }
 }
 
 /// The first stage of a pipeline: `<iri> [input]`. The target is the first word;
@@ -523,62 +640,114 @@ mod tests {
         assert!(err.contains("empty pipeline stage"), "got: {err}");
     }
 
-    /// Build an expected [`Stage`] from a connector and word strings.
-    fn stage(connector: Connector, words: &[&str]) -> Stage {
-        Stage {
-            connector,
-            words: words.iter().map(|w| w.to_string()).collect(),
-        }
+    /// Shorthand for an expected `Word` token.
+    fn w(s: &str) -> Token {
+        Token::Word(s.to_string())
     }
 
     #[test]
-    fn lex_pipeline_splits_and_unquotes() {
-        // Two stages; the quoted span holds a literal pipe and collapses to one word.
-        let stages = lex_pipeline("urn:fn:toUpper \"a | b\" | urn:demo:wrap").unwrap();
+    fn tokenize_splits_and_unquotes() {
+        // The quoted span holds a literal pipe and collapses to one word.
         assert_eq!(
-            stages,
+            tokenize("urn:fn:toUpper \"a | b\" | urn:demo:wrap").unwrap(),
             vec![
-                stage(Connector::Pipe, &["urn:fn:toUpper", "a | b"]),
-                stage(Connector::Pipe, &["urn:demo:wrap"]),
+                w("urn:fn:toUpper"),
+                w("a | b"),
+                Token::Pipe,
+                w("urn:demo:wrap"),
             ]
         );
     }
 
     #[test]
-    fn lex_pipeline_processes_escapes() {
-        let stages = lex_pipeline(r#"x "say \"hi\" \\ ok""#).unwrap();
+    fn tokenize_processes_escapes() {
         assert_eq!(
-            stages,
-            vec![stage(Connector::Pipe, &["x", r#"say "hi" \ ok"#])]
+            tokenize(r#"x "say \"hi\" \\ ok""#).unwrap(),
+            vec![w("x"), w(r#"say "hi" \ ok"#)]
         );
     }
 
     #[test]
-    fn lex_pipeline_rejects_an_unterminated_quote() {
-        assert!(lex_pipeline("x \"unclosed").is_err());
+    fn tokenize_rejects_an_unterminated_quote() {
+        assert!(tokenize("x \"unclosed").is_err());
     }
 
     #[test]
-    fn lex_pipeline_recognises_a_standalone_map_connector() {
-        let stages = lex_pipeline("urn:demo:split a | b .. urn:fn:toUpper").unwrap();
+    fn tokenize_recognises_a_standalone_map_operator() {
         assert_eq!(
-            stages,
+            tokenize("urn:demo:split a | b .. urn:fn:toUpper").unwrap(),
             vec![
-                stage(Connector::Pipe, &["urn:demo:split", "a"]),
-                stage(Connector::Pipe, &["b"]),
-                stage(Connector::Map, &["urn:fn:toUpper"]),
+                w("urn:demo:split"),
+                w("a"),
+                Token::Pipe,
+                w("b"),
+                Token::Map,
+                w("urn:fn:toUpper"),
             ]
         );
     }
 
     #[test]
-    fn lex_pipeline_keeps_dotdot_literal_inside_a_word_or_quotes() {
-        // `..` only splits as a whole word; a dotted IRI and a quoted ".." stay literal.
-        let stages = lex_pipeline(r#"urn:x/../y ".." z"#).unwrap();
+    fn tokenize_keeps_dotdot_literal_inside_a_word_or_quotes() {
+        // `..` only tokenises as Map when it's a whole, unquoted word.
         assert_eq!(
-            stages,
-            vec![stage(Connector::Pipe, &["urn:x/../y", "..", "z"])]
+            tokenize(r#"urn:x/../y ".." z"#).unwrap(),
+            vec![w("urn:x/../y"), w(".."), w("z")]
         );
+    }
+
+    #[test]
+    fn tokenize_splits_fork_punctuation_even_without_spaces() {
+        // `(`, `)`, `;` split mid-word like `|`, so spacing inside a fork is optional.
+        assert_eq!(
+            tokenize("(a|b;c)").unwrap(),
+            vec![
+                Token::Open,
+                w("a"),
+                Token::Pipe,
+                w("b"),
+                Token::Semi,
+                w("c"),
+                Token::Close,
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_spec_builds_a_nested_fork() {
+        // `a | ( b ; c .. d )` — a fork whose second branch is itself a map pipeline.
+        let pipeline = parse_spec("a | ( b ; c .. d )").unwrap();
+        assert_eq!(
+            pipeline,
+            Pipeline {
+                first: Node::Source(vec!["a".into()]),
+                rest: vec![Step {
+                    connector: Connector::Pipe,
+                    node: Node::Fork(vec![
+                        Pipeline {
+                            first: Node::Source(vec!["b".into()]),
+                            rest: vec![],
+                        },
+                        Pipeline {
+                            first: Node::Source(vec!["c".into()]),
+                            rest: vec![Step {
+                                connector: Connector::Map,
+                                node: Node::Source(vec!["d".into()]),
+                            }],
+                        },
+                    ]),
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_spec_rejects_malformed_forks() {
+        assert!(parse_spec("( a ; b").unwrap_err().contains("unclosed"));
+        assert!(parse_spec("a )").unwrap_err().contains("unmatched `)`"));
+        assert!(parse_spec("a ; b").unwrap_err().contains("outside"));
+        assert!(parse_spec("( )").unwrap_err().contains("empty"));
+        assert!(parse_spec("( a ; )").unwrap_err().contains("stray `;`"));
     }
 
     /// An engine over the list-y builtins: `reverseList` (newline list in/out)
@@ -623,6 +792,63 @@ mod tests {
     fn map_stage_with_a_literal_input_is_an_error() {
         let err =
             output(list_engine().eval("source urn:fn:toUpper hi .. urn:fn:toUpper x")).unwrap_err();
+        assert!(err.contains("from the pipe"), "got: {err}");
+    }
+
+    #[test]
+    fn fork_fans_the_input_to_each_branch_and_joins() {
+        // `X\nY` reaches both branches: reverseList flips it, toUpper passes it
+        // through; outputs join with a newline.
+        let out = output(
+            list_engine()
+                .eval("source urn:fn:toUpper \"x\ny\" | ( urn:fn:reverseList ; urn:fn:toUpper )"),
+        )
+        .unwrap();
+        assert_eq!(out, "Y\nX\nX\nY");
+    }
+
+    #[test]
+    fn fork_branches_can_be_multi_stage_pipelines() {
+        // First branch is a two-stage pipeline; second is a single stage.
+        let out = output(list_engine().eval(
+            "source urn:fn:reverseList \"x\ny\nz\" | ( urn:fn:toUpper | urn:fn:reverseList ; urn:fn:toUpper )",
+        ))
+        .unwrap();
+        assert_eq!(out, "X\nY\nZ\nZ\nY\nX");
+    }
+
+    #[test]
+    fn fork_at_the_top_level_runs_each_branch_with_its_own_literal() {
+        // No incoming value, so each branch's first stage takes its own literal.
+        let out =
+            output(list_engine().eval("source ( urn:fn:toUpper a ; urn:fn:toUpper b )")).unwrap();
+        assert_eq!(out, "A\nB");
+    }
+
+    #[test]
+    fn map_into_a_fork_fans_each_item() {
+        // reverseList → `b\na`; `..` runs the fork per item, each fanned to both.
+        let out = output(
+            list_engine()
+                .eval("source urn:fn:reverseList \"a\nb\" .. ( urn:fn:toUpper ; urn:fn:toUpper )"),
+        )
+        .unwrap();
+        assert_eq!(out, "B\nB\nA\nA");
+    }
+
+    #[test]
+    fn fork_propagates_a_branch_error() {
+        let out =
+            list_engine().eval("source urn:fn:toUpper \"a\nb\" | ( urn:fn:toUpper ; urn:fn:nope )");
+        assert!(output(out).is_err());
+    }
+
+    #[test]
+    fn piped_fork_branch_with_a_literal_input_is_an_error() {
+        let err = output(
+            list_engine().eval("source urn:fn:toUpper hi | ( urn:fn:toUpper x ; urn:fn:toUpper )"),
+        )
+        .unwrap_err();
         assert!(err.contains("from the pipe"), "got: {err}");
     }
 
