@@ -58,8 +58,17 @@ ikigai> source urn:fn:toUpper hi | urn:demo:wrap
 
 Each stage is just a `source`, so input is routed to each endpoint's declared
 argument — and piping into a binding-only endpoint reports the same helpful error.
-(A literal `|` inside an IRI or input isn't supported yet; that needs a quoting
-parser, which will also bring `..` map and fork/join.)
+
+**Quoting.** Wrap a word in `"…"` to keep `|` or whitespace literal inside an IRI
+or input, so a pipe can be data rather than a stage separator:
+
+```
+ikigai> source urn:fn:toUpper "a | b"
+A | B
+```
+
+Inside a quoted span, `\"` is a literal quote and `\\` a literal backslash. This
+tokenizer is the foundation for `..` map and fork/join (still upcoming).
 In the TUI, **↑/↓** recall input history, **PgUp/PgDn** scroll the transcript,
 **Esc** clears the line, and **Ctrl-C** / **Ctrl-D** exit. The demo space is
 composed in `transport-embedded`; a real host binds its own endpoints there.
