@@ -44,10 +44,33 @@ Commands: `source <iri> [input]` (SOURCE; `input` is routed to the endpoint's
 The demo space exercises every input style: `toUpper` / `reverseList` read the
 `in` argument; `wrap` reads a differently-named `text` argument; `echo` reads a
 `{message}` binding captured from the IRI; `split` turns a comma-list into a
-newline list (a list producer for `..` map). The routing follows each endpoint's
-self-description, so `source urn:demo:wrap hello` → `[hello]` lands the input in
-`text` (not `in`) — and passing a value to `echo` (`source urn:demo:echo/hi x`)
-reports that its parameter belongs in the identifier instead.
+newline list (a list producer for `..` map); `greet` takes two arguments. The
+routing follows each endpoint's self-description, so `source urn:demo:wrap hello`
+→ `[hello]` lands the input in `text` (not `in`) — and passing a value to `echo`
+(`source urn:demo:echo/hi x`) reports that its parameter belongs in the
+identifier instead.
+
+**Named arguments.** An endpoint can declare more than one argument. Name one
+with `key=value`, where `key` is a declared argument of the target; any other
+word is positional and fills the single argument left unnamed (so the one-argument
+case above is just the degenerate form). A piped value fills that unnamed argument
+too, and `..` can pin some arguments while mapping items into the rest:
+
+```
+ikigai> source urn:demo:greet greeting=Hello name=World
+Hello, World
+ikigai> source urn:demo:greet Hello name=World        # positional fills `greeting`
+Hello, World
+ikigai> source urn:demo:split "a,b,c" .. urn:demo:greet greeting=Hi   # items fill `name`
+Hi, a
+Hi, b
+Hi, c
+```
+
+Because the split is contract-driven, an `=` in ordinary input is harmless when
+the key isn't a declared argument (`source urn:fn:toUpper a=b` → `A=B`). If a
+positional value is left over with no unnamed argument to take it — or two
+arguments are unnamed and only one value is given — `source` says so.
 
 **Pipelines.** `source a [input] | b | c` feeds each stage's output into the next
 as its input (the first stage may take a literal input; later stages get the pipe):
