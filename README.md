@@ -75,17 +75,37 @@ C
 `|` and `..` compose freely — `split "c,b,a" | urn:fn:reverseList .. urn:demo:wrap`
 reverses the list as one value, then wraps each item: `[a]` / `[b]` / `[c]`.
 
-**Quoting.** Wrap a word in `"…"` to keep `|`, `..`, or whitespace literal inside
-an IRI or input, so a pipe (or a literal `..`) can be data rather than an operator:
+**Fork/join.** A stage can be a `( a | b ; c )` fork: each `;`-separated branch is
+itself a pipeline, the same input is fanned to all of them, and their outputs are
+joined (newline-concatenated, the same list convention):
 
 ```
-ikigai> source urn:fn:toUpper "a | b"
-A | B
+ikigai> source urn:demo:split "a,b,c" | ( urn:fn:toUpper ; urn:fn:reverseList )
+A
+B
+C
+c
+b
+a
+```
+
+Forks nest and compose with the connectors: a branch can be multi-stage
+(`( urn:fn:reverseList | urn:demo:wrap ; … )`), and `..` can map a whole fork over
+each item. At the top level a fork has no incoming value, so each branch takes its
+own literal input (`source ( urn:fn:toUpper hi ; urn:demo:wrap there )`).
+
+**Quoting.** Wrap a word in `"…"` to keep an operator — `|`, `..`, `(`, `)`, `;` —
+or whitespace literal inside an IRI or input, so it's data rather than structure:
+
+```
+ikigai> source urn:fn:toUpper "a | (b ; c)"
+A | (B ; C)
 ```
 
 Inside a quoted span, `\"` is a literal quote and `\\` a literal backslash. (`..`
 is an operator only as a whole, unquoted word, so a dotted IRI like `urn:x/../y`
-needs no quoting.) This tokenizer is the foundation for fork/join (still upcoming).
+needs no quoting; `|`, `(`, `)`, and `;` split even mid-word, so quote them to use
+them literally.) These three operators are parsed by one recursive-descent parser.
 In the TUI, **↑/↓** recall input history, **PgUp/PgDn** scroll the transcript,
 **Esc** clears the line, and **Ctrl-C** / **Ctrl-D** exit. The demo space is
 composed in `transport-embedded`; a real host binds its own endpoints there.
