@@ -32,8 +32,24 @@ ikigai --connect /tmp/k.sock -c 'source urn:fn:toUpper hi'
 The cache indicator then reflects the *server's* cache, so two clients sharing a
 server see each other's `cached` results. The socket lives in a `0700` per-user
 directory and is `0600`; the server checks each peer's kernel-verified UID and
-refuses other users (no certificates — that's for the future remote transport).
-The response is the resolved representation's bytes. On an interactive terminal
+refuses other users — no certificates, because the OS already authenticates a
+local peer.
+
+Across a **network**, the same `serve` / `--connect` work over QUIC (built with
+`--features quic`), authenticated by **mutually-pinned TLS certificates**:
+
+```bash
+ikigai cert generate                       # writes server/client certs to your config dir
+ikigai serve quic://0.0.0.0:4433           # run a QUIC kernel server
+ikigai --connect quic://host:4433          # attach the REPL over QUIC
+```
+
+A `quic://host:port` target selects QUIC; a plain path stays a Unix socket. Each
+side presents its own self-signed cert and pins the exact peer cert — no CA. On
+the same machine both default to the generated certs; to attach from another
+machine, copy `client.crt`, `client.key`, and `server.crt` there (or point the
+`--server-cert` / `--client-cert` / `--server-key` / `--client-key` flags at
+them). The response is the resolved representation's bytes. On an interactive terminal
 this is a full-screen [`ratatui`](https://ratatui.rs) REPL — a scrollback
 transcript above an input line; when output is piped or `--plain` is passed it
 falls back to a line-oriented REPL (handy for scripting). All drive the same
@@ -226,10 +242,12 @@ endpoints there.
 | crate | feature | targets |
 |-------|---------|---------|
 | `transport-embedded` | `embedded` (default) | native + wasm |
-| `transport-ipc`      | `ipc`  | native only (Unix domain socket) |
-| `transport-quic`     | `quic` | native only (QUIC/HTTP3 + mTLS) |
+| `transport-ipc`      | `ipc` (default) | Unix only (Unix domain socket) |
+| `transport-quic`     | `quic` (opt-in) | native (QUIC + mutually-pinned TLS) |
 
-The WebAssembly build enables only `embedded`; `ipc`/`quic` are gated out by target.
+`quic` is opt-in (it pulls quinn/rustls/tokio); the default build is `embedded` +
+`ipc`. The WebAssembly build enables only `embedded`; `ipc`/`quic` are gated out
+by target.
 
 ## Local development against a core checkout
 Copy `.cargo/config.toml.example` to `.cargo/config.toml` (gitignored) to redirect
