@@ -13,7 +13,6 @@
 use std::io;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ikigai_core::Kernel;
 use ratatui::layout::{Constraint, Layout, Position};
 use ratatui::style::Stylize;
 use ratatui::text::Line;
@@ -28,8 +27,7 @@ use crate::engine::{Action, CacheStats, Engine, Entry, HELP};
 const SCROLL_STEP: u16 = 5;
 
 /// Run the TUI to completion, restoring the terminal on the way out.
-pub fn run(kernel: Kernel, keys: Keybindings) -> io::Result<()> {
-    let engine = Engine::new(kernel);
+pub fn run(engine: Engine, keys: Keybindings) -> io::Result<()> {
     let mut terminal = ratatui::init();
     let result = event_loop(&mut terminal, &engine, keys);
     ratatui::restore();
