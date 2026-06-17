@@ -4,13 +4,20 @@
 
 use std::io::{self, Write};
 
-use ikigai_engine::{Action, Engine, HELP};
+use ikigai_engine::{Action, CacheStats, Engine, HELP};
 
 /// Execute each command non-interactively, then return a process exit code
 /// (`1` if any command errored, else `0`). Output goes to stdout, errors to
 /// stderr — so `ikigai -c '…'` composes in a shell. A `quit` ends the batch.
+///
+/// Across a multi-command batch, the cache outcomes are tallied and a one-line
+/// summary is printed at the end (to stderr) — so `ikigai -c … -c …`, especially
+/// `--connect`'d to a server with a warm cache, shows how much of the batch was
+/// served from cache rather than recomputed.
 pub fn run_commands(engine: Engine, commands: &[String]) -> i32 {
     let mut code = 0;
+    let mut total = CacheStats::default();
+    let mut ran = 0u32;
     for command in commands {
         match engine.eval(command) {
             Action::Output(entry) => {
@@ -25,10 +32,18 @@ pub fn run_commands(engine: Engine, commands: &[String]) -> i32 {
                 if let Some(label) = entry.cache.label() {
                     eprintln!("[{label}]");
                 }
+                total.merge(entry.cache);
+                ran += 1;
             }
             Action::Help => println!("{HELP}"),
             Action::Quit => break,
             Action::Noop => {}
+        }
+    }
+    // Batch caching summary — only when a batch resolved more than one command.
+    if ran > 1 {
+        if let Some(label) = total.label() {
+            eprintln!("— batch: {ran} commands · {label}");
         }
     }
     code

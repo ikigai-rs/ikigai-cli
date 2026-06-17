@@ -145,18 +145,57 @@ fn page() -> FnEndpoint {
     )
 }
 
-/// Build an embedded kernel pre-bound with the demo endpoints and a
-/// self-description renderer (Turtle / plain text / JSON).
+/// `urn:host:info` — reports the host's *nature* (the `nature` label, set by
+/// whoever composes the kernel: `Embedded (Native)`, `Remote (IPC)`, …) and its
+/// runtime, so `source urn:host:info` shows what differs between the embedded,
+/// IPC, and QUIC situations. Deliberately **uncacheable** — a live host fact, not
+/// a pure function — which also demonstrates the `uncacheable` cache outcome.
+fn host_info(nature: &'static str) -> FnEndpoint {
+    FnEndpoint::new("host-info", move |_inv: &Invocation<'_>| {
+        let runtime = if cfg!(target_family = "wasm") {
+            "browser · wasm32".to_string()
+        } else {
+            format!(
+                "native · {}/{}",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            )
+        };
+        let body = format!(
+            "ikigai host\n  nature    {nature}\n  runtime   {runtime}\n  \
+             space     demo (toUpper · reverseList · wrap · split · greet · echo · compose)\n"
+        );
+        Ok(Representation::new(
+            ReprType::new("text/plain").with_param("charset", "utf-8"),
+            body.into_bytes(),
+        ))
+    })
+    .with_description(
+        Description::new("host-info")
+            .title("Host info")
+            .summary("Reports the kernel host's nature (embedded/remote + transport) and runtime.")
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .output("text/plain;charset=utf-8"),
+    )
+}
+
+/// Build the embedded demo kernel (nature `Embedded (Native)`).
+pub fn kernel() -> Kernel {
+    kernel_for("Embedded (Native)")
+}
+
+/// Build the embedded demo kernel with the host nature `urn:host:info` reports —
+/// so a server can label itself `Remote (IPC)` / `Remote (QUIC)` while serving this
+/// same kernel, and a connected client sees how it reached it.
 ///
 /// The space deliberately exercises every input style: `toUpper` / `reverseList`
-/// read the `in` argument; `wrap` reads a differently-named `text` argument (so
-/// the contract-driven routing is visible); `echo` reads a `{message}` binding
-/// captured from the IRI; `split` produces a newline list, giving the `..` map
-/// operator something to iterate (`split … .. toUpper`); `greet` takes two
-/// arguments, exercising `name=value` routing.
-///
-/// This is the demo space; a real host would compose its own endpoints here.
-pub fn kernel() -> Kernel {
+/// read the `in` argument; `wrap` reads a differently-named `text` argument (so the
+/// contract-driven routing is visible); `echo` reads a `{message}` binding captured
+/// from the IRI; `split` produces a newline list, giving the `..` map operator
+/// something to iterate; `greet` takes two arguments, exercising `name=value`
+/// routing. This is the demo space; a real host composes its own endpoints here.
+pub fn kernel_for(nature: &'static str) -> Kernel {
     let echo = UriTemplate::parse("urn:demo:echo/{message}").expect("valid template");
     let space = EndpointSpace::new()
         .bind(Exact::new("urn:fn:toUpper"), builtins::to_upper())
@@ -166,6 +205,7 @@ pub fn kernel() -> Kernel {
         .bind(Exact::new("urn:demo:greet"), greet())
         .bind(Exact::new("urn:fn:compose"), builtins::compose())
         .bind(Exact::new("urn:data:page"), page())
+        .bind(Exact::new("urn:host:info"), host_info(nature))
         .bind(echo, builtins::echo());
     Kernel::with_meta_renderer(Arc::new(space), Arc::new(CliRenderer))
 }

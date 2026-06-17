@@ -273,8 +273,13 @@ fn serve_quic(target: &str, certs: &Certs) -> ! {
         let identity = quic::server_identity(certs)?;
         let trusted = quic::trusted_client_cert(certs)?;
         eprintln!("ikigai: serving on {target}  (Ctrl-C to stop)");
-        ikigai_quic::serve(ikigai_embedded::kernel(), addr, &identity, &trusted)
-            .map_err(|e| e.to_string())
+        ikigai_quic::serve(
+            ikigai_embedded::kernel_for("Remote (QUIC)"),
+            addr,
+            &identity,
+            &trusted,
+        )
+        .map_err(|e| e.to_string())
     })();
     match result {
         Ok(()) => std::process::exit(0),
@@ -312,7 +317,7 @@ fn connect_quic(_target: &str, _certs: &Certs) -> Result<Engine, String> {
 fn serve_ipc(path: Option<String>) -> ! {
     let socket = ipc_socket(path);
     eprintln!("ikigai: serving on {}  (Ctrl-C to stop)", socket.display());
-    match ikigai_ipc::serve(ikigai_embedded::kernel(), &socket) {
+    match ikigai_ipc::serve(ikigai_embedded::kernel_for("Remote (IPC)"), &socket) {
         Ok(()) => std::process::exit(0),
         Err(e) => {
             eprintln!("ikigai: serve error: {e}");
