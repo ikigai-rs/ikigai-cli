@@ -19,11 +19,25 @@ cargo run --bin ikigai -- -c 'source urn:fn:toUpper hello'   # run and exit (one
 several in order (`-c '…' -c '…'`). Output goes to stdout, errors to stderr, and
 the exit code is non-zero if any command failed, so it composes in a shell.
 
-You attach to an in-process kernel and issue one request per line. The response is
-the resolved representation's bytes. On an interactive terminal this is a
-full-screen [`ratatui`](https://ratatui.rs) REPL — a scrollback transcript above
-an input line; when output is piped or `--plain` is passed it falls back to a
-line-oriented REPL (handy for scripting). Both drive the same engine.
+By default you attach to an **in-process** kernel. You can also attach to a kernel
+running in **another process** over IPC — same REPL, same commands:
+
+```bash
+ikigai serve                    # run a kernel server on the default per-user socket
+ikigai --connect                # attach the REPL to it
+ikigai serve /tmp/k.sock        # …or an explicit socket path, on both sides
+ikigai --connect /tmp/k.sock -c 'source urn:fn:toUpper hi'
+```
+
+The cache indicator then reflects the *server's* cache, so two clients sharing a
+server see each other's `cached` results. The socket lives in a `0700` per-user
+directory and is `0600`; the server checks each peer's kernel-verified UID and
+refuses other users (no certificates — that's for the future remote transport).
+The response is the resolved representation's bytes. On an interactive terminal
+this is a full-screen [`ratatui`](https://ratatui.rs) REPL — a scrollback
+transcript above an input line; when output is piped or `--plain` is passed it
+falls back to a line-oriented REPL (handy for scripting). All drive the same
+engine, whether the kernel is in-process or across a socket.
 
 ```
 ikigai> source urn:fn:toUpper resource-oriented computing
