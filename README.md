@@ -212,7 +212,7 @@ endpoints there.
 | crate | feature | targets |
 |-------|---------|---------|
 | `transport-embedded` | `embedded` (default) | native + wasm |
-| `transport-ipc`      | `ipc`  | native only (shared memory) |
+| `transport-ipc`      | `ipc`  | native only (Unix domain socket) |
 | `transport-quic`     | `quic` | native only (QUIC/HTTP3 + mTLS) |
 
 The WebAssembly build enables only `embedded`; `ipc`/`quic` are gated out by target.

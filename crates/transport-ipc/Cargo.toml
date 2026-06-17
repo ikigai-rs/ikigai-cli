@@ -1,6 +1,6 @@
 [package]
 name = "transport-ipc"
-description = "Shared-memory IPC transport to a local kernel server."
+description = "Unix-domain-socket IPC transport to a local kernel server."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,3 +8,6 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+ikigai-core = { workspace = true }
+transport-core = { workspace = true }
+libc = { workspace = true }
