@@ -71,6 +71,18 @@ pub fn read_message<R: Read, T: DeserializeOwned>(reader: &mut R) -> io::Result<
     postcard::from_bytes(&buf).map_err(codec_error)
 }
 
+/// Serialize a message to postcard bytes, with no length prefix — for transports
+/// that frame messages themselves (e.g. one QUIC stream per call).
+pub fn encode<T: Serialize>(message: &T) -> io::Result<Vec<u8>> {
+    postcard::to_allocvec(message).map_err(codec_error)
+}
+
+/// Deserialize a postcard message from a complete, self-framed byte slice (the
+/// counterpart to [`encode`]).
+pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
+    postcard::from_bytes(bytes).map_err(codec_error)
+}
+
 fn codec_error(error: postcard::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
