@@ -148,6 +148,19 @@ ikigai> source urn:fn:toUpper hi | urn:demo:wrap   (1 cached · 1 computed)
 In the full-screen TUI the tag is dimmed after the prompt; in the line REPL it
 goes to stderr (prefixed `[…]`) so piped stdout stays clean.
 
+To ask *without* resolving, `cache <iri> [args]` reports whether the request is
+already in the cache — a read-only probe (it takes the same `<iri> [key=value …]
+[input]` as one `source` stage, but no pipelines):
+
+```
+ikigai> cache urn:fn:toUpper hi
+not cached
+ikigai> source urn:fn:toUpper hi
+HI
+ikigai> cache urn:fn:toUpper hi
+cached
+```
+
 In the TUI, **↑/↓** recall input history, **PgUp/PgDn** scroll the transcript,
 **Esc** clears the line, and **Ctrl-C** / **Ctrl-D** exit. The demo space is
 composed in `transport-embedded`; a real host binds its own endpoints there.
