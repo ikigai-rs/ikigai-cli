@@ -14,8 +14,8 @@ path = "src/main.rs"
 [features]
 default = ["embedded", "ipc"]
 embedded = ["dep:transport-embedded"]
-ipc = ["dep:transport-ipc"] # Unix only; the dep is empty elsewhere
-quic = []                    # native-only, not yet implemented
+ipc = ["dep:transport-ipc"]   # Unix only; the dep is empty elsewhere
+quic = ["dep:transport-quic"] # opt-in; pulls quinn/rustls/tokio
 
 [dependencies]
 ikigai-core = { workspace = true }
@@ -23,6 +23,7 @@ transport-core = { workspace = true }
 serde_json = { workspace = true }
 transport-embedded = { path = "../transport-embedded", optional = true }
 transport-ipc = { path = "../transport-ipc", optional = true }
+transport-quic = { path = "../transport-quic", optional = true }
 
 # The full-screen TUI is native-only (crossterm). The browser frontend (ratzilla)
 # lands in a later slice; on wasm the binary falls back to the line REPL.
