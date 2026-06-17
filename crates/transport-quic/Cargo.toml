@@ -1,6 +1,6 @@
 [package]
 name = "transport-quic"
-description = "QUIC/HTTP3 transport with mTLS to a remote kernel."
+description = "QUIC transport with mutually-pinned TLS to a remote kernel."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,3 +8,12 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+ikigai-core = { workspace = true }
+transport-core = { workspace = true }
+# The `ring` crypto provider everywhere — no cmake/nasm toolchain needed, so it
+# builds portably in CI (unlike the default `aws-lc-rs`).
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rustls-pemfile = "2"
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "io-util", "time", "sync"] }
