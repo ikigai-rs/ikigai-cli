@@ -180,14 +180,18 @@ Kill/copy/cut feed a kill buffer that **Ctrl-Y** yanks back; it also flows
 through the **system clipboard**, so you can cut in the REPL and paste in another
 app (and vice versa). Clipboard access is best-effort via the platform tools
 (`pbcopy`/`pbpaste`, `wl-copy`/`xclip`, `clip`/PowerShell); with none present it
-falls back to an in-process buffer. The active scheme is shown in the title.
+falls back to an in-process buffer. Over SSH (or with no tool installed) copies
+also go out as an **OSC-52** escape sequence, which sets your *local* terminal's
+clipboard rather than the unreachable remote one. The active scheme is shown in
+the title.
 
 **`vi` keybindings** are also available — modal editing with an Insert mode (type
-text; `Esc` → Normal) and a Normal mode: `h`/`l` (or `←`/`→`) and `w`/`b` to move,
-`0`/`$` for line ends, `i`/`a`/`A`/`I` to enter Insert, `x`/`X`/`D`/`C` to delete,
-`p`/`P` to paste, `j`/`k` for history. A fresh line starts in Insert (like
-`set -o vi`); the title shows the current mode. (Counts and operator+motion like
-`dw`/`cw` aren't in this first cut.)
+text; `Esc` → Normal) and a Normal mode: `h`/`l` (or `←`/`→`), `w`/`b`/`e`, and
+`0`/`$` to move; `i`/`a`/`A`/`I` to enter Insert; `x`/`X`/`D`/`C` to delete;
+`p`/`P` to paste; `j`/`k` for history. **Operators** compose with motions —
+`dw`/`db`/`d$`/`dd` delete, `cw`/`cc` change (then Insert; `cw` stops at the word
+end like `ce`), `yw`/`yy` yank — and the title shows the pending operator. A fresh
+line starts in Insert (like `set -o vi`). (Counts like `3w` aren't in yet.)
 
 The scheme is configurable — set `keybindings` from inside the REPL with
 `config keybindings=vi`, or edit `$XDG_CONFIG_HOME/ikigai-cli/config.toml`

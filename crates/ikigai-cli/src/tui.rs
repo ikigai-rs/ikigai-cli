@@ -61,13 +61,17 @@ enum Edit {
     ScrollUp,
     ScrollDown,
     Clear, // empty the line
-    // vi mode switches (no-ops under other schemes).
-    ViInsert,      // enter Insert mode at the cursor (`i`)
-    ViAppend,      // enter Insert mode one char right (`a`)
-    ViInsertHome,  // jump to the start and enter Insert (`I`)
-    ViAppendEnd,   // jump to the end and enter Insert (`A`)
-    ViChangeToEnd, // kill to the end of the line and enter Insert (`C`)
-    ViNormal,      // leave Insert for Normal mode (`Esc`)
+    // vi mode switches and operators (no-ops under other schemes).
+    ViInsert,                // enter Insert mode at the cursor (`i`)
+    ViAppend,                // enter Insert mode one char right (`a`)
+    ViInsertHome,            // jump to the start and enter Insert (`I`)
+    ViAppendEnd,             // jump to the end and enter Insert (`A`)
+    ViChangeToEnd,           // kill to the end of the line and enter Insert (`C`)
+    ViNormal,                // leave Insert for Normal mode (`Esc`)
+    ViWordFwd,               // `w` — move to the start of the next word
+    ViWordEnd,               // `e` — move onto the end of the word
+    ViOperator(ViOp),        // `d`/`c`/`y` — begin operator-pending
+    ViMotionApply(ViMotion), // a motion in operator-pending — apply the operator
     Submit,
     Quit,
     Ignore,
@@ -82,6 +86,40 @@ enum ViMode {
     Insert,
     /// Keys move the cursor and edit; `i`/`a`/`A`/`I`/`C` switch to Insert.
     Normal,
+    /// After `d`/`c`/`y`, waiting for a motion (or the doubled operator) to define
+    /// the range to operate on.
+    Operator(ViOp),
+}
+
+/// A vi operator awaiting a motion.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ViOp {
+    Delete,
+    Change,
+    Yank,
+}
+
+impl ViOp {
+    /// The key that starts this operator — and, pressed again, means "the whole
+    /// line" (`dd` / `cc` / `yy`).
+    fn key(self) -> char {
+        match self {
+            ViOp::Delete => 'd',
+            ViOp::Change => 'c',
+            ViOp::Yank => 'y',
+        }
+    }
+}
+
+/// A motion that, paired with an operator, defines the byte range to act on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ViMotion {
+    WordFwd,   // `w` — to the start of the next word
+    WordBack,  // `b` — to the start of the previous word
+    WordEnd,   // `e` — through the end of the word
+    LineStart, // `0`
+    LineEnd,   // `$`
+    WholeLine, // the doubled operator
 }
 
 /// Mutable UI state: the input buffer and cursor, the transcript, and history.
@@ -159,6 +197,7 @@ fn vi(key: KeyEvent, mode: ViMode) -> Edit {
     match mode {
         ViMode::Insert => vi_insert(key),
         ViMode::Normal => vi_normal(key),
+        ViMode::Operator(op) => vi_pending(key, op),
     }
 }
 
@@ -187,9 +226,9 @@ fn vi_insert(key: KeyEvent) -> Edit {
     }
 }
 
-/// vi Normal mode: motions (`h l w b 0 $`), edits (`x X D C p P`), mode switches
-/// (`i a A I`), and history (`j k`). Counts and operator+motion (`dw`, `cw`) are
-/// deferred — this is the movement-and-basic-edits subset.
+/// vi Normal mode: motions (`h l w b e 0 $`), edits (`x X D C p P`), mode
+/// switches (`i a A I`), operators (`d c y` → operator-pending), and history
+/// (`j k`). Counts (`3w`) are deferred.
 fn vi_normal(key: KeyEvent) -> Edit {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
@@ -201,13 +240,17 @@ fn vi_normal(key: KeyEvent) -> Edit {
         KeyCode::Char('C') => Edit::ViChangeToEnd,
         KeyCode::Char('h') | KeyCode::Left => Edit::Left,
         KeyCode::Char('l') | KeyCode::Right => Edit::Right,
-        KeyCode::Char('w') => Edit::WordRight,
+        KeyCode::Char('w') => Edit::ViWordFwd,
+        KeyCode::Char('e') => Edit::ViWordEnd,
         KeyCode::Char('b') => Edit::WordLeft,
         KeyCode::Char('0') => Edit::Home,
         KeyCode::Char('$') => Edit::End,
         KeyCode::Char('x') | KeyCode::Delete => Edit::DeleteRight,
         KeyCode::Char('X') => Edit::DeleteLeft,
         KeyCode::Char('D') => Edit::KillToEnd,
+        KeyCode::Char('d') => Edit::ViOperator(ViOp::Delete),
+        KeyCode::Char('c') => Edit::ViOperator(ViOp::Change),
+        KeyCode::Char('y') => Edit::ViOperator(ViOp::Yank),
         KeyCode::Char('p') | KeyCode::Char('P') => Edit::Yank,
         KeyCode::Char('j') | KeyCode::Down => Edit::HistoryNext,
         KeyCode::Char('k') | KeyCode::Up => Edit::HistoryPrev,
@@ -216,6 +259,21 @@ fn vi_normal(key: KeyEvent) -> Edit {
         KeyCode::PageDown => Edit::ScrollDown,
         KeyCode::Enter => Edit::Submit,
         _ => Edit::Ignore,
+    }
+}
+
+/// vi operator-pending: after `d`/`c`/`y`, a motion (`w b e 0 $`) or the doubled
+/// operator (`dd`/`cc`/`yy` = the whole line) selects the range. Anything else
+/// cancels back to Normal.
+fn vi_pending(key: KeyEvent, op: ViOp) -> Edit {
+    match key.code {
+        KeyCode::Char(c) if c == op.key() => Edit::ViMotionApply(ViMotion::WholeLine),
+        KeyCode::Char('w') => Edit::ViMotionApply(ViMotion::WordFwd),
+        KeyCode::Char('b') => Edit::ViMotionApply(ViMotion::WordBack),
+        KeyCode::Char('e') => Edit::ViMotionApply(ViMotion::WordEnd),
+        KeyCode::Char('0') => Edit::ViMotionApply(ViMotion::LineStart),
+        KeyCode::Char('$') => Edit::ViMotionApply(ViMotion::LineEnd),
+        _ => Edit::ViNormal, // unknown motion (or Esc) cancels the operator
     }
 }
 
@@ -365,7 +423,78 @@ fn edit(state: &mut State, action: Edit) {
             kill(state, state.cursor, state.input.len());
             state.vi_mode = ViMode::Insert;
         }
+        Edit::ViWordFwd => state.cursor = vi_word_forward(&state.input, state.cursor),
+        Edit::ViWordEnd => state.cursor = vi_word_end(&state.input, state.cursor),
+        Edit::ViOperator(op) => state.vi_mode = ViMode::Operator(op),
+        Edit::ViMotionApply(motion) => {
+            if let ViMode::Operator(op) = state.vi_mode {
+                let (lo, hi) = vi_range(&state.input, state.cursor, op, motion);
+                match op {
+                    ViOp::Delete => {
+                        kill(state, lo, hi);
+                        state.vi_mode = ViMode::Normal;
+                    }
+                    ViOp::Change => {
+                        kill(state, lo, hi);
+                        state.vi_mode = ViMode::Insert;
+                    }
+                    ViOp::Yank => {
+                        state.kill = state.input[lo..hi].to_string();
+                        state.cursor = lo;
+                        state.mark = None;
+                        state.vi_mode = ViMode::Normal;
+                    }
+                }
+            }
+        }
         Edit::Submit | Edit::Quit | Edit::Ignore => {}
+    }
+}
+
+/// The byte range a vi operator acts on, given the cursor and a motion. Forward
+/// motions span `cursor..target`, backward motions `target..cursor`. `cw` is the
+/// famous special case — it acts like `ce` (to the end of the word, not the start
+/// of the next), so it doesn't swallow the trailing space.
+fn vi_range(input: &str, cursor: usize, op: ViOp, motion: ViMotion) -> (usize, usize) {
+    match motion {
+        ViMotion::WordFwd if matches!(op, ViOp::Change) => (cursor, word_right(input, cursor)),
+        ViMotion::WordFwd => (cursor, vi_word_forward(input, cursor)),
+        ViMotion::WordEnd => (cursor, word_right(input, cursor)),
+        ViMotion::LineEnd => (cursor, input.len()),
+        ViMotion::WordBack => (word_left(input, cursor), cursor),
+        ViMotion::LineStart => (0, cursor),
+        ViMotion::WholeLine => (0, input.len()),
+    }
+}
+
+/// vi `w`: the start of the next word — skip the current word, then the run of
+/// whitespace after it.
+fn vi_word_forward(s: &str, cursor: usize) -> usize {
+    let next = |i: usize| s[i..].chars().next().map(|c| (i + c.len_utf8(), c));
+    let mut i = cursor;
+    while let Some((n, c)) = next(i) {
+        if c.is_whitespace() {
+            break;
+        }
+        i = n;
+    }
+    while let Some((n, c)) = next(i) {
+        if c.is_whitespace() {
+            i = n;
+        } else {
+            break;
+        }
+    }
+    i
+}
+
+/// vi `e`: onto the last character of the word ahead of the cursor.
+fn vi_word_end(s: &str, cursor: usize) -> usize {
+    let end = word_right(s, cursor);
+    if end > cursor {
+        prev_boundary(s, end)
+    } else {
+        cursor
     }
 }
 
@@ -521,8 +650,10 @@ fn mode_label(state: &State) -> String {
         Keybindings::Native => "native keys".to_string(),
         Keybindings::Vi => {
             let mode = match state.vi_mode {
-                ViMode::Insert => "insert",
-                ViMode::Normal => "normal",
+                ViMode::Insert => "insert".to_string(),
+                ViMode::Normal => "normal".to_string(),
+                // Operator-pending — show the operator key waiting for a motion.
+                ViMode::Operator(op) => format!("normal {}", op.key()),
             };
             format!("vi · {mode}")
         }
@@ -758,7 +889,8 @@ mod tests {
         use ViMode::Normal;
         assert_eq!(vi(vi_key('h'), Normal), Edit::Left);
         assert_eq!(vi(vi_key('l'), Normal), Edit::Right);
-        assert_eq!(vi(vi_key('w'), Normal), Edit::WordRight);
+        assert_eq!(vi(vi_key('w'), Normal), Edit::ViWordFwd);
+        assert_eq!(vi(vi_key('e'), Normal), Edit::ViWordEnd);
         assert_eq!(vi(vi_key('b'), Normal), Edit::WordLeft);
         assert_eq!(vi(vi_key('0'), Normal), Edit::Home);
         assert_eq!(vi(vi_key('$'), Normal), Edit::End);
@@ -843,6 +975,109 @@ mod tests {
         assert_eq!(decode(vi_key('x'), &s), Edit::DeleteRight);
         s.vi_mode = ViMode::Insert;
         assert_eq!(decode(vi_key('x'), &s), Edit::Insert('x'));
+    }
+
+    /// Drive a sequence of (unmodified) character keys through the real vi
+    /// decode→edit path, starting in Normal mode.
+    fn vi_keys(input: &str, cursor: usize, chars: &str) -> State {
+        let mut s = state_with(input, cursor);
+        s.keys = Keybindings::Vi;
+        s.vi_mode = ViMode::Normal;
+        for ch in chars.chars() {
+            let action = decode(vi_key(ch), &s);
+            edit(&mut s, action);
+        }
+        s
+    }
+
+    #[test]
+    fn vi_operator_pending_decodes_motions() {
+        let pending = State {
+            keys: Keybindings::Vi,
+            vi_mode: ViMode::Operator(ViOp::Delete),
+            ..State::default()
+        };
+        assert_eq!(
+            decode(vi_key('d'), &state_normal()),
+            Edit::ViOperator(ViOp::Delete)
+        );
+        assert_eq!(
+            decode(vi_key('w'), &pending),
+            Edit::ViMotionApply(ViMotion::WordFwd)
+        );
+        // The doubled operator means the whole line.
+        assert_eq!(
+            decode(vi_key('d'), &pending),
+            Edit::ViMotionApply(ViMotion::WholeLine)
+        );
+        // An unknown motion cancels back to Normal.
+        assert_eq!(decode(vi_key('z'), &pending), Edit::ViNormal);
+    }
+
+    fn state_normal() -> State {
+        State {
+            keys: Keybindings::Vi,
+            vi_mode: ViMode::Normal,
+            ..State::default()
+        }
+    }
+
+    #[test]
+    fn vi_delete_operator_spans_the_motion() {
+        // dw deletes the word and its trailing space; db deletes back a word.
+        let s = vi_keys("foo bar", 0, "dw");
+        assert_eq!(
+            (s.input.as_str(), s.cursor, s.kill.as_str()),
+            ("bar", 0, "foo ")
+        );
+        let s = vi_keys("foo bar", 7, "db");
+        assert_eq!((s.input.as_str(), s.kill.as_str()), ("foo ", "bar"));
+        // d$ to end of line; dd the whole line.
+        let s = vi_keys("hello world", 6, "d$");
+        assert_eq!((s.input.as_str(), s.kill.as_str()), ("hello ", "world"));
+        let s = vi_keys("hello", 2, "dd");
+        assert_eq!((s.input.as_str(), s.kill.as_str()), ("", "hello"));
+    }
+
+    #[test]
+    fn vi_change_word_acts_like_change_to_end() {
+        // The classic quirk: `cw` stops at the word end (like `ce`), not the start
+        // of the next word, so it leaves the trailing space — and enters Insert.
+        let s = vi_keys("foo bar", 0, "cw");
+        assert_eq!(
+            (s.input.as_str(), s.kill.as_str(), s.vi_mode),
+            (" bar", "foo", ViMode::Insert)
+        );
+    }
+
+    #[test]
+    fn vi_yank_copies_without_deleting() {
+        let s = vi_keys("foo bar", 0, "yw");
+        assert_eq!(s.input, "foo bar"); // unchanged
+        assert_eq!(s.kill, "foo ");
+        assert_eq!(s.vi_mode, ViMode::Normal);
+    }
+
+    #[test]
+    fn vi_operator_then_escape_cancels() {
+        let mut s = state_with("hello", 2);
+        s.keys = Keybindings::Vi;
+        s.vi_mode = ViMode::Normal;
+        let enter = decode(vi_key('d'), &s); // enter operator-pending
+        edit(&mut s, enter);
+        assert_eq!(s.vi_mode, ViMode::Operator(ViOp::Delete));
+        let escape = decode(key(KeyCode::Esc, KeyModifiers::NONE), &s);
+        edit(&mut s, escape);
+        assert_eq!((s.input.as_str(), s.vi_mode), ("hello", ViMode::Normal));
+    }
+
+    #[test]
+    fn vi_word_motions_move_by_word() {
+        // `w` lands on the start of the next word; `e` on the end of the word.
+        let s = vi_keys("foo bar", 0, "w");
+        assert_eq!(s.cursor, 4);
+        let s = vi_keys("foo bar", 0, "e");
+        assert_eq!(s.cursor, 2); // last char of "foo"
     }
 
     #[test]
