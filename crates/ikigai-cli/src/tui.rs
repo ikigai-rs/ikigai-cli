@@ -48,9 +48,12 @@ enum Edit {
     WordRight,
     Home,
     End,
-    KillToEnd,    // delete from the cursor to the end of the line
-    KillToStart,  // delete from the start of the line to the cursor
-    KillWordLeft, // delete the word before the cursor
+    KillToEnd,   // cut from the cursor to the end of the line into the kill buffer
+    KillToStart, // cut from the start of the line to the cursor into the kill buffer
+    SetMark,     // mark the cursor as one end of a region
+    Copy,        // copy the region (mark…cursor) into the kill buffer
+    Cut,         // cut the region into the kill buffer, or the previous word if no mark
+    Yank,        // insert (paste) the kill buffer at the cursor
     HistoryPrev,
     HistoryNext,
     ScrollUp,
@@ -67,6 +70,12 @@ struct State {
     input: String,
     /// Byte offset of the cursor within `input`, always on a `char` boundary.
     cursor: usize,
+    /// The most recent killed/copied text — yanked back by `Ctrl-Y`. Persists
+    /// across lines, so you can cut on one line and paste on another.
+    kill: String,
+    /// The mark (a byte offset) set by `Ctrl-Space`; with the cursor it bounds
+    /// the region that copy/cut act on. Cleared by any edit to the text.
+    mark: Option<usize>,
     keys: Keybindings,
     transcript: Vec<Entry>,
     history: Vec<String>,
@@ -74,6 +83,16 @@ struct State {
     history_pos: Option<usize>,
     /// Lines scrolled up from the bottom; `0` = pinned to the latest output.
     scroll_back: u16,
+}
+
+impl State {
+    /// The active region as sorted byte offsets `(lo, hi)`, or `None` when no
+    /// mark is set. The mark is clamped to the current length, defending against
+    /// a stale offset even though edits clear it.
+    fn region(&self) -> Option<(usize, usize)> {
+        let mark = self.mark?.min(self.input.len());
+        Some((mark.min(self.cursor), mark.max(self.cursor)))
+    }
 }
 
 fn event_loop(
@@ -136,7 +155,14 @@ fn emacs(key: KeyEvent, input_empty: bool) -> Edit {
         KeyCode::Char('n') if ctrl => Edit::HistoryNext,
         KeyCode::Char('k') if ctrl => Edit::KillToEnd,
         KeyCode::Char('u') if ctrl => Edit::KillToStart,
-        KeyCode::Char('w') if ctrl => Edit::KillWordLeft,
+        KeyCode::Char('w') if ctrl => Edit::Cut,
+        KeyCode::Char('w') if alt => Edit::Copy,
+        KeyCode::Char('y') if ctrl => Edit::Yank,
+        // Set the mark. Terminals report Ctrl-Space inconsistently — as Ctrl-`@`,
+        // a control space, or NUL — so accept all three.
+        KeyCode::Char('@') if ctrl => Edit::SetMark,
+        KeyCode::Char(' ') if ctrl => Edit::SetMark,
+        KeyCode::Null => Edit::SetMark,
         KeyCode::Char(c) if !ctrl && !alt => Edit::Insert(c),
         KeyCode::Backspace => Edit::DeleteLeft,
         KeyCode::Delete => Edit::DeleteRight,
@@ -158,10 +184,13 @@ fn emacs(key: KeyEvent, input_empty: bool) -> Edit {
 /// caller (control flow); everything else mutates the buffer, cursor, history
 /// browsing, or scrollback here.
 fn edit(state: &mut State, action: Edit) {
+    // Any edit to the text invalidates the mark (its byte offset would shift);
+    // movement and the mark/copy/cut commands manage it themselves.
     match action {
         Edit::Insert(c) => {
             state.input.insert(state.cursor, c);
             state.cursor += c.len_utf8();
+            state.mark = None;
         }
         Edit::DeleteLeft => {
             if state.cursor > 0 {
@@ -169,10 +198,12 @@ fn edit(state: &mut State, action: Edit) {
                 state.input.replace_range(from..state.cursor, "");
                 state.cursor = from;
             }
+            state.mark = None;
         }
         Edit::DeleteRight => {
             let to = next_boundary(&state.input, state.cursor);
             state.input.replace_range(state.cursor..to, "");
+            state.mark = None;
         }
         Edit::Left => state.cursor = prev_boundary(&state.input, state.cursor),
         Edit::Right => state.cursor = next_boundary(&state.input, state.cursor),
@@ -180,15 +211,25 @@ fn edit(state: &mut State, action: Edit) {
         Edit::WordRight => state.cursor = word_right(&state.input, state.cursor),
         Edit::Home => state.cursor = 0,
         Edit::End => state.cursor = state.input.len(),
-        Edit::KillToEnd => state.input.truncate(state.cursor),
-        Edit::KillToStart => {
-            state.input.replace_range(0..state.cursor, "");
-            state.cursor = 0;
+        Edit::KillToEnd => kill(state, state.cursor, state.input.len()),
+        Edit::KillToStart => kill(state, 0, state.cursor),
+        Edit::SetMark => state.mark = Some(state.cursor),
+        Edit::Copy => {
+            if let Some((lo, hi)) = state.region() {
+                state.kill = state.input[lo..hi].to_string();
+            }
+            state.mark = None;
         }
-        Edit::KillWordLeft => {
-            let from = word_left(&state.input, state.cursor);
-            state.input.replace_range(from..state.cursor, "");
-            state.cursor = from;
+        Edit::Cut => match state.region() {
+            Some((lo, hi)) => kill(state, lo, hi),
+            // No region: cut the previous word (readline `Ctrl-W`).
+            None => kill(state, word_left(&state.input, state.cursor), state.cursor),
+        },
+        Edit::Yank => {
+            let yanked = state.kill.clone();
+            state.input.insert_str(state.cursor, &yanked);
+            state.cursor += yanked.len();
+            state.mark = None;
         }
         Edit::HistoryPrev => recall(state, -1),
         Edit::HistoryNext => recall(state, 1),
@@ -197,9 +238,19 @@ fn edit(state: &mut State, action: Edit) {
         Edit::Clear => {
             state.input.clear();
             state.cursor = 0;
+            state.mark = None;
         }
         Edit::Submit | Edit::Quit | Edit::Ignore => {}
     }
+}
+
+/// Move the byte range `lo..hi` of `input` into the kill buffer, leaving the
+/// cursor at `lo`. The range must be on `char` boundaries.
+fn kill(state: &mut State, lo: usize, hi: usize) {
+    state.kill = state.input[lo..hi].to_string();
+    state.input.replace_range(lo..hi, "");
+    state.cursor = lo;
+    state.mark = None;
 }
 
 /// Byte offset of the `char` boundary just left of `cursor` (the cursor itself
@@ -298,6 +349,7 @@ fn recall(state: &mut State, dir: i32) {
     state.history_pos = next;
     state.input = next.map(|p| state.history[p].clone()).unwrap_or_default();
     state.cursor = state.input.len(); // land at the end of the recalled line
+    state.mark = None; // the recalled text is a new buffer; any old mark is stale
 }
 
 fn draw(frame: &mut Frame, state: &State) {
@@ -431,18 +483,67 @@ mod tests {
     }
 
     #[test]
-    fn kills_to_end_start_and_word() {
+    fn kills_to_end_start_and_word_into_the_buffer() {
         let mut s = state_with("foo bar baz", 8);
         edit(&mut s, Edit::KillToEnd);
         assert_eq!(s.input, "foo bar ");
+        assert_eq!(s.kill, "baz"); // killed text is yankable
 
         let mut s = state_with("foo bar", 4);
         edit(&mut s, Edit::KillToStart);
-        assert_eq!((s.input.as_str(), s.cursor), ("bar", 0));
+        assert_eq!(
+            (s.input.as_str(), s.cursor, s.kill.as_str()),
+            ("bar", 0, "foo ")
+        );
 
+        // `Cut` with no mark falls back to killing the previous word.
         let mut s = state_with("foo bar", 7);
-        edit(&mut s, Edit::KillWordLeft);
-        assert_eq!((s.input.as_str(), s.cursor), ("foo ", 4));
+        edit(&mut s, Edit::Cut);
+        assert_eq!(
+            (s.input.as_str(), s.cursor, s.kill.as_str()),
+            ("foo ", 4, "bar")
+        );
+    }
+
+    #[test]
+    fn yank_pastes_the_kill_buffer_at_the_cursor() {
+        let mut s = state_with("foo bar", 7);
+        edit(&mut s, Edit::Cut); // kill "bar"
+        edit(&mut s, Edit::Home);
+        edit(&mut s, Edit::Yank); // paste at the start
+        assert_eq!((s.input.as_str(), s.cursor), ("barfoo ", 3));
+    }
+
+    #[test]
+    fn copy_takes_the_region_without_deleting() {
+        let mut s = state_with("hello world", 0);
+        edit(&mut s, Edit::SetMark); // mark at 0
+        edit(&mut s, Edit::WordRight); // cursor to 5 ("hello")
+        edit(&mut s, Edit::Copy);
+        assert_eq!(s.input, "hello world"); // unchanged
+        assert_eq!(s.kill, "hello");
+        assert_eq!(s.mark, None); // region consumed
+    }
+
+    #[test]
+    fn cut_removes_the_region_when_a_mark_is_set() {
+        let mut s = state_with("hello world", 11);
+        edit(&mut s, Edit::SetMark); // mark at end
+        edit(&mut s, Edit::WordLeft); // cursor to 6 (start of "world")
+        edit(&mut s, Edit::Cut);
+        assert_eq!(
+            (s.input.as_str(), s.cursor, s.kill.as_str()),
+            ("hello ", 6, "world")
+        );
+    }
+
+    #[test]
+    fn editing_text_clears_the_mark() {
+        let mut s = state_with("abc", 0);
+        edit(&mut s, Edit::SetMark);
+        edit(&mut s, Edit::Insert('x'));
+        assert_eq!(s.mark, None);
+        assert!(s.region().is_none());
     }
 
     #[test]
@@ -484,6 +585,23 @@ mod tests {
         assert_eq!(
             emacs(key(KeyCode::Char('x'), KeyModifiers::NONE), false),
             Edit::Insert('x')
+        );
+    }
+
+    #[test]
+    fn emacs_maps_the_kill_ring() {
+        let c = KeyModifiers::CONTROL;
+        let a = KeyModifiers::ALT;
+        assert_eq!(emacs(key(KeyCode::Char('y'), c), false), Edit::Yank);
+        assert_eq!(emacs(key(KeyCode::Char('w'), c), false), Edit::Cut);
+        assert_eq!(emacs(key(KeyCode::Char('w'), a), false), Edit::Copy);
+        assert_eq!(emacs(key(KeyCode::Char('k'), c), false), Edit::KillToEnd);
+        // Ctrl-Space arrives variously across terminals; all set the mark.
+        assert_eq!(emacs(key(KeyCode::Char(' '), c), false), Edit::SetMark);
+        assert_eq!(emacs(key(KeyCode::Char('@'), c), false), Edit::SetMark);
+        assert_eq!(
+            emacs(key(KeyCode::Null, KeyModifiers::NONE), false),
+            Edit::SetMark
         );
     }
 
