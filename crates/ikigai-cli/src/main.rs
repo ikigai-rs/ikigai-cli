@@ -11,6 +11,8 @@
 //! piped or with `--plain` it falls back to the line-oriented [`repl`]. All three
 //! drive the same renderer-agnostic [`engine`].
 
+#[cfg(not(target_family = "wasm"))]
+mod clipboard;
 mod config;
 mod engine;
 mod repl;
