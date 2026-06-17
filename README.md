@@ -176,22 +176,31 @@ In the TUI the input line is a real editor with **Emacs / readline keybindings**
 | `Ctrl-D` | delete forward, or exit on an empty line |
 | `PgUp` / `PgDn` · `Esc` · `Ctrl-C` | scroll · clear line · exit |
 
-Kill/copy/cut feed a kill buffer that **Ctrl-Y** yanks back; it persists across
-lines, so you can cut on one and paste on another. The active scheme is shown in
-the title.
+Kill/copy/cut feed a kill buffer that **Ctrl-Y** yanks back; it also flows
+through the **system clipboard**, so you can cut in the REPL and paste in another
+app (and vice versa). Clipboard access is best-effort via the platform tools
+(`pbcopy`/`pbpaste`, `wl-copy`/`xclip`, `clip`/PowerShell); with none present it
+falls back to an in-process buffer. The active scheme is shown in the title.
+
+**`vi` keybindings** are also available — modal editing with an Insert mode (type
+text; `Esc` → Normal) and a Normal mode: `h`/`l` (or `←`/`→`) and `w`/`b` to move,
+`0`/`$` for line ends, `i`/`a`/`A`/`I` to enter Insert, `x`/`X`/`D`/`C` to delete,
+`p`/`P` to paste, `j`/`k` for history. A fresh line starts in Insert (like
+`set -o vi`); the title shows the current mode. (Counts and operator+motion like
+`dw`/`cw` aren't in this first cut.)
 
 The scheme is configurable — set `keybindings` from inside the REPL with
-`config keybindings=emacs`, or edit
-`$XDG_CONFIG_HOME/ikigai-cli/config.toml` (falling back to
-`~/.config/ikigai-cli/config.toml`):
+`config keybindings=vi`, or edit `$XDG_CONFIG_HOME/ikigai-cli/config.toml`
+(falling back to `~/.config/ikigai-cli/config.toml`):
 
 ```toml
-keybindings = "emacs"   # the default, and for now the only implemented scheme
+keybindings = "emacs"   # "emacs" (default) · "vi" · "native"
 ```
 
 `config` with no argument shows the file path and current settings; `config
-key=value` validates and saves a property. `vi` (and other schemes) are
-recognised but not implemented yet — they fall back to `emacs` with a notice. The
+key=value` validates and saves a property. `native` resolves to the platform's
+terminal default, which is Emacs on every supported OS — a terminal can't capture
+OS GUI shortcuts (⌘C etc.), so terminal-native editing *is* readline/Emacs. The
 demo space is composed in `transport-embedded`; a real host binds its own
 endpoints there.
 

@@ -8,23 +8,30 @@
 use std::path::PathBuf;
 
 /// Which keybinding scheme the TUI input line uses.
-///
-/// Only [`Emacs`](Keybindings::Emacs) is implemented for now; other values
-/// (`vi`, …) are recognised in the config but fall back to Emacs with a notice,
-/// so the scheme can grow without changing the config surface.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub enum Keybindings {
     /// Readline / Emacs-style editing: `Ctrl-A`/`Ctrl-E`, `Ctrl-F`/`Ctrl-B`,
     /// `Ctrl-P`/`Ctrl-N`, `Alt-F`/`Alt-B`, `Ctrl-K`/`Ctrl-U`/`Ctrl-W`. The default.
     #[default]
     Emacs,
+    /// Modal `vi`-style editing: a Normal mode for movement/edits and an Insert
+    /// mode for typing, switched with `Esc` / `i`.
+    Vi,
+    /// The platform's conventional terminal editing. A terminal can't capture OS
+    /// GUI shortcuts (the emulator intercepts them), so terminal-native editing
+    /// is readline/Emacs on every supported platform — `Native` is shown as such
+    /// but behaves as [`Emacs`](Keybindings::Emacs), leaving room to specialise
+    /// per-OS later.
+    Native,
 }
 
 impl Keybindings {
-    /// Parse a config value into a scheme, or `None` if it isn't one we implement.
+    /// Parse a config value into a scheme, or `None` if it isn't one we recognise.
     fn parse(value: &str) -> Option<Keybindings> {
         match value.to_ascii_lowercase().as_str() {
             "emacs" => Some(Keybindings::Emacs),
+            "vi" => Some(Keybindings::Vi),
+            "native" => Some(Keybindings::Native),
             _ => None,
         }
     }
@@ -149,8 +156,13 @@ mod tests {
     fn parses_known_schemes_only() {
         assert_eq!(Keybindings::parse("emacs"), Some(Keybindings::Emacs));
         assert_eq!(Keybindings::parse("EMACS"), Some(Keybindings::Emacs));
-        assert_eq!(Keybindings::parse("vi"), None);
+        assert_eq!(Keybindings::parse("vi"), Some(Keybindings::Vi));
+        assert_eq!(Keybindings::parse("native"), Some(Keybindings::Native));
         assert_eq!(Keybindings::parse("dvorak"), None);
+        // Recognised schemes are all reported as supported.
+        assert!(["emacs", "vi", "native"]
+            .iter()
+            .all(|s| keybindings_supported(s)));
     }
 
     #[test]
