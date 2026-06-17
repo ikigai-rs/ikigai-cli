@@ -21,6 +21,8 @@ use ikigai_core::{
     ArgRef, Capability, Description, Expiry, InputSource, Iri, Kernel, Request, Verb,
 };
 
+use crate::config;
+
 /// Help text shown by the `help` command (and the TUI's hint line links to it).
 pub const HELP: &str = "\
 commands:
@@ -31,6 +33,7 @@ commands:
   source a | ( b ; c )       fork: fan the input to each branch, join their outputs
   describe <iri> [type]      META a resource; `type` defaults to text/turtle
   cache <iri> [args]         report whether resolving it would hit the cache (no resolve)
+  config [key=value]         show settings, or save one (e.g. config keybindings=emacs)
   list                       list the resources bound in the current space
   help                       show this help
   quit                       exit
@@ -166,6 +169,7 @@ impl Engine {
             "quit" | "exit" => Action::Quit,
             "help" | "?" => Action::Help,
             "list" | "ls" => output(self, self.run_list()),
+            "config" => output(self, run_config(rest)),
             "cache" => output(self, self.run_cache(rest)),
             "source" | "src" => output(self, self.run_pipeline(rest)),
             "describe" | "desc" => {
@@ -440,6 +444,54 @@ impl Engine {
         self.cache.set(stats);
         String::from_utf8(representation.bytes).map_err(|e| e.to_string())
     }
+}
+
+/// `config` command: with no argument, show the config file and current
+/// properties; with `<key>=<value>`, validate and persist the property.
+fn run_config(rest: &str) -> Result<String, String> {
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return Ok(config_summary());
+    }
+    let (key, value) = parse_config_assignment(rest)?;
+    let path = config::set(key, &value).map_err(|e| format!("could not save config: {e}"))?;
+    let mut message = format!("{key} = {value}  (saved to {})", path.display());
+    if key == "keybindings" && !config::keybindings_supported(&value) {
+        message.push_str(&format!(
+            "\nnote: `{value}` keybindings aren't implemented yet — emacs is used until they are"
+        ));
+    }
+    Ok(message)
+}
+
+/// Show the config file path and the current value of each known property.
+fn config_summary() -> String {
+    let location = config::path().map_or_else(
+        || "(no config directory — set $XDG_CONFIG_HOME or $HOME)".to_string(),
+        |path| path.display().to_string(),
+    );
+    let keybindings = config::get("keybindings").unwrap_or_else(|| "emacs (default)".to_string());
+    format!("config file: {location}\nkeybindings = {keybindings}")
+}
+
+/// Parse and validate a `config` assignment into a canonical `(property, value)`.
+/// Pure — the write happens in [`run_config`]. `keybinds` is accepted as an alias
+/// for `keybindings`.
+fn parse_config_assignment(rest: &str) -> Result<(&'static str, String), String> {
+    let (key, value) = rest.split_once('=').ok_or_else(|| {
+        "usage: `config <key>=<value>` (e.g. `config keybindings=emacs`), or `config` to show \
+         current settings"
+            .to_string()
+    })?;
+    let key = match key.trim() {
+        "keybindings" | "keybinds" => "keybindings",
+        other => return Err(format!("unknown property `{other}` (known: keybindings)")),
+    };
+    let value = value.trim().trim_matches(['"', '\'']).trim();
+    if value.is_empty() {
+        return Err(format!("`{key}` needs a value, e.g. `config {key}=emacs`"));
+    }
+    Ok((key, value.to_string()))
 }
 
 /// The names of a target's declared by-value arguments, in declaration order.
@@ -745,6 +797,32 @@ mod tests {
         // A different input is a fresh computation.
         let other = entry(engine.eval("source urn:fn:toUpper bye"));
         assert_eq!(other.cache.label().as_deref(), Some("computed"));
+    }
+
+    #[test]
+    fn config_assignment_parses_and_canonicalises() {
+        assert_eq!(
+            parse_config_assignment("keybindings=emacs").unwrap(),
+            ("keybindings", "emacs".to_string())
+        );
+        // `keybinds` is an alias; quotes and whitespace are trimmed.
+        assert_eq!(
+            parse_config_assignment("  keybinds = \"vi\" ").unwrap(),
+            ("keybindings", "vi".to_string())
+        );
+    }
+
+    #[test]
+    fn config_assignment_rejects_bad_input() {
+        assert!(parse_config_assignment("keybindings")
+            .unwrap_err()
+            .contains("usage"));
+        assert!(parse_config_assignment("theme=dark")
+            .unwrap_err()
+            .contains("unknown property"));
+        assert!(parse_config_assignment("keybindings=")
+            .unwrap_err()
+            .contains("needs a value"));
     }
 
     #[test]
