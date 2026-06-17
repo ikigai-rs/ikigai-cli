@@ -40,7 +40,7 @@ Commands: `source <iri> [input]` (SOURCE; `input` is routed to the endpoint's
 **declared argument**, discovered from its self-description rather than assumed),
 `describe <iri> [type]` (META; `type` defaults to `text/turtle`),
 `list` (show the resources bound in the current space, pattern → endpoint),
-`help`, `quit`.
+`config [key=value]` (show settings or save one — see below), `help`, `quit`.
 The demo space exercises every input style: `toUpper` / `reverseList` read the
 `in` argument; `wrap` reads a differently-named `text` argument; `echo` reads a
 `{message}` binding captured from the IRI; `split` turns a comma-list into a
@@ -161,9 +161,39 @@ ikigai> cache urn:fn:toUpper hi
 cached
 ```
 
-In the TUI, **↑/↓** recall input history, **PgUp/PgDn** scroll the transcript,
-**Esc** clears the line, and **Ctrl-C** / **Ctrl-D** exit. The demo space is
-composed in `transport-embedded`; a real host binds its own endpoints there.
+In the TUI the input line is a real editor with **Emacs / readline keybindings**:
+
+| keys | action |
+|------|--------|
+| `Ctrl-A` / `Ctrl-E` | start / end of line |
+| `Ctrl-F` / `Ctrl-B` (or `←`/`→`) | char forward / back |
+| `Alt-F` / `Alt-B` | word forward / back |
+| `Ctrl-P` / `Ctrl-N` (or `↑`/`↓`) | history previous / next |
+| `Ctrl-K` / `Ctrl-U` | kill to end / start of line |
+| `Ctrl-Space`, move, `Alt-W` / `Ctrl-W` | set mark, then **copy** / **cut** the region |
+| `Ctrl-W` (no mark) | cut the previous word |
+| `Ctrl-Y` | **yank** (paste) the last cut/copied text |
+| `Ctrl-D` | delete forward, or exit on an empty line |
+| `PgUp` / `PgDn` · `Esc` · `Ctrl-C` | scroll · clear line · exit |
+
+Kill/copy/cut feed a kill buffer that **Ctrl-Y** yanks back; it persists across
+lines, so you can cut on one and paste on another. The active scheme is shown in
+the title.
+
+The scheme is configurable — set `keybindings` from inside the REPL with
+`config keybindings=emacs`, or edit
+`$XDG_CONFIG_HOME/ikigai-cli/config.toml` (falling back to
+`~/.config/ikigai-cli/config.toml`):
+
+```toml
+keybindings = "emacs"   # the default, and for now the only implemented scheme
+```
+
+`config` with no argument shows the file path and current settings; `config
+key=value` validates and saves a property. `vi` (and other schemes) are
+recognised but not implemented yet — they fall back to `emacs` with a notice. The
+demo space is composed in `transport-embedded`; a real host binds its own
+endpoints there.
 
 ## Transports (feature-gated)
 | crate | feature | targets |

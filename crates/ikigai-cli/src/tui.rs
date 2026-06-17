@@ -1,13 +1,17 @@
 //! Native full-screen REPL built on `ratatui` + `crossterm`.
 //!
-//! A scrollback transcript above an input line. Each submitted line is evaluated
-//! by the shared [`Engine`], so this is purely presentation — the same engine a
-//! future `ratzilla` (browser) frontend would render. Keys: Enter submits,
-//! Up/Down recall history, PgUp/PgDn scroll, Esc clears, Ctrl-C / Ctrl-D quit.
+//! A scrollback transcript above an editable input line. Each submitted line is
+//! evaluated by the shared [`Engine`], so this is purely presentation — the same
+//! engine a future `ratzilla` (browser) frontend would render.
+//!
+//! The input line is a real editor: a cursor moves through the text and the keys
+//! are decoded by the configured [`Keybindings`] scheme (Emacs today). See
+//! [`emacs`] for the bindings; Enter submits, PgUp/PgDn scroll the transcript,
+//! Ctrl-C quits.
 
 use std::io;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ikigai_core::Kernel;
 use ratatui::layout::{Constraint, Layout, Position};
 use ratatui::style::Stylize;
@@ -15,24 +19,64 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
+use crate::config::Keybindings;
 use crate::engine::{Action, CacheStats, Engine, Entry, HELP};
 
 /// How many transcript lines PgUp/PgDn move.
 const SCROLL_STEP: u16 = 5;
 
 /// Run the TUI to completion, restoring the terminal on the way out.
-pub fn run(kernel: Kernel) -> io::Result<()> {
+pub fn run(kernel: Kernel, keys: Keybindings) -> io::Result<()> {
     let engine = Engine::new(kernel);
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, &engine);
+    let result = event_loop(&mut terminal, &engine, keys);
     ratatui::restore();
     result
 }
 
-/// Mutable UI state: the input buffer, the transcript, and input history.
+/// One decoded input action — what a key press means, independent of which
+/// keybinding scheme produced it. `Submit` and `Quit` are control flow; the rest
+/// edit the line or move through history/scrollback and are applied by [`edit`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Edit {
+    Insert(char),
+    DeleteLeft,  // backspace
+    DeleteRight, // delete the char under the cursor
+    Left,
+    Right,
+    WordLeft,
+    WordRight,
+    Home,
+    End,
+    KillToEnd,   // cut from the cursor to the end of the line into the kill buffer
+    KillToStart, // cut from the start of the line to the cursor into the kill buffer
+    SetMark,     // mark the cursor as one end of a region
+    Copy,        // copy the region (mark…cursor) into the kill buffer
+    Cut,         // cut the region into the kill buffer, or the previous word if no mark
+    Yank,        // insert (paste) the kill buffer at the cursor
+    HistoryPrev,
+    HistoryNext,
+    ScrollUp,
+    ScrollDown,
+    Clear, // empty the line
+    Submit,
+    Quit,
+    Ignore,
+}
+
+/// Mutable UI state: the input buffer and cursor, the transcript, and history.
 #[derive(Default)]
 struct State {
     input: String,
+    /// Byte offset of the cursor within `input`, always on a `char` boundary.
+    cursor: usize,
+    /// The most recent killed/copied text — yanked back by `Ctrl-Y`. Persists
+    /// across lines, so you can cut on one line and paste on another.
+    kill: String,
+    /// The mark (a byte offset) set by `Ctrl-Space`; with the cursor it bounds
+    /// the region that copy/cut act on. Cleared by any edit to the text.
+    mark: Option<usize>,
+    keys: Keybindings,
     transcript: Vec<Entry>,
     history: Vec<String>,
     /// Index into `history` while browsing with Up/Down; `None` = editing fresh.
@@ -41,43 +85,236 @@ struct State {
     scroll_back: u16,
 }
 
-fn event_loop(terminal: &mut DefaultTerminal, engine: &Engine) -> io::Result<()> {
-    let mut state = State::default();
+impl State {
+    /// The active region as sorted byte offsets `(lo, hi)`, or `None` when no
+    /// mark is set. The mark is clamped to the current length, defending against
+    /// a stale offset even though edits clear it.
+    fn region(&self) -> Option<(usize, usize)> {
+        let mark = self.mark?.min(self.input.len());
+        Some((mark.min(self.cursor), mark.max(self.cursor)))
+    }
+}
+
+fn event_loop(
+    terminal: &mut DefaultTerminal,
+    engine: &Engine,
+    keys: Keybindings,
+) -> io::Result<()> {
+    let mut state = State {
+        keys,
+        ..State::default()
+    };
     loop {
         terminal.draw(|frame| draw(frame, &state))?;
         if let Event::Key(key) = event::read()? {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
-            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-            match key.code {
-                KeyCode::Char('c') | KeyCode::Char('d') if ctrl => return Ok(()),
-                KeyCode::Char(c) if !ctrl => state.input.push(c),
-                KeyCode::Backspace => {
-                    state.input.pop();
-                }
-                KeyCode::Esc => state.input.clear(),
-                KeyCode::Up => recall(&mut state, -1),
-                KeyCode::Down => recall(&mut state, 1),
-                KeyCode::PageUp => {
-                    state.scroll_back = state.scroll_back.saturating_add(SCROLL_STEP)
-                }
-                KeyCode::PageDown => {
-                    state.scroll_back = state.scroll_back.saturating_sub(SCROLL_STEP)
-                }
-                // `submit` evaluates the line for its effects and reports whether
-                // the REPL should quit; the bare arm catches the keep-going case.
-                KeyCode::Enter if submit(&mut state, engine) => return Ok(()),
-                KeyCode::Enter => {}
-                _ => {}
+            match decode(state.keys, key, state.input.is_empty()) {
+                Edit::Quit => return Ok(()),
+                // `submit` evaluates the line and reports whether to quit.
+                Edit::Submit if submit(&mut state, engine) => return Ok(()),
+                Edit::Submit => {}
+                action => edit(&mut state, action),
             }
         }
     }
 }
 
+/// Decode a key press into an [`Edit`] under the active scheme. `input_empty`
+/// lets a scheme make a key context-sensitive (Emacs `Ctrl-D` = quit on an empty
+/// line, delete-forward otherwise).
+fn decode(keys: Keybindings, key: KeyEvent, input_empty: bool) -> Edit {
+    match keys {
+        Keybindings::Emacs => emacs(key, input_empty),
+    }
+}
+
+/// Emacs / readline bindings. Arrow keys, Home/End, Delete, and Backspace work
+/// too, so muscle memory from either world lands.
+fn emacs(key: KeyEvent, input_empty: bool) -> Edit {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Char('c') if ctrl => Edit::Quit,
+        // Readline convention: delete-forward, but EOF (quit) on an empty line.
+        KeyCode::Char('d') if ctrl => {
+            if input_empty {
+                Edit::Quit
+            } else {
+                Edit::DeleteRight
+            }
+        }
+        KeyCode::Char('a') if ctrl => Edit::Home,
+        KeyCode::Char('e') if ctrl => Edit::End,
+        KeyCode::Char('f') if ctrl => Edit::Right,
+        KeyCode::Char('b') if ctrl => Edit::Left,
+        KeyCode::Char('f') if alt => Edit::WordRight,
+        KeyCode::Char('b') if alt => Edit::WordLeft,
+        KeyCode::Char('p') if ctrl => Edit::HistoryPrev,
+        KeyCode::Char('n') if ctrl => Edit::HistoryNext,
+        KeyCode::Char('k') if ctrl => Edit::KillToEnd,
+        KeyCode::Char('u') if ctrl => Edit::KillToStart,
+        KeyCode::Char('w') if ctrl => Edit::Cut,
+        KeyCode::Char('w') if alt => Edit::Copy,
+        KeyCode::Char('y') if ctrl => Edit::Yank,
+        // Set the mark. Terminals report Ctrl-Space inconsistently — as Ctrl-`@`,
+        // a control space, or NUL — so accept all three.
+        KeyCode::Char('@') if ctrl => Edit::SetMark,
+        KeyCode::Char(' ') if ctrl => Edit::SetMark,
+        KeyCode::Null => Edit::SetMark,
+        KeyCode::Char(c) if !ctrl && !alt => Edit::Insert(c),
+        KeyCode::Backspace => Edit::DeleteLeft,
+        KeyCode::Delete => Edit::DeleteRight,
+        KeyCode::Left => Edit::Left,
+        KeyCode::Right => Edit::Right,
+        KeyCode::Home => Edit::Home,
+        KeyCode::End => Edit::End,
+        KeyCode::Up => Edit::HistoryPrev,
+        KeyCode::Down => Edit::HistoryNext,
+        KeyCode::PageUp => Edit::ScrollUp,
+        KeyCode::PageDown => Edit::ScrollDown,
+        KeyCode::Esc => Edit::Clear,
+        KeyCode::Enter => Edit::Submit,
+        _ => Edit::Ignore,
+    }
+}
+
+/// Apply a line-editing action to the state. `Submit`/`Quit` are handled by the
+/// caller (control flow); everything else mutates the buffer, cursor, history
+/// browsing, or scrollback here.
+fn edit(state: &mut State, action: Edit) {
+    // Any edit to the text invalidates the mark (its byte offset would shift);
+    // movement and the mark/copy/cut commands manage it themselves.
+    match action {
+        Edit::Insert(c) => {
+            state.input.insert(state.cursor, c);
+            state.cursor += c.len_utf8();
+            state.mark = None;
+        }
+        Edit::DeleteLeft => {
+            if state.cursor > 0 {
+                let from = prev_boundary(&state.input, state.cursor);
+                state.input.replace_range(from..state.cursor, "");
+                state.cursor = from;
+            }
+            state.mark = None;
+        }
+        Edit::DeleteRight => {
+            let to = next_boundary(&state.input, state.cursor);
+            state.input.replace_range(state.cursor..to, "");
+            state.mark = None;
+        }
+        Edit::Left => state.cursor = prev_boundary(&state.input, state.cursor),
+        Edit::Right => state.cursor = next_boundary(&state.input, state.cursor),
+        Edit::WordLeft => state.cursor = word_left(&state.input, state.cursor),
+        Edit::WordRight => state.cursor = word_right(&state.input, state.cursor),
+        Edit::Home => state.cursor = 0,
+        Edit::End => state.cursor = state.input.len(),
+        Edit::KillToEnd => kill(state, state.cursor, state.input.len()),
+        Edit::KillToStart => kill(state, 0, state.cursor),
+        Edit::SetMark => state.mark = Some(state.cursor),
+        Edit::Copy => {
+            if let Some((lo, hi)) = state.region() {
+                state.kill = state.input[lo..hi].to_string();
+            }
+            state.mark = None;
+        }
+        Edit::Cut => match state.region() {
+            Some((lo, hi)) => kill(state, lo, hi),
+            // No region: cut the previous word (readline `Ctrl-W`).
+            None => kill(state, word_left(&state.input, state.cursor), state.cursor),
+        },
+        Edit::Yank => {
+            let yanked = state.kill.clone();
+            state.input.insert_str(state.cursor, &yanked);
+            state.cursor += yanked.len();
+            state.mark = None;
+        }
+        Edit::HistoryPrev => recall(state, -1),
+        Edit::HistoryNext => recall(state, 1),
+        Edit::ScrollUp => state.scroll_back = state.scroll_back.saturating_add(SCROLL_STEP),
+        Edit::ScrollDown => state.scroll_back = state.scroll_back.saturating_sub(SCROLL_STEP),
+        Edit::Clear => {
+            state.input.clear();
+            state.cursor = 0;
+            state.mark = None;
+        }
+        Edit::Submit | Edit::Quit | Edit::Ignore => {}
+    }
+}
+
+/// Move the byte range `lo..hi` of `input` into the kill buffer, leaving the
+/// cursor at `lo`. The range must be on `char` boundaries.
+fn kill(state: &mut State, lo: usize, hi: usize) {
+    state.kill = state.input[lo..hi].to_string();
+    state.input.replace_range(lo..hi, "");
+    state.cursor = lo;
+    state.mark = None;
+}
+
+/// Byte offset of the `char` boundary just left of `cursor` (the cursor itself
+/// when already at the start).
+fn prev_boundary(s: &str, cursor: usize) -> usize {
+    s[..cursor]
+        .chars()
+        .next_back()
+        .map_or(cursor, |c| cursor - c.len_utf8())
+}
+
+/// Byte offset of the `char` boundary just right of `cursor` (the cursor itself
+/// when already at the end).
+fn next_boundary(s: &str, cursor: usize) -> usize {
+    s[cursor..]
+        .chars()
+        .next()
+        .map_or(cursor, |c| cursor + c.len_utf8())
+}
+
+/// Byte offset one word left of `cursor`: skip whitespace, then the word.
+fn word_left(s: &str, cursor: usize) -> usize {
+    let prev = |i: usize| s[..i].chars().next_back().map(|c| (i - c.len_utf8(), c));
+    let mut i = cursor;
+    while let Some((p, c)) = prev(i) {
+        if c.is_whitespace() {
+            i = p;
+        } else {
+            break;
+        }
+    }
+    while let Some((p, c)) = prev(i) {
+        if c.is_whitespace() {
+            break;
+        }
+        i = p;
+    }
+    i
+}
+
+/// Byte offset one word right of `cursor`: skip whitespace, then the word.
+fn word_right(s: &str, cursor: usize) -> usize {
+    let next = |i: usize| s[i..].chars().next().map(|c| (i + c.len_utf8(), c));
+    let mut i = cursor;
+    while let Some((n, c)) = next(i) {
+        if c.is_whitespace() {
+            i = n;
+        } else {
+            break;
+        }
+    }
+    while let Some((n, c)) = next(i) {
+        if c.is_whitespace() {
+            break;
+        }
+        i = n;
+    }
+    i
+}
+
 /// Evaluate the current input line; returns `true` if the REPL should quit.
 fn submit(state: &mut State, engine: &Engine) -> bool {
     let line = std::mem::take(&mut state.input);
+    state.cursor = 0;
     state.history_pos = None;
     state.scroll_back = 0;
     if !line.trim().is_empty() {
@@ -111,6 +348,8 @@ fn recall(state: &mut State, dir: i32) {
     };
     state.history_pos = next;
     state.input = next.map(|p| state.history[p].clone()).unwrap_or_default();
+    state.cursor = state.input.len(); // land at the end of the recalled line
+    state.mark = None; // the recalled text is a new buffer; any old mark is stale
 }
 
 fn draw(frame: &mut Frame, state: &State) {
@@ -124,7 +363,11 @@ fn draw(frame: &mut Frame, state: &State) {
     let title = Line::from(vec![
         format!("ikigai {} ", env!("CARGO_PKG_VERSION")).bold(),
         "— resource-resolution REPL".into(),
-        "   (help · quit · ↑↓ history · PgUp/PgDn scroll · Ctrl-C exit)".dim(),
+        format!(
+            "   (help · quit · ↑↓ history · {} keys · PgUp/PgDn scroll · Ctrl-C exit)",
+            keymap_name(state.keys)
+        )
+        .dim(),
     ]);
     frame.render_widget(Paragraph::new(title), chunks[0]);
 
@@ -136,9 +379,18 @@ fn draw(frame: &mut Frame, state: &State) {
     let input = Paragraph::new(state.input.as_str())
         .block(Block::default().borders(Borders::ALL).title(" request "));
     frame.render_widget(input, chunks[2]);
-    // Place the cursor after the typed text (inside the 1-cell border).
-    let cursor_x = chunks[2].x + 1 + state.input.chars().count() as u16;
+    // Place the cursor at its column — the display width before it — inside the
+    // 1-cell border, clamped so a long line can't draw past the box.
+    let col = state.input[..state.cursor].chars().count() as u16;
+    let cursor_x = (chunks[2].x + 1 + col).min(chunks[2].x + chunks[2].width.saturating_sub(1));
     frame.set_cursor_position(Position::new(cursor_x, chunks[2].y + 1));
+}
+
+/// The active scheme's short name, shown in the title hint.
+fn keymap_name(keys: Keybindings) -> &'static str {
+    match keys {
+        Keybindings::Emacs => "emacs",
+    }
 }
 
 /// Render the transcript as colored lines: cyan prompt, green output, red errors,
@@ -179,6 +431,7 @@ mod tests {
         render(1, 1, &state); // degenerate: smaller than the layout wants
 
         state.input = "source urn:fn:toUpper hi".into();
+        state.cursor = 7; // cursor mid-line — exercises the cursor-column math
         state.transcript.push(Entry {
             input: "source urn:fn:toUpper hi".into(),
             result: Ok("line one\nline two".into()),
@@ -191,6 +444,183 @@ mod tests {
         });
         render(80, 5, &state); // transcript taller than the area → scrolled
         render(80, 24, &state);
+
+        // A line longer than the input box, cursor at the end → the column clamp
+        // must keep the cursor inside the border rather than drawing past it.
+        state.input = "x".repeat(200);
+        state.cursor = state.input.len();
+        render(40, 24, &state);
+    }
+
+    fn state_with(input: &str, cursor: usize) -> State {
+        State {
+            input: input.to_string(),
+            cursor,
+            ..State::default()
+        }
+    }
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn inserts_and_deletes_at_the_cursor() {
+        let mut s = state_with("ac", 1);
+        edit(&mut s, Edit::Insert('b'));
+        assert_eq!((s.input.as_str(), s.cursor), ("abc", 2));
+
+        edit(&mut s, Edit::Home);
+        edit(&mut s, Edit::Right);
+        edit(&mut s, Edit::DeleteRight); // remove 'b'
+        assert_eq!((s.input.as_str(), s.cursor), ("ac", 1));
+        edit(&mut s, Edit::DeleteLeft); // remove 'a'
+        assert_eq!((s.input.as_str(), s.cursor), ("c", 0));
+        edit(&mut s, Edit::DeleteLeft); // no-op at start
+        assert_eq!((s.input.as_str(), s.cursor), ("c", 0));
+        edit(&mut s, Edit::End);
+        assert_eq!(s.cursor, 1);
+    }
+
+    #[test]
+    fn kills_to_end_start_and_word_into_the_buffer() {
+        let mut s = state_with("foo bar baz", 8);
+        edit(&mut s, Edit::KillToEnd);
+        assert_eq!(s.input, "foo bar ");
+        assert_eq!(s.kill, "baz"); // killed text is yankable
+
+        let mut s = state_with("foo bar", 4);
+        edit(&mut s, Edit::KillToStart);
+        assert_eq!(
+            (s.input.as_str(), s.cursor, s.kill.as_str()),
+            ("bar", 0, "foo ")
+        );
+
+        // `Cut` with no mark falls back to killing the previous word.
+        let mut s = state_with("foo bar", 7);
+        edit(&mut s, Edit::Cut);
+        assert_eq!(
+            (s.input.as_str(), s.cursor, s.kill.as_str()),
+            ("foo ", 4, "bar")
+        );
+    }
+
+    #[test]
+    fn yank_pastes_the_kill_buffer_at_the_cursor() {
+        let mut s = state_with("foo bar", 7);
+        edit(&mut s, Edit::Cut); // kill "bar"
+        edit(&mut s, Edit::Home);
+        edit(&mut s, Edit::Yank); // paste at the start
+        assert_eq!((s.input.as_str(), s.cursor), ("barfoo ", 3));
+    }
+
+    #[test]
+    fn copy_takes_the_region_without_deleting() {
+        let mut s = state_with("hello world", 0);
+        edit(&mut s, Edit::SetMark); // mark at 0
+        edit(&mut s, Edit::WordRight); // cursor to 5 ("hello")
+        edit(&mut s, Edit::Copy);
+        assert_eq!(s.input, "hello world"); // unchanged
+        assert_eq!(s.kill, "hello");
+        assert_eq!(s.mark, None); // region consumed
+    }
+
+    #[test]
+    fn cut_removes_the_region_when_a_mark_is_set() {
+        let mut s = state_with("hello world", 11);
+        edit(&mut s, Edit::SetMark); // mark at end
+        edit(&mut s, Edit::WordLeft); // cursor to 6 (start of "world")
+        edit(&mut s, Edit::Cut);
+        assert_eq!(
+            (s.input.as_str(), s.cursor, s.kill.as_str()),
+            ("hello ", 6, "world")
+        );
+    }
+
+    #[test]
+    fn editing_text_clears_the_mark() {
+        let mut s = state_with("abc", 0);
+        edit(&mut s, Edit::SetMark);
+        edit(&mut s, Edit::Insert('x'));
+        assert_eq!(s.mark, None);
+        assert!(s.region().is_none());
+    }
+
+    #[test]
+    fn moves_by_word_over_runs_of_spaces() {
+        let mut s = state_with("foo  bar", 0);
+        edit(&mut s, Edit::WordRight);
+        assert_eq!(s.cursor, 3); // end of "foo"
+        edit(&mut s, Edit::WordRight);
+        assert_eq!(s.cursor, 8); // end of "bar"
+        edit(&mut s, Edit::WordLeft);
+        assert_eq!(s.cursor, 5); // start of "bar"
+    }
+
+    #[test]
+    fn edits_respect_utf8_boundaries() {
+        let mut s = state_with("", 0);
+        edit(&mut s, Edit::Insert('é')); // two bytes
+        assert_eq!(s.cursor, 2);
+        edit(&mut s, Edit::Insert('x'));
+        assert_eq!((s.input.as_str(), s.cursor), ("éx", 3));
+        edit(&mut s, Edit::Left);
+        assert_eq!(s.cursor, 2);
+        edit(&mut s, Edit::DeleteLeft); // remove the whole 'é'
+        assert_eq!((s.input.as_str(), s.cursor), ("x", 0));
+    }
+
+    #[test]
+    fn emacs_maps_the_core_motions() {
+        let c = KeyModifiers::CONTROL;
+        let a = KeyModifiers::ALT;
+        assert_eq!(emacs(key(KeyCode::Char('a'), c), false), Edit::Home);
+        assert_eq!(emacs(key(KeyCode::Char('e'), c), false), Edit::End);
+        assert_eq!(emacs(key(KeyCode::Char('f'), c), false), Edit::Right);
+        assert_eq!(emacs(key(KeyCode::Char('b'), c), false), Edit::Left);
+        assert_eq!(emacs(key(KeyCode::Char('f'), a), false), Edit::WordRight);
+        assert_eq!(emacs(key(KeyCode::Char('b'), a), false), Edit::WordLeft);
+        assert_eq!(emacs(key(KeyCode::Char('p'), c), false), Edit::HistoryPrev);
+        assert_eq!(emacs(key(KeyCode::Char('n'), c), false), Edit::HistoryNext);
+        assert_eq!(
+            emacs(key(KeyCode::Char('x'), KeyModifiers::NONE), false),
+            Edit::Insert('x')
+        );
+    }
+
+    #[test]
+    fn emacs_maps_the_kill_ring() {
+        let c = KeyModifiers::CONTROL;
+        let a = KeyModifiers::ALT;
+        assert_eq!(emacs(key(KeyCode::Char('y'), c), false), Edit::Yank);
+        assert_eq!(emacs(key(KeyCode::Char('w'), c), false), Edit::Cut);
+        assert_eq!(emacs(key(KeyCode::Char('w'), a), false), Edit::Copy);
+        assert_eq!(emacs(key(KeyCode::Char('k'), c), false), Edit::KillToEnd);
+        // Ctrl-Space arrives variously across terminals; all set the mark.
+        assert_eq!(emacs(key(KeyCode::Char(' '), c), false), Edit::SetMark);
+        assert_eq!(emacs(key(KeyCode::Char('@'), c), false), Edit::SetMark);
+        assert_eq!(
+            emacs(key(KeyCode::Null, KeyModifiers::NONE), false),
+            Edit::SetMark
+        );
+    }
+
+    #[test]
+    fn emacs_ctrl_d_is_eof_only_on_an_empty_line() {
+        let c = KeyModifiers::CONTROL;
+        assert_eq!(emacs(key(KeyCode::Char('d'), c), true), Edit::Quit);
+        assert_eq!(emacs(key(KeyCode::Char('d'), c), false), Edit::DeleteRight);
+        assert_eq!(emacs(key(KeyCode::Char('c'), c), false), Edit::Quit);
+    }
+
+    #[test]
+    fn recall_lands_the_cursor_at_the_end() {
+        let mut s = State {
+            history: vec!["source x".into()],
+            ..State::default()
+        };
+        edit(&mut s, Edit::HistoryPrev);
+        assert_eq!((s.input.as_str(), s.cursor), ("source x", 8));
     }
 
     #[test]
