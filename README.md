@@ -161,9 +161,24 @@ ikigai> cache urn:fn:toUpper hi
 cached
 ```
 
-In the TUI, **↑/↓** recall input history, **PgUp/PgDn** scroll the transcript,
-**Esc** clears the line, and **Ctrl-C** / **Ctrl-D** exit. The demo space is
-composed in `transport-embedded`; a real host binds its own endpoints there.
+In the TUI the input line is a real editor with **Emacs / readline keybindings**:
+**Ctrl-A/Ctrl-E** jump to start/end, **Ctrl-F/Ctrl-B** (or **←/→**) move by
+character, **Alt-F/Alt-B** by word, **Ctrl-P/Ctrl-N** (or **↑/↓**) recall history,
+**Ctrl-K/Ctrl-U** kill to end/start, **Ctrl-W** kills the previous word, **Ctrl-D**
+deletes forward (or exits on an empty line). **PgUp/PgDn** scroll the transcript,
+**Esc** clears the line, **Ctrl-C** exits. The active scheme is shown in the title.
+
+The scheme is configurable via `keybindings` in
+`$XDG_CONFIG_HOME/ikigai-cli/config.toml` (falling back to
+`~/.config/ikigai-cli/config.toml`):
+
+```toml
+keybindings = "emacs"   # the default, and for now the only implemented scheme
+```
+
+`vi` (and other schemes) are recognised but not implemented yet — they fall back
+to `emacs` with a notice. The demo space is composed in `transport-embedded`; a
+real host binds its own endpoints there.
 
 ## Transports (feature-gated)
 | crate | feature | targets |

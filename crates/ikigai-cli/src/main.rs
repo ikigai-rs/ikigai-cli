@@ -11,6 +11,7 @@
 //! piped or with `--plain` it falls back to the line-oriented [`repl`]. All three
 //! drive the same renderer-agnostic [`engine`].
 
+mod config;
 mod engine;
 mod repl;
 #[cfg(not(target_family = "wasm"))]
@@ -80,7 +81,9 @@ fn main() {
     {
         use std::io::IsTerminal;
         if !args.plain && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-            if let Err(e) = tui::run(kernel) {
+            // The keybinding scheme is read before entering the alternate screen
+            // so an unsupported-value notice is visible.
+            if let Err(e) = tui::run(kernel, config::keybindings()) {
                 eprintln!("ikigai: tui error: {e}");
                 std::process::exit(1);
             }
