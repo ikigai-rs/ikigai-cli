@@ -15,6 +15,8 @@ use futures::executor::block_on;
 use ikigai_core::{Capability, Expiry, Kernel, Representation, Request, SpaceEntry};
 use serde::{Deserialize, Serialize};
 
+pub mod wire;
+
 /// How a resolution was served by the representation cache.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum CacheStatus {
