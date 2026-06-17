@@ -4,7 +4,7 @@
 
 use std::io::{self, Write};
 
-use crate::engine::{Action, Engine, HELP};
+use ikigai_engine::{Action, Engine, HELP};
 
 /// Execute each command non-interactively, then return a process exit code
 /// (`1` if any command errored, else `0`). Output goes to stdout, errors to

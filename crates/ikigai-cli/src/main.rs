@@ -15,8 +15,6 @@
 
 #[cfg(not(target_family = "wasm"))]
 mod clipboard;
-mod config;
-mod engine;
 #[cfg(feature = "quic")]
 mod quic;
 mod repl;
@@ -38,7 +36,7 @@ usage:
 QUIC: --server-cert/--server-key name the server's identity, --client-cert/--client-key the client's
 inside the REPL: source, describe, help, quit (type `help` for details)";
 
-use crate::engine::Engine;
+use ikigai_engine::Engine;
 
 /// Per-role certificate-path overrides for QUIC, shared by `serve` and `--connect`.
 #[derive(Default)]
@@ -225,7 +223,7 @@ fn run_repl(engine: Engine, plain: bool, commands: &[String]) {
         if !plain && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
             // The keybinding scheme is read before entering the alternate screen
             // so an unsupported-value notice is visible.
-            if let Err(e) = tui::run(engine, config::keybindings()) {
+            if let Err(e) = tui::run(engine, ikigai_engine::config::keybindings()) {
                 eprintln!("ikigai: tui error: {e}");
                 std::process::exit(1);
             }

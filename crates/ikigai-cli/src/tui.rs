@@ -20,8 +20,8 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::clipboard;
-use crate::config::Keybindings;
-use crate::engine::{Action, CacheStats, Engine, Entry, HELP};
+use ikigai_engine::config::Keybindings;
+use ikigai_engine::{Action, CacheStats, Engine, Entry, HELP};
 
 /// How many transcript lines PgUp/PgDn move.
 const SCROLL_STEP: u16 = 5;

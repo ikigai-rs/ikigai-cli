@@ -1,0 +1,13 @@
+[package]
+name = "ikigai-engine"
+description = "Renderer-agnostic REPL engine for ikigai: parses a request line, drives a Backend, and reports the result as an Action. Shared by the CLI and the browser frontend."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ikigai-core = { workspace = true }
+transport-core = { workspace = true }
+serde_json = { workspace = true }

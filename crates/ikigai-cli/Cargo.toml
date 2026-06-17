@@ -19,6 +19,7 @@ quic = ["dep:transport-quic"] # opt-in; pulls quinn/rustls/tokio
 
 [dependencies]
 ikigai-core = { workspace = true }
+ikigai-engine = { path = "../ikigai-engine" }
 transport-core = { workspace = true }
 serde_json = { workspace = true }
 transport-embedded = { path = "../transport-embedded", optional = true }
