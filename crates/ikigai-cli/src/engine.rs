@@ -16,10 +16,8 @@
 
 use std::cell::Cell;
 
-use futures::executor::block_on;
-use ikigai_core::{
-    ArgRef, Capability, Description, Expiry, InputSource, Iri, Kernel, Request, Verb,
-};
+use ikigai_core::{ArgRef, Description, InputSource, Iri, Request, Verb};
+use transport_core::{Backend, CacheStatus};
 
 use crate::config;
 
@@ -63,17 +61,6 @@ pub struct Entry {
     pub input: String,
     pub result: Result<String, String>,
     pub cache: CacheStats,
-}
-
-/// How one issued request was served by the kernel's representation cache.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum CacheStatus {
-    /// Served from cache without recomputing.
-    Hit,
-    /// Computed now, and the result was cached for next time.
-    Miss,
-    /// Computed now; the result is not cacheable, so it recomputes every time.
-    Uncacheable,
 }
 
 /// A tally of the cache outcomes across the (possibly many) requests one input
@@ -131,9 +118,10 @@ pub enum Action {
     Noop,
 }
 
-/// Holds the kernel and turns input lines into [`Action`]s.
+/// Holds the backend (a local or remote kernel) and turns input lines into
+/// [`Action`]s.
 pub struct Engine {
-    kernel: Kernel,
+    backend: Box<dyn Backend>,
     /// Cache outcomes recorded by [`run`](Self::run) during the current `eval`.
     /// Interior-mutable so the `&self` resolution path can tally without
     /// threading an accumulator through every stage; the REPL is single-threaded.
@@ -141,9 +129,9 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(kernel: Kernel) -> Self {
+    pub fn new(backend: impl Backend + 'static) -> Self {
         Self {
-            kernel,
+            backend: Box::new(backend),
             cache: Cell::new(CacheStats::default()),
         }
     }
@@ -372,7 +360,7 @@ impl Engine {
         };
         let (target, args) = words.split_first().ok_or("expected an IRI")?;
         let request = self.source_request(target, args, None)?;
-        Ok(if self.kernel.is_cached(&request) {
+        Ok(if self.backend.is_cached(&request) {
             "cached".to_string()
         } else {
             "not cached".to_string()
@@ -383,7 +371,7 @@ impl Engine {
     /// error if the space doesn't support enumeration.
     fn run_list(&self) -> Result<String, String> {
         let entries = self
-            .kernel
+            .backend
             .entries()
             .ok_or_else(|| "the current space does not support listing".to_string())?;
         if entries.is_empty() {
@@ -414,31 +402,17 @@ impl Engine {
     fn describe_struct(&self, iri: &Iri) -> Option<Description> {
         let request = Request::new(Verb::Meta, iri.clone())
             .with_arg("as", ArgRef::Inline(b"application/json".to_vec()));
-        let representation = block_on(self.kernel.issue(request, &Capability::root())).ok()?;
+        // The contract fetch is internal plumbing — its cache outcome isn't part
+        // of the user-facing tally, so the status is discarded.
+        let (representation, _) = self.backend.issue(request).ok()?;
         serde_json::from_slice(&representation.bytes).ok()
     }
 
-    /// Issue a request, record how the cache served it, and decode the
-    /// representation as UTF-8 text.
-    ///
-    /// The kernel doesn't report hit-vs-miss directly, so we infer it: a hit
-    /// returns the cached representation without touching the cache, while a miss
-    /// that is cacheable inserts one entry. So with the result's own cacheability
-    /// (its [`Expiry`]) and the change in [`cache_len`](Kernel::cache_len) across
-    /// the single issue, the outcome is exact — a `Never` result whose issue grew
-    /// the cache was computed now, an unchanged cache means it was already there,
-    /// and an `Always` result is never cached at all.
+    /// Issue a request, record how the backend's cache served it, and decode the
+    /// representation as UTF-8 text. The backend reports the [`CacheStatus`]
+    /// directly — for a remote kernel the server knows it without a probe.
     fn run(&self, request: Request) -> Result<String, String> {
-        let before = self.kernel.cache_len();
-        let representation =
-            block_on(self.kernel.issue(request, &Capability::root())).map_err(|e| e.to_string())?;
-        let status = if representation.expiry != Expiry::Never {
-            CacheStatus::Uncacheable
-        } else if self.kernel.cache_len() > before {
-            CacheStatus::Miss
-        } else {
-            CacheStatus::Hit
-        };
+        let (representation, status) = self.backend.issue(request)?;
         let mut stats = self.cache.get();
         stats.record(status);
         self.cache.set(stats);
@@ -740,8 +714,8 @@ mod tests {
     use std::sync::Arc;
 
     use ikigai_core::{
-        builtins, ArgSpec, EndpointSpace, Exact, FnEndpoint, Invocation, MetaRenderer, ReprType,
-        Representation, Rewrite, UriTemplate,
+        builtins, ArgSpec, EndpointSpace, Exact, FnEndpoint, Invocation, Kernel, MetaRenderer,
+        ReprType, Representation, Rewrite, UriTemplate,
     };
 
     /// A minimal renderer that emits the description as JSON — what the embedded
