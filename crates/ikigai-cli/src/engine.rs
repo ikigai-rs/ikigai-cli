@@ -474,9 +474,8 @@ fn config_summary() -> String {
     format!("config file: {location}\nkeybindings = {keybindings}")
 }
 
-/// Parse and validate a `config` assignment into a canonical `(property, value)`.
-/// Pure — the write happens in [`run_config`]. `keybinds` is accepted as an alias
-/// for `keybindings`.
+/// Parse and validate a `config` assignment into a `(property, value)`. Pure —
+/// the write happens in [`run_config`].
 fn parse_config_assignment(rest: &str) -> Result<(&'static str, String), String> {
     let (key, value) = rest.split_once('=').ok_or_else(|| {
         "usage: `config <key>=<value>` (e.g. `config keybindings=emacs`), or `config` to show \
@@ -484,7 +483,7 @@ fn parse_config_assignment(rest: &str) -> Result<(&'static str, String), String>
             .to_string()
     })?;
     let key = match key.trim() {
-        "keybindings" | "keybinds" => "keybindings",
+        "keybindings" => "keybindings",
         other => return Err(format!("unknown property `{other}` (known: keybindings)")),
     };
     let value = value.trim().trim_matches(['"', '\'']).trim();
@@ -800,14 +799,14 @@ mod tests {
     }
 
     #[test]
-    fn config_assignment_parses_and_canonicalises() {
+    fn config_assignment_parses_the_property() {
         assert_eq!(
             parse_config_assignment("keybindings=emacs").unwrap(),
             ("keybindings", "emacs".to_string())
         );
-        // `keybinds` is an alias; quotes and whitespace are trimmed.
+        // Quotes and surrounding whitespace are trimmed.
         assert_eq!(
-            parse_config_assignment("  keybinds = \"vi\" ").unwrap(),
+            parse_config_assignment("  keybindings = \"vi\" ").unwrap(),
             ("keybindings", "vi".to_string())
         );
     }
@@ -817,6 +816,10 @@ mod tests {
         assert!(parse_config_assignment("keybindings")
             .unwrap_err()
             .contains("usage"));
+        // An unknown key — including the `keybinds` misspelling — is rejected.
+        assert!(parse_config_assignment("keybinds=emacs")
+            .unwrap_err()
+            .contains("unknown property"));
         assert!(parse_config_assignment("theme=dark")
             .unwrap_err()
             .contains("unknown property"));
