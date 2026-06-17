@@ -1,8 +1,8 @@
 //! The IPC wire protocol: length-prefixed [postcard](https://postcard.jamesmunns.com)
 //! messages between a REPL client and a kernel server.
 //!
-//! [`Call`] and [`Reply`] mirror the [`Backend`](crate::Backend) surface, and the
-//! framing ([`write_message`] / [`read_message`]) is a `u32` big-endian length
+//! [`Call`] and [`Reply`] mirror the [`Resolver`](ikigai_resolve::Resolver) surface,
+//! and the framing ([`write_message`] / [`read_message`]) is a `u32` big-endian length
 //! followed by the postcard payload. The codec is non-self-describing — client
 //! and server ship together at the same version — and the core types already
 //! derive `Serialize`/`Deserialize`, so nothing here re-describes them.
@@ -10,10 +10,9 @@
 use std::io::{self, Read, Write};
 
 use ikigai_core::{Representation, Request, SpaceEntry};
+use ikigai_resolve::CacheStatus;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-
-use crate::CacheStatus;
 
 /// Bumped when the on-wire shape changes incompatibly. Not negotiated yet
 /// (client and server ship together) — it's here to fail loudly when that
@@ -25,7 +24,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// representation a REPL round-trips.
 const MAX_FRAME: usize = 64 * 1024 * 1024;
 
-/// A client → server call, mirroring the [`Backend`](crate::Backend) methods.
+/// A client → server call, mirroring the [`Resolver`](ikigai_resolve::Resolver) methods.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Call {
     Issue(Request),

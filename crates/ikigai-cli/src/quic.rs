@@ -12,7 +12,7 @@
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 
-use transport_quic::Identity;
+use ikigai_quic::Identity;
 
 use crate::Certs;
 
@@ -40,8 +40,8 @@ pub fn generate(force: bool) -> Result<PathBuf, String> {
     restrict(&dir, 0o700)?;
 
     for (name, identity) in [
-        ("server", transport_quic::generate()),
-        ("client", transport_quic::generate()),
+        ("server", ikigai_quic::generate()),
+        ("client", ikigai_quic::generate()),
     ] {
         write(
             &dir.join(format!("{name}.crt")),

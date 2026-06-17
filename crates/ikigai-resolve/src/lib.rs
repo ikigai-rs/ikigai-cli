@@ -1,21 +1,20 @@
 //! The seam between the REPL engine and a kernel — local or, later, remote.
 //!
-//! The engine drives a [`Backend`] rather than a concrete [`Kernel`], so the
+//! The engine drives a [`Resolver`] rather than a concrete [`Kernel`], so the
 //! same engine resolves against an in-process kernel today and an IPC- or
-//! QUIC-attached one tomorrow. [`Backend`] is synchronous: the REPL runs a
+//! QUIC-attached one tomorrow. [`Resolver`] is synchronous: the REPL runs a
 //! blocking loop, so the local implementation hides `block_on` and a wire
 //! implementation hides its socket round-trip behind the same surface.
 //!
 //! The trait is deliberately small — exactly what the engine needs: issue a
 //! request, ask whether one is cached, and list the bound resources. Issue
 //! reports the [`CacheStatus`] the resolution had, which a remote server knows
-//! directly (no client-side cache probing across the wire).
+//! directly (no client-side cache probing across the wire). The wire protocol
+//! that remote resolvers speak lives in the companion `ikigai-wire` crate.
 
 use futures::executor::block_on;
 use ikigai_core::{Capability, Expiry, Kernel, Representation, Request, SpaceEntry};
 use serde::{Deserialize, Serialize};
-
-pub mod wire;
 
 /// How a resolution was served by the representation cache.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -33,7 +32,7 @@ pub enum CacheStatus {
 /// Synchronous by design (the REPL loop is blocking). Errors are surfaced as
 /// human-readable strings — the engine reports them verbatim; a richer transport
 /// error type can replace `String` when the wire protocol lands.
-pub trait Backend {
+pub trait Resolver {
     /// Resolve `request` and report its representation and cache outcome.
     fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), String>;
 
@@ -45,12 +44,12 @@ pub trait Backend {
     fn entries(&self) -> Option<Vec<SpaceEntry>>;
 }
 
-/// The in-process kernel as a [`Backend`]: drive it directly, inferring the
+/// The in-process kernel as a [`Resolver`]: drive it directly, inferring the
 /// cache outcome from its [`cache_len`](Kernel::cache_len) across the issue (a
 /// hit returns the cached value without growing the cache; a cacheable miss
 /// inserts one entry). All requests use the root capability — this is the
 /// trusted, same-process path.
-impl Backend for Kernel {
+impl Resolver for Kernel {
     fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), String> {
         let before = self.cache_len();
         let representation = block_on(Kernel::issue(self, request, &Capability::root()))

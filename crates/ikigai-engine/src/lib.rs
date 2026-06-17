@@ -1,7 +1,7 @@
 //! The renderer-agnostic ikigai REPL engine.
 //!
 //! [`Engine`] parses a request line, issues it against a kernel through a
-//! [`Backend`](transport_core::Backend), and returns an [`Action`] describing
+//! [`Resolver`](ikigai_resolve::Resolver), and returns an [`Action`] describing
 //! what to display — knowing nothing about terminals or rendering. The plain
 //! line REPL, the `ratatui` TUI, and a browser frontend all drive this same
 //! engine and present its [`Action`] however suits their medium.

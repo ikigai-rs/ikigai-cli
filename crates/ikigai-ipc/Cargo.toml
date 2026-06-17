@@ -1,5 +1,5 @@
 [package]
-name = "transport-ipc"
+name = "ikigai-ipc"
 description = "Unix-domain-socket IPC transport to a local kernel server."
 version.workspace = true
 edition.workspace = true
@@ -9,5 +9,6 @@ repository.workspace = true
 
 [dependencies]
 ikigai-core = { workspace = true }
-transport-core = { workspace = true }
+ikigai-resolve = { workspace = true }
+ikigai-wire = { workspace = true }
 libc = { workspace = true }

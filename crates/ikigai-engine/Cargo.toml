@@ -9,5 +9,5 @@ repository.workspace = true
 
 [dependencies]
 ikigai-core = { workspace = true }
-transport-core = { workspace = true }
+ikigai-resolve = { workspace = true }
 serde_json = { workspace = true }

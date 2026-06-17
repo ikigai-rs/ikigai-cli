@@ -2,7 +2,7 @@
 //! kernel server.
 //!
 //! Like the IPC transport, [`serve`] runs a kernel and [`connect`] returns a
-//! [`Backend`] driving it — here over QUIC (TLS 1.3) instead of a Unix socket, so
+//! [`Resolver`] driving it — here over QUIC (TLS 1.3) instead of a Unix socket, so
 //! it works across the network. Each call is one bidirectional QUIC stream
 //! carrying a postcard [`Call`]/[`Reply`]; the stream boundary frames the message.
 //!
@@ -11,7 +11,7 @@
 //! it will accept. The client pins the server's cert; the server requires and
 //! pins the client's. A capability bound to that identity can layer on later.
 //!
-//! quinn is async; the sync [`Backend`] hides a `tokio` runtime, just as the
+//! quinn is async; the sync [`Resolver`] hides a `tokio` runtime, just as the
 //! embedded kernel hides its executor.
 
 use std::io;
@@ -19,14 +19,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use ikigai_core::{Kernel, Representation, Request, SpaceEntry};
+use ikigai_resolve::{CacheStatus, Resolver};
+use ikigai_wire::{decode, encode, Call, Reply};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::WebPkiSupportedAlgorithms;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use tokio::runtime::Runtime;
-use transport_core::wire::{decode, encode, Call, Reply};
-use transport_core::{Backend, CacheStatus};
 
 /// The ALPN protocol id — both ends must agree on it.
 const ALPN: &[u8] = b"ikigai/0";
@@ -95,15 +95,15 @@ async fn serve_connection(kernel: &Kernel, connection: quinn::Connection) {
     }
 }
 
-/// Answer one [`Call`] against the local kernel, reusing its [`Backend`] impl.
+/// Answer one [`Call`] against the local kernel, reusing its [`Resolver`] impl.
 fn dispatch(kernel: &Kernel, call: Call) -> Reply {
     match call {
-        Call::Issue(request) => match Backend::issue(kernel, request) {
+        Call::Issue(request) => match Resolver::issue(kernel, request) {
             Ok((representation, status)) => Reply::Resolved(representation, status),
             Err(message) => Reply::Error(message),
         },
-        Call::IsCached(request) => Reply::Cached(Backend::is_cached(kernel, &request)),
-        Call::Entries => Reply::Entries(Backend::entries(kernel)),
+        Call::IsCached(request) => Reply::Cached(Resolver::is_cached(kernel, &request)),
+        Call::Entries => Reply::Entries(Resolver::entries(kernel)),
     }
 }
 
@@ -113,7 +113,7 @@ pub fn connect(
     addr: SocketAddr,
     identity: &Identity,
     trusted_server_cert_pem: &str,
-) -> io::Result<QuicBackend> {
+) -> io::Result<QuicResolver> {
     let config = client_config(identity, trusted_server_cert_pem)?;
     let runtime = Runtime::new()?;
     let (endpoint, connection) = runtime.block_on(async move {
@@ -133,22 +133,22 @@ pub fn connect(
             .map_err(other)?;
         io::Result::Ok((endpoint, connection))
     })?;
-    Ok(QuicBackend {
+    Ok(QuicResolver {
         runtime,
         _endpoint: endpoint,
         connection,
     })
 }
 
-/// A [`Backend`] backed by a kernel server over QUIC.
-pub struct QuicBackend {
+/// A [`Resolver`] backed by a kernel server over QUIC.
+pub struct QuicResolver {
     runtime: Runtime,
     /// Kept alive for the duration of the connection.
     _endpoint: quinn::Endpoint,
     connection: quinn::Connection,
 }
 
-impl QuicBackend {
+impl QuicResolver {
     /// One call → one bidirectional stream → one reply.
     fn round_trip(&self, call: Call) -> io::Result<Reply> {
         let request = encode(&call)?;
@@ -162,7 +162,7 @@ impl QuicBackend {
     }
 }
 
-impl Drop for QuicBackend {
+impl Drop for QuicResolver {
     fn drop(&mut self) {
         // Tell the peer we're done so it stops promptly instead of waiting out
         // the idle timeout; then let the endpoint flush the close frame.
@@ -177,7 +177,7 @@ impl Drop for QuicBackend {
     }
 }
 
-impl Backend for QuicBackend {
+impl Resolver for QuicResolver {
     fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), String> {
         match self
             .round_trip(Call::Issue(request))

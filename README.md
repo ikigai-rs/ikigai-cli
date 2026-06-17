@@ -235,15 +235,20 @@ keybindings = "emacs"   # "emacs" (default) · "vi" · "native"
 key=value` validates and saves a property. `native` resolves to the platform's
 terminal default, which is Emacs on every supported OS — a terminal can't capture
 OS GUI shortcuts (⌘C etc.), so terminal-native editing *is* readline/Emacs. The
-demo space is composed in `transport-embedded`; a real host binds its own
+demo space is composed in `ikigai-embedded`; a real host binds its own
 endpoints there.
 
-## Transports (feature-gated)
+## Crates
+The engine drives a `Resolver` — the seam in `ikigai-resolve` (`issue` / `is_cached`
+/ `entries`) that a kernel implements, local or remote. `ikigai-engine` is the
+renderer-agnostic REPL engine over that seam; `ikigai-wire` is the postcard Call/Reply
+protocol the remote transports speak. The transports are feature-gated:
+
 | crate | feature | targets |
 |-------|---------|---------|
-| `transport-embedded` | `embedded` (default) | native + wasm |
-| `transport-ipc`      | `ipc` (default) | Unix only (Unix domain socket) |
-| `transport-quic`     | `quic` (opt-in) | native (QUIC + mutually-pinned TLS) |
+| `ikigai-embedded` | `embedded` (default) | native + wasm |
+| `ikigai-ipc`      | `ipc` (default) | Unix only (Unix domain socket) |
+| `ikigai-quic`     | `quic` (opt-in) | native (QUIC + mutually-pinned TLS) |
 
 `quic` is opt-in (it pulls quinn/rustls/tokio); the default build is `embedded` +
 `ipc`. The WebAssembly build enables only `embedded`; `ipc`/`quic` are gated out

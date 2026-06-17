@@ -1,9 +1,9 @@
 //! Unix-domain-socket IPC between the `ikigai` REPL and a local kernel server.
 //!
 //! [`serve`] runs a kernel behind a socket; [`connect`] returns an
-//! [`IpcBackend`] that drives that server through the same [`Backend`] surface
+//! [`IpcResolver`] that drives that server through the same [`Resolver`] surface
 //! the embedded kernel uses, so the engine can't tell the difference. Messages
-//! are the framed [`wire`](transport_core::wire) protocol.
+//! are the framed [`wire`](ikigai_wire) protocol.
 //!
 //! Security is the operating system's, not a certificate's (see the crate
 //! README): the socket lives in a `0700` per-user directory ([`default_socket_path`])
@@ -22,8 +22,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ikigai_core::{Kernel, Representation, Request, SpaceEntry};
-use transport_core::wire::{read_message, write_message, Call, Reply};
-use transport_core::{Backend, CacheStatus};
+use ikigai_resolve::{CacheStatus, Resolver};
+use ikigai_wire::{read_message, write_message, Call, Reply};
 
 /// Run `kernel` as a server on `path` until an unrecoverable accept error: bind
 /// the socket (replacing a stale one), restrict it to `0600`, and serve each
@@ -47,18 +47,18 @@ pub fn serve(kernel: Kernel, path: &Path) -> io::Result<()> {
 }
 
 /// Connect to a kernel server listening on `path`.
-pub fn connect(path: &Path) -> io::Result<IpcBackend> {
-    Ok(IpcBackend {
+pub fn connect(path: &Path) -> io::Result<IpcResolver> {
+    Ok(IpcResolver {
         stream: UnixStream::connect(path)?,
     })
 }
 
-/// A [`Backend`] backed by a kernel server over a Unix socket.
-pub struct IpcBackend {
+/// A [`Resolver`] backed by a kernel server over a Unix socket.
+pub struct IpcResolver {
     stream: UnixStream,
 }
 
-impl IpcBackend {
+impl IpcResolver {
     /// Send a call and read its reply. `&UnixStream` is `Read + Write`, so the
     /// shared `&self` can drive the socket without interior mutability.
     fn round_trip(&self, call: Call) -> io::Result<Reply> {
@@ -68,7 +68,7 @@ impl IpcBackend {
     }
 }
 
-impl Backend for IpcBackend {
+impl Resolver for IpcResolver {
     fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), String> {
         match self
             .round_trip(Call::Issue(request))
@@ -109,16 +109,16 @@ fn handle_connection(kernel: &Kernel, stream: UnixStream) {
     }
 }
 
-/// Answer one [`Call`] against the local kernel, reusing its [`Backend`] impl so
+/// Answer one [`Call`] against the local kernel, reusing its [`Resolver`] impl so
 /// the server computes cache status exactly as the embedded path does.
 fn dispatch(kernel: &Kernel, call: Call) -> Reply {
     match call {
-        Call::Issue(request) => match Backend::issue(kernel, request) {
+        Call::Issue(request) => match Resolver::issue(kernel, request) {
             Ok((representation, status)) => Reply::Resolved(representation, status),
             Err(message) => Reply::Error(message),
         },
-        Call::IsCached(request) => Reply::Cached(Backend::is_cached(kernel, &request)),
-        Call::Entries => Reply::Entries(Backend::entries(kernel)),
+        Call::IsCached(request) => Reply::Cached(Resolver::is_cached(kernel, &request)),
+        Call::Entries => Reply::Entries(Resolver::entries(kernel)),
     }
 }
 
