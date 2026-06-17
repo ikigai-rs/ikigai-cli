@@ -5,8 +5,9 @@
 //! engine a future `ratzilla` (browser) frontend would render.
 //!
 //! The input line is a real editor: a cursor moves through the text and the keys
-//! are decoded by the configured [`Keybindings`] scheme (Emacs today). See
-//! [`emacs`] for the bindings; Enter submits, PgUp/PgDn scroll the transcript,
+//! are decoded by the configured [`Keybindings`] scheme — [`emacs`] (also
+//! `native`) or modal [`vi`]. Kill/yank flows through the system clipboard (see
+//! [`apply`] and [`clipboard`]). Enter submits, PgUp/PgDn scroll the transcript,
 //! Ctrl-C quits.
 
 use std::io;
@@ -19,6 +20,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
+use crate::clipboard;
 use crate::config::Keybindings;
 use crate::engine::{Action, CacheStats, Engine, Entry, HELP};
 
@@ -59,9 +61,27 @@ enum Edit {
     ScrollUp,
     ScrollDown,
     Clear, // empty the line
+    // vi mode switches (no-ops under other schemes).
+    ViInsert,      // enter Insert mode at the cursor (`i`)
+    ViAppend,      // enter Insert mode one char right (`a`)
+    ViInsertHome,  // jump to the start and enter Insert (`I`)
+    ViAppendEnd,   // jump to the end and enter Insert (`A`)
+    ViChangeToEnd, // kill to the end of the line and enter Insert (`C`)
+    ViNormal,      // leave Insert for Normal mode (`Esc`)
     Submit,
     Quit,
     Ignore,
+}
+
+/// The current mode of a vi-style input line.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+enum ViMode {
+    /// Typing inserts text; `Esc` switches to [`Normal`](ViMode::Normal). A fresh
+    /// line starts here (like `set -o vi` in a shell), so plain typing just works.
+    #[default]
+    Insert,
+    /// Keys move the cursor and edit; `i`/`a`/`A`/`I`/`C` switch to Insert.
+    Normal,
 }
 
 /// Mutable UI state: the input buffer and cursor, the transcript, and history.
@@ -77,6 +97,8 @@ struct State {
     /// the region that copy/cut act on. Cleared by any edit to the text.
     mark: Option<usize>,
     keys: Keybindings,
+    /// The vi sub-mode (only meaningful when `keys` is [`Keybindings::Vi`]).
+    vi_mode: ViMode,
     transcript: Vec<Entry>,
     history: Vec<String>,
     /// Index into `history` while browsing with Up/Down; `None` = editing fresh.
@@ -110,23 +132,90 @@ fn event_loop(
             if key.kind != KeyEventKind::Press {
                 continue;
             }
-            match decode(state.keys, key, state.input.is_empty()) {
+            match decode(key, &state) {
                 Edit::Quit => return Ok(()),
                 // `submit` evaluates the line and reports whether to quit.
                 Edit::Submit if submit(&mut state, engine) => return Ok(()),
                 Edit::Submit => {}
-                action => edit(&mut state, action),
+                action => apply(&mut state, action),
             }
         }
     }
 }
 
-/// Decode a key press into an [`Edit`] under the active scheme. `input_empty`
-/// lets a scheme make a key context-sensitive (Emacs `Ctrl-D` = quit on an empty
-/// line, delete-forward otherwise).
-fn decode(keys: Keybindings, key: KeyEvent, input_empty: bool) -> Edit {
-    match keys {
-        Keybindings::Emacs => emacs(key, input_empty),
+/// Decode a key press into an [`Edit`] under the active scheme, given the state
+/// the decoding depends on (whether the line is empty for Emacs; the vi mode).
+fn decode(key: KeyEvent, state: &State) -> Edit {
+    match state.keys {
+        // `Native` is the platform's terminal default, which is Emacs everywhere.
+        Keybindings::Emacs | Keybindings::Native => emacs(key, state.input.is_empty()),
+        Keybindings::Vi => vi(key, state.vi_mode),
+    }
+}
+
+/// Modal vi bindings: Normal mode moves and edits, Insert mode types. A fresh
+/// line starts in Insert (so typing works immediately); `Esc` enters Normal.
+fn vi(key: KeyEvent, mode: ViMode) -> Edit {
+    match mode {
+        ViMode::Insert => vi_insert(key),
+        ViMode::Normal => vi_normal(key),
+    }
+}
+
+/// vi Insert mode: type text, with a few readline conveniences; `Esc` → Normal.
+fn vi_insert(key: KeyEvent) -> Edit {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Esc => Edit::ViNormal,
+        KeyCode::Char('c') if ctrl => Edit::Quit,
+        KeyCode::Char('w') if ctrl => Edit::Cut,
+        KeyCode::Char('u') if ctrl => Edit::KillToStart,
+        KeyCode::Char(c) if !ctrl && !alt => Edit::Insert(c),
+        KeyCode::Backspace => Edit::DeleteLeft,
+        KeyCode::Delete => Edit::DeleteRight,
+        KeyCode::Left => Edit::Left,
+        KeyCode::Right => Edit::Right,
+        KeyCode::Home => Edit::Home,
+        KeyCode::End => Edit::End,
+        KeyCode::Up => Edit::HistoryPrev,
+        KeyCode::Down => Edit::HistoryNext,
+        KeyCode::PageUp => Edit::ScrollUp,
+        KeyCode::PageDown => Edit::ScrollDown,
+        KeyCode::Enter => Edit::Submit,
+        _ => Edit::Ignore,
+    }
+}
+
+/// vi Normal mode: motions (`h l w b 0 $`), edits (`x X D C p P`), mode switches
+/// (`i a A I`), and history (`j k`). Counts and operator+motion (`dw`, `cw`) are
+/// deferred — this is the movement-and-basic-edits subset.
+fn vi_normal(key: KeyEvent) -> Edit {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Char('c') if ctrl => Edit::Quit,
+        KeyCode::Char('i') => Edit::ViInsert,
+        KeyCode::Char('a') => Edit::ViAppend,
+        KeyCode::Char('I') => Edit::ViInsertHome,
+        KeyCode::Char('A') => Edit::ViAppendEnd,
+        KeyCode::Char('C') => Edit::ViChangeToEnd,
+        KeyCode::Char('h') | KeyCode::Left => Edit::Left,
+        KeyCode::Char('l') | KeyCode::Right => Edit::Right,
+        KeyCode::Char('w') => Edit::WordRight,
+        KeyCode::Char('b') => Edit::WordLeft,
+        KeyCode::Char('0') => Edit::Home,
+        KeyCode::Char('$') => Edit::End,
+        KeyCode::Char('x') | KeyCode::Delete => Edit::DeleteRight,
+        KeyCode::Char('X') => Edit::DeleteLeft,
+        KeyCode::Char('D') => Edit::KillToEnd,
+        KeyCode::Char('p') | KeyCode::Char('P') => Edit::Yank,
+        KeyCode::Char('j') | KeyCode::Down => Edit::HistoryNext,
+        KeyCode::Char('k') | KeyCode::Up => Edit::HistoryPrev,
+        KeyCode::Backspace => Edit::Left, // Normal-mode Backspace moves, not deletes
+        KeyCode::PageUp => Edit::ScrollUp,
+        KeyCode::PageDown => Edit::ScrollDown,
+        KeyCode::Enter => Edit::Submit,
+        _ => Edit::Ignore,
     }
 }
 
@@ -180,9 +269,27 @@ fn emacs(key: KeyEvent, input_empty: bool) -> Edit {
     }
 }
 
+/// Apply an editing action, keeping the kill buffer in sync with the system
+/// clipboard around the pure [`edit`]: a yank pulls the clipboard in first, and
+/// any change to the kill buffer is pushed back out. Best-effort — with no
+/// clipboard tool present, the in-process buffer is used (see [`clipboard`]).
+fn apply(state: &mut State, action: Edit) {
+    if action == Edit::Yank {
+        if let Some(text) = clipboard::paste() {
+            state.kill = text;
+        }
+    }
+    let before = state.kill.clone();
+    edit(state, action);
+    if state.kill != before {
+        clipboard::copy(&state.kill);
+    }
+}
+
 /// Apply a line-editing action to the state. `Submit`/`Quit` are handled by the
 /// caller (control flow); everything else mutates the buffer, cursor, history
-/// browsing, or scrollback here.
+/// browsing, scrollback, or vi mode here. Pure (no I/O) so it is fully testable;
+/// clipboard sync lives in [`apply`].
 fn edit(state: &mut State, action: Edit) {
     // Any edit to the text invalidates the mark (its byte offset would shift);
     // movement and the mark/copy/cut commands manage it themselves.
@@ -239,6 +346,24 @@ fn edit(state: &mut State, action: Edit) {
             state.input.clear();
             state.cursor = 0;
             state.mark = None;
+        }
+        Edit::ViInsert => state.vi_mode = ViMode::Insert,
+        Edit::ViNormal => state.vi_mode = ViMode::Normal,
+        Edit::ViAppend => {
+            state.cursor = next_boundary(&state.input, state.cursor);
+            state.vi_mode = ViMode::Insert;
+        }
+        Edit::ViInsertHome => {
+            state.cursor = 0;
+            state.vi_mode = ViMode::Insert;
+        }
+        Edit::ViAppendEnd => {
+            state.cursor = state.input.len();
+            state.vi_mode = ViMode::Insert;
+        }
+        Edit::ViChangeToEnd => {
+            kill(state, state.cursor, state.input.len());
+            state.vi_mode = ViMode::Insert;
         }
         Edit::Submit | Edit::Quit | Edit::Ignore => {}
     }
@@ -315,6 +440,8 @@ fn word_right(s: &str, cursor: usize) -> usize {
 fn submit(state: &mut State, engine: &Engine) -> bool {
     let line = std::mem::take(&mut state.input);
     state.cursor = 0;
+    state.mark = None;
+    state.vi_mode = ViMode::default(); // each new line starts in Insert
     state.history_pos = None;
     state.scroll_back = 0;
     if !line.trim().is_empty() {
@@ -364,8 +491,8 @@ fn draw(frame: &mut Frame, state: &State) {
         format!("ikigai {} ", env!("CARGO_PKG_VERSION")).bold(),
         "— resource-resolution REPL".into(),
         format!(
-            "   (help · quit · ↑↓ history · {} keys · PgUp/PgDn scroll · Ctrl-C exit)",
-            keymap_name(state.keys)
+            "   (help · quit · ↑↓ history · {} · PgUp/PgDn scroll · Ctrl-C exit)",
+            mode_label(state)
         )
         .dim(),
     ]);
@@ -386,10 +513,19 @@ fn draw(frame: &mut Frame, state: &State) {
     frame.set_cursor_position(Position::new(cursor_x, chunks[2].y + 1));
 }
 
-/// The active scheme's short name, shown in the title hint.
-fn keymap_name(keys: Keybindings) -> &'static str {
-    match keys {
-        Keybindings::Emacs => "emacs",
+/// The active scheme (and, for vi, its mode) shown in the title hint — so a vi
+/// user can always see whether they're in Normal or Insert.
+fn mode_label(state: &State) -> String {
+    match state.keys {
+        Keybindings::Emacs => "emacs keys".to_string(),
+        Keybindings::Native => "native keys".to_string(),
+        Keybindings::Vi => {
+            let mode = match state.vi_mode {
+                ViMode::Insert => "insert",
+                ViMode::Normal => "normal",
+            };
+            format!("vi · {mode}")
+        }
     }
 }
 
@@ -611,6 +747,102 @@ mod tests {
         assert_eq!(emacs(key(KeyCode::Char('d'), c), true), Edit::Quit);
         assert_eq!(emacs(key(KeyCode::Char('d'), c), false), Edit::DeleteRight);
         assert_eq!(emacs(key(KeyCode::Char('c'), c), false), Edit::Quit);
+    }
+
+    fn vi_key(c: char) -> KeyEvent {
+        key(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn vi_normal_maps_motions_and_edits() {
+        use ViMode::Normal;
+        assert_eq!(vi(vi_key('h'), Normal), Edit::Left);
+        assert_eq!(vi(vi_key('l'), Normal), Edit::Right);
+        assert_eq!(vi(vi_key('w'), Normal), Edit::WordRight);
+        assert_eq!(vi(vi_key('b'), Normal), Edit::WordLeft);
+        assert_eq!(vi(vi_key('0'), Normal), Edit::Home);
+        assert_eq!(vi(vi_key('$'), Normal), Edit::End);
+        assert_eq!(vi(vi_key('x'), Normal), Edit::DeleteRight);
+        assert_eq!(vi(vi_key('X'), Normal), Edit::DeleteLeft);
+        assert_eq!(vi(vi_key('D'), Normal), Edit::KillToEnd);
+        assert_eq!(vi(vi_key('p'), Normal), Edit::Yank);
+        assert_eq!(vi(vi_key('j'), Normal), Edit::HistoryNext);
+        assert_eq!(vi(vi_key('k'), Normal), Edit::HistoryPrev);
+        // A bare letter in Normal mode edits rather than inserting.
+        assert_eq!(vi(vi_key('z'), Normal), Edit::Ignore);
+    }
+
+    #[test]
+    fn vi_mode_switch_keys_enter_insert() {
+        use ViMode::Normal;
+        assert_eq!(vi(vi_key('i'), Normal), Edit::ViInsert);
+        assert_eq!(vi(vi_key('a'), Normal), Edit::ViAppend);
+        assert_eq!(vi(vi_key('I'), Normal), Edit::ViInsertHome);
+        assert_eq!(vi(vi_key('A'), Normal), Edit::ViAppendEnd);
+        assert_eq!(vi(vi_key('C'), Normal), Edit::ViChangeToEnd);
+    }
+
+    #[test]
+    fn vi_insert_types_until_escape() {
+        use ViMode::Insert;
+        assert_eq!(vi(vi_key('x'), Insert), Edit::Insert('x'));
+        assert_eq!(
+            vi(key(KeyCode::Esc, KeyModifiers::NONE), Insert),
+            Edit::ViNormal
+        );
+        assert_eq!(
+            vi(key(KeyCode::Char('w'), KeyModifiers::CONTROL), Insert),
+            Edit::Cut
+        );
+        assert_eq!(
+            vi(key(KeyCode::Backspace, KeyModifiers::NONE), Insert),
+            Edit::DeleteLeft
+        );
+    }
+
+    #[test]
+    fn vi_mode_transitions_move_and_switch() {
+        // `a` appends: cursor steps right, mode becomes Insert.
+        let mut s = state_with("ab", 0);
+        s.keys = Keybindings::Vi;
+        s.vi_mode = ViMode::Normal;
+        edit(&mut s, Edit::ViAppend);
+        assert_eq!((s.cursor, s.vi_mode), (1, ViMode::Insert));
+
+        // `A` jumps to the end; `I` to the start.
+        let mut s = state_with("hello", 2);
+        edit(&mut s, Edit::ViAppendEnd);
+        assert_eq!((s.cursor, s.vi_mode), (5, ViMode::Insert));
+        edit(&mut s, Edit::ViNormal);
+        edit(&mut s, Edit::ViInsertHome);
+        assert_eq!((s.cursor, s.vi_mode), (0, ViMode::Insert));
+
+        // `C` kills to the end (into the buffer) and enters Insert.
+        let mut s = state_with("hello", 2);
+        edit(&mut s, Edit::ViChangeToEnd);
+        assert_eq!(
+            (s.input.as_str(), s.kill.as_str(), s.vi_mode),
+            ("he", "llo", ViMode::Insert)
+        );
+    }
+
+    #[test]
+    fn decode_dispatches_by_scheme() {
+        // Native behaves as emacs.
+        let mut s = State {
+            keys: Keybindings::Native,
+            ..State::default()
+        };
+        assert_eq!(
+            decode(key(KeyCode::Char('a'), KeyModifiers::CONTROL), &s),
+            Edit::Home
+        );
+        // Vi routes through the current sub-mode.
+        s.keys = Keybindings::Vi;
+        s.vi_mode = ViMode::Normal;
+        assert_eq!(decode(vi_key('x'), &s), Edit::DeleteRight);
+        s.vi_mode = ViMode::Insert;
+        assert_eq!(decode(vi_key('x'), &s), Edit::Insert('x'));
     }
 
     #[test]
