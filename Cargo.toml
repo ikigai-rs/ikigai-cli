@@ -13,7 +13,7 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 [workspace.dependencies]
 # The released kernel, consumed from crates.io. For local cross-repo development
 # against a sibling checkout, use .cargo/config.toml (see .cargo/config.toml.example).
-ikigai-core = "0.1.4"  # needs binary-codec-friendly serde (0.1.4)
+ikigai-core = "0.1.5"  # needs builtins::compose (0.1.5)
 ikigai-vocab = "0.1"
 transport-core = { path = "crates/transport-core" }
 futures = "0.3"

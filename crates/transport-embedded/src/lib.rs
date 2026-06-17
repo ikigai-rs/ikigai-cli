@@ -117,6 +117,34 @@ fn greet() -> FnEndpoint {
     )
 }
 
+/// `urn:data:page`: a demo *shape* for `compose`. A text template whose
+/// `$a{<iri>}` markers transclude other resources in this space; resolving
+/// `source urn:fn:compose src=urn:data:page` assembles the whole thing in one
+/// pull. The escaped `$$a{…}` shows a literal marker surviving expansion.
+fn page_impl(_inv: &Invocation<'_>) -> Result<Representation> {
+    let body = "ikigai compose demo — one pull, recursively assembled\n\n  \
+        toUpper : $a{urn:fn:toUpper?in=\"resource oriented computing\"}\n  \
+        wrap    : $a{urn:demo:wrap?text=hello}\n  \
+        greet   : $a{urn:demo:greet?greeting=Hi&name=World}\n\n\
+        literal marker (escaped, not expanded): $$a{urn:fn:toUpper?in=x}\n";
+    Ok(Representation::new(
+        ReprType::new("text/plain").with_param("charset", "utf-8"),
+        body.as_bytes().to_vec(),
+    )
+    .cacheable())
+}
+
+fn page() -> FnEndpoint {
+    FnEndpoint::new("page", page_impl).with_description(
+        Description::new("page")
+            .title("Demo page")
+            .summary("A compose shape: a text template with `$a{<iri>}` transclusion markers.")
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .output("text/plain;charset=utf-8"),
+    )
+}
+
 /// Build an embedded kernel pre-bound with the demo endpoints and a
 /// self-description renderer (Turtle / plain text / JSON).
 ///
@@ -136,6 +164,8 @@ pub fn kernel() -> Kernel {
         .bind(Exact::new("urn:demo:wrap"), wrap())
         .bind(Exact::new("urn:demo:split"), split())
         .bind(Exact::new("urn:demo:greet"), greet())
+        .bind(Exact::new("urn:fn:compose"), builtins::compose())
+        .bind(Exact::new("urn:data:page"), page())
         .bind(echo, builtins::echo());
     Kernel::with_meta_renderer(Arc::new(space), Arc::new(CliRenderer))
 }
