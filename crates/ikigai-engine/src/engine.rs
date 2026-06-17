@@ -81,6 +81,13 @@ impl CacheStats {
         }
     }
 
+    /// Fold another tally into this one — used to summarise a `-c` batch.
+    pub fn merge(&mut self, other: CacheStats) {
+        self.hits += other.hits;
+        self.misses += other.misses;
+        self.uncacheable += other.uncacheable;
+    }
+
     /// A compact label for the outcome — `None` when nothing was issued (e.g.
     /// `list`, `help`, or a command that errored before resolving). A single
     /// request reads as one word; several stages summarise their mix.
