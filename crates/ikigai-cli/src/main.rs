@@ -11,12 +11,10 @@
 //! With `-c '<command>'` (repeatable) it runs the command(s) and exits. Otherwise,
 //! on an interactive terminal it launches a full-screen [`tui`] REPL; piped or
 //! with `--plain` it falls back to the line-oriented [`repl`]. All drive the same
-//! renderer-agnostic [`engine`] over the chosen [`Backend`](transport_core::Backend).
+//! renderer-agnostic [`engine`] over the chosen [`Resolver`](ikigai_resolve::Resolver).
 
 #[cfg(not(target_family = "wasm"))]
 mod clipboard;
-mod config;
-mod engine;
 #[cfg(feature = "quic")]
 mod quic;
 mod repl;
@@ -38,7 +36,7 @@ usage:
 QUIC: --server-cert/--server-key name the server's identity, --client-cert/--client-key the client's
 inside the REPL: source, describe, help, quit (type `help` for details)";
 
-use crate::engine::Engine;
+use ikigai_engine::Engine;
 
 /// Per-role certificate-path overrides for QUIC, shared by `serve` and `--connect`.
 #[derive(Default)]
@@ -204,7 +202,7 @@ fn main() {
 #[cfg(feature = "embedded")]
 fn build_engine(connect: Option<Option<String>>, certs: &Certs) -> Result<Engine, String> {
     match connect {
-        None => Ok(Engine::new(transport_embedded::kernel())),
+        None => Ok(Engine::new(ikigai_embedded::kernel())),
         Some(target) => match target.as_deref() {
             Some(t) if is_quic(t) => connect_quic(t, certs),
             _ => connect_ipc(target),
@@ -225,7 +223,7 @@ fn run_repl(engine: Engine, plain: bool, commands: &[String]) {
         if !plain && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
             // The keybinding scheme is read before entering the alternate screen
             // so an unsupported-value notice is visible.
-            if let Err(e) = tui::run(engine, config::keybindings()) {
+            if let Err(e) = tui::run(engine, ikigai_engine::config::keybindings()) {
                 eprintln!("ikigai: tui error: {e}");
                 std::process::exit(1);
             }
@@ -275,7 +273,7 @@ fn serve_quic(target: &str, certs: &Certs) -> ! {
         let identity = quic::server_identity(certs)?;
         let trusted = quic::trusted_client_cert(certs)?;
         eprintln!("ikigai: serving on {target}  (Ctrl-C to stop)");
-        transport_quic::serve(transport_embedded::kernel(), addr, &identity, &trusted)
+        ikigai_quic::serve(ikigai_embedded::kernel(), addr, &identity, &trusted)
             .map_err(|e| e.to_string())
     })();
     match result {
@@ -292,9 +290,9 @@ fn connect_quic(target: &str, certs: &Certs) -> Result<Engine, String> {
     let addr = quic::parse_addr(target)?;
     let identity = quic::client_identity(certs)?;
     let trusted = quic::trusted_server_cert(certs)?;
-    let backend = transport_quic::connect(addr, &identity, &trusted)
+    let resolver = ikigai_quic::connect(addr, &identity, &trusted)
         .map_err(|e| format!("connect {target}: {e}"))?;
-    Ok(Engine::new(backend))
+    Ok(Engine::new(resolver))
 }
 
 #[cfg(all(feature = "embedded", not(feature = "quic")))]
@@ -314,7 +312,7 @@ fn connect_quic(_target: &str, _certs: &Certs) -> Result<Engine, String> {
 fn serve_ipc(path: Option<String>) -> ! {
     let socket = ipc_socket(path);
     eprintln!("ikigai: serving on {}  (Ctrl-C to stop)", socket.display());
-    match transport_ipc::serve(transport_embedded::kernel(), &socket) {
+    match ikigai_ipc::serve(ikigai_embedded::kernel(), &socket) {
         Ok(()) => std::process::exit(0),
         Err(e) => {
             eprintln!("ikigai: serve error: {e}");
@@ -326,9 +324,9 @@ fn serve_ipc(path: Option<String>) -> ! {
 #[cfg(all(feature = "embedded", feature = "ipc", unix))]
 fn connect_ipc(path: Option<String>) -> Result<Engine, String> {
     let socket = ipc_socket(path);
-    let backend = transport_ipc::connect(&socket)
-        .map_err(|e| format!("connect {}: {e}", socket.display()))?;
-    Ok(Engine::new(backend))
+    let resolver =
+        ikigai_ipc::connect(&socket).map_err(|e| format!("connect {}: {e}", socket.display()))?;
+    Ok(Engine::new(resolver))
 }
 
 /// Resolve an explicit Unix socket path, or the secure default, exiting if
@@ -336,7 +334,7 @@ fn connect_ipc(path: Option<String>) -> Result<Engine, String> {
 #[cfg(all(feature = "embedded", feature = "ipc", unix))]
 fn ipc_socket(path: Option<String>) -> std::path::PathBuf {
     path.map(std::path::PathBuf::from)
-        .or_else(transport_ipc::default_socket_path)
+        .or_else(ikigai_ipc::default_socket_path)
         .unwrap_or_else(|| {
             eprintln!("ikigai: no socket path given and no runtime directory to default to");
             std::process::exit(2);

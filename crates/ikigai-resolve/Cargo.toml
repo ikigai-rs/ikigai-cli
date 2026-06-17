@@ -1,6 +1,6 @@
 [package]
-name = "transport-embedded"
-description = "In-process transport: composes a kernel directly in the host process."
+name = "ikigai-resolve"
+description = "The Resolver seam the ikigai REPL engine drives: issue a request against a kernel — local or remote — and report how the cache served it."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,8 +9,5 @@ repository.workspace = true
 
 [dependencies]
 ikigai-core = { workspace = true }
-ikigai-vocab = { workspace = true }
-serde_json = { workspace = true }
-
-[dev-dependencies]
 futures = { workspace = true }
+serde = { workspace = true }

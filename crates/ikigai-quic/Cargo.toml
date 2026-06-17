@@ -1,5 +1,5 @@
 [package]
-name = "transport-quic"
+name = "ikigai-quic"
 description = "QUIC transport with mutually-pinned TLS to a remote kernel."
 version.workspace = true
 edition.workspace = true
@@ -9,7 +9,8 @@ repository.workspace = true
 
 [dependencies]
 ikigai-core = { workspace = true }
-transport-core = { workspace = true }
+ikigai-resolve = { workspace = true }
+ikigai-wire = { workspace = true }
 # The `ring` crypto provider everywhere — no cmake/nasm toolchain needed, so it
 # builds portably in CI (unlike the default `aws-lc-rs`).
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }

@@ -13,17 +13,18 @@ path = "src/main.rs"
 
 [features]
 default = ["embedded", "ipc"]
-embedded = ["dep:transport-embedded"]
-ipc = ["dep:transport-ipc"]   # Unix only; the dep is empty elsewhere
-quic = ["dep:transport-quic"] # opt-in; pulls quinn/rustls/tokio
+embedded = ["dep:ikigai-embedded"]
+ipc = ["dep:ikigai-ipc"]   # Unix only; the dep is empty elsewhere
+quic = ["dep:ikigai-quic"] # opt-in; pulls quinn/rustls/tokio
 
 [dependencies]
 ikigai-core = { workspace = true }
-transport-core = { workspace = true }
+ikigai-engine = { path = "../ikigai-engine" }
+ikigai-resolve = { workspace = true }
 serde_json = { workspace = true }
-transport-embedded = { path = "../transport-embedded", optional = true }
-transport-ipc = { path = "../transport-ipc", optional = true }
-transport-quic = { path = "../transport-quic", optional = true }
+ikigai-embedded = { path = "../ikigai-embedded", optional = true }
+ikigai-ipc = { path = "../ikigai-ipc", optional = true }
+ikigai-quic = { path = "../ikigai-quic", optional = true }
 
 # The full-screen TUI is native-only (crossterm). The browser frontend (ratzilla)
 # lands in a later slice; on wasm the binary falls back to the line REPL.

@@ -17,7 +17,7 @@
 use std::cell::Cell;
 
 use ikigai_core::{ArgRef, Description, InputSource, Iri, Request, Verb};
-use transport_core::{Backend, CacheStatus};
+use ikigai_resolve::{CacheStatus, Resolver};
 
 use crate::config;
 
@@ -118,10 +118,10 @@ pub enum Action {
     Noop,
 }
 
-/// Holds the backend (a local or remote kernel) and turns input lines into
+/// Holds the resolver (a local or remote kernel) and turns input lines into
 /// [`Action`]s.
 pub struct Engine {
-    backend: Box<dyn Backend>,
+    resolver: Box<dyn Resolver>,
     /// Cache outcomes recorded by [`run`](Self::run) during the current `eval`.
     /// Interior-mutable so the `&self` resolution path can tally without
     /// threading an accumulator through every stage; the REPL is single-threaded.
@@ -129,9 +129,9 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(backend: impl Backend + 'static) -> Self {
+    pub fn new(resolver: impl Resolver + 'static) -> Self {
         Self {
-            backend: Box::new(backend),
+            resolver: Box::new(resolver),
             cache: Cell::new(CacheStats::default()),
         }
     }
@@ -360,7 +360,7 @@ impl Engine {
         };
         let (target, args) = words.split_first().ok_or("expected an IRI")?;
         let request = self.source_request(target, args, None)?;
-        Ok(if self.backend.is_cached(&request) {
+        Ok(if self.resolver.is_cached(&request) {
             "cached".to_string()
         } else {
             "not cached".to_string()
@@ -371,7 +371,7 @@ impl Engine {
     /// error if the space doesn't support enumeration.
     fn run_list(&self) -> Result<String, String> {
         let entries = self
-            .backend
+            .resolver
             .entries()
             .ok_or_else(|| "the current space does not support listing".to_string())?;
         if entries.is_empty() {
@@ -404,15 +404,15 @@ impl Engine {
             .with_arg("as", ArgRef::Inline(b"application/json".to_vec()));
         // The contract fetch is internal plumbing — its cache outcome isn't part
         // of the user-facing tally, so the status is discarded.
-        let (representation, _) = self.backend.issue(request).ok()?;
+        let (representation, _) = self.resolver.issue(request).ok()?;
         serde_json::from_slice(&representation.bytes).ok()
     }
 
-    /// Issue a request, record how the backend's cache served it, and decode the
-    /// representation as UTF-8 text. The backend reports the [`CacheStatus`]
+    /// Issue a request, record how the resolver's cache served it, and decode the
+    /// representation as UTF-8 text. The resolver reports the [`CacheStatus`]
     /// directly — for a remote kernel the server knows it without a probe.
     fn run(&self, request: Request) -> Result<String, String> {
-        let (representation, status) = self.backend.issue(request)?;
+        let (representation, status) = self.resolver.issue(request)?;
         let mut stats = self.cache.get();
         stats.record(status);
         self.cache.set(stats);

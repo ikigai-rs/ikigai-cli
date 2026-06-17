@@ -12,14 +12,14 @@
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 
-use transport_quic::Identity;
+use ikigai_quic::Identity;
 
 use crate::Certs;
 
 /// `<config>/ikigai-cli/quic/`.
 fn dir() -> Result<PathBuf, String> {
-    let config =
-        crate::config::path().ok_or("no config directory (set $XDG_CONFIG_HOME or $HOME)")?;
+    let config = ikigai_engine::config::path()
+        .ok_or("no config directory (set $XDG_CONFIG_HOME or $HOME)")?;
     let parent = config
         .parent()
         .ok_or("config path has no parent directory")?;
@@ -40,8 +40,8 @@ pub fn generate(force: bool) -> Result<PathBuf, String> {
     restrict(&dir, 0o700)?;
 
     for (name, identity) in [
-        ("server", transport_quic::generate()),
-        ("client", transport_quic::generate()),
+        ("server", ikigai_quic::generate()),
+        ("client", ikigai_quic::generate()),
     ] {
         write(
             &dir.join(format!("{name}.crt")),
