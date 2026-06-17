@@ -19,7 +19,7 @@ quic = []  # native-only, not yet implemented
 
 [dependencies]
 ikigai-core = { workspace = true }
-futures = { workspace = true }
+transport-core = { workspace = true }
 serde_json = { workspace = true }
 transport-embedded = { path = "../transport-embedded", optional = true }
 
