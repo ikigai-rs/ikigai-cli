@@ -15,6 +15,8 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 # against a sibling checkout, use .cargo/config.toml (see .cargo/config.toml.example).
 ikigai-core = "0.1.5"  # needs builtins::compose (0.1.5)
 ikigai-vocab = "0.1"
+# The reusable function library, linked in as a published module crate.
+ikigai-fn = "0.1.0"
 ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.1.0" }
 ikigai-wire = { path = "crates/ikigai-wire", version = "0.1.0" }
 futures = "0.3"
