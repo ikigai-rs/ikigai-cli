@@ -45,7 +45,8 @@ fn page_impl(_inv: &Invocation<'_>) -> Result<Representation> {
     let body = "ikigai compose demo — one pull, recursively assembled\n\n  \
         toUpper : $a{urn:fn:toUpper?in=\"resource oriented computing\"}\n  \
         wrap    : $a{urn:demo:wrap?text=hello}\n  \
-        greet   : $a{urn:demo:greet?greeting=Hi&name=World}\n\n\
+        greet   : $a{urn:demo:greet?greeting=Hi&name=World}\n  \
+        nested  : $a{urn:data:about}\n\n\
         literal marker (escaped, not expanded): $$a{urn:fn:toUpper?in=x}\n";
     Ok(Representation::new(
         ReprType::new("text/plain").with_param("charset", "utf-8"),
@@ -59,6 +60,29 @@ fn page() -> FnEndpoint {
         Description::new("page")
             .title("Demo page")
             .summary("A compose shape: a text template with `$a{<iri>}` transclusion markers.")
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .output("text/plain;charset=utf-8"),
+    )
+}
+
+/// `urn:data:about`: a nested shape the demo page transcludes — which itself
+/// transcludes another resource, so `compose` (and the `trace` tree) recurses.
+fn about_impl(_inv: &Invocation<'_>) -> Result<Representation> {
+    let body = "a shape within a shape: \
+        $a{urn:fn:toUpper?in=\"composed within a composed shape\"}";
+    Ok(Representation::new(
+        ReprType::new("text/plain").with_param("charset", "utf-8"),
+        body.as_bytes().to_vec(),
+    )
+    .cacheable())
+}
+
+fn about() -> FnEndpoint {
+    FnEndpoint::new("about", about_impl).with_description(
+        Description::new("about")
+            .title("About (nested shape)")
+            .summary("A compose shape the demo page transcludes, which itself transcludes another resource.")
             .verb(Verb::Source)
             .verb(Verb::Meta)
             .output("text/plain;charset=utf-8"),
@@ -107,6 +131,7 @@ fn host_info(nature: &'static str) -> FnEndpoint {
 fn base_space(nature: &'static str) -> EndpointSpace {
     ikigai_fn::space()
         .bind(Exact::new("urn:data:page"), page())
+        .bind(Exact::new("urn:data:about"), about())
         .bind(Exact::new("urn:host:info"), host_info(nature))
 }
 

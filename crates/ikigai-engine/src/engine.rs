@@ -458,11 +458,13 @@ impl Engine {
         }
     }
 
-    /// `trace` command: resolve a single resource and show its path — the client
-    /// and the capability it ran under, the transport it reached the kernel by,
-    /// the endpoint that answered, the cache outcome, and the output's type/size.
-    /// The resolution actually happens (this is the real path), so the result is
-    /// cached just like a `source`.
+    /// `trace` command: resolve a resource and show the path it takes — the client
+    /// and the capability it ran under, the transport it reached the kernel by, and
+    /// the **tree** of resolutions. A plain resource is one node; a `compose` shape
+    /// is the recursive `$a{…}` transclusion tree, each marker a child resolution
+    /// with its own endpoint and cache outcome. The resolutions actually happen, so
+    /// a sub-resource that appears twice shows up `cached` the second time — you
+    /// watch the fabric (and its cache) assemble the resource.
     fn run_trace(&self, spec: &str) -> Result<String, String> {
         let pipeline = parse_spec(spec)?;
         let words = match pipeline {
@@ -479,54 +481,98 @@ impl Engine {
         let (target, args) = words.split_first().ok_or("expected an IRI")?;
         let iri = parse_target(target)?;
         let request = self.source_request(target, args, None)?;
-        let endpoint = self.endpoint_for(&iri);
-        let capability = self.capability.borrow();
-        let (representation, status) = self.resolver.issue_as(request, &capability)?;
-        let cache = match status {
-            CacheStatus::Hit => "cached",
-            CacheStatus::Miss => "computed",
-            CacheStatus::Uncacheable => "uncacheable (a live fact)",
-        };
-        let preview = {
-            let text = String::from_utf8_lossy(&representation.bytes);
-            let first: String = text.lines().next().unwrap_or("").trim().chars().take(56).collect();
-            if text.lines().count() > 1 || first.chars().count() == 56 {
-                format!("{first} …")
-            } else {
-                first
-            }
-        };
-        Ok(format!(
-            "trace  {iri}\n  \
-             client      ikigai repl  ·  {}\n  \
-             transport   {}\n  \
-             endpoint    {endpoint}\n  \
-             cache       {cache}\n  \
-             output      {} · {} bytes\n  \
-             result      {preview}",
-            self.describe_capability(),
-            self.resolver.transport(),
-            representation.repr_type.canonical(),
-            representation.bytes.len(),
-        ))
+        let capability = self.capability.borrow().clone();
+        let entries = self.resolver.entries().unwrap_or_default();
+        let mut out = vec![
+            format!("trace  {iri}"),
+            format!("  client      ikigai repl  ·  {}", self.describe_capability()),
+            format!("  transport   {}", self.resolver.transport()),
+            String::new(),
+        ];
+        self.trace_node(
+            iri, request, &capability, &entries, String::new(), true, true, 0, &mut out,
+        );
+        Ok(out.join("\n"))
     }
 
-    /// Name the binding that answers `iri`, from the resolver's listed entries —
-    /// for `trace`'s endpoint line. Exact match first, then a template whose
-    /// literal prefix matches; otherwise it's a sub-space or remote endpoint.
-    fn endpoint_for(&self, iri: &Iri) -> String {
-        let entries = self.resolver.entries().unwrap_or_default();
-        let target = iri.as_str();
-        if let Some(entry) = entries.iter().find(|entry| entry.pattern == target) {
-            return format!("{}  ←  {} (exact)", entry.endpoint, entry.pattern);
+    /// Resolve one node, print its tree line, and recurse into the `$a{…}` markers
+    /// in its output. `prefix` carries the box-drawing for nested levels.
+    #[allow(clippy::too_many_arguments)]
+    fn trace_node(
+        &self,
+        iri: Iri,
+        request: Request,
+        capability: &Capability,
+        entries: &[ikigai_core::SpaceEntry],
+        prefix: String,
+        is_last: bool,
+        is_root: bool,
+        depth: usize,
+        out: &mut Vec<String>,
+    ) {
+        let branch = if is_root {
+            ""
+        } else if is_last {
+            "└─ "
+        } else {
+            "├─ "
+        };
+        let endpoint = endpoint_name(entries, &iri);
+        let label = short_iri(iri.as_str());
+        match self.resolver.issue_as(request, capability) {
+            Ok((representation, status)) => {
+                let text = String::from_utf8_lossy(&representation.bytes);
+                let markers = if depth < MAX_TRACE_DEPTH {
+                    scan_markers(&text)
+                } else {
+                    Vec::new()
+                };
+                let head = format!(
+                    "{prefix}{branch}{label}   {endpoint} · {} · {}b",
+                    cache_word(status),
+                    representation.bytes.len(),
+                );
+                if markers.is_empty() {
+                    out.push(format!("{head}   → {}", preview_of(&text)));
+                } else {
+                    out.push(head);
+                    let ext = if is_root {
+                        ""
+                    } else if is_last {
+                        "   "
+                    } else {
+                        "│  "
+                    };
+                    let child_prefix = format!("{prefix}{ext}");
+                    let count = markers.len();
+                    for (idx, inner) in markers.into_iter().enumerate() {
+                        let last = idx == count - 1;
+                        match marker_request(&inner) {
+                            Ok((child_iri, child_request)) => self.trace_node(
+                                child_iri,
+                                child_request,
+                                capability,
+                                entries,
+                                child_prefix.clone(),
+                                last,
+                                false,
+                                depth + 1,
+                                out,
+                            ),
+                            Err(message) => {
+                                let mark = if last { "└─ " } else { "├─ " };
+                                out.push(format!(
+                                    "{child_prefix}{mark}{inner}   (bad marker: {message})"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            Err(message) => {
+                out.push(format!("{prefix}{branch}{label}   {endpoint} · error: {message}"))
+            }
         }
-        if let Some(entry) = entries.iter().find(|entry| {
-            entry.pattern.contains('{')
-                && target.starts_with(entry.pattern.split('{').next().unwrap_or(""))
-        }) {
-            return format!("{}  ←  {} (template)", entry.endpoint, entry.pattern);
-        }
-        "(not a listed binding — a sub-space or remote endpoint)".to_string()
     }
 
     /// List the bindings of the kernel's root space (pattern → endpoint), or an
@@ -863,6 +909,160 @@ fn parse_target(target: &str) -> Result<Iri, String> {
         return Err("expected an IRI".to_string());
     }
     Iri::parse(target).map_err(|e| e.to_string())
+}
+
+// --- `trace` tree helpers ---------------------------------------------------
+
+/// Maximum `trace` recursion depth — a backstop against a cyclic transclusion.
+const MAX_TRACE_DEPTH: usize = 16;
+
+/// The endpoint name bound to `iri` in `entries` (exact, then template prefix).
+fn endpoint_name(entries: &[ikigai_core::SpaceEntry], iri: &Iri) -> String {
+    let target = iri.as_str();
+    if let Some(entry) = entries.iter().find(|entry| entry.pattern == target) {
+        return entry.endpoint.clone();
+    }
+    if let Some(entry) = entries.iter().find(|entry| {
+        entry.pattern.contains('{')
+            && target.starts_with(entry.pattern.split('{').next().unwrap_or(""))
+    }) {
+        return entry.endpoint.clone();
+    }
+    "?".to_string()
+}
+
+/// A short, single-line preview of a representation's text.
+fn preview_of(text: &str) -> String {
+    let first: String = text
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(40)
+        .collect();
+    if text.lines().count() > 1 || first.chars().count() == 40 {
+        format!("{first}…")
+    } else {
+        first
+    }
+}
+
+/// Truncate a long IRI for a tree label.
+fn short_iri(iri: &str) -> String {
+    if iri.chars().count() > 50 {
+        let head: String = iri.chars().take(49).collect();
+        format!("{head}…")
+    } else {
+        iri.to_string()
+    }
+}
+
+/// The one-word cache outcome.
+fn cache_word(status: CacheStatus) -> &'static str {
+    match status {
+        CacheStatus::Hit => "cached",
+        CacheStatus::Miss => "computed",
+        CacheStatus::Uncacheable => "uncacheable",
+    }
+}
+
+/// Extract the inner `<iri>[?args]` body of every `$a{…}` transclusion marker in
+/// `text`, in document order — a client-side view of what `compose` expands.
+/// `$$a{…}` is an escaped literal and is skipped. Mirrors the `compose` builtin.
+fn scan_markers(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut markers = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            if bytes.get(i + 1) == Some(&b'$') {
+                i += 2;
+                continue;
+            }
+            if text[i..].starts_with("$a{") {
+                let brace = i + 2;
+                if let Some(close) = find_marker_end(text, brace) {
+                    markers.push(text[brace + 1..close].trim().to_string());
+                    i = close + 1;
+                    continue;
+                }
+            }
+        }
+        i += utf8_len(bytes[i]);
+    }
+    markers
+}
+
+/// The index of the `}` closing the marker whose `{` is at `brace`, skipping any
+/// `}` inside a `"…"` span. `None` if unterminated.
+fn find_marker_end(text: &str, brace: usize) -> Option<usize> {
+    let b = text.as_bytes();
+    let mut i = brace + 1;
+    let mut in_quote = false;
+    while i < b.len() {
+        match b[i] {
+            b'\\' if in_quote => i += 2,
+            b'"' => {
+                in_quote = !in_quote;
+                i += 1;
+            }
+            b'}' if !in_quote => return Some(i),
+            c => i += utf8_len(c),
+        }
+    }
+    None
+}
+
+/// The byte length of the UTF-8 sequence starting with `first`.
+fn utf8_len(first: u8) -> usize {
+    match first {
+        b if b < 0x80 => 1,
+        b if b >> 5 == 0b110 => 2,
+        b if b >> 4 == 0b1110 => 3,
+        _ => 4,
+    }
+}
+
+/// Parse a marker body `<iri>[?k=v&…]` into its IRI and a Source request.
+fn marker_request(inner: &str) -> Result<(Iri, Request), String> {
+    let (iri_str, query) = match inner.split_once('?') {
+        Some((iri, q)) => (iri.trim(), Some(q)),
+        None => (inner.trim(), None),
+    };
+    let iri = Iri::parse(iri_str).map_err(|e| e.to_string())?;
+    let mut request = Request::new(Verb::Source, iri.clone());
+    if let Some(query) = query {
+        for pair in query.split('&') {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                continue;
+            }
+            if let Some((key, value)) = pair.split_once('=') {
+                let value = unquote(value.trim());
+                request = request.with_arg(key.trim(), ArgRef::Inline(value.into_bytes()));
+            }
+        }
+    }
+    Ok((iri, request))
+}
+
+/// Strip surrounding double quotes from a marker value, unescaping `\"` / `\\`.
+fn unquote(value: &str) -> String {
+    let b = value.as_bytes();
+    if b.len() >= 2 && b[0] == b'"' && b[b.len() - 1] == b'"' {
+        let mut out = String::with_capacity(value.len() - 2);
+        let mut chars = value[1..value.len() - 1].chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => out.push(chars.next().unwrap_or('\\')),
+                _ => out.push(c),
+            }
+        }
+        out
+    } else {
+        value.to_string()
+    }
 }
 
 /// Split off the first whitespace-delimited token; trim the remainder.
