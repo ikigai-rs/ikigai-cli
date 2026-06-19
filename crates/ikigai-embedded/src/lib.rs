@@ -159,7 +159,10 @@ fn local_space(nature: &'static str) -> EndpointSpace {
 /// their identity — the engine's default root capability — and the REPL's `cap`
 /// command lets them voluntarily attenuate it before handing work to an agent.
 pub fn kernel() -> Kernel {
-    Kernel::with_meta_renderer(Arc::new(local_space("Embedded (Native)")), Arc::new(CliRenderer))
+    Kernel::with_meta_renderer(
+        Arc::new(local_space("Embedded (Native)")),
+        Arc::new(CliRenderer),
+    )
 }
 
 /// Build a **trusted served** kernel (for IPC), *including* the personal space.
