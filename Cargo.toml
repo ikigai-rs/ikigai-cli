@@ -13,10 +13,12 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 [workspace.dependencies]
 # The released kernel, consumed from crates.io. For local cross-repo development
 # against a sibling checkout, use .cargo/config.toml (see .cargo/config.toml.example).
-ikigai-core = "0.1.5"  # needs builtins::compose (0.1.5)
+ikigai-core = "0.1.6"  # capability attenuation (attenuate/allows/scopes)
 ikigai-vocab = "0.1"
 # The reusable function library, linked in as a published module crate.
 ikigai-fn = "0.1.0"
+# Personal contexts (urn:personal:*), macOS-backed, linked as a published module.
+ikigai-personal = "0.1.0"
 ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.1.0" }
 ikigai-wire = { path = "crates/ikigai-wire", version = "0.1.0" }
 futures = "0.3"

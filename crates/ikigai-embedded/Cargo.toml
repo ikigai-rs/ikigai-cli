@@ -11,6 +11,7 @@ repository.workspace = true
 ikigai-core = { workspace = true }
 ikigai-vocab = { workspace = true }
 ikigai-fn = { workspace = true }
+ikigai-personal = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]

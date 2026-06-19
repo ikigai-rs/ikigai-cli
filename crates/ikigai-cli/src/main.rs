@@ -202,7 +202,13 @@ fn main() {
 #[cfg(feature = "embedded")]
 fn build_engine(connect: Option<Option<String>>, certs: &Certs) -> Result<Engine, String> {
     match connect {
-        None => Ok(Engine::new(ikigai_embedded::kernel())),
+        None => {
+            let engine = Engine::new(ikigai_embedded::kernel());
+            // A friendly profile for the personal-data demo: `cap freebusy` drops
+            // the session to the calendar's free/busy projection.
+            engine.define_cap_profile("freebusy", ["urn:cap:personal:calendar:read:freebusy"]);
+            Ok(engine)
+        }
         Some(target) => match target.as_deref() {
             Some(t) if is_quic(t) => connect_quic(t, certs),
             _ => connect_ipc(target),
