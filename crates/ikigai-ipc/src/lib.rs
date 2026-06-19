@@ -111,6 +111,10 @@ impl Resolver for IpcResolver {
             _ => None,
         }
     }
+
+    fn transport(&self) -> String {
+        "ipc · unix domain socket (peercred-verified, same user)".to_string()
+    }
 }
 
 /// Serve one connection: answer calls until the peer hangs up (or a wire error).

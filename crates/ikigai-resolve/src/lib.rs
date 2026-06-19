@@ -59,6 +59,12 @@ pub trait Resolver {
 
     /// The resources bound in the kernel's space, or `None` if it can't enumerate.
     fn entries(&self) -> Option<Vec<SpaceEntry>>;
+
+    /// A short human label for the transport this resolver speaks over — shown by
+    /// the REPL's `trace` command. The default is the in-process kernel.
+    fn transport(&self) -> String {
+        "embedded · in-process".to_string()
+    }
 }
 
 /// The in-process kernel as a [`Resolver`]: drive it directly, inferring the

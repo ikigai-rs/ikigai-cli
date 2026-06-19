@@ -33,6 +33,7 @@ commands:
   describe <iri> [type]      META a resource; `type` defaults to text/turtle
   cache <iri> [args]         report whether resolving it would hit the cache (no resolve)
   cap [scope…]               show the session capability, narrow it to `scope`s, or `cap reset`
+  trace <iri> [args]         resolve a resource and show its path: client, transport, endpoint
   config [key=value]         show settings, or save one (e.g. config keybindings=emacs)
   list                       list the resources bound in the current space
   help                       show this help
@@ -208,6 +209,7 @@ impl Engine {
             "config" => output(self, run_config(rest)),
             "cache" => output(self, self.run_cache(rest)),
             "cap" => output(self, self.run_cap(rest)),
+            "trace" => output(self, self.run_trace(rest)),
             "source" | "src" => output(self, self.run_pipeline(rest)),
             "describe" | "desc" => {
                 let (target, ty) = split_first_word(rest);
@@ -454,6 +456,77 @@ impl Engine {
                 scopes.iter().cloned().collect::<Vec<_>>().join(", ")
             ),
         }
+    }
+
+    /// `trace` command: resolve a single resource and show its path — the client
+    /// and the capability it ran under, the transport it reached the kernel by,
+    /// the endpoint that answered, the cache outcome, and the output's type/size.
+    /// The resolution actually happens (this is the real path), so the result is
+    /// cached just like a `source`.
+    fn run_trace(&self, spec: &str) -> Result<String, String> {
+        let pipeline = parse_spec(spec)?;
+        let words = match pipeline {
+            Pipeline {
+                first: Node::Source(words),
+                rest,
+            } if rest.is_empty() => words,
+            _ => {
+                return Err(
+                    "`trace` follows a single resource — no `|`, `..`, or `( )`".to_string()
+                )
+            }
+        };
+        let (target, args) = words.split_first().ok_or("expected an IRI")?;
+        let iri = parse_target(target)?;
+        let request = self.source_request(target, args, None)?;
+        let endpoint = self.endpoint_for(&iri);
+        let capability = self.capability.borrow();
+        let (representation, status) = self.resolver.issue_as(request, &capability)?;
+        let cache = match status {
+            CacheStatus::Hit => "cached",
+            CacheStatus::Miss => "computed",
+            CacheStatus::Uncacheable => "uncacheable (a live fact)",
+        };
+        let preview = {
+            let text = String::from_utf8_lossy(&representation.bytes);
+            let first: String = text.lines().next().unwrap_or("").trim().chars().take(56).collect();
+            if text.lines().count() > 1 || first.chars().count() == 56 {
+                format!("{first} …")
+            } else {
+                first
+            }
+        };
+        Ok(format!(
+            "trace  {iri}\n  \
+             client      ikigai repl  ·  {}\n  \
+             transport   {}\n  \
+             endpoint    {endpoint}\n  \
+             cache       {cache}\n  \
+             output      {} · {} bytes\n  \
+             result      {preview}",
+            self.describe_capability(),
+            self.resolver.transport(),
+            representation.repr_type.canonical(),
+            representation.bytes.len(),
+        ))
+    }
+
+    /// Name the binding that answers `iri`, from the resolver's listed entries —
+    /// for `trace`'s endpoint line. Exact match first, then a template whose
+    /// literal prefix matches; otherwise it's a sub-space or remote endpoint.
+    fn endpoint_for(&self, iri: &Iri) -> String {
+        let entries = self.resolver.entries().unwrap_or_default();
+        let target = iri.as_str();
+        if let Some(entry) = entries.iter().find(|entry| entry.pattern == target) {
+            return format!("{}  ←  {} (exact)", entry.endpoint, entry.pattern);
+        }
+        if let Some(entry) = entries.iter().find(|entry| {
+            entry.pattern.contains('{')
+                && target.starts_with(entry.pattern.split('{').next().unwrap_or(""))
+        }) {
+            return format!("{}  ←  {} (template)", entry.endpoint, entry.pattern);
+        }
+        "(not a listed binding — a sub-space or remote endpoint)".to_string()
     }
 
     /// List the bindings of the kernel's root space (pattern → endpoint), or an
