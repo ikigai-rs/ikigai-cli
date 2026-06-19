@@ -14,9 +14,10 @@
 //! contract is fetched through `issue`, so this works the same against a remote
 //! kernel.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 
-use ikigai_core::{ArgRef, Description, InputSource, Iri, Request, Verb};
+use ikigai_core::{ArgRef, Capability, Description, InputSource, Iri, Request, Verb};
 use ikigai_resolve::{CacheStatus, Resolver};
 
 use crate::config;
@@ -31,6 +32,7 @@ commands:
   source a | ( b ; c )       fork: fan the input to each branch, join their outputs
   describe <iri> [type]      META a resource; `type` defaults to text/turtle
   cache <iri> [args]         report whether resolving it would hit the cache (no resolve)
+  cap [scope…]               show the session capability, narrow it to `scope`s, or `cap reset`
   config [key=value]         show settings, or save one (e.g. config keybindings=emacs)
   list                       list the resources bound in the current space
   help                       show this help
@@ -133,14 +135,53 @@ pub struct Engine {
     /// Interior-mutable so the `&self` resolution path can tally without
     /// threading an accumulator through every stage; the REPL is single-threaded.
     cache: Cell<CacheStats>,
+    /// The session's current authority — every request resolves under it. It
+    /// starts at `identity` and the `cap` command can only ever *narrow* it.
+    capability: RefCell<Capability>,
+    /// The authority this session was opened with (the host's identity). `cap
+    /// reset` returns here — the owner-only move; a holder of a narrowed
+    /// capability has no identity to widen back to.
+    identity: Capability,
+    /// Named capability profiles a host registers (e.g. `freebusy` → a set of
+    /// `urn:cap:` scopes), so `cap <name>` reads friendlier than a scope list.
+    profiles: RefCell<HashMap<String, Vec<String>>>,
 }
 
 impl Engine {
+    /// An engine that resolves with full (root) authority — the trusted,
+    /// same-process default.
     pub fn new(resolver: impl Resolver + 'static) -> Self {
+        Self::with_identity(resolver, Capability::root())
+    }
+
+    /// An engine whose session authority is derived from a caller's identity.
+    /// The session starts at `identity`, and `cap reset` returns to it.
+    pub fn with_identity(resolver: impl Resolver + 'static, identity: Capability) -> Self {
         Self {
             resolver: Box::new(resolver),
             cache: Cell::new(CacheStats::default()),
+            capability: RefCell::new(identity.clone()),
+            identity,
+            profiles: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// The session's current capability.
+    pub fn capability(&self) -> Capability {
+        self.capability.borrow().clone()
+    }
+
+    /// Register a named capability profile — `cap <name>` then attenuates to its
+    /// scopes (e.g. `freebusy`). A host sets these so the REPL reads friendlier
+    /// than a bare scope list.
+    pub fn define_cap_profile(
+        &self,
+        name: impl Into<String>,
+        scopes: impl IntoIterator<Item = impl Into<String>>,
+    ) {
+        self.profiles
+            .borrow_mut()
+            .insert(name.into(), scopes.into_iter().map(Into::into).collect());
     }
 
     /// Evaluate one input line.
@@ -166,6 +207,7 @@ impl Engine {
             "list" | "ls" => output(self, self.run_list()),
             "config" => output(self, run_config(rest)),
             "cache" => output(self, self.run_cache(rest)),
+            "cap" => output(self, self.run_cap(rest)),
             "source" | "src" => output(self, self.run_pipeline(rest)),
             "describe" | "desc" => {
                 let (target, ty) = split_first_word(rest);
@@ -374,6 +416,46 @@ impl Engine {
         })
     }
 
+    /// `cap` command: show, narrow, or reset the session capability.
+    ///
+    /// `cap` shows the current authority; `cap <scope>…` narrows it to the given
+    /// `urn:cap:` scopes (intersected with what's already held — it can only ever
+    /// shrink); `cap reset` returns to the session's identity. This is how the
+    /// owner voluntarily gives up authority before handing work to an agent.
+    fn run_cap(&self, rest: &str) -> Result<String, String> {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return Ok(self.describe_capability());
+        }
+        if rest == "reset" {
+            *self.capability.borrow_mut() = self.identity.clone();
+            return Ok(format!("reset to identity — {}", self.describe_capability()));
+        }
+        // A registered profile name expands to its scopes; otherwise each word is
+        // taken as a `urn:cap:` scope directly.
+        let scopes: Vec<String> = match self.profiles.borrow().get(rest) {
+            Some(scopes) => scopes.clone(),
+            None => rest.split_whitespace().map(str::to_string).collect(),
+        };
+        let narrowed = self.capability.borrow().attenuate(scopes);
+        *self.capability.borrow_mut() = narrowed;
+        Ok(format!("narrowed — {}", self.describe_capability()))
+    }
+
+    /// A one-line summary of the session capability.
+    fn describe_capability(&self) -> String {
+        match self.capability.borrow().scopes() {
+            None => "capability: root (full authority)".to_string(),
+            Some(scopes) if scopes.is_empty() => {
+                "capability: empty (no scopes granted)".to_string()
+            }
+            Some(scopes) => format!(
+                "capability: {}",
+                scopes.iter().cloned().collect::<Vec<_>>().join(", ")
+            ),
+        }
+    }
+
     /// List the bindings of the kernel's root space (pattern → endpoint), or an
     /// error if the space doesn't support enumeration.
     fn run_list(&self) -> Result<String, String> {
@@ -410,8 +492,10 @@ impl Engine {
         let request = Request::new(Verb::Meta, iri.clone())
             .with_arg("as", ArgRef::Inline(b"application/json".to_vec()));
         // The contract fetch is internal plumbing — its cache outcome isn't part
-        // of the user-facing tally, so the status is discarded.
-        let (representation, _) = self.resolver.issue(request).ok()?;
+        // of the user-facing tally, so the status is discarded. It resolves under
+        // the session capability, like any request.
+        let capability = self.capability.borrow();
+        let (representation, _) = self.resolver.issue_as(request, &capability).ok()?;
         serde_json::from_slice(&representation.bytes).ok()
     }
 
@@ -419,7 +503,8 @@ impl Engine {
     /// representation as UTF-8 text. The resolver reports the [`CacheStatus`]
     /// directly — for a remote kernel the server knows it without a probe.
     fn run(&self, request: Request) -> Result<String, String> {
-        let (representation, status) = self.resolver.issue(request)?;
+        let capability = self.capability.borrow();
+        let (representation, status) = self.resolver.issue_as(request, &capability)?;
         let mut stats = self.cache.get();
         stats.record(status);
         self.cache.set(stats);
@@ -777,6 +862,39 @@ mod tests {
         // A different input is a fresh computation.
         let other = entry(engine.eval("source urn:fn:toUpper bye"));
         assert_eq!(other.cache.label().as_deref(), Some("computed"));
+    }
+
+    #[test]
+    fn cap_attenuates_the_session_and_endpoints_observe_it() {
+        // An endpoint that projects on the session capability — full detail vs a
+        // minimized view, exactly like urn:personal:calendar.
+        let cal = FnEndpoint::new("cal", |inv: &Invocation<'_>| {
+            let body = if inv.capability.allows("urn:cap:demo:cal:read:detail") {
+                "DETAIL"
+            } else {
+                "freebusy"
+            };
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                body.as_bytes().to_vec(),
+            ))
+        });
+        let space = EndpointSpace::new().bind(Exact::new("urn:demo:cal"), cal);
+        let engine = Engine::with_identity(
+            Kernel::with_meta_renderer(Arc::new(space), Arc::new(JsonRenderer)),
+            Capability::root(),
+        );
+        // Identity (root) sees detail.
+        assert_eq!(output(engine.eval("source urn:demo:cal")).unwrap(), "DETAIL");
+        // Give it up: narrow to the free/busy scope only.
+        engine.eval("cap urn:cap:demo:cal:read:freebusy");
+        assert_eq!(output(engine.eval("source urn:demo:cal")).unwrap(), "freebusy");
+        // You cannot widen back by asking for detail — attenuation only narrows.
+        engine.eval("cap urn:cap:demo:cal:read:detail");
+        assert_eq!(output(engine.eval("source urn:demo:cal")).unwrap(), "freebusy");
+        // Reset returns to identity (root) — the owner-only move.
+        engine.eval("cap reset");
+        assert_eq!(output(engine.eval("source urn:demo:cal")).unwrap(), "DETAIL");
     }
 
     #[test]

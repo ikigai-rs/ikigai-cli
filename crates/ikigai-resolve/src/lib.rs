@@ -33,8 +33,25 @@ pub enum CacheStatus {
 /// human-readable strings — the engine reports them verbatim; a richer transport
 /// error type can replace `String` when the wire protocol lands.
 pub trait Resolver {
-    /// Resolve `request` and report its representation and cache outcome.
+    /// Resolve `request` under the resolver's default authority, and report its
+    /// representation and cache outcome.
     fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), String>;
+
+    /// Resolve `request` under an explicit `capability`.
+    ///
+    /// The default ignores the capability and delegates to [`issue`](Resolver::issue)
+    /// — correct for a resolver that can't yet carry authority (a wire resolver,
+    /// until capability-on-the-wire lands; the server resolves under its own
+    /// default). The in-process kernel overrides this to enforce the capability,
+    /// which is what lets the REPL's `cap` command attenuate a local session.
+    fn issue_as(
+        &self,
+        request: Request,
+        capability: &Capability,
+    ) -> Result<(Representation, CacheStatus), String> {
+        let _ = capability;
+        self.issue(request)
+    }
 
     /// Whether resolving `request` would be served from the cache, without
     /// resolving it.
@@ -51,9 +68,17 @@ pub trait Resolver {
 /// trusted, same-process path.
 impl Resolver for Kernel {
     fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), String> {
+        self.issue_as(request, &Capability::root())
+    }
+
+    fn issue_as(
+        &self,
+        request: Request,
+        capability: &Capability,
+    ) -> Result<(Representation, CacheStatus), String> {
         let before = self.cache_len();
-        let representation = block_on(Kernel::issue(self, request, &Capability::root()))
-            .map_err(|e| e.to_string())?;
+        let representation =
+            block_on(Kernel::issue(self, request, capability)).map_err(|e| e.to_string())?;
         let status = if representation.expiry != Expiry::Never {
             CacheStatus::Uncacheable
         } else if self.cache_len() > before {

@@ -12,8 +12,8 @@
 use std::sync::Arc;
 
 use ikigai_core::{
-    Description, Error, Exact, FnEndpoint, Invocation, Kernel, MetaRenderer, ReprType,
-    Representation, Result, Verb,
+    Description, EndpointSpace, Error, Exact, FnEndpoint, Invocation, Kernel, MetaRenderer,
+    ReprType, Representation, Result, Verb,
 };
 use ikigai_vocab::TurtleRenderer;
 
@@ -100,24 +100,46 @@ fn host_info(nature: &'static str) -> FnEndpoint {
     )
 }
 
-/// Build the embedded demo kernel (nature `Embedded (Native)`).
-pub fn kernel() -> Kernel {
-    kernel_for("Embedded (Native)")
+/// The base demo space: the linked [`ikigai_fn`] function library plus this
+/// host's own resources (the `page` shape and `urn:host:info`). Used as-is for a
+/// *served* kernel — it deliberately omits the personal space, which must not be
+/// exposed over the wire until capability-on-the-wire and remote auth land.
+fn base_space(nature: &'static str) -> EndpointSpace {
+    ikigai_fn::space()
+        .bind(Exact::new("urn:data:page"), page())
+        .bind(Exact::new("urn:host:info"), host_info(nature))
 }
 
-/// Build the embedded demo kernel with the host nature `urn:host:info` reports —
-/// so a server can label itself `Remote (IPC)` / `Remote (QUIC)` while serving this
-/// same kernel, and a connected client sees how it reached it.
-///
-/// The reusable functions are mounted from the linked [`ikigai_fn`] module crate
-/// ([`ikigai_fn::space`]); this host chains only its own endpoints — the demo
-/// `page` shape and `urn:host:info` — on top, demonstrating a host *composing* a
-/// kernel from a module library plus its own bindings.
-pub fn kernel_for(nature: &'static str) -> Kernel {
-    let space = ikigai_fn::space()
-        .bind(Exact::new("urn:data:page"), page())
-        .bind(Exact::new("urn:host:info"), host_info(nature));
+/// Build the **local** embedded kernel (nature `Embedded (Native)`), including
+/// the personal space (`urn:personal:*`) from the linked [`ikigai_personal`]
+/// module. The running user *is* the owner, so it resolves under their identity —
+/// the engine's default root capability — and the REPL's `cap` command lets them
+/// voluntarily attenuate it (e.g. to free/busy) before handing work to an agent.
+pub fn kernel() -> Kernel {
+    let space = base_space("Embedded (Native)")
+        .bind(
+            Exact::new("urn:personal:contacts"),
+            ikigai_personal::contacts(),
+        )
+        .bind(
+            Exact::new("urn:personal:calendar"),
+            ikigai_personal::calendar(),
+        )
+        .bind(
+            Exact::new("urn:personal:availability"),
+            ikigai_personal::availability(),
+        );
     Kernel::with_meta_renderer(Arc::new(space), Arc::new(CliRenderer))
+}
+
+/// Build a **served** kernel labelled `nature` (`Remote (IPC)` / `Remote (QUIC)`).
+///
+/// This is the kernel a server exposes, so it has **no personal space**: a remote
+/// client has no capability for it yet, and the server resolves under a default
+/// authority — exposing `urn:personal:*` would leak it. The personal space stays
+/// local-only until capability-on-the-wire and remote authentication land.
+pub fn kernel_for(nature: &'static str) -> Kernel {
+    Kernel::with_meta_renderer(Arc::new(base_space(nature)), Arc::new(CliRenderer))
 }
 
 #[cfg(test)]
