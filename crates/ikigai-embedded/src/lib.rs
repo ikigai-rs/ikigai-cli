@@ -110,13 +110,11 @@ fn base_space(nature: &'static str) -> EndpointSpace {
         .bind(Exact::new("urn:host:info"), host_info(nature))
 }
 
-/// Build the **local** embedded kernel (nature `Embedded (Native)`), including
-/// the personal space (`urn:personal:*`) from the linked [`ikigai_personal`]
-/// module. The running user *is* the owner, so it resolves under their identity —
-/// the engine's default root capability — and the REPL's `cap` command lets them
-/// voluntarily attenuate it (e.g. to free/busy) before handing work to an agent.
-pub fn kernel() -> Kernel {
-    let space = base_space("Embedded (Native)")
+/// The base space plus the personal space (`urn:personal:*`) from the linked
+/// [`ikigai_personal`] module — for a kernel a *trusted* principal drives (the
+/// local owner, or an IPC peer the OS verified is the same user).
+fn local_space(nature: &'static str) -> EndpointSpace {
+    base_space(nature)
         .bind(
             Exact::new("urn:personal:contacts"),
             ikigai_personal::contacts(),
@@ -128,16 +126,32 @@ pub fn kernel() -> Kernel {
         .bind(
             Exact::new("urn:personal:availability"),
             ikigai_personal::availability(),
-        );
-    Kernel::with_meta_renderer(Arc::new(space), Arc::new(CliRenderer))
+        )
 }
 
-/// Build a **served** kernel labelled `nature` (`Remote (IPC)` / `Remote (QUIC)`).
+/// Build the **local** embedded kernel (nature `Embedded (Native)`), including
+/// the personal space. The running user *is* the owner, so it resolves under
+/// their identity — the engine's default root capability — and the REPL's `cap`
+/// command lets them voluntarily attenuate it before handing work to an agent.
+pub fn kernel() -> Kernel {
+    Kernel::with_meta_renderer(Arc::new(local_space("Embedded (Native)")), Arc::new(CliRenderer))
+}
+
+/// Build a **trusted served** kernel (for IPC), *including* the personal space.
 ///
-/// This is the kernel a server exposes, so it has **no personal space**: a remote
-/// client has no capability for it yet, and the server resolves under a default
-/// authority — exposing `urn:personal:*` would leak it. The personal space stays
-/// local-only until capability-on-the-wire and remote authentication land.
+/// Safe because the IPC server peercred-verifies that the connecting peer is the
+/// same OS user — the owner — so it's as trusted as the local kernel. The client
+/// carries its (possibly attenuated) capability, which the server clamps to that
+/// principal. Distinct from [`kernel_for`], the QUIC kernel, which omits personal
+/// because a QUIC peer isn't authenticated yet.
+pub fn trusted_kernel_for(nature: &'static str) -> Kernel {
+    Kernel::with_meta_renderer(Arc::new(local_space(nature)), Arc::new(CliRenderer))
+}
+
+/// Build a **served** kernel for an *unauthenticated* transport (QUIC), labelled
+/// `nature`. It has **no personal space**: a QUIC peer has no capability for it
+/// yet and the server resolves under a default authority, so exposing
+/// `urn:personal:*` would leak it — gated on remote auth + capability-on-the-wire.
 pub fn kernel_for(nature: &'static str) -> Kernel {
     Kernel::with_meta_renderer(Arc::new(base_space(nature)), Arc::new(CliRenderer))
 }

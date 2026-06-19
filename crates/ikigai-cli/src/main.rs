@@ -197,18 +197,21 @@ fn main() {
     }
 }
 
+/// Register the demo capability profiles on an engine (so `cap freebusy` reads
+/// friendlier than a scope list). Applied to every backend — embedded and, over
+/// IPC, the capability is carried to the server so it takes effect there too.
+#[cfg(feature = "embedded")]
+fn with_profiles(engine: Engine) -> Engine {
+    engine.define_cap_profile("freebusy", ["urn:cap:personal:calendar:read:freebusy"]);
+    engine
+}
+
 /// Build the engine over the chosen backend: the embedded kernel, or — with
 /// `--connect` — an IPC or QUIC client, dispatched by the target.
 #[cfg(feature = "embedded")]
 fn build_engine(connect: Option<Option<String>>, certs: &Certs) -> Result<Engine, String> {
     match connect {
-        None => {
-            let engine = Engine::new(ikigai_embedded::kernel());
-            // A friendly profile for the personal-data demo: `cap freebusy` drops
-            // the session to the calendar's free/busy projection.
-            engine.define_cap_profile("freebusy", ["urn:cap:personal:calendar:read:freebusy"]);
-            Ok(engine)
-        }
+        None => Ok(with_profiles(Engine::new(ikigai_embedded::kernel()))),
         Some(target) => match target.as_deref() {
             Some(t) if is_quic(t) => connect_quic(t, certs),
             _ => connect_ipc(target),
@@ -303,7 +306,7 @@ fn connect_quic(target: &str, certs: &Certs) -> Result<Engine, String> {
     let trusted = quic::trusted_server_cert(certs)?;
     let resolver = ikigai_quic::connect(addr, &identity, &trusted)
         .map_err(|e| format!("connect {target}: {e}"))?;
-    Ok(Engine::new(resolver))
+    Ok(with_profiles(Engine::new(resolver)))
 }
 
 #[cfg(all(feature = "embedded", not(feature = "quic")))]
@@ -323,7 +326,7 @@ fn connect_quic(_target: &str, _certs: &Certs) -> Result<Engine, String> {
 fn serve_ipc(path: Option<String>) -> ! {
     let socket = ipc_socket(path);
     eprintln!("ikigai: serving on {}  (Ctrl-C to stop)", socket.display());
-    match ikigai_ipc::serve(ikigai_embedded::kernel_for("Remote (IPC)"), &socket) {
+    match ikigai_ipc::serve(ikigai_embedded::trusted_kernel_for("Remote (IPC)"), &socket) {
         Ok(()) => std::process::exit(0),
         Err(e) => {
             eprintln!("ikigai: serve error: {e}");
@@ -337,7 +340,7 @@ fn connect_ipc(path: Option<String>) -> Result<Engine, String> {
     let socket = ipc_socket(path);
     let resolver =
         ikigai_ipc::connect(&socket).map_err(|e| format!("connect {}: {e}", socket.display()))?;
-    Ok(Engine::new(resolver))
+    Ok(with_profiles(Engine::new(resolver)))
 }
 
 /// Resolve an explicit Unix socket path, or the secure default, exiting if
