@@ -431,7 +431,10 @@ impl Engine {
         }
         if rest == "reset" {
             *self.capability.borrow_mut() = self.identity.clone();
-            return Ok(format!("reset to identity — {}", self.describe_capability()));
+            return Ok(format!(
+                "reset to identity — {}",
+                self.describe_capability()
+            ));
         }
         // A registered profile name expands to its scopes; otherwise each word is
         // taken as a `urn:cap:` scope directly.
@@ -473,9 +476,7 @@ impl Engine {
                 rest,
             } if rest.is_empty() => words,
             _ => {
-                return Err(
-                    "`trace` follows a single resource — no `|`, `..`, or `( )`".to_string()
-                )
+                return Err("`trace` follows a single resource — no `|`, `..`, or `( )`".to_string())
             }
         };
         let (target, args) = words.split_first().ok_or("expected an IRI")?;
@@ -485,12 +486,23 @@ impl Engine {
         let entries = self.resolver.entries().unwrap_or_default();
         let mut out = vec![
             format!("trace  {iri}"),
-            format!("  client      ikigai repl  ·  {}", self.describe_capability()),
+            format!(
+                "  client      ikigai repl  ·  {}",
+                self.describe_capability()
+            ),
             format!("  transport   {}", self.resolver.transport()),
             String::new(),
         ];
         self.trace_node(
-            iri, request, &capability, &entries, String::new(), true, true, 0, &mut out,
+            iri,
+            request,
+            &capability,
+            &entries,
+            String::new(),
+            true,
+            true,
+            0,
+            &mut out,
         );
         Ok(out.join("\n"))
     }
@@ -569,9 +581,9 @@ impl Engine {
                     }
                 }
             }
-            Err(message) => {
-                out.push(format!("{prefix}{branch}{label}   {endpoint} · error: {message}"))
-            }
+            Err(message) => out.push(format!(
+                "{prefix}{branch}{label}   {endpoint} · error: {message}"
+            )),
         }
     }
 
@@ -1158,16 +1170,28 @@ mod tests {
             Capability::root(),
         );
         // Identity (root) sees detail.
-        assert_eq!(output(engine.eval("source urn:demo:cal")).unwrap(), "DETAIL");
+        assert_eq!(
+            output(engine.eval("source urn:demo:cal")).unwrap(),
+            "DETAIL"
+        );
         // Give it up: narrow to the free/busy scope only.
         engine.eval("cap urn:cap:demo:cal:read:freebusy");
-        assert_eq!(output(engine.eval("source urn:demo:cal")).unwrap(), "freebusy");
+        assert_eq!(
+            output(engine.eval("source urn:demo:cal")).unwrap(),
+            "freebusy"
+        );
         // You cannot widen back by asking for detail — attenuation only narrows.
         engine.eval("cap urn:cap:demo:cal:read:detail");
-        assert_eq!(output(engine.eval("source urn:demo:cal")).unwrap(), "freebusy");
+        assert_eq!(
+            output(engine.eval("source urn:demo:cal")).unwrap(),
+            "freebusy"
+        );
         // Reset returns to identity (root) — the owner-only move.
         engine.eval("cap reset");
-        assert_eq!(output(engine.eval("source urn:demo:cal")).unwrap(), "DETAIL");
+        assert_eq!(
+            output(engine.eval("source urn:demo:cal")).unwrap(),
+            "DETAIL"
+        );
     }
 
     #[test]
