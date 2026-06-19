@@ -3,12 +3,17 @@
 //! This is the simplest "attach to a kernel instance" binding — no network, no
 //! IPC. The kernel, its endpoints, and its cache all live in the calling process.
 //! Other transports (IPC, QUIC) front the same `Issuer` interface over a wire.
+//!
+//! The reusable function endpoints (`toUpper`, `reverseList`, `wrap`, `split`,
+//! `greet`, `echo`, `compose`) are not defined here — they come from the linked
+//! [`ikigai_fn`] module crate, mounted via [`ikigai_fn::space`]. This host adds
+//! only its own endpoints: the demo `page` shape and `urn:host:info`.
 
 use std::sync::Arc;
 
 use ikigai_core::{
-    builtins, ArgSpec, Description, EndpointSpace, Error, Exact, FnEndpoint, Invocation, Kernel,
-    MetaRenderer, ReprType, Representation, Result, UriTemplate, Verb,
+    Description, Error, Exact, FnEndpoint, Invocation, Kernel, MetaRenderer, ReprType,
+    Representation, Result, Verb,
 };
 use ikigai_vocab::TurtleRenderer;
 
@@ -30,91 +35,6 @@ impl MetaRenderer for CliRenderer {
         }
         TurtleRenderer.render(description, target)
     }
-}
-
-/// `wrap`: surrounds the `text` argument with square brackets. Its argument is
-/// deliberately named `text`, not `in`, so the REPL's self-description-driven
-/// routing is visible — `source urn:demo:wrap hi` works only because the contract
-/// says the input goes to `text`, and it makes pipelines show their work
-/// (`source urn:fn:toUpper hi | urn:demo:wrap` → `[HI]`).
-fn wrap_impl(inv: &Invocation<'_>) -> Result<Representation> {
-    let text = inv.inline_str("text")?;
-    Ok(Representation::new(
-        ReprType::new("text/plain").with_param("charset", "utf-8"),
-        format!("[{text}]").into_bytes(),
-    )
-    .cacheable())
-}
-
-fn wrap() -> FnEndpoint {
-    FnEndpoint::new("wrap", wrap_impl).with_description(
-        Description::new("wrap")
-            .title("Wrap")
-            .summary("Surrounds the `text` argument with square brackets.")
-            .verb(Verb::Source)
-            .verb(Verb::Meta)
-            .input(ArgSpec::new("text").summary("the text to wrap"))
-            .output("text/plain;charset=utf-8"),
-    )
-}
-
-/// `split`: splits the `in` argument on commas (trimming each) into
-/// newline-separated items. It exists so the demo space has a *list producer*
-/// for the `..` map operator to iterate — `source urn:demo:split "a, b, c" ..
-/// urn:fn:toUpper` runs `toUpper` per item and rejoins (`A`/`B`/`C`). The
-/// newline-separated list is the same convention `reverseList` reads.
-fn split_impl(inv: &Invocation<'_>) -> Result<Representation> {
-    let input = inv.inline_str("in")?;
-    let items = input
-        .split(',')
-        .map(str::trim)
-        .collect::<Vec<_>>()
-        .join("\n");
-    Ok(Representation::new(
-        ReprType::new("text/plain").with_param("charset", "utf-8"),
-        items.into_bytes(),
-    )
-    .cacheable())
-}
-
-fn split() -> FnEndpoint {
-    FnEndpoint::new("split", split_impl).with_description(
-        Description::new("split")
-            .title("Split")
-            .summary("Splits the `in` argument on commas into newline-separated items.")
-            .verb(Verb::Source)
-            .verb(Verb::Meta)
-            .input(ArgSpec::new("in").summary("comma-separated items"))
-            .output("text/plain;charset=utf-8"),
-    )
-}
-
-/// `greet`: combines two arguments, `greeting` and `name`, into `"{greeting},
-/// {name}"`. It's the demo space's *multi-argument* endpoint — `source
-/// urn:demo:greet greeting=Hello name=World` names both; with one named, the
-/// positional text or a piped value fills the other (`source urn:demo:greet
-/// Hello name=World`, or `… | urn:demo:greet name=World`).
-fn greet_impl(inv: &Invocation<'_>) -> Result<Representation> {
-    let greeting = inv.inline_str("greeting")?;
-    let name = inv.inline_str("name")?;
-    Ok(Representation::new(
-        ReprType::new("text/plain").with_param("charset", "utf-8"),
-        format!("{greeting}, {name}").into_bytes(),
-    )
-    .cacheable())
-}
-
-fn greet() -> FnEndpoint {
-    FnEndpoint::new("greet", greet_impl).with_description(
-        Description::new("greet")
-            .title("Greet")
-            .summary("Combines `greeting` and `name` into a greeting.")
-            .verb(Verb::Source)
-            .verb(Verb::Meta)
-            .input(ArgSpec::new("greeting").summary("the salutation, e.g. Hello"))
-            .input(ArgSpec::new("name").summary("who to greet"))
-            .output("text/plain;charset=utf-8"),
-    )
 }
 
 /// `urn:data:page`: a demo *shape* for `compose`. A text template whose
@@ -163,7 +83,7 @@ fn host_info(nature: &'static str) -> FnEndpoint {
         };
         let body = format!(
             "ikigai host\n  nature    {nature}\n  runtime   {runtime}\n  \
-             space     demo (toUpper · reverseList · wrap · split · greet · echo · compose)\n"
+             space     ikigai-fn (toUpper · reverseList · wrap · split · greet · echo · compose)\n"
         );
         Ok(Representation::new(
             ReprType::new("text/plain").with_param("charset", "utf-8"),
@@ -189,24 +109,14 @@ pub fn kernel() -> Kernel {
 /// so a server can label itself `Remote (IPC)` / `Remote (QUIC)` while serving this
 /// same kernel, and a connected client sees how it reached it.
 ///
-/// The space deliberately exercises every input style: `toUpper` / `reverseList`
-/// read the `in` argument; `wrap` reads a differently-named `text` argument (so the
-/// contract-driven routing is visible); `echo` reads a `{message}` binding captured
-/// from the IRI; `split` produces a newline list, giving the `..` map operator
-/// something to iterate; `greet` takes two arguments, exercising `name=value`
-/// routing. This is the demo space; a real host composes its own endpoints here.
+/// The reusable functions are mounted from the linked [`ikigai_fn`] module crate
+/// ([`ikigai_fn::space`]); this host chains only its own endpoints — the demo
+/// `page` shape and `urn:host:info` — on top, demonstrating a host *composing* a
+/// kernel from a module library plus its own bindings.
 pub fn kernel_for(nature: &'static str) -> Kernel {
-    let echo = UriTemplate::parse("urn:demo:echo/{message}").expect("valid template");
-    let space = EndpointSpace::new()
-        .bind(Exact::new("urn:fn:toUpper"), builtins::to_upper())
-        .bind(Exact::new("urn:fn:reverseList"), builtins::reverse_list())
-        .bind(Exact::new("urn:demo:wrap"), wrap())
-        .bind(Exact::new("urn:demo:split"), split())
-        .bind(Exact::new("urn:demo:greet"), greet())
-        .bind(Exact::new("urn:fn:compose"), builtins::compose())
+    let space = ikigai_fn::space()
         .bind(Exact::new("urn:data:page"), page())
-        .bind(Exact::new("urn:host:info"), host_info(nature))
-        .bind(echo, builtins::echo());
+        .bind(Exact::new("urn:host:info"), host_info(nature));
     Kernel::with_meta_renderer(Arc::new(space), Arc::new(CliRenderer))
 }
 
@@ -242,5 +152,19 @@ mod tests {
             .with_arg("name", ArgRef::Inline(b"World".to_vec()));
         let representation = block_on(kernel.issue(request, &Capability::root())).unwrap();
         assert_eq!(representation.bytes, b"Hello, World");
+    }
+
+    #[test]
+    fn page_composes_through_the_linked_module() {
+        let kernel = kernel();
+        let request = Request::new(Verb::Source, Iri::parse("urn:fn:compose").unwrap())
+            .with_arg("src", ArgRef::Inline(b"urn:data:page".to_vec()));
+        let representation = block_on(kernel.issue(request, &Capability::root())).unwrap();
+        let text = String::from_utf8(representation.bytes).unwrap();
+        assert!(text.contains("RESOURCE ORIENTED COMPUTING"));
+        assert!(text.contains("[hello]"));
+        assert!(text.contains("Hi, World"));
+        // the escaped marker survives unexpanded
+        assert!(text.contains("$a{urn:fn:toUpper?in=x}"));
     }
 }
