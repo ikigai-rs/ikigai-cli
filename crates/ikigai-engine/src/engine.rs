@@ -552,6 +552,12 @@ impl Engine {
         };
         let endpoint = endpoint_name(entries, &iri);
         let label = short_iri(iri.as_str());
+        // Authority annotation: when the session is narrowed (a scoped, non-root
+        // capability), mark each node with the authority it resolved under — `cap ✓`
+        // for an authorized resolution, `cap ✗` for one the capability refused. A
+        // root session has nothing to attenuate, so the tree stays uncluttered and
+        // the header's authority line says it all.
+        let scoped = capability.scopes().is_some();
         match self.resolver.issue_as(request, capability) {
             Ok((representation, status)) => {
                 let text = String::from_utf8_lossy(&representation.bytes);
@@ -560,8 +566,9 @@ impl Engine {
                 } else {
                     Vec::new()
                 };
+                let cap_note = if scoped { " · cap ✓" } else { "" };
                 let head = format!(
-                    "{prefix}{branch}{label}   {endpoint} · {} · {}b",
+                    "{prefix}{branch}{label}   {endpoint} · {} · {}b{cap_note}",
                     cache_word(status),
                     representation.bytes.len(),
                 );
@@ -602,9 +609,21 @@ impl Engine {
                     }
                 }
             }
-            Err(message) => out.push(format!(
-                "{prefix}{branch}{label}   {endpoint} · error: {message}"
-            )),
+            Err(message) => {
+                // A capability denial is the authority dimension made visible —
+                // mark it as `cap ✗` rather than a generic error, so a `cap`-narrowed
+                // `trace` shows exactly which resolution the session may no longer
+                // reach. Endpoints word denials differently ("capability does not
+                // grant…", "is not authorized — needs urn:cap…"), so match on the
+                // shared signals: an authority verb or a named `urn:cap:` scope.
+                let denied = message.contains("capability")
+                    || message.contains("authoriz")
+                    || message.contains("urn:cap:");
+                let tag = if denied { "cap ✗ denied" } else { "error" };
+                out.push(format!(
+                    "{prefix}{branch}{label}   {endpoint} · {tag}: {message}"
+                ))
+            }
         }
     }
 
@@ -1201,6 +1220,40 @@ mod tests {
             output(engine.eval("source urn:file:notes.txt")).unwrap(),
             "remember the milk"
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn trace_annotates_capability_per_node() {
+        let root = std::env::temp_dir().join(format!("ikigai-engine-trace-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"hi").unwrap();
+        let mk = || {
+            Engine::new(Kernel::with_meta_renderer(
+                Arc::new(ikigai_fs::space(&root)),
+                Arc::new(JsonRenderer),
+            ))
+        };
+
+        // Root session: the tree stays uncluttered — authority is in the header.
+        let rooted = output(mk().eval("trace urn:file:a.txt")).unwrap();
+        assert!(
+            !rooted.contains("cap ✓") && !rooted.contains("cap ✗"),
+            "{rooted}"
+        );
+
+        // Narrowed to a read that covers the file: the node is marked authorized.
+        let e = mk();
+        output(e.eval(&format!("cap urn:cap:fs:read:{}", root.display()))).unwrap();
+        let ok = output(e.eval("trace urn:file:a.txt")).unwrap();
+        assert!(ok.contains("cap ✓"), "{ok}");
+
+        // Narrowed to a scope that does not cover the file: the node is denied.
+        let e = mk();
+        output(e.eval("cap urn:cap:fs:read:/nonexistent")).unwrap();
+        let denied = output(e.eval("trace urn:file:a.txt")).unwrap();
+        assert!(denied.contains("cap ✗"), "{denied}");
 
         std::fs::remove_dir_all(&root).ok();
     }
