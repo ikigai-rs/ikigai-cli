@@ -21,7 +21,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ikigai_core::{Kernel, Representation, Request, SpaceEntry};
+use ikigai_core::{Capability, Kernel, Representation, Request, SpaceEntry};
 use ikigai_resolve::{CacheStatus, Resolver};
 use ikigai_wire::{read_message, write_message, Call, Reply};
 
@@ -80,6 +80,24 @@ impl Resolver for IpcResolver {
         }
     }
 
+    /// Resolve under the session capability — carried to the server, which clamps
+    /// it to the peercred-verified principal. This is what makes a `cap`-attenuated
+    /// `--connect` session behave over IPC exactly like the embedded kernel.
+    fn issue_as(
+        &self,
+        request: Request,
+        capability: &Capability,
+    ) -> Result<(Representation, CacheStatus), String> {
+        match self
+            .round_trip(Call::IssueAs(request, capability.clone()))
+            .map_err(|e| e.to_string())?
+        {
+            Reply::Resolved(representation, status) => Ok((representation, status)),
+            Reply::Error(message) => Err(message),
+            other => Err(format!("unexpected reply to IssueAs: {other:?}")),
+        }
+    }
+
     fn is_cached(&self, request: &Request) -> bool {
         matches!(
             self.round_trip(Call::IsCached(request.clone())),
@@ -117,6 +135,16 @@ fn dispatch(kernel: &Kernel, call: Call) -> Reply {
             Ok((representation, status)) => Reply::Resolved(representation, status),
             Err(message) => Reply::Error(message),
         },
+        // The peer is the owner (peercred-verified in `serve`), so the principal's
+        // entitlement is root and the carried capability is already ≤ root —
+        // resolving under it *is* the clamp. A future non-root IPC principal would
+        // intersect the carried capability with its entitlement here.
+        Call::IssueAs(request, capability) => {
+            match Resolver::issue_as(kernel, request, &capability) {
+                Ok((representation, status)) => Reply::Resolved(representation, status),
+                Err(message) => Reply::Error(message),
+            }
+        }
         Call::IsCached(request) => Reply::Cached(Resolver::is_cached(kernel, &request)),
         Call::Entries => Reply::Entries(Resolver::entries(kernel)),
     }

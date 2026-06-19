@@ -9,15 +9,15 @@
 
 use std::io::{self, Read, Write};
 
-use ikigai_core::{Representation, Request, SpaceEntry};
+use ikigai_core::{Capability, Representation, Request, SpaceEntry};
 use ikigai_resolve::CacheStatus;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// Bumped when the on-wire shape changes incompatibly. Not negotiated yet
 /// (client and server ship together) — it's here to fail loudly when that
-/// changes.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// changes. v2 adds [`Call::IssueAs`] (capability-on-the-wire).
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The largest framed message accepted. Guards [`read_message`] against a bogus
 /// length header demanding a huge allocation; 64 MiB is far above any
@@ -30,6 +30,11 @@ pub enum Call {
     Issue(Request),
     IsCached(Request),
     Entries,
+    /// Resolve `Request` under an explicit `Capability` (capability-on-the-wire).
+    /// Appended after the existing variants so the postcard discriminants of
+    /// `Issue`/`IsCached`/`Entries` are unchanged. A server clamps the carried
+    /// capability to the principal the channel authenticated.
+    IssueAs(Request, Capability),
 }
 
 /// A server → client reply. [`Error`](Reply::Error) can answer any call — a

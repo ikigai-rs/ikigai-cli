@@ -13,7 +13,7 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 [workspace.dependencies]
 # The released kernel, consumed from crates.io. For local cross-repo development
 # against a sibling checkout, use .cargo/config.toml (see .cargo/config.toml.example).
-ikigai-core = "0.1.6"  # capability attenuation (attenuate/allows/scopes)
+ikigai-core = "0.1.7"  # capability attenuation + serde (capability-on-the-wire)
 ikigai-vocab = "0.1"
 # The reusable function library, linked in as a published module crate.
 ikigai-fn = "0.1.0"
