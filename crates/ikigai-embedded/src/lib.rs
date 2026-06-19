@@ -9,11 +9,12 @@
 //! [`ikigai_fn`] module crate, mounted via [`ikigai_fn::space`]. This host adds
 //! only its own endpoints: the demo `page` shape and `urn:host:info`.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use ikigai_core::{
     Description, EndpointSpace, Error, Exact, FnEndpoint, Invocation, Kernel, MetaRenderer,
-    ReprType, Representation, Result, Verb,
+    ReprType, Representation, Result, UriTemplate, Verb,
 };
 use ikigai_vocab::TurtleRenderer;
 
@@ -135,9 +136,29 @@ fn base_space(nature: &'static str) -> EndpointSpace {
         .bind(Exact::new("urn:host:info"), host_info(nature))
 }
 
-/// The base space plus the personal space (`urn:personal:*`) from the linked
-/// [`ikigai_personal`] module — for a kernel a *trusted* principal drives (the
-/// local owner, or an IPC peer the OS verified is the same user).
+/// The directory the local file module is jailed to: `$IKIGAI_FILES`, else
+/// `$HOME/.ikigai/workspace`. Created if missing.
+///
+/// Deliberately a dedicated, ikigai-owned sandbox — *not* the user's home or
+/// documents — so the owner's root capability grants files only within this tree.
+/// The CLI mints `read-only`/`write`/`delete` `cap` profiles against this root,
+/// and the file endpoint's jail makes it the hard floor regardless of capability.
+pub fn file_root() -> PathBuf {
+    let root = std::env::var_os("IKIGAI_FILES")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+            home.join(".ikigai").join("workspace")
+        });
+    let _ = std::fs::create_dir_all(&root);
+    root
+}
+
+/// The base space plus the spaces a *trusted* principal drives (the local owner,
+/// or an IPC peer the OS verified is the same user): the personal space
+/// (`urn:personal:*`) and the local file module (`urn:file:{path}`), jailed to
+/// [`file_root`]. Omitted from [`base_space`] (the QUIC-served space) until remote
+/// auth + capability-on-the-wire land.
 fn local_space(nature: &'static str) -> EndpointSpace {
     base_space(nature)
         .bind(
@@ -151,6 +172,10 @@ fn local_space(nature: &'static str) -> EndpointSpace {
         .bind(
             Exact::new("urn:personal:availability"),
             ikigai_personal::availability(),
+        )
+        .bind(
+            UriTemplate::parse(ikigai_fs::FILE_TEMPLATE).expect("FILE_TEMPLATE is valid"),
+            ikigai_fs::FileEndpoint::new(file_root()),
         )
 }
 

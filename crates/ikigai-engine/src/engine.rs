@@ -30,6 +30,7 @@ commands:
   source a [input] | b | c   pipeline: `|` pipes the whole output into the next stage
   source a [input] .. b      map: run `b` per newline-item of `a`'s output, rejoin
   source a | ( b ; c )       fork: fan the input to each branch, join their outputs
+  sink <iri> <content>       SINK content into a resource (the write verb)
   describe <iri> [type]      META a resource; `type` defaults to text/turtle
   cache <iri> [args]         report whether resolving it would hit the cache (no resolve)
   cap [scope…]               show the session capability, narrow it to `scope`s, or `cap reset`
@@ -56,6 +57,9 @@ try:
   source urn:fn:toUpper \"a | b\"
   source urn:demo:split \"a,b,c\" .. urn:fn:toUpper
   source urn:demo:split \"a,b,c\" | ( urn:fn:toUpper ; urn:fn:reverseList )
+  sink urn:file:notes.txt remember the milk
+  source urn:file:notes.txt
+  cap read-only ; sink urn:file:notes.txt nope   (write now refused)
   describe urn:fn:toUpper text/turtle";
 
 /// One evaluated request: the line the user typed, what came back, and how the
@@ -211,6 +215,7 @@ impl Engine {
             "cap" => output(self, self.run_cap(rest)),
             "trace" => output(self, self.run_trace(rest)),
             "source" | "src" => output(self, self.run_pipeline(rest)),
+            "sink" => output(self, self.run_sink(rest)),
             "describe" | "desc" => {
                 let (target, ty) = split_first_word(rest);
                 let ty = if ty.is_empty() { "text/turtle" } else { ty };
@@ -291,6 +296,22 @@ impl Engine {
         incoming: Option<&str>,
     ) -> Result<String, String> {
         let request = self.source_request(target, args, incoming)?;
+        self.run(request)
+    }
+
+    /// `sink` command: write a representation *into* a resource — the write half
+    /// of the REPL. `sink <iri> <content>` issues a `Sink` with the text after the
+    /// IRI as the `content` argument, under the session capability — so a
+    /// `cap`-narrowed session is refused the write by a capability-gated endpoint
+    /// exactly as a read is. The endpoint's reply (e.g. `wrote N bytes`) is shown.
+    fn run_sink(&self, rest: &str) -> Result<String, String> {
+        let (target, content) = split_first_word(rest);
+        if target.is_empty() {
+            return Err("usage: sink <iri> <content>".to_string());
+        }
+        let iri = parse_target(target)?;
+        let request = Request::new(Verb::Sink, iri)
+            .with_arg("content", ArgRef::Inline(content.as_bytes().to_vec()));
         self.run(request)
     }
 
@@ -1147,6 +1168,41 @@ mod tests {
         // A different input is a fresh computation.
         let other = entry(engine.eval("source urn:fn:toUpper bye"));
         assert_eq!(other.cache.label().as_deref(), Some("computed"));
+    }
+
+    #[test]
+    fn sink_then_source_round_trips_a_file_gated_by_capability() {
+        let root = std::env::temp_dir().join(format!("ikigai-engine-fs-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(ikigai_fs::space(&root)),
+            Arc::new(JsonRenderer),
+        ));
+
+        // Owner (root capability): write a file, then read it back.
+        assert!(output(engine.eval("sink urn:file:notes.txt remember the milk")).is_ok());
+        assert_eq!(
+            output(engine.eval("source urn:file:notes.txt")).unwrap(),
+            "remember the milk"
+        );
+
+        // Narrow the session to read-only on the root: reads still work, but the
+        // capability-gated endpoint refuses the write — exactly like a read it
+        // doesn't authorise.
+        let read_only = format!("cap urn:cap:fs:read:{}", root.display());
+        assert!(output(engine.eval(&read_only)).is_ok());
+        assert_eq!(
+            output(engine.eval("source urn:file:notes.txt")).unwrap(),
+            "remember the milk"
+        );
+        assert!(output(engine.eval("sink urn:file:notes.txt nope")).is_err());
+        // The refused write left the file untouched.
+        assert_eq!(
+            output(engine.eval("source urn:file:notes.txt")).unwrap(),
+            "remember the milk"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

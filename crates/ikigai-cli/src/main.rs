@@ -203,6 +203,24 @@ fn main() {
 #[cfg(feature = "embedded")]
 fn with_profiles(engine: Engine) -> Engine {
     engine.define_cap_profile("freebusy", ["urn:cap:personal:calendar:read:freebusy"]);
+
+    // File capability profiles, scoped to the local file module's jail root. Each
+    // is a single-step narrowing from the owner's root authority — `cap write`
+    // grants read+write within the root, `cap read-only` drops writes. `cap agent`
+    // bundles the cross-cutting "what I'd hand an agent" set (free/busy + read).
+    let root = ikigai_embedded::file_root();
+    let root = root.display();
+    let read = format!("urn:cap:fs:read:{root}");
+    let write = format!("urn:cap:fs:write:{root}");
+    let delete = format!("urn:cap:fs:delete:{root}");
+    engine.define_cap_profile("read-only", [read.clone()]);
+    engine.define_cap_profile("read", [read.clone()]);
+    engine.define_cap_profile("write", [read.clone(), write.clone()]);
+    engine.define_cap_profile("delete", [read.clone(), write, delete]);
+    engine.define_cap_profile(
+        "agent",
+        ["urn:cap:personal:calendar:read:freebusy".to_string(), read],
+    );
     engine
 }
 
