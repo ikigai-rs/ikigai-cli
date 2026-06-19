@@ -12,6 +12,7 @@ ikigai-core = { workspace = true }
 ikigai-vocab = { workspace = true }
 ikigai-fn = { workspace = true }
 ikigai-personal = { workspace = true }
+ikigai-fs = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
