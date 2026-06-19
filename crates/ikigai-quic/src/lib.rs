@@ -102,6 +102,15 @@ fn dispatch(kernel: &Kernel, call: Call) -> Reply {
             Ok((representation, status)) => Reply::Resolved(representation, status),
             Err(message) => Reply::Error(message),
         },
+        // QUIC does not honor capability-on-the-wire yet: a QUIC peer isn't
+        // authenticated (gated on remote auth, #36), so a carried capability is
+        // not trusted. Resolve under the server's default authority, ignoring it.
+        // (The QUIC client never sends this today — its resolver doesn't override
+        // `issue_as` — but the arm keeps the match safe and exhaustive.)
+        Call::IssueAs(request, _capability) => match Resolver::issue(kernel, request) {
+            Ok((representation, status)) => Reply::Resolved(representation, status),
+            Err(message) => Reply::Error(message),
+        },
         Call::IsCached(request) => Reply::Cached(Resolver::is_cached(kernel, &request)),
         Call::Entries => Reply::Entries(Resolver::entries(kernel)),
     }
@@ -201,6 +210,10 @@ impl Resolver for QuicResolver {
             Ok(Reply::Entries(entries)) => entries,
             _ => None,
         }
+    }
+
+    fn transport(&self) -> String {
+        "quic · network (HTTP/3), mutually-pinned TLS".to_string()
     }
 }
 
