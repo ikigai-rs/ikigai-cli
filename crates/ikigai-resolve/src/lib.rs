@@ -82,15 +82,19 @@ impl Resolver for Kernel {
         request: Request,
         capability: &Capability,
     ) -> Result<(Representation, CacheStatus), String> {
-        let before = self.cache_len();
+        // Probe before issuing: a valid (thread-current) cached entry means a Hit;
+        // a cut or absent one means we'll (re)compute. A cache-length delta would
+        // misreport once golden-thread eviction is in play — evict + reinsert nets
+        // zero — so the probe, not the delta, is the source of truth.
+        let was_cached = Kernel::is_cached(self, &request);
         let representation =
             block_on(Kernel::issue(self, request, capability)).map_err(|e| e.to_string())?;
         let status = if representation.expiry != Expiry::Never {
             CacheStatus::Uncacheable
-        } else if self.cache_len() > before {
-            CacheStatus::Miss
-        } else {
+        } else if was_cached {
             CacheStatus::Hit
+        } else {
+            CacheStatus::Miss
         };
         Ok((representation, status))
     }
