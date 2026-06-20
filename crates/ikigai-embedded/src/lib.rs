@@ -175,7 +175,12 @@ fn local_space(nature: &'static str) -> EndpointSpace {
         )
         .bind(
             UriTemplate::parse(ikigai_fs::FILE_TEMPLATE).expect("FILE_TEMPLATE is valid"),
-            ikigai_fs::FileEndpoint::new(file_root()),
+            // Cacheable: reads of the workspace cache under a golden thread, and a
+            // `sink`/`delete` through the kernel auto-cuts it (so a write
+            // invalidates the cached read, and any compose over it). The workspace
+            // is written through ikigai, so the only stale window is an out-of-band
+            // editor change — closed once the file watcher lands.
+            ikigai_fs::FileEndpoint::new(file_root()).cacheable(),
         )
 }
 
