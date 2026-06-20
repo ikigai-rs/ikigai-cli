@@ -9,7 +9,7 @@
 //! [`ikigai_fn`] module crate, mounted via [`ikigai_fn::space`]. This host adds
 //! only its own endpoints: the demo `page` shape and `urn:host:info`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ikigai_core::{
@@ -17,6 +17,7 @@ use ikigai_core::{
     ReprType, Representation, Result, UriTemplate, Verb,
 };
 use ikigai_vocab::TurtleRenderer;
+use notify::{RecursiveMode, Watcher};
 
 /// The `Meta` renderer used by the CLI kernel.
 ///
@@ -178,8 +179,8 @@ fn local_space(nature: &'static str) -> EndpointSpace {
             // Cacheable: reads of the workspace cache under a golden thread, and a
             // `sink`/`delete` through the kernel auto-cuts it (so a write
             // invalidates the cached read, and any compose over it). The workspace
-            // is written through ikigai, so the only stale window is an out-of-band
-            // editor change — closed once the file watcher lands.
+            // is written through ikigai; out-of-band editor changes are caught by
+            // the filesystem watcher behind [`watched_kernel`].
             ikigai_fs::FileEndpoint::new(file_root()).cacheable(),
         )
 }
@@ -193,6 +194,69 @@ pub fn kernel() -> Kernel {
         Arc::new(local_space("Embedded (Native)")),
         Arc::new(CliRenderer),
     )
+}
+
+/// The local embedded kernel as a shared `Arc`, with a filesystem **watcher** over
+/// [`file_root`] running behind it.
+///
+/// The watcher is the first *external* golden-thread freshness source: when a
+/// workspace file changes out of band (an editor, `git checkout`, another
+/// process), it cuts that file's thread, so the kernel's cached `Source` — and any
+/// composite over it — recompute, exactly as a `Sink` through the kernel already
+/// does. The returned `Arc` is what the engine drives, so the watcher and the
+/// engine share one kernel and one cache.
+pub fn watched_kernel() -> Arc<Kernel> {
+    let kernel = Arc::new(kernel());
+    watch_root(Arc::clone(&kernel), file_root());
+    kernel
+}
+
+/// Watch `root` recursively; on any out-of-band change, cut `urn:file:<rel>` so the
+/// cached read recomputes. Runs on a detached thread for the process's lifetime; a
+/// watch error disables it silently (caching then invalidates only on
+/// kernel-mediated writes — still correct for files written through ikigai).
+fn watch_root(kernel: Arc<Kernel>, root: PathBuf) {
+    // Canonicalize so the prefix matches the paths `notify` reports — it resolves
+    // symlinks (notably macOS maps `/var` → `/private/var`), and the relative path
+    // is what becomes the `urn:file:<rel>` thread.
+    let root = root.canonicalize().unwrap_or(root);
+    std::thread::spawn(move || {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = match notify::recommended_watcher(move |res| {
+            let _ = tx.send(res);
+        }) {
+            Ok(watcher) => watcher,
+            Err(_) => return,
+        };
+        if watcher.watch(&root, RecursiveMode::Recursive).is_err() {
+            return;
+        }
+        // `watcher` is held to the end of this scope, keeping the watch (and the
+        // channel) alive; the loop blocks until the process exits.
+        for event in rx.iter().flatten() {
+            if event.kind.is_access() {
+                continue; // a read doesn't change content
+            }
+            for path in &event.paths {
+                if let Some(thread) = file_thread(&root, path) {
+                    kernel.cut(thread);
+                }
+            }
+        }
+    });
+}
+
+/// The golden thread for a changed `path` under `root`: `urn:file:<rel>` with
+/// forward-slash separators (matching the `urn:file:{path}` grammar). `None` if
+/// `path` is not under `root`, or is the root itself.
+fn file_thread(root: &Path, path: &Path) -> Option<String> {
+    let rel = path.strip_prefix(root).ok()?;
+    let joined = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    (!joined.is_empty()).then(|| format!("urn:file:{joined}"))
 }
 
 /// Build a **trusted served** kernel (for IPC), *including* the personal space.
@@ -260,5 +324,60 @@ mod tests {
         assert!(text.contains("Hi, World"));
         // the escaped marker survives unexpanded
         assert!(text.contains("$a{urn:fn:toUpper?in=x}"));
+    }
+
+    #[test]
+    fn file_thread_maps_a_changed_path_to_its_urn() {
+        let root = Path::new("/ws");
+        assert_eq!(
+            file_thread(root, Path::new("/ws/notes.txt")).as_deref(),
+            Some("urn:file:notes.txt")
+        );
+        assert_eq!(
+            file_thread(root, Path::new("/ws/docs/a.txt")).as_deref(),
+            Some("urn:file:docs/a.txt")
+        );
+        assert_eq!(file_thread(root, root), None); // the root itself
+        assert_eq!(file_thread(root, Path::new("/elsewhere/x")), None);
+    }
+
+    #[test]
+    fn the_watcher_cuts_a_thread_on_an_out_of_band_change() {
+        use std::time::Duration;
+        let root = std::env::temp_dir().join(format!("ikigai-watch-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("notes.txt"), b"v1").unwrap();
+
+        // A cacheable file space over the temp root, with the watcher behind it.
+        let kernel = Arc::new(Kernel::new(Arc::new(ikigai_fs::cacheable_space(&root))));
+        watch_root(Arc::clone(&kernel), root.clone());
+        std::thread::sleep(Duration::from_millis(400)); // let the watch start
+        let cap = Capability::root();
+        let source = || Request::new(Verb::Source, Iri::parse("urn:file:notes.txt").unwrap());
+
+        // Cache the read.
+        assert_eq!(block_on(kernel.issue(source(), &cap)).unwrap().bytes, b"v1");
+        assert!(kernel.is_cached(&source()), "cached after the first read");
+
+        // Change the file OUT OF BAND — not through the kernel.
+        std::fs::write(root.join("notes.txt"), b"v2").unwrap();
+
+        // The watcher should cut the thread (filesystem-event latency: poll).
+        let mut cut = false;
+        for _ in 0..60 {
+            if !kernel.is_cached(&source()) {
+                cut = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            cut,
+            "watcher should cut the thread within ~6s of the change"
+        );
+
+        // A fresh read now sees v2.
+        assert_eq!(block_on(kernel.issue(source(), &cap)).unwrap().bytes, b"v2");
+        std::fs::remove_dir_all(&root).ok();
     }
 }

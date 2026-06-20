@@ -12,6 +12,8 @@
 //! directly (no client-side cache probing across the wire). The wire protocol
 //! that remote resolvers speak lives in the companion `ikigai-wire` crate.
 
+use std::sync::Arc;
+
 use futures::executor::block_on;
 use ikigai_core::{Capability, Expiry, Kernel, Representation, Request, SpaceEntry};
 use serde::{Deserialize, Serialize};
@@ -105,5 +107,36 @@ impl Resolver for Kernel {
 
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
         Kernel::entries(self)
+    }
+}
+
+/// An `Arc`-shared resolver is itself a resolver, delegating to the inner one. So
+/// a kernel can be held as `Arc<Kernel>` and *shared* — driven by the engine, and
+/// at the same time reached by a file watcher that cuts golden threads on the very
+/// same kernel (and thus the same cache). Every method delegates, so the inner
+/// resolver's overrides (e.g. the kernel's `issue_as`/`transport`) are preserved.
+impl<R: Resolver + ?Sized> Resolver for Arc<R> {
+    fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), String> {
+        (**self).issue(request)
+    }
+
+    fn issue_as(
+        &self,
+        request: Request,
+        capability: &Capability,
+    ) -> Result<(Representation, CacheStatus), String> {
+        (**self).issue_as(request, capability)
+    }
+
+    fn is_cached(&self, request: &Request) -> bool {
+        (**self).is_cached(request)
+    }
+
+    fn entries(&self) -> Option<Vec<SpaceEntry>> {
+        (**self).entries()
+    }
+
+    fn transport(&self) -> String {
+        (**self).transport()
     }
 }

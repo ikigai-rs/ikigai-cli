@@ -229,7 +229,11 @@ fn with_profiles(engine: Engine) -> Engine {
 #[cfg(feature = "embedded")]
 fn build_engine(connect: Option<Option<String>>, certs: &Certs) -> Result<Engine, String> {
     match connect {
-        None => Ok(with_profiles(Engine::new(ikigai_embedded::kernel()))),
+        // The watched kernel: cached workspace reads also invalidate on an
+        // out-of-band file change (an editor), not just a `sink` through the REPL.
+        None => Ok(with_profiles(
+            Engine::new(ikigai_embedded::watched_kernel()),
+        )),
         Some(target) => match target.as_deref() {
             Some(t) if is_quic(t) => connect_quic(t, certs),
             _ => connect_ipc(target),
