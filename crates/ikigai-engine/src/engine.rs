@@ -15,14 +15,14 @@
 //! kernel.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use futures::executor::block_on;
 use futures::future::join_all;
 use ikigai_core::{
     ArgRef, BoxFuture, Capability, Description, InputSource, Iri, Representation, Request, Spawner,
-    Verb,
+    TraceEvent, Tracer, Verb,
 };
 use ikigai_resolve::{CacheStatus, Resolver};
 
@@ -627,13 +627,16 @@ impl Engine {
         }
     }
 
-    /// `trace` command: resolve a resource and show the path it takes — the client
-    /// and the capability it ran under, the transport it reached the kernel by, and
-    /// the **tree** of resolutions. A plain resource is one node; a `compose` shape
-    /// is the recursive `$a{…}` transclusion tree, each marker a child resolution
-    /// with its own endpoint and cache outcome. The resolutions actually happen, so
-    /// a sub-resource that appears twice shows up `cached` the second time — you
-    /// watch the fabric (and its cache) assemble the resource.
+    /// `trace` command: resolve a resource **for real**, once, and show the actual
+    /// execution — the client and capability it ran under, the transport it reached
+    /// the kernel by, and the tree of resolutions the kernel recorded. Each node
+    /// reports which **worker thread** ran it, how long it took, and whether the
+    /// cache served it. Because it's the real resolution (not a structural walk), the
+    /// tree reflects what truly happened: a plain resource is a single node, while a
+    /// `compose` shows its `$a{…}` markers as the branches it fanned out — on
+    /// distinct workers under `pool:N`, the same thread under the single-threaded
+    /// default. Trace `urn:fn:compose src=<shape>` to see the fan-out, not the bare
+    /// shape (sourcing the shape itself really is one resolution).
     fn run_trace(&self, spec: &str) -> Result<String, String> {
         let pipeline = parse_spec(spec)?;
         let words = match pipeline {
@@ -649,6 +652,10 @@ impl Engine {
         let iri = parse_target(target)?;
         let request = self.source_request(target, args, None)?;
         let capability = self.capability.borrow().clone();
+        // A scoped (non-root) session annotates each node with the authority it ran
+        // under — `cap ✓` on success, `cap ✗` on a denial; a root session has nothing
+        // to attenuate, so the tree stays uncluttered (the header says it all).
+        let scoped = capability.scopes().is_some();
         let entries = self.resolver.entries().unwrap_or_default();
         let mut out = vec![
             format!("trace  {iri}"),
@@ -659,117 +666,47 @@ impl Engine {
             format!("  transport   {}", self.resolver.transport()),
             String::new(),
         ];
-        self.trace_node(
-            iri,
-            request,
-            &capability,
-            &entries,
-            String::new(),
-            true,
-            true,
-            0,
-            &mut out,
-        );
-        Ok(out.join("\n"))
-    }
 
-    /// Resolve one node, print its tree line, and recurse into the `$a{…}` markers
-    /// in its output. `prefix` carries the box-drawing for nested levels.
-    #[allow(clippy::too_many_arguments)]
-    fn trace_node(
-        &self,
-        iri: Iri,
-        request: Request,
-        capability: &Capability,
-        entries: &[ikigai_core::SpaceEntry],
-        prefix: String,
-        is_last: bool,
-        is_root: bool,
-        depth: usize,
-        out: &mut Vec<String>,
-    ) {
-        let branch = if is_root {
-            ""
-        } else if is_last {
-            "└─ "
-        } else {
-            "├─ "
-        };
-        let endpoint = endpoint_name(entries, &iri);
-        let label = short_iri(iri.as_str());
-        // Authority annotation: when the session is narrowed (a scoped, non-root
-        // capability), mark each node with the authority it resolved under — `cap ✓`
-        // for an authorized resolution, `cap ✗` for one the capability refused. A
-        // root session has nothing to attenuate, so the tree stays uncluttered and
-        // the header's authority line says it all.
-        let scoped = capability.scopes().is_some();
-        match self.resolver.issue_as(request, capability) {
+        // Record one real resolution: the kernel reports a TraceEvent per invocation
+        // — the actual execution, including the branches `compose` fans out onto
+        // worker threads — which we reconstruct into a tree via each event's parent
+        // span. The resolution genuinely runs, so its cache effects are real too.
+        let collector = Arc::new(TraceCollector::default());
+        self.resolver.set_tracer(collector.clone());
+        let result = self.resolver.issue_as(request, &capability);
+        self.resolver.clear_tracer();
+
+        match result {
             Ok((representation, status)) => {
-                let text = String::from_utf8_lossy(&representation.bytes);
-                let markers = if depth < MAX_TRACE_DEPTH {
-                    scan_markers(&text)
+                let events = collector.take();
+                if events.is_empty() {
+                    // A resolver that doesn't trace (e.g. a wire resolver): one line.
+                    let endpoint = endpoint_name(&entries, &iri);
+                    let text = String::from_utf8_lossy(&representation.bytes);
+                    let cap_note = if scoped { " · cap ✓" } else { "" };
+                    out.push(format!(
+                        "{}   {endpoint} · {} · {}b{cap_note}   → {}",
+                        short_iri(iri.as_str()),
+                        cache_word(status),
+                        representation.bytes.len(),
+                        preview_of(&text),
+                    ));
                 } else {
-                    Vec::new()
-                };
-                let cap_note = if scoped { " · cap ✓" } else { "" };
-                let head = format!(
-                    "{prefix}{branch}{label}   {endpoint} · {} · {}b{cap_note}",
-                    cache_word(status),
-                    representation.bytes.len(),
-                );
-                if markers.is_empty() {
-                    out.push(format!("{head}   → {}", preview_of(&text)));
-                } else {
-                    out.push(head);
-                    let ext = if is_root {
-                        ""
-                    } else if is_last {
-                        "   "
-                    } else {
-                        "│  "
-                    };
-                    let child_prefix = format!("{prefix}{ext}");
-                    let count = markers.len();
-                    for (idx, inner) in markers.into_iter().enumerate() {
-                        let last = idx == count - 1;
-                        match marker_request(&inner) {
-                            Ok((child_iri, child_request)) => self.trace_node(
-                                child_iri,
-                                child_request,
-                                capability,
-                                entries,
-                                child_prefix.clone(),
-                                last,
-                                false,
-                                depth + 1,
-                                out,
-                            ),
-                            Err(message) => {
-                                let mark = if last { "└─ " } else { "├─ " };
-                                out.push(format!(
-                                    "{child_prefix}{mark}{inner}   (bad marker: {message})"
-                                ));
-                            }
-                        }
-                    }
+                    render_trace_tree(&events, &entries, scoped, &representation, &mut out);
                 }
             }
             Err(message) => {
-                // A capability denial is the authority dimension made visible —
-                // mark it as `cap ✗` rather than a generic error, so a `cap`-narrowed
-                // `trace` shows exactly which resolution the session may no longer
-                // reach. Endpoints word denials differently ("capability does not
-                // grant…", "is not authorized — needs urn:cap…"), so match on the
-                // shared signals: an authority verb or a named `urn:cap:` scope.
+                // The real resolution aborted — surface where. A capability denial is
+                // the authority dimension made visible (`cap ✗`); endpoints word it
+                // differently, so match the shared signals.
                 let denied = message.contains("capability")
                     || message.contains("authoriz")
                     || message.contains("urn:cap:");
                 let tag = if denied { "cap ✗ denied" } else { "error" };
-                out.push(format!(
-                    "{prefix}{branch}{label}   {endpoint} · {tag}: {message}"
-                ))
+                out.push(format!("{}   {tag}: {message}", short_iri(iri.as_str())));
             }
         }
+        Ok(out.join("\n"))
     }
 
     /// List the bindings of the kernel's root space (pattern → endpoint), or an
@@ -1125,8 +1062,140 @@ fn parse_target(target: &str) -> Result<Iri, String> {
 
 // --- `trace` tree helpers ---------------------------------------------------
 
-/// Maximum `trace` recursion depth — a backstop against a cyclic transclusion.
-const MAX_TRACE_DEPTH: usize = 16;
+/// Collects the [`TraceEvent`]s the kernel reports during one traced resolution,
+/// installed via [`Resolver::set_tracer`](ikigai_resolve::Resolver::set_tracer).
+#[derive(Default)]
+struct TraceCollector(Mutex<Vec<TraceEvent>>);
+
+impl TraceCollector {
+    /// Drain the recorded events.
+    fn take(&self) -> Vec<TraceEvent> {
+        std::mem::take(&mut *self.0.lock().expect("trace collector"))
+    }
+}
+
+impl Tracer for TraceCollector {
+    fn record(&self, event: TraceEvent) {
+        self.0.lock().expect("trace collector").push(event);
+    }
+}
+
+/// Reconstruct the execution tree from recorded events — linked by each event's
+/// `(span, parent)` — and render it. The root is the invocation with no parent (the
+/// traced request itself); `repr` is the assembled result, shown on that root line.
+fn render_trace_tree(
+    events: &[TraceEvent],
+    entries: &[ikigai_core::SpaceEntry],
+    scoped: bool,
+    repr: &Representation,
+    out: &mut Vec<String>,
+) {
+    // children[parent span] → child events; roots have no parent. Ordered by span
+    // (issue order) so siblings read in the order the parent requested them.
+    let mut children: BTreeMap<u64, Vec<&TraceEvent>> = BTreeMap::new();
+    let mut roots: Vec<&TraceEvent> = Vec::new();
+    for event in events {
+        match event.parent {
+            Some(parent) => children.entry(parent).or_default().push(event),
+            None => roots.push(event),
+        }
+    }
+    for kids in children.values_mut() {
+        kids.sort_by_key(|event| event.span);
+    }
+    roots.sort_by_key(|event| event.span);
+    let count = roots.len();
+    for (idx, root) in roots.into_iter().enumerate() {
+        render_trace_event(
+            root,
+            &children,
+            entries,
+            scoped,
+            Some(repr),
+            String::new(),
+            true,
+            idx + 1 == count,
+            out,
+        );
+    }
+}
+
+/// Render one recorded invocation and recurse into the sub-requests it issued.
+/// `prefix` carries the box-drawing for nested levels; `root_repr` annotates the
+/// root with the assembled size and a preview (children carry no bytes).
+#[allow(clippy::too_many_arguments)]
+fn render_trace_event(
+    event: &TraceEvent,
+    children: &BTreeMap<u64, Vec<&TraceEvent>>,
+    entries: &[ikigai_core::SpaceEntry],
+    scoped: bool,
+    root_repr: Option<&Representation>,
+    prefix: String,
+    is_root: bool,
+    is_last: bool,
+    out: &mut Vec<String>,
+) {
+    let branch = if is_root {
+        ""
+    } else if is_last {
+        "└─ "
+    } else {
+        "├─ "
+    };
+    let label = short_iri(&event.target);
+    let endpoint = Iri::parse(&event.target)
+        .map(|iri| endpoint_name(entries, &iri))
+        .unwrap_or_else(|_| "?".to_string());
+    let cache = if event.cache_hit {
+        "cached"
+    } else {
+        "computed"
+    };
+    let dur = match (event.started, event.ended) {
+        (Some(start), Some(end)) => {
+            format!("{}ms", end.as_millis().saturating_sub(start.as_millis()))
+        }
+        _ => "—".to_string(),
+    };
+    let cap_note = if scoped { " · cap ✓" } else { "" };
+    let mut line = format!(
+        "{prefix}{branch}{label}   {endpoint} · {cache} · {} · {dur}{cap_note}",
+        event.thread,
+    );
+    if let Some(repr) = root_repr {
+        let text = String::from_utf8_lossy(&repr.bytes);
+        line.push_str(&format!(
+            "   → {}b  {}",
+            repr.bytes.len(),
+            preview_of(&text)
+        ));
+    }
+    out.push(line);
+
+    let kids = children.get(&event.span).map(Vec::as_slice).unwrap_or(&[]);
+    let ext = if is_root {
+        ""
+    } else if is_last {
+        "   "
+    } else {
+        "│  "
+    };
+    let child_prefix = format!("{prefix}{ext}");
+    let count = kids.len();
+    for (idx, kid) in kids.iter().enumerate() {
+        render_trace_event(
+            kid,
+            children,
+            entries,
+            scoped,
+            None,
+            child_prefix.clone(),
+            false,
+            idx + 1 == count,
+            out,
+        );
+    }
+}
 
 /// The endpoint name bound to `iri` in `entries` (exact, then template prefix).
 fn endpoint_name(entries: &[ikigai_core::SpaceEntry], iri: &Iri) -> String {
@@ -1176,104 +1245,6 @@ fn cache_word(status: CacheStatus) -> &'static str {
         CacheStatus::Hit => "cached",
         CacheStatus::Miss => "computed",
         CacheStatus::Uncacheable => "uncacheable",
-    }
-}
-
-/// Extract the inner `<iri>[?args]` body of every `$a{…}` transclusion marker in
-/// `text`, in document order — a client-side view of what `compose` expands.
-/// `$$a{…}` is an escaped literal and is skipped. Mirrors the `compose` builtin.
-fn scan_markers(text: &str) -> Vec<String> {
-    let bytes = text.as_bytes();
-    let mut markers = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'$' {
-            if bytes.get(i + 1) == Some(&b'$') {
-                i += 2;
-                continue;
-            }
-            if text[i..].starts_with("$a{") {
-                let brace = i + 2;
-                if let Some(close) = find_marker_end(text, brace) {
-                    markers.push(text[brace + 1..close].trim().to_string());
-                    i = close + 1;
-                    continue;
-                }
-            }
-        }
-        i += utf8_len(bytes[i]);
-    }
-    markers
-}
-
-/// The index of the `}` closing the marker whose `{` is at `brace`, skipping any
-/// `}` inside a `"…"` span. `None` if unterminated.
-fn find_marker_end(text: &str, brace: usize) -> Option<usize> {
-    let b = text.as_bytes();
-    let mut i = brace + 1;
-    let mut in_quote = false;
-    while i < b.len() {
-        match b[i] {
-            b'\\' if in_quote => i += 2,
-            b'"' => {
-                in_quote = !in_quote;
-                i += 1;
-            }
-            b'}' if !in_quote => return Some(i),
-            c => i += utf8_len(c),
-        }
-    }
-    None
-}
-
-/// The byte length of the UTF-8 sequence starting with `first`.
-fn utf8_len(first: u8) -> usize {
-    match first {
-        b if b < 0x80 => 1,
-        b if b >> 5 == 0b110 => 2,
-        b if b >> 4 == 0b1110 => 3,
-        _ => 4,
-    }
-}
-
-/// Parse a marker body `<iri>[?k=v&…]` into its IRI and a Source request.
-fn marker_request(inner: &str) -> Result<(Iri, Request), String> {
-    let (iri_str, query) = match inner.split_once('?') {
-        Some((iri, q)) => (iri.trim(), Some(q)),
-        None => (inner.trim(), None),
-    };
-    let iri = Iri::parse(iri_str).map_err(|e| e.to_string())?;
-    let mut request = Request::new(Verb::Source, iri.clone());
-    if let Some(query) = query {
-        for pair in query.split('&') {
-            let pair = pair.trim();
-            if pair.is_empty() {
-                continue;
-            }
-            if let Some((key, value)) = pair.split_once('=') {
-                let value = unquote(value.trim());
-                request = request.with_arg(key.trim(), ArgRef::Inline(value.into_bytes()));
-            }
-        }
-    }
-    Ok((iri, request))
-}
-
-/// Strip surrounding double quotes from a marker value, unescaping `\"` / `\\`.
-fn unquote(value: &str) -> String {
-    let b = value.as_bytes();
-    if b.len() >= 2 && b[0] == b'"' && b[b.len() - 1] == b'"' {
-        let mut out = String::with_capacity(value.len() - 2);
-        let mut chars = value[1..value.len() - 1].chars();
-        while let Some(c) = chars.next() {
-            match c {
-                '\\' => out.push(chars.next().unwrap_or('\\')),
-                _ => out.push(c),
-            }
-        }
-        out
-    } else {
-        value.to_string()
     }
 }
 
@@ -1547,6 +1518,53 @@ mod tests {
         assert!(denied.contains("cap ✗"), "{denied}");
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn trace_tree_reconstructs_the_real_execution_from_span_links() {
+        use ikigai_core::Time;
+        // Synthetic recording of a `compose` run: a root (no parent) that fanned out
+        // three markers on workers, the last of which (`about`) itself sourced a
+        // cached `toUpper` — a grandchild. The renderer must rebuild this tree purely
+        // from the (span, parent) edges, regardless of record order.
+        let ev =
+            |target: &str, thread: &str, span: u64, parent: Option<u64>, hit: bool| TraceEvent {
+                target: target.to_string(),
+                thread: thread.to_string(),
+                started: Some(Time::from_millis(0)),
+                ended: Some(Time::from_millis(2)),
+                cache_hit: hit,
+                span,
+                parent,
+            };
+        let events = vec![
+            ev("urn:fn:toUpper", "ikigai-sched-0", 4, Some(3), true), // grandchild, out of order
+            ev("urn:fn:compose", "main", 0, None, false),
+            ev("urn:demo:wrap", "ikigai-sched-1", 1, Some(0), false),
+            ev("urn:demo:greet", "ikigai-sched-2", 2, Some(0), false),
+            ev("urn:data:about", "ikigai-sched-0", 3, Some(0), false),
+        ];
+        let repr = Representation::new(ReprType::new("text/plain"), b"assembled".to_vec());
+        let mut out = Vec::new();
+        render_trace_tree(&events, &[], false, &repr, &mut out);
+
+        // Root first, carrying the assembled result and its worker/timing.
+        assert!(out[0].contains("urn:fn:compose"), "{out:#?}");
+        assert!(
+            out[0].contains("· main ·") && out[0].contains("→ 9b"),
+            "{out:#?}"
+        );
+        // The three fanned-out markers nest directly under the root, on their workers.
+        assert!(out[1].starts_with("├─ urn:demo:wrap") && out[1].contains("ikigai-sched-1"));
+        assert!(
+            out[3].starts_with("└─ urn:data:about"),
+            "last sibling: {out:#?}"
+        );
+        // The grandchild nests one level deeper under `about` and shows as a cache hit.
+        assert!(
+            out[4].starts_with("   └─ urn:fn:toUpper") && out[4].contains("cached"),
+            "grandchild indented under about: {out:#?}"
+        );
     }
 
     #[test]
