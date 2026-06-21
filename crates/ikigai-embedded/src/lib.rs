@@ -295,6 +295,14 @@ fn http_space() -> EndpointSpace {
 /// uncacheable. The root is a [`Fallback`] over the local space then the HTTP space.
 pub fn kernel() -> Kernel {
     let root: Arc<dyn Space> = Arc::new(Fallback::new(vec![
+        // Resolve `urn:fn:compose` to core's fan-out compose, which spawns a level's
+        // `$a{}` markers onto the scheduler. ikigai-fn's space (below) ships its own
+        // cooperative copy; a Fallback resolves members in order, so this first
+        // binding wins. (Only matters on this scheduled local kernel.)
+        Arc::new(EndpointSpace::new().bind(
+            Exact::new("urn:fn:compose"),
+            ikigai_core::builtins::compose(),
+        )) as Arc<dyn Space>,
         Arc::new(local_space("Embedded (Native)")) as Arc<dyn Space>,
         Arc::new(http_space()) as Arc<dyn Space>,
     ]));
