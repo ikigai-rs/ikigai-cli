@@ -14,6 +14,7 @@ ikigai-fn = { workspace = true }
 ikigai-personal = { workspace = true }
 ikigai-fs = { workspace = true }
 ikigai-http = { workspace = true }
+ikigai-scheduler = { workspace = true }
 serde_json = { workspace = true }
 # Filesystem watching — the first external golden-thread freshness source: an
 # out-of-band change to a workspace file cuts its thread so cached reads recompute.
