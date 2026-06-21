@@ -195,6 +195,16 @@ impl<T: 'static> Future for Task<T> {
     }
 }
 
+/// The kernel's concurrent-fan-out executor: `Invocation::fan_out` spawns each
+/// sub-request through this and parks on the join. The returned completion future
+/// resolves when the task finishes (on a `Pool` the task is already running on a
+/// worker; on `Single` it runs cooperatively when the future is driven).
+impl ikigai_core::Spawner for Scheduler {
+    fn spawn(&self, task: ikigai_core::BoxFuture<()>) -> ikigai_core::BoxFuture<()> {
+        Box::pin(Scheduler::spawn(self, task))
+    }
+}
+
 /// One worker per available core, or 1 if the count can't be determined.
 fn default_threads() -> usize {
     std::thread::available_parallelism()
@@ -261,6 +271,37 @@ mod tests {
         let single = Scheduler::single();
         assert_eq!(single.backend(), "single");
         assert_eq!(single.threads(), 1);
+    }
+
+    #[test]
+    fn reentrant_fan_out_does_not_deadlock_on_one_worker() {
+        use ikigai_core::{BoxFuture, Spawner};
+        // The whole point of park-don't-block: a "parent" task on a 1-worker pool
+        // spawns children onto the SAME pool and joins them. It must PARK (free the
+        // worker) so the children can run — if it blocked, the single worker would be
+        // stuck on the parent and the children would never run (deadlock).
+        let sched = Scheduler::pool(1);
+        let spawner: Arc<dyn Spawner> = Arc::new(sched.clone());
+        let ran = Arc::new(AtomicUsize::new(0));
+
+        let ran_in_parent = ran.clone();
+        sched.run(async move {
+            let children: Vec<BoxFuture<()>> = (0..3)
+                .map(|_| {
+                    let ran = ran_in_parent.clone();
+                    spawner.spawn(Box::pin(async move {
+                        ran.fetch_add(1, Ordering::SeqCst);
+                    }))
+                })
+                .collect();
+            futures::future::join_all(children).await;
+        });
+
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            3,
+            "all children ran on the 1-worker pool — the parent parked rather than blocked"
+        );
     }
 
     #[test]

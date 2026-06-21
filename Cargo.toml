@@ -13,7 +13,7 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 [workspace.dependencies]
 # The released kernel, consumed from crates.io. For local cross-repo development
 # against a sibling checkout, use .cargo/config.toml (see .cargo/config.toml.example).
-ikigai-core = "0.1.12" # golden threads + time-based expiry (Expiry::At, injected Clock, Invocation::now)
+ikigai-core = "0.1.13" # + concurrent fan-out: Spawner, Kernel::into_scheduled, Invocation::fan_out
 ikigai-vocab = "0.1"
 # The reusable function library, linked in as a published module crate.
 ikigai-fn = "0.1.0"
