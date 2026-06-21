@@ -91,7 +91,10 @@ impl Resolver for Kernel {
         let was_cached = Kernel::is_cached(self, &request);
         let representation =
             block_on(Kernel::issue(self, request, capability)).map_err(|e| e.to_string())?;
-        let status = if representation.expiry != Expiry::Never {
+        // Only `Always` is truly uncacheable; `Never` and a time-based `At`
+        // deadline are both cacheable (so an `At` read still reports Hit/Miss, not
+        // Uncacheable).
+        let status = if representation.expiry == Expiry::Always {
             CacheStatus::Uncacheable
         } else if was_cached {
             CacheStatus::Hit

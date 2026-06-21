@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ikigai_core::{
-    Description, EndpointSpace, Error, Exact, FnEndpoint, Invocation, Kernel, MetaRenderer,
-    ReprType, Representation, Result, UriTemplate, Verb,
+    Description, EndpointSpace, Error, Exact, Fallback, FnEndpoint, Invocation, Kernel,
+    MetaRenderer, ReprType, Representation, Result, Space, SystemClock, UriTemplate, Verb,
 };
 use ikigai_vocab::TurtleRenderer;
 use notify::{RecursiveMode, Watcher};
@@ -185,15 +185,76 @@ fn local_space(nature: &'static str) -> EndpointSpace {
         )
 }
 
+/// The native HTTP transport backing the `urn:http*` endpoints: a blocking `ureq`
+/// client. Runtime-free, so it runs under the CLI's `futures::block_on` without
+/// pulling in Tokio — the executor stays chosen at the edge.
+struct UreqTransport;
+
+#[async_trait::async_trait]
+impl ikigai_http::HttpTransport for UreqTransport {
+    async fn send(
+        &self,
+        request: ikigai_http::HttpRequest,
+    ) -> std::result::Result<ikigai_http::HttpResponse, String> {
+        use std::io::Read;
+        let mut req = ureq::request(request.method.as_str(), &request.url);
+        for (name, value) in &request.headers {
+            req = req.set(name, value);
+        }
+        let outcome = if request.body.is_empty() {
+            req.call()
+        } else {
+            req.send_bytes(&request.body)
+        };
+        // A 4xx/5xx is still a response (with a body), not a transport failure.
+        let resp = match outcome {
+            Ok(resp) => resp,
+            Err(ureq::Error::Status(_, resp)) => resp,
+            Err(e) => return Err(e.to_string()),
+        };
+        let status = resp.status();
+        let headers = resp
+            .headers_names()
+            .into_iter()
+            .filter_map(|name| resp.header(&name).map(|v| (name.clone(), v.to_string())))
+            .collect();
+        // A HEAD response carries headers only — no body to read.
+        let mut body = Vec::new();
+        if request.method != ikigai_http::Method::Head {
+            resp.into_reader()
+                .read_to_end(&mut body)
+                .map_err(|e| format!("reading response body: {e}"))?;
+        }
+        Ok(ikigai_http::HttpResponse {
+            status,
+            headers,
+            body,
+        })
+    }
+}
+
+/// The HTTP-client module space (`urn:httpGet`…`urn:httpDelete`) on the native
+/// transport — mounted only on the *local* kernel for now, alongside the personal
+/// space, since outbound HTTP from a wire-served kernel awaits capability-on-the-wire.
+fn http_space() -> EndpointSpace {
+    ikigai_http::space(Arc::new(UreqTransport))
+}
+
 /// Build the **local** embedded kernel (nature `Embedded (Native)`), including
-/// the personal space. The running user *is* the owner, so it resolves under
-/// their identity — the engine's default root capability — and the REPL's `cap`
-/// command lets them voluntarily attenuate it before handing work to an agent.
+/// the personal space and the HTTP-client module. The running user *is* the owner,
+/// so it resolves under their identity — the engine's default root capability — and
+/// the REPL's `cap` command lets them voluntarily attenuate it before handing work
+/// to an agent.
+///
+/// A [`SystemClock`] is injected so the HTTP module's `Cache-Control: max-age`
+/// deadlines (`Expiry::At`) are honoured; without a clock those reads would stay
+/// uncacheable. The root is a [`Fallback`] over the local space then the HTTP space.
 pub fn kernel() -> Kernel {
-    Kernel::with_meta_renderer(
-        Arc::new(local_space("Embedded (Native)")),
-        Arc::new(CliRenderer),
-    )
+    let root: Arc<dyn Space> = Arc::new(Fallback::new(vec![
+        Arc::new(local_space("Embedded (Native)")) as Arc<dyn Space>,
+        Arc::new(http_space()) as Arc<dyn Space>,
+    ]));
+    Kernel::with_meta_renderer(root, Arc::new(CliRenderer)).with_clock(Arc::new(SystemClock))
 }
 
 /// The local embedded kernel as a shared `Arc`, with a filesystem **watcher** over
