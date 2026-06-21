@@ -16,7 +16,7 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 ikigai-core = "0.1.14" # + compose fan_out (concurrent markers on a scheduled kernel)
 ikigai-vocab = "0.1"
 # The reusable function library, linked in as a published module crate.
-ikigai-fn = "0.1.0"
+ikigai-fn = "0.1.1" # compose fans `$a{}` markers out via Invocation::fan_out
 # Personal contexts (urn:personal:*), macOS-backed, linked as a published module.
 ikigai-personal = "0.1.0"
 # Capability-gated file/store module, linked as a published module crate.
