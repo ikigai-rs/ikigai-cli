@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use futures::executor::block_on;
 use ikigai_core::{Capability, Expiry, Kernel, Representation, Request, SpaceEntry};
 use serde::{Deserialize, Serialize};
@@ -34,7 +35,8 @@ pub enum CacheStatus {
 /// Synchronous by design (the REPL loop is blocking). Errors are surfaced as
 /// human-readable strings — the engine reports them verbatim; a richer transport
 /// error type can replace `String` when the wire protocol lands.
-pub trait Resolver {
+#[async_trait]
+pub trait Resolver: Send + Sync {
     /// Resolve `request` under the resolver's default authority, and report its
     /// representation and cache outcome.
     fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), String>;
@@ -53,6 +55,21 @@ pub trait Resolver {
     ) -> Result<(Representation, CacheStatus), String> {
         let _ = capability;
         self.issue(request)
+    }
+
+    /// Async resolution under an explicit `capability` — what the engine `await`s
+    /// when it drives a stage on the scheduler, so a *spawned* branch (fork/map)
+    /// parks rather than blocking a worker thread. The default runs the synchronous
+    /// [`issue_as`](Resolver::issue_as) (correct for a resolver that hides a
+    /// `block_on`/wire round-trip); the in-process kernel overrides it to await its
+    /// own async issue with no `block_on`, which is what makes concurrent fan-out
+    /// deadlock-free under a bounded pool.
+    async fn issue_as_async(
+        &self,
+        request: Request,
+        capability: &Capability,
+    ) -> Result<(Representation, CacheStatus), String> {
+        self.issue_as(request, capability)
     }
 
     /// Whether resolving `request` would be served from the cache, without
@@ -74,6 +91,7 @@ pub trait Resolver {
 /// hit returns the cached value without growing the cache; a cacheable miss
 /// inserts one entry). All requests use the root capability — this is the
 /// trusted, same-process path.
+#[async_trait]
 impl Resolver for Kernel {
     fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), String> {
         self.issue_as(request, &Capability::root())
@@ -91,16 +109,23 @@ impl Resolver for Kernel {
         let was_cached = Kernel::is_cached(self, &request);
         let representation =
             block_on(Kernel::issue(self, request, capability)).map_err(|e| e.to_string())?;
-        // Only `Always` is truly uncacheable; `Never` and a time-based `At`
-        // deadline are both cacheable (so an `At` read still reports Hit/Miss, not
-        // Uncacheable).
-        let status = if representation.expiry == Expiry::Always {
-            CacheStatus::Uncacheable
-        } else if was_cached {
-            CacheStatus::Hit
-        } else {
-            CacheStatus::Miss
-        };
+        let status = cache_status(was_cached, &representation);
+        Ok((representation, status))
+    }
+
+    async fn issue_as_async(
+        &self,
+        request: Request,
+        capability: &Capability,
+    ) -> Result<(Representation, CacheStatus), String> {
+        // Same as `issue_as`, but awaits the kernel's async issue directly — no
+        // `block_on`, so when the engine spawns this on the scheduler it parks
+        // (freeing the worker for any sub-resolutions it fans out).
+        let was_cached = Kernel::is_cached(self, &request);
+        let representation = Kernel::issue(self, request, capability)
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = cache_status(was_cached, &representation);
         Ok((representation, status))
     }
 
@@ -113,11 +138,25 @@ impl Resolver for Kernel {
     }
 }
 
+/// The cache-status label for a resolved representation. Only `Always` is truly
+/// uncacheable; `Never` and a time-based `At` deadline are both cacheable (so an
+/// `At` read reports Hit/Miss, not Uncacheable).
+fn cache_status(was_cached: bool, representation: &Representation) -> CacheStatus {
+    if representation.expiry == Expiry::Always {
+        CacheStatus::Uncacheable
+    } else if was_cached {
+        CacheStatus::Hit
+    } else {
+        CacheStatus::Miss
+    }
+}
+
 /// An `Arc`-shared resolver is itself a resolver, delegating to the inner one. So
 /// a kernel can be held as `Arc<Kernel>` and *shared* — driven by the engine, and
 /// at the same time reached by a file watcher that cuts golden threads on the very
 /// same kernel (and thus the same cache). Every method delegates, so the inner
 /// resolver's overrides (e.g. the kernel's `issue_as`/`transport`) are preserved.
+#[async_trait]
 impl<R: Resolver + ?Sized> Resolver for Arc<R> {
     fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), String> {
         (**self).issue(request)
@@ -129,6 +168,15 @@ impl<R: Resolver + ?Sized> Resolver for Arc<R> {
         capability: &Capability,
     ) -> Result<(Representation, CacheStatus), String> {
         (**self).issue_as(request, capability)
+    }
+
+    async fn issue_as_async(
+        &self,
+        request: Request,
+        capability: &Capability,
+    ) -> Result<(Representation, CacheStatus), String> {
+        // Delegate to the inner resolver's override (e.g. the kernel's true-async one).
+        (**self).issue_as_async(request, capability).await
     }
 
     fn is_cached(&self, request: &Request) -> bool {

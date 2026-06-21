@@ -11,3 +11,6 @@ repository.workspace = true
 ikigai-core = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
+# Async `issue_as_async` on the Resolver trait, so the engine can drive a stage on
+# the scheduler (a spawned branch parks rather than blocking a worker).
+async-trait = "0.1"
