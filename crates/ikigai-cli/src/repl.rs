@@ -36,6 +36,8 @@ pub fn run_commands(engine: Engine, commands: &[String]) -> i32 {
                 ran += 1;
             }
             Action::Help => println!("{HELP}"),
+            // No screen to clear in a non-interactive batch.
+            Action::Clear => {}
             Action::Quit => break,
             Action::Noop => {}
         }
@@ -68,6 +70,12 @@ pub fn run(engine: Engine) {
         match engine.eval(&line) {
             Action::Quit => break,
             Action::Help => println!("{HELP}"),
+            // Clear the terminal screen and home the cursor (ANSI). The shell's
+            // scrollback and the kernel's state are untouched.
+            Action::Clear => {
+                print!("\x1b[2J\x1b[H");
+                io::stdout().flush().ok();
+            }
             Action::Output(entry) => {
                 match &entry.result {
                     Ok(out) => println!("{out}"),

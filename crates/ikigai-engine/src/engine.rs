@@ -45,6 +45,7 @@ commands:
   trace <iri> [args]         resolve a resource and show its path: client, transport, endpoint
   config [key=value]         show settings, or save one (e.g. config keybindings=emacs)
   list                       list the resources bound in the current space
+  clear                      clear the visible output (history is kept)
   help                       show this help
   quit                       exit
 
@@ -134,6 +135,8 @@ pub enum Action {
     Output(Entry),
     /// Show [`HELP`].
     Help,
+    /// Clear the visible output. Command history is kept.
+    Clear,
     /// Leave the REPL.
     Quit,
     /// Empty line — do nothing.
@@ -230,6 +233,7 @@ impl Engine {
         match cmd {
             "quit" | "exit" => Action::Quit,
             "help" | "?" => Action::Help,
+            "clear" | "cls" => Action::Clear,
             "list" | "ls" => output(self, self.run_list()),
             "config" => output(self, run_config(rest)),
             "cache" => output(self, self.run_cache(rest)),
@@ -2199,6 +2203,8 @@ mod tests {
     fn control_words_map_to_actions() {
         assert!(matches!(builtin_engine().eval("quit"), Action::Quit));
         assert!(matches!(builtin_engine().eval("help"), Action::Help));
+        assert!(matches!(builtin_engine().eval("clear"), Action::Clear));
+        assert!(matches!(builtin_engine().eval("cls"), Action::Clear));
         assert!(matches!(builtin_engine().eval("   "), Action::Noop));
     }
 

@@ -582,6 +582,9 @@ fn submit(state: &mut State, engine: &Engine) -> bool {
             cache: CacheStats::default(),
         }),
         Action::Output(entry) => state.transcript.push(entry),
+        // Drop the scrollback transcript; `state.history` (line recall) is untouched,
+        // and the `clear` line itself was already pushed to it above.
+        Action::Clear => state.transcript.clear(),
         Action::Noop => {}
     }
     false
