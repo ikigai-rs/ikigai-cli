@@ -30,7 +30,8 @@ commands:
   source a [input] | b | c   pipeline: `|` pipes the whole output into the next stage
   source a [input] .. b      map: run `b` per newline-item of `a`'s output, rejoin
   source a | ( b ; c )       fork: fan the input to each branch, join their outputs
-  sink <iri> <content>       SINK content into a resource (the write verb)
+  sink <iri> [k=v …] <content>  SINK into a resource: leading k=v name declared args, the rest is content
+  delete <iri> [k=v …]       DELETE a resource (the delete verb)
   describe <iri> [type]      META a resource; `type` defaults to text/turtle
   cache <iri> [args]         report whether resolving it would hit the cache (no resolve)
   cap [scope…]               show the session capability, narrow it to `scope`s, or `cap reset`
@@ -216,6 +217,7 @@ impl Engine {
             "trace" => output(self, self.run_trace(rest)),
             "source" | "src" => output(self, self.run_pipeline(rest)),
             "sink" => output(self, self.run_sink(rest)),
+            "delete" | "del" => output(self, self.run_delete(rest)),
             "describe" | "desc" => {
                 let (target, ty) = split_first_word(rest);
                 let ty = if ty.is_empty() { "text/turtle" } else { ty };
@@ -300,19 +302,63 @@ impl Engine {
     }
 
     /// `sink` command: write a representation *into* a resource — the write half
-    /// of the REPL. `sink <iri> <content>` issues a `Sink` with the text after the
-    /// IRI as the `content` argument, under the session capability — so a
-    /// `cap`-narrowed session is refused the write by a capability-gated endpoint
-    /// exactly as a read is. The endpoint's reply (e.g. `wrote N bytes`) is shown.
+    /// of the REPL. `sink <iri> [key=value …] <content>` issues a `Sink` under the
+    /// session capability (so a `cap`-narrowed session is refused by a gated
+    /// endpoint exactly as a read is) and shows the endpoint's reply.
     fn run_sink(&self, rest: &str) -> Result<String, String> {
-        let (target, content) = split_first_word(rest);
+        self.run(self.write_request(Verb::Sink, rest)?)
+    }
+
+    /// `delete` command: remove a resource (the `Delete` verb). Same
+    /// `delete <iri> [key=value …]` shape as `sink`, capability-gated identically.
+    fn run_delete(&self, rest: &str) -> Result<String, String> {
+        self.run(self.write_request(Verb::Delete, rest)?)
+    }
+
+    /// Build a write [`Request`] (`Sink`/`Delete`) for `sink`/`delete`.
+    ///
+    /// A leading run of `key=value` words whose key is a *declared* argument of the
+    /// target is routed as named arguments; the **verbatim remainder** (untokenized,
+    /// so whitespace and quotes survive) becomes the `content` argument. This keeps
+    /// `sink urn:file:notes.txt remember   the milk` byte-exact when there are no
+    /// named args, while letting `sink urn:httpPost url=https://… the body` name the
+    /// URL and still pass an arbitrary body. The contract is only consulted when the
+    /// first word looks like `key=value`, so a plain content write needs no lookup.
+    fn write_request(&self, verb: Verb, rest: &str) -> Result<Request, String> {
+        let (target, mut tail) = split_first_word(rest);
         if target.is_empty() {
-            return Err("usage: sink <iri> <content>".to_string());
+            return Err(format!(
+                "usage: {} <iri> [key=value …] <content>",
+                if verb == Verb::Delete {
+                    "delete"
+                } else {
+                    "sink"
+                }
+            ));
         }
         let iri = parse_target(target)?;
-        let request = Request::new(Verb::Sink, iri)
-            .with_arg("content", ArgRef::Inline(content.as_bytes().to_vec()));
-        self.run(request)
+
+        // Only look up the argument contract if a leading word could be a named
+        // argument — a bare content write (the common case) skips it.
+        let declared = if split_first_word(tail).0.contains('=') {
+            declared_arguments(self.describe_struct(&iri).as_ref())
+        } else {
+            Vec::new()
+        };
+
+        let mut request = Request::new(verb, iri);
+        loop {
+            let (word, after) = split_first_word(tail);
+            match word.split_once('=') {
+                Some((key, value)) if !key.is_empty() && declared.iter().any(|n| n == key) => {
+                    request = request.with_arg(key, ArgRef::Inline(value.as_bytes().to_vec()));
+                    tail = after;
+                }
+                _ => break,
+            }
+        }
+        // The verbatim remainder is the content (empty for a no-body delete).
+        Ok(request.with_arg("content", ArgRef::Inline(tail.as_bytes().to_vec())))
     }
 
     /// Build the `Source` [`Request`] for a stage without issuing it — shared by
@@ -1162,6 +1208,31 @@ mod tests {
         ))
     }
 
+    /// An engine over a write endpoint that declares a `url` argument and echoes
+    /// the verb, `url`, and `content` it received — for testing sink/delete arg
+    /// routing (named leading args vs verbatim content).
+    fn write_engine() -> Engine {
+        let endpoint = FnEndpoint::new("write", |inv: &Invocation<'_>| {
+            let url = inv.inline_str("url").unwrap_or("");
+            let content = inv.inline_str("content").unwrap_or("");
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("{:?} url={url} content={content}", inv.request.verb).into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("write")
+                .verb(Verb::Sink)
+                .verb(Verb::Delete)
+                .input(ArgSpec::new("url").summary("the target URL"))
+                .input(ArgSpec::new("content").summary("the body")),
+        );
+        Engine::new(Kernel::with_meta_renderer(
+            Arc::new(EndpointSpace::new().bind(Exact::new("urn:test:write"), endpoint)),
+            Arc::new(JsonRenderer),
+        ))
+    }
+
     fn output(action: Action) -> Result<String, String> {
         match action {
             Action::Output(entry) => entry.result,
@@ -1222,6 +1293,35 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn sink_routes_leading_named_args_then_verbatim_content() {
+        let engine = write_engine();
+        // `url=` is a declared arg → named; the rest is the body, byte-exact.
+        assert_eq!(
+            output(engine.eval("sink urn:test:write url=https://h/p the  body  text")).unwrap(),
+            "Sink url=https://h/p content=the  body  text"
+        );
+    }
+
+    #[test]
+    fn sink_with_no_named_args_is_all_content() {
+        let engine = write_engine();
+        // No leading `key=value` with a declared key → the whole remainder is content.
+        assert_eq!(
+            output(engine.eval("sink urn:test:write just content here")).unwrap(),
+            "Sink url= content=just content here"
+        );
+    }
+
+    #[test]
+    fn delete_command_issues_the_delete_verb_with_named_args() {
+        let engine = write_engine();
+        assert_eq!(
+            output(engine.eval("delete urn:test:write url=https://h/p")).unwrap(),
+            "Delete url=https://h/p content="
+        );
     }
 
     #[test]
