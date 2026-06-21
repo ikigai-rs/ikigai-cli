@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::executor::block_on;
-use ikigai_core::{Capability, Expiry, Kernel, Representation, Request, SpaceEntry};
+use ikigai_core::{Capability, Expiry, Kernel, Representation, Request, SpaceEntry, Tracer};
 use serde::{Deserialize, Serialize};
 
 /// How a resolution was served by the representation cache.
@@ -71,6 +71,17 @@ pub trait Resolver: Send + Sync {
     ) -> Result<(Representation, CacheStatus), String> {
         self.issue_as(request, capability)
     }
+
+    /// Install an execution [`Tracer`] for the next resolution — the `trace` command
+    /// records one real `source` to show which worker each node ran on. Default
+    /// no-op: a wire resolver can't yet trace the remote kernel; the in-process
+    /// kernel forwards to [`Kernel::set_tracer`]. Paired with [`clear_tracer`].
+    fn set_tracer(&self, tracer: Arc<dyn Tracer>) {
+        let _ = tracer;
+    }
+
+    /// Remove the installed tracer (default no-op).
+    fn clear_tracer(&self) {}
 
     /// Whether resolving `request` would be served from the cache, without
     /// resolving it.
@@ -129,6 +140,14 @@ impl Resolver for Kernel {
         Ok((representation, status))
     }
 
+    fn set_tracer(&self, tracer: Arc<dyn Tracer>) {
+        Kernel::set_tracer(self, tracer);
+    }
+
+    fn clear_tracer(&self) {
+        Kernel::clear_tracer(self);
+    }
+
     fn is_cached(&self, request: &Request) -> bool {
         Kernel::is_cached(self, request)
     }
@@ -177,6 +196,14 @@ impl<R: Resolver + ?Sized> Resolver for Arc<R> {
     ) -> Result<(Representation, CacheStatus), String> {
         // Delegate to the inner resolver's override (e.g. the kernel's true-async one).
         (**self).issue_as_async(request, capability).await
+    }
+
+    fn set_tracer(&self, tracer: Arc<dyn Tracer>) {
+        (**self).set_tracer(tracer);
+    }
+
+    fn clear_tracer(&self) {
+        (**self).clear_tracer();
     }
 
     fn is_cached(&self, request: &Request) -> bool {
