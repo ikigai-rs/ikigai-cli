@@ -16,8 +16,14 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
-use ikigai_core::{ArgRef, Capability, Description, InputSource, Iri, Request, Verb};
+use futures::executor::block_on;
+use futures::future::join_all;
+use ikigai_core::{
+    ArgRef, BoxFuture, Capability, Description, InputSource, Iri, Representation, Request, Spawner,
+    Verb,
+};
 use ikigai_resolve::{CacheStatus, Resolver};
 
 use crate::config;
@@ -137,7 +143,7 @@ pub enum Action {
 /// Holds the resolver (a local or remote kernel) and turns input lines into
 /// [`Action`]s.
 pub struct Engine {
-    resolver: Box<dyn Resolver>,
+    resolver: Arc<dyn Resolver>,
     /// Cache outcomes recorded by [`run`](Self::run) during the current `eval`.
     /// Interior-mutable so the `&self` resolution path can tally without
     /// threading an accumulator through every stage; the REPL is single-threaded.
@@ -152,6 +158,10 @@ pub struct Engine {
     /// Named capability profiles a host registers (e.g. `freebusy` → a set of
     /// `urn:cap:` scopes), so `cap <name>` reads friendlier than a scope list.
     profiles: RefCell<HashMap<String, Vec<String>>>,
+    /// The scheduler (as a [`Spawner`]) a host injects so `( a ; b )` forks and `..`
+    /// maps over single `source` stages resolve concurrently on it. Absent ⇒ those
+    /// run sequentially (the default; the browser frontend has no scheduler).
+    spawner: Option<Arc<dyn Spawner>>,
 }
 
 impl Engine {
@@ -165,12 +175,21 @@ impl Engine {
     /// The session starts at `identity`, and `cap reset` returns to it.
     pub fn with_identity(resolver: impl Resolver + 'static, identity: Capability) -> Self {
         Self {
-            resolver: Box::new(resolver),
+            resolver: Arc::new(resolver),
             cache: Cell::new(CacheStats::default()),
             capability: RefCell::new(identity.clone()),
             identity,
             profiles: RefCell::new(HashMap::new()),
+            spawner: None,
         }
+    }
+
+    /// Inject the scheduler (as a [`Spawner`]) so `( a ; b )` forks and `..` maps
+    /// whose branches are single `source` stages resolve **concurrently** on it.
+    /// Without one — or for multi-stage branches — they run sequentially.
+    pub fn with_spawner(mut self, spawner: Arc<dyn Spawner>) -> Self {
+        self.spawner = Some(spawner);
+        self
     }
 
     /// The session's current capability.
@@ -270,6 +289,21 @@ impl Engine {
                 self.run_source(target, args, incoming)
             }
             Node::Fork(branches) => {
+                // Concurrent path: when every branch is a lone `source` stage and a
+                // scheduler is injected, resolve them on it in parallel.
+                if let Some(spawner) = &self.spawner {
+                    if let Some(branch_words) = single_source_branches(branches) {
+                        let requests = branch_words
+                            .iter()
+                            .map(|words| {
+                                let (target, args) =
+                                    words.split_first().ok_or("expected an IRI")?;
+                                self.source_request(target, args, incoming)
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        return Ok(self.run_parallel(spawner, requests)?.join("\n"));
+                    }
+                }
                 let outputs = branches
                     .iter()
                     .map(|branch| self.run_pipeline_node(branch, incoming))
@@ -284,11 +318,69 @@ impl Engine {
     /// is the list convention used across the kernel (e.g. `reverseList`), so `..`
     /// threads a list through a per-item transform. An error on any item aborts.
     fn run_map(&self, node: &Node, value: &str) -> Result<String, String> {
+        // Concurrent path: mapping a single `source` over each item — resolve the
+        // items on the injected scheduler in parallel.
+        if let (Node::Source(words), Some(spawner)) = (node, &self.spawner) {
+            let (target, args) = words.split_first().ok_or("expected an IRI")?;
+            let requests = value
+                .split('\n')
+                .map(|item| self.source_request(target, args, Some(item)))
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(self.run_parallel(spawner, requests)?.join("\n"));
+        }
         let outputs = value
             .split('\n')
             .map(|item| self.run_node(node, Some(item)))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(outputs.join("\n"))
+    }
+
+    /// Resolve `requests` concurrently on `spawner` and return their text outputs in
+    /// order, recording each cache outcome (so the batch summary reflects them).
+    /// Each resolve is spawned (`issue_as_async`, which *parks* rather than blocking
+    /// a worker) and joined under a local `block_on` on this thread — which is the
+    /// REPL thread, not a pool worker, so there's no nesting and no deadlock with the
+    /// kernel's own fan-out. Only used for single-`source` branches/items, so a
+    /// spawned task never itself re-enters this `block_on`.
+    fn run_parallel(
+        &self,
+        spawner: &Arc<dyn Spawner>,
+        requests: Vec<Request>,
+    ) -> Result<Vec<String>, String> {
+        type Slot = Arc<Mutex<Option<Result<(Representation, CacheStatus), String>>>>;
+        let capability = self.capability.borrow().clone();
+        let slots: Vec<Slot> = requests
+            .iter()
+            .map(|_| Arc::new(Mutex::new(None)))
+            .collect();
+        let joins: Vec<BoxFuture<()>> = requests
+            .into_iter()
+            .zip(&slots)
+            .map(|(request, slot)| {
+                let resolver = Arc::clone(&self.resolver);
+                let capability = capability.clone();
+                let slot = Arc::clone(slot);
+                spawner.spawn(Box::pin(async move {
+                    let result = resolver.issue_as_async(request, &capability).await;
+                    *slot.lock().expect("branch slot") = Some(result);
+                }))
+            })
+            .collect();
+        block_on(join_all(joins));
+
+        let mut outputs = Vec::with_capacity(slots.len());
+        let mut stats = self.cache.get();
+        for slot in slots {
+            let (representation, status) = slot
+                .lock()
+                .expect("branch slot")
+                .take()
+                .expect("spawned branch completed")?;
+            stats.record(status);
+            outputs.push(String::from_utf8(representation.bytes).map_err(|e| e.to_string())?);
+        }
+        self.cache.set(stats);
+        Ok(outputs)
     }
 
     /// `SOURCE` a resource and return its representation as text.
@@ -803,6 +895,21 @@ enum Connector {
     Map,
 }
 
+/// If every branch is a lone `source` stage (no `|`, `..`, or nested `( )`), return
+/// their word lists — the case a fork can resolve concurrently. `None` if any branch
+/// is multi-stage or itself a fork, in which case the fork runs sequentially (so a
+/// spawned branch is always a single resolve, never something that re-enters the
+/// parallel path).
+fn single_source_branches(branches: &[Pipeline]) -> Option<Vec<&[String]>> {
+    branches
+        .iter()
+        .map(|branch| match &branch.first {
+            Node::Source(words) if branch.rest.is_empty() => Some(words.as_slice()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// One stage of a pipeline.
 #[derive(Debug, PartialEq, Eq)]
 enum Node {
@@ -1245,6 +1352,51 @@ mod tests {
             Arc::new(EndpointSpace::new().bind(Exact::new("urn:test:write"), endpoint)),
             Arc::new(JsonRenderer),
         ))
+    }
+
+    /// A cooperative spawner: returns each task as its own completion future so the
+    /// join drives them on the current thread — exercises the parallel fork/map path
+    /// without real threads (the threaded version is verified live + in ikigai-scheduler).
+    struct InlineSpawner;
+    impl ikigai_core::Spawner for InlineSpawner {
+        fn spawn(&self, task: ikigai_core::BoxFuture<()>) -> ikigai_core::BoxFuture<()> {
+            task
+        }
+    }
+
+    /// An engine with toUpper, reverseList, a fixed `urn:test:list` (→ "a\nb"), and an
+    /// injected spawner — so forks/maps over single sources take the parallel path.
+    fn parallel_engine() -> Engine {
+        let list = FnEndpoint::new("list", |_: &Invocation<'_>| {
+            Ok(Representation::new(ReprType::new("text/plain"), b"a\nb".to_vec()).cacheable())
+        });
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:fn:toUpper"), builtins::to_upper())
+            .bind(Exact::new("urn:fn:reverseList"), builtins::reverse_list())
+            .bind(Exact::new("urn:test:list"), list);
+        Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ))
+        .with_spawner(Arc::new(InlineSpawner))
+    }
+
+    #[test]
+    fn fork_over_a_spawner_resolves_each_branch() {
+        // `( toUpper ; reverseList )` fed "a\nb" → "A\nB" then "b\na", joined.
+        let out = output(
+            parallel_engine()
+                .eval("source urn:test:list | ( urn:fn:toUpper ; urn:fn:reverseList )"),
+        )
+        .unwrap();
+        assert_eq!(out, "A\nB\nb\na");
+    }
+
+    #[test]
+    fn map_over_a_spawner_resolves_each_item() {
+        // `.. toUpper` over the items a, b → A, B.
+        let out = output(parallel_engine().eval("source urn:test:list .. urn:fn:toUpper")).unwrap();
+        assert_eq!(out, "A\nB");
     }
 
     fn output(action: Action) -> Result<String, String> {

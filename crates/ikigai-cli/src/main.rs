@@ -231,8 +231,12 @@ fn build_engine(connect: Option<Option<String>>, certs: &Certs) -> Result<Engine
     match connect {
         // The watched kernel: cached workspace reads also invalidate on an
         // out-of-band file change (an editor), not just a `sink` through the REPL.
+        // The same process scheduler drives both the kernel's fan-out and the
+        // engine's `( a ; b )` / `..` parallelism, so `IKIGAI_SCHEDULER=pool:N`
+        // governs all of it.
         None => Ok(with_profiles(
-            Engine::new(ikigai_embedded::watched_kernel()),
+            Engine::new(ikigai_embedded::watched_kernel())
+                .with_spawner(std::sync::Arc::new(ikigai_embedded::scheduler())),
         )),
         Some(target) => match target.as_deref() {
             Some(t) if is_quic(t) => connect_quic(t, certs),
