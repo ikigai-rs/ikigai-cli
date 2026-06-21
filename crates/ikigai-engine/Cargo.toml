@@ -11,6 +11,10 @@ repository.workspace = true
 ikigai-core = { workspace = true }
 ikigai-resolve = { workspace = true }
 serde_json = { workspace = true }
+# block_on + join_all for the parallel fork/map path. Only block_on/join_all are
+# used (no ThreadPool), so the engine still compiles to wasm; without an injected
+# spawner the parallel path is never taken (sequential fallback).
+futures = { workspace = true }
 
 [dev-dependencies]
 # End-to-end `sink`/`source`/`cap` tests mount the real file module.
