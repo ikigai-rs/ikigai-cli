@@ -1,0 +1,46 @@
+<svg viewBox="0 0 680 348" xmlns="http://www.w3.org/2000/svg" role="img" width="100%">
+<title>Task lifecycle — scheduled, not attached; park, don't block</title>
+<desc>A task is QUEUED on submit, ATTACHED to a thread only when one frees up (running, holds a thread), PARKED while awaiting any external completion (releasing its thread — holds zero threads), re-QUEUED when woken, and DONE on completion.</desc>
+<defs>
+<marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#5F5E5A" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></marker>
+</defs>
+<style>
+.st{font:600 15px ui-monospace,Menlo,monospace}
+.sub{font:11px -apple-system,system-ui,sans-serif;fill:#5F5E5A}
+.e{stroke:#5F5E5A;stroke-width:1.5;fill:none}
+.el{font:11px ui-monospace,Menlo,monospace;fill:#5F5E5A}
+</style>
+
+<text class="el" x="110" y="46" text-anchor="middle">submit</text>
+<line class="e" x1="110" y1="52" x2="110" y2="92" marker-end="url(#ar)"/>
+
+<rect x="40" y="92" width="140" height="58" rx="10" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="1.5"/>
+<text class="st" x="110" y="126" text-anchor="middle" fill="#2C2C2A">QUEUED</text>
+
+<rect x="270" y="92" width="160" height="58" rx="10" fill="#FAEEDA" stroke="#854F0B" stroke-width="1.5"/>
+<text class="st" x="350" y="120" text-anchor="middle" fill="#412402">ATTACHED</text>
+<text class="sub" x="350" y="138" text-anchor="middle">running — holds a thread</text>
+
+<rect x="540" y="92" width="110" height="58" rx="10" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="1.5"/>
+<text class="st" x="595" y="126" text-anchor="middle" fill="#2C2C2A">DONE</text>
+
+<rect x="270" y="232" width="160" height="58" rx="10" fill="#EAF3DE" stroke="#3B6D11" stroke-width="1.5"/>
+<text class="st" x="350" y="260" text-anchor="middle" fill="#173404">PARKED</text>
+<text class="sub" x="350" y="278" text-anchor="middle" fill="#3B6D11">holds 0 threads</text>
+
+<line class="e" x1="180" y1="121" x2="270" y2="121" marker-end="url(#ar)"/>
+<text class="el" x="225" y="112" text-anchor="middle">thread frees up</text>
+
+<line class="e" x1="430" y1="121" x2="540" y2="121" marker-end="url(#ar)"/>
+<text class="el" x="485" y="112" text-anchor="middle">completes</text>
+
+<line class="e" x1="350" y1="150" x2="350" y2="232" marker-end="url(#ar)"/>
+<text class="el" x="362" y="180">awaits external</text>
+<text class="el" x="362" y="195" fill="#3B6D11">releases its thread</text>
+
+<path class="e" d="M270 261 C 150 261 110 210 110 152" marker-end="url(#ar)"/>
+<text class="el" x="120" y="225">woken</text>
+<text class="el" x="120" y="240">fence · reply · promise</text>
+
+<text class="el" x="40" y="322">ATTACHED only when a thread is free (“scheduled, not attached”); any await ⇒ PARKED, thread released (“don’t pin I/O on a CPU”).</text>
+</svg>
