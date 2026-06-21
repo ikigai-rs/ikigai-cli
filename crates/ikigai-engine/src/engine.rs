@@ -35,6 +35,7 @@ commands:
   describe <iri> [type]      META a resource; `type` defaults to text/turtle
   cache <iri> [args]         report whether resolving it would hit the cache (no resolve)
   cap [scope…]               show the session capability, narrow it to `scope`s, or `cap reset`
+                             (`net-<host>` is shorthand for the `urn:cap:net:<host>` scope)
   trace <iri> [args]         resolve a resource and show its path: client, transport, endpoint
   config [key=value]         show settings, or save one (e.g. config keybindings=emacs)
   list                       list the resources bound in the current space
@@ -504,10 +505,12 @@ impl Engine {
             ));
         }
         // A registered profile name expands to its scopes; otherwise each word is
-        // taken as a `urn:cap:` scope directly.
+        // a scope, with a `net-<host>` shorthand for `urn:cap:net:<host>` so a
+        // session can be narrowed to one host without typing the full scope (e.g.
+        // `cap net-example.com` before handing outbound HTTP to an agent).
         let scopes: Vec<String> = match self.profiles.borrow().get(rest) {
             Some(scopes) => scopes.clone(),
-            None => rest.split_whitespace().map(str::to_string).collect(),
+            None => rest.split_whitespace().map(expand_cap_shorthand).collect(),
         };
         let narrowed = self.capability.borrow().attenuate(scopes);
         *self.capability.borrow_mut() = narrowed;
@@ -1171,6 +1174,17 @@ fn split_first_word(s: &str) -> (&str, &str) {
     }
 }
 
+/// Expand a `cap` scope word: `net-<host>` is shorthand for the full
+/// `urn:cap:net:<host>` network scope; anything else is taken verbatim (so a full
+/// `urn:cap:…` scope still works). Lets `cap net-example.com` narrow a session to
+/// one host without typing the whole scope.
+fn expand_cap_shorthand(word: &str) -> String {
+    match word.strip_prefix("net-") {
+        Some(host) if !host.is_empty() => format!("urn:cap:net:{host}"),
+        _ => word.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1322,6 +1336,27 @@ mod tests {
             output(engine.eval("delete urn:test:write url=https://h/p")).unwrap(),
             "Delete url=https://h/p content="
         );
+    }
+
+    #[test]
+    fn cap_net_shorthand_expands_to_a_net_scope() {
+        assert_eq!(
+            expand_cap_shorthand("net-example.com"),
+            "urn:cap:net:example.com"
+        );
+        // A full scope passes through unchanged; an empty host is left verbatim.
+        assert_eq!(
+            expand_cap_shorthand("urn:cap:fs:read:/x"),
+            "urn:cap:fs:read:/x"
+        );
+        assert_eq!(expand_cap_shorthand("net-"), "net-");
+    }
+
+    #[test]
+    fn cap_narrows_to_a_host_via_the_net_shorthand() {
+        let engine = builtin_engine();
+        let out = output(engine.eval("cap net-example.com")).unwrap();
+        assert!(out.contains("urn:cap:net:example.com"), "{out}");
     }
 
     #[test]
