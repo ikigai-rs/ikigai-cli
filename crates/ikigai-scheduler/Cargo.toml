@@ -8,6 +8,8 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Runs arbitrary futures; deliberately depends only on `futures` (no kernel, no
-# Tokio) so the scheduler stays a thin host-side seam above the runtime-free kernel.
+# Runs arbitrary futures on `futures` (no Tokio) so the scheduler stays a thin
+# host-side seam. ikigai-core only for the `Spawner` trait it implements — the kernel
+# injects this as its concurrent-fan-out executor (Kernel::into_scheduled).
+ikigai-core = { workspace = true }
 futures = { workspace = true, features = ["thread-pool"] }
