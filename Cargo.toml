@@ -13,7 +13,7 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 [workspace.dependencies]
 # The released kernel, consumed from crates.io. For local cross-repo development
 # against a sibling checkout, use .cargo/config.toml (see .cargo/config.toml.example).
-ikigai-core = "0.1.9"  # golden threads: depends_on + Sink auto-cut
+ikigai-core = "0.1.12" # golden threads + time-based expiry (Expiry::At, injected Clock, Invocation::now)
 ikigai-vocab = "0.1"
 # The reusable function library, linked in as a published module crate.
 ikigai-fn = "0.1.0"
@@ -21,6 +21,8 @@ ikigai-fn = "0.1.0"
 ikigai-personal = "0.1.0"
 # Capability-gated file/store module, linked as a published module crate.
 ikigai-fs = "0.1.2"
+# Outbound HTTP-client module (urn:httpGet…), linked as a published module crate.
+ikigai-http = "0.1.0"
 ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.1.1" }
 ikigai-wire = { path = "crates/ikigai-wire", version = "0.1.0" }
 futures = "0.3"
@@ -28,3 +30,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 postcard = { version = "1", features = ["use-std"] }
 libc = "0.2"
+# Native HTTP client for the embedded host's ikigai-http transport. Blocking and
+# runtime-free, so it works under the CLI's `futures::block_on` without pulling Tokio.
+ureq = "2"
