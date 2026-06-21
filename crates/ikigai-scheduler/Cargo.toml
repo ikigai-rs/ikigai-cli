@@ -1,0 +1,13 @@
+[package]
+name = "ikigai-scheduler"
+description = "Async work scheduler for the ikigai kernel: a pluggable executor (single-thread or a configurable threadpool) that drives the runtime-free kernel's futures, parking — not blocking — on awaits."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Runs arbitrary futures; deliberately depends only on `futures` (no kernel, no
+# Tokio) so the scheduler stays a thin host-side seam above the runtime-free kernel.
+futures = { workspace = true, features = ["thread-pool"] }
