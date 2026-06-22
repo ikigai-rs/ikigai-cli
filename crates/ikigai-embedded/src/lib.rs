@@ -267,15 +267,25 @@ fn http_space() -> EndpointSpace {
 /// A [`SystemClock`] is injected so the HTTP module's `Cache-Control: max-age`
 /// deadlines (`Expiry::At`) are honoured; without a clock those reads would stay
 /// uncacheable. The root is a [`Fallback`] over the local space then the HTTP space.
+/// The embedded kernel's root space: the local space, the HTTP module, and — only
+/// when `demo` is set — the interactive runbook (`urn:runbook:*`). The runbook is OFF
+/// by default so the CLI reads as a tool, not a demo; `--demo` mounts it (the same
+/// module the in-browser kernel links).
+fn root_space(demo: bool) -> Arc<dyn Space> {
+    let mut members: Vec<Arc<dyn Space>> = vec![
+        Arc::new(local_space("Embedded (Native)")),
+        Arc::new(http_space()),
+    ];
+    if demo {
+        members.push(Arc::new(ikigai_runbook::space()));
+    }
+    Arc::new(Fallback::new(members))
+}
+
+/// The embedded kernel (no runbook — the default tool surface).
 pub fn kernel() -> Kernel {
-    let root: Arc<dyn Space> = Arc::new(Fallback::new(vec![
-        Arc::new(local_space("Embedded (Native)")) as Arc<dyn Space>,
-        Arc::new(http_space()) as Arc<dyn Space>,
-        // The interactive runbook (`urn:runbook:*`) — the same module the in-browser
-        // kernel links, so the guided demos are authored once and run in both.
-        Arc::new(ikigai_runbook::space()) as Arc<dyn Space>,
-    ]));
-    Kernel::with_meta_renderer(root, Arc::new(CliRenderer)).with_clock(Arc::new(SystemClock))
+    Kernel::with_meta_renderer(root_space(false), Arc::new(CliRenderer))
+        .with_clock(Arc::new(SystemClock))
 }
 
 /// The local embedded kernel as a shared `Arc`, with a filesystem **watcher** over
@@ -287,13 +297,15 @@ pub fn kernel() -> Kernel {
 /// composite over it — recompute, exactly as a `Sink` through the kernel already
 /// does. The returned `Arc` is what the engine drives, so the watcher and the
 /// engine share one kernel and one cache.
-pub fn watched_kernel() -> Arc<Kernel> {
+pub fn watched_kernel(demo: bool) -> Arc<Kernel> {
     // Inject the process scheduler so re-entrant fan-out (e.g. `compose`'s `$a{}`
     // markers) runs concurrently on it; single-threaded by default, a pool under
     // `IKIGAI_SCHEDULER=pool[:N]`. The same scheduler is injected as a read-only
     // reporter so `urn:kernel:scheduler` surfaces its live state intrinsically.
+    // `demo` mounts the runbook (`urn:runbook:*`); off by default.
     let sched = Arc::new(scheduler());
-    let kernel = kernel()
+    let kernel = Kernel::with_meta_renderer(root_space(demo), Arc::new(CliRenderer))
+        .with_clock(Arc::new(SystemClock))
         .with_scheduler_reporter(sched.clone())
         .into_scheduled(sched);
     watch_root(Arc::clone(&kernel), file_root());
