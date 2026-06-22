@@ -47,6 +47,7 @@ commands:
   trace <iri> [args]         resolve a resource and show its path: client, transport, endpoint
   config [key=value]         show settings, or save one (e.g. config keybindings=emacs)
   list                       list the resources bound in the current space
+  demo [on|off]              show or toggle the interactive runbook (urn:runbook:*)
   clear                      clear the visible output (history is kept)
   help                       show this help
   quit                       exit
@@ -250,6 +251,7 @@ impl Engine {
             "config" => output(self, run_config(rest)),
             "cache" => output(self, self.run_cache(rest).await),
             "cap" => output(self, self.run_cap(rest)),
+            "demo" => output(self, self.run_demo(rest).await),
             "trace" => output(self, self.run_trace(rest).await),
             "source" | "src" => output(self, self.run_pipeline(rest).await),
             "sink" => output(self, self.run_sink(rest).await),
@@ -764,6 +766,25 @@ impl Engine {
         let request =
             Request::new(Verb::Meta, iri).with_arg("as", ArgRef::Inline(ty.as_bytes().to_vec()));
         self.run(request).await
+    }
+
+    /// `demo` command: sugar over the `urn:host:demo` resource. Bare `demo` reports
+    /// the state (`source`); `demo on`/`demo off` (or any value the host accepts)
+    /// flips it (`sink`). The engine stays generic — it just resolves the resource;
+    /// the host owns the flag, so on a backend that doesn't bind `urn:host:demo` this
+    /// reports a normal "unresolved" error.
+    async fn run_demo(&self, rest: &str) -> Result<String, String> {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            self.run(Request::new(Verb::Source, parse_target("urn:host:demo")?))
+                .await
+        } else {
+            self.run(
+                self.write_request(Verb::Sink, &format!("urn:host:demo {rest}"))
+                    .await?,
+            )
+            .await
+        }
     }
 
     /// Fetch a target's structured self-description via a `Meta` request rendered

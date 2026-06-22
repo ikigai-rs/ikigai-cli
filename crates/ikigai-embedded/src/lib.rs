@@ -10,11 +10,13 @@
 //! only its own endpoints: the demo `page` shape and `urn:host:info`.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use ikigai_core::{
     Description, EndpointSpace, Error, Exact, Fallback, FnEndpoint, Invocation, Kernel,
-    MetaRenderer, ReprType, Representation, Result, Space, SystemClock, UriTemplate, Verb,
+    MetaRenderer, ReprType, Representation, Request, Resolution, Result, Scope, Space, SpaceEntry,
+    SystemClock, UriTemplate, Verb,
 };
 use ikigai_scheduler::Scheduler;
 use ikigai_vocab::TurtleRenderer;
@@ -144,15 +146,89 @@ pub fn scheduler() -> Scheduler {
         .clone()
 }
 
-/// The base demo space: the linked [`ikigai_fn`] function library plus this
-/// host's own resources (the `page` shape and `urn:host:info`). Used as-is for a
-/// *served* kernel — it deliberately omits the personal space, which must not be
-/// exposed over the wire until capability-on-the-wire and remote auth land.
+/// Process-global flag: is the interactive runbook (`urn:runbook:*`) active? OFF by
+/// default — the CLI is a tool, not a demo. `--demo` sets it at startup; `sink
+/// urn:host:demo on|off` (the `demo` command) flips it at runtime. One source of
+/// truth, read by the [`Gated`] runbook space and (later) the TUI's tab bar.
+pub fn demo_flag() -> Arc<AtomicBool> {
+    static DEMO: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    DEMO.get_or_init(|| Arc::new(AtomicBool::new(false)))
+        .clone()
+}
+
+/// A space mounted only while its flag is set. When off it resolves and enumerates
+/// nothing, so the runbook is absent from `list` and `urn:runbook:*` is unresolved
+/// until the demo is turned on — without rebuilding the kernel.
+struct Gated {
+    inner: EndpointSpace,
+    on: Arc<AtomicBool>,
+}
+
+impl Space for Gated {
+    fn resolve(&self, request: &Request, scope: &Scope) -> Resolution {
+        if self.on.load(Ordering::Relaxed) {
+            self.inner.resolve(request, scope)
+        } else {
+            Resolution::Miss
+        }
+    }
+    fn entries(&self) -> Option<Vec<SpaceEntry>> {
+        if self.on.load(Ordering::Relaxed) {
+            self.inner.entries()
+        } else {
+            Some(Vec::new())
+        }
+    }
+}
+
+/// `urn:host:demo` — the demo toggle as a resource. `source urn:host:demo` reports
+/// `on`/`off`; `sink urn:host:demo on|off` (lenient: also true/false/enable/disable)
+/// flips it, mounting/unmounting the runbook (and, in the TUI, the demo tabs). The
+/// `demo` command is sugar over these.
+fn host_demo() -> FnEndpoint {
+    FnEndpoint::new("host-demo", move |inv: &Invocation<'_>| {
+        let flag = demo_flag();
+        // A Sink carries the new state as `content`; a Source just reports it.
+        if let Ok(value) = inv.inline_str("content") {
+            let on = matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "on" | "true" | "enable" | "enabled" | "yes" | "1"
+            );
+            flag.store(on, Ordering::SeqCst);
+        }
+        let state = if flag.load(Ordering::SeqCst) {
+            "on"
+        } else {
+            "off"
+        };
+        Ok(Representation::new(
+            ReprType::new("text/plain").with_param("charset", "utf-8"),
+            format!("demo {state}\n").into_bytes(),
+        ))
+    })
+    .with_description(
+        Description::new("host-demo")
+            .title("Demo toggle")
+            .summary(
+                "The interactive runbook on/off — source reports it, `sink … on|off` flips it.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Sink)
+            .verb(Verb::Meta)
+            .output("text/plain;charset=utf-8"),
+    )
+}
+
+/// The base demo space: the linked [`ikigai_fn`] function library plus this host's
+/// own resources (the `page`/`about` shapes, `urn:host:info`, and the `urn:host:demo`
+/// toggle). Used as-is for a *served* kernel — it deliberately omits the personal
+/// space, which must not be exposed over the wire until capability-on-the-wire lands.
 fn base_space(nature: &'static str) -> EndpointSpace {
     ikigai_fn::space()
         .bind(Exact::new("urn:data:page"), page())
         .bind(Exact::new("urn:data:about"), about())
         .bind(Exact::new("urn:host:info"), host_info(nature))
+        .bind(Exact::new("urn:host:demo"), host_demo())
 }
 
 /// The directory the local file module is jailed to: `$IKIGAI_FILES`, else
@@ -267,24 +343,24 @@ fn http_space() -> EndpointSpace {
 /// A [`SystemClock`] is injected so the HTTP module's `Cache-Control: max-age`
 /// deadlines (`Expiry::At`) are honoured; without a clock those reads would stay
 /// uncacheable. The root is a [`Fallback`] over the local space then the HTTP space.
-/// The embedded kernel's root space: the local space, the HTTP module, and — only
-/// when `demo` is set — the interactive runbook (`urn:runbook:*`). The runbook is OFF
-/// by default so the CLI reads as a tool, not a demo; `--demo` mounts it (the same
-/// module the in-browser kernel links).
-fn root_space(demo: bool) -> Arc<dyn Space> {
-    let mut members: Vec<Arc<dyn Space>> = vec![
-        Arc::new(local_space("Embedded (Native)")),
-        Arc::new(http_space()),
-    ];
-    if demo {
-        members.push(Arc::new(ikigai_runbook::space()));
-    }
-    Arc::new(Fallback::new(members))
+/// The embedded kernel's root space: the local space, the HTTP module, and the
+/// interactive runbook (`urn:runbook:*`) — the last **gated** by [`demo_flag`], so it
+/// only resolves while the demo is on (OFF by default; `--demo` or `demo on` turns it
+/// on at runtime, no kernel rebuild). The CLI thus reads as a tool by default.
+fn root_space() -> Arc<dyn Space> {
+    Arc::new(Fallback::new(vec![
+        Arc::new(local_space("Embedded (Native)")) as Arc<dyn Space>,
+        Arc::new(http_space()) as Arc<dyn Space>,
+        Arc::new(Gated {
+            inner: ikigai_runbook::space(),
+            on: demo_flag(),
+        }) as Arc<dyn Space>,
+    ]))
 }
 
-/// The embedded kernel (no runbook — the default tool surface).
+/// The embedded kernel.
 pub fn kernel() -> Kernel {
-    Kernel::with_meta_renderer(root_space(false), Arc::new(CliRenderer))
+    Kernel::with_meta_renderer(root_space(), Arc::new(CliRenderer))
         .with_clock(Arc::new(SystemClock))
 }
 
@@ -297,14 +373,14 @@ pub fn kernel() -> Kernel {
 /// composite over it — recompute, exactly as a `Sink` through the kernel already
 /// does. The returned `Arc` is what the engine drives, so the watcher and the
 /// engine share one kernel and one cache.
-pub fn watched_kernel(demo: bool) -> Arc<Kernel> {
+pub fn watched_kernel() -> Arc<Kernel> {
     // Inject the process scheduler so re-entrant fan-out (e.g. `compose`'s `$a{}`
     // markers) runs concurrently on it; single-threaded by default, a pool under
     // `IKIGAI_SCHEDULER=pool[:N]`. The same scheduler is injected as a read-only
-    // reporter so `urn:kernel:scheduler` surfaces its live state intrinsically.
-    // `demo` mounts the runbook (`urn:runbook:*`); off by default.
+    // reporter so `urn:kernel:scheduler` surfaces its live state intrinsically. The
+    // runbook is mounted but gated by `demo_flag()` (off by default).
     let sched = Arc::new(scheduler());
-    let kernel = Kernel::with_meta_renderer(root_space(demo), Arc::new(CliRenderer))
+    let kernel = Kernel::with_meta_renderer(root_space(), Arc::new(CliRenderer))
         .with_clock(Arc::new(SystemClock))
         .with_scheduler_reporter(sched.clone())
         .into_scheduled(sched);
