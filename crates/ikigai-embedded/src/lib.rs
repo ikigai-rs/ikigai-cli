@@ -271,6 +271,9 @@ pub fn kernel() -> Kernel {
     let root: Arc<dyn Space> = Arc::new(Fallback::new(vec![
         Arc::new(local_space("Embedded (Native)")) as Arc<dyn Space>,
         Arc::new(http_space()) as Arc<dyn Space>,
+        // The interactive runbook (`urn:runbook:*`) — the same module the in-browser
+        // kernel links, so the guided demos are authored once and run in both.
+        Arc::new(ikigai_runbook::space()) as Arc<dyn Space>,
     ]));
     Kernel::with_meta_renderer(root, Arc::new(CliRenderer)).with_clock(Arc::new(SystemClock))
 }

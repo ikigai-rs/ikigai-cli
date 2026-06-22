@@ -23,6 +23,8 @@ ikigai-personal = "0.1.0"
 ikigai-fs = "0.1.2"
 # Outbound HTTP-client module (urn:httpGet…), linked as a published module crate.
 ikigai-http = "0.1.0"
+# Interactive runbook module (urn:runbook:*) — local path during dev; publish 0.1.0 when stable.
+ikigai-runbook = { git = "https://github.com/ikigai-rs/ikigai-runbook" }
 ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.1.1" }
 ikigai-wire = { path = "crates/ikigai-wire", version = "0.1.0" }
 ikigai-scheduler = { path = "crates/ikigai-scheduler", version = "0.1.3" }
