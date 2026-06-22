@@ -205,6 +205,22 @@ impl ikigai_core::Spawner for Scheduler {
     }
 }
 
+/// Reports the scheduler's live state for `urn:kernel:scheduler`, so the kernel can
+/// surface it intrinsically (the [`SchedulerReporter`](ikigai_core::SchedulerReporter)
+/// is injected like a `Clock`). Same fields as [`Scheduler::stats`].
+impl ikigai_core::SchedulerReporter for Scheduler {
+    fn rows(&self) -> Vec<(String, String)> {
+        let stats = self.stats();
+        vec![
+            ("backend".to_string(), stats.backend),
+            ("threads".to_string(), stats.threads.to_string()),
+            ("active".to_string(), stats.active.to_string()),
+            ("spawned".to_string(), stats.spawned.to_string()),
+            ("completed".to_string(), stats.completed.to_string()),
+        ]
+    }
+}
+
 /// One worker per available core, or 1 if the count can't be determined.
 fn default_threads() -> usize {
     std::thread::available_parallelism()

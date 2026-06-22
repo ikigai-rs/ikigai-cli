@@ -130,7 +130,7 @@ fn host_info(nature: &'static str) -> FnEndpoint {
 /// The process scheduler that drives kernel work. Single-threaded by default; set
 /// `IKIGAI_SCHEDULER` (`single` | `pool` | `pool:N`) to run on a threadpool. Built
 /// once and shared (a clone shares the pool), so the kernel's injected spawner and
-/// the `urn:host:scheduler` reflection endpoint report the same scheduler.
+/// its `urn:kernel:scheduler` reporter reflect the same scheduler.
 pub fn scheduler() -> Scheduler {
     static SCHEDULER: OnceLock<Scheduler> = OnceLock::new();
     SCHEDULER
@@ -144,31 +144,6 @@ pub fn scheduler() -> Scheduler {
         .clone()
 }
 
-/// `urn:host:scheduler` — reports the live scheduler (backend, threads, task
-/// counts), the addressable analogue of `urn:kernel:cache` / `urn:host:info`.
-/// Uncacheable: a live fact.
-fn host_scheduler() -> FnEndpoint {
-    FnEndpoint::new("host-scheduler", |_inv: &Invocation<'_>| {
-        let stats = scheduler().stats();
-        let body = format!(
-            "scheduler\n  backend    {}\n  threads    {}\n  active     {}\n  spawned    {}\n  completed  {}\n",
-            stats.backend, stats.threads, stats.active, stats.spawned, stats.completed
-        );
-        Ok(Representation::new(
-            ReprType::new("text/plain").with_param("charset", "utf-8"),
-            body.into_bytes(),
-        ))
-    })
-    .with_description(
-        Description::new("host-scheduler")
-            .title("Scheduler")
-            .summary("Reports the host scheduler's backend, thread count, and live task counts.")
-            .verb(Verb::Source)
-            .verb(Verb::Meta)
-            .output("text/plain;charset=utf-8"),
-    )
-}
-
 /// The base demo space: the linked [`ikigai_fn`] function library plus this
 /// host's own resources (the `page` shape and `urn:host:info`). Used as-is for a
 /// *served* kernel — it deliberately omits the personal space, which must not be
@@ -178,7 +153,6 @@ fn base_space(nature: &'static str) -> EndpointSpace {
         .bind(Exact::new("urn:data:page"), page())
         .bind(Exact::new("urn:data:about"), about())
         .bind(Exact::new("urn:host:info"), host_info(nature))
-        .bind(Exact::new("urn:host:scheduler"), host_scheduler())
 }
 
 /// The directory the local file module is jailed to: `$IKIGAI_FILES`, else
@@ -313,8 +287,12 @@ pub fn kernel() -> Kernel {
 pub fn watched_kernel() -> Arc<Kernel> {
     // Inject the process scheduler so re-entrant fan-out (e.g. `compose`'s `$a{}`
     // markers) runs concurrently on it; single-threaded by default, a pool under
-    // `IKIGAI_SCHEDULER=pool[:N]`.
-    let kernel = kernel().into_scheduled(Arc::new(scheduler()));
+    // `IKIGAI_SCHEDULER=pool[:N]`. The same scheduler is injected as a read-only
+    // reporter so `urn:kernel:scheduler` surfaces its live state intrinsically.
+    let sched = Arc::new(scheduler());
+    let kernel = kernel()
+        .with_scheduler_reporter(sched.clone())
+        .into_scheduled(sched);
     watch_root(Arc::clone(&kernel), file_root());
     kernel
 }
