@@ -35,7 +35,8 @@ pub enum CacheStatus {
 /// Synchronous by design (the REPL loop is blocking). Errors are surfaced as
 /// human-readable strings — the engine reports them verbatim; a richer transport
 /// error type can replace `String` when the wire protocol lands.
-#[async_trait]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
 pub trait Resolver: Send + Sync {
     /// Resolve `request` under the resolver's default authority, and report its
     /// representation and cache outcome.
@@ -102,7 +103,8 @@ pub trait Resolver: Send + Sync {
 /// hit returns the cached value without growing the cache; a cacheable miss
 /// inserts one entry). All requests use the root capability — this is the
 /// trusted, same-process path.
-#[async_trait]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
 impl Resolver for Kernel {
     fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), String> {
         self.issue_as(request, &Capability::root())
@@ -175,7 +177,8 @@ fn cache_status(was_cached: bool, representation: &Representation) -> CacheStatu
 /// at the same time reached by a file watcher that cuts golden threads on the very
 /// same kernel (and thus the same cache). Every method delegates, so the inner
 /// resolver's overrides (e.g. the kernel's `issue_as`/`transport`) are preserved.
-#[async_trait]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
 impl<R: Resolver + ?Sized> Resolver for Arc<R> {
     fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), String> {
         (**self).issue(request)
