@@ -193,7 +193,12 @@ fn main() {
             _ => serve_ipc(target),
         },
         Mode::Repl(args) => {
-            let engine = build_engine(args.connect, &args.certs, args.demo).unwrap_or_else(|e| {
+            // `--demo` seeds the runtime demo flag; `demo on`/`off` (→ urn:host:demo)
+            // toggles it thereafter. The runbook is gated on it, off by default.
+            if args.demo {
+                ikigai_embedded::demo_flag().store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            let engine = build_engine(args.connect, &args.certs).unwrap_or_else(|e| {
                 eprintln!("ikigai: {e}");
                 std::process::exit(1);
             });
@@ -232,11 +237,7 @@ fn with_profiles(engine: Engine) -> Engine {
 /// Build the engine over the chosen backend: the embedded kernel, or — with
 /// `--connect` — an IPC or QUIC client, dispatched by the target.
 #[cfg(feature = "embedded")]
-fn build_engine(
-    connect: Option<Option<String>>,
-    certs: &Certs,
-    demo: bool,
-) -> Result<Engine, String> {
+fn build_engine(connect: Option<Option<String>>, certs: &Certs) -> Result<Engine, String> {
     match connect {
         // The watched kernel: cached workspace reads also invalidate on an
         // out-of-band file change (an editor), not just a `sink` through the REPL.
@@ -244,7 +245,7 @@ fn build_engine(
         // engine's `( a ; b )` / `..` parallelism, so `IKIGAI_SCHEDULER=pool:N`
         // governs all of it.
         None => Ok(with_profiles(
-            Engine::new(ikigai_embedded::watched_kernel(demo))
+            Engine::new(ikigai_embedded::watched_kernel())
                 .with_spawner(std::sync::Arc::new(ikigai_embedded::scheduler())),
         )),
         Some(target) => match target.as_deref() {
