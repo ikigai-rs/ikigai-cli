@@ -16,6 +16,8 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use futures::executor::block_on;
@@ -213,8 +215,18 @@ impl Engine {
             .insert(name.into(), scopes.into_iter().map(Into::into).collect());
     }
 
-    /// Evaluate one input line.
+    /// Evaluate one input line. The synchronous entry point — a thin
+    /// `block_on` over [`eval_async`](Self::eval_async), kept byte-identical for
+    /// the native frontends. A browser frontend drives `eval_async` directly
+    /// (where `block_on` would deadlock on a JS Promise).
     pub fn eval(&self, line: &str) -> Action {
+        block_on(self.eval_async(line))
+    }
+
+    /// Evaluate one input line, async-first. The resolving commands `.await`
+    /// their helpers so the whole resolution path can be driven without
+    /// blocking; the non-resolving commands stay synchronous.
+    pub async fn eval_async(&self, line: &str) -> Action {
         let line = line.trim();
         if line.is_empty() {
             return Action::Noop;
@@ -236,16 +248,16 @@ impl Engine {
             "clear" | "cls" => Action::Clear,
             "list" | "ls" => output(self, self.run_list()),
             "config" => output(self, run_config(rest)),
-            "cache" => output(self, self.run_cache(rest)),
+            "cache" => output(self, self.run_cache(rest).await),
             "cap" => output(self, self.run_cap(rest)),
-            "trace" => output(self, self.run_trace(rest)),
-            "source" | "src" => output(self, self.run_pipeline(rest)),
-            "sink" => output(self, self.run_sink(rest)),
-            "delete" | "del" => output(self, self.run_delete(rest)),
+            "trace" => output(self, self.run_trace(rest).await),
+            "source" | "src" => output(self, self.run_pipeline(rest).await),
+            "sink" => output(self, self.run_sink(rest).await),
+            "delete" | "del" => output(self, self.run_delete(rest).await),
             "describe" | "desc" => {
                 let (target, ty) = split_first_word(rest);
                 let ty = if ty.is_empty() { "text/turtle" } else { ty };
-                output(self, self.run_meta(target, ty))
+                output(self, self.run_meta(target, ty).await)
             }
             other => output(self, Err(format!("unknown command `{other}` (try `help`)"))),
         }
@@ -260,83 +272,95 @@ impl Engine {
     /// literal operator can appear inside an IRI or input. Every leaf is just a
     /// `source`, so routing, the binding-only error, and caching all come from
     /// [`run_source`](Self::run_source).
-    fn run_pipeline(&self, spec: &str) -> Result<String, String> {
+    async fn run_pipeline(&self, spec: &str) -> Result<String, String> {
         let pipeline = parse_spec(spec)?;
-        self.run_pipeline_node(&pipeline, None)
+        self.run_pipeline_node(&pipeline, None).await
     }
 
     /// Run a parsed pipeline. `incoming` is the value flowing in from an enclosing
     /// connector or fork — `None` at the top level, where the first stage takes
     /// its literal input from the command line instead.
-    fn run_pipeline_node(
-        &self,
-        pipeline: &Pipeline,
-        incoming: Option<&str>,
-    ) -> Result<String, String> {
-        let mut value = self.run_node(&pipeline.first, incoming)?;
-        for step in &pipeline.rest {
-            value = match step.connector {
-                Connector::Pipe => self.run_node(&step.node, Some(&value))?,
-                Connector::Map => self.run_map(&step.node, &value)?,
-            };
-        }
-        Ok(value)
+    fn run_pipeline_node<'a>(
+        &'a self,
+        pipeline: &'a Pipeline,
+        incoming: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + 'a>> {
+        Box::pin(async move {
+            let mut value = self.run_node(&pipeline.first, incoming).await?;
+            for step in &pipeline.rest {
+                value = match step.connector {
+                    Connector::Pipe => self.run_node(&step.node, Some(&value)).await?,
+                    Connector::Map => self.run_map(&step.node, &value).await?,
+                };
+            }
+            Ok(value)
+        })
     }
 
     /// Run one stage. A `Source` is a `source` request; a `Fork` fans `incoming`
     /// to every branch and joins their outputs with newlines (the same list
     /// convention `..` reads).
-    fn run_node(&self, node: &Node, incoming: Option<&str>) -> Result<String, String> {
-        match node {
-            Node::Source(words) => {
-                let (target, args) = words.split_first().ok_or("expected an IRI")?;
-                self.run_source(target, args, incoming)
-            }
-            Node::Fork(branches) => {
-                // Concurrent path: when every branch is a lone `source` stage and a
-                // scheduler is injected, resolve them on it in parallel.
-                if let Some(spawner) = &self.spawner {
-                    if let Some(branch_words) = single_source_branches(branches) {
-                        let requests = branch_words
-                            .iter()
-                            .map(|words| {
+    fn run_node<'a>(
+        &'a self,
+        node: &'a Node,
+        incoming: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + 'a>> {
+        Box::pin(async move {
+            match node {
+                Node::Source(words) => {
+                    let (target, args) = words.split_first().ok_or("expected an IRI")?;
+                    self.run_source(target, args, incoming).await
+                }
+                Node::Fork(branches) => {
+                    // Concurrent path: when every branch is a lone `source` stage and a
+                    // scheduler is injected, resolve them on it in parallel.
+                    if let Some(spawner) = &self.spawner {
+                        if let Some(branch_words) = single_source_branches(branches) {
+                            let mut requests = Vec::with_capacity(branch_words.len());
+                            for words in &branch_words {
                                 let (target, args) =
                                     words.split_first().ok_or("expected an IRI")?;
-                                self.source_request(target, args, incoming)
-                            })
-                            .collect::<Result<Vec<_>, _>>()?;
-                        return Ok(self.run_parallel(spawner, requests)?.join("\n"));
+                                requests.push(self.source_request(target, args, incoming).await?);
+                            }
+                            return Ok(self.run_parallel(spawner, requests).await?.join("\n"));
+                        }
                     }
+                    let mut outputs = Vec::with_capacity(branches.len());
+                    for branch in branches {
+                        outputs.push(self.run_pipeline_node(branch, incoming).await?);
+                    }
+                    Ok(outputs.join("\n"))
                 }
-                let outputs = branches
-                    .iter()
-                    .map(|branch| self.run_pipeline_node(branch, incoming))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(outputs.join("\n"))
             }
-        }
+        })
     }
 
     /// Map a stage over the newline-separated items of `value`: run the node once
     /// per item (feeding the item in) and rejoin the outputs with newlines. This
     /// is the list convention used across the kernel (e.g. `reverseList`), so `..`
     /// threads a list through a per-item transform. An error on any item aborts.
-    fn run_map(&self, node: &Node, value: &str) -> Result<String, String> {
-        // Concurrent path: mapping a single `source` over each item — resolve the
-        // items on the injected scheduler in parallel.
-        if let (Node::Source(words), Some(spawner)) = (node, &self.spawner) {
-            let (target, args) = words.split_first().ok_or("expected an IRI")?;
-            let requests = value
-                .split('\n')
-                .map(|item| self.source_request(target, args, Some(item)))
-                .collect::<Result<Vec<_>, _>>()?;
-            return Ok(self.run_parallel(spawner, requests)?.join("\n"));
-        }
-        let outputs = value
-            .split('\n')
-            .map(|item| self.run_node(node, Some(item)))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(outputs.join("\n"))
+    fn run_map<'a>(
+        &'a self,
+        node: &'a Node,
+        value: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + 'a>> {
+        Box::pin(async move {
+            // Concurrent path: mapping a single `source` over each item — resolve the
+            // items on the injected scheduler in parallel.
+            if let (Node::Source(words), Some(spawner)) = (node, &self.spawner) {
+                let (target, args) = words.split_first().ok_or("expected an IRI")?;
+                let mut requests = Vec::new();
+                for item in value.split('\n') {
+                    requests.push(self.source_request(target, args, Some(item)).await?);
+                }
+                return Ok(self.run_parallel(spawner, requests).await?.join("\n"));
+            }
+            let mut outputs = Vec::new();
+            for item in value.split('\n') {
+                outputs.push(self.run_node(node, Some(item)).await?);
+            }
+            Ok(outputs.join("\n"))
+        })
     }
 
     /// Resolve `requests` concurrently on `spawner` and return their text outputs in
@@ -346,7 +370,7 @@ impl Engine {
     /// REPL thread, not a pool worker, so there's no nesting and no deadlock with the
     /// kernel's own fan-out. Only used for single-`source` branches/items, so a
     /// spawned task never itself re-enters this `block_on`.
-    fn run_parallel(
+    async fn run_parallel(
         &self,
         spawner: &Arc<dyn Spawner>,
         requests: Vec<Request>,
@@ -370,7 +394,7 @@ impl Engine {
                 }))
             })
             .collect();
-        block_on(join_all(joins));
+        join_all(joins).await;
 
         let mut outputs = Vec::with_capacity(slots.len());
         let mut stats = self.cache.get();
@@ -388,28 +412,29 @@ impl Engine {
     }
 
     /// `SOURCE` a resource and return its representation as text.
-    fn run_source(
+    async fn run_source(
         &self,
         target: &str,
         args: &[String],
         incoming: Option<&str>,
     ) -> Result<String, String> {
-        let request = self.source_request(target, args, incoming)?;
-        self.run(request)
+        let request = self.source_request(target, args, incoming).await?;
+        self.run(request).await
     }
 
     /// `sink` command: write a representation *into* a resource — the write half
     /// of the REPL. `sink <iri> [key=value …] <content>` issues a `Sink` under the
     /// session capability (so a `cap`-narrowed session is refused by a gated
     /// endpoint exactly as a read is) and shows the endpoint's reply.
-    fn run_sink(&self, rest: &str) -> Result<String, String> {
-        self.run(self.write_request(Verb::Sink, rest)?)
+    async fn run_sink(&self, rest: &str) -> Result<String, String> {
+        self.run(self.write_request(Verb::Sink, rest).await?).await
     }
 
     /// `delete` command: remove a resource (the `Delete` verb). Same
     /// `delete <iri> [key=value …]` shape as `sink`, capability-gated identically.
-    fn run_delete(&self, rest: &str) -> Result<String, String> {
-        self.run(self.write_request(Verb::Delete, rest)?)
+    async fn run_delete(&self, rest: &str) -> Result<String, String> {
+        self.run(self.write_request(Verb::Delete, rest).await?)
+            .await
     }
 
     /// Build a write [`Request`] (`Sink`/`Delete`) for `sink`/`delete`.
@@ -421,7 +446,7 @@ impl Engine {
     /// named args, while letting `sink urn:httpPost url=https://… the body` name the
     /// URL and still pass an arbitrary body. The contract is only consulted when the
     /// first word looks like `key=value`, so a plain content write needs no lookup.
-    fn write_request(&self, verb: Verb, rest: &str) -> Result<Request, String> {
+    async fn write_request(&self, verb: Verb, rest: &str) -> Result<Request, String> {
         let (target, mut tail) = split_first_word(rest);
         if target.is_empty() {
             return Err(format!(
@@ -438,7 +463,7 @@ impl Engine {
         // Only look up the argument contract if a leading word could be a named
         // argument — a bare content write (the common case) skips it.
         let declared = if split_first_word(tail).0.contains('=') {
-            declared_arguments(self.describe_struct(&iri).as_ref())
+            declared_arguments(self.describe_struct(&iri).await.as_ref())
         } else {
             Vec::new()
         };
@@ -465,7 +490,7 @@ impl Engine {
     /// self-description), otherwise it is positional text. The positional text —
     /// or `incoming`, the value flowing in from a connector/fork — is routed to
     /// the one declared argument left unnamed.
-    fn source_request(
+    async fn source_request(
         &self,
         target: &str,
         args: &[String],
@@ -475,9 +500,11 @@ impl Engine {
 
         // The contract is only needed to recognise named arguments and route the
         // value; a bare `source <iri>` (no args, no pipe) skips the lookup.
-        let description = (!args.is_empty() || incoming.is_some())
-            .then(|| self.describe_struct(&iri))
-            .flatten();
+        let description = if !args.is_empty() || incoming.is_some() {
+            self.describe_struct(&iri).await
+        } else {
+            None
+        };
         let declared = declared_arguments(description.as_ref());
 
         // Split args into named (`key=value` with a declared key) and positional.
@@ -562,7 +589,7 @@ impl Engine {
     /// surface as one `source` stage, but no pipelines (there's nothing to thread
     /// through). Read-only except that naming arguments fetches the target's
     /// contract (a `Meta`), which is itself cacheable.
-    fn run_cache(&self, spec: &str) -> Result<String, String> {
+    async fn run_cache(&self, spec: &str) -> Result<String, String> {
         let pipeline = parse_spec(spec)?;
         let words = match pipeline {
             Pipeline {
@@ -574,7 +601,7 @@ impl Engine {
             }
         };
         let (target, args) = words.split_first().ok_or("expected an IRI")?;
-        let request = self.source_request(target, args, None)?;
+        let request = self.source_request(target, args, None).await?;
         Ok(if self.resolver.is_cached(&request) {
             "cached".to_string()
         } else {
@@ -637,7 +664,7 @@ impl Engine {
     /// distinct workers under `pool:N`, the same thread under the single-threaded
     /// default. Trace `urn:fn:compose src=<shape>` to see the fan-out, not the bare
     /// shape (sourcing the shape itself really is one resolution).
-    fn run_trace(&self, spec: &str) -> Result<String, String> {
+    async fn run_trace(&self, spec: &str) -> Result<String, String> {
         let pipeline = parse_spec(spec)?;
         let words = match pipeline {
             Pipeline {
@@ -650,7 +677,7 @@ impl Engine {
         };
         let (target, args) = words.split_first().ok_or("expected an IRI")?;
         let iri = parse_target(target)?;
-        let request = self.source_request(target, args, None)?;
+        let request = self.source_request(target, args, None).await?;
         let capability = self.capability.borrow().clone();
         // A scoped (non-root) session annotates each node with the authority it ran
         // under — `cap ✓` on success, `cap ✗` on a denial; a root session has nothing
@@ -673,7 +700,7 @@ impl Engine {
         // span. The resolution genuinely runs, so its cache effects are real too.
         let collector = Arc::new(TraceCollector::default());
         self.resolver.set_tracer(collector.clone());
-        let result = self.resolver.issue_as(request, &capability);
+        let result = self.resolver.issue_as_async(request, &capability).await;
         self.resolver.clear_tracer();
 
         match result {
@@ -732,32 +759,37 @@ impl Engine {
     }
 
     /// `META` a resource, rendered to `ty`.
-    fn run_meta(&self, target: &str, ty: &str) -> Result<String, String> {
+    async fn run_meta(&self, target: &str, ty: &str) -> Result<String, String> {
         let iri = parse_target(target)?;
         let request =
             Request::new(Verb::Meta, iri).with_arg("as", ArgRef::Inline(ty.as_bytes().to_vec()));
-        self.run(request)
+        self.run(request).await
     }
 
     /// Fetch a target's structured self-description via a `Meta` request rendered
     /// as `application/json`. `None` if it doesn't resolve or isn't JSON-renderable.
-    fn describe_struct(&self, iri: &Iri) -> Option<Description> {
+    async fn describe_struct(&self, iri: &Iri) -> Option<Description> {
         let request = Request::new(Verb::Meta, iri.clone())
             .with_arg("as", ArgRef::Inline(b"application/json".to_vec()));
         // The contract fetch is internal plumbing — its cache outcome isn't part
         // of the user-facing tally, so the status is discarded. It resolves under
-        // the session capability, like any request.
-        let capability = self.capability.borrow();
-        let (representation, _) = self.resolver.issue_as(request, &capability).ok()?;
+        // the session capability, like any request. Clone the capability so no
+        // `Ref` borrow is held across the `.await`.
+        let capability = self.capability.borrow().clone();
+        let (representation, _) = self
+            .resolver
+            .issue_as_async(request, &capability)
+            .await
+            .ok()?;
         serde_json::from_slice(&representation.bytes).ok()
     }
 
     /// Issue a request, record how the resolver's cache served it, and decode the
     /// representation as UTF-8 text. The resolver reports the [`CacheStatus`]
     /// directly — for a remote kernel the server knows it without a probe.
-    fn run(&self, request: Request) -> Result<String, String> {
-        let capability = self.capability.borrow();
-        let (representation, status) = self.resolver.issue_as(request, &capability)?;
+    async fn run(&self, request: Request) -> Result<String, String> {
+        let capability = self.capability.borrow().clone();
+        let (representation, status) = self.resolver.issue_as_async(request, &capability).await?;
         let mut stats = self.cache.get();
         stats.record(status);
         self.cache.set(stats);
