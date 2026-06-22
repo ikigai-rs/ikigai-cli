@@ -27,6 +27,7 @@ ikigai — resource-resolution REPL
 usage:
   ikigai                       start the interactive REPL (full-screen on a terminal)
   ikigai --plain               force the line REPL (also used automatically when piped)
+  ikigai --demo                mount the interactive runbook (urn:runbook:*); off by default
   ikigai --connect [<target>]  attach the REPL to a kernel server (a Unix path, or quic://host:port)
   ikigai serve [<target>]      run a kernel server (a Unix socket path, or quic://addr to bind)
   ikigai cert generate         create the pinned QUIC certificates in your config dir
@@ -63,6 +64,9 @@ enum Mode {
 #[derive(Default)]
 struct ReplArgs {
     plain: bool,
+    /// Mount the interactive runbook (`urn:runbook:*`); off by default so the CLI is
+    /// a tool, not a demo. Only meaningful for the embedded (non-`--connect`) kernel.
+    demo: bool,
     commands: Vec<String>,
     /// `None` = the embedded in-process kernel; `Some` = attach to a server, with
     /// `Some(None)` meaning the default Unix socket.
@@ -147,6 +151,7 @@ fn parse_args() -> Result<Option<Mode>, String> {
         match arg.as_str() {
             "-h" | "--help" => return Ok(None),
             "--plain" => repl.plain = true,
+            "--demo" => repl.demo = true,
             "--connect" => {
                 // Optional target: take the next token unless it looks like a flag.
                 let target = match argv.peek() {
@@ -188,7 +193,7 @@ fn main() {
             _ => serve_ipc(target),
         },
         Mode::Repl(args) => {
-            let engine = build_engine(args.connect, &args.certs).unwrap_or_else(|e| {
+            let engine = build_engine(args.connect, &args.certs, args.demo).unwrap_or_else(|e| {
                 eprintln!("ikigai: {e}");
                 std::process::exit(1);
             });
@@ -227,7 +232,11 @@ fn with_profiles(engine: Engine) -> Engine {
 /// Build the engine over the chosen backend: the embedded kernel, or — with
 /// `--connect` — an IPC or QUIC client, dispatched by the target.
 #[cfg(feature = "embedded")]
-fn build_engine(connect: Option<Option<String>>, certs: &Certs) -> Result<Engine, String> {
+fn build_engine(
+    connect: Option<Option<String>>,
+    certs: &Certs,
+    demo: bool,
+) -> Result<Engine, String> {
     match connect {
         // The watched kernel: cached workspace reads also invalidate on an
         // out-of-band file change (an editor), not just a `sink` through the REPL.
@@ -235,7 +244,7 @@ fn build_engine(connect: Option<Option<String>>, certs: &Certs) -> Result<Engine
         // engine's `( a ; b )` / `..` parallelism, so `IKIGAI_SCHEDULER=pool:N`
         // governs all of it.
         None => Ok(with_profiles(
-            Engine::new(ikigai_embedded::watched_kernel())
+            Engine::new(ikigai_embedded::watched_kernel(demo))
                 .with_spawner(std::sync::Arc::new(ikigai_embedded::scheduler())),
         )),
         Some(target) => match target.as_deref() {
