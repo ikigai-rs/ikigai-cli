@@ -678,7 +678,10 @@ mod tests {
 
         // Cache the read.
         assert_eq!(block_on(kernel.issue(source(), &cap)).unwrap().bytes, b"v1");
-        assert!(kernel.is_cached(&source()), "cached after the first read");
+        assert!(
+            kernel.is_cached(&source(), &cap),
+            "cached after the first read"
+        );
 
         // Change the file OUT OF BAND — not through the kernel.
         std::fs::write(root.join("notes.txt"), b"v2").unwrap();
@@ -686,7 +689,7 @@ mod tests {
         // The watcher should cut the thread (filesystem-event latency: poll).
         let mut cut = false;
         for _ in 0..60 {
-            if !kernel.is_cached(&source()) {
+            if !kernel.is_cached(&source(), &cap) {
                 cut = true;
                 break;
             }
