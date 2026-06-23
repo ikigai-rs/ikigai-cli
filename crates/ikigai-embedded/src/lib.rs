@@ -219,16 +219,139 @@ fn host_demo() -> FnEndpoint {
     )
 }
 
+/// `$HOME/.ikigai`, created — the ikigai-owned config/state directory. ([`file_root`]
+/// nests `workspace/` beneath it; command history persists here too.)
+fn ikigai_home() -> PathBuf {
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+    let dir = home.join(".ikigai");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Process-global flag: persist command history across invocations? Mirrors
+/// [`demo_flag`], but seeded from the on-disk marker so `history on` is **sticky** —
+/// a session enabled in a prior run starts with persistence already on (and its
+/// history loaded). `sink urn:host:history on|off` (the `history` command) flips it.
+pub fn history_flag() -> Arc<AtomicBool> {
+    static HISTORY: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    HISTORY
+        .get_or_init(|| Arc::new(AtomicBool::new(history_marker().exists())))
+        .clone()
+}
+
+/// The marker whose presence means persistence is on, so the toggle survives across
+/// invocations (the flag is seeded from it). Kept separate from the history file, so
+/// turning persistence off never discards the lines already recorded.
+fn history_marker() -> PathBuf {
+    ikigai_home().join("history.on")
+}
+
+/// The history file within a given config dir — one line per command. Split from
+/// [`ikigai_home`] so the round-trip is testable without touching `$HOME`.
+fn history_file(dir: &Path) -> PathBuf {
+    dir.join("history")
+}
+
+/// Read the command history from `dir`, oldest first; empty if absent/unreadable.
+fn read_history(dir: &Path) -> Vec<String> {
+    std::fs::read_to_string(history_file(dir))
+        .map(|s| s.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// Append a (trimmed, non-blank) command to the history file in `dir`.
+fn write_history(dir: &Path, line: &str) {
+    let line = line.trim();
+    if line.is_empty() {
+        return;
+    }
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(history_file(dir))
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+/// The persisted command history, oldest first — what a fresh session preloads into
+/// its line recall. Empty if nothing has been saved (or the file can't be read).
+pub fn load_history() -> Vec<String> {
+    read_history(&ikigai_home())
+}
+
+/// Append one command to the persisted history — a no-op when persistence is off or
+/// the line is blank, so a frontend can call it unconditionally on every submit.
+pub fn append_history(line: &str) {
+    if !history_flag().load(Ordering::Relaxed) {
+        return;
+    }
+    write_history(&ikigai_home(), line);
+}
+
+/// Turn history persistence on or off, updating both the live flag and the on-disk
+/// marker that makes the choice stick across invocations. Turning it off leaves the
+/// recorded lines in place.
+pub fn set_history(on: bool) {
+    history_flag().store(on, Ordering::SeqCst);
+    let marker = history_marker();
+    if on {
+        let _ = std::fs::File::create(&marker); // presence is the signal; empty is fine
+    } else {
+        let _ = std::fs::remove_file(&marker);
+    }
+}
+
+/// `urn:host:history` — the history-persistence toggle as a resource, the same
+/// convention as [`host_demo`]. `source urn:host:history` reports `on`/`off` (with the
+/// entry count when on); `sink urn:host:history on|off` (lenient) flips it. The
+/// `history` command is sugar over these.
+fn host_history() -> FnEndpoint {
+    FnEndpoint::new("host-history", move |inv: &Invocation<'_>| {
+        // A Sink carries the new state as `content`; a Source just reports it.
+        if let Ok(value) = inv.inline_str("content") {
+            let on = matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "on" | "true" | "enable" | "enabled" | "yes" | "1"
+            );
+            set_history(on);
+        }
+        let body = if history_flag().load(Ordering::SeqCst) {
+            format!("history on ({} entries)\n", load_history().len())
+        } else {
+            "history off\n".to_string()
+        };
+        Ok(Representation::new(
+            ReprType::new("text/plain").with_param("charset", "utf-8"),
+            body.into_bytes(),
+        ))
+    })
+    .with_description(
+        Description::new("host-history")
+            .title("History toggle")
+            .summary(
+                "Persist command history across runs — source reports it, `sink … on|off` flips it.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Sink)
+            .verb(Verb::Meta)
+            .output("text/plain;charset=utf-8"),
+    )
+}
+
 /// The base demo space: the linked [`ikigai_fn`] function library plus this host's
 /// own resources (the `page`/`about` shapes, `urn:host:info`, and the `urn:host:demo`
-/// toggle). Used as-is for a *served* kernel — it deliberately omits the personal
-/// space, which must not be exposed over the wire until capability-on-the-wire lands.
+/// / `urn:host:history` toggles). Used as-is for a *served* kernel — it deliberately
+/// omits the personal space, which must not be exposed over the wire until
+/// capability-on-the-wire lands.
 fn base_space(nature: &'static str) -> EndpointSpace {
     ikigai_fn::space()
         .bind(Exact::new("urn:data:page"), page())
         .bind(Exact::new("urn:data:about"), about())
         .bind(Exact::new("urn:host:info"), host_info(nature))
         .bind(Exact::new("urn:host:demo"), host_demo())
+        .bind(Exact::new("urn:host:history"), host_history())
 }
 
 /// The directory the local file module is jailed to: `$IKIGAI_FILES`, else
@@ -460,6 +583,27 @@ mod tests {
     use super::*;
     use futures::executor::block_on;
     use ikigai_core::{ArgRef, Capability, Iri, Request};
+
+    #[test]
+    fn history_round_trips_lines() {
+        // A unique dir per run so the file I/O is exercised without touching `$HOME`
+        // (and without racing the env-reading tests).
+        let dir = std::env::temp_dir().join(format!("ikigai-hist-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::remove_file(history_file(&dir));
+
+        assert!(read_history(&dir).is_empty(), "absent file → no history");
+        write_history(&dir, "source urn:fn:toUpper hi");
+        write_history(&dir, "   "); // blank → skipped
+        write_history(&dir, "list");
+        assert_eq!(
+            read_history(&dir),
+            vec!["source urn:fn:toUpper hi".to_string(), "list".to_string()],
+            "appends in order, blanks dropped"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn wrap_routes_the_text_argument() {
