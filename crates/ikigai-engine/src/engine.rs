@@ -160,8 +160,11 @@ pub struct Engine {
     capability: RefCell<Capability>,
     /// The authority this session was opened with (the host's identity). `cap
     /// reset` returns here — the owner-only move; a holder of a narrowed
-    /// capability has no identity to widen back to.
-    identity: Capability,
+    /// capability has no identity to widen back to. Interior-mutable so a host can
+    /// swap the identity at runtime via [`login`](Self::login)/[`logout`](Self::logout)
+    /// (e.g. a browser passkey establishing a per-client identity) — `cap reset` then
+    /// returns to the *logged-in* identity, not the process default.
+    identity: RefCell<Capability>,
     /// Named capability profiles a host registers (e.g. `freebusy` → a set of
     /// `urn:cap:` scopes), so `cap <name>` reads friendlier than a scope list.
     profiles: RefCell<HashMap<String, Vec<String>>>,
@@ -185,7 +188,7 @@ impl Engine {
             resolver: Arc::new(resolver),
             cache: Cell::new(CacheStats::default()),
             capability: RefCell::new(identity.clone()),
-            identity,
+            identity: RefCell::new(identity),
             profiles: RefCell::new(HashMap::new()),
             spawner: None,
         }
@@ -202,6 +205,28 @@ impl Engine {
     /// The session's current capability.
     pub fn capability(&self) -> Capability {
         self.capability.borrow().clone()
+    }
+
+    /// The session's identity — the authority `cap reset` returns to.
+    pub fn identity(&self) -> Capability {
+        self.identity.borrow().clone()
+    }
+
+    /// Establish a new session identity, replacing both the identity (the `cap reset`
+    /// target) and the current capability. A signed-in session therefore resolves
+    /// under — and resets back to — its scoped identity, not the process default. The
+    /// browser passkey flow mints a per-client identity this way; the same hook serves
+    /// the future CLI browser-handoff. Attenuation (`cap`) and `logout` still apply on
+    /// top of it.
+    pub fn login(&self, identity: Capability) {
+        *self.identity.borrow_mut() = identity.clone();
+        *self.capability.borrow_mut() = identity;
+    }
+
+    /// Drop the session back to the process default (root) identity — the anonymous
+    /// state before any `login`.
+    pub fn logout(&self) {
+        self.login(Capability::root());
     }
 
     /// Register a named capability profile — `cap <name>` then attenuates to its
@@ -632,7 +657,7 @@ impl Engine {
             return Ok(self.describe_capability());
         }
         if rest == "reset" {
-            *self.capability.borrow_mut() = self.identity.clone();
+            *self.capability.borrow_mut() = self.identity.borrow().clone();
             return Ok(format!(
                 "reset to identity — {}",
                 self.describe_capability()
@@ -1688,6 +1713,55 @@ mod tests {
         );
         // Reset returns to identity (root) — the owner-only move.
         engine.eval("cap reset");
+        assert_eq!(
+            output(engine.eval("source urn:demo:cal")).unwrap(),
+            "DETAIL"
+        );
+    }
+
+    #[test]
+    fn login_sets_a_scoped_identity_that_reset_returns_to() {
+        // Same capability-projecting endpoint as above.
+        let cal = FnEndpoint::new("cal", |inv: &Invocation<'_>| {
+            let body = if inv.capability.allows("urn:cap:demo:cal:read:detail") {
+                "DETAIL"
+            } else {
+                "freebusy"
+            };
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                body.as_bytes().to_vec(),
+            ))
+        });
+        let space = EndpointSpace::new().bind(Exact::new("urn:demo:cal"), cal);
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ));
+
+        // Anonymous (root) identity sees detail.
+        assert_eq!(
+            output(engine.eval("source urn:demo:cal")).unwrap(),
+            "DETAIL"
+        );
+
+        // Log in as a scoped identity (the browser passkey flow mints one like this).
+        engine.login(Capability::root().attenuate(["urn:cap:demo:cal:read:freebusy".to_string()]));
+        assert_eq!(
+            output(engine.eval("source urn:demo:cal")).unwrap(),
+            "freebusy"
+        );
+
+        // `cap reset` returns to the *logged-in* identity, not root — the scope holds.
+        engine.eval("cap urn:cap:nonexistent"); // narrow further, then reset
+        engine.eval("cap reset");
+        assert_eq!(
+            output(engine.eval("source urn:demo:cal")).unwrap(),
+            "freebusy"
+        );
+
+        // Logout drops back to the anonymous (root) default.
+        engine.logout();
         assert_eq!(
             output(engine.eval("source urn:demo:cal")).unwrap(),
             "DETAIL"
