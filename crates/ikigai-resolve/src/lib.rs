@@ -83,9 +83,10 @@ pub trait Resolver: Send + Sync {
     /// Remove the installed tracer (default no-op).
     fn clear_tracer(&self) {}
 
-    /// Whether resolving `request` would be served from the cache, without
-    /// resolving it.
-    fn is_cached(&self, request: &Request) -> bool;
+    /// Whether resolving `request` under `capability` would be served from the
+    /// cache, without resolving it. The capability matters because the cache is
+    /// namespaced by authority — a probe reports "cached *for this capability*".
+    fn is_cached(&self, request: &Request, capability: &Capability) -> bool;
 
     /// The resources bound in the kernel's space, or `None` if it can't enumerate.
     fn entries(&self) -> Option<Vec<SpaceEntry>>;
@@ -117,7 +118,7 @@ impl Resolver for Kernel {
         // a cut or absent one means we'll (re)compute. A cache-length delta would
         // misreport once golden-thread eviction is in play — evict + reinsert nets
         // zero — so the probe, not the delta, is the source of truth.
-        let was_cached = Kernel::is_cached(self, &request);
+        let was_cached = Kernel::is_cached(self, &request, capability);
         let representation =
             block_on(Kernel::issue(self, request, capability)).map_err(|e| e.to_string())?;
         let status = cache_status(was_cached, &representation);
@@ -132,7 +133,7 @@ impl Resolver for Kernel {
         // Same as `issue_as`, but awaits the kernel's async issue directly — no
         // `block_on`, so when the engine spawns this on the scheduler it parks
         // (freeing the worker for any sub-resolutions it fans out).
-        let was_cached = Kernel::is_cached(self, &request);
+        let was_cached = Kernel::is_cached(self, &request, capability);
         let representation = Kernel::issue(self, request, capability)
             .await
             .map_err(|e| e.to_string())?;
@@ -148,8 +149,8 @@ impl Resolver for Kernel {
         Kernel::clear_tracer(self);
     }
 
-    fn is_cached(&self, request: &Request) -> bool {
-        Kernel::is_cached(self, request)
+    fn is_cached(&self, request: &Request, capability: &Capability) -> bool {
+        Kernel::is_cached(self, request, capability)
     }
 
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
@@ -206,8 +207,8 @@ impl<R: Resolver + ?Sized> Resolver for Arc<R> {
         (**self).clear_tracer();
     }
 
-    fn is_cached(&self, request: &Request) -> bool {
-        (**self).is_cached(request)
+    fn is_cached(&self, request: &Request, capability: &Capability) -> bool {
+        (**self).is_cached(request, capability)
     }
 
     fn entries(&self) -> Option<Vec<SpaceEntry>> {

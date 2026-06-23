@@ -316,13 +316,38 @@ fn serve_quic(target: &str, certs: &Certs) -> ! {
     let result = (|| -> Result<(), String> {
         let addr = quic::parse_addr(target)?;
         let identity = quic::server_identity(certs)?;
-        let trusted = quic::trusted_client_cert(certs)?;
-        eprintln!("ikigai: serving on {target}  (Ctrl-C to stop)");
+        let trusted = quic::trusted_client_certs(certs)?;
+        // Multi-tenant capability-on-the-wire: every connection is scoped to the
+        // authenticated client's own workspace segment, minted per-connection from
+        // *which* certificate authenticated. The cert IS the credential — the same
+        // identity→capability move as the browser passkey, over mTLS. Each tenant
+        // addresses files transparently under its own root (`urn:file:notes.txt`), and
+        // `source urn:host:identity` reports its `<id>`.
+        let root = ikigai_embedded::file_root();
+        let minter: std::sync::Arc<dyn Fn(&str) -> ikigai_quic::Session + Send + Sync> =
+            std::sync::Arc::new(move |id: &str| {
+                let segment = root.join(id);
+                let _ = std::fs::create_dir_all(&segment); // the tenant's private dir
+                let seg = segment.display();
+                ikigai_quic::Session {
+                    capability: ikigai_core::Capability::root().attenuate([
+                        format!("urn:cap:fs:read:{seg}"),
+                        format!("urn:cap:fs:write:{seg}"),
+                        format!("urn:cap:fs:delete:{seg}"),
+                    ]),
+                    file_segment: id.to_string(),
+                }
+            });
+        eprintln!(
+            "ikigai: serving on {target}  (per-client workspaces; {} trusted client cert(s))  (Ctrl-C to stop)",
+            trusted.len()
+        );
         ikigai_quic::serve(
             ikigai_embedded::kernel_for("Remote (QUIC)"),
             addr,
             &identity,
             &trusted,
+            minter,
         )
         .map_err(|e| e.to_string())
     })();

@@ -340,11 +340,40 @@ fn host_history() -> FnEndpoint {
     )
 }
 
+/// `urn:host:identity` — reports the identity the current session resolves under, read
+/// from the invocation capability (the capability *is* the identity). Over QUIC this is
+/// the principal minted from the client certificate, so a connected peer can `source
+/// urn:host:identity` to see the `ws/<id>` segment its cert scoped it to — capability-on-
+/// the-wire, made observable. Anonymous (root) resolves report `root`.
+fn host_identity() -> FnEndpoint {
+    FnEndpoint::new("host-identity", move |inv: &Invocation<'_>| {
+        let who = inv
+            .capability
+            .scopes()
+            .and_then(|s| s.iter().find_map(|sc| sc.strip_prefix("urn:cap:fs:read:")))
+            .and_then(|path| path.rsplit(['/', '\\']).next())
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "root (full authority)".to_string());
+        Ok(Representation::new(
+            ReprType::new("text/plain").with_param("charset", "utf-8"),
+            format!("identity {who}\n").into_bytes(),
+        ))
+    })
+    .with_description(
+        Description::new("host-identity")
+            .title("Identity")
+            .summary("Reports the identity the session resolves under (the session capability).")
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .output("text/plain;charset=utf-8"),
+    )
+}
+
 /// The base demo space: the linked [`ikigai_fn`] function library plus this host's
-/// own resources (the `page`/`about` shapes, `urn:host:info`, and the `urn:host:demo`
-/// / `urn:host:history` toggles). Used as-is for a *served* kernel — it deliberately
-/// omits the personal space, which must not be exposed over the wire until
-/// capability-on-the-wire lands.
+/// own resources (the `page`/`about` shapes, `urn:host:info`, the `urn:host:demo` /
+/// `urn:host:history` toggles, and `urn:host:identity`). Used as-is for a *served*
+/// kernel — it deliberately omits the personal space, which must not be exposed over the
+/// wire until capability-on-the-wire lands.
 fn base_space(nature: &'static str) -> EndpointSpace {
     ikigai_fn::space()
         .bind(Exact::new("urn:data:page"), page())
@@ -352,6 +381,7 @@ fn base_space(nature: &'static str) -> EndpointSpace {
         .bind(Exact::new("urn:host:info"), host_info(nature))
         .bind(Exact::new("urn:host:demo"), host_demo())
         .bind(Exact::new("urn:host:history"), host_history())
+        .bind(Exact::new("urn:host:identity"), host_identity())
 }
 
 /// The directory the local file module is jailed to: `$IKIGAI_FILES`, else
@@ -400,6 +430,19 @@ fn local_space(nature: &'static str) -> EndpointSpace {
             // the filesystem watcher behind [`watched_kernel`].
             ikigai_fs::FileEndpoint::new(file_root()).cacheable(),
         )
+}
+
+/// The space a remote (QUIC) kernel serves: the base demo space **plus** the file
+/// module (`urn:file:{path}`, jailed to [`file_root`]). Files are exposed over the wire
+/// now that capability-on-the-wire scopes each connection to its own `<file_root>/<id>`
+/// segment (the client cert's principal), so a remote peer gets an **isolated** workspace
+/// and the capability path-ACL refuses any other segment. The personal space stays OFF
+/// the wire — owner-only, no per-tenant story yet.
+fn served_space(nature: &'static str) -> EndpointSpace {
+    base_space(nature).bind(
+        UriTemplate::parse(ikigai_fs::FILE_TEMPLATE).expect("FILE_TEMPLATE is valid"),
+        ikigai_fs::FileEndpoint::new(file_root()).cacheable(),
+    )
 }
 
 /// The native HTTP transport backing the `urn:http*` endpoints: a blocking `ureq`
@@ -575,7 +618,7 @@ pub fn trusted_kernel_for(nature: &'static str) -> Kernel {
 /// yet and the server resolves under a default authority, so exposing
 /// `urn:personal:*` would leak it — gated on remote auth + capability-on-the-wire.
 pub fn kernel_for(nature: &'static str) -> Kernel {
-    Kernel::with_meta_renderer(Arc::new(base_space(nature)), Arc::new(CliRenderer))
+    Kernel::with_meta_renderer(Arc::new(served_space(nature)), Arc::new(CliRenderer))
 }
 
 #[cfg(test)]
@@ -678,7 +721,10 @@ mod tests {
 
         // Cache the read.
         assert_eq!(block_on(kernel.issue(source(), &cap)).unwrap().bytes, b"v1");
-        assert!(kernel.is_cached(&source()), "cached after the first read");
+        assert!(
+            kernel.is_cached(&source(), &cap),
+            "cached after the first read"
+        );
 
         // Change the file OUT OF BAND — not through the kernel.
         std::fs::write(root.join("notes.txt"), b"v2").unwrap();
@@ -686,7 +732,7 @@ mod tests {
         // The watcher should cut the thread (filesystem-event latency: poll).
         let mut cut = false;
         for _ in 0..60 {
-            if !kernel.is_cached(&source()) {
+            if !kernel.is_cached(&source(), &cap) {
                 cut = true;
                 break;
             }

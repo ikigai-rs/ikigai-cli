@@ -93,6 +93,27 @@ pub fn trusted_client_cert(certs: &Certs) -> Result<String, String> {
     read(certs.client_cert.clone(), "client.crt")
 }
 
+/// Every client certificate the server accepts — the configured `client.crt` plus any
+/// extra tenant certs dropped into `<certdir>/clients/*.crt`. Each distinct cert is a
+/// distinct identity (its own `ws/<id>` workspace), so multi-tenant is "add a cert".
+pub fn trusted_client_certs(certs: &Certs) -> Result<Vec<String>, String> {
+    let mut pems = vec![trusted_client_cert(certs)?];
+    if let Ok(entries) = dir()
+        .map(|d| d.join("clients"))
+        .and_then(|clients| std::fs::read_dir(&clients).map_err(|e| e.to_string()))
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "crt") {
+                if let Ok(pem) = std::fs::read_to_string(&path) {
+                    pems.push(pem);
+                }
+            }
+        }
+    }
+    Ok(pems)
+}
+
 /// The server certificate the client pins.
 pub fn trusted_server_cert(certs: &Certs) -> Result<String, String> {
     read(certs.server_cert.clone(), "server.crt")
