@@ -48,6 +48,7 @@ commands:
   config [key=value]         show settings, or save one (e.g. config keybindings=emacs)
   list                       list the resources bound in the current space
   demo [on|off]              show or toggle the interactive runbook (urn:runbook:*)
+  history [on|off]           show or toggle persisting command history across runs
   clear                      clear the visible output (history is kept)
   help                       show this help
   quit                       exit
@@ -259,6 +260,7 @@ impl Engine {
             "cache" => output(self, self.run_cache(rest).await),
             "cap" => output(self, self.run_cap(rest)),
             "demo" => output(self, self.run_demo(rest).await),
+            "history" => output(self, self.run_history(rest).await),
             "trace" => output(self, self.run_trace(rest).await),
             "source" | "src" => output(self, self.run_pipeline(rest).await),
             "sink" => output(self, self.run_sink(rest).await),
@@ -788,6 +790,26 @@ impl Engine {
         } else {
             self.run(
                 self.write_request(Verb::Sink, &format!("urn:host:demo {rest}"))
+                    .await?,
+            )
+            .await
+        }
+    }
+
+    /// `history` / `history on|off` — sugar over the `urn:host:history` resource: bare
+    /// reports the persistence state, an argument sinks the new state. Mirrors
+    /// [`run_demo`](Self::run_demo); the host endpoint does the persisting.
+    async fn run_history(&self, rest: &str) -> Result<String, String> {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            self.run(Request::new(
+                Verb::Source,
+                parse_target("urn:host:history")?,
+            ))
+            .await
+        } else {
+            self.run(
+                self.write_request(Verb::Sink, &format!("urn:host:history {rest}"))
                     .await?,
             )
             .await

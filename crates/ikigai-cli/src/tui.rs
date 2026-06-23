@@ -185,6 +185,11 @@ fn event_loop(
         keys,
         ..State::default()
     };
+    // Preload persisted command history when persistence is on — the flag is seeded
+    // from the sticky on-disk marker, so ↑↓ recall spans prior sessions.
+    if ikigai_embedded::history_flag().load(std::sync::atomic::Ordering::Relaxed) {
+        state.history = ikigai_embedded::load_history();
+    }
     loop {
         // The demo can be toggled at runtime (`demo on|off`, or over the wire via
         // `urn:host:demo`), so reconcile the tab bar with the flag each frame: load
@@ -199,6 +204,12 @@ fn event_loop(
         }
 
         terminal.draw(|frame| draw(frame, &state))?;
+        // Poll rather than block on input, so a demo toggle that arrives without a
+        // keypress — `sink urn:host:demo on` over the wire — surfaces (or hides) the
+        // tabs on the next tick instead of waiting for the user to press a key.
+        if !event::poll(std::time::Duration::from_millis(250))? {
+            continue;
+        }
         if let Event::Key(key) = event::read()? {
             if key.kind != KeyEventKind::Press {
                 continue;
@@ -710,6 +721,8 @@ fn submit(state: &mut State, engine: &Engine) -> bool {
     state.scroll_back = 0;
     if !line.trim().is_empty() {
         state.history.push(line.clone());
+        // Persist across sessions when history is on (a no-op otherwise).
+        ikigai_embedded::append_history(&line);
     }
     match engine.eval(&line) {
         Action::Quit => return true,
@@ -760,7 +773,7 @@ fn draw(frame: &mut Frame, state: &State) {
             format!("ikigai {} ", env!("CARGO_PKG_VERSION")).bold(),
             "— resource-resolution REPL".into(),
             format!(
-                "   (help · quit · ↑↓ history · {} · PgUp/PgDn scroll · Ctrl-C exit)",
+                "   (help · demo on → guided tabs · ↑↓ history · {} · PgUp/PgDn scroll · Ctrl-C exit)",
                 mode_label(state)
             )
             .dim(),
