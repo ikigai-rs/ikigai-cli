@@ -18,7 +18,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use ikigai_core::{Kernel, Representation, Request, SpaceEntry};
+use ikigai_core::{Capability, Kernel, Representation, Request, SpaceEntry};
 use ikigai_resolve::{CacheStatus, Resolver};
 use ikigai_wire::{decode, encode, Call, Reply};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -111,7 +111,9 @@ fn dispatch(kernel: &Kernel, call: Call) -> Reply {
             Ok((representation, status)) => Reply::Resolved(representation, status),
             Err(message) => Reply::Error(message),
         },
-        Call::IsCached(request) => Reply::Cached(Resolver::is_cached(kernel, &request)),
+        Call::IsCached(request) => {
+            Reply::Cached(Resolver::is_cached(kernel, &request, &Capability::root()))
+        }
         Call::Entries => Reply::Entries(Resolver::entries(kernel)),
     }
 }
@@ -198,7 +200,10 @@ impl Resolver for QuicResolver {
         }
     }
 
-    fn is_cached(&self, request: &Request) -> bool {
+    fn is_cached(&self, request: &Request, capability: &Capability) -> bool {
+        // Resolves under the server's authority; the wire doesn't carry the caller's
+        // capability yet (capability-on-the-wire is a TODO), so it's accepted but not sent.
+        let _ = capability;
         matches!(
             self.round_trip(Call::IsCached(request.clone())),
             Ok(Reply::Cached(true))
@@ -438,7 +443,7 @@ mod tests {
         assert_eq!(first, CacheStatus::Miss);
         let (_, second) = client.issue(upper("hi")).unwrap();
         assert_eq!(second, CacheStatus::Hit);
-        assert!(client.is_cached(&upper("hi")));
+        assert!(client.is_cached(&upper("hi"), &Capability::root()));
         assert!(client
             .entries()
             .unwrap()

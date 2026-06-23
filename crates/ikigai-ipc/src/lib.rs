@@ -98,7 +98,11 @@ impl Resolver for IpcResolver {
         }
     }
 
-    fn is_cached(&self, request: &Request) -> bool {
+    fn is_cached(&self, request: &Request, capability: &Capability) -> bool {
+        // The probe resolves under the server's own authority; the wire protocol
+        // doesn't carry the caller's capability yet (capability-on-the-wire is a TODO),
+        // so it's accepted but not forwarded.
+        let _ = capability;
         matches!(
             self.round_trip(Call::IsCached(request.clone())),
             Ok(Reply::Cached(true))
@@ -149,7 +153,9 @@ fn dispatch(kernel: &Kernel, call: Call) -> Reply {
                 Err(message) => Reply::Error(message),
             }
         }
-        Call::IsCached(request) => Reply::Cached(Resolver::is_cached(kernel, &request)),
+        Call::IsCached(request) => {
+            Reply::Cached(Resolver::is_cached(kernel, &request, &Capability::root()))
+        }
         Call::Entries => Reply::Entries(Resolver::entries(kernel)),
     }
 }
@@ -215,7 +221,7 @@ mod tests {
     use super::*;
     use std::thread;
 
-    use ikigai_core::{builtins, ArgRef, EndpointSpace, Exact, Iri, Verb};
+    use ikigai_core::{builtins, ArgRef, Capability, EndpointSpace, Exact, Iri, Verb};
 
     fn kernel() -> Kernel {
         Kernel::new(Arc::new(
@@ -267,9 +273,9 @@ mod tests {
         let server = serve_one(&path, kernel());
 
         let client = connect(&path).unwrap();
-        assert!(!client.is_cached(&upper("hey"))); // not resolved yet
+        assert!(!client.is_cached(&upper("hey"), &Capability::root())); // not resolved yet
         client.issue(upper("hey")).unwrap();
-        assert!(client.is_cached(&upper("hey")));
+        assert!(client.is_cached(&upper("hey"), &Capability::root()));
 
         let entries = client.entries().expect("space enumerates");
         assert!(entries.iter().any(|e| e.endpoint == "toUpper"));

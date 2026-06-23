@@ -638,11 +638,13 @@ impl Engine {
         };
         let (target, args) = words.split_first().ok_or("expected an IRI")?;
         let request = self.source_request(target, args, None).await?;
-        Ok(if self.resolver.is_cached(&request) {
-            "cached".to_string()
-        } else {
-            "not cached".to_string()
-        })
+        Ok(
+            if self.resolver.is_cached(&request, &self.capability.borrow()) {
+                "cached".to_string()
+            } else {
+                "not cached".to_string()
+            },
+        )
     }
 
     /// `cap` command: show, narrow, or reset the session capability.
