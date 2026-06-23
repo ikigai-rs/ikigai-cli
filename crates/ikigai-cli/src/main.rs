@@ -316,22 +316,38 @@ fn serve_quic(target: &str, certs: &Certs) -> ! {
     let result = (|| -> Result<(), String> {
         let addr = quic::parse_addr(target)?;
         let identity = quic::server_identity(certs)?;
-        let trusted = quic::trusted_client_cert(certs)?;
-        // Capability-on-the-wire: scope every connection to the authenticated client's
-        // own workspace segment, derived from its (pinned) certificate. The cert IS the
-        // credential — the same identity→capability move as the browser passkey, over
-        // mTLS. `source urn:host:identity` reports the resulting `ws/<id>`.
-        let session = quic_session(&trusted);
+        let trusted = quic::trusted_client_certs(certs)?;
+        // Multi-tenant capability-on-the-wire: every connection is scoped to the
+        // authenticated client's own workspace segment, minted per-connection from
+        // *which* certificate authenticated. The cert IS the credential — the same
+        // identity→capability move as the browser passkey, over mTLS. Each tenant
+        // addresses files transparently under its own root (`urn:file:notes.txt`), and
+        // `source urn:host:identity` reports its `<id>`.
+        let root = ikigai_embedded::file_root();
+        let minter: std::sync::Arc<dyn Fn(&str) -> ikigai_quic::Session + Send + Sync> =
+            std::sync::Arc::new(move |id: &str| {
+                let segment = root.join(id);
+                let _ = std::fs::create_dir_all(&segment); // the tenant's private dir
+                let seg = segment.display();
+                ikigai_quic::Session {
+                    capability: ikigai_core::Capability::root().attenuate([
+                        format!("urn:cap:fs:read:{seg}"),
+                        format!("urn:cap:fs:write:{seg}"),
+                        format!("urn:cap:fs:delete:{seg}"),
+                    ]),
+                    file_segment: id.to_string(),
+                }
+            });
         eprintln!(
-            "ikigai: serving on {target} as {}  (Ctrl-C to stop)",
-            session_label(&session)
+            "ikigai: serving on {target}  (per-client workspaces; {} trusted client cert(s))  (Ctrl-C to stop)",
+            trusted.len()
         );
         ikigai_quic::serve(
             ikigai_embedded::kernel_for("Remote (QUIC)"),
             addr,
             &identity,
             &trusted,
-            session,
+            minter,
         )
         .map_err(|e| e.to_string())
     })();
@@ -342,40 +358,6 @@ fn serve_quic(target: &str, certs: &Certs) -> ! {
             std::process::exit(1);
         }
     }
-}
-
-/// Mint the session capability for a QUIC client from its pinned certificate: a stable
-/// id derived from the cert keys a private workspace segment `<file_root>/<id>`, granting
-/// `urn:cap:fs:{read,write,delete}` only there. The certificate is the credential, so this
-/// is the mTLS analogue of the browser passkey minting `ws/<client-id>` — one
-/// identity→capability model across transports. The per-client subdirectory is created so
-/// the first write lands; the fs jail + path-ACL confine the connection to it.
-#[cfg(all(feature = "embedded", feature = "quic"))]
-fn quic_session(client_cert_pem: &str) -> ikigai_core::Capability {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    client_cert_pem.hash(&mut hasher);
-    let id = format!("{:012x}", hasher.finish());
-    let segment = ikigai_embedded::file_root().join(&id);
-    let _ = std::fs::create_dir_all(&segment); // the client's private workspace dir
-    let segment = segment.display();
-    ikigai_core::Capability::root().attenuate([
-        format!("urn:cap:fs:read:{segment}"),
-        format!("urn:cap:fs:write:{segment}"),
-        format!("urn:cap:fs:delete:{segment}"),
-    ])
-}
-
-/// A short label for the session a connection resolves under — the `<id>` of its workspace
-/// segment (the last path component), or `root`. Shown when the server starts.
-#[cfg(all(feature = "embedded", feature = "quic"))]
-fn session_label(session: &ikigai_core::Capability) -> String {
-    session
-        .scopes()
-        .and_then(|s| s.iter().find_map(|sc| sc.strip_prefix("urn:cap:fs:read:")))
-        .and_then(|path| path.rsplit(['/', '\\']).next())
-        .map(|id| id.to_string())
-        .unwrap_or_else(|| "root".to_string())
 }
 
 #[cfg(all(feature = "embedded", feature = "quic"))]

@@ -18,7 +18,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use ikigai_core::{Capability, Kernel, Representation, Request, SpaceEntry};
+use ikigai_core::{Capability, Iri, Kernel, Representation, Request, SpaceEntry};
 use ikigai_resolve::{CacheStatus, Resolver};
 use ikigai_wire::{decode, encode, Call, Reply};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -54,26 +54,36 @@ pub fn generate() -> Identity {
 /// Run `kernel` as a QUIC server on `addr`, presenting `identity` and accepting
 /// only the client whose certificate is `trusted_client_cert_pem`. Blocks until
 /// an unrecoverable endpoint error.
+/// The per-connection authority and namespace, minted from the authenticated client
+/// certificate. `capability` bounds every call on the connection; `file_segment`
+/// transparently roots its `urn:file:` namespace at `<file_segment>/…`, so a tenant
+/// addresses files as if its segment were the root and never sees another's.
+pub struct Session {
+    pub capability: Capability,
+    pub file_segment: String,
+}
+
 pub fn serve(
     kernel: Kernel,
     addr: SocketAddr,
     identity: &Identity,
-    trusted_client_cert_pem: &str,
-    session: Capability,
+    trusted_client_cert_pems: &[String],
+    minter: Arc<dyn Fn(&str) -> Session + Send + Sync>,
 ) -> io::Result<()> {
-    let config = server_config(identity, trusted_client_cert_pem)?;
+    let config = server_config(identity, trusted_client_cert_pems)?;
     let runtime = Runtime::new()?;
     runtime.block_on(async move {
         let endpoint = quinn::Endpoint::server(config, addr)?;
         let kernel = Arc::new(kernel);
         while let Some(incoming) = endpoint.accept().await {
             let kernel = Arc::clone(&kernel);
-            // mTLS already verified the peer is the pinned client, so every
-            // connection resolves under that principal's `session` authority —
-            // capability-on-the-wire via the certificate.
-            let session = session.clone();
+            let minter = Arc::clone(&minter);
             tokio::spawn(async move {
                 if let Ok(connection) = incoming.await {
+                    // mTLS verified the peer is one of the enrolled clients; mint that
+                    // principal's session from *which* cert authenticated — multi-tenant
+                    // capability-on-the-wire.
+                    let session = minter(&peer_cert_id(&connection));
                     serve_connection(&kernel, connection, &session).await;
                 }
             });
@@ -82,9 +92,28 @@ pub fn serve(
     })
 }
 
+/// A stable id for the connection's authenticated client — a hash of its leaf
+/// certificate (exposed by quinn post-handshake). `anonymous` if the peer presented
+/// no cert (shouldn't happen with the client-cert verifier in force).
+fn peer_cert_id(connection: &quinn::Connection) -> String {
+    use std::hash::{Hash, Hasher};
+    let leaf = connection
+        .peer_identity()
+        .and_then(|any| any.downcast::<Vec<CertificateDer<'static>>>().ok())
+        .and_then(|chain| chain.first().map(|c| c.as_ref().to_vec()));
+    match leaf {
+        Some(der) => {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            der.hash(&mut hasher);
+            format!("{:016x}", hasher.finish())
+        }
+        None => "anonymous".to_string(),
+    }
+}
+
 /// Answer calls on one connection until the peer closes it, every call resolved
-/// under the connection's `session` capability (the authenticated principal).
-async fn serve_connection(kernel: &Kernel, connection: quinn::Connection, session: &Capability) {
+/// under the connection's [`Session`] (the authenticated principal).
+async fn serve_connection(kernel: &Kernel, connection: quinn::Connection, session: &Session) {
     while let Ok((mut send, mut recv)) = connection.accept_bi().await {
         let bytes = match recv.read_to_end(MAX_MESSAGE).await {
             Ok(bytes) => bytes,
@@ -101,22 +130,43 @@ async fn serve_connection(kernel: &Kernel, connection: quinn::Connection, sessio
     }
 }
 
+/// Transparently root the connection's `urn:file:` namespace at its segment: rewrite
+/// `urn:file:<rel>` → `urn:file:<segment>/<rel>` so a tenant addresses files as if its
+/// own segment were the root (and the session capability — scoped to that segment —
+/// then refuses anything outside it). Non-file targets and an empty segment pass through.
+fn localize(request: &mut Request, segment: &str) {
+    if segment.is_empty() {
+        return;
+    }
+    if let Some(rel) = request.target.as_str().strip_prefix("urn:file:") {
+        if let Ok(rooted) = Iri::parse(format!("urn:file:{segment}/{rel}")) {
+            request.target = rooted;
+        }
+    }
+}
+
 /// Answer one [`Call`] against the local kernel, resolved under the connection's
-/// `session` authority (the principal the mTLS handshake authenticated).
-fn dispatch(kernel: &Kernel, call: Call, session: &Capability) -> Reply {
-    let issue =
-        |request, capability: &Capability| match Resolver::issue_as(kernel, request, capability) {
+/// `session` (the principal the mTLS handshake authenticated), with its file namespace
+/// rooted at its segment.
+fn dispatch(kernel: &Kernel, call: Call, session: &Session) -> Reply {
+    let issue = |mut request: Request, capability: &Capability| {
+        localize(&mut request, &session.file_segment);
+        match Resolver::issue_as(kernel, request, capability) {
             Ok((representation, status)) => Reply::Resolved(representation, status),
             Err(message) => Reply::Error(message),
-        };
+        }
+    };
     match call {
         // Resolve under the session — capability-on-the-wire via the client cert.
-        Call::Issue(request) => issue(request, session),
+        Call::Issue(request) => issue(request, &session.capability),
         // A carried capability is untrusted: the peer can only *narrow* its own
         // authority, so clamp it to the session before resolving (never widen past
         // the authenticated principal).
-        Call::IssueAs(request, carried) => issue(request, &session.clamp(&carried)),
-        Call::IsCached(request) => Reply::Cached(Resolver::is_cached(kernel, &request, session)),
+        Call::IssueAs(request, carried) => issue(request, &session.capability.clamp(&carried)),
+        Call::IsCached(mut request) => {
+            localize(&mut request, &session.file_segment);
+            Reply::Cached(Resolver::is_cached(kernel, &request, &session.capability))
+        }
         Call::Entries => Reply::Entries(Resolver::entries(kernel)),
     }
 }
@@ -229,9 +279,13 @@ impl Resolver for QuicResolver {
 
 fn server_config(
     identity: &Identity,
-    trusted_client_cert_pem: &str,
+    trusted_client_cert_pems: &[String],
 ) -> io::Result<quinn::ServerConfig> {
-    let verifier = Arc::new(PinnedPeer::new(load_cert(trusted_client_cert_pem)?));
+    let certs = trusted_client_cert_pems
+        .iter()
+        .map(|pem| load_cert(pem))
+        .collect::<io::Result<Vec<_>>>()?;
+    let verifier = Arc::new(PinnedPeer::set(certs));
     let mut tls = rustls::ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(other)?
@@ -276,12 +330,19 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
 /// is pinned.
 #[derive(Debug)]
 struct PinnedPeer {
-    pinned: CertificateDer<'static>,
+    /// The accepted peer certificates. One for the client (it pins the single server
+    /// cert); one *or more* for the server (it accepts any enrolled tenant's client
+    /// cert — multi-tenant mTLS, each identity its own cert).
+    pinned: Vec<CertificateDer<'static>>,
     algorithms: WebPkiSupportedAlgorithms,
 }
 
 impl PinnedPeer {
     fn new(pinned: CertificateDer<'static>) -> Self {
+        Self::set(vec![pinned])
+    }
+
+    fn set(pinned: Vec<CertificateDer<'static>>) -> Self {
         PinnedPeer {
             pinned,
             algorithms: rustls::crypto::ring::default_provider().signature_verification_algorithms,
@@ -289,7 +350,7 @@ impl PinnedPeer {
     }
 
     fn matches(&self, presented: &CertificateDer<'_>) -> bool {
-        presented.as_ref() == self.pinned.as_ref()
+        self.pinned.iter().any(|c| c.as_ref() == presented.as_ref())
     }
 }
 
@@ -402,8 +463,8 @@ mod tests {
     use std::thread;
 
     use ikigai_core::{
-        builtins, ArgRef, EndpointSpace, Exact, FnEndpoint, Invocation, Iri, ReprType,
-        Representation, Verb,
+        builtins, ArgRef, EndpointSpace, Error, Exact, FnEndpoint, Invocation, Iri, ReprType,
+        Representation, UriTemplate, Verb,
     };
 
     fn kernel() -> Kernel {
@@ -435,17 +496,22 @@ mod tests {
     /// Serve `kernel` under `session` on an ephemeral port, run `urn:demo:cal` from a
     /// pinned client, and return what it resolved — the projection reveals the authority
     /// the connection resolved under.
-    fn cal_over_quic(session: Capability) -> String {
+    fn cal_over_quic(capability: Capability) -> String {
         let server_id = generate();
         let client_id = generate();
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let server_cfg = server_config(&server_id, &client_id.cert_pem).unwrap();
+        let server_cfg =
+            server_config(&server_id, std::slice::from_ref(&client_id.cert_pem)).unwrap();
         let rt = Runtime::new().unwrap();
         let endpoint = rt
             .block_on(async { quinn::Endpoint::server(server_cfg, addr) })
             .unwrap();
         let server_addr = endpoint.local_addr().unwrap();
         let kernel = Arc::new(gated_kernel());
+        let session = Session {
+            capability,
+            file_segment: String::new(),
+        };
         let server = thread::spawn(move || {
             rt.block_on(async move {
                 let incoming = endpoint.accept().await.unwrap();
@@ -473,6 +539,93 @@ mod tests {
         assert_eq!(cal_over_quic(scoped), "freebusy");
     }
 
+    /// A kernel mimicking the file module enough to show wire-side rooting + scoping:
+    /// `urn:file:{path}` echoes the (localized) path it received, gated by a prefix ACL
+    /// over the session's `urn:cap:fs:read:<segment>` scopes — as ikigai-fs does for real
+    /// (the live fs is exercised by the CLI end-to-end).
+    fn files_kernel() -> Kernel {
+        let files = FnEndpoint::new("file", |inv: &Invocation<'_>| {
+            let path = inv.bindings.get("path").unwrap_or_default().to_string();
+            let allowed = match inv.capability.scopes() {
+                None => true,
+                Some(scopes) => scopes.iter().any(|s| {
+                    s.strip_prefix("urn:cap:fs:read:")
+                        .is_some_and(|p| path == p || path.starts_with(&format!("{p}/")))
+                }),
+            };
+            if allowed {
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    path.into_bytes(),
+                ))
+            } else {
+                Err(Error::Endpoint(format!(
+                    "capability does not grant read on `{path}`"
+                )))
+            }
+        });
+        Kernel::new(Arc::new(
+            EndpointSpace::new().bind(UriTemplate::parse("urn:file:{path}").unwrap(), files),
+        ))
+    }
+
+    /// Resolve `urn:file:<path>` over QUIC under `session`, returning the echoed
+    /// (localized) path or the endpoint error.
+    fn file_over_quic(session: Session, path: &str) -> Result<String, String> {
+        let server_id = generate();
+        let client_id = generate();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server_cfg =
+            server_config(&server_id, std::slice::from_ref(&client_id.cert_pem)).unwrap();
+        let rt = Runtime::new().unwrap();
+        let endpoint = rt
+            .block_on(async { quinn::Endpoint::server(server_cfg, addr) })
+            .unwrap();
+        let server_addr = endpoint.local_addr().unwrap();
+        let kernel = Arc::new(files_kernel());
+        let server = thread::spawn(move || {
+            rt.block_on(async move {
+                let incoming = endpoint.accept().await.unwrap();
+                let connection = incoming.await.unwrap();
+                serve_connection(&kernel, connection, &session).await;
+            });
+        });
+        let client = connect(server_addr, &client_id, &server_id.cert_pem).unwrap();
+        let target = Iri::parse(&format!("urn:file:{path}")).unwrap();
+        let result = client
+            .issue(Request::new(Verb::Source, target))
+            .map(|(r, _)| String::from_utf8(r.bytes).unwrap());
+        drop(client);
+        server.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn tenants_get_isolated_transparently_rooted_workspaces() {
+        let session = |seg: &str| Session {
+            capability: Capability::root().attenuate([format!("urn:cap:fs:read:{seg}")]),
+            file_segment: seg.to_string(),
+        };
+        // Each tenant addresses `urn:file:notes.txt` as if rooted at its own segment — it
+        // resolves to `<segment>/notes.txt`, so the SAME name is a different file per
+        // tenant: transparent rooting + isolation, neither seeing the other's.
+        assert_eq!(
+            file_over_quic(session("alice"), "notes.txt").unwrap(),
+            "alice/notes.txt"
+        );
+        assert_eq!(
+            file_over_quic(session("bob"), "notes.txt").unwrap(),
+            "bob/notes.txt"
+        );
+        // A tenant cannot address outside its segment: even naming another's id just roots
+        // it under its own (`alice` asking for `bob/x` → `alice/bob/x`), so there is no way
+        // to reach another tenant's files.
+        assert_eq!(
+            file_over_quic(session("alice"), "bob/x").unwrap(),
+            "alice/bob/x"
+        );
+    }
+
     fn upper(text: &str) -> Request {
         Request::new(Verb::Source, Iri::parse("urn:fn:toUpper").unwrap())
             .with_arg("in", ArgRef::Inline(text.as_bytes().to_vec()))
@@ -485,7 +638,8 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
         // Bind the server first so we can learn its actual (ephemeral) port.
-        let server_cfg = server_config(&server_id, &client_id.cert_pem).unwrap();
+        let server_cfg =
+            server_config(&server_id, std::slice::from_ref(&client_id.cert_pem)).unwrap();
         let rt = Runtime::new().unwrap();
         let endpoint = rt
             .block_on(async { quinn::Endpoint::server(server_cfg, addr) })
@@ -493,13 +647,17 @@ mod tests {
         let server_addr = endpoint.local_addr().unwrap();
 
         let kernel = Arc::new(kernel());
+        let session = Session {
+            capability: Capability::root(),
+            file_segment: String::new(),
+        };
         let server = {
             let kernel = Arc::clone(&kernel);
             thread::spawn(move || {
                 rt.block_on(async move {
                     let incoming = endpoint.accept().await.unwrap();
                     let connection = incoming.await.unwrap();
-                    serve_connection(&kernel, connection, &Capability::root()).await;
+                    serve_connection(&kernel, connection, &session).await;
                 });
             })
         };
@@ -528,7 +686,8 @@ mod tests {
         let impostor = generate();
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-        let server_cfg = server_config(&server_id, &client_id.cert_pem).unwrap();
+        let server_cfg =
+            server_config(&server_id, std::slice::from_ref(&client_id.cert_pem)).unwrap();
         let rt = Runtime::new().unwrap();
         let endpoint = rt
             .block_on(async { quinn::Endpoint::server(server_cfg, addr) })
