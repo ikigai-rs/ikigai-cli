@@ -591,7 +591,7 @@ mod tests {
             });
         });
         let client = connect(server_addr, &client_id, &server_id.cert_pem).unwrap();
-        let target = Iri::parse(&format!("urn:file:{path}")).unwrap();
+        let target = Iri::parse(format!("urn:file:{path}")).unwrap();
         let result = client
             .issue(Request::new(Verb::Source, target))
             .map(|(r, _)| String::from_utf8(r.bytes).unwrap());
