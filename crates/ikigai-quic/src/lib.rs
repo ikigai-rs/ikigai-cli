@@ -59,6 +59,7 @@ pub fn serve(
     addr: SocketAddr,
     identity: &Identity,
     trusted_client_cert_pem: &str,
+    session: Capability,
 ) -> io::Result<()> {
     let config = server_config(identity, trusted_client_cert_pem)?;
     let runtime = Runtime::new()?;
@@ -67,9 +68,13 @@ pub fn serve(
         let kernel = Arc::new(kernel);
         while let Some(incoming) = endpoint.accept().await {
             let kernel = Arc::clone(&kernel);
+            // mTLS already verified the peer is the pinned client, so every
+            // connection resolves under that principal's `session` authority —
+            // capability-on-the-wire via the certificate.
+            let session = session.clone();
             tokio::spawn(async move {
                 if let Ok(connection) = incoming.await {
-                    serve_connection(&kernel, connection).await;
+                    serve_connection(&kernel, connection, &session).await;
                 }
             });
         }
@@ -77,15 +82,16 @@ pub fn serve(
     })
 }
 
-/// Answer calls on one connection until the peer closes it.
-async fn serve_connection(kernel: &Kernel, connection: quinn::Connection) {
+/// Answer calls on one connection until the peer closes it, every call resolved
+/// under the connection's `session` capability (the authenticated principal).
+async fn serve_connection(kernel: &Kernel, connection: quinn::Connection, session: &Capability) {
     while let Ok((mut send, mut recv)) = connection.accept_bi().await {
         let bytes = match recv.read_to_end(MAX_MESSAGE).await {
             Ok(bytes) => bytes,
             Err(_) => return,
         };
         let reply = match decode::<Call>(&bytes) {
-            Ok(call) => dispatch(kernel, call),
+            Ok(call) => dispatch(kernel, call, session),
             Err(e) => Reply::Error(format!("malformed call: {e}")),
         };
         if let Ok(out) = encode(&reply) {
@@ -95,25 +101,22 @@ async fn serve_connection(kernel: &Kernel, connection: quinn::Connection) {
     }
 }
 
-/// Answer one [`Call`] against the local kernel, reusing its [`Resolver`] impl.
-fn dispatch(kernel: &Kernel, call: Call) -> Reply {
+/// Answer one [`Call`] against the local kernel, resolved under the connection's
+/// `session` authority (the principal the mTLS handshake authenticated).
+fn dispatch(kernel: &Kernel, call: Call, session: &Capability) -> Reply {
+    let issue =
+        |request, capability: &Capability| match Resolver::issue_as(kernel, request, capability) {
+            Ok((representation, status)) => Reply::Resolved(representation, status),
+            Err(message) => Reply::Error(message),
+        };
     match call {
-        Call::Issue(request) => match Resolver::issue(kernel, request) {
-            Ok((representation, status)) => Reply::Resolved(representation, status),
-            Err(message) => Reply::Error(message),
-        },
-        // QUIC does not honor capability-on-the-wire yet: a QUIC peer isn't
-        // authenticated (gated on remote auth, #36), so a carried capability is
-        // not trusted. Resolve under the server's default authority, ignoring it.
-        // (The QUIC client never sends this today — its resolver doesn't override
-        // `issue_as` — but the arm keeps the match safe and exhaustive.)
-        Call::IssueAs(request, _capability) => match Resolver::issue(kernel, request) {
-            Ok((representation, status)) => Reply::Resolved(representation, status),
-            Err(message) => Reply::Error(message),
-        },
-        Call::IsCached(request) => {
-            Reply::Cached(Resolver::is_cached(kernel, &request, &Capability::root()))
-        }
+        // Resolve under the session — capability-on-the-wire via the client cert.
+        Call::Issue(request) => issue(request, session),
+        // A carried capability is untrusted: the peer can only *narrow* its own
+        // authority, so clamp it to the session before resolving (never widen past
+        // the authenticated principal).
+        Call::IssueAs(request, carried) => issue(request, &session.clamp(&carried)),
+        Call::IsCached(request) => Reply::Cached(Resolver::is_cached(kernel, &request, session)),
         Call::Entries => Reply::Entries(Resolver::entries(kernel)),
     }
 }
@@ -398,12 +401,76 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
-    use ikigai_core::{builtins, ArgRef, EndpointSpace, Exact, Iri, Verb};
+    use ikigai_core::{
+        builtins, ArgRef, EndpointSpace, Exact, FnEndpoint, Invocation, Iri, ReprType,
+        Representation, Verb,
+    };
 
     fn kernel() -> Kernel {
         Kernel::new(Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:fn:toUpper"), builtins::to_upper()),
         ))
+    }
+
+    /// A kernel whose `urn:demo:cal` projects on the session capability — full DETAIL at
+    /// root, the minimized `freebusy` otherwise — so a test can see which authority a
+    /// connection actually resolved under.
+    fn gated_kernel() -> Kernel {
+        let cal = FnEndpoint::new("cal", |inv: &Invocation<'_>| {
+            let body = if inv.capability.allows("urn:cap:demo:detail") {
+                "DETAIL"
+            } else {
+                "freebusy"
+            };
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                body.as_bytes().to_vec(),
+            ))
+        });
+        Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:demo:cal"), cal),
+        ))
+    }
+
+    /// Serve `kernel` under `session` on an ephemeral port, run `urn:demo:cal` from a
+    /// pinned client, and return what it resolved — the projection reveals the authority
+    /// the connection resolved under.
+    fn cal_over_quic(session: Capability) -> String {
+        let server_id = generate();
+        let client_id = generate();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server_cfg = server_config(&server_id, &client_id.cert_pem).unwrap();
+        let rt = Runtime::new().unwrap();
+        let endpoint = rt
+            .block_on(async { quinn::Endpoint::server(server_cfg, addr) })
+            .unwrap();
+        let server_addr = endpoint.local_addr().unwrap();
+        let kernel = Arc::new(gated_kernel());
+        let server = thread::spawn(move || {
+            rt.block_on(async move {
+                let incoming = endpoint.accept().await.unwrap();
+                let connection = incoming.await.unwrap();
+                serve_connection(&kernel, connection, &session).await;
+            });
+        });
+        let client = connect(server_addr, &client_id, &server_id.cert_pem).unwrap();
+        let cal = Request::new(Verb::Source, Iri::parse("urn:demo:cal").unwrap());
+        let (representation, _) = client.issue(cal).unwrap();
+        drop(client);
+        server.join().unwrap();
+        String::from_utf8(representation.bytes).unwrap()
+    }
+
+    #[test]
+    fn the_connection_resolves_under_its_session_capability() {
+        // A root session is full authority — the endpoint sees DETAIL.
+        assert_eq!(cal_over_quic(Capability::root()), "DETAIL");
+        // A scoped session (no `detail` scope) confines the whole connection — the
+        // endpoint resolves under it, not root, so it sees only `freebusy`. This is
+        // capability-on-the-wire: the mTLS-authenticated principal's authority, enforced
+        // server-side for every call on the connection.
+        let scoped = Capability::root().attenuate(["urn:cap:demo:other".to_string()]);
+        assert_eq!(cal_over_quic(scoped), "freebusy");
     }
 
     fn upper(text: &str) -> Request {
@@ -432,7 +499,7 @@ mod tests {
                 rt.block_on(async move {
                     let incoming = endpoint.accept().await.unwrap();
                     let connection = incoming.await.unwrap();
-                    serve_connection(&kernel, connection).await;
+                    serve_connection(&kernel, connection, &Capability::root()).await;
                 });
             })
         };

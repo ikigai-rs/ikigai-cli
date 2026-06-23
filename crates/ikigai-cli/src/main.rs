@@ -317,12 +317,21 @@ fn serve_quic(target: &str, certs: &Certs) -> ! {
         let addr = quic::parse_addr(target)?;
         let identity = quic::server_identity(certs)?;
         let trusted = quic::trusted_client_cert(certs)?;
-        eprintln!("ikigai: serving on {target}  (Ctrl-C to stop)");
+        // Capability-on-the-wire: scope every connection to the authenticated client's
+        // own workspace segment, derived from its (pinned) certificate. The cert IS the
+        // credential — the same identity→capability move as the browser passkey, over
+        // mTLS. `source urn:host:identity` reports the resulting `ws/<id>`.
+        let session = quic_session(&trusted);
+        eprintln!(
+            "ikigai: serving on {target} as {}  (Ctrl-C to stop)",
+            session_label(&session)
+        );
         ikigai_quic::serve(
             ikigai_embedded::kernel_for("Remote (QUIC)"),
             addr,
             &identity,
             &trusted,
+            session,
         )
         .map_err(|e| e.to_string())
     })();
@@ -333,6 +342,34 @@ fn serve_quic(target: &str, certs: &Certs) -> ! {
             std::process::exit(1);
         }
     }
+}
+
+/// Mint the session capability for a QUIC client from its pinned certificate: a stable
+/// id derived from the cert keys an `ws/<id>` workspace segment (`urn:cap:fs:*:ws/<id>`).
+/// The certificate is the credential, so this is the mTLS analogue of the browser passkey
+/// minting `ws/<client-id>` — one identity→capability model across transports.
+#[cfg(all(feature = "embedded", feature = "quic"))]
+fn quic_session(client_cert_pem: &str) -> ikigai_core::Capability {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    client_cert_pem.hash(&mut hasher);
+    let id = format!("{:012x}", hasher.finish());
+    ikigai_core::Capability::root().attenuate([
+        format!("urn:cap:fs:read:ws/{id}"),
+        format!("urn:cap:fs:write:ws/{id}"),
+        format!("urn:cap:fs:delete:ws/{id}"),
+    ])
+}
+
+/// A short label for the session a connection resolves under — its `ws/<id>` segment, or
+/// `root`. Shown when the server starts.
+#[cfg(all(feature = "embedded", feature = "quic"))]
+fn session_label(session: &ikigai_core::Capability) -> String {
+    session
+        .scopes()
+        .and_then(|s| s.iter().find_map(|sc| sc.strip_prefix("urn:cap:fs:read:")))
+        .map(|seg| seg.to_string())
+        .unwrap_or_else(|| "root".to_string())
 }
 
 #[cfg(all(feature = "embedded", feature = "quic"))]

@@ -340,11 +340,39 @@ fn host_history() -> FnEndpoint {
     )
 }
 
+/// `urn:host:identity` — reports the identity the current session resolves under, read
+/// from the invocation capability (the capability *is* the identity). Over QUIC this is
+/// the principal minted from the client certificate, so a connected peer can `source
+/// urn:host:identity` to see the `ws/<id>` segment its cert scoped it to — capability-on-
+/// the-wire, made observable. Anonymous (root) resolves report `root`.
+fn host_identity() -> FnEndpoint {
+    FnEndpoint::new("host-identity", move |inv: &Invocation<'_>| {
+        let who = inv
+            .capability
+            .scopes()
+            .and_then(|s| s.iter().find_map(|sc| sc.strip_prefix("urn:cap:fs:read:")))
+            .map(|seg| seg.to_string())
+            .unwrap_or_else(|| "root (full authority)".to_string());
+        Ok(Representation::new(
+            ReprType::new("text/plain").with_param("charset", "utf-8"),
+            format!("identity {who}\n").into_bytes(),
+        ))
+    })
+    .with_description(
+        Description::new("host-identity")
+            .title("Identity")
+            .summary("Reports the identity the session resolves under (the session capability).")
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .output("text/plain;charset=utf-8"),
+    )
+}
+
 /// The base demo space: the linked [`ikigai_fn`] function library plus this host's
-/// own resources (the `page`/`about` shapes, `urn:host:info`, and the `urn:host:demo`
-/// / `urn:host:history` toggles). Used as-is for a *served* kernel — it deliberately
-/// omits the personal space, which must not be exposed over the wire until
-/// capability-on-the-wire lands.
+/// own resources (the `page`/`about` shapes, `urn:host:info`, the `urn:host:demo` /
+/// `urn:host:history` toggles, and `urn:host:identity`). Used as-is for a *served*
+/// kernel — it deliberately omits the personal space, which must not be exposed over the
+/// wire until capability-on-the-wire lands.
 fn base_space(nature: &'static str) -> EndpointSpace {
     ikigai_fn::space()
         .bind(Exact::new("urn:data:page"), page())
@@ -352,6 +380,7 @@ fn base_space(nature: &'static str) -> EndpointSpace {
         .bind(Exact::new("urn:host:info"), host_info(nature))
         .bind(Exact::new("urn:host:demo"), host_demo())
         .bind(Exact::new("urn:host:history"), host_history())
+        .bind(Exact::new("urn:host:identity"), host_identity())
 }
 
 /// The directory the local file module is jailed to: `$IKIGAI_FILES`, else
