@@ -316,7 +316,19 @@ fn run_step(state: &mut State, engine: &Engine, idx: usize) {
     };
     let cmd = step.cmd.clone();
     let out = match engine.eval(&cmd) {
-        Action::Output(entry) => entry.result.unwrap_or_else(|e| format!("error: {e}")),
+        // Append the cache outcome (computed / cached / …) after the output, so the
+        // demo tab shows the caching story inline — parity with the web runbook.
+        Action::Output(entry) => match entry.result {
+            Ok(text) => {
+                let tag = entry
+                    .cache
+                    .label()
+                    .map(|l| format!("   [{l}]"))
+                    .unwrap_or_default();
+                format!("{text}{tag}")
+            }
+            Err(e) => format!("error: {e}"),
+        },
         Action::Help => HELP.to_string(),
         Action::Clear => {
             state.transcript.clear();
