@@ -345,30 +345,36 @@ fn serve_quic(target: &str, certs: &Certs) -> ! {
 }
 
 /// Mint the session capability for a QUIC client from its pinned certificate: a stable
-/// id derived from the cert keys an `ws/<id>` workspace segment (`urn:cap:fs:*:ws/<id>`).
-/// The certificate is the credential, so this is the mTLS analogue of the browser passkey
-/// minting `ws/<client-id>` — one identity→capability model across transports.
+/// id derived from the cert keys a private workspace segment `<file_root>/<id>`, granting
+/// `urn:cap:fs:{read,write,delete}` only there. The certificate is the credential, so this
+/// is the mTLS analogue of the browser passkey minting `ws/<client-id>` — one
+/// identity→capability model across transports. The per-client subdirectory is created so
+/// the first write lands; the fs jail + path-ACL confine the connection to it.
 #[cfg(all(feature = "embedded", feature = "quic"))]
 fn quic_session(client_cert_pem: &str) -> ikigai_core::Capability {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     client_cert_pem.hash(&mut hasher);
     let id = format!("{:012x}", hasher.finish());
+    let segment = ikigai_embedded::file_root().join(&id);
+    let _ = std::fs::create_dir_all(&segment); // the client's private workspace dir
+    let segment = segment.display();
     ikigai_core::Capability::root().attenuate([
-        format!("urn:cap:fs:read:ws/{id}"),
-        format!("urn:cap:fs:write:ws/{id}"),
-        format!("urn:cap:fs:delete:ws/{id}"),
+        format!("urn:cap:fs:read:{segment}"),
+        format!("urn:cap:fs:write:{segment}"),
+        format!("urn:cap:fs:delete:{segment}"),
     ])
 }
 
-/// A short label for the session a connection resolves under — its `ws/<id>` segment, or
-/// `root`. Shown when the server starts.
+/// A short label for the session a connection resolves under — the `<id>` of its workspace
+/// segment (the last path component), or `root`. Shown when the server starts.
 #[cfg(all(feature = "embedded", feature = "quic"))]
 fn session_label(session: &ikigai_core::Capability) -> String {
     session
         .scopes()
         .and_then(|s| s.iter().find_map(|sc| sc.strip_prefix("urn:cap:fs:read:")))
-        .map(|seg| seg.to_string())
+        .and_then(|path| path.rsplit(['/', '\\']).next())
+        .map(|id| id.to_string())
         .unwrap_or_else(|| "root".to_string())
 }
 

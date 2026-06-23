@@ -351,7 +351,8 @@ fn host_identity() -> FnEndpoint {
             .capability
             .scopes()
             .and_then(|s| s.iter().find_map(|sc| sc.strip_prefix("urn:cap:fs:read:")))
-            .map(|seg| seg.to_string())
+            .and_then(|path| path.rsplit(['/', '\\']).next())
+            .map(|id| id.to_string())
             .unwrap_or_else(|| "root (full authority)".to_string());
         Ok(Representation::new(
             ReprType::new("text/plain").with_param("charset", "utf-8"),
@@ -429,6 +430,19 @@ fn local_space(nature: &'static str) -> EndpointSpace {
             // the filesystem watcher behind [`watched_kernel`].
             ikigai_fs::FileEndpoint::new(file_root()).cacheable(),
         )
+}
+
+/// The space a remote (QUIC) kernel serves: the base demo space **plus** the file
+/// module (`urn:file:{path}`, jailed to [`file_root`]). Files are exposed over the wire
+/// now that capability-on-the-wire scopes each connection to its own `<file_root>/<id>`
+/// segment (the client cert's principal), so a remote peer gets an **isolated** workspace
+/// and the capability path-ACL refuses any other segment. The personal space stays OFF
+/// the wire — owner-only, no per-tenant story yet.
+fn served_space(nature: &'static str) -> EndpointSpace {
+    base_space(nature).bind(
+        UriTemplate::parse(ikigai_fs::FILE_TEMPLATE).expect("FILE_TEMPLATE is valid"),
+        ikigai_fs::FileEndpoint::new(file_root()).cacheable(),
+    )
 }
 
 /// The native HTTP transport backing the `urn:http*` endpoints: a blocking `ureq`
@@ -604,7 +618,7 @@ pub fn trusted_kernel_for(nature: &'static str) -> Kernel {
 /// yet and the server resolves under a default authority, so exposing
 /// `urn:personal:*` would leak it — gated on remote auth + capability-on-the-wire.
 pub fn kernel_for(nature: &'static str) -> Kernel {
-    Kernel::with_meta_renderer(Arc::new(base_space(nature)), Arc::new(CliRenderer))
+    Kernel::with_meta_renderer(Arc::new(served_space(nature)), Arc::new(CliRenderer))
 }
 
 #[cfg(test)]
