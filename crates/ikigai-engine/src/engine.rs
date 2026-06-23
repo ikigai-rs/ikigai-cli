@@ -224,6 +224,13 @@ impl Engine {
         block_on(self.eval_async(line))
     }
 
+    /// The resources bound in the kernel's space, or `None` if it can't enumerate —
+    /// the same list `list` shows. A frontend uses it to discover bound resources
+    /// (e.g. the TUI enumerating `urn:runbook:*` to build its demo tabs).
+    pub fn entries(&self) -> Option<Vec<ikigai_core::SpaceEntry>> {
+        self.resolver.entries()
+    }
+
     /// Evaluate one input line, async-first. The resolving commands `.await`
     /// their helpers so the whole resolution path can be driven without
     /// blocking; the non-resolving commands stay synchronous.

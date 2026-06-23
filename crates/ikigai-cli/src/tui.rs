@@ -14,9 +14,9 @@ use std::io;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Position};
-use ratatui::style::Stylize;
+use ratatui::style::{Style, Stylize};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Tabs, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::clipboard;
@@ -141,6 +141,29 @@ struct State {
     history_pos: Option<usize>,
     /// Lines scrolled up from the bottom; `0` = pinned to the latest output.
     scroll_back: u16,
+    /// Active tab: `0` = the REPL, `1..=demos.len()` = a runbook demo page. Only
+    /// non-zero when the demo is on (tabs are shown).
+    tab: usize,
+    /// The runbook demos, lazily loaded the first time the demo turns on (sourced
+    /// as `application/json`). Empty ⇒ no tab bar; the REPL renders as before.
+    demos: Vec<DemoData>,
+    /// Output of the last step run on the current demo page, shown beneath it.
+    demo_out: String,
+}
+
+/// One step of a runbook demo, as carried by the `application/json` representation.
+struct StepData {
+    label: String,
+    cmd: String,
+    note: String,
+}
+
+/// A runbook demo page: its tab label, intro prose, and runnable steps. Parsed from
+/// `source urn:runbook:<id> as=application/json`.
+struct DemoData {
+    label: String,
+    intro: String,
+    steps: Vec<StepData>,
 }
 
 impl State {
@@ -163,11 +186,63 @@ fn event_loop(
         ..State::default()
     };
     loop {
+        // The demo can be toggled at runtime (`demo on|off`, or over the wire via
+        // `urn:host:demo`), so reconcile the tab bar with the flag each frame: load
+        // the demos the first time it's on, drop them (and any open tab) when it's off.
+        let demo_on = ikigai_embedded::demo_flag().load(std::sync::atomic::Ordering::Relaxed);
+        if demo_on && state.demos.is_empty() {
+            load_demos(&mut state, engine);
+        } else if !demo_on && !state.demos.is_empty() {
+            state.demos.clear();
+            state.tab = 0;
+            state.demo_out.clear();
+        }
+
         terminal.draw(|frame| draw(frame, &state))?;
         if let Event::Key(key) = event::read()? {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+            // Ctrl-C always exits, on any tab (demo pages don't run the editor that
+            // would otherwise decode it).
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                return Ok(());
+            }
+            // With tabs shown, Tab/BackTab cycle them regardless of which tab is up,
+            // and a demo page is a browse view (number keys run steps; no text entry).
+            if !state.demos.is_empty() {
+                let n = state.demos.len() + 1; // the REPL plus one tab per demo
+                match key.code {
+                    KeyCode::Tab => {
+                        state.tab = (state.tab + 1) % n;
+                        state.demo_out.clear();
+                        continue;
+                    }
+                    KeyCode::BackTab => {
+                        state.tab = (state.tab + n - 1) % n;
+                        state.demo_out.clear();
+                        continue;
+                    }
+                    _ => {}
+                }
+                if state.tab > 0 {
+                    match key.code {
+                        KeyCode::Char(c @ '1'..='9') => {
+                            run_step(&mut state, engine, c as usize - '1' as usize);
+                        }
+                        // `0` runs the tenth step, so a ten-step demo (ZeroTrust) is
+                        // fully reachable from the number row.
+                        KeyCode::Char('0') => run_step(&mut state, engine, 9),
+                        KeyCode::Esc => {
+                            state.tab = 0;
+                            state.demo_out.clear();
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+            }
+            // The REPL tab (or the demo off entirely): the normal line editor.
             match decode(key, &state) {
                 Edit::Quit => return Ok(()),
                 // `submit` evaluates the line and reports whether to quit.
@@ -177,6 +252,68 @@ fn event_loop(
             }
         }
     }
+}
+
+/// Load the runbook demos into `state` by enumerating `urn:runbook:*` and sourcing
+/// each as `application/json`. Called the first time the demo turns on; a parse or
+/// resolve failure simply skips that page rather than aborting the TUI.
+fn load_demos(state: &mut State, engine: &Engine) {
+    let Some(entries) = engine.entries() else {
+        return;
+    };
+    for entry in entries {
+        let Some(id) = entry.pattern.strip_prefix("urn:runbook:") else {
+            continue;
+        };
+        let Action::Output(out) =
+            engine.eval(&format!("source urn:runbook:{id} as=application/json"))
+        else {
+            continue;
+        };
+        let Ok(json) = out.result else { continue };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&json) else {
+            continue;
+        };
+        let steps = value["steps"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|s| StepData {
+                        label: s["label"].as_str().unwrap_or_default().to_string(),
+                        cmd: s["cmd"].as_str().unwrap_or_default().to_string(),
+                        note: s["note"].as_str().unwrap_or_default().to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        state.demos.push(DemoData {
+            label: value["label"].as_str().unwrap_or(id).to_string(),
+            intro: value["intro"].as_str().unwrap_or_default().to_string(),
+            steps,
+        });
+    }
+}
+
+/// Run step `idx` of the demo on the current tab, capturing its output (or error)
+/// into `demo_out` for display on the page.
+fn run_step(state: &mut State, engine: &Engine, idx: usize) {
+    let Some(demo) = state.demos.get(state.tab.wrapping_sub(1)) else {
+        return;
+    };
+    let Some(step) = demo.steps.get(idx) else {
+        return;
+    };
+    let cmd = step.cmd.clone();
+    let out = match engine.eval(&cmd) {
+        Action::Output(entry) => entry.result.unwrap_or_else(|e| format!("error: {e}")),
+        Action::Help => HELP.to_string(),
+        Action::Clear => {
+            state.transcript.clear();
+            String::new()
+        }
+        Action::Quit | Action::Noop => String::new(),
+    };
+    state.demo_out = format!("$ {cmd}\n{out}");
 }
 
 /// Decode a key press into an [`Edit`] under the active scheme, given the state
@@ -611,36 +748,91 @@ fn recall(state: &mut State, dir: i32) {
 
 fn draw(frame: &mut Frame, state: &State) {
     let chunks = Layout::vertical([
-        Constraint::Length(1), // title
-        Constraint::Min(1),    // transcript
-        Constraint::Length(3), // input box
+        Constraint::Length(1), // title, or the tab strip when the demo is on
+        Constraint::Min(1),    // transcript, or a demo page
+        Constraint::Length(3), // input box, or a demo-page hint
     ])
     .split(frame.area());
 
-    let title = Line::from(vec![
-        format!("ikigai {} ", env!("CARGO_PKG_VERSION")).bold(),
-        "— resource-resolution REPL".into(),
-        format!(
-            "   (help · quit · ↑↓ history · {} · PgUp/PgDn scroll · Ctrl-C exit)",
-            mode_label(state)
+    // Top row: the tab strip when the demo is on, otherwise the usual title/help line.
+    if state.demos.is_empty() {
+        let title = Line::from(vec![
+            format!("ikigai {} ", env!("CARGO_PKG_VERSION")).bold(),
+            "— resource-resolution REPL".into(),
+            format!(
+                "   (help · quit · ↑↓ history · {} · PgUp/PgDn scroll · Ctrl-C exit)",
+                mode_label(state)
+            )
+            .dim(),
+        ]);
+        frame.render_widget(Paragraph::new(title), chunks[0]);
+    } else {
+        let mut titles = vec![Line::from("REPL")];
+        titles.extend(state.demos.iter().map(|d| Line::from(d.label.clone())));
+        let tabs = Tabs::new(titles)
+            .select(state.tab)
+            .highlight_style(Style::new().reversed())
+            .divider("  ");
+        frame.render_widget(tabs, chunks[0]);
+    }
+
+    // Main area: the REPL transcript on tab 0, the demo page on a demo tab.
+    if state.tab == 0 {
+        let lines = transcript_lines(&state.transcript);
+        let bottom = (lines.len() as u16).saturating_sub(chunks[1].height);
+        let scroll_y = bottom.saturating_sub(state.scroll_back);
+        frame.render_widget(Paragraph::new(lines).scroll((scroll_y, 0)), chunks[1]);
+    } else if let Some(demo) = state.demos.get(state.tab - 1) {
+        let page = Paragraph::new(demo_lines(demo, &state.demo_out)).wrap(Wrap { trim: false });
+        frame.render_widget(page, chunks[1]);
+    }
+
+    // Bottom row: the editable request line on the REPL tab; a static hint on a demo
+    // page, which is browse-only (keys run steps, they don't type).
+    if state.tab == 0 {
+        let input = Paragraph::new(state.input.as_str())
+            .block(Block::default().borders(Borders::ALL).title(" request "));
+        frame.render_widget(input, chunks[2]);
+        // Place the cursor at its column — the display width before it — inside the
+        // 1-cell border, clamped so a long line can't draw past the box.
+        let col = state.input[..state.cursor].chars().count() as u16;
+        let cursor_x = (chunks[2].x + 1 + col).min(chunks[2].x + chunks[2].width.saturating_sub(1));
+        frame.set_cursor_position(Position::new(cursor_x, chunks[2].y + 1));
+    } else {
+        let hint = Paragraph::new(
+            "1–9 run a step · Tab/⇧Tab switch · Esc back to REPL · Ctrl-C exit".dim(),
         )
-        .dim(),
-    ]);
-    frame.render_widget(Paragraph::new(title), chunks[0]);
+        .block(Block::default().borders(Borders::ALL).title(" runbook "));
+        frame.render_widget(hint, chunks[2]);
+    }
+}
 
-    let lines = transcript_lines(&state.transcript);
-    let bottom = (lines.len() as u16).saturating_sub(chunks[1].height);
-    let scroll_y = bottom.saturating_sub(state.scroll_back);
-    frame.render_widget(Paragraph::new(lines).scroll((scroll_y, 0)), chunks[1]);
-
-    let input = Paragraph::new(state.input.as_str())
-        .block(Block::default().borders(Borders::ALL).title(" request "));
-    frame.render_widget(input, chunks[2]);
-    // Place the cursor at its column — the display width before it — inside the
-    // 1-cell border, clamped so a long line can't draw past the box.
-    let col = state.input[..state.cursor].chars().count() as u16;
-    let cursor_x = (chunks[2].x + 1 + col).min(chunks[2].x + chunks[2].width.saturating_sub(1));
-    frame.set_cursor_position(Position::new(cursor_x, chunks[2].y + 1));
+/// Render a demo page as styled lines: the intro, the numbered runnable steps (each
+/// with its command and note), and the most recent step's output beneath them.
+fn demo_lines(demo: &DemoData, out: &str) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(demo.intro.clone()),
+        Line::from(""),
+        Line::from("steps:".bold()),
+    ];
+    for (i, step) in demo.steps.iter().enumerate() {
+        // The leading digit IS the key that runs the step: 1–9, then 0 for a tenth.
+        let key = if i < 9 { (b'1' + i as u8) as char } else { '0' };
+        lines.push(Line::from(vec![
+            format!("  {key}. ").bold(),
+            step.label.clone().bold(),
+        ]));
+        lines.push(Line::from(format!("     {}", step.cmd).cyan()));
+        lines.push(Line::from(format!("     — {}", step.note).dim()));
+    }
+    if !out.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from("─ output ─".dim()));
+        for l in out.lines() {
+            lines.push(Line::from(l.to_string().green()));
+        }
+    }
+    lines
 }
 
 /// The active scheme (and, for vi, its mode) shown in the title hint — so a vi
@@ -718,6 +910,40 @@ mod tests {
         state.input = "x".repeat(200);
         state.cursor = state.input.len();
         render(40, 24, &state);
+    }
+
+    // With demos loaded, `draw` renders the tab strip plus either the transcript
+    // (REPL tab) or a demo page (a demo tab, with and without step output).
+    #[test]
+    fn draws_demo_tabs_without_panicking() {
+        let mut state = State::default();
+        state.demos.push(DemoData {
+            label: "Basics".into(),
+            intro: "A resource is resolved by name; functions are resources too.".into(),
+            steps: vec![
+                StepData {
+                    label: "uppercase".into(),
+                    cmd: "source urn:fn:toUpper hello".into(),
+                    note: "a function resource".into(),
+                },
+                StepData {
+                    label: "pipe".into(),
+                    cmd: "source urn:fn:toUpper hi | urn:demo:wrap".into(),
+                    note: "pipe output into the next stage".into(),
+                },
+            ],
+        });
+
+        state.tab = 0; // tab strip shown, REPL transcript beneath
+        render(80, 24, &state);
+        render(1, 1, &state); // degenerate size with tabs present
+
+        state.tab = 1; // the demo page, no step run yet
+        render(80, 24, &state);
+
+        state.demo_out = "$ source urn:fn:toUpper hello\nHELLO".into();
+        render(80, 24, &state); // demo page with output
+        render(20, 6, &state); // narrow → intro wraps, output scrolls
     }
 
     fn state_with(input: &str, cursor: usize) -> State {
