@@ -19,12 +19,14 @@ quic = ["dep:ikigai-quic"] # opt-in; pulls quinn/rustls/tokio
 
 [dependencies]
 ikigai-core = { workspace = true }
-ikigai-engine = { path = "../ikigai-engine" }
+# Sibling crates carry an explicit version (required to publish) pinned to this
+# release, so the binary always resolves them at the matching lockstep version.
+ikigai-engine = { path = "../ikigai-engine", version = "0.1.5" }
 ikigai-resolve = { workspace = true }
 serde_json = { workspace = true }
-ikigai-embedded = { path = "../ikigai-embedded", optional = true }
-ikigai-ipc = { path = "../ikigai-ipc", optional = true }
-ikigai-quic = { path = "../ikigai-quic", optional = true }
+ikigai-embedded = { path = "../ikigai-embedded", version = "0.1.5", optional = true }
+ikigai-ipc = { path = "../ikigai-ipc", version = "0.1.5", optional = true }
+ikigai-quic = { path = "../ikigai-quic", version = "0.1.5", optional = true }
 
 # The full-screen TUI is native-only (crossterm). The browser frontend (ratzilla)
 # lands in a later slice; on wasm the binary falls back to the line REPL.
