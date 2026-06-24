@@ -16,7 +16,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::executor::block_on;
-use ikigai_core::{Capability, Expiry, Kernel, Representation, Request, SpaceEntry, Tracer};
+use ikigai_core::{
+    Capability, Expiry, Kernel, Provenance, Representation, Request, SpaceEntry, Tracer,
+};
 use serde::{Deserialize, Serialize};
 
 /// How a resolution was served by the representation cache.
@@ -70,6 +72,23 @@ pub trait Resolver: Send + Sync {
         capability: &Capability,
     ) -> Result<(Representation, CacheStatus), String> {
         self.issue_as(request, capability)
+    }
+
+    /// Async resolution of a request whose input came from an upstream pipe stage,
+    /// folding that upstream's [`Provenance`] into the result's cacheability — so
+    /// `source <X> | transform` is no more cacheable than `X`. The default *ignores*
+    /// the provenance and delegates to [`issue_as_async`](Resolver::issue_as_async):
+    /// correct for a wire resolver, which doesn't yet propagate provenance across the
+    /// wire (the remote kernel resolves each stage on its own merits). The in-process
+    /// kernel overrides this to thread the provenance into its dependency merge.
+    async fn issue_as_async_with_incoming(
+        &self,
+        request: Request,
+        capability: &Capability,
+        incoming: Provenance,
+    ) -> Result<(Representation, CacheStatus), String> {
+        let _ = incoming;
+        self.issue_as_async(request, capability).await
     }
 
     /// Install an execution [`Tracer`] for the next resolution — the `trace` command
@@ -141,6 +160,23 @@ impl Resolver for Kernel {
         Ok((representation, status))
     }
 
+    async fn issue_as_async_with_incoming(
+        &self,
+        request: Request,
+        capability: &Capability,
+        incoming: Provenance,
+    ) -> Result<(Representation, CacheStatus), String> {
+        // Thread the upstream pipe provenance into the kernel's dependency merge, so
+        // the result's cacheability is no greater than its piped input's. `is_cached`
+        // probes the same content-keyed entry the merged result would store under.
+        let was_cached = Kernel::is_cached(self, &request, capability);
+        let representation = Kernel::issue_with_incoming(self, request, capability, incoming)
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = cache_status(was_cached, &representation);
+        Ok((representation, status))
+    }
+
     fn set_tracer(&self, tracer: Arc<dyn Tracer>) {
         Kernel::set_tracer(self, tracer);
     }
@@ -197,6 +233,19 @@ impl<R: Resolver + ?Sized> Resolver for Arc<R> {
     ) -> Result<(Representation, CacheStatus), String> {
         // Delegate to the inner resolver's override (e.g. the kernel's true-async one).
         (**self).issue_as_async(request, capability).await
+    }
+
+    async fn issue_as_async_with_incoming(
+        &self,
+        request: Request,
+        capability: &Capability,
+        incoming: Provenance,
+    ) -> Result<(Representation, CacheStatus), String> {
+        // Delegate so the inner resolver's override threads the pipe provenance —
+        // otherwise the trait default would silently drop it here.
+        (**self)
+            .issue_as_async_with_incoming(request, capability, incoming)
+            .await
     }
 
     fn set_tracer(&self, tracer: Arc<dyn Tracer>) {

@@ -374,10 +374,48 @@ fn host_identity() -> FnEndpoint {
 /// `urn:host:history` toggles, and `urn:host:identity`). Used as-is for a *served*
 /// kernel — it deliberately omits the personal space, which must not be exposed over the
 /// wire until capability-on-the-wire lands.
+/// `urn:style:catalog` — a **text-output** XSLT (a resource) that renders the catalog
+/// RDF/XML into terminal-friendly text "cards", one per endpoint. The TUI Docs tab pipes
+/// `urn:kernel:catalog | urn:rdf:transrept as=application/rdf+xml | urn:xslt:transform
+/// stylesheet=urn:style:catalog as=text/plain` through it — the same XSLT styling the
+/// browser uses for HTML cards, here producing text. The `id`-fallback + omit-empty
+/// guards keep an under-described endpoint from rendering a hollow card.
+// Note on the whitespace: xrust strips *whitespace-only* text nodes, but preserves
+// whitespace embedded in a text node that also carries a visible character. So every
+// newline here rides with the `│` card-border glyph (`&#10;│ …`) — which both keeps the
+// line break and draws a tidy left border on each card. (The HTML stylesheet in the web
+// demo doesn't need this — element structure carries the layout there.)
+const CATALOG_CARDS_TEXT_XSL: &str = r#"<xsl:stylesheet version="1.0"
+  xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+  xmlns:ik="https://ikigai-rs.dev/ns#">
+  <xsl:output method="text"/>
+  <xsl:template match="/"><xsl:apply-templates select="//ik:Endpoint"/></xsl:template>
+  <xsl:template match="ik:Endpoint"><xsl:text>&#10;│&#10;│ </xsl:text><xsl:choose><xsl:when test="ik:title"><xsl:value-of select="ik:title"/></xsl:when><xsl:otherwise><xsl:value-of select="ik:id"/></xsl:otherwise></xsl:choose><xsl:text>  ·  </xsl:text><xsl:value-of select="ik:id"/><xsl:if test="ik:summary"><xsl:text>&#10;│   </xsl:text><xsl:value-of select="ik:summary"/></xsl:if><xsl:if test="ik:verb or ik:output"><xsl:text>&#10;│   </xsl:text><xsl:for-each select="ik:verb"><xsl:text>[</xsl:text><xsl:value-of select="."/><xsl:text>] </xsl:text></xsl:for-each><xsl:if test="ik:output"><xsl:text>&#8594; </xsl:text><xsl:value-of select="ik:output"/></xsl:if></xsl:if><xsl:text>&#10;</xsl:text></xsl:template>
+</xsl:stylesheet>"#;
+
+fn catalog_cards_xsl() -> FnEndpoint {
+    FnEndpoint::new("catalog-cards-xsl", |_inv: &Invocation<'_>| {
+        Ok(Representation::new(
+            ReprType::new("application/xslt+xml").with_param("charset", "utf-8"),
+            CATALOG_CARDS_TEXT_XSL.as_bytes().to_vec(),
+        )
+        .cacheable())
+    })
+    .with_description(
+        Description::new("catalog-cards-xsl")
+            .title("Catalog cards stylesheet (text)")
+            .summary("XSLT that renders the catalog RDF/XML into terminal text cards for the Docs tab.")
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .output("application/xslt+xml"),
+    )
+}
+
 fn base_space(nature: &'static str) -> EndpointSpace {
     ikigai_fn::space()
         .bind(Exact::new("urn:data:page"), page())
         .bind(Exact::new("urn:data:about"), about())
+        .bind(Exact::new("urn:style:catalog"), catalog_cards_xsl())
         .bind(Exact::new("urn:host:info"), host_info(nature))
         .bind(Exact::new("urn:host:demo"), host_demo())
         .bind(Exact::new("urn:host:history"), host_history())
@@ -517,6 +555,12 @@ fn root_space() -> Arc<dyn Space> {
     Arc::new(Fallback::new(vec![
         Arc::new(local_space("Embedded (Native)")) as Arc<dyn Space>,
         Arc::new(http_space()) as Arc<dyn Space>,
+        // The Linked Data toolkit: RDF transreption (urn:rdf:*) + SPARQL (urn:sparql:*)
+        // + XSLT styling (urn:xslt:*). Linked natively — no module-loading machinery in
+        // the native binary (that's a browser/WASI concern).
+        Arc::new(ikigai_rdf::space()) as Arc<dyn Space>,
+        Arc::new(ikigai_sparql::space()) as Arc<dyn Space>,
+        Arc::new(ikigai_xslt::space()) as Arc<dyn Space>,
         Arc::new(Gated {
             inner: ikigai_runbook::space(),
             on: demo_flag(),
