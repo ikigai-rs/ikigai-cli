@@ -15,6 +15,9 @@ ikigai-personal = { workspace = true }
 ikigai-fs = { workspace = true }
 ikigai-http = { workspace = true }
 ikigai-runbook = { workspace = true }
+ikigai-rdf = { workspace = true }
+ikigai-sparql = { workspace = true }
+ikigai-xslt = { workspace = true }
 ikigai-scheduler = { workspace = true }
 serde_json = { workspace = true }
 # Filesystem watching — the first external golden-thread freshness source: an

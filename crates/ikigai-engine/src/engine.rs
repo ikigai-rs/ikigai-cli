@@ -23,10 +23,54 @@ use std::sync::{Arc, Mutex};
 use futures::executor::block_on;
 use futures::future::join_all;
 use ikigai_core::{
-    ArgRef, BoxFuture, Capability, Description, InputSource, Iri, Representation, Request, Spawner,
-    TraceEvent, Tracer, Verb,
+    ArgRef, BoxFuture, Capability, Description, Expiry, InputSource, Iri, Provenance,
+    Representation, Request, Spawner, Thread, TraceEvent, Tracer, Verb,
 };
 use ikigai_resolve::{CacheStatus, Resolver};
+use std::collections::BTreeSet;
+
+/// A pipe stage's output: its text plus the cache provenance (expiry + golden
+/// threads) to hand the next stage, so cacheability flows down the pipeline. The
+/// downstream stage resolves with this as its upstream [`Provenance`], and the
+/// kernel folds it into the result — a transform is no more cacheable than its input.
+struct Staged {
+    text: String,
+    expiry: Expiry,
+    threads: BTreeSet<Thread>,
+}
+
+impl Staged {
+    /// The provenance this stage hands to the next.
+    fn provenance(&self) -> Provenance {
+        Provenance::new(self.expiry, self.threads.clone())
+    }
+}
+
+/// The neutral upstream for the first stage of a pipeline (no pipe feeds it): a
+/// `Never`/empty provenance folds as the identity, so the first stage resolves on
+/// its own merits.
+fn root_provenance() -> Provenance {
+    Provenance::new(Expiry::Never, BTreeSet::new())
+}
+
+/// Join several stage outputs (fork branches or mapped items) into one, combining
+/// their provenance: the result is cacheable only if *every* part is (the most
+/// restrictive expiry wins), and depends on the union of their threads.
+fn combine_outputs(parts: Vec<Staged>) -> Staged {
+    let mut expiry = Expiry::Never;
+    let mut threads = BTreeSet::new();
+    let mut texts = Vec::with_capacity(parts.len());
+    for part in parts {
+        expiry = expiry.most_restrictive(part.expiry);
+        threads.extend(part.threads);
+        texts.push(part.text);
+    }
+    Staged {
+        text: texts.join("\n"),
+        expiry,
+        threads,
+    }
+}
 
 use crate::config;
 
@@ -315,7 +359,10 @@ impl Engine {
     /// [`run_source`](Self::run_source).
     async fn run_pipeline(&self, spec: &str) -> Result<String, String> {
         let pipeline = parse_spec(spec)?;
-        self.run_pipeline_node(&pipeline, None).await
+        Ok(self
+            .run_pipeline_node(&pipeline, None, root_provenance())
+            .await?
+            .text)
     }
 
     /// Run a parsed pipeline. `incoming` is the value flowing in from an enclosing
@@ -325,16 +372,23 @@ impl Engine {
         &'a self,
         pipeline: &'a Pipeline,
         incoming: Option<&'a str>,
-    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + 'a>> {
+        prov: Provenance,
+    ) -> Pin<Box<dyn Future<Output = Result<Staged, String>> + 'a>> {
         Box::pin(async move {
-            let mut value = self.run_node(&pipeline.first, incoming).await?;
+            let mut staged = self.run_node(&pipeline.first, incoming, prov).await?;
             for step in &pipeline.rest {
-                value = match step.connector {
-                    Connector::Pipe => self.run_node(&step.node, Some(&value)).await?,
-                    Connector::Map => self.run_map(&step.node, &value).await?,
+                // Each `|` hands the prior stage's provenance down as the next stage's
+                // upstream, so cacheability flows along the pipe; `..` does the same per
+                // mapped item.
+                staged = match step.connector {
+                    Connector::Pipe => {
+                        self.run_node(&step.node, Some(&staged.text), staged.provenance())
+                            .await?
+                    }
+                    Connector::Map => self.run_map(&step.node, &staged).await?,
                 };
             }
-            Ok(value)
+            Ok(staged)
         })
     }
 
@@ -345,12 +399,13 @@ impl Engine {
         &'a self,
         node: &'a Node,
         incoming: Option<&'a str>,
-    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + 'a>> {
+        prov: Provenance,
+    ) -> Pin<Box<dyn Future<Output = Result<Staged, String>> + 'a>> {
         Box::pin(async move {
             match node {
                 Node::Source(words) => {
                     let (target, args) = words.split_first().ok_or("expected an IRI")?;
-                    self.run_source(target, args, incoming).await
+                    self.run_source(target, args, incoming, prov).await
                 }
                 Node::Fork(branches) => {
                     // Concurrent path: when every branch is a lone `source` stage and a
@@ -363,14 +418,19 @@ impl Engine {
                                     words.split_first().ok_or("expected an IRI")?;
                                 requests.push(self.source_request(target, args, incoming).await?);
                             }
-                            return Ok(self.run_parallel(spawner, requests).await?.join("\n"));
+                            let outputs =
+                                self.run_parallel(spawner, requests, prov.clone()).await?;
+                            return Ok(combine_outputs(outputs));
                         }
                     }
                     let mut outputs = Vec::with_capacity(branches.len());
                     for branch in branches {
-                        outputs.push(self.run_pipeline_node(branch, incoming).await?);
+                        outputs.push(
+                            self.run_pipeline_node(branch, incoming, prov.clone())
+                                .await?,
+                        );
                     }
-                    Ok(outputs.join("\n"))
+                    Ok(combine_outputs(outputs))
                 }
             }
         })
@@ -383,24 +443,28 @@ impl Engine {
     fn run_map<'a>(
         &'a self,
         node: &'a Node,
-        value: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + 'a>> {
+        value: &'a Staged,
+    ) -> Pin<Box<dyn Future<Output = Result<Staged, String>> + 'a>> {
         Box::pin(async move {
+            // Every mapped item descends from the same upstream, so each inherits its
+            // provenance; the joined result combines them (cacheable iff all are).
+            let prov = value.provenance();
             // Concurrent path: mapping a single `source` over each item — resolve the
             // items on the injected scheduler in parallel.
             if let (Node::Source(words), Some(spawner)) = (node, &self.spawner) {
                 let (target, args) = words.split_first().ok_or("expected an IRI")?;
                 let mut requests = Vec::new();
-                for item in value.split('\n') {
+                for item in value.text.split('\n') {
                     requests.push(self.source_request(target, args, Some(item)).await?);
                 }
-                return Ok(self.run_parallel(spawner, requests).await?.join("\n"));
+                let outputs = self.run_parallel(spawner, requests, prov).await?;
+                return Ok(combine_outputs(outputs));
             }
             let mut outputs = Vec::new();
-            for item in value.split('\n') {
-                outputs.push(self.run_node(node, Some(item)).await?);
+            for item in value.text.split('\n') {
+                outputs.push(self.run_node(node, Some(item), prov.clone()).await?);
             }
-            Ok(outputs.join("\n"))
+            Ok(combine_outputs(outputs))
         })
     }
 
@@ -415,7 +479,8 @@ impl Engine {
         &self,
         spawner: &Arc<dyn Spawner>,
         requests: Vec<Request>,
-    ) -> Result<Vec<String>, String> {
+        prov: Provenance,
+    ) -> Result<Vec<Staged>, String> {
         type Slot = Arc<Mutex<Option<Result<(Representation, CacheStatus), String>>>>;
         let capability = self.capability.borrow().clone();
         let slots: Vec<Slot> = requests
@@ -428,9 +493,13 @@ impl Engine {
             .map(|(request, slot)| {
                 let resolver = Arc::clone(&self.resolver);
                 let capability = capability.clone();
+                let prov = prov.clone();
                 let slot = Arc::clone(slot);
                 spawner.spawn(Box::pin(async move {
-                    let result = resolver.issue_as_async(request, &capability).await;
+                    // Each fanned-out branch/item inherits the same upstream provenance.
+                    let result = resolver
+                        .issue_as_async_with_incoming(request, &capability, prov)
+                        .await;
                     *slot.lock().expect("branch slot") = Some(result);
                 }))
             })
@@ -446,21 +515,30 @@ impl Engine {
                 .take()
                 .expect("spawned branch completed")?;
             stats.record(status);
-            outputs.push(String::from_utf8(representation.bytes).map_err(|e| e.to_string())?);
+            let expiry = representation.expiry;
+            let threads = representation.threads().clone();
+            let text = String::from_utf8(representation.bytes).map_err(|e| e.to_string())?;
+            outputs.push(Staged {
+                text,
+                expiry,
+                threads,
+            });
         }
         self.cache.set(stats);
         Ok(outputs)
     }
 
-    /// `SOURCE` a resource and return its representation as text.
+    /// `SOURCE` a resource, folding the upstream pipe `prov` into its cacheability,
+    /// and return the stage's text + its own provenance for the next stage.
     async fn run_source(
         &self,
         target: &str,
         args: &[String],
         incoming: Option<&str>,
-    ) -> Result<String, String> {
+        prov: Provenance,
+    ) -> Result<Staged, String> {
         let request = self.source_request(target, args, incoming).await?;
-        self.run(request).await
+        self.run_staged(request, Some(prov)).await
     }
 
     /// `sink` command: write a representation *into* a resource — the write half
@@ -904,12 +982,40 @@ impl Engine {
     /// representation as UTF-8 text. The resolver reports the [`CacheStatus`]
     /// directly — for a remote kernel the server knows it without a probe.
     async fn run(&self, request: Request) -> Result<String, String> {
+        // No pipe upstream (sink / meta / a single source): resolve on its own merits.
+        Ok(self.run_staged(request, None).await?.text)
+    }
+
+    /// Issue a request — optionally carrying the upstream pipe `incoming` provenance,
+    /// which the kernel folds into the result's cacheability — record how the cache
+    /// served it, and return the stage's text plus its own provenance for the next
+    /// stage. The resolver reports the [`CacheStatus`] directly (a remote kernel knows
+    /// it without a probe).
+    async fn run_staged(
+        &self,
+        request: Request,
+        incoming: Option<Provenance>,
+    ) -> Result<Staged, String> {
         let capability = self.capability.borrow().clone();
-        let (representation, status) = self.resolver.issue_as_async(request, &capability).await?;
+        let (representation, status) = match incoming {
+            Some(prov) => {
+                self.resolver
+                    .issue_as_async_with_incoming(request, &capability, prov)
+                    .await?
+            }
+            None => self.resolver.issue_as_async(request, &capability).await?,
+        };
         let mut stats = self.cache.get();
         stats.record(status);
         self.cache.set(stats);
-        String::from_utf8(representation.bytes).map_err(|e| e.to_string())
+        let expiry = representation.expiry;
+        let threads = representation.threads().clone();
+        let text = String::from_utf8(representation.bytes).map_err(|e| e.to_string())?;
+        Ok(Staged {
+            text,
+            expiry,
+            threads,
+        })
     }
 }
 
@@ -1979,6 +2085,44 @@ mod tests {
         let engine = builtin_engine();
         assert_eq!(entry(engine.eval("list")).cache.label(), None);
         assert_eq!(entry(engine.eval("frobnicate")).cache.label(), None);
+    }
+
+    /// An engine with a *volatile* source (uncacheable, like a live fetch) and a
+    /// *stable* one (cacheable, like the catalog), plus the cacheable `toUpper`
+    /// transform — to prove cacheability flows down the pipe.
+    fn inheritance_engine() -> Engine {
+        let volatile = FnEndpoint::new("volatile", |_: &Invocation<'_>| {
+            Ok(Representation::new(ReprType::new("text/plain"), b"data".to_vec())) // no .cacheable()
+        });
+        let stable = FnEndpoint::new("stable", |_: &Invocation<'_>| {
+            Ok(Representation::new(ReprType::new("text/plain"), b"data".to_vec()).cacheable())
+        });
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:test:volatile"), volatile)
+            .bind(Exact::new("urn:test:stable"), stable)
+            .bind(Exact::new("urn:fn:toUpper"), builtins::to_upper());
+        Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ))
+    }
+
+    #[test]
+    fn a_transform_inherits_its_pipe_sources_cacheability() {
+        let engine = inheritance_engine();
+        // Volatile upstream: the transform can't be cached either — both stages
+        // recompute every run (the live-fetch case).
+        let v1 = entry(engine.eval("source urn:test:volatile | urn:fn:toUpper"));
+        assert_eq!(v1.cache.label().as_deref(), Some("2 uncacheable"));
+        let v2 = entry(engine.eval("source urn:test:volatile | urn:fn:toUpper"));
+        assert_eq!(v2.cache.label().as_deref(), Some("2 uncacheable"));
+
+        // Stable upstream: the whole pipeline caches — computed once, then served
+        // (the catalog case).
+        let s1 = entry(engine.eval("source urn:test:stable | urn:fn:toUpper"));
+        assert_eq!(s1.cache.label().as_deref(), Some("2 computed"));
+        let s2 = entry(engine.eval("source urn:test:stable | urn:fn:toUpper"));
+        assert_eq!(s2.cache.label().as_deref(), Some("2 cached"));
     }
 
     #[test]

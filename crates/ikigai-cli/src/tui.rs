@@ -141,14 +141,19 @@ struct State {
     history_pos: Option<usize>,
     /// Lines scrolled up from the bottom; `0` = pinned to the latest output.
     scroll_back: u16,
-    /// Active tab: `0` = the REPL, `1..=demos.len()` = a runbook demo page. Only
-    /// non-zero when the demo is on (tabs are shown).
+    /// Active tab: `0` = the REPL, `1` = the Docs page (the catalog as text),
+    /// `2..=demos.len()+1` = a runbook demo page. Only non-zero when the demo is on
+    /// (tabs are shown).
     tab: usize,
     /// The runbook demos, lazily loaded the first time the demo turns on (sourced
     /// as `application/json`). Empty ⇒ no tab bar; the REPL renders as before.
     demos: Vec<DemoData>,
     /// Output of the last step run on the current demo page, shown beneath it.
     demo_out: String,
+    /// The Docs page text — the kernel's own catalog (`urn:kernel:catalog`) as
+    /// Turtle, the text analog of the browser demo's rendered Catalog page. Loaded
+    /// alongside the demos when the demo turns on.
+    docs: String,
 }
 
 /// One step of a runbook demo, as carried by the `application/json` representation.
@@ -199,6 +204,7 @@ fn event_loop(
             load_demos(&mut state, engine);
         } else if !demo_on && !state.demos.is_empty() {
             state.demos.clear();
+            state.docs.clear();
             state.tab = 0;
             state.demo_out.clear();
         }
@@ -222,21 +228,41 @@ fn event_loop(
             // With tabs shown, Tab/BackTab cycle them regardless of which tab is up,
             // and a demo page is a browse view (number keys run steps; no text entry).
             if !state.demos.is_empty() {
-                let n = state.demos.len() + 1; // the REPL plus one tab per demo
+                let n = state.demos.len() + 2; // REPL, Docs, then one tab per demo
                 match key.code {
                     KeyCode::Tab => {
                         state.tab = (state.tab + 1) % n;
                         state.demo_out.clear();
+                        state.scroll_back = 0; // each tab opens fresh
                         continue;
                     }
                     KeyCode::BackTab => {
                         state.tab = (state.tab + n - 1) % n;
                         state.demo_out.clear();
+                        state.scroll_back = 0;
                         continue;
                     }
                     _ => {}
                 }
-                if state.tab > 0 {
+                if state.tab == 1 {
+                    // The Docs tab: a scrollable text view (top-anchored), no text entry.
+                    match key.code {
+                        KeyCode::PageDown => {
+                            state.scroll_back = state.scroll_back.saturating_add(SCROLL_STEP);
+                        }
+                        KeyCode::PageUp => {
+                            state.scroll_back = state.scroll_back.saturating_sub(SCROLL_STEP);
+                        }
+                        KeyCode::Esc => {
+                            state.tab = 0;
+                            state.scroll_back = 0;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                if state.tab > 1 {
+                    // A demo page is a browse view: number keys run steps, no text entry.
                     match key.code {
                         KeyCode::Char(c @ '1'..='9') => {
                             run_step(&mut state, engine, c as usize - '1' as usize);
@@ -303,12 +329,23 @@ fn load_demos(state: &mut State, engine: &Engine) {
             steps,
         });
     }
+    // The Docs tab: the kernel's own catalog rendered as text "cards" — every bound
+    // endpoint, transrepted to RDF/XML and styled by the same XSLT the browser demo uses
+    // for HTML cards (here with `method="text"`). Turtle all the way down, in the terminal.
+    state.docs = match engine.eval(
+        "source urn:kernel:catalog | urn:rdf:transrept as=application/rdf+xml \
+         | urn:xslt:transform stylesheet=urn:style:catalog as=text/plain",
+    ) {
+        Action::Output(out) => out.result.unwrap_or_else(|e| format!("error: {e}")),
+        _ => String::new(),
+    };
 }
 
 /// Run step `idx` of the demo on the current tab, capturing its output (or error)
 /// into `demo_out` for display on the page.
 fn run_step(state: &mut State, engine: &Engine, idx: usize) {
-    let Some(demo) = state.demos.get(state.tab.wrapping_sub(1)) else {
+    // Demo tabs start at index 2 (after REPL and Docs).
+    let Some(demo) = state.demos.get(state.tab.wrapping_sub(2)) else {
         return;
     };
     let Some(step) = demo.steps.get(idx) else {
@@ -792,7 +829,7 @@ fn draw(frame: &mut Frame, state: &State) {
         ]);
         frame.render_widget(Paragraph::new(title), chunks[0]);
     } else {
-        let mut titles = vec![Line::from("REPL")];
+        let mut titles = vec![Line::from("REPL"), Line::from("Docs")];
         titles.extend(state.demos.iter().map(|d| Line::from(d.label.clone())));
         let tabs = Tabs::new(titles)
             .select(state.tab)
@@ -801,19 +838,25 @@ fn draw(frame: &mut Frame, state: &State) {
         frame.render_widget(tabs, chunks[0]);
     }
 
-    // Main area: the REPL transcript on tab 0, the demo page on a demo tab.
+    // Main area: REPL transcript on tab 0, the Docs page on tab 1, a demo page beyond.
     if state.tab == 0 {
         let lines = transcript_lines(&state.transcript);
         let bottom = (lines.len() as u16).saturating_sub(chunks[1].height);
         let scroll_y = bottom.saturating_sub(state.scroll_back);
         frame.render_widget(Paragraph::new(lines).scroll((scroll_y, 0)), chunks[1]);
-    } else if let Some(demo) = state.demos.get(state.tab - 1) {
+    } else if state.tab == 1 {
+        // Docs: top-anchored, `scroll_back` is the offset down from the top.
+        let lines = docs_lines(&state.docs);
+        let max = (lines.len() as u16).saturating_sub(chunks[1].height);
+        let scroll_y = state.scroll_back.min(max);
+        frame.render_widget(Paragraph::new(lines).scroll((scroll_y, 0)), chunks[1]);
+    } else if let Some(demo) = state.demos.get(state.tab - 2) {
         let page = Paragraph::new(demo_lines(demo, &state.demo_out)).wrap(Wrap { trim: false });
         frame.render_widget(page, chunks[1]);
     }
 
-    // Bottom row: the editable request line on the REPL tab; a static hint on a demo
-    // page, which is browse-only (keys run steps, they don't type).
+    // Bottom row: the editable request line on the REPL tab; a static hint on the
+    // Docs page (scroll-only) and on a demo page (browse-only — keys run steps).
     if state.tab == 0 {
         let input = Paragraph::new(state.input.as_str())
             .block(Block::default().borders(Borders::ALL).title(" request "));
@@ -823,6 +866,12 @@ fn draw(frame: &mut Frame, state: &State) {
         let col = state.input[..state.cursor].chars().count() as u16;
         let cursor_x = (chunks[2].x + 1 + col).min(chunks[2].x + chunks[2].width.saturating_sub(1));
         frame.set_cursor_position(Position::new(cursor_x, chunks[2].y + 1));
+    } else if state.tab == 1 {
+        let hint = Paragraph::new(
+            "PgUp/PgDn scroll · Tab/⇧Tab switch · Esc back to REPL · Ctrl-C exit".dim(),
+        )
+        .block(Block::default().borders(Borders::ALL).title(" docs "));
+        frame.render_widget(hint, chunks[2]);
     } else {
         let hint = Paragraph::new(
             "1–9 run a step · Tab/⇧Tab switch · Esc back to REPL · Ctrl-C exit".dim(),
@@ -830,6 +879,31 @@ fn draw(frame: &mut Frame, state: &State) {
         .block(Block::default().borders(Borders::ALL).title(" runbook "));
         frame.render_widget(hint, chunks[2]);
     }
+}
+
+/// Render the Docs page: a header naming the resource, then the catalog text (Turtle).
+fn docs_lines(docs: &str) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from("the catalog · every bound endpoint, as cards".bold()),
+        Line::from("urn:kernel:catalog | urn:rdf:transrept as=rdf/xml | urn:xslt:transform".cyan()),
+        Line::from(""),
+    ];
+    if docs.trim().is_empty() {
+        lines.push(Line::from("(catalog unavailable)".dim()));
+    } else {
+        // Each card line is bordered with `│`. A title line is `│ <title>` (one space);
+        // detail lines are `│   <…>` (three) and the separator is a bare `│`. Highlight
+        // the titles, dim the rest, for hierarchy.
+        for l in docs.lines() {
+            let is_title = l.starts_with("│ ") && !l.starts_with("│  ");
+            if is_title {
+                lines.push(Line::from(l.to_string().cyan().bold()));
+            } else {
+                lines.push(Line::from(l.to_string().dim()));
+            }
+        }
+    }
+    lines
 }
 
 /// Render a demo page as styled lines: the intro, the numbered runnable steps (each
