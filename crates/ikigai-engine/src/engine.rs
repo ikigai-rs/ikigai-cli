@@ -2092,7 +2092,10 @@ mod tests {
     /// transform — to prove cacheability flows down the pipe.
     fn inheritance_engine() -> Engine {
         let volatile = FnEndpoint::new("volatile", |_: &Invocation<'_>| {
-            Ok(Representation::new(ReprType::new("text/plain"), b"data".to_vec())) // no .cacheable()
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                b"data".to_vec(),
+            )) // no .cacheable()
         });
         let stable = FnEndpoint::new("stable", |_: &Invocation<'_>| {
             Ok(Representation::new(ReprType::new("text/plain"), b"data".to_vec()).cacheable())
