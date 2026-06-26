@@ -563,6 +563,10 @@ fn root_space() -> Arc<dyn Space> {
         Arc::new(ikigai_rdf::space()) as Arc<dyn Space>,
         Arc::new(ikigai_sparql::space()) as Arc<dyn Space>,
         Arc::new(ikigai_xslt::space()) as Arc<dyn Space>,
+        // The ikigai vocabulary as a resolvable resource (urn:ikigai:vocab): the ns#
+        // ontology Turtle (ik:Transreptor rdfs:subClassOf ik:Endpoint + property defs),
+        // the same bytes served at https://ikigai-rs.dev/ns. Lists in the catalog.
+        Arc::new(ikigai_vocab::space()) as Arc<dyn Space>,
         Arc::new(Gated {
             inner: ikigai_runbook::space(),
             on: demo_flag(),
