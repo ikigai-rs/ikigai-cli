@@ -404,7 +404,9 @@ fn catalog_cards_xsl() -> FnEndpoint {
     .with_description(
         Description::new("catalog-cards-xsl")
             .title("Catalog cards stylesheet (text)")
-            .summary("XSLT that renders the catalog RDF/XML into terminal text cards for the Docs tab.")
+            .summary(
+                "XSLT that renders the catalog RDF/XML into terminal text cards for the Docs tab.",
+            )
             .verb(Verb::Source)
             .verb(Verb::Meta)
             .output("application/xslt+xml"),
