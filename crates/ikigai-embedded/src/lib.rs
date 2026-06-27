@@ -563,6 +563,10 @@ fn root_space() -> Arc<dyn Space> {
         Arc::new(ikigai_rdf::space()) as Arc<dyn Space>,
         Arc::new(ikigai_sparql::space()) as Arc<dyn Space>,
         Arc::new(ikigai_xslt::space()) as Arc<dyn Space>,
+        // Content sniffing + sniff-and-dispatch: `urn:sniff` classifies opaque bytes,
+        // `urn:transrept:auto` sniffs then routes them to the matching transreptor — so a
+        // mislabeled fetch or a file read transrepts without asserting its input type.
+        Arc::new(ikigai_sniff::space()) as Arc<dyn Space>,
         // The ikigai vocabulary as a resolvable resource (urn:ikigai:vocab): the ns#
         // ontology Turtle (ik:Transreptor rdfs:subClassOf ik:Endpoint + property defs),
         // the same bytes served at https://ikigai-rs.dev/ns. Lists in the catalog.
