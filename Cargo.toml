@@ -28,6 +28,8 @@ ikigai-runbook = "0.1.3"
 # Linked Data toolkit (separate ikigai-linkeddata repo): RDF transreption + SPARQL.
 ikigai-rdf = "0.1.0"
 ikigai-sparql = "0.1.0"
+# Content sniffing + sniff-and-dispatch (urn:sniff, urn:transrept:auto).
+ikigai-sniff = "0.1.1"
 # XSLT transform module (urn:xslt:transform) — linked natively (no download cost in a
 # native binary; the dynamic/lazy form is a browser/WASI concern).
 ikigai-xslt = "0.1.0"
