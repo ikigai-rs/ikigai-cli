@@ -26,7 +26,7 @@ ikigai-http = "0.1.0"
 # Interactive runbook module (urn:runbook:*) — Linked Data demo tab since 0.1.3;
 # 0.1.5 adds the JSON-LD demo tab (expand/flatten/compact), which works here because
 # the CLI links its own pipe-fixed ikigai-engine.
-ikigai-runbook = "0.1.5"
+ikigai-runbook = "0.1.6"
 # Linked Data toolkit (separate ikigai-linkeddata repo): RDF transreption + SPARQL.
 ikigai-rdf = "0.1.0"
 ikigai-sparql = "0.1.0"
@@ -37,7 +37,7 @@ ikigai-sniff = "0.1.1"
 ikigai-xslt = "0.1.0"
 # JSON-LD operators (urn:jsonld:expand/compact/flatten) — linked natively (the heavy
 # json-ld tree is a browser-wasm concern, lazy-loaded there; native links it directly).
-ikigai-jsonld = "0.1.0"
+ikigai-jsonld = "0.1.1"
 # Sibling workspace crates pinned to the current release: a published crate must
 # require its siblings at this version too, so the lockstep release publishes in
 # dependency order (resolve → wire → engine → …) and a crate can never build against
