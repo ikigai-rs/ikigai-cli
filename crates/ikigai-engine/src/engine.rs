@@ -724,11 +724,32 @@ impl Engine {
                             ))
                         }
                         many => {
-                            return Err(format!(
-                                "`{}` accepts multiple arguments ({}); name one with `key=value`",
-                                iri.as_str(),
-                                many.join(", ")
-                            ))
+                            // Several inputs are unnamed — but optional ones default to unset,
+                            // so if exactly one *required* input is unnamed, the piped/positional
+                            // value fills it (e.g. `… | urn:jsonld:flatten` → `content`, leaving
+                            // optional `base` unset). Only genuinely ambiguous when 2+ required
+                            // inputs are still unnamed.
+                            let required: Vec<&str> = many
+                                .iter()
+                                .copied()
+                                .filter(|name| {
+                                    description
+                                        .inputs
+                                        .iter()
+                                        .any(|i| i.name == *name && i.required)
+                                })
+                                .collect();
+                            match required.as_slice() {
+                                [name] => request = request.with_arg(*name, value),
+                                _ => {
+                                    return Err(format!(
+                                        "`{}` accepts multiple arguments ({}); name one with \
+                                         `key=value`",
+                                        iri.as_str(),
+                                        many.join(", ")
+                                    ))
+                                }
+                            }
                         }
                     }
                 }
@@ -2426,6 +2447,36 @@ mod tests {
     fn a_positional_value_with_two_unnamed_arguments_is_ambiguous() {
         let err = output(greet_engine().eval("source urn:demo:greet Hello")).unwrap_err();
         assert!(err.contains("name one with `key=value`"), "got: {err}");
+    }
+
+    #[test]
+    fn a_value_fills_the_sole_required_arg_when_others_are_optional() {
+        // `content` (required) + `base` (optional): a positional/piped value fills `content`,
+        // leaving the optional `base` unset — not ambiguous (the json-ld ops rely on this).
+        let opt = FnEndpoint::new("opt", |inv: &Invocation<'_>| {
+            let content = inv.inline_str("content")?;
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                content.to_uppercase().into_bytes(),
+            )
+            .cacheable())
+        })
+        .with_description(
+            Description::new("opt")
+                .verb(Verb::Source)
+                .verb(Verb::Meta)
+                .input(ArgSpec::new("content"))
+                .input(ArgSpec::new("base").optional())
+                .output("text/plain"),
+        );
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(EndpointSpace::new().bind(Exact::new("urn:demo:opt"), opt)),
+            Arc::new(JsonRenderer),
+        ));
+        assert_eq!(
+            output(engine.eval("source urn:demo:opt hello")).unwrap(),
+            "HELLO"
+        );
     }
 
     #[test]
