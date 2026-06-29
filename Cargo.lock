@@ -1300,9 +1300,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-core"
-version = "0.1.30"
+version = "0.1.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c4b9d910580b41244713bf0901a81ba15d57f50f72887e37cc258ed55150629"
+checksum = "80475c26934fcafbf267142d8b6a3b8e6efd9919d47f27371f08e3a2701eefa6"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1427,9 +1427,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-rdf"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a42061d0a3d91e3a93c47e43472318b9394281bc0b9830b94bd163286005ef2"
+checksum = "a26ce4966ae193fa07b5e6c5200b0cd11503419a5972cd552bfb416ce4b61af3"
 dependencies = [
  "getrandom 0.3.4",
  "ikigai-core",
@@ -1449,9 +1449,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-runbook"
-version = "0.1.7"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f457bfd2159fc4d7f4e8d36d69e18d9715ac4978734982d92a30222e73b4efeb"
+checksum = "17f4e599831d2c6d179f4ebe91897b3b2988f2e557354c4b238444c4537dcc3f"
 dependencies = [
  "ikigai-core",
  "serde",
