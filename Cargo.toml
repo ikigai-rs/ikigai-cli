@@ -26,7 +26,7 @@ ikigai-http = "0.1.0"
 # Interactive runbook module (urn:runbook:*) — Linked Data demo tab since 0.1.3;
 # 0.1.5 adds the JSON-LD demo tab (expand/flatten/compact), which works here because
 # the CLI links its own pipe-fixed ikigai-engine.
-ikigai-runbook = "0.1.8"
+ikigai-runbook = "0.1.9"
 # Linked Data toolkit (separate ikigai-linkeddata repo): RDF transreption + SPARQL.
 ikigai-rdf = "0.1.2"
 ikigai-sparql = "0.1.0"
