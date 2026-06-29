@@ -566,6 +566,9 @@ fn root_space() -> Arc<dyn Space> {
         // JSON-LD operators (urn:jsonld:expand/compact/flatten) — linked natively (the heavy
         // json-ld tree is a browser-wasm concern, lazy-loaded there; native links it).
         Arc::new(ikigai_jsonld::space()) as Arc<dyn Space>,
+        // SHACL validation (urn:shacl:validate) — rudof's validator, native-only (wasm-gated
+        // upstream); the browser serves the same resource via shacl-engine (JS).
+        Arc::new(ikigai_shacl::space()) as Arc<dyn Space>,
         // Content sniffing + sniff-and-dispatch: `urn:sniff` classifies opaque bytes,
         // `urn:transrept:auto` sniffs then routes them to the matching transreptor — so a
         // mislabeled fetch or a file read transrepts without asserting its input type.

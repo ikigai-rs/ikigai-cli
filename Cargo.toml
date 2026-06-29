@@ -38,6 +38,9 @@ ikigai-xslt = "0.1.0"
 # JSON-LD operators (urn:jsonld:expand/compact/flatten) — linked natively (the heavy
 # json-ld tree is a browser-wasm concern, lazy-loaded there; native links it directly).
 ikigai-jsonld = "0.1.1"
+# SHACL validation (urn:shacl:validate) — rudof's validator is native-only (gated off wasm),
+# so it's linked natively here; the browser serves the same resource via shacl-engine (JS).
+ikigai-shacl = "0.1.0"
 # Sibling workspace crates pinned to the current release: a published crate must
 # require its siblings at this version too, so the lockstep release publishes in
 # dependency order (resolve → wire → engine → …) and a crate can never build against
