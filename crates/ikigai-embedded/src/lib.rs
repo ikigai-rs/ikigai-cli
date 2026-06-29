@@ -71,6 +71,35 @@ fn page() -> FnEndpoint {
     )
 }
 
+/// `urn:data:control`: the **Control** page as one composed resource. The two
+/// `$a{}` markers are sub-requests `compose` resolves and inlines —
+/// `urn:kernel:scheduler` (the host work backend + live task counts) and
+/// `urn:kernel:cache` (what's cached). So `source urn:fn:compose src=urn:data:control`
+/// is "a composite resource pulling two sub-requests," its cache validity folding
+/// both — the text analog of the browser demo's Control page.
+fn control_impl(_inv: &Invocation<'_>) -> Result<Representation> {
+    let body = "ikigai control plane — one composed resource\n\
+        two sub-requests: urn:kernel:scheduler + urn:kernel:cache\n\n\
+        $a{urn:kernel:scheduler}\n\
+        $a{urn:kernel:cache}";
+    Ok(Representation::new(
+        ReprType::new("text/plain").with_param("charset", "utf-8"),
+        body.as_bytes().to_vec(),
+    )
+    .cacheable())
+}
+
+fn control() -> FnEndpoint {
+    FnEndpoint::new("control", control_impl).with_description(
+        Description::new("control")
+            .title("Control page")
+            .summary("A compose shape: the kernel control plane (scheduler + cache) as two transcluded sub-requests.")
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .output("text/plain;charset=utf-8"),
+    )
+}
+
 /// `urn:data:about`: a nested shape the demo page transcludes — which itself
 /// transcludes another resource, so `compose` (and the `trace` tree) recurses.
 fn about_impl(_inv: &Invocation<'_>) -> Result<Representation> {
@@ -416,6 +445,7 @@ fn catalog_cards_xsl() -> FnEndpoint {
 fn base_space(nature: &'static str) -> EndpointSpace {
     ikigai_fn::space()
         .bind(Exact::new("urn:data:page"), page())
+        .bind(Exact::new("urn:data:control"), control())
         .bind(Exact::new("urn:data:about"), about())
         .bind(Exact::new("urn:style:catalog"), catalog_cards_xsl())
         .bind(Exact::new("urn:host:info"), host_info(nature))
