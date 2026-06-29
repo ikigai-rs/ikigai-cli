@@ -13,7 +13,7 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 [workspace.dependencies]
 # The released kernel, consumed from crates.io. For local cross-repo development
 # against a sibling checkout, use .cargo/config.toml (see .cargo/config.toml.example).
-ikigai-core = "0.1.30" # EndpointKind/Transreption (transreptor typing in the catalog)
+ikigai-core = "0.1.31" # EndpointKind/Transreption (transreptor typing in the catalog)
 ikigai-vocab = "0.1.22" # ikigai_vocab::space() — urn:ikigai:vocab resource
 # The reusable function library, linked in as a published module crate.
 ikigai-fn = "0.1.1" # compose fans `$a{}` markers out via Invocation::fan_out
@@ -26,9 +26,9 @@ ikigai-http = "0.1.0"
 # Interactive runbook module (urn:runbook:*) — Linked Data demo tab since 0.1.3;
 # 0.1.5 adds the JSON-LD demo tab (expand/flatten/compact), which works here because
 # the CLI links its own pipe-fixed ikigai-engine.
-ikigai-runbook = "0.1.7"
+ikigai-runbook = "0.1.8"
 # Linked Data toolkit (separate ikigai-linkeddata repo): RDF transreption + SPARQL.
-ikigai-rdf = "0.1.0"
+ikigai-rdf = "0.1.2"
 ikigai-sparql = "0.1.0"
 # Content sniffing + sniff-and-dispatch (urn:sniff, urn:transrept:auto).
 ikigai-sniff = "0.1.1"

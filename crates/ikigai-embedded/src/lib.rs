@@ -581,10 +581,19 @@ fn root_space() -> Arc<dyn Space> {
     ]))
 }
 
+/// `rdfs:subClassOf` axioms for type-aware action selection — parsed from the runbook's RDFS
+/// alignment graph (`foaf:Person ⊑ schema:Person`) so `urn:kernel:actions` reasons over the
+/// hierarchy (a `foaf:Person` entity satisfies a `schema:Person` action). See
+/// [`ikigai_runbook::ALIGNMENT_TTL`].
+fn subclass_axioms() -> Vec<(String, String)> {
+    ikigai_rdf::subclass_axioms(ikigai_runbook::ALIGNMENT_TTL)
+}
+
 /// The embedded kernel.
 pub fn kernel() -> Kernel {
     Kernel::with_meta_renderer(root_space(), Arc::new(CliRenderer))
         .with_clock(Arc::new(SystemClock))
+        .with_subclass_axioms(subclass_axioms())
 }
 
 /// The local embedded kernel as a shared `Arc`, with a filesystem **watcher** over
@@ -605,6 +614,7 @@ pub fn watched_kernel() -> Arc<Kernel> {
     let sched = Arc::new(scheduler());
     let kernel = Kernel::with_meta_renderer(root_space(), Arc::new(CliRenderer))
         .with_clock(Arc::new(SystemClock))
+        .with_subclass_axioms(subclass_axioms())
         .with_scheduler_reporter(sched.clone())
         .into_scheduled(sched);
     watch_root(Arc::clone(&kernel), file_root());
