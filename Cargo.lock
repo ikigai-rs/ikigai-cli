@@ -1556,7 +1556,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-cli"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "crossterm",
  "ikigai-core",
@@ -1584,7 +1584,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-embedded"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "async-trait",
  "futures",
@@ -1609,7 +1609,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-engine"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "futures",
  "ikigai-core",
@@ -1653,7 +1653,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-ipc"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "ikigai-core",
  "ikigai-resolve",
@@ -1685,7 +1685,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-quic"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "ikigai-core",
  "ikigai-resolve",
@@ -1711,7 +1711,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-resolve"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "async-trait",
  "futures",
@@ -1732,7 +1732,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-scheduler"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "futures",
  "ikigai-core",
@@ -1787,7 +1787,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-wire"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "ikigai-core",
  "ikigai-resolve",
