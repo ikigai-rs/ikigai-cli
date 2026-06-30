@@ -841,7 +841,11 @@ fn draw(frame: &mut Frame, state: &State) {
         ]);
         frame.render_widget(Paragraph::new(title), chunks[0]);
     } else {
-        let mut titles = vec![Line::from("REPL"), Line::from("Docs"), Line::from("Control")];
+        let mut titles = vec![
+            Line::from("REPL"),
+            Line::from("Docs"),
+            Line::from("Control"),
+        ];
         titles.extend(state.demos.iter().map(|d| Line::from(d.label.clone())));
         let tabs = Tabs::new(titles)
             .select(state.tab)
@@ -885,7 +889,11 @@ fn draw(frame: &mut Frame, state: &State) {
         let cursor_x = (chunks[2].x + 1 + col).min(chunks[2].x + chunks[2].width.saturating_sub(1));
         frame.set_cursor_position(Position::new(cursor_x, chunks[2].y + 1));
     } else if state.tab == 1 || state.tab == 2 {
-        let title = if state.tab == 1 { " docs " } else { " control " };
+        let title = if state.tab == 1 {
+            " docs "
+        } else {
+            " control "
+        };
         let hint = Paragraph::new(
             "PgUp/PgDn scroll · Tab/⇧Tab switch · Esc back to REPL · Ctrl-C exit".dim(),
         )
@@ -930,7 +938,9 @@ fn docs_lines(docs: &str) -> Vec<Line<'static>> {
 /// highlighted; the indented detail rows are dimmed.
 fn control_lines(control: &str) -> Vec<Line<'static>> {
     let mut lines = vec![
-        Line::from("the control plane · scheduler + cache + time jobs, one composed resource".bold()),
+        Line::from(
+            "the control plane · scheduler + cache + time jobs, one composed resource".bold(),
+        ),
         Line::from("source urn:fn:compose src=urn:data:control".cyan()),
         Line::from(""),
     ];
@@ -1079,7 +1089,8 @@ mod tests {
         });
 
         state.docs = "│ urn:fn:toUpper\n│   a function resource".into();
-        state.control = "scheduler\n  backend    single\n  threads    1\ncache\n  entries  3".into();
+        state.control =
+            "scheduler\n  backend    single\n  threads    1\ncache\n  entries  3".into();
 
         state.tab = 0; // tab strip shown, REPL transcript beneath
         render(80, 24, &state);

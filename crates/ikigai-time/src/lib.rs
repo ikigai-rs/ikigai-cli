@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use ikigai_core::{
     ArgSpec, Capability, Description, EndpointSpace, Error, Exact, FnEndpoint, Invocation, Iri,
-    Representation, ReprType, Request, Verb,
+    ReprType, Representation, Request, Verb,
 };
 use ikigai_resolve::Resolver;
 
@@ -106,11 +106,11 @@ fn verb_label(v: Verb) -> &'static str {
 
 fn fmt_duration(d: Duration) -> String {
     let ms = d.as_millis();
-    if ms != 0 && ms % 3_600_000 == 0 {
+    if ms != 0 && ms.is_multiple_of(3_600_000) {
         format!("{}h", ms / 3_600_000)
-    } else if ms != 0 && ms % 60_000 == 0 {
+    } else if ms != 0 && ms.is_multiple_of(60_000) {
         format!("{}m", ms / 60_000)
-    } else if ms % 1000 == 0 {
+    } else if ms.is_multiple_of(1000) {
         format!("{}s", ms / 1000)
     } else {
         format!("{ms}ms")
@@ -551,7 +551,10 @@ mod tests {
         issued: Arc<AtomicU64>,
     }
     impl Resolver for StubResolver {
-        fn issue(&self, _request: Request) -> std::result::Result<(Representation, CacheStatus), String> {
+        fn issue(
+            &self,
+            _request: Request,
+        ) -> std::result::Result<(Representation, CacheStatus), String> {
             self.issued.fetch_add(1, Ordering::SeqCst);
             Ok((text("Hello, World".to_string()), CacheStatus::Uncacheable))
         }
