@@ -154,8 +154,8 @@ struct State {
     /// Turtle, the text analog of the browser demo's rendered Catalog page. Loaded
     /// alongside the demos when the demo turns on.
     docs: String,
-    /// The Control page text — `urn:data:control` composed (scheduler + cache),
-    /// the text analog of the browser demo's Control page. Loaded with the demos.
+    /// The Control page text — `urn:data:control` composed (scheduler + cache + time
+    /// jobs), the text analog of the browser demo's Control page. Loaded with the demos.
     control: String,
 }
 
@@ -930,7 +930,7 @@ fn docs_lines(docs: &str) -> Vec<Line<'static>> {
 /// highlighted; the indented detail rows are dimmed.
 fn control_lines(control: &str) -> Vec<Line<'static>> {
     let mut lines = vec![
-        Line::from("the control plane · scheduler + cache, one composed resource".bold()),
+        Line::from("the control plane · scheduler + cache + time jobs, one composed resource".bold()),
         Line::from("source urn:fn:compose src=urn:data:control".cyan()),
         Line::from(""),
     ];

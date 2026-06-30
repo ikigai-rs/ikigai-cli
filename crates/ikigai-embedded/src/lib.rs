@@ -19,6 +19,7 @@ use ikigai_core::{
     SystemClock, UriTemplate, Verb,
 };
 use ikigai_scheduler::Scheduler;
+use ikigai_time::JobRegistry;
 use ikigai_vocab::TurtleRenderer;
 use notify::{RecursiveMode, Watcher};
 
@@ -71,17 +72,19 @@ fn page() -> FnEndpoint {
     )
 }
 
-/// `urn:data:control`: the **Control** page as one composed resource. The two
+/// `urn:data:control`: the **Control** page as one composed resource. The three
 /// `$a{}` markers are sub-requests `compose` resolves and inlines —
-/// `urn:kernel:scheduler` (the host work backend + live task counts) and
-/// `urn:kernel:cache` (what's cached). So `source urn:fn:compose src=urn:data:control`
-/// is "a composite resource pulling two sub-requests," its cache validity folding
-/// both — the text analog of the browser demo's Control page.
+/// `urn:kernel:scheduler` (the host work backend + live task counts),
+/// `urn:kernel:cache` (what's cached), and `urn:time:jobs` (the time transport's
+/// timed jobs). So `source urn:fn:compose src=urn:data:control` is "a composite
+/// resource pulling three sub-requests," its cache validity folding all three — the
+/// text analog of the browser demo's Control page.
 fn control_impl(_inv: &Invocation<'_>) -> Result<Representation> {
     let body = "ikigai control plane — one composed resource\n\
-        two sub-requests: urn:kernel:scheduler + urn:kernel:cache\n\n\
+        three sub-requests: urn:kernel:scheduler + urn:kernel:cache + urn:time:jobs\n\n\
         $a{urn:kernel:scheduler}\n\
-        $a{urn:kernel:cache}";
+        $a{urn:kernel:cache}\n\
+        $a{urn:time:jobs}";
     Ok(Representation::new(
         ReprType::new("text/plain").with_param("charset", "utf-8"),
         body.as_bytes().to_vec(),
@@ -93,7 +96,7 @@ fn control() -> FnEndpoint {
     FnEndpoint::new("control", control_impl).with_description(
         Description::new("control")
             .title("Control page")
-            .summary("A compose shape: the kernel control plane (scheduler + cache) as two transcluded sub-requests.")
+            .summary("A compose shape: the kernel control plane (scheduler + cache + time jobs) as three transcluded sub-requests.")
             .verb(Verb::Source)
             .verb(Verb::Meta)
             .output("text/plain;charset=utf-8"),
@@ -172,6 +175,20 @@ pub fn scheduler() -> Scheduler {
             }),
             Err(_) => Scheduler::single(),
         })
+        .clone()
+}
+
+/// Process-global registry of time-transport jobs — the `urn:time:schedule` /
+/// `urn:time:cancel` / `urn:time:jobs` control plane, driven by the native
+/// [`ThreadTimer`](ikigai_time::ThreadTimer). Built once and shared (a clone shares
+/// the same `Arc`-backed registry), so the `urn:time:*` endpoints bound in
+/// [`root_space`] and the kernel handle installed in [`watched_kernel`] act on one
+/// registry. The kernel handle is set *after* the kernel is built, since the
+/// endpoints are bound into that same kernel.
+pub fn time_registry() -> JobRegistry {
+    static REGISTRY: OnceLock<JobRegistry> = OnceLock::new();
+    REGISTRY
+        .get_or_init(|| JobRegistry::new(Arc::new(ikigai_time::ThreadTimer)))
         .clone()
 }
 
@@ -607,6 +624,11 @@ fn root_space() -> Arc<dyn Space> {
         // ontology Turtle (ik:Transreptor rdfs:subClassOf ik:Endpoint + property defs),
         // the same bytes served at https://ikigai-rs.dev/ns. Lists in the catalog.
         Arc::new(ikigai_vocab::space()) as Arc<dyn Space>,
+        // The time transport's control plane: urn:time:schedule (target=/every=/after=/
+        // method=) registers a job that fires a kernel request on a timer, urn:time:cancel
+        // (id=) stops one, urn:time:jobs is the live readout (also the Control composite's
+        // third marker). The registry's kernel handle is installed in watched_kernel().
+        Arc::new(ikigai_time::space(time_registry())) as Arc<dyn Space>,
         Arc::new(Gated {
             inner: ikigai_runbook::space(),
             on: demo_flag(),
@@ -651,6 +673,13 @@ pub fn watched_kernel() -> Arc<Kernel> {
         .with_scheduler_reporter(sched.clone())
         .into_scheduled(sched);
     watch_root(Arc::clone(&kernel), file_root());
+    // Install the kernel handle the time transport fires its timed requests on, now
+    // that the kernel exists (its urn:time:* endpoints are bound into this same
+    // kernel). A scheduled job re-enters here under the registry's capability.
+    // Path-qualify the trait rather than `use` it: ikigai_resolve::Resolver has a
+    // 1-arg `issue` that would collide with the inherent async `Kernel::issue` in this
+    // module's tests if brought into scope.
+    time_registry().set_resolver(Arc::clone(&kernel) as Arc<dyn ikigai_resolve::Resolver>);
     kernel
 }
 

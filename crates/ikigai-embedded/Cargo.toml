@@ -22,6 +22,12 @@ ikigai-xslt = { workspace = true }
 ikigai-jsonld = { workspace = true }
 ikigai-shacl = { workspace = true }
 ikigai-scheduler = { workspace = true }
+# The time transport (urn:time:schedule/cancel/jobs): fires a kernel resource-request
+# on a timer. Bound in root_space; its kernel handle is installed in watched_kernel.
+ikigai-time = { workspace = true }
+# Needed to coerce the built kernel to `dyn Resolver` when installing it on the time
+# registry (ikigai-core doesn't re-export the Resolver trait).
+ikigai-resolve = { workspace = true }
 serde_json = { workspace = true }
 # Filesystem watching — the first external golden-thread freshness source: an
 # out-of-band change to a workspace file cuts its thread so cached reads recompute.
