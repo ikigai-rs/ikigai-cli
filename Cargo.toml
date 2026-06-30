@@ -48,7 +48,7 @@ ikigai-shacl = "0.1.0"
 ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.1.8" }
 ikigai-wire = { path = "crates/ikigai-wire", version = "0.1.8" }
 ikigai-scheduler = { path = "crates/ikigai-scheduler", version = "0.1.8" }
-ikigai-time = { path = "crates/ikigai-time", version = "0.1.9" }
+ikigai-time = { path = "crates/ikigai-time", version = "0.1.10" }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
