@@ -13,7 +13,7 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 [workspace.dependencies]
 # The released kernel, consumed from crates.io. For local cross-repo development
 # against a sibling checkout, use .cargo/config.toml (see .cargo/config.toml.example).
-ikigai-core = "0.1.31" # EndpointKind/Transreption (transreptor typing in the catalog)
+ikigai-core = "0.1.32" # urn:kernel:cache lists each entry (IRI · type · size · golden-thread count)
 ikigai-vocab = "0.1.22" # ikigai_vocab::space() — urn:ikigai:vocab resource
 # The reusable function library, linked in as a published module crate.
 ikigai-fn = "0.1.1" # compose fans `$a{}` markers out via Invocation::fan_out
