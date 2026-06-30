@@ -1595,11 +1595,13 @@ dependencies = [
  "ikigai-jsonld",
  "ikigai-personal",
  "ikigai-rdf",
+ "ikigai-resolve",
  "ikigai-runbook",
  "ikigai-scheduler",
  "ikigai-shacl",
  "ikigai-sniff",
  "ikigai-sparql",
+ "ikigai-time",
  "ikigai-vocab",
  "ikigai-xslt",
  "notify",
@@ -1774,6 +1776,14 @@ dependencies = [
  "ikigai-core",
  "ikigai-vocab",
  "oxigraph",
+]
+
+[[package]]
+name = "ikigai-time"
+version = "0.1.8"
+dependencies = [
+ "ikigai-core",
+ "ikigai-resolve",
 ]
 
 [[package]]

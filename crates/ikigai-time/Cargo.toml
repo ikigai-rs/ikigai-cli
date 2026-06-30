@@ -1,0 +1,12 @@
+[package]
+name = "ikigai-time"
+description = "The time transport: originates kernel resource-requests on a timer (one-shot or recurring)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ikigai-core = { workspace = true }
+ikigai-resolve = { workspace = true }

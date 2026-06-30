@@ -154,6 +154,9 @@ struct State {
     /// Turtle, the text analog of the browser demo's rendered Catalog page. Loaded
     /// alongside the demos when the demo turns on.
     docs: String,
+    /// The Control page text — `urn:data:control` composed (scheduler + cache + time
+    /// jobs), the text analog of the browser demo's Control page. Loaded with the demos.
+    control: String,
 }
 
 /// One step of a runbook demo, as carried by the `application/json` representation.
@@ -205,6 +208,7 @@ fn event_loop(
         } else if !demo_on && !state.demos.is_empty() {
             state.demos.clear();
             state.docs.clear();
+            state.control.clear();
             state.tab = 0;
             state.demo_out.clear();
         }
@@ -228,7 +232,7 @@ fn event_loop(
             // With tabs shown, Tab/BackTab cycle them regardless of which tab is up,
             // and a demo page is a browse view (number keys run steps; no text entry).
             if !state.demos.is_empty() {
-                let n = state.demos.len() + 2; // REPL, Docs, then one tab per demo
+                let n = state.demos.len() + 3; // REPL, Docs, Control, then one tab per demo
                 match key.code {
                     KeyCode::Tab => {
                         state.tab = (state.tab + 1) % n;
@@ -244,8 +248,9 @@ fn event_loop(
                     }
                     _ => {}
                 }
-                if state.tab == 1 {
-                    // The Docs tab: a scrollable text view (top-anchored), no text entry.
+                if state.tab == 1 || state.tab == 2 {
+                    // The Docs (1) and Control (2) tabs: scrollable text views
+                    // (top-anchored), no text entry.
                     match key.code {
                         KeyCode::PageDown => {
                             state.scroll_back = state.scroll_back.saturating_add(SCROLL_STEP);
@@ -261,7 +266,7 @@ fn event_loop(
                     }
                     continue;
                 }
-                if state.tab > 1 {
+                if state.tab > 2 {
                     // A demo page is a browse view: number keys run steps, no text entry.
                     match key.code {
                         KeyCode::Char(c @ '1'..='9') => {
@@ -339,13 +344,20 @@ fn load_demos(state: &mut State, engine: &Engine) {
         Action::Output(out) => out.result.unwrap_or_else(|e| format!("error: {e}")),
         _ => String::new(),
     };
+    // The Control tab: the kernel control plane (scheduler + cache) as one composed
+    // resource — `urn:data:control` is a compose shape whose two `$a{}` markers are the
+    // sub-requests. The same resource the browser demo's Control page composes.
+    state.control = match engine.eval("source urn:fn:compose src=urn:data:control") {
+        Action::Output(out) => out.result.unwrap_or_else(|e| format!("error: {e}")),
+        _ => String::new(),
+    };
 }
 
 /// Run step `idx` of the demo on the current tab, capturing its output (or error)
 /// into `demo_out` for display on the page.
 fn run_step(state: &mut State, engine: &Engine, idx: usize) {
-    // Demo tabs start at index 2 (after REPL and Docs).
-    let Some(demo) = state.demos.get(state.tab.wrapping_sub(2)) else {
+    // Demo tabs start at index 3 (after REPL, Docs, and Control).
+    let Some(demo) = state.demos.get(state.tab.wrapping_sub(3)) else {
         return;
     };
     let Some(step) = demo.steps.get(idx) else {
@@ -829,7 +841,11 @@ fn draw(frame: &mut Frame, state: &State) {
         ]);
         frame.render_widget(Paragraph::new(title), chunks[0]);
     } else {
-        let mut titles = vec![Line::from("REPL"), Line::from("Docs")];
+        let mut titles = vec![
+            Line::from("REPL"),
+            Line::from("Docs"),
+            Line::from("Control"),
+        ];
         titles.extend(state.demos.iter().map(|d| Line::from(d.label.clone())));
         let tabs = Tabs::new(titles)
             .select(state.tab)
@@ -850,7 +866,13 @@ fn draw(frame: &mut Frame, state: &State) {
         let max = (lines.len() as u16).saturating_sub(chunks[1].height);
         let scroll_y = state.scroll_back.min(max);
         frame.render_widget(Paragraph::new(lines).scroll((scroll_y, 0)), chunks[1]);
-    } else if let Some(demo) = state.demos.get(state.tab - 2) {
+    } else if state.tab == 2 {
+        // Control: the composed scheduler + cache readout, top-anchored like Docs.
+        let lines = control_lines(&state.control);
+        let max = (lines.len() as u16).saturating_sub(chunks[1].height);
+        let scroll_y = state.scroll_back.min(max);
+        frame.render_widget(Paragraph::new(lines).scroll((scroll_y, 0)), chunks[1]);
+    } else if let Some(demo) = state.demos.get(state.tab - 3) {
         let page = Paragraph::new(demo_lines(demo, &state.demo_out)).wrap(Wrap { trim: false });
         frame.render_widget(page, chunks[1]);
     }
@@ -866,11 +888,16 @@ fn draw(frame: &mut Frame, state: &State) {
         let col = state.input[..state.cursor].chars().count() as u16;
         let cursor_x = (chunks[2].x + 1 + col).min(chunks[2].x + chunks[2].width.saturating_sub(1));
         frame.set_cursor_position(Position::new(cursor_x, chunks[2].y + 1));
-    } else if state.tab == 1 {
+    } else if state.tab == 1 || state.tab == 2 {
+        let title = if state.tab == 1 {
+            " docs "
+        } else {
+            " control "
+        };
         let hint = Paragraph::new(
             "PgUp/PgDn scroll · Tab/⇧Tab switch · Esc back to REPL · Ctrl-C exit".dim(),
         )
-        .block(Block::default().borders(Borders::ALL).title(" docs "));
+        .block(Block::default().borders(Borders::ALL).title(title));
         frame.render_widget(hint, chunks[2]);
     } else {
         let hint = Paragraph::new(
@@ -897,6 +924,34 @@ fn docs_lines(docs: &str) -> Vec<Line<'static>> {
         for l in docs.lines() {
             let is_title = l.starts_with("│ ") && !l.starts_with("│  ");
             if is_title {
+                lines.push(Line::from(l.to_string().cyan().bold()));
+            } else {
+                lines.push(Line::from(l.to_string().dim()));
+            }
+        }
+    }
+    lines
+}
+
+/// Render the Control page: a header, then the composed scheduler + cache readout.
+/// Section headers (`scheduler`, `cache` — flush-left, no leading space) are
+/// highlighted; the indented detail rows are dimmed.
+fn control_lines(control: &str) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(
+            "the control plane · scheduler + cache + time jobs, one composed resource".bold(),
+        ),
+        Line::from("source urn:fn:compose src=urn:data:control".cyan()),
+        Line::from(""),
+    ];
+    if control.trim().is_empty() {
+        lines.push(Line::from("(control plane unavailable)".dim()));
+    } else {
+        for l in control.lines() {
+            // A readout section header is flush-left and non-empty; detail rows are
+            // indented (the kernel renders `  label  value`).
+            let is_header = !l.is_empty() && !l.starts_with(' ') && !l.starts_with("urn:");
+            if is_header {
                 lines.push(Line::from(l.to_string().cyan().bold()));
             } else {
                 lines.push(Line::from(l.to_string().dim()));
@@ -1033,11 +1088,21 @@ mod tests {
             ],
         });
 
+        state.docs = "│ urn:fn:toUpper\n│   a function resource".into();
+        state.control =
+            "scheduler\n  backend    single\n  threads    1\ncache\n  entries  3".into();
+
         state.tab = 0; // tab strip shown, REPL transcript beneath
         render(80, 24, &state);
         render(1, 1, &state); // degenerate size with tabs present
 
-        state.tab = 1; // the demo page, no step run yet
+        state.tab = 1; // Docs page
+        render(80, 24, &state);
+
+        state.tab = 2; // Control page (scheduler + cache readout)
+        render(80, 24, &state);
+
+        state.tab = 3; // the demo page (demos now start at index 3), no step run yet
         render(80, 24, &state);
 
         state.demo_out = "$ source urn:fn:toUpper hello\nHELLO".into();
