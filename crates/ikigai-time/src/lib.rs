@@ -299,6 +299,18 @@ impl JobRegistry {
         }
     }
 
+    /// Stop and remove every job. Returns how many were cancelled. (Ids keep
+    /// incrementing — a later schedule still gets a fresh id.)
+    pub fn cancel_all(&self) -> usize {
+        let mut inner = self.inner.lock().expect("time registry lock");
+        let jobs = std::mem::take(&mut inner.jobs);
+        let n = jobs.len();
+        for (_id, job) in jobs {
+            job.handle.cancel();
+        }
+        n
+    }
+
     /// Fire one tick of a job: resolve its request and fold the outcome into the
     /// record. A one-shot's timer won't tick again; we leave the record listed (runs
     /// = 1) so the result is visible.
@@ -449,11 +461,17 @@ pub fn space(registry: JobRegistry) -> EndpointSpace {
             FnEndpoint::new("time-cancel", move |inv: &Invocation<'_>| {
                 let id_str = inv
                     .inline_str("id")
-                    .map_err(|_| Error::Endpoint("urn:time:cancel needs id=<n>".to_string()))?;
+                    .map_err(|_| Error::Endpoint("urn:time:cancel needs id=<n> (or id=all)".to_string()))?;
+                let id_str = id_str.trim();
+                // `id=all` cancels every job — handy for a demo "stop" button that can't
+                // know the running job's id (ids increment and never reuse).
+                if id_str.eq_ignore_ascii_case("all") {
+                    let n = cancel_reg.cancel_all();
+                    return Ok(text(format!("cancelled {n} job{}\n", if n == 1 { "" } else { "s" })));
+                }
                 let id: u64 = id_str
-                    .trim()
                     .parse()
-                    .map_err(|_| Error::Endpoint(format!("invalid job id '{id_str}'")))?;
+                    .map_err(|_| Error::Endpoint(format!("invalid job id '{id_str}' (expected a number or 'all')")))?;
                 let body = if cancel_reg.cancel(id) {
                     format!("cancelled job #{id}\n")
                 } else {
@@ -464,9 +482,9 @@ pub fn space(registry: JobRegistry) -> EndpointSpace {
             .with_description(
                 Description::new("time-cancel")
                     .title("Cancel a timed job")
-                    .summary("Stop and remove a scheduled job by id.")
+                    .summary("Stop and remove a scheduled job by id, or id=all to cancel every job.")
                     .verb(Verb::Source)
-                    .input(ArgSpec::new("id").summary("the job id to cancel"))
+                    .input(ArgSpec::new("id").summary("the job id to cancel, or 'all'"))
                     .output("text/plain;charset=utf-8"),
             ),
         )
@@ -613,5 +631,31 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.contains("not ready"));
+    }
+
+    #[test]
+    fn cancel_all_clears_every_job() {
+        let issued = Arc::new(AtomicU64::new(0));
+        let reg = JobRegistry::new(Arc::new(ManualBackend::default()));
+        reg.set_resolver(Arc::new(StubResolver {
+            issued: Arc::clone(&issued),
+        }));
+        let sched = |t: &str| {
+            reg.schedule(
+                t.to_string(),
+                Verb::Source,
+                Schedule::Every(Duration::from_secs(1)),
+                true,
+            )
+            .expect("scheduled")
+        };
+        sched("urn:demo:a");
+        sched("urn:demo:b");
+        sched("urn:demo:c");
+        assert_eq!(reg.cancel_all(), 3);
+        assert!(reg.render().contains("(none scheduled)"));
+        // Idempotent, and ids keep advancing (the next schedule is #4, not #1).
+        assert_eq!(reg.cancel_all(), 0);
+        assert_eq!(sched("urn:demo:d"), 4);
     }
 }

@@ -506,9 +506,9 @@ fn runbook_timer_demo() -> FnEndpoint {
                     "note": "id · interval · run count · last greeting"
                 },
                 {
-                    "label": "stop job #1",
-                    "cmd": "source urn:time:cancel id=1",
-                    "note": "cancels the timer (start it once, then stop #1)"
+                    "label": "stop the greeter timer",
+                    "cmd": "source urn:time:cancel id=all",
+                    "note": "cancels every timed job — no need to know the id"
                 }
             ]
         });
