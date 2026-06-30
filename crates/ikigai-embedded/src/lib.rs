@@ -459,11 +459,80 @@ fn catalog_cards_xsl() -> FnEndpoint {
     )
 }
 
+/// `urn:demo:greeter` — a tiny endpoint that returns a greeting. It's the target the
+/// **Timer** runbook fires on a schedule (`source urn:time:schedule
+/// target=urn:demo:greeter every=1s`), the same command the browser demo uses, so the
+/// timed-job demo reads identically in the REPL and in both frontends' runbooks.
+fn greeter() -> FnEndpoint {
+    FnEndpoint::new("greeter", |_inv: &Invocation<'_>| {
+        Ok(Representation::new(
+            ReprType::new("text/plain").with_param("charset", "utf-8"),
+            b"Hello from the ikigai kernel.\n".to_vec(),
+        ))
+    })
+    .with_description(
+        Description::new("greeter")
+            .title("Greeter")
+            .summary("Returns a greeting — the target the Timer runbook fires on a schedule.")
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .output("text/plain;charset=utf-8"),
+    )
+}
+
+/// `urn:runbook:timer` — a **Timer** runbook tab for the TUI, mirroring the browser
+/// demo's tab. Sourced `as=application/json` by the TUI's `load_demos`, it returns the
+/// `{label, intro, steps}` shape the runbook renders: start a one-second job that fires
+/// the greeter through the time transport, list the jobs, and stop it. The job lives in
+/// the kernel's registry, so it keeps ticking when you switch to the Control tab and
+/// watch it there. Each step's `cmd` is exactly what you'd type in the REPL.
+fn runbook_timer_demo() -> FnEndpoint {
+    FnEndpoint::new("runbook-timer", |_inv: &Invocation<'_>| {
+        let json = serde_json::json!({
+            "label": "Timer",
+            "intro": "The time transport fires a resource-request on a timer. Start a one-second \
+                      job that sources urn:demo:greeter on every tick, then switch to the Control \
+                      tab and watch it tick live in the time-jobs readout — the job runs in the \
+                      kernel, so it keeps firing while you're on another tab. Come back to stop it.",
+            "steps": [
+                {
+                    "label": "start a 1-second greeter timer",
+                    "cmd": "source urn:time:schedule target=urn:demo:greeter every=1s",
+                    "note": "schedules urn:demo:greeter every 1s — persists across tabs"
+                },
+                {
+                    "label": "list the timed jobs",
+                    "cmd": "source urn:time:jobs",
+                    "note": "id · interval · run count · last greeting"
+                },
+                {
+                    "label": "stop the greeter timer",
+                    "cmd": "source urn:time:cancel id=all",
+                    "note": "cancels every timed job — no need to know the id"
+                }
+            ]
+        });
+        Ok(Representation::new(
+            ReprType::new("application/json"),
+            serde_json::to_vec(&json).unwrap_or_default(),
+        ))
+    })
+    .with_description(
+        Description::new("runbook-timer")
+            .title("Timer")
+            .summary("A runbook tab: start/stop a recurring time job that fires the greeter every second.")
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .output("application/json"),
+    )
+}
+
 fn base_space(nature: &'static str) -> EndpointSpace {
     ikigai_fn::space()
         .bind(Exact::new("urn:data:page"), page())
         .bind(Exact::new("urn:data:control"), control())
         .bind(Exact::new("urn:data:about"), about())
+        .bind(Exact::new("urn:demo:greeter"), greeter())
         .bind(Exact::new("urn:style:catalog"), catalog_cards_xsl())
         .bind(Exact::new("urn:host:info"), host_info(nature))
         .bind(Exact::new("urn:host:demo"), host_demo())
@@ -630,7 +699,11 @@ fn root_space() -> Arc<dyn Space> {
         // third marker). The registry's kernel handle is installed in watched_kernel().
         Arc::new(ikigai_time::space(time_registry())) as Arc<dyn Space>,
         Arc::new(Gated {
-            inner: ikigai_runbook::space(),
+            // The shared runbook demos, plus a local Timer tab (urn:runbook:timer) — the
+            // native mirror of the browser demo's tab. The TUI's load_demos enumerates
+            // every urn:runbook:* here, so binding it locally is all it takes.
+            inner: ikigai_runbook::space()
+                .bind(Exact::new("urn:runbook:timer"), runbook_timer_demo()),
             on: demo_flag(),
         }) as Arc<dyn Space>,
     ]))
