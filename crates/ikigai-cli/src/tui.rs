@@ -221,6 +221,16 @@ fn event_loop(
         // the minute, so this is cheap every 250ms tick and only recomputes on the minute.
         state.clock = clock_text(engine);
 
+        // Live-refresh the Control tab each frame (the CLI analog of the browser's htmx
+        // self-refresh), so its scheduler/cache/time-jobs readouts — the clock timer and
+        // any greeter timer — tick instead of showing a frozen snapshot. Only while it's
+        // the visible tab, so we don't re-compose when it isn't on screen.
+        if state.tab == 2 {
+            if let Action::Output(out) = engine.eval("source urn:fn:compose src=urn:data:control") {
+                state.control = out.result.unwrap_or_else(|e| format!("error: {e}"));
+            }
+        }
+
         terminal.draw(|frame| draw(frame, &state))?;
         // Poll rather than block on input, so a demo toggle that arrives without a
         // keypress — `sink urn:host:demo on` over the wire — surfaces (or hides) the
