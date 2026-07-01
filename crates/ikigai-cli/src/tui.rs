@@ -202,6 +202,10 @@ fn event_loop(
     if ikigai_embedded::history_flag().load(std::sync::atomic::Ordering::Relaxed) {
         state.history = ikigai_embedded::load_history();
     }
+    // The eval-driven readouts (clock + Control tab) refresh at ~1s, not every 250ms
+    // draw — the colon blink is computed at draw time, so drawing stays at the full
+    // frame rate while these (and their scheduler fan-out) tick just once a second.
+    let mut last_refresh: Option<std::time::Instant> = None;
     loop {
         // The demo can be toggled at runtime (`demo on|off`, or over the wire via
         // `urn:host:demo`), so reconcile the tab bar with the flag each frame: load
@@ -217,18 +221,22 @@ fn event_loop(
             state.demo_out.clear();
         }
 
-        // Refresh the tab-bar clock from the cacheable urn:time:now — a cache hit within
-        // the minute, so this is cheap every 250ms tick and only recomputes on the minute.
-        state.clock = clock_text(engine);
-
-        // Live-refresh the Control tab each frame (the CLI analog of the browser's htmx
-        // self-refresh), so its scheduler/cache/time-jobs readouts — the clock timer and
-        // any greeter timer — tick instead of showing a frozen snapshot. Only while it's
-        // the visible tab, so we don't re-compose when it isn't on screen.
-        if state.tab == 2 {
-            if let Action::Output(out) = engine.eval("source urn:fn:compose src=urn:data:control") {
-                state.control = out.result.unwrap_or_else(|e| format!("error: {e}"));
+        // Once a second (not every 250ms draw): refresh the tab-bar clock from the
+        // cacheable urn:time:now, and — the CLI analog of the browser's htmx self-refresh
+        // — re-compose the Control tab so its scheduler/cache/time-jobs readouts (the
+        // clock timer and any greeter timer) tick instead of freezing. Throttling this to
+        // 1s (vs every frame) keeps the compose fan-out from spinning the scheduler ~4×/s
+        // just to display itself; the colon blink is unaffected (it's computed at draw).
+        if last_refresh.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
+            state.clock = clock_text(engine);
+            if state.tab == 2 {
+                if let Action::Output(out) =
+                    engine.eval("source urn:fn:compose src=urn:data:control")
+                {
+                    state.control = out.result.unwrap_or_else(|e| format!("error: {e}"));
+                }
             }
+            last_refresh = Some(std::time::Instant::now());
         }
 
         terminal.draw(|frame| draw(frame, &state))?;
