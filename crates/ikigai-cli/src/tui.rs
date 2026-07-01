@@ -13,9 +13,9 @@
 use std::io;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout, Position};
+use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Style, Stylize};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Tabs, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
@@ -157,6 +157,10 @@ struct State {
     /// The Control page text — `urn:data:control` composed (scheduler + cache + time
     /// jobs), the text analog of the browser demo's Control page. Loaded with the demos.
     control: String,
+    /// The tab-bar clock `HH:MM`, refreshed each frame from the cacheable `urn:time:now`
+    /// (a cache hit within the minute — recomputes only on the minute). Empty until the
+    /// first fetch. The colon blinks per second, computed at draw time.
+    clock: String,
 }
 
 /// One step of a runbook demo, as carried by the `application/json` representation.
@@ -212,6 +216,10 @@ fn event_loop(
             state.tab = 0;
             state.demo_out.clear();
         }
+
+        // Refresh the tab-bar clock from the cacheable urn:time:now — a cache hit within
+        // the minute, so this is cheap every 250ms tick and only recomputes on the minute.
+        state.clock = clock_text(engine);
 
         terminal.draw(|frame| draw(frame, &state))?;
         // Poll rather than block on input, so a demo toggle that arrives without a
@@ -820,38 +828,106 @@ fn recall(state: &mut State, dir: i32) {
     state.mark = None; // the recalled text is a new buffer; any old mark is stale
 }
 
+/// The current `HH:MM` from the cacheable `urn:time:now` (plain variant), or empty on
+/// error. Sourced through the engine so the tab-bar clock is a real resolved resource
+/// (cached within the minute), not a direct clock read.
+fn clock_text(engine: &Engine) -> String {
+    match engine.eval("source urn:time:now") {
+        Action::Output(out) => out.result.unwrap_or_default().trim().to_string(),
+        _ => String::new(),
+    }
+}
+
+/// The clock as styled spans `HH : MM` with the colon blinked per second (shown in the
+/// first half of each second, dimmed in the second half — computed from the wall clock,
+/// so it's aligned to real seconds regardless of the 250ms redraw tick). Empty input
+/// (no fetch yet) renders nothing.
+fn clock_spans(clock: &str) -> Vec<Span<'static>> {
+    let Some((h, m)) = clock.split_once(':') else {
+        return vec![clock.to_string().into()];
+    };
+    let colon_on = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_millis() < 500)
+        .unwrap_or(true);
+    let colon = if colon_on { ":" } else { " " };
+    vec![
+        h.to_string().cyan().bold(),
+        colon.cyan().bold(),
+        m.to_string().cyan().bold(),
+    ]
+}
+
 fn draw(frame: &mut Frame, state: &State) {
+    // The tab strip is two rows when the demo tabs are shown (core tabs + clock on top,
+    // the ~dozen demo tabs wrapped below) — one row otherwise (title + clock).
+    let tab_rows = if state.demos.is_empty() { 1 } else { 2 };
     let chunks = Layout::vertical([
-        Constraint::Length(1), // title, or the tab strip when the demo is on
-        Constraint::Min(1),    // transcript, or a demo page
-        Constraint::Length(3), // input box, or a demo-page hint
+        Constraint::Length(tab_rows), // title/tab strip (+ demo-tab row) with the clock
+        Constraint::Min(1),           // transcript, or a demo page
+        Constraint::Length(3),        // input box, or a demo-page hint
     ])
     .split(frame.area());
 
-    // Top row: the tab strip when the demo is on, otherwise the usual title/help line.
+    // Reserve a fixed-width cell on the FAR RIGHT of the first row for the clock; the
+    // tabs/title take the rest. (The clock lives on row 1 only; demo tabs wrap to row 2.)
+    let first_row = Rect {
+        height: 1,
+        ..chunks[0]
+    };
+    let top = Layout::horizontal([Constraint::Min(1), Constraint::Length(7)]).split(first_row);
+    frame.render_widget(
+        Paragraph::new(Line::from(clock_spans(&state.clock))).alignment(Alignment::Right),
+        top[1],
+    );
+
     if state.demos.is_empty() {
+        // No demo tabs: the usual title/help line (left of the clock).
         let title = Line::from(vec![
             format!("ikigai {} ", env!("CARGO_PKG_VERSION")).bold(),
-            "— resource-resolution REPL".into(),
+            "— REPL".into(),
             format!(
-                "   (help · demo on → guided tabs · ↑↓ history · {} · PgUp/PgDn scroll · Ctrl-C exit)",
+                "  (help · demo on → tabs · ↑↓ history · {} · PgUp/PgDn · Ctrl-C)",
                 mode_label(state)
             )
             .dim(),
         ]);
-        frame.render_widget(Paragraph::new(title), chunks[0]);
+        frame.render_widget(Paragraph::new(title), top[0]);
     } else {
-        let mut titles = vec![
+        // Row 1: the core tabs (REPL/Docs/Control), left of the clock.
+        let core = Tabs::new(vec![
             Line::from("REPL"),
             Line::from("Docs"),
             Line::from("Control"),
-        ];
-        titles.extend(state.demos.iter().map(|d| Line::from(d.label.clone())));
-        let tabs = Tabs::new(titles)
-            .select(state.tab)
-            .highlight_style(Style::new().reversed())
-            .divider("  ");
-        frame.render_widget(tabs, chunks[0]);
+        ])
+        .select(if state.tab < 3 { state.tab } else { 3 }) // 3 = out of range ⇒ no highlight
+        .highlight_style(Style::new().reversed())
+        .divider("  ");
+        frame.render_widget(core, top[0]);
+
+        // Row 2: the demo tabs, wrapped onto their own full-width line — only when the
+        // top strip actually has a second row (a degenerately short terminal may not).
+        if chunks[0].height >= 2 {
+            let demo_row = Rect {
+                y: chunks[0].y + 1,
+                height: 1,
+                ..chunks[0]
+            };
+            let demo_titles: Vec<Line> = state
+                .demos
+                .iter()
+                .map(|d| Line::from(d.label.clone()))
+                .collect();
+            let demo_tabs = Tabs::new(demo_titles)
+                .select(if state.tab >= 3 {
+                    state.tab - 3
+                } else {
+                    state.demos.len() // out of range ⇒ no highlight
+                })
+                .highlight_style(Style::new().reversed())
+                .divider(" ");
+            frame.render_widget(demo_tabs, demo_row);
+        }
     }
 
     // Main area: REPL transcript on tab 0, the Docs page on tab 1, a demo page beyond.
@@ -1108,6 +1184,43 @@ mod tests {
         state.demo_out = "$ source urn:fn:toUpper hello\nHELLO".into();
         render(80, 24, &state); // demo page with output
         render(20, 6, &state); // narrow → intro wraps, output scrolls
+    }
+
+    // The tab bar is two rows when demos are shown: core tabs + clock (far right) on
+    // row 0, the demo tabs wrapped onto row 1.
+    #[test]
+    fn clock_top_right_and_demo_tabs_wrap_to_row_two() {
+        let mut state = State {
+            clock: "12:34".into(),
+            ..State::default()
+        };
+        for label in ["Basics", "Piping", "HTTP"] {
+            state.demos.push(DemoData {
+                label: label.into(),
+                intro: String::new(),
+                steps: vec![],
+            });
+        }
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        terminal.draw(|f| draw(f, &state)).unwrap();
+        let buf = terminal.backend().buffer();
+        let row = |y: u16| -> String { (0..60).map(|x| buf[(x, y)].symbol()).collect() };
+        let (row0, row1) = (row(0), row(1));
+        // Core tabs + the clock digits on the top row (the colon may be blinked to a space).
+        assert!(
+            row0.contains("REPL") && row0.contains("Control"),
+            "core tabs: {row0:?}"
+        );
+        assert!(
+            row0.contains("12") && row0.trim_end().ends_with("34"),
+            "clock far right: {row0:?}"
+        );
+        // Demo tabs wrapped onto the second row (not on row 0 with the core tabs).
+        assert!(
+            row1.contains("Basics") && row1.contains("Piping"),
+            "demo tabs row1: {row1:?}"
+        );
+        assert!(!row0.contains("Basics"), "demo tabs NOT on row0: {row0:?}");
     }
 
     fn state_with(input: &str, cursor: usize) -> State {
