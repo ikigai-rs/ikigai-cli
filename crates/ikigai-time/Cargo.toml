@@ -3,7 +3,7 @@ name = "ikigai-time"
 description = "The time transport: originates kernel resource-requests on a timer (one-shot or recurring)."
 # Independent of the workspace lockstep: a leaf transport, bumped on its own for the
 # id=all cancel feature (0.1.8 → 0.1.9) without rev'ing every sibling crate.
-version = "0.1.9"
+version = "0.1.10"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true

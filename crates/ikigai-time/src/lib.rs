@@ -16,7 +16,8 @@
 //! The job registry surfaces through three resources the host mounts:
 //! - `source urn:time:schedule target=<iri> every=<dur>` (or `after=<dur>` for a
 //!   one-shot, `method=<verb>` to pick the verb) — registers a job, returns its id;
-//! - `source urn:time:cancel id=<n>` — stops and removes a job;
+//! - `source urn:time:cancel id=<n>` — stops a job (or `id=all` for every
+//!   non-persistent job, or `target=<iri>` for every job firing that resource);
 //! - `source urn:time:jobs` — the live job list (id, target, interval, runs, last
 //!   output), which the Control page composes alongside the scheduler and cache.
 //!
@@ -184,6 +185,11 @@ struct JobRecord {
     verb: Verb,
     schedule: Schedule,
     recurring: bool,
+    /// A persistent job is skipped by [`cancel_all`](JobRegistry::cancel_all) — a
+    /// blanket "cancel all" leaves it running. For host-registered background timers
+    /// (e.g. the nav clock) that a demo's cancel-all shouldn't stop. Still cancellable
+    /// explicitly by id or target.
+    persistent: bool,
     runs: u64,
     last_output: String,
     handle: TimerHandle,
@@ -243,6 +249,31 @@ impl JobRegistry {
         schedule: Schedule,
         recurring: bool,
     ) -> std::result::Result<u64, String> {
+        self.schedule_inner(target, verb, schedule, recurring, false)
+    }
+
+    /// Like [`schedule`](Self::schedule), but the job is **persistent** —
+    /// [`cancel_all`](Self::cancel_all) skips it. For host-registered background timers
+    /// (the nav clock) that a demo's "cancel all" button shouldn't stop. Cancel it
+    /// explicitly with [`cancel`](Self::cancel) or [`cancel_target`](Self::cancel_target).
+    pub fn schedule_persistent(
+        &self,
+        target: String,
+        verb: Verb,
+        schedule: Schedule,
+        recurring: bool,
+    ) -> std::result::Result<u64, String> {
+        self.schedule_inner(target, verb, schedule, recurring, true)
+    }
+
+    fn schedule_inner(
+        &self,
+        target: String,
+        verb: Verb,
+        schedule: Schedule,
+        recurring: bool,
+        persistent: bool,
+    ) -> std::result::Result<u64, String> {
         // Reserve an id and grab the backend handle under a *short* lock, then release
         // it before calling into the backend. `start()` runs injected code that ticks
         // out of band, and every tick re-acquires this same lock in `fire()`; holding
@@ -280,6 +311,7 @@ impl JobRegistry {
                 verb,
                 schedule,
                 recurring,
+                persistent,
                 runs: 0,
                 last_output: String::new(),
                 handle,
@@ -299,16 +331,41 @@ impl JobRegistry {
         }
     }
 
-    /// Stop and remove every job. Returns how many were cancelled. (Ids keep
-    /// incrementing — a later schedule still gets a fresh id.)
+    /// Stop and remove every **non-persistent** job. Returns how many were cancelled —
+    /// persistent jobs are left running (cancel those explicitly by id or target). Ids
+    /// keep incrementing — a later schedule still gets a fresh id.
     pub fn cancel_all(&self) -> usize {
         let mut inner = self.inner.lock().expect("time registry lock");
-        let jobs = std::mem::take(&mut inner.jobs);
-        let n = jobs.len();
-        for (_id, job) in jobs {
-            job.handle.cancel();
+        let ids: Vec<u64> = inner
+            .jobs
+            .iter()
+            .filter(|(_, job)| !job.persistent)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &ids {
+            if let Some(job) = inner.jobs.remove(id) {
+                job.handle.cancel();
+            }
         }
-        n
+        ids.len()
+    }
+
+    /// Stop and remove every job whose target IRI is `target` (persistent or not — an
+    /// explicit target is deliberate). Returns how many were cancelled.
+    pub fn cancel_target(&self, target: &str) -> usize {
+        let mut inner = self.inner.lock().expect("time registry lock");
+        let ids: Vec<u64> = inner
+            .jobs
+            .iter()
+            .filter(|(_, job)| job.target == target)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &ids {
+            if let Some(job) = inner.jobs.remove(id) {
+                job.handle.cancel();
+            }
+        }
+        ids.len()
     }
 
     /// Fire one tick of a job: resolve its request and fold the outcome into the
@@ -348,14 +405,16 @@ impl JobRegistry {
         }
         for job in inner.jobs.values() {
             let when = if job.recurring { "every" } else { "after" };
+            let tag = if job.persistent { "  (persistent)" } else { "" };
             s.push_str(&format!(
-                "  #{}  {} {}  {} {}  runs {}\n",
+                "  #{}  {} {}  {} {}  runs {}{}\n",
                 job.id,
                 verb_label(job.verb),
                 job.target,
                 when,
                 fmt_duration(job.schedule.interval()),
                 job.runs,
+                tag,
             ));
             if !job.last_output.is_empty() {
                 s.push_str(&format!("       last: {}\n", job.last_output));
@@ -459,19 +518,32 @@ pub fn space(registry: JobRegistry) -> EndpointSpace {
         .bind(
             Exact::new("urn:time:cancel"),
             FnEndpoint::new("time-cancel", move |inv: &Invocation<'_>| {
-                let id_str = inv
-                    .inline_str("id")
-                    .map_err(|_| Error::Endpoint("urn:time:cancel needs id=<n> (or id=all)".to_string()))?;
+                let plural = |n: usize| if n == 1 { "" } else { "s" };
+                // `target=<iri>` cancels every job firing that resource — precise, and
+                // leaves other timers (e.g. the nav clock on urn:time:now) alone.
+                if let Ok(target) = inv.inline_str("target") {
+                    let target = target.trim();
+                    let n = cancel_reg.cancel_target(target);
+                    return Ok(text(format!("cancelled {n} job{} for {target}\n", plural(n))));
+                }
+                let id_str = inv.inline_str("id").map_err(|_| {
+                    Error::Endpoint(
+                        "urn:time:cancel needs id=<n>, id=all, or target=<iri>".to_string(),
+                    )
+                })?;
                 let id_str = id_str.trim();
-                // `id=all` cancels every job — handy for a demo "stop" button that can't
-                // know the running job's id (ids increment and never reuse).
+                // `id=all` cancels every non-persistent job — a demo "stop" button that
+                // can't know the running job's id (ids increment and never reuse); it
+                // leaves persistent jobs (the nav clock) running.
                 if id_str.eq_ignore_ascii_case("all") {
                     let n = cancel_reg.cancel_all();
-                    return Ok(text(format!("cancelled {n} job{}\n", if n == 1 { "" } else { "s" })));
+                    return Ok(text(format!("cancelled {n} job{}\n", plural(n))));
                 }
-                let id: u64 = id_str
-                    .parse()
-                    .map_err(|_| Error::Endpoint(format!("invalid job id '{id_str}' (expected a number or 'all')")))?;
+                let id: u64 = id_str.parse().map_err(|_| {
+                    Error::Endpoint(format!(
+                        "invalid job id '{id_str}' (expected a number, 'all', or target=<iri>)"
+                    ))
+                })?;
                 let body = if cancel_reg.cancel(id) {
                     format!("cancelled job #{id}\n")
                 } else {
@@ -482,9 +554,17 @@ pub fn space(registry: JobRegistry) -> EndpointSpace {
             .with_description(
                 Description::new("time-cancel")
                     .title("Cancel a timed job")
-                    .summary("Stop and remove a scheduled job by id, or id=all to cancel every job.")
+                    .summary(
+                        "Stop and remove a timed job: id=<n> (one), id=all (every \
+                         non-persistent job), or target=<iri> (every job firing that resource).",
+                    )
                     .verb(Verb::Source)
-                    .input(ArgSpec::new("id").summary("the job id to cancel, or 'all'"))
+                    .input(ArgSpec::new("id").summary("the job id to cancel, or 'all'").optional())
+                    .input(
+                        ArgSpec::new("target")
+                            .summary("cancel every job firing this target IRI")
+                            .optional(),
+                    )
                     .output("text/plain;charset=utf-8"),
             ),
         )
@@ -657,5 +737,61 @@ mod tests {
         // Idempotent, and ids keep advancing (the next schedule is #4, not #1).
         assert_eq!(reg.cancel_all(), 0);
         assert_eq!(sched("urn:demo:d"), 4);
+    }
+
+    #[test]
+    fn cancel_all_skips_persistent_but_target_and_id_still_remove_it() {
+        let issued = Arc::new(AtomicU64::new(0));
+        let reg = JobRegistry::new(Arc::new(ManualBackend::default()));
+        reg.set_resolver(Arc::new(StubResolver {
+            issued: Arc::clone(&issued),
+        }));
+        let every = || Schedule::Every(Duration::from_secs(1));
+        // A persistent clock + two cancelable demo jobs.
+        let clock = reg
+            .schedule_persistent("urn:time:now".to_string(), Verb::Source, every(), true)
+            .expect("scheduled");
+        reg.schedule("urn:demo:greeter".to_string(), Verb::Source, every(), true)
+            .unwrap();
+        reg.schedule("urn:demo:greeter".to_string(), Verb::Source, every(), true)
+            .unwrap();
+
+        // cancel_all removes the two greeters, leaves the persistent clock.
+        assert_eq!(reg.cancel_all(), 2);
+        let rendered = reg.render();
+        assert!(
+            rendered.contains("urn:time:now"),
+            "clock survives: {rendered}"
+        );
+        assert!(rendered.contains("(persistent)"), "marked: {rendered}");
+        assert!(!rendered.contains("urn:demo:greeter"));
+
+        // cancel_target removes the persistent clock explicitly (an explicit target
+        // is deliberate, so it overrides persistence).
+        assert_eq!(reg.cancel_target("urn:time:now"), 1);
+        assert!(reg.render().contains("(none scheduled)"));
+        // It's gone now, so a follow-up cancel by id finds nothing.
+        assert!(!reg.cancel(clock));
+    }
+
+    #[test]
+    fn cancel_target_removes_only_matching_jobs() {
+        let issued = Arc::new(AtomicU64::new(0));
+        let reg = JobRegistry::new(Arc::new(ManualBackend::default()));
+        reg.set_resolver(Arc::new(StubResolver {
+            issued: Arc::clone(&issued),
+        }));
+        let every = || Schedule::Every(Duration::from_secs(1));
+        reg.schedule("urn:demo:greeter".to_string(), Verb::Source, every(), true)
+            .unwrap();
+        reg.schedule("urn:demo:greeter".to_string(), Verb::Source, every(), true)
+            .unwrap();
+        reg.schedule("urn:time:now".to_string(), Verb::Source, every(), true)
+            .unwrap();
+        assert_eq!(reg.cancel_target("urn:demo:greeter"), 2);
+        let rendered = reg.render();
+        assert!(rendered.contains("urn:time:now"));
+        assert!(!rendered.contains("urn:demo:greeter"));
+        assert_eq!(reg.cancel_target("urn:nope:missing"), 0);
     }
 }
