@@ -14,9 +14,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use ikigai_core::{
-    Description, EndpointSpace, Error, Exact, Fallback, FnEndpoint, Invocation, Kernel,
+    ArgSpec, Description, EndpointSpace, Error, Exact, Fallback, FnEndpoint, Invocation, Kernel,
     MetaRenderer, ReprType, Representation, Request, Resolution, Result, Scope, Space, SpaceEntry,
-    SystemClock, UriTemplate, Verb,
+    SystemClock, Time, UriTemplate, Verb,
 };
 use ikigai_scheduler::Scheduler;
 use ikigai_time::JobRegistry;
@@ -480,6 +480,51 @@ fn greeter() -> FnEndpoint {
     )
 }
 
+/// `urn:time:now` — the current **OS-local** time as `HH:MM`, **cacheable** until the
+/// next minute boundary (`Expiry::At`, honoured by the injected `SystemClock`). The
+/// REPL tab-bar clock sources it every render tick, but within the minute every request
+/// is a cache HIT returning the same value — it only recomputes on the minute. Default
+/// is plain `HH:MM`; `html=true` wraps the colon in a span (the browser nav's blink).
+/// The same resource + demo as the web nav clock.
+fn clock_now() -> FnEndpoint {
+    FnEndpoint::new("clock-now", |inv: &Invocation<'_>| {
+        use chrono::Timelike;
+        let html = inv.inline_str("html").is_ok();
+        let now = chrono::Local::now();
+        let (h, m) = (now.hour(), now.minute());
+        let next_minute = ((now.timestamp_millis().max(0) as u64) / 60_000 + 1) * 60_000;
+        let (body, media) = if html {
+            (
+                format!("{h:02}<span class=\"ik-clock-colon\">:</span>{m:02}"),
+                "text/html",
+            )
+        } else {
+            (format!("{h:02}:{m:02}"), "text/plain")
+        };
+        Ok(Representation::new(
+            ReprType::new(media).with_param("charset", "utf-8"),
+            body.into_bytes(),
+        )
+        .cacheable_until(Time::from_millis(next_minute)))
+    })
+    .with_description(
+        Description::new("clock-now")
+            .title("Clock")
+            .summary(
+                "The current local time (HH:MM), cacheable until the next minute boundary — \
+                 sourced every render tick but recomputes once a minute.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .input(
+                ArgSpec::new("html")
+                    .summary("html=true wraps the colon in a span (default: plain HH:MM)")
+                    .optional(),
+            )
+            .output("text/plain;charset=utf-8"),
+    )
+}
+
 /// `urn:runbook:timer` — a **Timer** runbook tab for the TUI, mirroring the browser
 /// demo's tab. Sourced `as=application/json` by the TUI's `load_demos`, it returns the
 /// `{label, intro, steps}` shape the runbook renders: start a one-second job that fires
@@ -507,8 +552,8 @@ fn runbook_timer_demo() -> FnEndpoint {
                 },
                 {
                     "label": "stop the greeter timer",
-                    "cmd": "source urn:time:cancel id=all",
-                    "note": "cancels every timed job — no need to know the id"
+                    "cmd": "source urn:time:cancel target=urn:demo:greeter",
+                    "note": "cancels every greeter timer by target — leaves the clock running"
                 }
             ]
         });
@@ -533,6 +578,7 @@ fn base_space(nature: &'static str) -> EndpointSpace {
         .bind(Exact::new("urn:data:control"), control())
         .bind(Exact::new("urn:data:about"), about())
         .bind(Exact::new("urn:demo:greeter"), greeter())
+        .bind(Exact::new("urn:time:now"), clock_now())
         .bind(Exact::new("urn:style:catalog"), catalog_cards_xsl())
         .bind(Exact::new("urn:host:info"), host_info(nature))
         .bind(Exact::new("urn:host:demo"), host_demo())
@@ -752,7 +798,17 @@ pub fn watched_kernel() -> Arc<Kernel> {
     // Path-qualify the trait rather than `use` it: ikigai_resolve::Resolver has a
     // 1-arg `issue` that would collide with the inherent async `Kernel::issue` in this
     // module's tests if brought into scope.
-    time_registry().set_resolver(Arc::clone(&kernel) as Arc<dyn ikigai_resolve::Resolver>);
+    let registry = time_registry();
+    registry.set_resolver(Arc::clone(&kernel) as Arc<dyn ikigai_resolve::Resolver>);
+    // Register the tab-bar clock's 1s timer as a PERSISTENT time-transport job, so it
+    // shows on the Control tab's Time-jobs readout (the cache demo, live) and a demo
+    // cancel-all leaves it running. Mirrors the browser nav clock.
+    let _ = registry.schedule_persistent(
+        "urn:time:now".to_string(),
+        Verb::Source,
+        ikigai_time::Schedule::Every(std::time::Duration::from_secs(1)),
+        true,
+    );
     kernel
 }
 

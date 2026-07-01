@@ -1587,6 +1587,7 @@ name = "ikigai-embedded"
 version = "0.1.8"
 dependencies = [
  "async-trait",
+ "chrono",
  "futures",
  "ikigai-core",
  "ikigai-fn",
