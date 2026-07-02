@@ -728,7 +728,13 @@ fn llm_registry() -> ikigai_llm::Registry {
             ),
         }
     }
-    ikigai_llm::Registry::single(ikigai_llm::OpenAiConfig::ollama("llama3.2:3b"))
+    let mut ollama = ikigai_llm::OpenAiConfig::ollama("llama3.2:3b");
+    // The declared trait profile urn:llm:models reports (and selection will
+    // reason over): llama3.2:3b is a 3B text model with a 128k context window.
+    ollama.caps.context = Some(131_072);
+    ollama.caps.modalities = vec!["text".to_string()];
+    ollama.caps.params = Some("3B".to_string());
+    ikigai_llm::Registry::single(ollama)
 }
 
 /// The `urn:fn:compose` shape behind the Jury runbook tab: one question, two
@@ -752,6 +758,44 @@ $a{urn:llm:ask?system=Answer with one vivid everyday analogy, at most two senten
     })
 }
 
+/// The friendly degraded branch for LLM demos: what `urn:fn:conditional` returns
+/// when `urn:llm:ollama:up` says the model server is down.
+fn ollama_offline() -> FnEndpoint {
+    const NOTE: &str = "\
+(the model server is not running)
+
+This demo forks a question to a local LLM, but urn:llm:ollama:up reports it
+down. To bring it up:
+
+    ollama serve                 # or launch the Ollama app
+    ollama pull llama3.2:3b      # once, to fetch the model
+
+then re-run this step — no restart needed, liveness is a live fact.
+";
+    FnEndpoint::new("ollama-offline", |_inv: &Invocation<'_>| {
+        Ok(Representation::new(
+            ReprType::new("text/plain").with_param("charset", "utf-8"),
+            NOTE.as_bytes().to_vec(),
+        ))
+    })
+}
+
+/// The gracefully-degrading Jury: ONE compose marker invoking `urn:fn:conditional`
+/// on the liveness resource. When Ollama is up the conditional returns the jury
+/// shape and compose recursively expands its two `urn:llm:ask` markers (the fork);
+/// when it's down the offline note is spliced in instead — the LLM branch is never
+/// invoked, so nothing errors. compose + conditional + up + ask, zero glue code.
+fn jury_gated_shape() -> FnEndpoint {
+    const GATED: &str = "\
+$a{urn:fn:conditional?if=urn:llm:ollama:up&then=urn:demo:jury&else=urn:data:ollama-offline}";
+    FnEndpoint::new("jury-gated-shape", |_inv: &Invocation<'_>| {
+        Ok(Representation::new(
+            ReprType::new("text/plain").with_param("charset", "utf-8"),
+            GATED.as_bytes().to_vec(),
+        ))
+    })
+}
+
 /// A native-only runbook tab (like [`runbook_timer_demo`]): best-of-two-models as
 /// pure composition. Forks one question to two `urn:llm:ask` personas concurrently
 /// via `urn:fn:compose` fan-out, then pipes both candidates into a third `urn:llm:ask`
@@ -766,18 +810,32 @@ fn runbook_jury_demo() -> FnEndpoint {
                       it forks both concurrently (fan-out) and inlines both answers; pipe that \
                       into a third urn:llm:ask and it judges which is better. Watch the \
                       [N uncacheable] tag: the verdict depends on both upstream generations, so \
-                      the cache-dependency graph propagates across compose AND the pipe. Needs a \
-                      local Ollama.",
+                      the cache-dependency graph propagates across compose AND the pipe. The \
+                      gated form degrades gracefully: urn:fn:conditional branches on the \
+                      urn:llm:ollama:up liveness resource, so if Ollama is down you get a \
+                      friendly note instead of an error.",
             "steps": [
                 {
-                    "label": "fork the question to two personas",
-                    "cmd": "source urn:fn:compose src=urn:demo:jury",
-                    "note": "compose fans the two urn:llm:ask markers out concurrently, inlines both answers"
+                    "label": "is the model server up?",
+                    "cmd": "source urn:llm:ollama:up",
+                    "note": "a boolean liveness resource — a cheap ping, uncacheable (a live fact)"
+                },
+                {
+                    "label": "fork the question to two personas (gracefully)",
+                    "cmd": "source urn:fn:compose src=urn:demo:jury-gated",
+                    "note": "ONE marker: conditional branches on :up — Ollama up = the jury shape \
+                             (whose own markers then fork), down = a friendly note. The LLM branch \
+                             is never touched when down, so nothing errors."
                 },
                 {
                     "label": "let a third model pick the winner",
                     "cmd": "source urn:fn:compose src=urn:demo:jury | urn:llm:ask system=\"You are judging two candidate answers, A and B, to the question shown. Reply with the winner (A or B) and one short sentence why.\"",
-                    "note": "pipes both candidates into a judge; [2 uncacheable] = the verdict's two upstream deps"
+                    "note": "pipes both candidates into a judge; [2 uncacheable] = the verdict's two upstream deps (needs Ollama up)"
+                },
+                {
+                    "label": "what models do I have, as data?",
+                    "cmd": "source urn:llm:models as=text/turtle",
+                    "note": "the annotated inventory as a queryable trait graph (context/modalities/cost) — selection's substrate"
                 }
             ]
         });
@@ -849,7 +907,9 @@ fn root_space() -> Arc<dyn Space> {
             inner: ikigai_runbook::space()
                 .bind(Exact::new("urn:runbook:timer"), runbook_timer_demo())
                 .bind(Exact::new("urn:runbook:jury"), runbook_jury_demo())
-                .bind(Exact::new("urn:demo:jury"), jury_shape()),
+                .bind(Exact::new("urn:demo:jury"), jury_shape())
+                .bind(Exact::new("urn:demo:jury-gated"), jury_gated_shape())
+                .bind(Exact::new("urn:data:ollama-offline"), ollama_offline()),
             on: demo_flag(),
         }) as Arc<dyn Space>,
     ]))
