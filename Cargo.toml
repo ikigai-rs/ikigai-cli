@@ -41,9 +41,9 @@ ikigai-jsonld = "0.1.1"
 # SHACL validation (urn:shacl:validate) — rudof's validator is native-only (gated off wasm),
 # so it's linked natively here; the browser serves the same resource via shacl-engine (JS).
 ikigai-shacl = "0.1.0"
-# LLM inference (urn:llm:ask + urn:llm:<provider>:ask): a facade grammar over pluggable
-# backends. Slice 0 = an OpenAI-compatible REST backend (Ollama/vLLM/llama.cpp/mlx_lm).
-ikigai-llm = "0.1.0"
+# LLM inference (urn:llm:ask + urn:llm:<provider>:ask + urn:llm:config): a facade grammar
+# over pluggable backends. OpenAI-compatible REST backend (Ollama/vLLM/llama.cpp/mlx_lm).
+ikigai-llm = "0.2.0"
 # Sibling workspace crates pinned to the current release: a published crate must
 # require its siblings at this version too, so the lockstep release publishes in
 # dependency order (resolve → wire → engine → …) and a crate can never build against

@@ -706,10 +706,29 @@ fn http_space() -> EndpointSpace {
 /// transport. Slice 0: an OpenAI-compatible backend defaulting to a local Ollama.
 /// (Mounted via a local path override until ikigai-llm is published.)
 fn llm_space() -> EndpointSpace {
-    ikigai_llm::space(
-        Arc::new(UreqTransport),
-        ikigai_llm::OpenAiConfig::ollama("llama3.2:3b"),
-    )
+    ikigai_llm::space(Arc::new(UreqTransport), llm_registry())
+}
+
+/// The LLM provider registry: a hand-editable JSON file pointed at by
+/// `IKIGAI_LLM_CONFIG` (see ikigai-llm's `Registry::from_json`), else a local
+/// Ollama default. Load-time — a config edit needs a restart; live-reload (the
+/// config as a golden-thread resource) is a follow-up. A bad path/JSON warns and
+/// falls back rather than failing the kernel build.
+fn llm_registry() -> ikigai_llm::Registry {
+    if let Ok(path) = std::env::var("IKIGAI_LLM_CONFIG") {
+        match std::fs::read_to_string(&path) {
+            Ok(json) => match ikigai_llm::Registry::from_json(&json) {
+                Ok(registry) => return registry,
+                Err(e) => eprintln!(
+                    "ikigai: IKIGAI_LLM_CONFIG ({path}) parse error: {e:?} — using the default"
+                ),
+            },
+            Err(e) => eprintln!(
+                "ikigai: cannot read IKIGAI_LLM_CONFIG ({path}): {e:?} — using the default"
+            ),
+        }
+    }
+    ikigai_llm::Registry::single(ikigai_llm::OpenAiConfig::ollama("llama3.2:3b"))
 }
 
 /// The `urn:fn:compose` shape behind the Jury runbook tab: one question, two
