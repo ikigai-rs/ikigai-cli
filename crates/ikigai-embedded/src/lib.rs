@@ -712,6 +712,74 @@ fn llm_space() -> EndpointSpace {
     )
 }
 
+/// The `urn:fn:compose` shape behind the Jury runbook tab: one question, two
+/// `urn:llm:ask` personas. Native demo scaffolding (bound with the tab, demo-gated).
+/// Two real models = add `&model=…` per marker.
+fn jury_shape() -> FnEndpoint {
+    const JURY: &str = "\
+QUESTION: What is resource-oriented computing, in plain terms?
+
+--- Candidate A (concise) ---
+$a{urn:llm:ask?system=Answer in exactly one concise sentence.&prompt=What is resource-oriented computing, in plain terms}
+
+--- Candidate B (analogy) ---
+$a{urn:llm:ask?system=Answer with one vivid everyday analogy, at most two sentences.&prompt=What is resource-oriented computing, in plain terms}
+";
+    FnEndpoint::new("jury-shape", |_inv: &Invocation<'_>| {
+        Ok(Representation::new(
+            ReprType::new("text/plain").with_param("charset", "utf-8"),
+            JURY.as_bytes().to_vec(),
+        ))
+    })
+}
+
+/// A native-only runbook tab (like [`runbook_timer_demo`]): best-of-two-models as
+/// pure composition. Forks one question to two `urn:llm:ask` personas concurrently
+/// via `urn:fn:compose` fan-out, then pipes both candidates into a third `urn:llm:ask`
+/// that judges. Needs a local Ollama (LLM is mounted natively). Cross-frontend
+/// promotion into the shared runbook awaits the browser LLM face.
+fn runbook_jury_demo() -> FnEndpoint {
+    FnEndpoint::new("runbook-jury", |_inv: &Invocation<'_>| {
+        let json = serde_json::json!({
+            "label": "Jury",
+            "intro": "Best-of-two, as pure composition. urn:demo:jury is a urn:fn:compose shape \
+                      with two urn:llm:ask markers — two personas of your local model. Sourcing \
+                      it forks both concurrently (fan-out) and inlines both answers; pipe that \
+                      into a third urn:llm:ask and it judges which is better. Watch the \
+                      [N uncacheable] tag: the verdict depends on both upstream generations, so \
+                      the cache-dependency graph propagates across compose AND the pipe. Needs a \
+                      local Ollama.",
+            "steps": [
+                {
+                    "label": "fork the question to two personas",
+                    "cmd": "source urn:fn:compose src=urn:demo:jury",
+                    "note": "compose fans the two urn:llm:ask markers out concurrently, inlines both answers"
+                },
+                {
+                    "label": "let a third model pick the winner",
+                    "cmd": "source urn:fn:compose src=urn:demo:jury | urn:llm:ask system=\"You are judging two candidate answers, A and B, to the question shown. Reply with the winner (A or B) and one short sentence why.\"",
+                    "note": "pipes both candidates into a judge; [2 uncacheable] = the verdict's two upstream deps"
+                }
+            ]
+        });
+        Ok(Representation::new(
+            ReprType::new("application/json"),
+            serde_json::to_vec(&json).unwrap_or_default(),
+        ))
+    })
+    .with_description(
+        Description::new("runbook-jury")
+            .title("Jury")
+            .summary(
+                "A runbook tab: fork a question to two LLM personas and let a third judge \
+                 — compose fan-out + pipe.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .output("application/json"),
+    )
+}
+
 /// Build the **local** embedded kernel (nature `Embedded (Native)`), including
 /// the personal space and the HTTP-client module. The running user *is* the owner,
 /// so it resolves under their identity — the engine's default root capability — and
@@ -760,7 +828,9 @@ fn root_space() -> Arc<dyn Space> {
             // native mirror of the browser demo's tab. The TUI's load_demos enumerates
             // every urn:runbook:* here, so binding it locally is all it takes.
             inner: ikigai_runbook::space()
-                .bind(Exact::new("urn:runbook:timer"), runbook_timer_demo()),
+                .bind(Exact::new("urn:runbook:timer"), runbook_timer_demo())
+                .bind(Exact::new("urn:runbook:jury"), runbook_jury_demo())
+                .bind(Exact::new("urn:demo:jury"), jury_shape()),
             on: demo_flag(),
         }) as Arc<dyn Space>,
     ]))
