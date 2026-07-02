@@ -1607,6 +1607,8 @@ dependencies = [
  "ikigai-vocab",
  "ikigai-xslt",
  "notify",
+ "oxrdf",
+ "oxrdfio",
  "serde_json",
  "ureq",
 ]
@@ -1680,9 +1682,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-llm"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd2d643766b7a51e3af9316b00fcfa21fb7e500b05604b2d5c26c6eead2b750c"
+checksum = "f5723e18cb672a1cdb832ccfba8ef46f9480ee8ef3d86256cde0c3b8b5424026"
 dependencies = [
  "async-trait",
  "ikigai-core",

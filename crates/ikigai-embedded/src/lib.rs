@@ -715,6 +715,21 @@ fn llm_space() -> EndpointSpace {
 /// config as a golden-thread resource) is a follow-up. A bad path/JSON warns and
 /// falls back rather than failing the kernel build.
 fn llm_registry() -> ikigai_llm::Registry {
+    let mut registry = llm_declared_registry();
+    // The annotation graph (IKIGAI_LLM_ANNOTATIONS, Turtle) completes or CORRECTS
+    // the declared descriptions — annotations are authoritative, but an override
+    // is never silent: every conflict is logged.
+    for c in registry.apply_annotations(&llm_annotation_facts()) {
+        eprintln!(
+            "ikigai: llm annotation overrides {}.{}: {} -> {}",
+            c.provider, c.trait_name, c.declared, c.annotated
+        );
+    }
+    registry
+}
+
+/// The declared registry: the `IKIGAI_LLM_CONFIG` file, else the Ollama default.
+fn llm_declared_registry() -> ikigai_llm::Registry {
     if let Ok(path) = std::env::var("IKIGAI_LLM_CONFIG") {
         match std::fs::read_to_string(&path) {
             Ok(json) => match ikigai_llm::Registry::from_json(&json) {
@@ -729,12 +744,51 @@ fn llm_registry() -> ikigai_llm::Registry {
         }
     }
     let mut ollama = ikigai_llm::OpenAiConfig::ollama("llama3.2:3b");
-    // The declared trait profile urn:llm:models reports (and selection will
-    // reason over): llama3.2:3b is a 3B text model with a 128k context window.
+    // The declared trait profile urn:llm:models reports (and selection reasons
+    // over): a 3B text model with a 128k window. vendor "ollama" (set by the
+    // constructor) opts into /api/show discovery, which fills what's left.
     ollama.caps.context = Some(131_072);
     ollama.caps.modalities = vec!["text".to_string()];
     ollama.caps.params = Some("3B".to_string());
     ikigai_llm::Registry::single(ollama)
+}
+
+/// Facts from the `IKIGAI_LLM_ANNOTATIONS` Turtle file, as `(subject, predicate,
+/// object)` strings — literal objects lose their datatype here;
+/// `Registry::apply_annotations` re-parses values per trait. Missing env is
+/// normal (no annotations); an unreadable/unparseable file warns and yields
+/// nothing rather than failing the kernel build.
+fn llm_annotation_facts() -> Vec<(String, String, String)> {
+    let Ok(path) = std::env::var("IKIGAI_LLM_ANNOTATIONS") else {
+        return Vec::new();
+    };
+    let ttl = match std::fs::read_to_string(&path) {
+        Ok(ttl) => ttl,
+        Err(e) => {
+            eprintln!("ikigai: cannot read IKIGAI_LLM_ANNOTATIONS ({path}): {e} — ignoring");
+            return Vec::new();
+        }
+    };
+    let mut facts = Vec::new();
+    for quad in
+        oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle).for_slice(ttl.as_bytes())
+    {
+        let Ok(quad) = quad else { continue };
+        let oxrdf::NamedOrBlankNode::NamedNode(subject) = &quad.subject else {
+            continue;
+        };
+        let object = match &quad.object {
+            oxrdf::Term::NamedNode(n) => n.as_str().to_string(),
+            oxrdf::Term::Literal(l) => l.value().to_string(),
+            _ => continue,
+        };
+        facts.push((
+            subject.as_str().to_string(),
+            quad.predicate.as_str().to_string(),
+            object,
+        ));
+    }
+    facts
 }
 
 /// The `urn:fn:compose` shape behind the Jury runbook tab: one question, two
