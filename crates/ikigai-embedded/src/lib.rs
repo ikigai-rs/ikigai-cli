@@ -702,6 +702,16 @@ fn http_space() -> EndpointSpace {
     ikigai_http::space(Arc::new(UreqTransport))
 }
 
+/// The LLM module (`urn:llm:ask` + `urn:llm:<provider>:ask`) on the native ureq
+/// transport. Slice 0: an OpenAI-compatible backend defaulting to a local Ollama.
+/// (Mounted via a local path override until ikigai-llm is published.)
+fn llm_space() -> EndpointSpace {
+    ikigai_llm::space(
+        Arc::new(UreqTransport),
+        ikigai_llm::OpenAiConfig::ollama("llama3.2:3b"),
+    )
+}
+
 /// Build the **local** embedded kernel (nature `Embedded (Native)`), including
 /// the personal space and the HTTP-client module. The running user *is* the owner,
 /// so it resolves under their identity — the engine's default root capability — and
@@ -719,6 +729,7 @@ fn root_space() -> Arc<dyn Space> {
     Arc::new(Fallback::new(vec![
         Arc::new(local_space("Embedded (Native)")) as Arc<dyn Space>,
         Arc::new(http_space()) as Arc<dyn Space>,
+        Arc::new(llm_space()) as Arc<dyn Space>,
         // The Linked Data toolkit: RDF transreption (urn:rdf:*) + SPARQL (urn:sparql:*)
         // + XSLT styling (urn:xslt:*). Linked natively — no module-loading machinery in
         // the native binary (that's a browser/WASI concern).
