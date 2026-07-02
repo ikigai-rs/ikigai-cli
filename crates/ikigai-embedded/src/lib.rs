@@ -835,7 +835,14 @@ fn runbook_jury_demo() -> FnEndpoint {
                 {
                     "label": "what models do I have, as data?",
                     "cmd": "source urn:llm:models as=text/turtle",
-                    "note": "the annotated inventory as a queryable trait graph (context/modalities/cost) — selection's substrate"
+                    "note": "the annotated inventory as a queryable trait graph (context/modalities/cost/vendor) — selection's substrate"
+                },
+                {
+                    "label": "pick a backend by capability, not by name",
+                    "cmd": "source urn:llm:select needs=\"cost<=local, ctx>=32k, vendor!=openai\"",
+                    "note": "resolves requirements over the trait profiles: cheapest-that-fits wins; vendor!= is a \
+                             governance exclusion (an undeclared vendor fails it — it might BE that vendor). The \
+                             facade takes the same needs= directly: urn:llm:ask needs=\"…\" prompt=\"…\""
                 }
             ]
         });

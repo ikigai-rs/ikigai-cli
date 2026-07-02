@@ -43,7 +43,7 @@ ikigai-jsonld = "0.1.1"
 ikigai-shacl = "0.1.0"
 # LLM inference (urn:llm:ask + urn:llm:<provider>:ask + urn:llm:config): a facade grammar
 # over pluggable backends. OpenAI-compatible REST backend (Ollama/vLLM/llama.cpp/mlx_lm).
-ikigai-llm = "0.3.0" # + caps profiles, urn:llm:models (trait graph), urn:llm:<provider>:up liveness
+ikigai-llm = "0.4.0" # + urn:llm:select / needs= (capability+vendor-constrained selection)
 # Sibling workspace crates pinned to the current release: a published crate must
 # require its siblings at this version too, so the lockstep release publishes in
 # dependency order (resolve → wire → engine → …) and a crate can never build against
