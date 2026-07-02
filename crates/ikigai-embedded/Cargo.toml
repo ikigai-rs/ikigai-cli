@@ -21,6 +21,8 @@ ikigai-sniff = { workspace = true }
 ikigai-xslt = { workspace = true }
 ikigai-jsonld = { workspace = true }
 ikigai-shacl = { workspace = true }
+# LLM inference (urn:llm:ask + urn:llm:<provider>:ask), on the native ureq transport.
+ikigai-llm = { workspace = true }
 ikigai-scheduler = { workspace = true }
 # The time transport (urn:time:schedule/cancel/jobs): fires a kernel resource-request
 # on a timer. Bound in root_space; its kernel handle is installed in watched_kernel.
