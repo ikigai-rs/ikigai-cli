@@ -1624,9 +1624,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-fn"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41a06790c5fea8edc0639a79d418d7259588db7342711a5cf6260242f6eefa0f"
+checksum = "66cab3913390b281889d38bd0d47d733e548e444fc440dc852da161a6cca56e4"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1739,9 +1739,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-runbook"
-version = "0.1.9"
+version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74d5acecfb61f9c335eb4f91ab1bc8b2693dd4dc7b8baed8b097c829f081e856"
+checksum = "202e175da01dc8ab0c3dbc2cdb44d11d600155f1939a2bf0a9206a6526a16ab4"
 dependencies = [
  "ikigai-core",
  "serde",
