@@ -1715,11 +1715,12 @@ dependencies = [
 
 [[package]]
 name = "ikigai-personal"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4f357e41adec4e9c217ec28c6f1a5a0dd183af9969d83bc1abd3782561c4df7"
+checksum = "2bbb0ec1009737fb781ffbafd648e8437644ccd430829a0f9100383e2dd1a3ca"
 dependencies = [
  "block2",
+ "chrono",
  "ikigai-core",
  "objc2",
  "objc2-event-kit",
