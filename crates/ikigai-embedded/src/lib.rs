@@ -1776,6 +1776,7 @@ pub fn watched_kernel() -> Arc<Kernel> {
         .into_scheduled(sched);
     watch_root(Arc::clone(&kernel), file_root());
     watch_org(Arc::clone(&kernel));
+    watch_store(Arc::clone(&kernel));
     // Install the kernel handle the time transport fires its timed requests on, now
     // that the kernel exists (its urn:time:* endpoints are bound into this same
     // kernel). A scheduled job re-enters here under the registry's capability.
@@ -1943,6 +1944,90 @@ fn watch_org(kernel: Arc<Kernel>) {
                     String::from_utf8_lossy(&report.bytes).trim()
                 ),
                 Err(e) => eprintln!("ikigai: org change → derive failed: {e}"),
+            }
+            last_run = std::time::Instant::now();
+        }
+    });
+}
+
+/// React to OS calendar-store changes — an invitation landing, an edit in
+/// Calendar.app, an iCloud sync from another device — by deriving the
+/// consolidated view. The other half of event-driven freshness (watch_org
+/// covers Brian's side; this covers the world's). The 15s window both
+/// debounces iCloud bursts and suppresses the notifications our OWN derive
+/// writes cause (the loop would self-terminate anyway — a re-derive is a
+/// no-op — but suppression skips even that pass). Gated like the standing
+/// sync: only instances with a scoped derive_every react.
+fn watch_store(kernel: Arc<Kernel>) {
+    if derive_every().is_none() {
+        return;
+    }
+    // Signal source: the calendar daemon writes ~/Library/Calendars on every
+    // change (local edits, invitations, iCloud syncs) — a filesystem event is a
+    // reliable, documented-behavior-free change signal. (EventKit's own
+    // EKEventStoreChangedNotification needs a serviced MAIN runloop this CLI
+    // doesn't have — ikigai_personal::observe_calendar_changes remains for
+    // hosts that do.)
+    let Some(home) = std::env::var("HOME").ok() else {
+        return;
+    };
+    // Both store locations: the classic path and the modern group container.
+    let store_dirs: Vec<PathBuf> = [
+        "Library/Calendars",
+        "Library/Group Containers/group.com.apple.calendar",
+    ]
+    .iter()
+    .map(|rel| Path::new(&home).join(rel))
+    .filter(|dir| dir.is_dir())
+    .collect();
+    if store_dirs.is_empty() {
+        return;
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let (ftx, frx) = std::sync::mpsc::channel();
+        let mut watcher = match notify::recommended_watcher(move |res| {
+            let _ = ftx.send(res);
+        }) {
+            Ok(watcher) => watcher,
+            Err(_) => return,
+        };
+        let mut watching = 0;
+        for dir in &store_dirs {
+            if watcher.watch(dir, RecursiveMode::Recursive).is_ok() {
+                watching += 1;
+            }
+        }
+        if watching == 0 {
+            eprintln!("ikigai: calendar store watcher could not attach");
+            return;
+        }
+        eprintln!("ikigai: calendar store watcher active ({watching} location(s))");
+        for event in frx.iter().flatten() {
+            if event.kind.is_access() {
+                continue;
+            }
+            let _ = tx.send(());
+        }
+    });
+    std::thread::spawn(move || {
+        let mut last_run = std::time::Instant::now();
+        for () in rx.iter() {
+            if last_run.elapsed() < std::time::Duration::from_secs(15) {
+                continue;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            while rx.try_recv().is_ok() {}
+            let request = Request::new(
+                Verb::Source,
+                Iri::parse("urn:view:derive").expect("valid IRI"),
+            );
+            match ikigai_resolve::Resolver::issue(kernel.as_ref(), request) {
+                Ok((report, _)) => eprintln!(
+                    "ikigai: calendar change → {}",
+                    String::from_utf8_lossy(&report.bytes).trim()
+                ),
+                Err(e) => eprintln!("ikigai: calendar change → derive failed: {e}"),
             }
             last_run = std::time::Instant::now();
         }
