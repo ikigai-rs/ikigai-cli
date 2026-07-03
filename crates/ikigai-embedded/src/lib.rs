@@ -14,9 +14,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use ikigai_core::{
-    ArgSpec, Description, EndpointSpace, Error, Exact, Fallback, FnEndpoint, Invocation, Kernel,
-    MetaRenderer, ReprType, Representation, Request, Resolution, Result, Scope, Space, SpaceEntry,
-    SystemClock, Time, UriTemplate, Verb,
+    ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, Fallback, FnEndpoint, Invocation,
+    Iri, Kernel, MetaRenderer, ReprType, Representation, Request, Resolution, Result, Scope, Space,
+    SpaceEntry, SystemClock, Time, UriTemplate, Verb,
 };
 use ikigai_scheduler::Scheduler;
 use ikigai_time::JobRegistry;
@@ -792,24 +792,90 @@ fn llm_annotation_facts() -> Vec<(String, String, String)> {
 }
 
 /// The `urn:fn:compose` shape behind the Jury runbook tab: one question, two
-/// `urn:llm:ask` personas. Native demo scaffolding (bound with the tab, demo-gated).
-/// Two real models = add `&model=…` per marker.
-fn jury_shape() -> FnEndpoint {
-    const JURY: &str = "\
-QUESTION: What is resource-oriented computing, in plain terms?
+/// `urn:llm:ask` markers — built against what's ACTUALLY installed. Sources
+/// `urn:llm:ollama:installed` and forks to the first two distinct models (two
+/// personas of one model when only one is pulled), so the demo is portable: no
+/// hardcoded model name. If the list can't be read the markers carry no
+/// `model=` and the backend's own default-resolution (and the gated
+/// conditional's offline note) take over.
+struct JuryShape;
 
---- Candidate A (concise) ---
-$a{urn:llm:ask?system=Answer in exactly one concise sentence.&prompt=What is resource-oriented computing, in plain terms}
-
---- Candidate B (analogy) ---
-$a{urn:llm:ask?system=Answer with one vivid everyday analogy, at most two sentences.&prompt=What is resource-oriented computing, in plain terms}
-";
-    FnEndpoint::new("jury-shape", |_inv: &Invocation<'_>| {
+#[async_trait::async_trait]
+impl Endpoint for JuryShape {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let installed: Vec<String> = match inv
+            .issue(Request::new(
+                Verb::Source,
+                Iri::parse("urn:llm:ollama:installed").expect("valid IRI"),
+            ))
+            .await
+        {
+            Ok(repr) => String::from_utf8_lossy(&repr.bytes)
+                .lines()
+                .map(str::to_string)
+                .filter(|line| !line.is_empty())
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        let (juror_a, juror_b) = match installed.as_slice() {
+            [] => (None, None),
+            [only] => (Some(only.clone()), Some(only.clone())),
+            [first, second, ..] => (Some(first.clone()), Some(second.clone())),
+        };
+        let marker = |system: &str, model: &Option<String>| {
+            let model_arg = model
+                .as_ref()
+                .map(|m| format!("&model={m}"))
+                .unwrap_or_default();
+            format!(
+                "$a{{urn:llm:ask?system={system}&prompt=What is resource-oriented computing, \
+                 in plain terms{model_arg}}}"
+            )
+        };
+        let label = |model: &Option<String>| {
+            model
+                .as_ref()
+                .map(|m| format!(" · {m}"))
+                .unwrap_or_default()
+        };
+        let shape = format!(
+            "QUESTION: What is resource-oriented computing, in plain terms?\n\n\
+             --- Candidate A (concise{}) ---\n{}\n\n\
+             --- Candidate B (analogy{}) ---\n{}\n",
+            label(&juror_a),
+            marker("Answer in exactly one concise sentence.", &juror_a),
+            label(&juror_b),
+            marker(
+                "Answer with one vivid everyday analogy, at most two sentences.",
+                &juror_b
+            ),
+        );
         Ok(Representation::new(
             ReprType::new("text/plain").with_param("charset", "utf-8"),
-            JURY.as_bytes().to_vec(),
+            shape.into_bytes(),
         ))
-    })
+    }
+
+    fn name(&self) -> &str {
+        "jury-shape"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("jury-shape")
+            .title("Jury shape")
+            .summary(
+                "The best-of-two compose shape, built against what's actually installed: \
+                 forks to the first two distinct models the provider serves (two personas \
+                 of one model if only one is pulled).",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .output("text/plain;charset=utf-8")
+    }
+}
+
+fn jury_shape() -> JuryShape {
+    JuryShape
 }
 
 /// The friendly degraded branch for LLM demos: what `urn:fn:conditional` returns
@@ -875,11 +941,18 @@ fn runbook_jury_demo() -> FnEndpoint {
                     "note": "a boolean liveness resource — a cheap ping, uncacheable (a live fact)"
                 },
                 {
-                    "label": "fork the question to two personas (gracefully)",
+                    "label": "who are the jurors? (whatever is installed)",
+                    "cmd": "source urn:llm:ollama:installed",
+                    "note": "the models this machine can actually serve — the jury forks to the \
+                             first two distinct ones (two personas of one model if only one is \
+                             pulled). No hardcoded model names."
+                },
+                {
+                    "label": "fork the question to two jurors (gracefully)",
                     "cmd": "source urn:fn:compose src=urn:demo:jury-gated",
                     "note": "ONE marker: conditional branches on :up — Ollama up = the jury shape \
-                             (whose own markers then fork), down = a friendly note. The LLM branch \
-                             is never touched when down, so nothing errors."
+                             (built against the installed list, whose markers then fork), down = a \
+                             friendly note. The LLM branch is never touched when down."
                 },
                 {
                     "label": "let a third model pick the winner",
