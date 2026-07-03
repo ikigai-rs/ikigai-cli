@@ -800,28 +800,130 @@ fn llm_annotation_facts() -> Vec<(String, String, String)> {
 /// conditional's offline note) take over.
 struct JuryShape;
 
+/// Total physical memory, best-effort — the machine attribute the jury's
+/// co-load budget is computed from. None on platforms we don't know how to ask.
+fn total_memory_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let kb: u64 = meminfo
+            .lines()
+            .find(|line| line.starts_with("MemTotal:"))?
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()?;
+        Some(kb * 1024)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+/// Pick the jurors under a co-load budget. `installed` is smallest-first with
+/// sizes where known. Juror A = the smallest model that fits alone (≤ ~50% of
+/// RAM); juror B = the next distinct model ONLY if both together fit the pair
+/// budget (≤ ~60% of RAM) — otherwise A again (two personas), with a note
+/// explaining the decision. Unknown sizes or unknown RAM are assumed to fit
+/// (no machine facts = no machine policy).
+fn empanel(
+    installed: &[(String, Option<u64>)],
+    ram: Option<u64>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let gb = |bytes: u64| format!("{:.1} GB", bytes as f64 / 1e9);
+    let Some((first, first_size)) = installed.first() else {
+        return (None, None, None);
+    };
+    let Some(ram) = ram else {
+        let b = installed.get(1).map(|(m, _)| m.clone());
+        return (Some(first.clone()), b.or_else(|| Some(first.clone())), None);
+    };
+    let solo_budget = ram / 2;
+    let pair_budget = ram / 5 * 3;
+    let ram_display = format!("{} GB", ram >> 30);
+
+    // Juror A: smallest that fits alone (the list is smallest-first).
+    let Some((a, a_size)) = installed
+        .iter()
+        .find(|(_, size)| size.unwrap_or(0) <= solo_budget)
+    else {
+        // Nothing fits comfortably; use the smallest anyway rather than refuse.
+        return (
+            Some(first.clone()),
+            Some(first.clone()),
+            Some(format!(
+                "jury note: no installed model fits comfortably on a {ram_display} machine; \
+                 using {first} ({}) twice",
+                first_size.map(gb).unwrap_or_else(|| "size unknown".into())
+            )),
+        );
+    };
+
+    // Juror B: the next distinct model that CO-LOADS with A.
+    let b = installed
+        .iter()
+        .find(|(m, size)| m != a && a_size.unwrap_or(0) + size.unwrap_or(0) <= pair_budget);
+    if let Some((b, _)) = b {
+        return (Some(a.clone()), Some(b.clone()), None);
+    }
+
+    // A second model exists but won't co-load: two personas, and say why.
+    let note = installed.iter().find(|(m, _)| m != a).map(|(m, size)| {
+        format!(
+            "jury note: {m} ({}) not empaneled — won't co-load with {a} within a \
+             {} budget on a {ram_display} machine; using two personas of {a} instead",
+            size.map(gb).unwrap_or_else(|| "size unknown".into()),
+            gb(pair_budget),
+        )
+    });
+    (Some(a.clone()), Some(a.clone()), note)
+}
+
 #[async_trait::async_trait]
 impl Endpoint for JuryShape {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
-        let installed: Vec<String> = match inv
-            .issue(Request::new(
-                Verb::Source,
-                Iri::parse("urn:llm:ollama:installed").expect("valid IRI"),
-            ))
+        // The installed list, smallest-first, with sizes where the provider
+        // reports them (the as=json face of urn:llm:ollama:installed).
+        let installed: Vec<(String, Option<u64>)> = match inv
+            .issue(
+                Request::new(
+                    Verb::Source,
+                    Iri::parse("urn:llm:ollama:installed").expect("valid IRI"),
+                )
+                .with_arg(
+                    "as",
+                    ikigai_core::ArgRef::Inline(b"application/json".to_vec()),
+                ),
+            )
             .await
         {
-            Ok(repr) => String::from_utf8_lossy(&repr.bytes)
-                .lines()
-                .map(str::to_string)
-                .filter(|line| !line.is_empty())
-                .collect(),
+            Ok(repr) => serde_json::from_slice::<serde_json::Value>(&repr.bytes)
+                .ok()
+                .and_then(|v| {
+                    v.as_array().map(|models| {
+                        models
+                            .iter()
+                            .filter_map(|m| {
+                                m["model"]
+                                    .as_str()
+                                    .map(|name| (name.to_string(), m["size"].as_u64()))
+                            })
+                            .collect()
+                    })
+                })
+                .unwrap_or_default(),
             Err(_) => Vec::new(),
         };
-        let (juror_a, juror_b) = match installed.as_slice() {
-            [] => (None, None),
-            [only] => (Some(only.clone()), Some(only.clone())),
-            [first, second, ..] => (Some(first.clone()), Some(second.clone())),
-        };
+        let (juror_a, juror_b, jury_note) = empanel(&installed, total_memory_bytes());
         let marker = |system: &str, model: &Option<String>| {
             let model_arg = model
                 .as_ref()
@@ -838,7 +940,7 @@ impl Endpoint for JuryShape {
                 .map(|m| format!(" · {m}"))
                 .unwrap_or_default()
         };
-        let shape = format!(
+        let mut shape = format!(
             "QUESTION: What is resource-oriented computing, in plain terms?\n\n\
              --- Candidate A (concise{}) ---\n{}\n\n\
              --- Candidate B (analogy{}) ---\n{}\n",
@@ -850,6 +952,9 @@ impl Endpoint for JuryShape {
                 &juror_b
             ),
         );
+        if let Some(note) = jury_note {
+            shape.push_str(&format!("\n({note})\n"));
+        }
         Ok(Representation::new(
             ReprType::new("text/plain").with_param("charset", "utf-8"),
             shape.into_bytes(),
