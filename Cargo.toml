@@ -18,7 +18,7 @@ ikigai-vocab = "0.1.22" # ikigai_vocab::space() — urn:ikigai:vocab resource
 # The reusable function library, linked in as a published module crate.
 ikigai-fn = "0.1.2" # + urn:fn:conditional (the lazy branch: if/then/else are URIs)
 # Personal contexts (urn:personal:*), macOS-backed, linked as a published module.
-ikigai-personal = "0.3.1" # calendar partitions + turtle event graph + occurrence-qualified recurring uids
+ikigai-personal = "0.4.1" # event writes + identity round-trip + q= search + year period
 # Capability-gated file/store module, linked as a published module crate.
 ikigai-fs = "0.1.2"
 # Outbound HTTP-client module (urn:httpGet…), linked as a published module crate.
@@ -44,7 +44,7 @@ ikigai-shacl = "0.1.0"
 # The org-mode agenda (urn:org:agenda:{period}) — reads org files through the
 # kernel (urn:orgfile:*) and speaks the same skolemized event graph as the
 # calendar, so the two union/diff as graphs.
-ikigai-org = "0.1.0"
+ikigai-org = "0.1.1" # + q= title search + year period
 # LLM inference (urn:llm:ask + urn:llm:<provider>:ask + urn:llm:config): a facade grammar
 # over pluggable backends. OpenAI-compatible REST backend (Ollama/vLLM/llama.cpp/mlx_lm).
 ikigai-llm = "0.7.0" # installed: smallest-first with sizes (host co-load budgeting)
