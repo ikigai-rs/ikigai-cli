@@ -1695,6 +1695,7 @@ pub fn watched_kernel() -> Arc<Kernel> {
         .with_scheduler_reporter(sched.clone())
         .into_scheduled(sched);
     watch_root(Arc::clone(&kernel), file_root());
+    watch_org(Arc::clone(&kernel));
     // Install the kernel handle the time transport fires its timed requests on, now
     // that the kernel exists (its urn:time:* endpoints are bound into this same
     // kernel). A scheduled job re-enters here under the registry's capability.
@@ -1798,6 +1799,72 @@ fn watch_root(kernel: Arc<Kernel>, root: PathBuf) {
                     kernel.cut(thread);
                 }
             }
+        }
+    });
+}
+
+/// Watch the org directory and trigger a consolidated-view derivation when an
+/// agenda file changes — INSTANT freshness on top of the timer's heartbeat.
+/// Debounced (Dropbox delivers edits as event bursts) and gated the same way
+/// the standing sync is: only instances with a scoped `derive_every` react
+/// (an unsynced instance has no business deriving). The derive itself is
+/// idempotent, so a spurious extra trigger costs one no-op pass.
+fn watch_org(kernel: Arc<Kernel>) {
+    if derive_every().is_none() {
+        return; // not a syncing instance
+    }
+    let Some((dir, files)) = org_config() else {
+        return;
+    };
+    let watched: Vec<String> = files
+        .iter()
+        .filter_map(|iri| iri.strip_prefix("urn:orgfile:").map(str::to_string))
+        .collect();
+    let dir = dir.canonicalize().unwrap_or(dir);
+    std::thread::spawn(move || {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = match notify::recommended_watcher(move |res| {
+            let _ = tx.send(res);
+        }) {
+            Ok(watcher) => watcher,
+            Err(_) => return,
+        };
+        if watcher.watch(&dir, RecursiveMode::NonRecursive).is_err() {
+            return;
+        }
+        let mut last_run = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        for event in rx.iter().flatten() {
+            if event.kind.is_access() {
+                continue;
+            }
+            let relevant = event.paths.iter().any(|path| {
+                path.file_name()
+                    .map(|name| watched.iter().any(|w| w.as_str() == name.to_string_lossy()))
+                    .unwrap_or(false)
+            });
+            if !relevant {
+                continue;
+            }
+            // Debounce the burst, then let straggler events settle before deriving.
+            if last_run.elapsed() < std::time::Duration::from_secs(3) {
+                continue;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            while rx.try_recv().is_ok() {} // drain the settled burst
+            let request = Request::new(
+                Verb::Source,
+                Iri::parse("urn:view:derive").expect("valid IRI"),
+            );
+            // The same sync seam the time transport drives the kernel through.
+            let outcome = ikigai_resolve::Resolver::issue(kernel.as_ref(), request);
+            match outcome {
+                Ok((report, _)) => eprintln!(
+                    "ikigai: org change → {}",
+                    String::from_utf8_lossy(&report.bytes).trim()
+                ),
+                Err(e) => eprintln!("ikigai: org change → derive failed: {e}"),
+            }
+            last_run = std::time::Instant::now();
         }
     });
 }
