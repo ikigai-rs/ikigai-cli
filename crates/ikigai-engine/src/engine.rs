@@ -622,15 +622,9 @@ impl Engine {
         };
 
         let mut request = Request::new(verb, iri);
-        loop {
-            let (word, after) = split_first_word(tail);
-            match word.split_once('=') {
-                Some((key, value)) if !key.is_empty() && declared.iter().any(|n| n == key) => {
-                    request = request.with_arg(key, ArgRef::Inline(value.as_bytes().to_vec()));
-                    tail = after;
-                }
-                _ => break,
-            }
+        while let Some((key, value, after)) = take_named_arg(tail, &declared) {
+            request = request.with_arg(key, ArgRef::Inline(value.into_bytes()));
+            tail = after;
         }
         // The verbatim remainder is the content (empty for a no-body delete).
         Ok(request.with_arg("content", ArgRef::Inline(tail.as_bytes().to_vec())))
@@ -1524,6 +1518,40 @@ fn cache_word(status: CacheStatus) -> &'static str {
 }
 
 /// Split off the first whitespace-delimited token; trim the remainder.
+/// Take one leading `key=value` argument off `tail` when `key` is declared —
+/// quote-aware: `title="two words"` consumes the quoted span (with `\"` and
+/// `\\` escapes) as ONE value, so multi-word values survive the sink/delete
+/// grammar's word scanning. Returns `(key, value, rest)`; `None` when the next
+/// word isn't a declared `key=` (the verbatim-content boundary) or a quote is
+/// unterminated (the text then rides as content, where it's at least visible).
+fn take_named_arg<'a>(tail: &'a str, declared: &[String]) -> Option<(&'a str, String, &'a str)> {
+    let (word, _) = split_first_word(tail);
+    let (key, _) = word.split_once('=')?;
+    if key.is_empty() || !declared.iter().any(|name| name == key) {
+        return None;
+    }
+    let after_eq = &tail[key.len() + 1..];
+    if let Some(quoted) = after_eq.strip_prefix('"') {
+        let mut value = String::new();
+        let mut chars = quoted.char_indices();
+        while let Some((i, c)) = chars.next() {
+            match c {
+                '\\' => {
+                    if let Some((_, escaped)) = chars.next() {
+                        value.push(escaped);
+                    }
+                }
+                '"' => return Some((key, value, quoted[i + 1..].trim_start())),
+                ch => value.push(ch),
+            }
+        }
+        None // unterminated quote: not an argument — leave it for the content
+    } else {
+        let (word, rest) = split_first_word(tail);
+        Some((key, word[key.len() + 1..].to_string(), rest))
+    }
+}
+
 fn split_first_word(s: &str) -> (&str, &str) {
     match s.split_once(char::is_whitespace) {
         Some((head, tail)) => (head, tail.trim()),
@@ -2231,6 +2259,29 @@ mod tests {
     /// Shorthand for an expected `Word` token.
     fn w(s: &str) -> Token {
         Token::Word(s.to_string())
+    }
+
+    #[test]
+    fn take_named_arg_handles_quotes_and_boundaries() {
+        let declared = vec!["title".to_string(), "start".to_string()];
+        // a quoted multi-word value is ONE argument, and scanning continues after it
+        let (key, value, rest) =
+            take_named_arg("title=\"two words\" start=now trailing content", &declared).unwrap();
+        assert_eq!((key, value.as_str()), ("title", "two words"));
+        let (key, value, rest) = take_named_arg(rest, &declared).unwrap();
+        assert_eq!((key, value.as_str()), ("start", "now"));
+        assert_eq!(rest, "trailing content");
+        assert!(
+            take_named_arg(rest, &declared).is_none(),
+            "content boundary"
+        );
+        // escapes inside the quoted value
+        let (_, value, _) = take_named_arg("title=\"say \\\"hi\\\"\" x", &declared).unwrap();
+        assert_eq!(value, "say \"hi\"");
+        // an undeclared key is content, not an argument
+        assert!(take_named_arg("nope=1 x", &declared).is_none());
+        // an unterminated quote falls through to content
+        assert!(take_named_arg("title=\"oops", &declared).is_none());
     }
 
     #[test]
