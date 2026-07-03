@@ -609,6 +609,31 @@ pub fn file_root() -> PathBuf {
 /// (`urn:personal:*`) and the local file module (`urn:file:{path}`), jailed to
 /// [`file_root`]. Omitted from [`base_space`] (the QUIC-served space) until remote
 /// auth + capability-on-the-wire land.
+/// The consolidated-view calendar config: `IKIGAI_CALENDAR_CONFIG`, else
+/// `~/.config/ikigai/calendar.json`. An absent file is normal (the config
+/// resource then guides you to create it); a bad file warns and is ignored.
+fn calendar_config() -> Option<ikigai_personal::CalendarConfig> {
+    let path = std::env::var("IKIGAI_CALENDAR_CONFIG")
+        .map(PathBuf::from)
+        .ok()
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|home| Path::new(&home).join(".config/ikigai/calendar.json"))
+        })?;
+    let json = std::fs::read_to_string(&path).ok()?;
+    match ikigai_personal::CalendarConfig::from_json(&json) {
+        Ok(config) => Some(config),
+        Err(e) => {
+            eprintln!(
+                "ikigai: calendar config ({}) parse error: {e:?} — ignoring",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
 fn local_space(nature: &'static str) -> EndpointSpace {
     base_space(nature)
         .bind(
@@ -622,6 +647,14 @@ fn local_space(nature: &'static str) -> EndpointSpace {
         .bind(
             Exact::new("urn:personal:availability"),
             ikigai_personal::availability(),
+        )
+        .bind(
+            Exact::new("urn:personal:calendars"),
+            ikigai_personal::calendars(calendar_config()),
+        )
+        .bind(
+            Exact::new("urn:personal:calendar:config"),
+            ikigai_personal::calendar_config(calendar_config()),
         )
         .bind(
             UriTemplate::parse(ikigai_fs::FILE_TEMPLATE).expect("FILE_TEMPLATE is valid"),
