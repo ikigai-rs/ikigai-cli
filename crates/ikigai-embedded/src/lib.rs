@@ -634,6 +634,34 @@ fn calendar_config() -> Option<ikigai_personal::CalendarConfig> {
     }
 }
 
+/// The org agenda config from the same calendar.json: `org_dir` (the jail root
+/// for the org-file space) and `org_files` (which files carry date-fixed
+/// events). Parsed independently of CalendarConfig so the file stays ONE
+/// hand-editable config.
+fn org_config() -> Option<(PathBuf, Vec<String>)> {
+    let path = std::env::var("IKIGAI_CALENDAR_CONFIG")
+        .map(PathBuf::from)
+        .ok()
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|home| Path::new(&home).join(".config/ikigai/calendar.json"))
+        })?;
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let dir = v["org_dir"].as_str()?;
+    let dir = if let Some(rest) = dir.strip_prefix("~/") {
+        Path::new(&std::env::var("HOME").ok()?).join(rest)
+    } else {
+        PathBuf::from(dir)
+    };
+    let files = v["org_files"]
+        .as_array()?
+        .iter()
+        .filter_map(|f| f.as_str().map(|f| format!("urn:orgfile:{f}")))
+        .collect::<Vec<_>>();
+    Some((dir, files))
+}
+
 fn local_space(nature: &'static str) -> EndpointSpace {
     base_space(nature)
         .bind(
@@ -661,6 +689,12 @@ fn local_space(nature: &'static str) -> EndpointSpace {
         .bind(
             UriTemplate::parse("urn:personal:calendar:{period}").expect("valid template"),
             ikigai_personal::calendar(),
+        )
+        .bind(
+            // The org files, jailed to the configured org_dir and read THROUGH
+            // the kernel by urn:org:agenda (capability-gated; golden-thread-ready).
+            UriTemplate::parse("urn:orgfile:{path}").expect("valid template"),
+            ikigai_fs::FileEndpoint::new(org_config().map(|(dir, _)| dir).unwrap_or_default()),
         )
         .bind(
             UriTemplate::parse(ikigai_fs::FILE_TEMPLATE).expect("FILE_TEMPLATE is valid"),
@@ -1153,6 +1187,11 @@ fn root_space() -> Arc<dyn Space> {
         Arc::new(local_space("Embedded (Native)")) as Arc<dyn Space>,
         Arc::new(http_space()) as Arc<dyn Space>,
         Arc::new(llm_space()) as Arc<dyn Space>,
+        // The org agenda (urn:org:agenda[:{period}]) over the configured org
+        // files, which it reads through the kernel via urn:orgfile:*.
+        Arc::new(ikigai_org::space(
+            org_config().map(|(_, files)| files).unwrap_or_default(),
+        )) as Arc<dyn Space>,
         // The Linked Data toolkit: RDF transreption (urn:rdf:*) + SPARQL (urn:sparql:*)
         // + XSLT styling (urn:xslt:*). Linked natively — no module-loading machinery in
         // the native binary (that's a browser/WASI concern).

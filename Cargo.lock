@@ -1614,6 +1614,7 @@ dependencies = [
  "ikigai-http",
  "ikigai-jsonld",
  "ikigai-llm",
+ "ikigai-org",
  "ikigai-personal",
  "ikigai-rdf",
  "ikigai-resolve",
@@ -1714,10 +1715,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "ikigai-personal"
-version = "0.3.0"
+name = "ikigai-org"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2bbb0ec1009737fb781ffbafd648e8437644ccd430829a0f9100383e2dd1a3ca"
+checksum = "8fbf3ccd47ee3dca83bd2ac345ec467bed0d700f6c611aa2e64c6d4f724a094a"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "ikigai-core",
+]
+
+[[package]]
+name = "ikigai-personal"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d055254e66f4d252c30b9312bebf2dda48ecfdd45e0a107b918d048f3343136f"
 dependencies = [
  "block2",
  "chrono",
@@ -1745,10 +1757,11 @@ dependencies = [
 
 [[package]]
 name = "ikigai-rdf"
-version = "0.1.2"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a26ce4966ae193fa07b5e6c5200b0cd11503419a5972cd552bfb416ce4b61af3"
+checksum = "90d2c23c7b257f0b1ce6fac776719035055180efbd62dab21ff08722f10977eb"
 dependencies = [
+ "async-trait",
  "getrandom 0.3.4",
  "ikigai-core",
  "oxrdf",
