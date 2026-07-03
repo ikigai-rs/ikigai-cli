@@ -656,6 +656,12 @@ fn local_space(nature: &'static str) -> EndpointSpace {
             Exact::new("urn:personal:calendar:config"),
             ikigai_personal::calendar_config(calendar_config()),
         )
+        // AFTER the exact binds: the period grammar must not shadow
+        // urn:personal:calendar:config (first grammar match wins).
+        .bind(
+            UriTemplate::parse("urn:personal:calendar:{period}").expect("valid template"),
+            ikigai_personal::calendar(),
+        )
         .bind(
             UriTemplate::parse(ikigai_fs::FILE_TEMPLATE).expect("FILE_TEMPLATE is valid"),
             // Cacheable: reads of the workspace cache under a golden thread, and a
