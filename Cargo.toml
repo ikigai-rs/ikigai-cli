@@ -18,7 +18,7 @@ ikigai-vocab = "0.1.22" # ikigai_vocab::space() — urn:ikigai:vocab resource
 # The reusable function library, linked in as a published module crate.
 ikigai-fn = "0.1.2" # + urn:fn:conditional (the lazy branch: if/then/else are URIs)
 # Personal contexts (urn:personal:*), macOS-backed, linked as a published module.
-ikigai-personal = "0.4.1" # event writes + identity round-trip + q= search + year period
+ikigai-personal = "0.4.2" # event writes + identity round-trip + q= search + year + reused EKEventStore
 # Capability-gated file/store module, linked as a published module crate.
 ikigai-fs = "0.1.2"
 # Outbound HTTP-client module (urn:httpGet…), linked as a published module crate.
