@@ -18,7 +18,7 @@ ikigai-vocab = "0.1.22" # ikigai_vocab::space() — urn:ikigai:vocab resource
 # The reusable function library, linked in as a published module crate.
 ikigai-fn = "0.1.2" # + urn:fn:conditional (the lazy branch: if/then/else are URIs)
 # Personal contexts (urn:personal:*), macOS-backed, linked as a published module.
-ikigai-personal = "0.3.0" # calendar partitions (urn:personal:calendar:{period}) + real EventKit reads + turtle event graph
+ikigai-personal = "0.3.1" # calendar partitions + turtle event graph + occurrence-qualified recurring uids
 # Capability-gated file/store module, linked as a published module crate.
 ikigai-fs = "0.1.2"
 # Outbound HTTP-client module (urn:httpGet…), linked as a published module crate.
@@ -28,7 +28,7 @@ ikigai-http = "0.1.0"
 # the CLI links its own pipe-fixed ikigai-engine.
 ikigai-runbook = "0.1.10" # Basics: urn:fn:conditional branch (lazy) example
 # Linked Data toolkit (separate ikigai-linkeddata repo): RDF transreption + SPARQL.
-ikigai-rdf = "0.1.2"
+ikigai-rdf = "0.1.3" # + urn:rdf:union / urn:rdf:diff (graph set ops, with= carries ?k=v args)
 ikigai-sparql = "0.1.0"
 # Content sniffing + sniff-and-dispatch (urn:sniff, urn:transrept:auto).
 ikigai-sniff = "0.1.1"
@@ -41,6 +41,10 @@ ikigai-jsonld = "0.1.1"
 # SHACL validation (urn:shacl:validate) — rudof's validator is native-only (gated off wasm),
 # so it's linked natively here; the browser serves the same resource via shacl-engine (JS).
 ikigai-shacl = "0.1.0"
+# The org-mode agenda (urn:org:agenda:{period}) — reads org files through the
+# kernel (urn:orgfile:*) and speaks the same skolemized event graph as the
+# calendar, so the two union/diff as graphs.
+ikigai-org = "0.1.0"
 # LLM inference (urn:llm:ask + urn:llm:<provider>:ask + urn:llm:config): a facade grammar
 # over pluggable backends. OpenAI-compatible REST backend (Ollama/vLLM/llama.cpp/mlx_lm).
 ikigai-llm = "0.7.0" # installed: smallest-first with sizes (host co-load budgeting)
