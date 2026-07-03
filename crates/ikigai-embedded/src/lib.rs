@@ -886,6 +886,81 @@ fn org_stamp(event: &ViewEvent) -> String {
     format!("<{date} {day} {}-{}>", hhmm(&event.start), hhmm(&event.end))
 }
 
+/// The per-source detail projection from calendar.json: `"project":
+/// {"Bosatsu": "busy"}` renders that source's events into the view as
+/// `Busy (Bosatsu)` with the location withheld — the freebusy capability idea
+/// applied at derivation time. UIDs are untouched, so flipping a source's mode
+/// UPDATES its events in place (the diff sees changed titles, not new events).
+fn projection_config() -> std::collections::BTreeMap<String, String> {
+    let Some(path) = std::env::var("IKIGAI_CALENDAR_CONFIG")
+        .map(PathBuf::from)
+        .ok()
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|home| Path::new(&home).join(".config/ikigai/calendar.json"))
+        })
+    else {
+        return Default::default();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Default::default();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Default::default();
+    };
+    v["project"]
+        .as_object()
+        .map(|map| {
+            map.iter()
+                .filter_map(|(source, mode)| mode.as_str().map(|m| (source.clone(), m.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Apply a source's projection mode to its event graph (Turtle in, Turtle out).
+/// `busy`: titles become "Busy (<source>)", locations are withheld. Anything
+/// else (or no mode) passes through untouched.
+fn project_source(turtle: String, source: &str, mode: Option<&str>) -> String {
+    if mode != Some("busy") {
+        return turtle;
+    }
+    let events = events_by_uid(&turtle);
+    let mut out = String::from(
+        "@prefix ical: <http://www.w3.org/2002/12/cal/ical#> .\n\
+         @prefix ik: <https://ikigai-rs.dev/ns#> .\n",
+    );
+    for event in events.values() {
+        let mut props = vec![
+            "a ical:Vevent".to_string(),
+            format!("ical:uid {}", view_ttl_str(&event.uid)),
+            format!("ical:summary {}", view_ttl_str(&format!("Busy ({source})"))),
+            format!("ical:dtstart {}", view_ttl_str(&event.start)),
+            format!("ical:dtend {}", view_ttl_str(&event.end)),
+            format!("ik:calendar {}", view_ttl_str(source)),
+        ];
+        if event.all_day {
+            props.push("ik:allDay true".to_string());
+        }
+        out.push_str(&format!(
+            "\n<urn:event:{}> {} .\n",
+            event.uid.replace(['<', '>', ' '], "-"),
+            props.join(" ;\n    ")
+        ));
+    }
+    out
+}
+
+fn view_ttl_str(s: &str) -> String {
+    format!(
+        "\"{}\"",
+        s.replace('\\', "\\\\")
+            .replace('\"', "\\\"")
+            .replace('\n', " ")
+    )
+}
+
 /// `urn:view:derive` — one materialization pass of the consolidated view (the
 /// Brian-Busy plan's P4): desired = org agenda ∪ the allowlisted source
 /// calendars (this year); current = the view calendar; the delta comes from
@@ -935,6 +1010,7 @@ impl Endpoint for DeriveEndpoint {
                 .await?;
             desired.push_str(&String::from_utf8_lossy(&org.bytes));
         }
+        let projections = projection_config();
         for source in &config.sources {
             let part = inv
                 .issue(
@@ -948,7 +1024,11 @@ impl Endpoint for DeriveEndpoint {
                     ),
                 )
                 .await?;
-            desired.push_str(&String::from_utf8_lossy(&part.bytes));
+            desired.push_str(&project_source(
+                String::from_utf8_lossy(&part.bytes).to_string(),
+                source,
+                projections.get(source).map(String::as_str),
+            ));
         }
 
         // CURRENT: what the view calendar holds now.
