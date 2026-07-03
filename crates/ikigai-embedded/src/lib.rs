@@ -662,6 +662,430 @@ fn org_config() -> Option<(PathBuf, Vec<String>)> {
     Some((dir, files))
 }
 
+/// One event as the deriver applies it, lifted from the skolemized graph.
+#[derive(Clone, Debug, PartialEq)]
+struct ViewEvent {
+    uid: String,
+    title: String,
+    start: String,
+    end: String,
+    all_day: bool,
+    location: Option<String>,
+}
+
+/// Parse a skolemized event graph (Turtle) into events keyed by uid.
+fn events_by_uid(turtle: &str) -> std::collections::BTreeMap<String, ViewEvent> {
+    const ICAL: &str = "http://www.w3.org/2002/12/cal/ical#";
+    const IK: &str = "https://ikigai-rs.dev/ns#";
+    let mut props: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> =
+        Default::default();
+    for quad in
+        oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle).for_slice(turtle.as_bytes())
+    {
+        let Ok(quad) = quad else { continue };
+        let oxrdf::NamedOrBlankNode::NamedNode(subject) = &quad.subject else {
+            continue;
+        };
+        let Some(uid) = subject.as_str().strip_prefix("urn:event:") else {
+            continue;
+        };
+        let value = match &quad.object {
+            oxrdf::Term::Literal(l) => l.value().to_string(),
+            oxrdf::Term::NamedNode(n) => n.as_str().to_string(),
+            _ => continue,
+        };
+        props
+            .entry(uid.to_string())
+            .or_default()
+            .insert(quad.predicate.as_str().to_string(), value);
+    }
+    props
+        .into_iter()
+        .filter_map(|(uid, p)| {
+            Some((
+                uid.clone(),
+                ViewEvent {
+                    // the ical:uid literal is authoritative (subjects are IRI-safe
+                    // mangled); fall back to the subject-derived uid
+                    uid: p.get(&format!("{ICAL}uid")).cloned().unwrap_or(uid),
+                    title: p.get(&format!("{ICAL}summary")).cloned()?,
+                    start: p.get(&format!("{ICAL}dtstart")).cloned()?,
+                    end: p.get(&format!("{ICAL}dtend")).cloned()?,
+                    all_day: p
+                        .get(&format!("{IK}allDay"))
+                        .map(|v| v == "true")
+                        .unwrap_or(false),
+                    location: p.get(&format!("{ICAL}location")).cloned(),
+                },
+            ))
+        })
+        .collect()
+}
+
+/// `urn:view:ingest` — drain the phone-capture inbox (config `inbox`, e.g.
+/// Brian-New) into the org system of record: each event becomes an org heading
+/// (its iCal UID recorded as `:ID:`, which the org parser prefers — one
+/// identity from capture to Brian-Busy), APPENDED through the kernel to the
+/// first configured org file, then deleted from the inbox. Append-then-delete
+/// + skip-if-ID-present make a crash between the two harmless.
+struct IngestEndpoint;
+
+#[async_trait::async_trait]
+impl Endpoint for IngestEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let Some(config) = calendar_config() else {
+            return Err(Error::Endpoint(
+                "urn:view:ingest: no calendar config — see urn:personal:calendar:config"
+                    .to_string(),
+            ));
+        };
+        let Some(inbox) = &config.inbox else {
+            return Ok(Representation::new(
+                ReprType::new("text/plain").with_param("charset", "utf-8"),
+                b"no inbox configured - nothing to ingest
+"
+                .to_vec(),
+            ));
+        };
+        let Some((_, files)) = org_config() else {
+            return Err(Error::Endpoint(
+                "urn:view:ingest: no org_files configured".to_string(),
+            ));
+        };
+        let Some(target) = files.first() else {
+            return Err(Error::Endpoint(
+                "urn:view:ingest: org_files is empty".to_string(),
+            ));
+        };
+
+        // The inbox's events (this year), as the same graph everything speaks.
+        let captured = inv
+            .issue(
+                Request::new(
+                    Verb::Source,
+                    Iri::parse("urn:personal:calendar:year").expect("valid IRI"),
+                )
+                .with_arg(
+                    "calendar",
+                    ikigai_core::ArgRef::Inline(inbox.as_bytes().to_vec()),
+                )
+                .with_arg("as", ikigai_core::ArgRef::Inline(b"text/turtle".to_vec())),
+            )
+            .await?;
+        let events = events_by_uid(&String::from_utf8_lossy(&captured.bytes));
+        if events.is_empty() {
+            return Ok(Representation::new(
+                ReprType::new("text/plain").with_param("charset", "utf-8"),
+                format!(
+                    "{inbox}: empty - nothing to ingest
+"
+                )
+                .into_bytes(),
+            ));
+        }
+
+        // Read the target org file through the kernel (same jailed space the
+        // agenda reads), append a heading per event, write it back, THEN drain.
+        let target_iri = Iri::parse(target.as_str())
+            .map_err(|e| Error::Endpoint(format!("urn:view:ingest: bad org IRI: {e}")))?;
+        let current = inv.source(&target_iri).await?;
+        let mut org = String::from_utf8_lossy(&current.bytes).to_string();
+
+        let mut ingested = 0usize;
+        let mut drained = 0usize;
+        for event in events.values() {
+            // Idempotency: an ID already in the file was ingested by an earlier
+            // (possibly crashed) pass — just drain the inbox copy.
+            if !org.contains(&format!(":ID: {}", event.uid)) {
+                org.push_str(&org_heading(event));
+                ingested += 1;
+            }
+        }
+        if ingested > 0 {
+            inv.issue(
+                Request::new(Verb::Sink, target_iri.clone())
+                    .with_arg("content", ikigai_core::ArgRef::Inline(org.into_bytes())),
+            )
+            .await?;
+        }
+        // Only after the org write landed: drain the inbox.
+        for event in events.values() {
+            let request = Request::new(
+                Verb::Delete,
+                Iri::parse("urn:personal:calendar").expect("valid IRI"),
+            )
+            .with_arg(
+                "calendar",
+                ikigai_core::ArgRef::Inline(inbox.as_bytes().to_vec()),
+            )
+            .with_arg(
+                "uid",
+                ikigai_core::ArgRef::Inline(event.uid.as_bytes().to_vec()),
+            )
+            .with_arg(
+                "start",
+                ikigai_core::ArgRef::Inline(event.start.as_bytes().to_vec()),
+            );
+            inv.issue(request).await?;
+            drained += 1;
+        }
+        Ok(Representation::new(
+            ReprType::new("text/plain").with_param("charset", "utf-8"),
+            format!(
+                "{inbox}: ingested {ingested} into {target} · drained {drained}
+"
+            )
+            .into_bytes(),
+        ))
+    }
+
+    fn name(&self) -> &str {
+        "view-ingest"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("view-ingest")
+            .title("Ingest the capture inbox")
+            .summary(
+                "Drain the phone-capture inbox calendar into the org system of record:                  each event becomes an org heading (:ID: = its iCal UID, one identity                  from capture to the consolidated view), appended through the kernel,                  then removed from the inbox. Idempotent; derive runs it first.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .output("text/plain;charset=utf-8")
+    }
+}
+
+/// One captured event as an org heading: title, a `:PROPERTIES:` drawer carrying
+/// the identity, and an active timestamp the agenda parser round-trips.
+fn org_heading(event: &ViewEvent) -> String {
+    let stamp = org_stamp(event);
+    format!(
+        "\n* {}\n  :PROPERTIES:\n  :ID: {}\n  :END:\n  {stamp}\n",
+        event.title, event.uid
+    )
+}
+
+fn org_stamp(event: &ViewEvent) -> String {
+    let date = event
+        .start
+        .split_once('T')
+        .map(|(d, _)| d)
+        .unwrap_or(&event.start);
+    let day = date
+        .parse::<chrono::NaiveDate>()
+        .map(|d| d.format("%a").to_string())
+        .unwrap_or_default();
+    if event.all_day {
+        return format!("<{date} {day}>");
+    }
+    let hhmm = |s: &str| {
+        s.split_once('T')
+            .map(|(_, t)| t[..5.min(t.len())].to_string())
+            .unwrap_or_default()
+    };
+    format!("<{date} {day} {}-{}>", hhmm(&event.start), hhmm(&event.end))
+}
+
+/// `urn:view:derive` — one materialization pass of the consolidated view (the
+/// Brian-Busy plan's P4): desired = org agenda ∪ the allowlisted source
+/// calendars (this year); current = the view calendar; the delta comes from
+/// `urn:rdf:diff` THROUGH the kernel; apply = Delete the gone/changed, Sink the
+/// new/changed (identity carried as urn:event:{uid} — the round-trip that makes
+/// this idempotent). Drive it on a timer: `source urn:time:schedule
+/// target=urn:view:derive every=300s`.
+struct DeriveEndpoint;
+
+#[async_trait::async_trait]
+impl Endpoint for DeriveEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let Some(config) = calendar_config() else {
+            return Err(Error::Endpoint(
+                "urn:view:derive: no calendar config — see urn:personal:calendar:config"
+                    .to_string(),
+            ));
+        };
+        // Drain the capture inbox into org FIRST, so a phone capture reaches the
+        // consolidated view in the same pass. Failure here must not block the
+        // derivation (the inbox may be mid-sync); it reports on the next tick.
+        let _ = inv
+            .issue(Request::new(
+                Verb::Source,
+                Iri::parse("urn:view:ingest").expect("valid IRI"),
+            ))
+            .await;
+
+        let turtle_of = |mut request: Request| {
+            request = request.with_arg("as", ikigai_core::ArgRef::Inline(b"text/turtle".to_vec()));
+            request
+        };
+
+        // DESIRED: the org agenda plus each allowlisted source calendar, this
+        // year. Concatenated Turtle is legal (re-declared prefixes are fine);
+        // the diff parses it with set semantics.
+        let mut desired = String::new();
+        if org_config()
+            .map(|(_, files)| !files.is_empty())
+            .unwrap_or(false)
+        {
+            let org = inv
+                .issue(turtle_of(Request::new(
+                    Verb::Source,
+                    Iri::parse("urn:org:agenda:year").expect("valid IRI"),
+                )))
+                .await?;
+            desired.push_str(&String::from_utf8_lossy(&org.bytes));
+        }
+        for source in &config.sources {
+            let part = inv
+                .issue(
+                    turtle_of(Request::new(
+                        Verb::Source,
+                        Iri::parse("urn:personal:calendar:year").expect("valid IRI"),
+                    ))
+                    .with_arg(
+                        "calendar",
+                        ikigai_core::ArgRef::Inline(source.as_bytes().to_vec()),
+                    ),
+                )
+                .await?;
+            desired.push_str(&String::from_utf8_lossy(&part.bytes));
+        }
+
+        // CURRENT: what the view calendar holds now.
+        let current = inv
+            .issue(
+                turtle_of(Request::new(
+                    Verb::Source,
+                    Iri::parse("urn:personal:calendar:year").expect("valid IRI"),
+                ))
+                .with_arg(
+                    "calendar",
+                    ikigai_core::ArgRef::Inline(config.view.as_bytes().to_vec()),
+                ),
+            )
+            .await?;
+        let current = String::from_utf8_lossy(&current.bytes).to_string();
+
+        // THE DELTA — urn:rdf:diff through the kernel, both directions.
+        let diff = |mode: &'static str, a: String, b: String| {
+            Request::new(Verb::Source, Iri::parse("urn:rdf:diff").expect("valid IRI"))
+                .with_arg("content", ikigai_core::ArgRef::Inline(a.into_bytes()))
+                .with_arg("with", ikigai_core::ArgRef::Inline(b.into_bytes()))
+                .with_arg(
+                    "mode",
+                    ikigai_core::ArgRef::Inline(mode.as_bytes().to_vec()),
+                )
+        };
+        let added = inv
+            .issue(diff("added", desired.clone(), current.clone()))
+            .await?;
+        let removed = inv
+            .issue(diff("removed", desired.clone(), current.clone()))
+            .await?;
+
+        // Subjects in `removed` = gone or changed -> Delete (data from CURRENT).
+        // Subjects in `added` = new or changed -> Sink (data from DESIRED).
+        // A changed event is in both: delete first, recreate after = an update.
+        let desired_events = events_by_uid(&desired);
+        let current_events = events_by_uid(&current);
+        let to_delete: Vec<&ViewEvent> = events_by_uid(&String::from_utf8_lossy(&removed.bytes))
+            .keys()
+            .filter_map(|uid| current_events.get(uid))
+            .collect();
+        let to_create: Vec<&ViewEvent> = events_by_uid(&String::from_utf8_lossy(&added.bytes))
+            .keys()
+            .filter_map(|uid| desired_events.get(uid))
+            .collect();
+
+        let mut deleted = 0usize;
+        for event in &to_delete {
+            let request = Request::new(
+                Verb::Delete,
+                Iri::parse("urn:personal:calendar").expect("valid IRI"),
+            )
+            .with_arg(
+                "calendar",
+                ikigai_core::ArgRef::Inline(config.view.as_bytes().to_vec()),
+            )
+            .with_arg(
+                "uid",
+                ikigai_core::ArgRef::Inline(event.uid.as_bytes().to_vec()),
+            )
+            .with_arg(
+                "start",
+                ikigai_core::ArgRef::Inline(event.start.as_bytes().to_vec()),
+            );
+            inv.issue(request).await?;
+            deleted += 1;
+        }
+        let mut created = 0usize;
+        for event in &to_create {
+            let mut request = Request::new(
+                Verb::Sink,
+                Iri::parse("urn:personal:calendar").expect("valid IRI"),
+            )
+            .with_arg(
+                "calendar",
+                ikigai_core::ArgRef::Inline(config.view.as_bytes().to_vec()),
+            )
+            .with_arg(
+                "title",
+                ikigai_core::ArgRef::Inline(event.title.as_bytes().to_vec()),
+            )
+            .with_arg(
+                "start",
+                ikigai_core::ArgRef::Inline(event.start.as_bytes().to_vec()),
+            )
+            .with_arg(
+                "end",
+                ikigai_core::ArgRef::Inline(event.end.as_bytes().to_vec()),
+            )
+            .with_arg(
+                "uid",
+                ikigai_core::ArgRef::Inline(event.uid.as_bytes().to_vec()),
+            );
+            if event.all_day {
+                request =
+                    request.with_arg("all_day", ikigai_core::ArgRef::Inline(b"true".to_vec()));
+            }
+            if let Some(location) = &event.location {
+                request = request.with_arg(
+                    "location",
+                    ikigai_core::ArgRef::Inline(location.as_bytes().to_vec()),
+                );
+            }
+            inv.issue(request).await?;
+            created += 1;
+        }
+
+        let unchanged = current_events.len().saturating_sub(deleted);
+        Ok(Representation::new(
+            ReprType::new("text/plain").with_param("charset", "utf-8"),
+            format!(
+                "{}: created {created} · removed {deleted} · unchanged {unchanged}
+",
+                config.view
+            )
+            .into_bytes(),
+        ))
+    }
+
+    fn name(&self) -> &str {
+        "view-derive"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("view-derive")
+            .title("Derive the consolidated view")
+            .summary(
+                "One materialization pass: desired (org agenda ∪ the configured source                  calendars, this year) minus current (the view calendar) via urn:rdf:diff —                  gone/changed events deleted, new/changed created, identity carried as                  urn:event:{uid} so the pass is idempotent. Drive it on a timer.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .output("text/plain;charset=utf-8")
+    }
+}
+
 fn local_space(nature: &'static str) -> EndpointSpace {
     base_space(nature)
         .bind(
@@ -684,6 +1108,8 @@ fn local_space(nature: &'static str) -> EndpointSpace {
             Exact::new("urn:personal:calendar:config"),
             ikigai_personal::calendar_config(calendar_config()),
         )
+        .bind(Exact::new("urn:view:derive"), DeriveEndpoint)
+        .bind(Exact::new("urn:view:ingest"), IngestEndpoint)
         // AFTER the exact binds: the period grammar must not shadow
         // urn:personal:calendar:config (first grammar match wins).
         .bind(
@@ -1286,7 +1712,59 @@ pub fn watched_kernel() -> Arc<Kernel> {
         ikigai_time::Schedule::Every(std::time::Duration::from_secs(1)),
         true,
     );
+    // The standing sync: when calendar.json sets `derive_every` (e.g. "300s",
+    // "5m"), register the consolidated-view derivation as a PERSISTENT job —
+    // the clock pattern. Any long-running session (REPL, --daemon) then keeps
+    // Brian-Busy fresh; it shows on the Control tab's Time-jobs readout.
+    if let Some(every) = derive_every() {
+        let _ = registry.schedule_persistent(
+            "urn:view:derive".to_string(),
+            Verb::Source,
+            ikigai_time::Schedule::Every(every),
+            true,
+        );
+    }
     kernel
+}
+
+/// This process's INSTANCE NAME — the key config properties are scoped by
+/// (`<name>.derive_every`), so behavior attaches to a named instance, never to
+/// the binary: a REPL is "repl", the headless agent "daemon", a served kernel
+/// "serve", and `--name` mints others. First write wins; defaults to "repl".
+pub fn set_instance_name(name: impl Into<String>) {
+    let _ = INSTANCE_NAME.set(name.into());
+}
+
+fn instance_name() -> &'static str {
+    INSTANCE_NAME.get().map(String::as_str).unwrap_or("repl")
+}
+
+static INSTANCE_NAME: OnceLock<String> = OnceLock::new();
+
+/// `<instance>.derive_every` from calendar.json — "300s" / "5m" / "1h". SCOPED
+/// ONLY: the standing sync starts on instances explicitly named in the config
+/// (a server without `serve.derive_every` never touches the calendar); an
+/// unscoped `derive_every` is deliberately ignored.
+fn derive_every() -> Option<std::time::Duration> {
+    let path = std::env::var("IKIGAI_CALENDAR_CONFIG")
+        .map(PathBuf::from)
+        .ok()
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|home| Path::new(&home).join(".config/ikigai/calendar.json"))
+        })?;
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let spec = v[format!("{}.derive_every", instance_name())].as_str()?;
+    let (digits, unit) = spec.split_at(spec.len().saturating_sub(1));
+    let n: u64 = digits.parse().ok()?;
+    let seconds = match unit {
+        "s" => n,
+        "m" => n * 60,
+        "h" => n * 3600,
+        _ => return None,
+    };
+    (seconds >= 30).then(|| std::time::Duration::from_secs(seconds))
 }
 
 /// Watch `root` recursively; on any out-of-band change, cut `urn:file:<rel>` so the

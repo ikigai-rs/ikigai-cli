@@ -30,6 +30,9 @@ usage:
   ikigai --demo                mount the interactive runbook (urn:runbook:*); off by default
   ikigai --connect [<target>]  attach the REPL to a kernel server (a Unix path, or quic://host:port)
   ikigai serve [<target>]      run a kernel server (a Unix socket path, or quic://addr to bind)
+  ikigai --daemon              headless: timers, the watcher, and the standing sync — for launchd
+  ikigai --name <instance>     name this instance (scopes <name>.* config properties; defaults
+                               repl / daemon / serve by mode)
   ikigai cert generate         create the pinned QUIC certificates in your config dir
   ikigai -c '<command>' ...    run command(s) non-interactively, then exit
   ikigai -h | --help           show this help
@@ -51,6 +54,9 @@ struct Certs {
 /// What the CLI was asked to do.
 enum Mode {
     Repl(ReplArgs),
+    /// Headless: build the watched kernel (timers, watcher, the standing sync)
+    /// and park — the launchd-agent face of the desktop machine.
+    Daemon,
     Serve {
         target: Option<String>,
         certs: Certs,
@@ -152,6 +158,13 @@ fn parse_args() -> Result<Option<Mode>, String> {
             "-h" | "--help" => return Ok(None),
             "--plain" => repl.plain = true,
             "--demo" => repl.demo = true,
+            "--daemon" => return Ok(Some(Mode::Daemon)),
+            "--name" => {
+                let name = argv
+                    .next()
+                    .ok_or_else(|| "--name needs a value".to_string())?;
+                ikigai_embedded::set_instance_name(name);
+            }
             "--connect" => {
                 // Optional target: take the next token unless it looks like a flag.
                 let target = match argv.peek() {
@@ -186,7 +199,17 @@ fn main() {
         }
     };
 
+    // The default instance name follows the mode; an explicit --name (already
+    // set during parsing) wins because set_instance_name is first-write-wins.
+    #[cfg(feature = "embedded")]
+    ikigai_embedded::set_instance_name(match &mode {
+        Mode::Daemon => "daemon",
+        Mode::Serve { .. } => "serve",
+        _ => "repl",
+    });
+
     match mode {
+        Mode::Daemon => daemon(),
         Mode::CertGenerate { force } => cert_generate(force),
         Mode::Serve { target, certs } => match target.as_deref() {
             Some(t) if is_quic(t) => serve_quic(t, &certs),
@@ -205,6 +228,25 @@ fn main() {
             run_repl(engine, args.plain, &args.commands);
         }
     }
+}
+
+/// Headless mode: build the watched kernel — the filesystem watcher, the time
+/// transport, and (via calendar.json's `derive_every`) the standing
+/// consolidated-view sync all live in it — then park. This is what a
+/// LaunchAgent runs: the desktop machine as a quiet, always-on resolver.
+#[cfg(feature = "embedded")]
+fn daemon() {
+    let _kernel = ikigai_embedded::kernel_for("Daemon");
+    eprintln!("ikigai: daemon up — timers and the filesystem watcher are live (Ctrl-C to stop)");
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
+#[cfg(not(feature = "embedded"))]
+fn daemon() {
+    eprintln!("ikigai: --daemon requires the embedded feature");
+    std::process::exit(2);
 }
 
 /// Register the demo capability profiles on an engine (so `cap freebusy` reads
