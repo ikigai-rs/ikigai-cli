@@ -252,7 +252,7 @@ fn daemon() {
     // kernel handle, and the standing-sync registration all live in the
     // watched constructor — a bare served-space kernel would park with the
     // banner up and nothing actually scheduled.
-    let _kernel = ikigai_embedded::watched_kernel();
+    let kernel = ikigai_embedded::watched_kernel();
     let name = ikigai_embedded::instance_name();
     match ikigai_embedded::standing_sync_interval() {
         Some(every) => eprintln!(
@@ -263,6 +263,11 @@ fn daemon() {
             "ikigai: daemon up — instance \"{name}\": no \"{name}.derive_every\" in calendar.json — IDLE (Ctrl-C to stop)"
         ),
     }
+    // Catch up immediately: the interval timer waits a full period before its
+    // first pass, and a daemon coming up after downtime is exactly when a
+    // derive is most wanted (it also makes a fresh deploy verifiable now, not
+    // in five minutes).
+    ikigai_embedded::startup_derive(&kernel);
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3600));
     }
