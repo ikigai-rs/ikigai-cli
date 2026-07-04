@@ -1872,8 +1872,16 @@ pub fn set_instance_name(name: impl Into<String>) {
     let _ = INSTANCE_NAME.set(name.into());
 }
 
-fn instance_name() -> &'static str {
+/// This process's instance name (see [`set_instance_name`]).
+pub fn instance_name() -> &'static str {
     INSTANCE_NAME.get().map(String::as_str).unwrap_or("repl")
+}
+
+/// The standing-sync registration, for hosts that report their own startup
+/// state: `Some(interval)` when `<instance>.derive_every` matched this
+/// instance's name in calendar.json, `None` when this instance is idle.
+pub fn standing_sync_interval() -> Option<std::time::Duration> {
+    derive_every()
 }
 
 static INSTANCE_NAME: OnceLock<String> = OnceLock::new();

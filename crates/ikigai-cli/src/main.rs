@@ -138,6 +138,14 @@ fn parse_args() -> Result<Option<Mode>, String> {
             if cert_flag(&arg, &mut argv, &mut certs)? {
                 continue;
             }
+            if arg == "--name" {
+                let name = argv
+                    .next()
+                    .ok_or_else(|| "--name needs a value".to_string())?;
+                #[cfg(feature = "embedded")]
+                ikigai_embedded::set_instance_name(name);
+                continue;
+            }
             if arg.starts_with('-') {
                 return Err(format!("unknown argument: {arg}"));
             } else if target.is_none() {
@@ -150,6 +158,7 @@ fn parse_args() -> Result<Option<Mode>, String> {
     }
 
     let mut repl = ReplArgs::default();
+    let mut daemon = false;
     while let Some(arg) = argv.next() {
         if cert_flag(&arg, &mut argv, &mut repl.certs)? {
             continue;
@@ -158,7 +167,7 @@ fn parse_args() -> Result<Option<Mode>, String> {
             "-h" | "--help" => return Ok(None),
             "--plain" => repl.plain = true,
             "--demo" => repl.demo = true,
-            "--daemon" => return Ok(Some(Mode::Daemon)),
+            "--daemon" => daemon = true,
             "--name" => {
                 let name = argv
                     .next()
@@ -181,6 +190,9 @@ fn parse_args() -> Result<Option<Mode>, String> {
             }
             other => return Err(format!("unknown argument: {other}")),
         }
+    }
+    if daemon {
+        return Ok(Some(Mode::Daemon));
     }
     Ok(Some(Mode::Repl(repl)))
 }
@@ -237,7 +249,16 @@ fn main() {
 #[cfg(feature = "embedded")]
 fn daemon() {
     let _kernel = ikigai_embedded::kernel_for("Daemon");
-    eprintln!("ikigai: daemon up — timers and the filesystem watcher are live (Ctrl-C to stop)");
+    let name = ikigai_embedded::instance_name();
+    match ikigai_embedded::standing_sync_interval() {
+        Some(every) => eprintln!(
+            "ikigai: daemon up — instance \"{name}\": standing sync every {}s + watchers (Ctrl-C to stop)",
+            every.as_secs()
+        ),
+        None => eprintln!(
+            "ikigai: daemon up — instance \"{name}\": no \"{name}.derive_every\" in calendar.json — IDLE (Ctrl-C to stop)"
+        ),
+    }
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3600));
     }
