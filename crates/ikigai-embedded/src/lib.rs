@@ -1926,6 +1926,27 @@ pub fn standing_sync_interval() -> Option<std::time::Duration> {
     derive_every()
 }
 
+/// One immediate standing-sync pass, for a host that just came up: a daemon
+/// restarting after downtime shouldn't wait a full interval to catch up on
+/// what it missed. Reports under its own `startup →` label, like each watcher
+/// does. No-op when the standing sync isn't registered for this instance.
+pub fn startup_derive(kernel: &Arc<Kernel>) {
+    if derive_every().is_none() {
+        return;
+    }
+    let request = Request::new(
+        Verb::Source,
+        Iri::parse("urn:view:derive").expect("valid IRI"),
+    );
+    match ikigai_resolve::Resolver::issue(kernel.as_ref(), request) {
+        Ok((report, _)) => eprintln!(
+            "ikigai: startup → {}",
+            String::from_utf8_lossy(&report.bytes).trim()
+        ),
+        Err(e) => eprintln!("ikigai: startup → derive failed: {e}"),
+    }
+}
+
 static INSTANCE_NAME: OnceLock<String> = OnceLock::new();
 
 /// `<instance>.derive_every` from calendar.json — "300s" / "5m" / "1h". SCOPED
