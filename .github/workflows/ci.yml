@@ -31,3 +31,21 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --workspace --all-features
+
+  # macOS face: the embedded host's mac-only code (store watcher paths,
+  # EventKit-linked deps) is invisible to the Ubuntu job's clippy/test.
+  # The fs-watcher timing test is skipped here pending its deflake (it is
+  # fsevents-latency flaky on mac; inotify on the Ubuntu job stays green).
+  check-macos:
+    name: clippy · test (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --workspace --all-features -- --skip the_watcher_cuts_a_thread

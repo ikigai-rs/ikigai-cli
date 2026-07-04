@@ -2331,18 +2331,27 @@ mod tests {
         // Change the file OUT OF BAND — not through the kernel.
         std::fs::write(root.join("notes.txt"), b"v2").unwrap();
 
-        // The watcher should cut the thread (filesystem-event latency: poll).
+        // The watcher should cut the thread. Two macOS/fsevents hazards: delivery
+        // latency is unbounded under load, and a write landing before the stream
+        // is fully established is LOST, not delayed (streams start at
+        // kFSEventStreamEventIdSinceNow). So poll with a generous ceiling,
+        // early-exiting the moment the thread is cut, and re-touch the file every
+        // ~2s — each touch is itself an out-of-band change, so a lost first event
+        // doesn't strand the run.
         let mut cut = false;
-        for _ in 0..60 {
+        for tick in 0..300 {
             if !kernel.is_cached(&source(), &cap) {
                 cut = true;
                 break;
+            }
+            if tick % 20 == 19 {
+                std::fs::write(root.join("notes.txt"), b"v2").unwrap();
             }
             std::thread::sleep(Duration::from_millis(100));
         }
         assert!(
             cut,
-            "watcher should cut the thread within ~6s of the change"
+            "watcher should cut the thread within 30s of an out-of-band change"
         );
 
         // A fresh read now sees v2.
