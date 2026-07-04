@@ -13,6 +13,7 @@ This repository carries the transport dependencies, keeping
 cargo run --bin ikigai          # full-screen TUI on a terminal
 cargo run --bin ikigai -- --plain   # line REPL (also used automatically when piped)
 cargo run --bin ikigai -- -c 'source urn:fn:toUpper hello'   # run and exit (one-shot)
+cargo run --bin ikigai -- --daemon  # headless kernel: timers + watchers, no REPL
 ```
 
 `-c '<command>'` runs a command non-interactively and exits — repeat it to run
@@ -100,7 +101,10 @@ Hi, c
 Because the split is contract-driven, an `=` in ordinary input is harmless when
 the key isn't a declared argument (`source urn:fn:toUpper a=b` → `A=B`). If a
 positional value is left over with no unnamed argument to take it — or two
-arguments are unnamed and only one value is given — `source` says so.
+arguments are unnamed and only one value is given — `source` says so. A named
+value can be quoted to carry whitespace — `title="Dinner with the Hendersons"`
+stays one argument (`\"` and `\\` escape inside the quotes); an undeclared key
+or an unterminated quote falls back to ordinary positional input.
 
 **Pipelines.** `source a [input] | b | c` feeds each stage's output into the next
 as its input (the first stage may take a literal input; later stages get the pipe):
@@ -237,6 +241,52 @@ terminal default, which is Emacs on every supported OS — a terminal can't capt
 OS GUI shortcuts (⌘C etc.), so terminal-native editing *is* readline/Emacs. The
 demo space is composed in `ikigai-embedded`; a real host binds its own
 endpoints there.
+
+## Instance names and the daemon
+
+Every process has an **instance name** — `repl`, `serve`, or `daemon` by mode,
+or `--name <x>` to override — and configuration can be **scoped to a name**:
+a `<name>.key` property applies only to the instance so named. Scoped-only is
+deliberate (explicit beats ambient): a kernel server you spin up for something
+else never starts a background job just because a config file exists.
+
+`ikigai --daemon` runs the embedded kernel headless — persistent timers and
+filesystem watchers stay live, nothing is printed but their output — which is
+the shape a LaunchAgent/systemd unit wants.
+
+## The consolidated calendar (the embedded host's standing job)
+
+The embedded host wires the [`ikigai-personal`](https://github.com/ikigai-rs/ikigai-personal)
+calendar, the [`ikigai-org`](https://github.com/ikigai-rs/ikigai-org) agenda,
+and `urn:rdf:diff` into a **derived-calendar pipeline**, configured by
+`~/.config/ikigai/calendar.json` (or `$IKIGAI_CALENDAR_CONFIG`):
+
+```json
+{ "view": "Brian-Busy", "account": "iCloud",
+  "sources": ["Brian", "Bosatsu"], "inbox": "Brian-New",
+  "org_dir": "~/Dropbox/org-mode-files", "org_files": ["calendar.org"],
+  "repl.derive_every": "300s", "daemon.derive_every": "300s" }
+```
+
+- **`urn:view:derive`** — one materialization pass: desired (the org agenda ∪
+  each source calendar, over a rolling `today−7d..today+400d` window) minus
+  current (the view calendar) via `urn:rdf:diff`; gone/changed events deleted,
+  new/changed created. Identity rides as `urn:event:{uid}`, so the pass is
+  idempotent and alarms (`:ALERT: 1h 1d` in org → `ik:alert` → `EKAlarm`)
+  survive the round-trip.
+- **`urn:view:ingest`** — drains the capture-inbox calendar into the first org
+  file (heading + `:ID:` drawer + `:ALERT:` line + round-trippable timestamp),
+  then deletes the inbox copies; derive runs it first each pass.
+- **Freshness** — `<name>.derive_every` registers a persistent timer, and two
+  watchers make it event-driven from both directions: the org directory
+  (your edits, incl. Dropbox arrivals) and the calendar store (the world's —
+  an invitation lands, the view re-derives within seconds).
+- A per-source projection (`"project": {"Bosatsu": "busy"}`) renders that
+  source as `Busy (Bosatsu)` — titles, locations, and alarms withheld.
+
+macOS note: calendar access is TCC-gated per *hosting* process — terminal
+launches prompt normally; a non-bundled binary under launchd may be silently
+denied.
 
 ## Crates
 The engine drives a `Resolver` — the seam in `ikigai-resolve` (`issue` / `is_cached`
