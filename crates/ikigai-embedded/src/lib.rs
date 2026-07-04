@@ -671,6 +671,8 @@ struct ViewEvent {
     end: String,
     all_day: bool,
     location: Option<String>,
+    /// Alarms: minutes before start (ik:alert, multi-valued).
+    alerts: Vec<u32>,
 }
 
 /// Parse a skolemized event graph (Turtle) into events keyed by uid.
@@ -679,6 +681,7 @@ fn events_by_uid(turtle: &str) -> std::collections::BTreeMap<String, ViewEvent> 
     const IK: &str = "https://ikigai-rs.dev/ns#";
     let mut props: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> =
         Default::default();
+    let mut alert_map: std::collections::BTreeMap<String, Vec<u32>> = Default::default();
     for quad in
         oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle).for_slice(turtle.as_bytes())
     {
@@ -694,6 +697,13 @@ fn events_by_uid(turtle: &str) -> std::collections::BTreeMap<String, ViewEvent> 
             oxrdf::Term::NamedNode(n) => n.as_str().to_string(),
             _ => continue,
         };
+        // ik:alert is MULTI-valued — collect separately from the single-valued props.
+        if quad.predicate.as_str() == "https://ikigai-rs.dev/ns#alert" {
+            if let Ok(minutes) = value.parse::<u32>() {
+                alert_map.entry(uid.to_string()).or_default().push(minutes);
+            }
+            continue;
+        }
         props
             .entry(uid.to_string())
             .or_default()
@@ -702,6 +712,9 @@ fn events_by_uid(turtle: &str) -> std::collections::BTreeMap<String, ViewEvent> 
     props
         .into_iter()
         .filter_map(|(uid, p)| {
+            let mut alerts = alert_map.get(&uid).cloned().unwrap_or_default();
+            alerts.sort_unstable();
+            alerts.dedup();
             Some((
                 uid.clone(),
                 ViewEvent {
@@ -716,6 +729,7 @@ fn events_by_uid(turtle: &str) -> std::collections::BTreeMap<String, ViewEvent> 
                         .map(|v| v == "true")
                         .unwrap_or(false),
                     location: p.get(&format!("{ICAL}location")).cloned(),
+                    alerts,
                 },
             ))
         })
@@ -758,12 +772,13 @@ impl Endpoint for IngestEndpoint {
             ));
         };
 
-        // The inbox's events (this year), as the same graph everything speaks.
+        // The inbox's events (the rolling window), as the graph everything speaks.
         let captured = inv
             .issue(
                 Request::new(
                     Verb::Source,
-                    Iri::parse("urn:personal:calendar:year").expect("valid IRI"),
+                    Iri::parse(format!("urn:personal:calendar:{}", derive_window()))
+                        .expect("valid IRI"),
                 )
                 .with_arg(
                     "calendar",
@@ -859,8 +874,14 @@ impl Endpoint for IngestEndpoint {
 /// the identity, and an active timestamp the agenda parser round-trips.
 fn org_heading(event: &ViewEvent) -> String {
     let stamp = org_stamp(event);
+    let alert = if event.alerts.is_empty() {
+        String::new()
+    } else {
+        let tokens: Vec<String> = event.alerts.iter().map(|m| alert_token(*m)).collect();
+        format!("  :ALERT: {}\n", tokens.join(" "))
+    };
     format!(
-        "\n* {}\n  :PROPERTIES:\n  :ID: {}\n  :END:\n  {stamp}\n",
+        "\n* {}\n  :PROPERTIES:\n  :ID: {}\n  :END:\n{alert}  {stamp}\n",
         event.title, event.uid
     )
 }
@@ -884,6 +905,30 @@ fn org_stamp(event: &ViewEvent) -> String {
             .unwrap_or_default()
     };
     format!("<{date} {day} {}-{}>", hhmm(&event.start), hhmm(&event.end))
+}
+
+/// The derivation window: a rolling `today-7d..today+400d` range rather than
+/// the calendar year, so a late-December derive still carries January into the
+/// view, and a week of just-past events survives for the diff to leave alone.
+fn derive_window() -> String {
+    let today = chrono::Local::now().date_naive();
+    format!(
+        "{}..{}",
+        today - chrono::Duration::days(7),
+        today + chrono::Duration::days(400)
+    )
+}
+
+/// Minutes-before-start as the friendly token both the org `:ALERT:` parser
+/// and the calendar `alert=` argument accept.
+fn alert_token(minutes: u32) -> String {
+    if minutes > 0 && minutes.is_multiple_of(1440) {
+        format!("{}d", minutes / 1440)
+    } else if minutes > 0 && minutes.is_multiple_of(60) {
+        format!("{}h", minutes / 60)
+    } else {
+        format!("{minutes}m")
+    }
 }
 
 /// The per-source detail projection from calendar.json: `"project":
@@ -920,8 +965,9 @@ fn projection_config() -> std::collections::BTreeMap<String, String> {
 }
 
 /// Apply a source's projection mode to its event graph (Turtle in, Turtle out).
-/// `busy`: titles become "Busy (<source>)", locations are withheld. Anything
-/// else (or no mode) passes through untouched.
+/// `busy`: titles become "Busy (<source>)", locations and alarms are withheld.
+/// Anything
+/// (or no mode) passes through untouched.
 fn project_source(turtle: String, source: &str, mode: Option<&str>) -> String {
     if mode != Some("busy") {
         return turtle;
@@ -994,9 +1040,9 @@ impl Endpoint for DeriveEndpoint {
             request
         };
 
-        // DESIRED: the org agenda plus each allowlisted source calendar, this
-        // year. Concatenated Turtle is legal (re-declared prefixes are fine);
-        // the diff parses it with set semantics.
+        // DESIRED: the org agenda plus each allowlisted source calendar, over
+        // the rolling window. Concatenated Turtle is legal (re-declared
+        // prefixes are fine); the diff parses it with set semantics.
         let mut desired = String::new();
         if org_config()
             .map(|(_, files)| !files.is_empty())
@@ -1005,7 +1051,7 @@ impl Endpoint for DeriveEndpoint {
             let org = inv
                 .issue(turtle_of(Request::new(
                     Verb::Source,
-                    Iri::parse("urn:org:agenda:year").expect("valid IRI"),
+                    Iri::parse(format!("urn:org:agenda:{}", derive_window())).expect("valid IRI"),
                 )))
                 .await?;
             desired.push_str(&String::from_utf8_lossy(&org.bytes));
@@ -1016,7 +1062,8 @@ impl Endpoint for DeriveEndpoint {
                 .issue(
                     turtle_of(Request::new(
                         Verb::Source,
-                        Iri::parse("urn:personal:calendar:year").expect("valid IRI"),
+                        Iri::parse(format!("urn:personal:calendar:{}", derive_window()))
+                            .expect("valid IRI"),
                     ))
                     .with_arg(
                         "calendar",
@@ -1036,7 +1083,8 @@ impl Endpoint for DeriveEndpoint {
             .issue(
                 turtle_of(Request::new(
                     Verb::Source,
-                    Iri::parse("urn:personal:calendar:year").expect("valid IRI"),
+                    Iri::parse(format!("urn:personal:calendar:{}", derive_window()))
+                        .expect("valid IRI"),
                 ))
                 .with_arg(
                     "calendar",
@@ -1134,6 +1182,13 @@ impl Endpoint for DeriveEndpoint {
                     ikigai_core::ArgRef::Inline(location.as_bytes().to_vec()),
                 );
             }
+            if !event.alerts.is_empty() {
+                let minutes: Vec<String> = event.alerts.iter().map(u32::to_string).collect();
+                request = request.with_arg(
+                    "alert",
+                    ikigai_core::ArgRef::Inline(minutes.join(",").into_bytes()),
+                );
+            }
             inv.issue(request).await?;
             created += 1;
         }
@@ -1158,7 +1213,7 @@ impl Endpoint for DeriveEndpoint {
         Description::new("view-derive")
             .title("Derive the consolidated view")
             .summary(
-                "One materialization pass: desired (org agenda ∪ the configured source                  calendars, this year) minus current (the view calendar) via urn:rdf:diff —                  gone/changed events deleted, new/changed created, identity carried as                  urn:event:{uid} so the pass is idempotent. Drive it on a timer.",
+                "One materialization pass: desired (org agenda ∪ the configured source                  calendars, over a rolling today-7d..+400d window) minus current (the view calendar) via urn:rdf:diff —                  gone/changed events deleted, new/changed created, identity carried as                  urn:event:{uid} so the pass is idempotent. Drive it on a timer.",
             )
             .verb(Verb::Source)
             .verb(Verb::Meta)
@@ -2148,6 +2203,37 @@ mod tests {
         );
         assert_eq!(file_thread(root, root), None); // the root itself
         assert_eq!(file_thread(root, Path::new("/elsewhere/x")), None);
+    }
+
+    #[test]
+    fn alerts_round_trip_from_graph_to_org_heading() {
+        // Multi-valued ik:alert on one subject → sorted/deduped minutes on the
+        // ViewEvent → a friendly `:ALERT:` line in the captured org heading.
+        let turtle = r#"@prefix ical: <http://www.w3.org/2002/12/cal/ical#> .
+@prefix ik: <https://ikigai-rs.dev/ns#> .
+<urn:event:abc> a ical:Vevent ;
+    ical:uid "abc" ;
+    ical:summary "Dentist" ;
+    ical:dtstart "2026-07-10T09:00:00" ;
+    ical:dtend "2026-07-10T10:00:00" ;
+    ik:alert 1440 ;
+    ik:alert 60 ;
+    ik:alert 60 .
+"#;
+        let events = events_by_uid(turtle);
+        let event = events.get("abc").expect("event parsed");
+        assert_eq!(event.alerts, vec![60, 1440], "sorted and deduped");
+
+        let heading = org_heading(event);
+        assert!(heading.contains(":ID: abc"));
+        assert!(
+            heading.contains(":ALERT: 1h 1d"),
+            "friendly tokens, not raw minutes: {heading}"
+        );
+
+        assert_eq!(alert_token(30), "30m");
+        assert_eq!(alert_token(90), "90m", "not a whole hour → minutes");
+        assert_eq!(alert_token(2880), "2d");
     }
 
     #[test]

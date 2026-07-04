@@ -14,11 +14,11 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 # The released kernel, consumed from crates.io. For local cross-repo development
 # against a sibling checkout, use .cargo/config.toml (see .cargo/config.toml.example).
 ikigai-core = "0.1.32" # urn:kernel:cache lists each entry (IRI · type · size · golden-thread count)
-ikigai-vocab = "0.1.22" # ikigai_vocab::space() — urn:ikigai:vocab resource
+ikigai-vocab = "0.1.33" # + event terms (ik:calendar/allDay/alert) + LLM trait terms
 # The reusable function library, linked in as a published module crate.
 ikigai-fn = "0.1.2" # + urn:fn:conditional (the lazy branch: if/then/else are URIs)
 # Personal contexts (urn:personal:*), macOS-backed, linked as a published module.
-ikigai-personal = "0.4.2" # event writes + identity round-trip + q= search + year + reused EKEventStore
+ikigai-personal = "0.5.0" # + store-observer API, range periods, event alerts (alert= / ik:alert)
 # Capability-gated file/store module, linked as a published module crate.
 ikigai-fs = "0.1.2"
 # Outbound HTTP-client module (urn:httpGet…), linked as a published module crate.
@@ -44,7 +44,7 @@ ikigai-shacl = "0.1.0"
 # The org-mode agenda (urn:org:agenda:{period}) — reads org files through the
 # kernel (urn:orgfile:*) and speaks the same skolemized event graph as the
 # calendar, so the two union/diff as graphs.
-ikigai-org = "0.1.1" # + q= title search + year period
+ikigai-org = "0.1.2" # + range periods, :ALERT:/:APPT_WARNTIME: -> ik:alert
 # LLM inference (urn:llm:ask + urn:llm:<provider>:ask + urn:llm:config): a facade grammar
 # over pluggable backends. OpenAI-compatible REST backend (Ollama/vLLM/llama.cpp/mlx_lm).
 ikigai-llm = "0.7.0" # installed: smallest-first with sizes (host co-load budgeting)
