@@ -1221,6 +1221,47 @@ impl Endpoint for DeriveEndpoint {
     }
 }
 
+/// `urn:view:derive:tick` — the standing-sync face of the derivation: issues
+/// `urn:view:derive` and reports the pass to stderr (the daemon log), so the
+/// timer leaves a heartbeat. Silence in the log then MEANS the sync is not
+/// running — never that a healthy pass had nothing to say.
+struct DeriveTickEndpoint;
+
+#[async_trait::async_trait]
+impl Endpoint for DeriveTickEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let result = inv
+            .issue(Request::new(
+                Verb::Source,
+                Iri::parse("urn:view:derive").expect("valid IRI"),
+            ))
+            .await;
+        match &result {
+            Ok(report) => eprintln!(
+                "ikigai: timer → {}",
+                String::from_utf8_lossy(&report.bytes).trim_end()
+            ),
+            Err(e) => eprintln!("ikigai: timer → derive failed: {e}"),
+        }
+        result
+    }
+
+    fn name(&self) -> &str {
+        "view-derive-tick"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("view-derive-tick")
+            .title("Derive the consolidated view (reporting)")
+            .summary(
+                "urn:view:derive plus a stderr report of the pass — the standing sync                  schedules this face so the daemon log carries a heartbeat.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .output("text/plain;charset=utf-8")
+    }
+}
+
 fn local_space(nature: &'static str) -> EndpointSpace {
     base_space(nature)
         .bind(
@@ -1244,6 +1285,7 @@ fn local_space(nature: &'static str) -> EndpointSpace {
             ikigai_personal::calendar_config(calendar_config()),
         )
         .bind(Exact::new("urn:view:derive"), DeriveEndpoint)
+        .bind(Exact::new("urn:view:derive:tick"), DeriveTickEndpoint)
         .bind(Exact::new("urn:view:ingest"), IngestEndpoint)
         // AFTER the exact binds: the period grammar must not shadow
         // urn:personal:calendar:config (first grammar match wins).
@@ -1855,7 +1897,7 @@ pub fn watched_kernel() -> Arc<Kernel> {
     // Brian-Busy fresh; it shows on the Control tab's Time-jobs readout.
     if let Some(every) = derive_every() {
         let _ = registry.schedule_persistent(
-            "urn:view:derive".to_string(),
+            "urn:view:derive:tick".to_string(),
             Verb::Source,
             ikigai_time::Schedule::Every(every),
             true,

@@ -248,7 +248,11 @@ fn main() {
 /// LaunchAgent runs: the desktop machine as a quiet, always-on resolver.
 #[cfg(feature = "embedded")]
 fn daemon() {
-    let _kernel = ikigai_embedded::kernel_for("Daemon");
+    // watched_kernel(), NOT kernel_for(): the watchers, the time transport's
+    // kernel handle, and the standing-sync registration all live in the
+    // watched constructor — a bare served-space kernel would park with the
+    // banner up and nothing actually scheduled.
+    let _kernel = ikigai_embedded::watched_kernel();
     let name = ikigai_embedded::instance_name();
     match ikigai_embedded::standing_sync_interval() {
         Some(every) => eprintln!(
