@@ -2073,6 +2073,10 @@ fn root_space() -> Arc<dyn Space> {
         // + XSLT styling (urn:xslt:*). Linked natively — no module-loading machinery in
         // the native binary (that's a browser/WASI concern).
         Arc::new(ikigai_rdf::space()) as Arc<dyn Space>,
+        // Unix-like text endpoints (urn:text:*) — pure, cacheable pipeline citizens;
+        // compose with | and .. over the newline-list convention. First module built
+        // by a satellite session.
+        Arc::new(ikigai_text::space()) as Arc<dyn Space>,
         Arc::new(ikigai_sparql::space()) as Arc<dyn Space>,
         Arc::new(ikigai_xslt::space()) as Arc<dyn Space>,
         // JSON-LD operators (urn:jsonld:expand/compact/flatten) — linked natively (the heavy
