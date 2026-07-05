@@ -1126,6 +1126,8 @@ impl Endpoint for DeriveEndpoint {
             .collect();
 
         let mut deleted = 0usize;
+        let mut failed = 0usize;
+        let mut first_failure: Option<String> = None;
         for event in &to_delete {
             let request = Request::new(
                 Verb::Delete,
@@ -1143,8 +1145,16 @@ impl Endpoint for DeriveEndpoint {
                 "start",
                 ikigai_core::ArgRef::Inline(event.start.as_bytes().to_vec()),
             );
-            inv.issue(request).await?;
-            deleted += 1;
+            match inv.issue(request).await {
+                Ok(_) => deleted += 1,
+                // One bad event must not abort the pass: everything else still
+                // syncs, and the failure is REPORTED (the heartbeat carries it)
+                // instead of wedging the whole view on one entry.
+                Err(e) => {
+                    failed += 1;
+                    first_failure.get_or_insert_with(|| format!("delete \"{}\": {e}", event.title));
+                }
+            }
         }
         let mut created = 0usize;
         for event in &to_create {
@@ -1189,19 +1199,30 @@ impl Endpoint for DeriveEndpoint {
                     ikigai_core::ArgRef::Inline(minutes.join(",").into_bytes()),
                 );
             }
-            inv.issue(request).await?;
-            created += 1;
+            match inv.issue(request).await {
+                Ok(_) => created += 1,
+                Err(e) => {
+                    failed += 1;
+                    first_failure.get_or_insert_with(|| format!("create \"{}\": {e}", event.title));
+                }
+            }
         }
 
         let unchanged = current_events.len().saturating_sub(deleted);
+        let mut report = format!(
+            "{}: created {created} · removed {deleted} · unchanged {unchanged}",
+            config.view
+        );
+        if failed > 0 {
+            report.push_str(&format!(
+                " · FAILED {failed} ({})",
+                first_failure.as_deref().unwrap_or("unknown")
+            ));
+        }
+        report.push('\n');
         Ok(Representation::new(
             ReprType::new("text/plain").with_param("charset", "utf-8"),
-            format!(
-                "{}: created {created} · removed {deleted} · unchanged {unchanged}
-",
-                config.view
-            )
-            .into_bytes(),
+            report.into_bytes(),
         ))
     }
 
