@@ -1,0 +1,13 @@
+[package]
+name = "ikigai-mcp"
+description = "Project the capability-scoped ikigai manifold as an MCP (Model Context Protocol) server."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ikigai-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
