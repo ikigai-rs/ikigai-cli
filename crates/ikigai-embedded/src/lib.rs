@@ -1283,6 +1283,258 @@ impl Endpoint for DeriveTickEndpoint {
     }
 }
 
+/// One candidate parsed back out of the `urn:kernel:actions` Turtle face.
+#[derive(Debug, Clone)]
+struct SelectCandidate {
+    action: String,
+    endpoint: String,
+    verb: String,
+    requires: Vec<String>,
+    missing_optional: u32,
+}
+
+/// Parse the `ik:ActionMatch` nodes of a manifold graph.
+fn parse_action_matches(turtle: &str) -> Vec<SelectCandidate> {
+    use std::collections::BTreeMap;
+    const IK: &str = "https://ikigai-rs.dev/ns#";
+    let mut by_subject: BTreeMap<String, SelectCandidate> = BTreeMap::new();
+    for quad in
+        oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle).for_slice(turtle.as_bytes())
+    {
+        let Ok(quad) = quad else { continue };
+        let oxrdf::NamedOrBlankNode::NamedNode(subject) = &quad.subject else {
+            continue;
+        };
+        let entry = by_subject
+            .entry(subject.as_str().to_string())
+            .or_insert_with(|| SelectCandidate {
+                action: subject.as_str().to_string(),
+                endpoint: String::new(),
+                verb: String::new(),
+                requires: Vec::new(),
+                missing_optional: 0,
+            });
+        let pred = quad.predicate.as_str();
+        match &quad.object {
+            oxrdf::Term::NamedNode(n) if pred == format!("{IK}endpoint") => {
+                entry.endpoint = n.as_str().to_string();
+            }
+            oxrdf::Term::NamedNode(n) if pred == format!("{IK}requires") => {
+                entry.requires.push(n.as_str().to_string());
+            }
+            oxrdf::Term::Literal(l) if pred == format!("{IK}verb") => {
+                entry.verb = l.value().to_string();
+            }
+            oxrdf::Term::Literal(l) if pred == format!("{IK}requires") => {
+                entry.requires.push(l.value().to_string());
+            }
+            oxrdf::Term::Literal(l) if pred == format!("{IK}missingOptional") => {
+                entry.missing_optional = l.value().parse().unwrap_or(0);
+            }
+            _ => {}
+        }
+    }
+    let mut candidates: Vec<SelectCandidate> = by_subject
+        .into_values()
+        .filter(|c| !c.verb.is_empty())
+        .collect();
+    candidates
+        .sort_by(|a, b| (a.missing_optional, &a.action).cmp(&(b.missing_optional, &b.action)));
+    candidates
+}
+
+/// Render candidates back out as the selection graph. The chosen one (if any)
+/// leads and carries the rationale as `rdfs:comment`; the rest follow, marked
+/// considered. (Proper ik:selected/ik:rationale terms can join the vocabulary
+/// in a later window; rdfs:comment keeps this vocab-neutral for now.)
+fn selection_turtle(
+    candidates: &[SelectCandidate],
+    chosen: Option<usize>,
+    rationale: Option<&str>,
+) -> String {
+    let mut ttl = String::from(
+        "@prefix ik: <https://ikigai-rs.dev/ns#> .\n@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n",
+    );
+    let escape = |s: &str| {
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', " ")
+    };
+    let order: Vec<usize> = match chosen {
+        Some(i) => std::iter::once(i)
+            .chain((0..candidates.len()).filter(|j| *j != i))
+            .collect(),
+        None => (0..candidates.len()).collect(),
+    };
+    for (rank, i) in order.iter().enumerate() {
+        let c = &candidates[*i];
+        ttl.push_str(&format!(
+            "\n<{}> a ik:ActionMatch ;\n    ik:endpoint <{}> ;\n    ik:verb \"{}\"",
+            c.action, c.endpoint, c.verb
+        ));
+        for r in &c.requires {
+            ttl.push_str(&format!(" ;\n    ik:requires <{r}>"));
+        }
+        let comment = match (chosen, rank) {
+            (Some(_), 0) => rationale.unwrap_or("chosen").to_string(),
+            (Some(_), _) => "considered, not chosen".to_string(),
+            (None, _) => "candidate — give goal= to disambiguate".to_string(),
+        };
+        ttl.push_str(&format!(
+            " ;\n    rdfs:comment \"{}\" .\n",
+            escape(&comment)
+        ));
+    }
+    ttl
+}
+
+/// `urn:agent:select` — the tool-selection funnel as one resource: the
+/// deterministic narrowing (capability, verb=, want=, types=) runs first via
+/// `urn:kernel:actions`; the LLM is the RESIDUAL, consulted only when several
+/// authorized actions survive AND a goal= is given. Zero survivors is a clean
+/// answer; one survivor never wakes the model. The decision comes back as a
+/// graph — chosen action, rationale, and the also-rans — so "why did the
+/// agent pick that tool" stays auditable.
+struct AgentSelectEndpoint;
+
+#[async_trait::async_trait]
+impl Endpoint for AgentSelectEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let mut request = Request::new(
+            Verb::Source,
+            Iri::parse("urn:kernel:actions").expect("valid IRI"),
+        )
+        .with_arg("as", ikigai_core::ArgRef::Inline(b"text/turtle".to_vec()));
+        for axis in ["types", "verb", "want"] {
+            if let Ok(value) = inv.inline_str(axis) {
+                request =
+                    request.with_arg(axis, ikigai_core::ArgRef::Inline(value.as_bytes().to_vec()));
+            }
+        }
+        let manifold = inv.issue(request).await?;
+        let candidates = parse_action_matches(&String::from_utf8_lossy(&manifold.bytes));
+        let goal = inv.inline_str("goal").ok();
+
+        if candidates.is_empty() {
+            return Ok(Representation::new(
+                ReprType::new("text/plain").with_param("charset", "utf-8"),
+                b"no authorized action fits: the manifold under your capability is empty for this query
+"
+                    .to_vec(),
+            ));
+        }
+        if candidates.len() == 1 {
+            let ttl = selection_turtle(
+                &candidates,
+                Some(0),
+                Some("the only authorized fit — no disambiguation needed"),
+            );
+            return Ok(Representation::new(
+                ReprType::new("text/turtle").with_param("charset", "utf-8"),
+                ttl.into_bytes(),
+            ));
+        }
+        let Some(goal) = goal else {
+            let ttl = selection_turtle(&candidates, None, None);
+            return Ok(Representation::new(
+                ReprType::new("text/turtle").with_param("charset", "utf-8"),
+                ttl.into_bytes(),
+            ));
+        };
+
+        // The residual: several authorized fits and a stated goal. The model
+        // picks ONE and says why; if it is unreachable or unparseable the
+        // ranked list comes back instead — the resource degrades to
+        // deterministic, it never fails because inference did.
+        let mut prompt = format!(
+            "Goal: {goal}
+
+Authorized candidate actions:
+"
+        );
+        for (i, c) in candidates.iter().enumerate() {
+            prompt.push_str(&format!(
+                "{}. {} — {} on <{}>
+",
+                i + 1,
+                c.action,
+                c.verb,
+                c.endpoint
+            ));
+        }
+        prompt.push_str("\nRespond EXACTLY as: CHOICE: <number> — <one-sentence rationale>");
+        let ask = Request::new(Verb::Source, Iri::parse("urn:llm:ask").expect("valid IRI"))
+            .with_arg(
+                "system",
+                ikigai_core::ArgRef::Inline(
+                    b"You select exactly one action from a numbered list. Terse.".to_vec(),
+                ),
+            )
+            .with_arg("prompt", ikigai_core::ArgRef::Inline(prompt.into_bytes()));
+        let picked = match inv.issue(ask).await {
+            Ok(reply) => {
+                let text = String::from_utf8_lossy(&reply.bytes).to_string();
+                // Parse the declared form first ("CHOICE: 5 — …"): a model that
+                // ignores it and emits list formatting ("1. Action 5 …") would
+                // otherwise have its FORMATTING read as its choice.
+                let digits = |t: &str| -> Option<usize> {
+                    t.chars()
+                        .skip_while(|ch| !ch.is_ascii_digit())
+                        .take_while(char::is_ascii_digit)
+                        .collect::<String>()
+                        .parse()
+                        .ok()
+                };
+                let number = text
+                    .to_ascii_uppercase()
+                    .find("CHOICE")
+                    .and_then(|i| digits(&text[i..]))
+                    .or_else(|| digits(&text));
+                number
+                    .and_then(|n| n.checked_sub(1))
+                    .filter(|i| *i < candidates.len())
+                    .map(|index| (index, format!("goal: {goal} — {}", text.trim())))
+            }
+            Err(_) => None,
+        };
+        let ttl = match picked {
+            Some((index, rationale)) => {
+                selection_turtle(&candidates, Some(index), Some(&rationale))
+            }
+            None => selection_turtle(&candidates, None, None),
+        };
+        Ok(Representation::new(
+            ReprType::new("text/turtle").with_param("charset", "utf-8"),
+            ttl.into_bytes(),
+        ))
+    }
+
+    fn name(&self) -> &str {
+        "agent-select"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("agent-select")
+            .title("Select an action for a goal")
+            .summary(
+                "The tool-selection funnel as one resource: deterministic narrowing first                  (your capability, verb=, want=, types= via urn:kernel:actions), the LLM as                  the RESIDUAL — consulted only when several authorized actions survive and                  a goal= is given. Returns the decision as a graph: chosen action,                  rationale, and the also-rans. One survivor never wakes the model;                  inference failure degrades to the ranked list, never to an error.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .input(ArgSpec::new("goal").summary("natural-language intent for the residual").optional())
+            .input(ArgSpec::new("types").summary("present RDF class IRIs").optional())
+            .input(
+                ArgSpec::new("verb")
+                    .summary("only actions answering this verb")
+                    .one_of(["source", "sink", "exists", "delete"])
+                    .optional(),
+            )
+            .input(ArgSpec::new("want").summary("only actions producing this media type").optional())
+            .output("text/turtle")
+            .output("text/plain;charset=utf-8")
+    }
+}
+
 fn local_space(nature: &'static str) -> EndpointSpace {
     base_space(nature)
         .bind(
@@ -1307,6 +1559,7 @@ fn local_space(nature: &'static str) -> EndpointSpace {
         )
         .bind(Exact::new("urn:view:derive"), DeriveEndpoint)
         .bind(Exact::new("urn:view:derive:tick"), DeriveTickEndpoint)
+        .bind(Exact::new("urn:agent:select"), AgentSelectEndpoint)
         .bind(Exact::new("urn:view:ingest"), IngestEndpoint)
         // AFTER the exact binds: the period grammar must not shadow
         // urn:personal:calendar:config (first grammar match wins).
@@ -2295,6 +2548,43 @@ mod tests {
         );
         assert_eq!(file_thread(root, root), None); // the root itself
         assert_eq!(file_thread(root, Path::new("/elsewhere/x")), None);
+    }
+
+    #[test]
+    fn agent_select_answers_deterministically_without_a_goal() {
+        let kernel = kernel();
+        // Zero fits is a clean text answer, not an error.
+        let request = Request::new(Verb::Source, Iri::parse("urn:agent:select").unwrap())
+            .with_arg("types", ArgRef::Inline(b"urn:no:Such".to_vec()));
+        let repr = block_on(kernel.issue(request, &Capability::root())).unwrap();
+        assert!(String::from_utf8(repr.bytes)
+            .unwrap()
+            .contains("no authorized action fits"));
+
+        // Several fits, no goal: the ranked candidate graph, no LLM involved.
+        let request = Request::new(Verb::Source, Iri::parse("urn:agent:select").unwrap());
+        let repr = block_on(kernel.issue(request, &Capability::root())).unwrap();
+        let ttl = String::from_utf8(repr.bytes).unwrap();
+        assert!(repr.repr_type.media_type == "text/turtle");
+        assert!(ttl.matches("a ik:ActionMatch").count() > 1, "{ttl}");
+        assert!(ttl.contains("give goal= to disambiguate"), "{ttl}");
+    }
+
+    #[test]
+    fn agent_select_carries_the_callers_attenuation() {
+        // The funnel through the agent face: a capability without the write
+        // scope gets a selection graph that simply lacks the write actions —
+        // the attenuation propagates through inv.issue to urn:kernel:actions.
+        let kernel = kernel();
+        let scoped = Capability::scoped(["urn:cap:personal:calendar:read:freebusy"]);
+        let request = Request::new(Verb::Source, Iri::parse("urn:agent:select").unwrap())
+            .with_arg("verb", ArgRef::Inline(b"sink".to_vec()));
+        let repr = block_on(kernel.issue(request, &scoped)).unwrap();
+        let body = String::from_utf8(repr.bytes).unwrap();
+        assert!(
+            !body.contains("personal-calendar:action:sink"),
+            "write actions must not be offered through the agent face either: {body}"
+        );
     }
 
     #[test]
