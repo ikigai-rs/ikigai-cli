@@ -17,7 +17,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use futures::executor::block_on;
 use ikigai_core::{
-    Capability, Expiry, Kernel, Provenance, Representation, Request, SpaceEntry, TraceEvent, Tracer,
+    Bindings, Capability, Endpoint, Error, Expiry, Invocation, Kernel, Provenance, Representation,
+    Request, Resolution, Resolved, Scope, Space, SpaceEntry, TraceEvent, Tracer,
 };
 use serde::{Deserialize, Serialize};
 
@@ -50,6 +51,65 @@ impl SpanCollector {
     /// Drain the events collected so far.
     pub fn take(&self) -> Vec<TraceEvent> {
         std::mem::take(&mut self.0.lock().expect("span collector"))
+    }
+}
+
+/// A [`Space`] that resolves every request under its mount into a *remote* kernel:
+/// it wraps a [`Resolver`] (an IPC or QUIC client) and, on resolve, yields a
+/// forwarding endpoint that round-trips the request over the wire on invoke. This
+/// is what lets a *local* kernel compose a remote one — mount it behind a prefix
+/// ([`Mount`](ikigai_core::Mount)) so only that namespace goes remote. It always
+/// hits (routing is the mount prefix's job); a genuinely-absent remote resource
+/// comes back as an error on invoke, not a resolution miss.
+pub struct RemoteSpace {
+    resolver: Arc<dyn Resolver>,
+}
+
+impl RemoteSpace {
+    /// Wrap a connected [`Resolver`] as a mountable space.
+    pub fn new(resolver: Arc<dyn Resolver>) -> Self {
+        RemoteSpace { resolver }
+    }
+}
+
+impl Space for RemoteSpace {
+    fn resolve(&self, request: &Request, _scope: &Scope) -> Resolution {
+        // Capture the whole request (target + verb + args) so the endpoint forwards
+        // it verbatim; the caller's capability arrives via the Invocation on invoke.
+        Resolution::Hit(Resolved {
+            endpoint: Arc::new(ForwardingEndpoint {
+                resolver: Arc::clone(&self.resolver),
+                request: request.clone(),
+            }),
+            bindings: Bindings::new(),
+        })
+    }
+
+    fn entries(&self) -> Option<Vec<SpaceEntry>> {
+        // Forward the remote's catalog (a round-trip — off the hot path).
+        self.resolver.entries()
+    }
+}
+
+/// The endpoint a [`RemoteSpace`] resolves to: on invoke, forward the captured
+/// request to the remote kernel under the invocation's capability (which the
+/// server clamps to its authenticated principal).
+struct ForwardingEndpoint {
+    resolver: Arc<dyn Resolver>,
+    request: Request,
+}
+
+#[async_trait]
+impl Endpoint for ForwardingEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation, Error> {
+        self.resolver
+            .issue_as(self.request.clone(), inv.capability)
+            .map(|(representation, _status)| representation)
+            .map_err(Error::Endpoint)
+    }
+
+    fn name(&self) -> &str {
+        "remote"
     }
 }
 

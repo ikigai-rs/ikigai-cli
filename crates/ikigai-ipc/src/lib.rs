@@ -347,6 +347,37 @@ mod tests {
     }
 
     #[test]
+    fn a_local_kernel_composes_a_remote_one_via_remotespace() {
+        use ikigai_core::{Fallback, Space};
+        use ikigai_resolve::RemoteSpace;
+
+        // Remote server: has urn:fn:toUpper.
+        let path = socket_path("remote-mount");
+        let server = serve_one(&path, kernel());
+
+        // Local kernel: an empty local space, then the remote as a fallback. A
+        // resource the local kernel lacks resolves by forwarding to the remote —
+        // one composed resolution graph across two kernels.
+        let client = connect(&path).unwrap();
+        let local = Fallback::new(vec![
+            Arc::new(EndpointSpace::new()) as Arc<dyn Space>,
+            Arc::new(RemoteSpace::new(Arc::new(client))) as Arc<dyn Space>,
+        ]);
+        let local_kernel = Kernel::new(Arc::new(local));
+
+        let (representation, _status) =
+            Resolver::issue_as(&local_kernel, upper("hi"), &Capability::root()).unwrap();
+        assert_eq!(
+            representation.bytes, b"HI",
+            "the local kernel resolved a remote-only resource by forwarding"
+        );
+
+        drop(local_kernel); // drops the client → the server sees EOF and returns
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn is_cached_and_entries_round_trip() {
         let path = socket_path("probe");
         let server = serve_one(&path, kernel());
