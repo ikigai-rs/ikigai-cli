@@ -13,7 +13,7 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 [workspace.dependencies]
 # The released kernel, consumed from crates.io. For local cross-repo development
 # against a sibling checkout, use .cargo/config.toml (see .cargo/config.toml.example).
-ikigai-core = "0.1.43" # + TraceEvent capability field, serde, PartialEq/Eq (trace-over-the-wire)
+ikigai-core = "0.1.44" # + Invocation::record_subtree/trace_span (cross-boundary trace stitching)
 ikigai-vocab = "0.1.33" # + event terms (ik:calendar/allDay/alert) + LLM trait terms
 # The reusable function library, linked in as a published module crate.
 ikigai-fn = "0.1.2" # + urn:fn:conditional (the lazy branch: if/then/else are URIs)
