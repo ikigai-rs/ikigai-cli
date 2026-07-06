@@ -308,38 +308,104 @@ fn daemon() {
     std::process::exit(2);
 }
 
-/// MCP stdio mode: project the composed manifold as MCP tools, scoped to the
-/// session capability built from `--grant`/`--scope`. The grant is the ceiling.
+/// Build the session capability from the union of named grants + explicit
+/// scopes. Empty ⇒ root (unrestricted). The grant is the ceiling.
 #[cfg(feature = "embedded")]
-fn mcp(grants: Vec<String>, scopes: Vec<String>) {
-    use ikigai_core::Capability;
-    let mut union = scopes;
-    for name in &grants {
-        let found = ikigai_embedded::grant_scopes(name);
-        if found.is_empty() {
-            eprintln!("ikigai mcp: grant \"{name}\" is empty or undefined in grants.json");
-        }
-        union.extend(found);
+fn mcp_capability(grants: &[String], scopes: &[String]) -> ikigai_core::Capability {
+    let mut union: Vec<String> = scopes.to_vec();
+    for name in grants {
+        union.extend(ikigai_embedded::grant_scopes(name));
     }
     union.sort();
     union.dedup();
-    let capability = if union.is_empty() {
-        eprintln!(
-            "ikigai mcp: no --grant/--scope given — running UNRESTRICTED (root). \
-             Pass a grant to scope the tool list."
-        );
-        Capability::root()
+    if union.is_empty() {
+        ikigai_core::Capability::root()
     } else {
-        eprintln!(
+        ikigai_core::Capability::scoped(union)
+    }
+}
+
+/// MCP stdio mode: project the composed manifold as MCP tools, scoped to the
+/// session capability built from `--grant`/`--scope` (the ceiling). A poller
+/// watches the grants file; when the active grant's scopes change, it rebuilds
+/// the capability and emits `notifications/tools/list_changed` so a connected
+/// client's tool list morphs live — no restart. Broadening is safe here because
+/// it is the HUMAN editing the grant (root re-granting), never the client.
+#[cfg(feature = "embedded")]
+fn mcp(grants: Vec<String>, scopes: Vec<String>) {
+    use ikigai_mcp::server::handle;
+    use std::io::{BufRead, Write};
+    use std::sync::{Arc, Mutex, RwLock};
+
+    let capability = Arc::new(RwLock::new(mcp_capability(&grants, &scopes)));
+    match capability.read().expect("cap lock").scopes() {
+        None => eprintln!("ikigai mcp: no --grant/--scope — running UNRESTRICTED (root)"),
+        Some(s) => eprintln!(
             "ikigai mcp: serving the manifold under {} scope(s)",
-            union.len()
-        );
-        Capability::scoped(union)
-    };
+            s.len()
+        ),
+    }
     let kernel = ikigai_embedded::watched_kernel();
-    if let Err(e) = ikigai_mcp::server::serve(&kernel, &capability) {
-        eprintln!("ikigai mcp: {e}");
-        std::process::exit(1);
+    let stdout = Arc::new(Mutex::new(std::io::stdout()));
+
+    // The live grant-swap watcher (poll the grants file's mtime). Only meaningful
+    // when a named grant is in play; explicit --scope unions are fixed at launch.
+    if !grants.is_empty() {
+        if let Some(path) = ikigai_embedded::grants_path() {
+            let capability = Arc::clone(&capability);
+            let stdout = Arc::clone(&stdout);
+            std::thread::spawn(move || {
+                let mtime = || std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                let mut last = mtime();
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    let now = mtime();
+                    if now == last {
+                        continue;
+                    }
+                    last = now;
+                    let fresh = mcp_capability(&grants, &scopes);
+                    let changed = fresh.scopes() != capability.read().expect("cap lock").scopes();
+                    if changed {
+                        *capability.write().expect("cap lock") = fresh;
+                        let note =
+                            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}";
+                        let mut out = stdout.lock().expect("stdout lock");
+                        let _ = writeln!(out, "{note}");
+                        let _ = out.flush();
+                        eprintln!("ikigai mcp: grant changed — tool list re-emitted");
+                    }
+                }
+            });
+        }
+    }
+
+    let stdin = std::io::stdin();
+    for line in stdin.lock().lines() {
+        let Ok(line) = line else { break };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let response = {
+            let guard = capability.read().expect("cap lock");
+            handle(&kernel, &guard, &msg)
+        };
+        if let Some(response) = response {
+            let mut out = stdout.lock().expect("stdout lock");
+            if writeln!(
+                out,
+                "{}",
+                serde_json::to_string(&response).unwrap_or_default()
+            )
+            .is_err()
+            {
+                break;
+            }
+            let _ = out.flush();
+        }
     }
 }
 

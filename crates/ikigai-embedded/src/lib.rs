@@ -936,12 +936,11 @@ fn alert_token(minutes: u32) -> String {
 /// `Busy (Bosatsu)` with the location withheld — the freebusy capability idea
 /// applied at derivation time. UIDs are untouched, so flipping a source's mode
 /// UPDATES its events in place (the diff sees changed titles, not new events).
-/// The scopes of a named MCP grant, from `~/.config/ikigai/grants.json`
-/// (env override `IKIGAI_GRANTS`): a `{ "<grant>": ["urn:cap:…", …] }` map. A
-/// grant is a NAMED UNION of capability scopes — the union of affordances an MCP
-/// session may see. Unknown grant / no file ⇒ empty.
-pub fn grant_scopes(name: &str) -> Vec<String> {
-    let Some(path) = std::env::var("IKIGAI_GRANTS")
+/// Where MCP grants are read from: `$IKIGAI_GRANTS` else
+/// `~/.config/ikigai/grants.json`. Exposed so a host can WATCH it (the live
+/// grant-swap: edit the file, the connected client's tool list morphs).
+pub fn grants_path() -> Option<PathBuf> {
+    std::env::var("IKIGAI_GRANTS")
         .map(PathBuf::from)
         .ok()
         .or_else(|| {
@@ -949,7 +948,14 @@ pub fn grant_scopes(name: &str) -> Vec<String> {
                 .ok()
                 .map(|home| Path::new(&home).join(".config/ikigai/grants.json"))
         })
-    else {
+}
+
+/// The scopes of a named MCP grant, from `~/.config/ikigai/grants.json`
+/// (env override `IKIGAI_GRANTS`): a `{ "<grant>": ["urn:cap:…", …] }` map. A
+/// grant is a NAMED UNION of capability scopes — the union of affordances an MCP
+/// session may see. Unknown grant / no file ⇒ empty.
+pub fn grant_scopes(name: &str) -> Vec<String> {
+    let Some(path) = grants_path() else {
         return Vec::new();
     };
     let Ok(text) = std::fs::read_to_string(path) else {
