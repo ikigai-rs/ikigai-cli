@@ -936,6 +936,39 @@ fn alert_token(minutes: u32) -> String {
 /// `Busy (Bosatsu)` with the location withheld — the freebusy capability idea
 /// applied at derivation time. UIDs are untouched, so flipping a source's mode
 /// UPDATES its events in place (the diff sees changed titles, not new events).
+/// The scopes of a named MCP grant, from `~/.config/ikigai/grants.json`
+/// (env override `IKIGAI_GRANTS`): a `{ "<grant>": ["urn:cap:…", …] }` map. A
+/// grant is a NAMED UNION of capability scopes — the union of affordances an MCP
+/// session may see. Unknown grant / no file ⇒ empty.
+pub fn grant_scopes(name: &str) -> Vec<String> {
+    let Some(path) = std::env::var("IKIGAI_GRANTS")
+        .map(PathBuf::from)
+        .ok()
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|home| Path::new(&home).join(".config/ikigai/grants.json"))
+        })
+    else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    v[name]
+        .as_array()
+        .map(|scopes| {
+            scopes
+                .iter()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn projection_config() -> std::collections::BTreeMap<String, String> {
     let Some(path) = std::env::var("IKIGAI_CALENDAR_CONFIG")
         .map(PathBuf::from)
