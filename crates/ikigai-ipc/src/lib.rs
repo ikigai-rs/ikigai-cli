@@ -19,11 +19,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use ikigai_core::{Capability, Kernel, Representation, Request, SpaceEntry};
-use ikigai_resolve::{CacheStatus, Resolver};
-use ikigai_wire::{read_message, write_message, Call, Reply};
+use ikigai_core::{Capability, Kernel, Representation, Request, SpaceEntry, Tracer};
+use ikigai_resolve::{CacheStatus, Resolver, SpanCollector};
+use ikigai_wire::{read_message, write_message, Call, Reply, TraceContext};
 
 /// Run `kernel` as a server on `path` until an unrecoverable accept error: bind
 /// the socket (replacing a stale one), restrict it to `0600`, and serve each
@@ -50,12 +50,17 @@ pub fn serve(kernel: Kernel, path: &Path) -> io::Result<()> {
 pub fn connect(path: &Path) -> io::Result<IpcResolver> {
     Ok(IpcResolver {
         stream: UnixStream::connect(path)?,
+        tracer: Mutex::new(None),
     })
 }
 
 /// A [`Resolver`] backed by a kernel server over a Unix socket.
 pub struct IpcResolver {
     stream: UnixStream,
+    /// The tracer the `trace` command installs. When set, a resolution is sent as
+    /// [`Call::IssueTraced`] and the server's returned spans are forwarded here —
+    /// so a `--connect` trace shows the *remote* kernel's execution tree.
+    tracer: Mutex<Option<Arc<dyn Tracer>>>,
 }
 
 impl IpcResolver {
@@ -88,14 +93,44 @@ impl Resolver for IpcResolver {
         request: Request,
         capability: &Capability,
     ) -> Result<(Representation, CacheStatus), String> {
-        match self
-            .round_trip(Call::IssueAs(request, capability.clone()))
-            .map_err(|e| e.to_string())?
-        {
+        // When a tracer is installed (the `trace` command), ask the server to record
+        // the resolution and ship its spans back, then forward them to the tracer —
+        // so the tree shows the *remote* kernel's execution. `parent_span` is None:
+        // the whole session runs remotely, so the remote root is the trace root.
+        let tracer = self.tracer.lock().expect("tracer lock").clone();
+        let call = if tracer.is_some() {
+            Call::IssueTraced(
+                request,
+                capability.clone(),
+                TraceContext {
+                    trace_id: 1,
+                    parent_span: None,
+                },
+            )
+        } else {
+            Call::IssueAs(request, capability.clone())
+        };
+        match self.round_trip(call).map_err(|e| e.to_string())? {
             Reply::Resolved(representation, status) => Ok((representation, status)),
+            Reply::ResolvedTraced(representation, status, events) => {
+                if let Some(tracer) = &tracer {
+                    for event in events {
+                        tracer.record(event);
+                    }
+                }
+                Ok((representation, status))
+            }
             Reply::Error(message) => Err(message),
             other => Err(format!("unexpected reply to IssueAs: {other:?}")),
         }
+    }
+
+    fn set_tracer(&self, tracer: Arc<dyn Tracer>) {
+        *self.tracer.lock().expect("tracer lock") = Some(tracer);
+    }
+
+    fn clear_tracer(&self) {
+        *self.tracer.lock().expect("tracer lock") = None;
     }
 
     fn is_cached(&self, request: &Request, capability: &Capability) -> bool {
@@ -157,6 +192,23 @@ fn dispatch(kernel: &Kernel, call: Call) -> Reply {
             Reply::Cached(Resolver::is_cached(kernel, &request, &Capability::root()))
         }
         Call::Entries => Reply::Entries(Resolver::entries(kernel)),
+        // Trace-over-the-wire: install a collector, resolve, ship the recorded spans
+        // back. `_ctx.parent_span` is for a future mount-stitch (re-parenting the
+        // subtree); a whole-session `--connect` trace ignores it. The kernel's tracer
+        // is process-global, so concurrent traced calls would interleave — fine for
+        // the one-shot interactive `trace`.
+        Call::IssueTraced(request, capability, _ctx) => {
+            let collector = Arc::new(SpanCollector::default());
+            Kernel::set_tracer(kernel, collector.clone());
+            let reply = match Resolver::issue_as(kernel, request, &capability) {
+                Ok((representation, status)) => {
+                    Reply::ResolvedTraced(representation, status, collector.take())
+                }
+                Err(message) => Reply::Error(message),
+            };
+            Kernel::clear_tracer(kernel);
+            reply
+        }
     }
 }
 
@@ -263,6 +315,33 @@ mod tests {
         assert_eq!(second, CacheStatus::Hit);
 
         drop(client); // hang up → the handler returns
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_traced_resolution_returns_the_remote_spans() {
+        let path = socket_path("traced");
+        let server = serve_one(&path, kernel());
+
+        let client = connect(&path).unwrap();
+        // Install a tracer, as the `trace` command does. The client sends
+        // Call::IssueTraced, the server records its own execution and ships the
+        // spans back, and the client forwards them here — so a --connect trace
+        // shows the *remote* kernel's tree.
+        let collector = Arc::new(SpanCollector::default());
+        client.set_tracer(collector.clone());
+        let (representation, _status) = client.issue_as(upper("hi"), &Capability::root()).unwrap();
+        client.clear_tracer();
+        assert_eq!(representation.bytes, b"HI");
+
+        let events = collector.take();
+        assert!(
+            events.iter().any(|e| e.target == "urn:fn:toUpper"),
+            "the remote span crossed the wire: {events:?}"
+        );
+
+        drop(client);
         server.join().unwrap();
         let _ = std::fs::remove_file(&path);
     }

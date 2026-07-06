@@ -16,11 +16,11 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use ikigai_core::{Capability, Iri, Kernel, Representation, Request, SpaceEntry};
-use ikigai_resolve::{CacheStatus, Resolver};
-use ikigai_wire::{decode, encode, Call, Reply};
+use ikigai_core::{Capability, Iri, Kernel, Representation, Request, SpaceEntry, Tracer};
+use ikigai_resolve::{CacheStatus, Resolver, SpanCollector};
+use ikigai_wire::{decode, encode, Call, Reply, TraceContext};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::WebPkiSupportedAlgorithms;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
@@ -168,6 +168,24 @@ fn dispatch(kernel: &Kernel, call: Call, session: &Session) -> Reply {
             Reply::Cached(Resolver::is_cached(kernel, &request, &session.capability))
         }
         Call::Entries => Reply::Entries(Resolver::entries(kernel)),
+        // Trace-over-the-wire: install a collector, resolve under the clamped
+        // authority, ship the recorded spans back. `_ctx.parent_span` is for a
+        // future mount-stitch. The kernel tracer is process-global, so concurrent
+        // traced calls would interleave — acceptable for the one-shot `trace`.
+        Call::IssueTraced(mut request, carried, _ctx) => {
+            localize(&mut request, &session.file_segment);
+            let capability = session.capability.clamp(&carried);
+            let collector = Arc::new(SpanCollector::default());
+            Kernel::set_tracer(kernel, collector.clone());
+            let reply = match Resolver::issue_as(kernel, request, &capability) {
+                Ok((representation, status)) => {
+                    Reply::ResolvedTraced(representation, status, collector.take())
+                }
+                Err(message) => Reply::Error(message),
+            };
+            Kernel::clear_tracer(kernel);
+            reply
+        }
     }
 }
 
@@ -201,6 +219,7 @@ pub fn connect(
         runtime,
         _endpoint: endpoint,
         connection,
+        tracer: Mutex::new(None),
     })
 }
 
@@ -210,6 +229,9 @@ pub struct QuicResolver {
     /// Kept alive for the duration of the connection.
     _endpoint: quinn::Endpoint,
     connection: quinn::Connection,
+    /// The tracer the `trace` command installs; when set, a resolution is sent as
+    /// [`Call::IssueTraced`] and the server's returned spans are forwarded here.
+    tracer: Mutex<Option<Arc<dyn Tracer>>>,
 }
 
 impl QuicResolver {
@@ -251,6 +273,51 @@ impl Resolver for QuicResolver {
             Reply::Error(message) => Err(message),
             other => Err(format!("unexpected reply to Issue: {other:?}")),
         }
+    }
+
+    /// QUIC carries the caller's authority in the client cert (the server's
+    /// session), so an untraced resolution goes as plain `Call::Issue`. When a
+    /// tracer is installed, send `Call::IssueTraced` and forward the returned
+    /// spans — so a `--connect` QUIC trace shows the remote execution tree.
+    fn issue_as(
+        &self,
+        request: Request,
+        capability: &Capability,
+    ) -> Result<(Representation, CacheStatus), String> {
+        let tracer = self.tracer.lock().expect("tracer lock").clone();
+        let call = if tracer.is_some() {
+            Call::IssueTraced(
+                request,
+                capability.clone(),
+                TraceContext {
+                    trace_id: 1,
+                    parent_span: None,
+                },
+            )
+        } else {
+            Call::Issue(request)
+        };
+        match self.round_trip(call).map_err(|e| e.to_string())? {
+            Reply::Resolved(representation, status) => Ok((representation, status)),
+            Reply::ResolvedTraced(representation, status, events) => {
+                if let Some(tracer) = &tracer {
+                    for event in events {
+                        tracer.record(event);
+                    }
+                }
+                Ok((representation, status))
+            }
+            Reply::Error(message) => Err(message),
+            other => Err(format!("unexpected reply to IssueAs: {other:?}")),
+        }
+    }
+
+    fn set_tracer(&self, tracer: Arc<dyn Tracer>) {
+        *self.tracer.lock().expect("tracer lock") = Some(tracer);
+    }
+
+    fn clear_tracer(&self) {
+        *self.tracer.lock().expect("tracer lock") = None;
     }
 
     fn is_cached(&self, request: &Request, capability: &Capability) -> bool {

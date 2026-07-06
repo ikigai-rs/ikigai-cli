@@ -1839,6 +1839,7 @@ mod tests {
                 cache_hit: hit,
                 span,
                 parent,
+                capability: None,
             };
         let events = vec![
             ev("urn:fn:toUpper", "ikigai-sched-0", 4, Some(3), true), // grandchild, out of order

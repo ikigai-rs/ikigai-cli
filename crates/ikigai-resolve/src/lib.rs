@@ -12,12 +12,12 @@
 //! directly (no client-side cache probing across the wire). The wire protocol
 //! that remote resolvers speak lives in the companion `ikigai-wire` crate.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures::executor::block_on;
 use ikigai_core::{
-    Capability, Expiry, Kernel, Provenance, Representation, Request, SpaceEntry, Tracer,
+    Capability, Expiry, Kernel, Provenance, Representation, Request, SpaceEntry, TraceEvent, Tracer,
 };
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +30,27 @@ pub enum CacheStatus {
     Miss,
     /// Computed now; the result is not cacheable, so it recomputes every time.
     Uncacheable,
+}
+
+/// Collects the [`TraceEvent`]s recorded during one traced resolution. A server
+/// installs it on its kernel ([`Kernel::set_tracer`](ikigai_core::Kernel::set_tracer)),
+/// resolves a traced call, and [`take`](SpanCollector::take)s the events to ship
+/// back over the wire; the client forwards them to the tracer the `trace` command
+/// installed. Shared by the IPC and QUIC transports.
+#[derive(Default)]
+pub struct SpanCollector(Mutex<Vec<TraceEvent>>);
+
+impl Tracer for SpanCollector {
+    fn record(&self, event: TraceEvent) {
+        self.0.lock().expect("span collector").push(event);
+    }
+}
+
+impl SpanCollector {
+    /// Drain the events collected so far.
+    pub fn take(&self) -> Vec<TraceEvent> {
+        std::mem::take(&mut self.0.lock().expect("span collector"))
+    }
 }
 
 /// What the REPL engine needs of a kernel, local or remote.

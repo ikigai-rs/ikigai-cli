@@ -9,20 +9,34 @@
 
 use std::io::{self, Read, Write};
 
-use ikigai_core::{Capability, Representation, Request, SpaceEntry};
+use ikigai_core::{Capability, Representation, Request, SpaceEntry, TraceEvent};
 use ikigai_resolve::CacheStatus;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// Bumped when the on-wire shape changes incompatibly. Not negotiated yet
 /// (client and server ship together) — it's here to fail loudly when that
-/// changes. v2 adds [`Call::IssueAs`] (capability-on-the-wire).
-pub const PROTOCOL_VERSION: u32 = 2;
+/// changes. v2 adds [`Call::IssueAs`] (capability-on-the-wire); v3 adds
+/// [`Call::IssueTraced`] / [`Reply::ResolvedTraced`] (trace-over-the-wire).
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The largest framed message accepted. Guards [`read_message`] against a bogus
 /// length header demanding a huge allocation; 64 MiB is far above any
 /// representation a REPL round-trips.
 const MAX_FRAME: usize = 64 * 1024 * 1024;
+
+/// A trace context carried on a traced call, so a remote kernel can record into
+/// the caller's trace. `parent_span` is `None` for a whole-session `--connect`
+/// trace (the remote root *is* the trace root); a future mount-stitch sets it to
+/// the local span that issued the call, to re-parent the returned subtree.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct TraceContext {
+    /// Identifies the overall trace this call belongs to.
+    pub trace_id: u64,
+    /// The caller's span to parent the returned subtree under, or `None` for a
+    /// whole-session trace (the returned root has no parent).
+    pub parent_span: Option<u64>,
+}
 
 /// A client → server call, mirroring the [`Resolver`](ikigai_resolve::Resolver) methods.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -35,6 +49,11 @@ pub enum Call {
     /// `Issue`/`IsCached`/`Entries` are unchanged. A server clamps the carried
     /// capability to the principal the channel authenticated.
     IssueAs(Request, Capability),
+    /// Resolve under `Capability` **and record the resolution**, answered with
+    /// [`Reply::ResolvedTraced`] carrying the recorded spans. The [`TraceContext`]
+    /// lets a future mount stitch the remote subtree under a local span. Appended
+    /// so existing discriminants are unchanged.
+    IssueTraced(Request, Capability, TraceContext),
 }
 
 /// A server → client reply. [`Error`](Reply::Error) can answer any call — a
@@ -45,6 +64,10 @@ pub enum Reply {
     Cached(bool),
     Entries(Option<Vec<SpaceEntry>>),
     Error(String),
+    /// A resolved representation plus the [`TraceEvent`]s the server recorded for
+    /// the call — the answer to [`Call::IssueTraced`]. Appended so existing
+    /// discriminants are unchanged.
+    ResolvedTraced(Representation, CacheStatus, Vec<TraceEvent>),
 }
 
 /// Serialize `message` and write it length-prefixed (`u32` big-endian length,
@@ -112,6 +135,20 @@ mod tests {
             Reply::Cached(true),
             Reply::Entries(None),
             Reply::Error("boom".to_string()),
+            Reply::ResolvedTraced(
+                Representation::new(ReprType::new("text/plain"), b"HI".to_vec()),
+                CacheStatus::Miss,
+                vec![TraceEvent {
+                    target: "urn:fn:toUpper".to_string(),
+                    thread: "ikigai-sched-0".to_string(),
+                    started: None,
+                    ended: None,
+                    cache_hit: false,
+                    span: 0,
+                    parent: None,
+                    capability: Some(vec!["urn:cap:demo".to_string()]),
+                }],
+            ),
         ];
         let mut buf: Vec<u8> = Vec::new();
         for message in &messages {
@@ -129,12 +166,22 @@ mod tests {
         let mut buf = Vec::new();
         write_message(&mut buf, &Call::Issue(request())).unwrap();
         write_message(&mut buf, &Call::Entries).unwrap();
+        let traced = Call::IssueTraced(
+            request(),
+            Capability::root(),
+            TraceContext {
+                trace_id: 7,
+                parent_span: None,
+            },
+        );
+        write_message(&mut buf, &traced).unwrap();
         let mut cursor = std::io::Cursor::new(buf);
         assert_eq!(
             read_message::<_, Call>(&mut cursor).unwrap(),
             Call::Issue(request())
         );
         assert_eq!(read_message::<_, Call>(&mut cursor).unwrap(), Call::Entries);
+        assert_eq!(read_message::<_, Call>(&mut cursor).unwrap(), traced);
     }
 
     #[test]
