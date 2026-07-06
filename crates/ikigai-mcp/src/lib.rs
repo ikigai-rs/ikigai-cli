@@ -14,7 +14,7 @@
 
 pub mod server;
 
-use ikigai_core::{ActionSpec, ArgSpec, Description, Verb};
+use ikigai_core::{ActionSpec, ArgSpec, Description, InputSource, Verb};
 use serde_json::{json, Map, Value};
 
 /// The separator between an endpoint id and its verb in an MCP tool name. Double
@@ -139,10 +139,156 @@ pub fn endpoint_tools(description: &Description) -> Vec<Value> {
         .collect()
 }
 
+/// Pre-flight a tool call's JSON `arguments` against an action's declared
+/// contract — required present (Binding inputs ride the IRI, so exempt),
+/// `one_of` honored, XSD scalars plausible, no unknown argument names. Returns
+/// `None` when it conforms, or `Some(report)` — a SHACL `ValidationReport` whose
+/// `sh:resultPath` joins each violation to the catalog's input node — when it
+/// does not. Structured JSON in, so a value carrying a newline or `&` (a text
+/// tool's `in`) validates correctly, unlike the kernel's flat `k=v` args face.
+pub fn validate_arguments(
+    description: &Description,
+    action: &ActionSpec,
+    arguments: &Value,
+) -> Option<String> {
+    let empty = Map::new();
+    let args = arguments.as_object().unwrap_or(&empty);
+    let scalar = |v: &Value| -> Option<String> {
+        match v {
+            Value::String(s) => Some(s.clone()),
+            Value::Bool(b) => Some(b.to_string()),
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        }
+    };
+
+    let verb = format!("{:?}", action.verb).to_lowercase();
+    let action_iri = format!("urn:ikigai:endpoint:{}:action:{verb}", description.id);
+    // Explicit actions own action-scoped input nodes; synthesized ones reference
+    // the endpoint-level nodes — mirror the projection so resultPath joins.
+    let explicit = description.actions.iter().any(|a| a.verb == action.verb);
+    let input_ns = if explicit {
+        format!("{action_iri}:input:")
+    } else {
+        format!("urn:ikigai:endpoint:{}:input:", description.id)
+    };
+
+    let mut violations: Vec<(String, Option<String>)> = Vec::new();
+    for input in &action.inputs {
+        let node = format!("{input_ns}{}", input.name);
+        let value = args.get(&input.name).and_then(&scalar);
+        if input.required && input.source != InputSource::Binding && value.is_none() {
+            violations.push((
+                format!("required input `{}` is missing", input.name),
+                Some(node),
+            ));
+            continue;
+        }
+        let Some(value) = value else { continue };
+        if !input.one_of.is_empty() && !input.one_of.iter().any(|v| v == &value) {
+            violations.push((
+                format!(
+                    "`{value}` is not an accepted value of `{}` (one of: {})",
+                    input.name,
+                    input.one_of.join(", ")
+                ),
+                Some(node),
+            ));
+            continue;
+        }
+        if let Some(class) = &input.class {
+            let ok = match class.as_str() {
+                "http://www.w3.org/2001/XMLSchema#boolean" => value == "true" || value == "false",
+                "http://www.w3.org/2001/XMLSchema#integer" => value.parse::<i64>().is_ok(),
+                "http://www.w3.org/2001/XMLSchema#dateTime" => {
+                    let b = value.as_bytes();
+                    b.len() >= 10
+                        && b[..4].iter().all(u8::is_ascii_digit)
+                        && b[4] == b'-'
+                        && b[5..7].iter().all(u8::is_ascii_digit)
+                        && b[7] == b'-'
+                        && b[8..10].iter().all(u8::is_ascii_digit)
+                }
+                _ => true,
+            };
+            if !ok {
+                violations.push((
+                    format!(
+                        "`{value}` does not look like a {class} for `{}`",
+                        input.name
+                    ),
+                    Some(node),
+                ));
+            }
+        }
+    }
+    for key in args.keys() {
+        if !action.inputs.iter().any(|i| &i.name == key) {
+            violations.push((
+                format!("unknown argument `{key}` — not in this action's contract"),
+                None,
+            ));
+        }
+    }
+
+    if violations.is_empty() {
+        return None;
+    }
+    let escape = |s: &str| {
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', " ")
+    };
+    let mut ttl = String::from("@prefix sh: <http://www.w3.org/ns/shacl#> .\n\n");
+    ttl.push_str("<urn:ikigai:validation:report> a sh:ValidationReport ;\n    sh:conforms false");
+    for (message, path) in &violations {
+        ttl.push_str(&format!(
+            " ;\n    sh:result [ a sh:ValidationResult ;\n        sh:resultSeverity sh:Violation ;\n        sh:focusNode <{action_iri}>"
+        ));
+        if let Some(path) = path {
+            ttl.push_str(&format!(" ;\n        sh:resultPath <{path}>"));
+        }
+        ttl.push_str(&format!(
+            " ;\n        sh:resultMessage \"{}\" ]",
+            escape(message)
+        ));
+    }
+    ttl.push_str(" .\n");
+    Some(ttl)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ikigai_core::ArgSpec;
+
+    #[test]
+    fn validate_arguments_checks_the_contract() {
+        use serde_json::json;
+        let d = Description::new("wc").verb(Verb::Source).input(
+            ArgSpec::new("count")
+                .one_of(["lines", "words", "bytes"])
+                .default_value("lines"),
+        );
+        let action = &d.action_specs()[0];
+
+        // Conforms: a valid enum, and a value carrying newlines is fine.
+        assert!(validate_arguments(&d, action, &json!({ "count": "lines" })).is_none());
+        assert!(validate_arguments(&d, action, &json!({})).is_none());
+
+        // Bad enum → a SHACL report joined to the input node.
+        let report = validate_arguments(&d, action, &json!({ "count": "nope" })).unwrap();
+        assert!(report.contains("sh:conforms false"), "{report}");
+        assert!(
+            report.contains("not an accepted value of `count`"),
+            "{report}"
+        );
+        assert!(report.contains("wc:input:count"), "{report}");
+
+        // Unknown argument.
+        let report = validate_arguments(&d, action, &json!({ "bogus": "x" })).unwrap();
+        assert!(report.contains("unknown argument `bogus`"), "{report}");
+    }
 
     #[test]
     fn tool_names_round_trip() {
