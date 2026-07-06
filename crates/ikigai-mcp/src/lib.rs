@@ -12,6 +12,8 @@
 //! This module is pure — no kernel, no I/O — so the mapping is unit-testable on
 //! its own. The stdio JSON-RPC server that drives a live kernel is layered on top.
 
+pub mod server;
+
 use ikigai_core::{ActionSpec, ArgSpec, Description, Verb};
 use serde_json::{json, Map, Value};
 
