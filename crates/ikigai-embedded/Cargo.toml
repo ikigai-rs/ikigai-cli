@@ -14,6 +14,7 @@ ikigai-fn = { workspace = true }
 ikigai-personal = { workspace = true }
 ikigai-org = { workspace = true }
 ikigai-text = { workspace = true }
+ikigai-repo = { workspace = true }
 ikigai-fs = { workspace = true }
 ikigai-http = { workspace = true }
 ikigai-runbook = { workspace = true }
