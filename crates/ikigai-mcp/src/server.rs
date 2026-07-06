@@ -13,7 +13,7 @@
 //! the manifold the model sees and the calls it can make never exceed the grant.
 
 use futures::executor::block_on;
-use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request, Verb};
+use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request};
 use serde_json::{json, Value};
 
 use crate::{action_to_tool, parse_tool_name};
@@ -143,25 +143,12 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
             req_args.push((input.name.clone(), value));
         }
     }
-
-    // Pre-flight the argument values against the action's declared contract.
-    let proposed = req_args
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join("&");
-    let validate = Request::new(
-        Verb::Source,
-        Iri::parse("urn:kernel:validate").expect("valid IRI"),
-    )
-    .with_arg("action", ArgRef::Inline(m.action.clone().into_bytes()))
-    .with_arg("args", ArgRef::Inline(proposed.into_bytes()));
-    if let Ok(report) = block_on(kernel.issue(validate, capability)) {
-        let report = String::from_utf8_lossy(&report.bytes);
-        if report.contains("sh:conforms false") {
-            return tool_error(format!("arguments failed validation:\n{report}"));
-        }
-    }
+    // NOTE: a pre-flight through `urn:kernel:validate` belongs here, but its
+    // `args` face is a flat `k=v&k=v` string that cannot carry a value with a
+    // newline or `&` — exactly what a text tool's `in` argument holds. Wiring
+    // it up naively made the input's newlines read as argument separators. The
+    // correct fix is a structured (JSON) args face on validate; until then the
+    // endpoint's own error handling surfaces bad arguments as an isError result.
 
     // Invoke.
     let Ok(target_iri) = Iri::parse(&target) else {
@@ -222,7 +209,7 @@ pub fn serve(kernel: &Kernel, capability: &Capability) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use ikigai_core::{
-        ArgSpec, Description, EndpointSpace, Exact, FnEndpoint, ReprType, Representation,
+        ArgSpec, Description, EndpointSpace, Exact, FnEndpoint, ReprType, Representation, Verb,
     };
     use std::sync::Arc;
 

@@ -61,6 +61,13 @@ enum Mode {
         target: Option<String>,
         certs: Certs,
     },
+    /// Serve the capability-scoped manifold as an MCP (Model Context Protocol)
+    /// server over stdio. `grants`/`scopes` union into the session capability —
+    /// the ceiling on the tools an MCP client sees and can call.
+    Mcp {
+        grants: Vec<String>,
+        scopes: Vec<String>,
+    },
     CertGenerate {
         force: bool,
     },
@@ -157,6 +164,26 @@ fn parse_args() -> Result<Option<Mode>, String> {
         return Ok(Some(Mode::Serve { target, certs }));
     }
 
+    if argv.peek().map(String::as_str) == Some("mcp") {
+        argv.next();
+        let mut grants = Vec::new();
+        let mut scopes = Vec::new();
+        while let Some(arg) = argv.next() {
+            match arg.as_str() {
+                "--grant" => grants.push(
+                    argv.next()
+                        .ok_or_else(|| "--grant needs a name".to_string())?,
+                ),
+                "--scope" => scopes.push(
+                    argv.next()
+                        .ok_or_else(|| "--scope needs a capability IRI".to_string())?,
+                ),
+                other => return Err(format!("unknown argument after `mcp`: {other}")),
+            }
+        }
+        return Ok(Some(Mode::Mcp { grants, scopes }));
+    }
+
     let mut repl = ReplArgs::default();
     let mut daemon = false;
     while let Some(arg) = argv.next() {
@@ -217,11 +244,13 @@ fn main() {
     ikigai_embedded::set_instance_name(match &mode {
         Mode::Daemon => "daemon",
         Mode::Serve { .. } => "serve",
+        Mode::Mcp { .. } => "mcp",
         _ => "repl",
     });
 
     match mode {
         Mode::Daemon => daemon(),
+        Mode::Mcp { grants, scopes } => mcp(grants, scopes),
         Mode::CertGenerate { force } => cert_generate(force),
         Mode::Serve { target, certs } => match target.as_deref() {
             Some(t) if is_quic(t) => serve_quic(t, &certs),
@@ -276,6 +305,47 @@ fn daemon() {
 #[cfg(not(feature = "embedded"))]
 fn daemon() {
     eprintln!("ikigai: --daemon requires the embedded feature");
+    std::process::exit(2);
+}
+
+/// MCP stdio mode: project the composed manifold as MCP tools, scoped to the
+/// session capability built from `--grant`/`--scope`. The grant is the ceiling.
+#[cfg(feature = "embedded")]
+fn mcp(grants: Vec<String>, scopes: Vec<String>) {
+    use ikigai_core::Capability;
+    let mut union = scopes;
+    for name in &grants {
+        let found = ikigai_embedded::grant_scopes(name);
+        if found.is_empty() {
+            eprintln!("ikigai mcp: grant \"{name}\" is empty or undefined in grants.json");
+        }
+        union.extend(found);
+    }
+    union.sort();
+    union.dedup();
+    let capability = if union.is_empty() {
+        eprintln!(
+            "ikigai mcp: no --grant/--scope given — running UNRESTRICTED (root). \
+             Pass a grant to scope the tool list."
+        );
+        Capability::root()
+    } else {
+        eprintln!(
+            "ikigai mcp: serving the manifold under {} scope(s)",
+            union.len()
+        );
+        Capability::scoped(union)
+    };
+    let kernel = ikigai_embedded::watched_kernel();
+    if let Err(e) = ikigai_mcp::server::serve(&kernel, &capability) {
+        eprintln!("ikigai mcp: {e}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(not(feature = "embedded"))]
+fn mcp(_grants: Vec<String>, _scopes: Vec<String>) {
+    eprintln!("ikigai: mcp requires the embedded feature");
     std::process::exit(2);
 }
 

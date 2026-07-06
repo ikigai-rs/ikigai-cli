@@ -1,0 +1,13 @@
+{
+  "_doc": "Named MCP grants: each is a UNION of capability scopes. Copy to ~/.config/ikigai/grants.json (or point IKIGAI_GRANTS at it), then `ikigai mcp --grant <name>`. The grant is the CEILING on the tools an MCP client sees and can call.",
+  "research-agent": [
+    "urn:cap:net:query.wikidata.org",
+    "urn:cap:net:dbpedia.org"
+  ],
+  "booking-agent": [
+    "urn:cap:personal:calendar:read:freebusy"
+  ],
+  "reader": [
+    "urn:cap:fs:read:*"
+  ]
+}

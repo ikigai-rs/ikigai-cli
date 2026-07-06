@@ -25,6 +25,7 @@ ikigai-engine = { path = "../ikigai-engine", version = "0.1.6" }
 ikigai-resolve = { workspace = true }
 serde_json = { workspace = true }
 ikigai-embedded = { path = "../ikigai-embedded", version = "0.1.6", optional = true }
+ikigai-mcp = { path = "../ikigai-mcp", version = "0.1.9" }
 ikigai-ipc = { path = "../ikigai-ipc", version = "0.1.6", optional = true }
 ikigai-quic = { path = "../ikigai-quic", version = "0.1.6", optional = true }
 
