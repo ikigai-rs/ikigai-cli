@@ -18,20 +18,42 @@ use ikigai_core::{ActionSpec, ArgSpec, Description, InputSource, Verb};
 use serde_json::{json, Map, Value};
 
 /// The separator between an endpoint id and its verb in an MCP tool name. Double
-/// underscore keeps the name inside the common MCP `[A-Za-z0-9_-]` constraint
-/// (endpoint ids are lowerCamel/kebab, verbs are lowercase words) while staying
-/// reversible: `personal-calendar__sink` → (`personal-calendar`, Sink).
+/// underscore keeps the name inside the MCP `[A-Za-z0-9_-]` constraint (verbs are
+/// lowercase words) while staying reversible: `personal-calendar__sink` →
+/// (`personal-calendar`, Sink).
 const SEP: &str = "__";
 
-/// The MCP tool name for an (endpoint id, verb) action — reversible via
-/// [`parse_tool_name`]. Every verb is suffixed, including single-verb endpoints,
-/// so the name always states which action it invokes.
-pub fn tool_name(id: &str, verb: Verb) -> String {
-    format!("{id}{SEP}{}", verb_token(verb))
+/// Collapse an endpoint id into the MCP tool-name charset `[A-Za-z0-9_-]`.
+/// Endpoint ids are conventionally kebab/lowerCamel, but an id may be a full URI
+/// (`urn:llm:config`), and MCP names forbid `:` — so any character outside the
+/// set becomes `_`. The map is lossy, but it is never inverted: [`tool_name`]
+/// sanitizes when building a name and `tools/call` sanitizes each candidate id
+/// the same way before matching, so both sides agree on the canonical form.
+pub fn sanitize_id(id: &str) -> String {
+    id.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
-/// Recover the `(endpoint id, verb)` an MCP tool name was built from. `None` for
-/// a name that carries no known verb suffix.
+/// The MCP tool name for an (endpoint id, verb) action. The id is sanitized into
+/// the legal charset (see [`sanitize_id`]); the verb is suffixed on every tool,
+/// including single-verb endpoints, so the name always states which action it
+/// invokes. Recover the parts with [`parse_tool_name`] — which yields the
+/// *sanitized* id, the form `tools/call` matches on.
+pub fn tool_name(id: &str, verb: Verb) -> String {
+    format!("{}{SEP}{}", sanitize_id(id), verb_token(verb))
+}
+
+/// Recover the `(sanitized endpoint id, verb)` an MCP tool name was built from.
+/// The id is in the [`sanitize_id`] canonical form — `tools/call` compares it
+/// against `sanitize_id(candidate)`, so the lossy map is never inverted. `None`
+/// for a name that carries no known verb suffix.
 pub fn parse_tool_name(name: &str) -> Option<(String, Verb)> {
     let (id, verb) = name.rsplit_once(SEP)?;
     if id.is_empty() {
@@ -302,6 +324,26 @@ mod tests {
         }
         assert!(parse_tool_name("no-verb-suffix").is_none());
         assert!(parse_tool_name("__source").is_none());
+    }
+
+    #[test]
+    fn uri_shaped_ids_project_legal_names() {
+        // A colon-bearing id (`urn:llm:config`) must yield a name in the MCP
+        // charset, and parse back to the sanitized form the server matches on.
+        let name = tool_name("urn:llm:config", Verb::Source);
+        assert_eq!(name, "urn_llm_config__source");
+        assert!(name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+        assert_eq!(
+            parse_tool_name(&name),
+            Some(("urn_llm_config".to_string(), Verb::Source))
+        );
+        // The parsed id equals sanitize_id of the original — the server's match key.
+        assert_eq!(
+            parse_tool_name(&name).unwrap().0,
+            sanitize_id("urn:llm:config")
+        );
     }
 
     #[test]
