@@ -9,5 +9,10 @@
   ],
   "reader": [
     "urn:cap:fs:read:*"
+  ],
+  "dev": [
+    "urn:cap:exec:git",
+    "urn:cap:exec:gh",
+    "urn:cap:exec:cargo"
   ]
 }

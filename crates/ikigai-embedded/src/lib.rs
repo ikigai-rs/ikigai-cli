@@ -2116,6 +2116,10 @@ fn root_space() -> Arc<dyn Space> {
         // compose with | and .. over the newline-list convention. First module built
         // by a satellite session.
         Arc::new(ikigai_text::space()) as Arc<dyn Space>,
+        // Dev-tooling platform seam (urn:system:exec + urn:repo:*) — git/gh/cargo
+        // as capability-gated resources. Native subprocess seam; ikigai using the
+        // tools that build ikigai.
+        Arc::new(ikigai_repo::space()) as Arc<dyn Space>,
         Arc::new(ikigai_sparql::space()) as Arc<dyn Space>,
         Arc::new(ikigai_xslt::space()) as Arc<dyn Space>,
         // JSON-LD operators (urn:jsonld:expand/compact/flatten) — linked natively (the heavy
