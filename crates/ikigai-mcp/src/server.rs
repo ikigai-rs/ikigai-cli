@@ -143,12 +143,13 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
             req_args.push((input.name.clone(), value));
         }
     }
-    // NOTE: a pre-flight through `urn:kernel:validate` belongs here, but its
-    // `args` face is a flat `k=v&k=v` string that cannot carry a value with a
-    // newline or `&` — exactly what a text tool's `in` argument holds. Wiring
-    // it up naively made the input's newlines read as argument separators. The
-    // correct fix is a structured (JSON) args face on validate; until then the
-    // endpoint's own error handling surfaces bad arguments as an isError result.
+    // Pre-flight the JSON arguments against the action's declared contract
+    // (structured, so a value with a newline/& validates correctly). A
+    // non-conforming call comes back as the SHACL report — data the model reads
+    // and repairs from — without touching the endpoint.
+    if let Some(report) = crate::validate_arguments(&description, &action, &arguments) {
+        return tool_error(format!("arguments failed validation:\n{report}"));
+    }
 
     // Invoke.
     let Ok(target_iri) = Iri::parse(&target) else {
