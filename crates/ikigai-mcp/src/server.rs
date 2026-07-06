@@ -104,10 +104,13 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
         capability: Some(capability),
         ..Default::default()
     };
+    // Match on the sanitized id: `id` from the tool name is already in
+    // `sanitize_id` form, so sanitize each candidate the same way (a URI-shaped
+    // id like `urn:llm:config` projects to `urn_llm_config`).
     let Some(m) = kernel
         .select_actions(&query)
         .into_iter()
-        .find(|m| m.id == id && m.verb == verb)
+        .find(|m| crate::sanitize_id(&m.id) == id && m.verb == verb)
     else {
         return tool_error(format!(
             "tool `{name}` is not available under this capability"
