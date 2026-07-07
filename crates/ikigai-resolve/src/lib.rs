@@ -17,8 +17,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use futures::executor::block_on;
 use ikigai_core::{
-    Bindings, Capability, Endpoint, Error, Expiry, Invocation, Kernel, Provenance, Representation,
-    Request, Resolution, Resolved, Scope, Space, SpaceEntry, TraceEvent, Tracer,
+    ArgRef, Bindings, Capability, Description, Endpoint, Error, Expiry, Invocation, Kernel,
+    Provenance, Representation, Request, Resolution, Resolved, Scope, Space, SpaceEntry,
+    TraceEvent, Tracer, Verb,
 };
 use serde::{Deserialize, Serialize};
 
@@ -126,6 +127,19 @@ impl Endpoint for ForwardingEndpoint {
 
     fn name(&self) -> &str {
         "remote"
+    }
+
+    fn describe(&self) -> Description {
+        // Forward a Meta request (JSON face) so the engine can route named args by
+        // the *remote* endpoint's own contract — otherwise `compose src=…` over a
+        // mount loses its `src`. Best-effort: a bare description on any error.
+        let meta = Request::new(Verb::Meta, self.request.target.clone())
+            .with_arg("as", ArgRef::Inline(b"application/json".to_vec()));
+        self.resolver
+            .issue_as(meta, &Capability::root())
+            .ok()
+            .and_then(|(repr, _status)| serde_json::from_slice(&repr.bytes).ok())
+            .unwrap_or_else(|| Description::new("remote"))
     }
 }
 
