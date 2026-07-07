@@ -951,23 +951,57 @@ pub fn grants_path() -> Option<PathBuf> {
 }
 
 /// The scopes of a named MCP grant, from `~/.config/ikigai/grants.json`
-/// (env override `IKIGAI_GRANTS`): a `{ "<grant>": ["urn:cap:…", …] }` map. A
-/// grant is a NAMED UNION of capability scopes — the union of affordances an MCP
-/// session may see. Unknown grant / no file ⇒ empty.
+/// (env override `IKIGAI_GRANTS`). A grant is a NAMED UNION of capability scopes —
+/// the union of affordances an MCP session may see. Two shapes are accepted, so a
+/// grant can also carry a *visibility* profile (see [`grant_visibility`]): the
+/// original scopes-only array `"<grant>": ["urn:cap:…", …]`, or an object
+/// `"<grant>": { "scopes": ["urn:cap:…", …], "show": […], "hide": […] }`.
+/// Unknown grant / no file / neither shape ⇒ empty.
 pub fn grant_scopes(name: &str) -> Vec<String> {
-    let Some(path) = grants_path() else {
-        return Vec::new();
-    };
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return Vec::new();
-    };
-    v[name]
-        .as_array()
-        .map(|scopes| {
-            scopes
+    grant_entry(name).map(|e| scopes_of(&e)).unwrap_or_default()
+}
+
+/// The visibility profile of a named MCP grant — the `show`/`hide` glob lists from
+/// the object form (empty for the scopes-only array form). Distinct from the
+/// grant's *authority* ([`grant_scopes`]): visibility narrows the projected tool
+/// list to what's worth showing, without changing what the session may call.
+/// Returns `(show, hide)`.
+pub fn grant_visibility(name: &str) -> (Vec<String>, Vec<String>) {
+    grant_entry(name)
+        .map(|e| visibility_of(&e))
+        .unwrap_or_default()
+}
+
+/// Scopes of one grant entry: the object form nests them under `"scopes"`; the
+/// array form IS the scopes.
+fn scopes_of(entry: &serde_json::Value) -> Vec<String> {
+    string_array(entry.get("scopes").unwrap_or(entry))
+}
+
+/// `(show, hide)` visibility globs of one grant entry (both empty for the array
+/// form, which carries no visibility keys).
+fn visibility_of(entry: &serde_json::Value) -> (Vec<String>, Vec<String>) {
+    (string_array(&entry["show"]), string_array(&entry["hide"]))
+}
+
+/// Read one grant's JSON value from the grants file. `None` if there is no file,
+/// it doesn't parse, or the grant is absent.
+fn grant_entry(name: &str) -> Option<serde_json::Value> {
+    let path = grants_path()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let v = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+    let entry = &v[name];
+    if entry.is_null() {
+        return None;
+    }
+    Some(entry.clone())
+}
+
+/// The string members of a JSON array value (non-arrays and non-strings dropped).
+fn string_array(v: &serde_json::Value) -> Vec<String> {
+    v.as_array()
+        .map(|items| {
+            items
                 .iter()
                 .filter_map(|s| s.as_str().map(str::to_string))
                 .collect()
@@ -2550,6 +2584,40 @@ mod tests {
     use super::*;
     use futures::executor::block_on;
     use ikigai_core::{ArgRef, Capability, Iri, Request};
+
+    #[test]
+    fn grant_entry_parses_both_shapes() {
+        // Array form: scopes only, no visibility (backward compatible).
+        let arr = serde_json::json!(["urn:cap:exec:git", "urn:cap:fs:read:*"]);
+        assert_eq!(
+            scopes_of(&arr),
+            vec![
+                "urn:cap:exec:git".to_string(),
+                "urn:cap:fs:read:*".to_string()
+            ]
+        );
+        assert_eq!(visibility_of(&arr), (Vec::new(), Vec::new()));
+
+        // Object form: scopes under "scopes", plus show/hide visibility globs.
+        let obj = serde_json::json!({
+            "scopes": ["urn:cap:exec:git"],
+            "hide": ["wc", "greet"],
+            "show": ["sparql"]
+        });
+        assert_eq!(scopes_of(&obj), vec!["urn:cap:exec:git".to_string()]);
+        assert_eq!(
+            visibility_of(&obj),
+            (
+                vec!["sparql".to_string()],
+                vec!["wc".to_string(), "greet".to_string()]
+            )
+        );
+
+        // Object form without visibility keys: scopes present, globs empty.
+        let bare_obj = serde_json::json!({ "scopes": ["urn:cap:net:*"] });
+        assert_eq!(scopes_of(&bare_obj), vec!["urn:cap:net:*".to_string()]);
+        assert_eq!(visibility_of(&bare_obj), (Vec::new(), Vec::new()));
+    }
 
     #[test]
     fn history_round_trips_lines() {

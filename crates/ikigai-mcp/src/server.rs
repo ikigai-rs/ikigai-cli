@@ -16,14 +16,19 @@ use futures::executor::block_on;
 use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request};
 use serde_json::{json, Value};
 
-use crate::{action_to_tool, parse_tool_name};
+use crate::{action_to_tool, parse_tool_name, ToolFilter};
 
 /// The MCP protocol revision this server implements against.
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// Dispatch one JSON-RPC message. Returns the response value to write back, or
 /// `None` for a notification (no `id` ⇒ no reply).
-pub fn handle(kernel: &Kernel, capability: &Capability, msg: &Value) -> Option<Value> {
+pub fn handle(
+    kernel: &Kernel,
+    capability: &Capability,
+    filter: &ToolFilter,
+    msg: &Value,
+) -> Option<Value> {
     let id = msg.get("id").cloned();
     let method = msg.get("method").and_then(Value::as_str)?;
 
@@ -32,7 +37,7 @@ pub fn handle(kernel: &Kernel, capability: &Capability, msg: &Value) -> Option<V
         _ if id.is_none() => None,
         "initialize" => Some(ok(id?, initialize_result())),
         "ping" => Some(ok(id?, json!({}))),
-        "tools/list" => Some(ok(id?, tools_list(kernel, capability))),
+        "tools/list" => Some(ok(id?, tools_list(kernel, capability, filter))),
         "tools/call" => Some(ok(id?, tools_call(kernel, capability, msg.get("params")))),
         other => Some(err(id?, -32601, &format!("method not found: {other}"))),
     }
@@ -55,9 +60,10 @@ fn initialize_result() -> Value {
 }
 
 /// Project the capability-scoped manifold as the MCP tool list. `select_actions`
-/// with no present types returns every action the grant allows; each is
-/// `describe`d for its typed contract and projected to a tool.
-fn tools_list(kernel: &Kernel, capability: &Capability) -> Value {
+/// with no present types returns every action the grant *authorizes*; each is
+/// `describe`d for its typed contract and projected to a tool — then `filter`
+/// drops the ones not worth showing (relevance, not authority; see [`ToolFilter`]).
+fn tools_list(kernel: &Kernel, capability: &Capability, filter: &ToolFilter) -> Value {
     let query = ikigai_core::ActionQuery {
         capability: Some(capability),
         ..Default::default()
@@ -75,7 +81,14 @@ fn tools_list(kernel: &Kernel, capability: &Capability) -> Value {
             .into_iter()
             .find(|a| a.verb == m.verb)
         {
-            tools.push(action_to_tool(&description, &action));
+            let tool = action_to_tool(&description, &action);
+            let shown = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| filter.allows(n));
+            if shown {
+                tools.push(tool);
+            }
         }
     }
     json!({ "tools": tools })
@@ -191,6 +204,7 @@ fn tool_error(message: String) -> Value {
 /// response as one line. Runs until stdin closes.
 pub fn serve(kernel: &Kernel, capability: &Capability) -> std::io::Result<()> {
     use std::io::{BufRead, Write};
+    let filter = ToolFilter::default(); // allow-all: the plain server shows the full grant
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -201,7 +215,7 @@ pub fn serve(kernel: &Kernel, capability: &Capability) -> std::io::Result<()> {
         let Ok(msg) = serde_json::from_str::<Value>(&line) else {
             continue; // a malformed line is ignored, not fatal
         };
-        if let Some(response) = handle(kernel, capability, &msg) {
+        if let Some(response) = handle(kernel, capability, &filter, &msg) {
             writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
             stdout.flush()?;
         }
@@ -244,6 +258,7 @@ mod tests {
         let resp = handle(
             &k,
             &cap,
+            &ToolFilter::default(),
             &json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
         )
         .unwrap();
@@ -258,6 +273,7 @@ mod tests {
         assert!(handle(
             &k,
             &cap,
+            &ToolFilter::default(),
             &json!({"jsonrpc":"2.0","method":"notifications/initialized"})
         )
         .is_none());
@@ -271,6 +287,7 @@ mod tests {
         let resp = handle(
             &k,
             &held,
+            &ToolFilter::default(),
             &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
         )
         .unwrap();
@@ -287,10 +304,64 @@ mod tests {
         let resp = handle(
             &k,
             &bare,
+            &ToolFilter::default(),
             &json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
         )
         .unwrap();
         assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn a_hide_filter_drops_an_authorized_tool_from_the_list() {
+        let k = kernel();
+        let held = Capability::scoped(["urn:cap:demo:echo"]);
+        // The echo tool is authorized, but the visibility filter hides it by id —
+        // authority unchanged, menu narrowed.
+        let filter = ToolFilter {
+            show: vec![],
+            hide: vec!["echo".to_string()],
+        };
+        let resp = handle(
+            &k,
+            &held,
+            &filter,
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .unwrap();
+        assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 0);
+
+        // A show list that doesn't include echo hides it too; one that does keeps it.
+        let only_other = ToolFilter {
+            show: vec!["other".to_string()],
+            hide: vec![],
+        };
+        let resp = handle(
+            &k,
+            &held,
+            &only_other,
+            &json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+        )
+        .unwrap();
+        assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn tools_call_ignores_the_filter_authority_still_governs() {
+        // A hidden tool is not a forbidden tool: the filter shapes the menu, not
+        // the security boundary — a client that names it still invokes under cap.
+        let k = kernel();
+        let held = Capability::scoped(["urn:cap:demo:echo"]);
+        let hide_all = ToolFilter {
+            show: vec![],
+            hide: vec!["*".to_string()],
+        };
+        let call = json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params": { "name": "echo__source", "arguments": { "in": "hi" } }
+        });
+        let resp = handle(&k, &held, &hide_all, &call).unwrap();
+        assert_eq!(resp["result"]["isError"], false);
+        assert_eq!(resp["result"]["content"][0]["text"], "[hi]");
     }
 
     #[test]
@@ -301,14 +372,14 @@ mod tests {
             "jsonrpc":"2.0","id":1,"method":"tools/call",
             "params": { "name": "echo__source", "arguments": { "in": "hi" } }
         });
-        let resp = handle(&k, &held, &call).unwrap();
+        let resp = handle(&k, &held, &ToolFilter::default(), &call).unwrap();
         assert_eq!(resp["result"]["isError"], false);
         assert_eq!(resp["result"]["content"][0]["text"], "[hi]");
 
         // The same call under a capability that doesn't hold the scope: the tool
         // is not in the manifold, so it can't be invoked.
         let bare = Capability::scoped(["urn:cap:unrelated"]);
-        let resp = handle(&k, &bare, &call).unwrap();
+        let resp = handle(&k, &bare, &ToolFilter::default(), &call).unwrap();
         assert_eq!(resp["result"]["isError"], true);
         assert!(resp["result"]["content"][0]["text"]
             .as_str()

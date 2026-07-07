@@ -62,6 +62,52 @@ pub fn parse_tool_name(name: &str) -> Option<(String, Verb)> {
     Some((id.to_string(), parse_verb_token(verb)?))
 }
 
+/// A visibility profile for the projected tool list — *relevance*, distinct from
+/// *authority*. The capability (grant) already decides which actions a client may
+/// see and call; a `ToolFilter` narrows that authorized set to the ones worth
+/// showing, so a focused agent isn't handed dozens of tools that duplicate its
+/// built-ins (the `urn:text:*` Unix set beside a shell) or demo endpoints. It is
+/// never a security boundary: a hidden tool the client somehow names is still
+/// governed by the capability at `tools/call`; hiding only shapes the menu.
+///
+/// Both lists are glob patterns matched against a tool name by [`Self::allows`].
+/// Semantics: allowlist-wins — a `hide` match is dropped; otherwise, if `show` is
+/// non-empty the tool must match it; an empty filter allows everything (the
+/// default, so an unconfigured grant behaves exactly as before).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolFilter {
+    /// If non-empty, only tools matching one of these patterns are shown.
+    pub show: Vec<String>,
+    /// Tools matching any of these patterns are always hidden (wins over `show`).
+    pub hide: Vec<String>,
+}
+
+impl ToolFilter {
+    /// Whether `tool_name` (the sanitized `id__verb` form) survives the filter.
+    pub fn allows(&self, tool_name: &str) -> bool {
+        if self.hide.iter().any(|p| pattern_matches(p, tool_name)) {
+            return false;
+        }
+        self.show.is_empty() || self.show.iter().any(|p| pattern_matches(p, tool_name))
+    }
+}
+
+/// Match one visibility pattern against a tool name. Three human-friendly forms,
+/// no regex: an exact name (`grep__source`); a trailing-`*` prefix (`repo-*`,
+/// `http*`); or a bare endpoint id (`grep`) that matches every verb of that
+/// endpoint (`grep__source`, `grep__sink`) by matching `id__`. `*` alone matches
+/// all.
+fn pattern_matches(pattern: &str, name: &str) -> bool {
+    if pattern == name || pattern == "*" {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return name.starts_with(prefix);
+    }
+    // A verb-less id matches any verb of that endpoint.
+    !pattern.contains(SEP) && name.starts_with(&format!("{pattern}{SEP}"))
+}
+
 fn verb_token(verb: Verb) -> &'static str {
     match verb {
         Verb::Source => "source",
@@ -310,6 +356,38 @@ mod tests {
         // Unknown argument.
         let report = validate_arguments(&d, action, &json!({ "bogus": "x" })).unwrap();
         assert!(report.contains("unknown argument `bogus`"), "{report}");
+    }
+
+    #[test]
+    fn tool_filter_allows_by_relevance() {
+        // Empty filter = allow-all (an unconfigured grant is unchanged).
+        assert!(ToolFilter::default().allows("wc__source"));
+
+        // Bare id matches every verb of that endpoint; a trailing-* is a prefix;
+        // an exact name matches only itself.
+        let f = ToolFilter {
+            show: vec![],
+            hide: vec![
+                "wc".to_string(),     // id → wc__source, wc__sink, …
+                "repo-*".to_string(), // prefix → repo-status__source, repo-log__source
+                "greet__source".to_string(),
+            ],
+        };
+        assert!(!f.allows("wc__source"));
+        assert!(!f.allows("repo-status__source"));
+        assert!(!f.allows("greet__source"));
+        assert!(f.allows("greeter__source")); // "greet__source" is exact, not a prefix
+        assert!(f.allows("sparql__source")); // unmatched → shown
+
+        // Allowlist-wins: with a show list, only matches survive; hide still cuts.
+        let g = ToolFilter {
+            show: vec!["sparql".to_string(), "rdf-*".to_string()],
+            hide: vec!["rdf-transrept".to_string()],
+        };
+        assert!(g.allows("sparql__source"));
+        assert!(g.allows("rdf-union__source"));
+        assert!(!g.allows("rdf-transrept__source")); // hidden despite matching show
+        assert!(!g.allows("calendar__source")); // not in show → dropped
     }
 
     #[test]
