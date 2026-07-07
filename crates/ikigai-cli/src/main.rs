@@ -717,18 +717,27 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String]) -> ! {
         } else {
             format!("fixed ceiling: {}", caps.join(", "))
         };
+        // A personal ceiling means this is a personal-resource server (the calendar
+        // federation): serve the minimal calendar-only kernel — availability + calendar
+        // and nothing else — instead of the default served kernel (host + fs). The clamp
+        // still gates it (a freebusy ceiling → freebusy), but the manifold is also
+        // minimal, so nothing but the calendar is even nameable over the wire.
+        let personal = caps.iter().any(|c| c.starts_with("urn:cap:personal:"));
+        let kernel = if personal {
+            ikigai_embedded::calendar_server_kernel()
+        } else {
+            ikigai_embedded::kernel_for("Remote (QUIC)")
+        };
+        let surface = if personal {
+            "calendar-only"
+        } else {
+            "host + fs"
+        };
         eprintln!(
-            "ikigai: serving on {target}  ({posture}; {} trusted client cert(s))  (Ctrl-C to stop)",
+            "ikigai: serving on {target}  ({posture}; surface: {surface}; {} trusted client cert(s))  (Ctrl-C to stop)",
             trusted.len()
         );
-        ikigai_quic::serve(
-            ikigai_embedded::kernel_for("Remote (QUIC)"),
-            addr,
-            &identity,
-            &trusted,
-            minter,
-        )
-        .map_err(|e| e.to_string())
+        ikigai_quic::serve(kernel, addr, &identity, &trusted, minter).map_err(|e| e.to_string())
     })();
     match result {
         Ok(()) => std::process::exit(0),

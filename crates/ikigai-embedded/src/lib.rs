@@ -1685,6 +1685,43 @@ fn served_space(nature: &'static str) -> EndpointSpace {
     )
 }
 
+/// A purpose-built kernel for a calendar-federation server (`ikigai serve quic://…
+/// --cap urn:cap:personal:calendar:read:freebusy`): the base host resources PLUS the
+/// calendar endpoints ONLY — `urn:personal:availability`, `urn:personal:calendar`,
+/// and its period grammar — and deliberately NOTHING else. No contacts, no filesystem
+/// (`served_space`'s `urn:file:` is omitted), no exec, no org. So the entire surface a
+/// remote client can even name is the calendar, and the connection's clamped capability
+/// (a free/busy ceiling → free/busy, a detail/write grant → detail/write) governs what
+/// of that it may actually resolve. Defense-in-depth: authority is clamped AND the
+/// manifold is minimal, so a bug in one still leaves the other. The endpoints read
+/// EventKit directly through the configured calendar, so this kernel is only useful on
+/// the machine holding the calendar (with its TCC grant).
+pub fn calendar_server_space(nature: &'static str) -> EndpointSpace {
+    base_space(nature)
+        .bind(
+            Exact::new("urn:personal:availability"),
+            ikigai_personal::availability(),
+        )
+        .bind(
+            Exact::new("urn:personal:calendar"),
+            ikigai_personal::calendar(),
+        )
+        // AFTER the exact bind: the period grammar (`urn:personal:calendar:this-week`)
+        // must not shadow the bare `urn:personal:calendar` (first grammar match wins).
+        .bind(
+            UriTemplate::parse("urn:personal:calendar:{period}").expect("valid template"),
+            ikigai_personal::calendar(),
+        )
+}
+
+/// The kernel a calendar-federation server runs. See [`calendar_server_space`].
+pub fn calendar_server_kernel() -> Kernel {
+    Kernel::with_meta_renderer(
+        Arc::new(calendar_server_space("Calendar (QUIC)")),
+        Arc::new(CliRenderer),
+    )
+}
+
 /// The native HTTP transport backing the `urn:http*` endpoints: a blocking `ureq`
 /// client. Runtime-free, so it runs under the CLI's `futures::block_on` without
 /// pulling in Tokio — the executor stays chosen at the edge.
@@ -2599,6 +2636,36 @@ mod tests {
     use super::*;
     use futures::executor::block_on;
     use ikigai_core::{ArgRef, Capability, Iri, Request};
+
+    #[test]
+    fn calendar_server_space_exposes_only_the_calendar() {
+        use ikigai_core::Space;
+        let space = calendar_server_space("test");
+        let patterns: Vec<String> = Space::entries(&space)
+            .unwrap_or_default()
+            .iter()
+            .map(|e| format!("{} {}", e.pattern, e.endpoint))
+            .collect();
+        let has = |needle: &str| patterns.iter().any(|p| p.contains(needle));
+
+        // The calendar surface IS present.
+        assert!(has("personal:availability"), "availability: {patterns:?}");
+        assert!(has("personal:calendar"), "calendar: {patterns:?}");
+        // Personal data and local reach that must NOT be exposed over the wire.
+        assert!(
+            !has("personal:contacts"),
+            "contacts must not leak: {patterns:?}"
+        );
+        assert!(
+            !has("urn:file"),
+            "the filesystem must not be served: {patterns:?}"
+        );
+        assert!(!has("system:exec"), "exec must not be served: {patterns:?}");
+        assert!(
+            !has("urn:orgfile"),
+            "org files must not be served: {patterns:?}"
+        );
+    }
 
     #[test]
     fn grant_entry_parses_both_shapes() {
