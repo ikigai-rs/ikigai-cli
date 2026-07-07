@@ -1557,9 +1557,11 @@ fn cache_word(status: CacheStatus) -> &'static str {
 }
 
 /// Whether an error is a capability denial, for the trace annotation. Prefers the
-/// kernel's typed `Error::Denied`; falls back to the "does not grant" phrase for
-/// modules (e.g. ikigai-fs) that still return a denial as an `Endpoint` string —
-/// remove that arm once those modules adopt the typed variant.
+/// kernel's typed `Error::Denied` (ikigai-fs now returns it, as of fs 0.1.4);
+/// falls back to the "does not grant" phrase for modules that STILL spell a denial
+/// as an `Endpoint` string — `ikigai-repo` and `ikigai-http` today. Remove that
+/// arm once those two also adopt the typed variant (until then, dropping it would
+/// regress their denials to a generic "error" tag).
 fn is_denial(error: &ikigai_core::Error) -> bool {
     matches!(error, ikigai_core::Error::Denied(_))
         || matches!(error, ikigai_core::Error::Endpoint(m) if m.contains("does not grant"))
