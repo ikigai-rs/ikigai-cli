@@ -340,6 +340,21 @@ fn mcp_capability(grants: &[String], scopes: &[String]) -> ikigai_core::Capabili
     }
 }
 
+/// Build the tool-visibility filter from the named grants — the union of their
+/// `show`/`hide` globs. Distinct from [`mcp_capability`]: authority decides what
+/// the session may call; this decides what the projected tool list bothers to
+/// show. Empty ⇒ allow-all. `--scope` unions carry authority only, no visibility.
+#[cfg(feature = "embedded")]
+fn mcp_filter(grants: &[String]) -> ikigai_mcp::ToolFilter {
+    let mut filter = ikigai_mcp::ToolFilter::default();
+    for name in grants {
+        let (show, hide) = ikigai_embedded::grant_visibility(name);
+        filter.show.extend(show);
+        filter.hide.extend(hide);
+    }
+    filter
+}
+
 /// MCP stdio mode: project the composed manifold as MCP tools, scoped to the
 /// session capability built from `--grant`/`--scope` (the ceiling). A poller
 /// watches the grants file; when the active grant's scopes change, it rebuilds
@@ -353,12 +368,23 @@ fn mcp(grants: Vec<String>, scopes: Vec<String>) {
     use std::sync::{Arc, Mutex, RwLock};
 
     let capability = Arc::new(RwLock::new(mcp_capability(&grants, &scopes)));
+    let filter = Arc::new(RwLock::new(mcp_filter(&grants)));
     match capability.read().expect("cap lock").scopes() {
         None => eprintln!("ikigai mcp: no --grant/--scope — running UNRESTRICTED (root)"),
         Some(s) => eprintln!(
             "ikigai mcp: serving the manifold under {} scope(s)",
             s.len()
         ),
+    }
+    {
+        let f = filter.read().expect("filter lock");
+        if !f.show.is_empty() || !f.hide.is_empty() {
+            eprintln!(
+                "ikigai mcp: tool visibility — {} shown, {} hidden pattern(s)",
+                f.show.len(),
+                f.hide.len()
+            );
+        }
     }
     let kernel = ikigai_embedded::watched_kernel();
     let stdout = Arc::new(Mutex::new(std::io::stdout()));
@@ -368,6 +394,7 @@ fn mcp(grants: Vec<String>, scopes: Vec<String>) {
     if !grants.is_empty() {
         if let Some(path) = ikigai_embedded::grants_path() {
             let capability = Arc::clone(&capability);
+            let filter = Arc::clone(&filter);
             let stdout = Arc::clone(&stdout);
             std::thread::spawn(move || {
                 let mtime = || std::fs::metadata(&path).and_then(|m| m.modified()).ok();
@@ -379,10 +406,20 @@ fn mcp(grants: Vec<String>, scopes: Vec<String>) {
                         continue;
                     }
                     last = now;
-                    let fresh = mcp_capability(&grants, &scopes);
-                    let changed = fresh.scopes() != capability.read().expect("cap lock").scopes();
-                    if changed {
-                        *capability.write().expect("cap lock") = fresh;
+                    // A grant edit can change authority (scopes) and/or visibility
+                    // (show/hide) — either reshapes the tool list, so re-emit on both.
+                    let fresh_cap = mcp_capability(&grants, &scopes);
+                    let fresh_filter = mcp_filter(&grants);
+                    let cap_changed =
+                        fresh_cap.scopes() != capability.read().expect("cap lock").scopes();
+                    let filter_changed = fresh_filter != *filter.read().expect("filter lock");
+                    if cap_changed {
+                        *capability.write().expect("cap lock") = fresh_cap;
+                    }
+                    if filter_changed {
+                        *filter.write().expect("filter lock") = fresh_filter;
+                    }
+                    if cap_changed || filter_changed {
                         let note =
                             "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}";
                         let mut out = stdout.lock().expect("stdout lock");
@@ -405,8 +442,9 @@ fn mcp(grants: Vec<String>, scopes: Vec<String>) {
             continue;
         };
         let response = {
-            let guard = capability.read().expect("cap lock");
-            handle(&kernel, &guard, &msg)
+            let cap = capability.read().expect("cap lock");
+            let filt = filter.read().expect("filter lock");
+            handle(&kernel, &cap, &filt, &msg)
         };
         if let Some(response) = response {
             let mut out = stdout.lock().expect("stdout lock");
