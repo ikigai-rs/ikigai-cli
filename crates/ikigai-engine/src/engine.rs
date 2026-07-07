@@ -923,7 +923,15 @@ impl Engine {
             .unwrap_or(0);
         let lines: Vec<String> = entries
             .iter()
-            .map(|entry| format!("{:<width$}  → {}", entry.pattern, entry.endpoint))
+            .map(|entry| {
+                // A mounted binding names where it resolves; a local one stays quiet.
+                let origin = entry
+                    .origin
+                    .as_deref()
+                    .map(|o| format!("   [{o}]"))
+                    .unwrap_or_default();
+                format!("{:<width$}  → {}{origin}", entry.pattern, entry.endpoint)
+            })
             .collect();
         Ok(lines.join("\n"))
     }

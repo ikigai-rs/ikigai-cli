@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 /// (client and server ship together) — it's here to fail loudly when that
 /// changes. v2 adds [`Call::IssueAs`] (capability-on-the-wire); v3 adds
 /// [`Call::IssueTraced`] / [`Reply::ResolvedTraced`] (trace-over-the-wire).
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The largest framed message accepted. Guards [`read_message`] against a bogus
 /// length header demanding a huge allocation; 64 MiB is far above any
