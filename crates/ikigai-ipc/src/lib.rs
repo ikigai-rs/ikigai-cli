@@ -20,6 +20,7 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ikigai_core::{Capability, Kernel, Representation, Request, SpaceEntry, Tracer};
 use ikigai_resolve::{scoped_entries, CacheStatus, Resolver, SpanCollector};
@@ -46,10 +47,24 @@ pub fn serve(kernel: Kernel, path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Connect to a kernel server listening on `path`.
+/// The default socket read/write deadline. Without it, a hung or vanished server
+/// would block a `--connect` client's blocking read **forever** (a synchronous
+/// read never yields, so no async `Timeout` overlay can save it). On elapse the
+/// call returns a `timeout` error — which the reliability overlays can then act on.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Connect to a kernel server listening on `path`, with the default I/O timeout.
 pub fn connect(path: &Path) -> io::Result<IpcResolver> {
+    connect_with_timeout(path, Some(DEFAULT_TIMEOUT))
+}
+
+/// Connect with an explicit socket I/O `timeout` (`None` blocks indefinitely).
+pub fn connect_with_timeout(path: &Path, timeout: Option<Duration>) -> io::Result<IpcResolver> {
+    let stream = UnixStream::connect(path)?;
+    stream.set_read_timeout(timeout)?;
+    stream.set_write_timeout(timeout)?;
     Ok(IpcResolver {
-        stream: UnixStream::connect(path)?,
+        stream,
         tracer: Mutex::new(None),
     })
 }
@@ -73,12 +88,22 @@ impl IpcResolver {
     }
 }
 
+/// Turn a socket I/O error into the resolver's string error, naming a **timeout**
+/// (the read/write deadline elapsed) so a hung server is recognizable rather than a
+/// bare "resource temporarily unavailable" — and so the "timeout" marker is present
+/// for a caller that classifies it as transient.
+fn wire_error(e: io::Error) -> String {
+    match e.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
+            "timeout: no response from the kernel server (it may be hung or gone)".to_string()
+        }
+        _ => e.to_string(),
+    }
+}
+
 impl Resolver for IpcResolver {
     fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), String> {
-        match self
-            .round_trip(Call::Issue(request))
-            .map_err(|e| e.to_string())?
-        {
+        match self.round_trip(Call::Issue(request)).map_err(wire_error)? {
             Reply::Resolved(representation, status) => Ok((representation, status)),
             Reply::Error(message) => Err(message),
             other => Err(format!("unexpected reply to Issue: {other:?}")),
@@ -110,7 +135,7 @@ impl Resolver for IpcResolver {
         } else {
             Call::IssueAs(request, capability.clone())
         };
-        match self.round_trip(call).map_err(|e| e.to_string())? {
+        match self.round_trip(call).map_err(wire_error)? {
             Reply::Resolved(representation, status) => Ok((representation, status)),
             Reply::ResolvedTraced(representation, status, events) => {
                 if let Some(tracer) = &tracer {
@@ -423,6 +448,37 @@ mod tests {
         );
 
         drop(local_kernel);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_hung_server_times_out_instead_of_hanging() {
+        let path = socket_path("hang");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        // A "server" that accepts the connection but never replies.
+        let server = thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_millis(400)); // hold it, write nothing
+                drop(stream);
+            }
+        });
+
+        let client = connect_with_timeout(&path, Some(Duration::from_millis(100))).unwrap();
+        let start = std::time::Instant::now();
+        let result = client.issue(upper("hi"));
+        assert!(result.is_err(), "a hung server errors instead of hanging");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "returned promptly on the read timeout, not blocked forever"
+        );
+        assert!(
+            result.unwrap_err().contains("timeout"),
+            "the hang is reported as a timeout"
+        );
+
+        drop(client);
         server.join().unwrap();
         let _ = std::fs::remove_file(&path);
     }
