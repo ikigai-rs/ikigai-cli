@@ -277,7 +277,14 @@ impl Resolver for QuicResolver {
     fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), Error> {
         match self.round_trip(Call::Issue(request)).map_err(quic_error)? {
             Reply::Resolved(representation, status) => Ok((representation, status)),
-            Reply::Error(message) => Err(Error::Endpoint(message)),
+            // The server already rendered its error to a string; don't re-prefix an
+            // already-"endpoint error: …" message into a doubled one across the wire.
+            Reply::Error(message) => Err(Error::Endpoint(
+                message
+                    .strip_prefix("endpoint error: ")
+                    .map(str::to_string)
+                    .unwrap_or(message),
+            )),
             other => Err(Error::Endpoint(format!(
                 "unexpected reply to Issue: {other:?}"
             ))),
@@ -316,7 +323,14 @@ impl Resolver for QuicResolver {
                 }
                 Ok((representation, status))
             }
-            Reply::Error(message) => Err(Error::Endpoint(message)),
+            // The server already rendered its error to a string; don't re-prefix an
+            // already-"endpoint error: …" message into a doubled one across the wire.
+            Reply::Error(message) => Err(Error::Endpoint(
+                message
+                    .strip_prefix("endpoint error: ")
+                    .map(str::to_string)
+                    .unwrap_or(message),
+            )),
             other => Err(Error::Endpoint(format!(
                 "unexpected reply to IssueAs: {other:?}"
             ))),
