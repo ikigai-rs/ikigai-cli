@@ -175,9 +175,17 @@ pub fn parse_addr(target: &str) -> Result<SocketAddr, String> {
     let hostport = target
         .strip_prefix("quic://")
         .ok_or_else(|| format!("not a quic:// target: {target}"))?;
-    hostport
+    let mut addrs: Vec<SocketAddr> = hostport
         .to_socket_addrs()
         .map_err(|e| format!("resolve {hostport}: {e}"))?
+        .collect();
+    // Prefer IPv4. A `serve` binds `0.0.0.0` (IPv4-only), but an mDNS `.local`
+    // name often resolves to BOTH families and hands the IPv6 first — dialing
+    // that, the IPv4-only server never answers and the connect times out. Sorting
+    // IPv4 ahead (`is_ipv6()` false < true) picks a family the server is on.
+    addrs.sort_by_key(|a| a.is_ipv6());
+    addrs
+        .into_iter()
         .next()
         .ok_or_else(|| format!("{hostport} resolved to no address"))
 }
