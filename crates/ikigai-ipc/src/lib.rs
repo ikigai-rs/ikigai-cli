@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use ikigai_core::{Capability, Kernel, Representation, Request, SpaceEntry, Tracer};
-use ikigai_resolve::{CacheStatus, Resolver, SpanCollector};
+use ikigai_resolve::{scoped_entries, CacheStatus, Resolver, SpanCollector};
 use ikigai_wire::{read_message, write_message, Call, Reply, TraceContext};
 
 /// Run `kernel` as a server on `path` until an unrecoverable accept error: bind
@@ -191,7 +191,10 @@ fn dispatch(kernel: &Kernel, call: Call) -> Reply {
         Call::IsCached(request) => {
             Reply::Cached(Resolver::is_cached(kernel, &request, &Capability::root()))
         }
-        Call::Entries => Reply::Entries(Resolver::entries(kernel)),
+        // The peer is the peercred-verified owner (root authority), so this lists the
+        // whole capability-scoped manifold — but it goes through the same cap filter
+        // as QUIC, not the raw catalog, so the two transports agree.
+        Call::Entries => Reply::Entries(Some(scoped_entries(kernel, &Capability::root()))),
         // Trace-over-the-wire: install a collector, resolve, ship the recorded spans
         // back. `_ctx.parent_span` is for a future mount-stitch (re-parenting the
         // subtree); a whole-session `--connect` trace ignores it. The kernel's tracer

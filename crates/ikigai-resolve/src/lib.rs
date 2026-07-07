@@ -55,6 +55,31 @@ impl SpanCollector {
     }
 }
 
+/// The **capability-scoped** catalog: one [`SpaceEntry`] per endpoint that has at
+/// least one action the `capability` may invoke. This is the *affordance =
+/// authorization* view — the same [`Capability::allows`](ikigai_core::Capability)
+/// filter the manifold (`urn:kernel:actions`) and MCP's `tools/list` apply — so a
+/// scoped principal enumerating a server **over the wire** sees only what it could
+/// actually call, never the full catalog. A server whose principal is root gets
+/// everything. Fixes the leak where the wire `entries` bypassed capability while
+/// invocation was clamped.
+pub fn scoped_entries(kernel: &Kernel, capability: &Capability) -> Vec<SpaceEntry> {
+    let query = ikigai_core::ActionQuery {
+        capability: Some(capability),
+        ..Default::default()
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    kernel
+        .select_actions(&query)
+        .into_iter()
+        .filter(|m| seen.insert(m.endpoint.clone()))
+        .map(|m| SpaceEntry {
+            pattern: m.endpoint,
+            endpoint: m.id,
+        })
+        .collect()
+}
+
 /// A [`Space`] that resolves every request under its mount into a *remote* kernel:
 /// it wraps a [`Resolver`] (an IPC or QUIC client) and, on resolve, yields a
 /// forwarding endpoint that round-trips the request over the wire on invoke. This
@@ -377,5 +402,58 @@ impl<R: Resolver + ?Sized> Resolver for Arc<R> {
 
     fn transport(&self) -> String {
         (**self).transport()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ikigai_core::{Description, EndpointSpace, Exact, FnEndpoint, ReprType, Verb};
+
+    fn kernel_with_a_gated_endpoint() -> Kernel {
+        let ok = |name: &'static str| {
+            FnEndpoint::new(name, |_inv| {
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    b"ok".to_vec(),
+                ))
+            })
+        };
+        let space = EndpointSpace::new()
+            .bind(
+                Exact::new("urn:open"),
+                ok("open").with_description(Description::new("open").verb(Verb::Source)),
+            )
+            .bind(
+                Exact::new("urn:gated"),
+                ok("gated").with_description(
+                    Description::new("gated")
+                        .verb(Verb::Source)
+                        .requires("urn:cap:secret"),
+                ),
+            );
+        Kernel::new(Arc::new(space))
+    }
+
+    #[test]
+    fn scoped_entries_hides_what_the_capability_cannot_invoke() {
+        let kernel = kernel_with_a_gated_endpoint();
+
+        // Root authority enumerates both.
+        let root = scoped_entries(&kernel, &Capability::root());
+        assert!(root.iter().any(|e| e.pattern == "urn:open"));
+        assert!(
+            root.iter().any(|e| e.pattern == "urn:gated"),
+            "root sees the gated endpoint"
+        );
+
+        // A capability without the gating scope sees only the open one — the gated
+        // endpoint doesn't even appear (affordance = authorization).
+        let scoped = scoped_entries(&kernel, &Capability::scoped(["urn:cap:other"]));
+        assert!(scoped.iter().any(|e| e.pattern == "urn:open"));
+        assert!(
+            !scoped.iter().any(|e| e.pattern == "urn:gated"),
+            "the gated endpoint is hidden from a principal that can't invoke it"
+        );
     }
 }
