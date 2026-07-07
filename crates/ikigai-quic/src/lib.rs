@@ -18,7 +18,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use ikigai_core::{Capability, Iri, Kernel, Representation, Request, SpaceEntry, Tracer};
+use ikigai_core::{Capability, Error, Iri, Kernel, Representation, Request, SpaceEntry, Tracer};
 use ikigai_resolve::{scoped_entries, CacheStatus, Resolver, SpanCollector};
 use ikigai_wire::{decode, encode, Call, Reply, TraceContext};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -153,7 +153,7 @@ fn dispatch(kernel: &Kernel, call: Call, session: &Session) -> Reply {
         localize(&mut request, &session.file_segment);
         match Resolver::issue_as(kernel, request, capability) {
             Ok((representation, status)) => Reply::Resolved(representation, status),
-            Err(message) => Reply::Error(message),
+            Err(error) => Reply::Error(error.to_string()),
         }
     };
     match call {
@@ -184,7 +184,7 @@ fn dispatch(kernel: &Kernel, call: Call, session: &Session) -> Reply {
                 Ok((representation, status)) => {
                     Reply::ResolvedTraced(representation, status, collector.take())
                 }
-                Err(message) => Reply::Error(message),
+                Err(error) => Reply::Error(error.to_string()),
             };
             Kernel::clear_tracer(kernel);
             reply
@@ -266,15 +266,21 @@ impl Drop for QuicResolver {
     }
 }
 
+/// A QUIC round-trip failure means the remote kernel is unreachable — a **transient**
+/// [`Unavailable`](Error::Unavailable) the reliability overlays (Retry/Failover) can
+/// act on, rather than a permanent error.
+fn quic_error(e: io::Error) -> Error {
+    Error::Unavailable(format!("quic transport: {e}"))
+}
+
 impl Resolver for QuicResolver {
-    fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), String> {
-        match self
-            .round_trip(Call::Issue(request))
-            .map_err(|e| e.to_string())?
-        {
+    fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), Error> {
+        match self.round_trip(Call::Issue(request)).map_err(quic_error)? {
             Reply::Resolved(representation, status) => Ok((representation, status)),
-            Reply::Error(message) => Err(message),
-            other => Err(format!("unexpected reply to Issue: {other:?}")),
+            Reply::Error(message) => Err(Error::Endpoint(message)),
+            other => Err(Error::Endpoint(format!(
+                "unexpected reply to Issue: {other:?}"
+            ))),
         }
     }
 
@@ -286,7 +292,7 @@ impl Resolver for QuicResolver {
         &self,
         request: Request,
         capability: &Capability,
-    ) -> Result<(Representation, CacheStatus), String> {
+    ) -> Result<(Representation, CacheStatus), Error> {
         let tracer = self.tracer.lock().expect("tracer lock").clone();
         let call = if tracer.is_some() {
             Call::IssueTraced(
@@ -300,7 +306,7 @@ impl Resolver for QuicResolver {
         } else {
             Call::Issue(request)
         };
-        match self.round_trip(call).map_err(|e| e.to_string())? {
+        match self.round_trip(call).map_err(quic_error)? {
             Reply::Resolved(representation, status) => Ok((representation, status)),
             Reply::ResolvedTraced(representation, status, events) => {
                 if let Some(tracer) = &tracer {
@@ -310,8 +316,10 @@ impl Resolver for QuicResolver {
                 }
                 Ok((representation, status))
             }
-            Reply::Error(message) => Err(message),
-            other => Err(format!("unexpected reply to IssueAs: {other:?}")),
+            Reply::Error(message) => Err(Error::Endpoint(message)),
+            other => Err(Error::Endpoint(format!(
+                "unexpected reply to IssueAs: {other:?}"
+            ))),
         }
     }
 
@@ -641,7 +649,7 @@ mod tests {
 
     /// Resolve `urn:file:<path>` over QUIC under `session`, returning the echoed
     /// (localized) path or the endpoint error.
-    fn file_over_quic(session: Session, path: &str) -> Result<String, String> {
+    fn file_over_quic(session: Session, path: &str) -> Result<String, Error> {
         let server_id = generate();
         let client_id = generate();
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();

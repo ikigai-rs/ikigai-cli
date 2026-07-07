@@ -499,7 +499,8 @@ impl Engine {
                     // Each fanned-out branch/item inherits the same upstream provenance.
                     let result = resolver
                         .issue_as_async_with_incoming(request, &capability, prov)
-                        .await;
+                        .await
+                        .map_err(|e| e.to_string());
                     *slot.lock().expect("branch slot") = Some(result);
                 }))
             })
@@ -892,15 +893,19 @@ impl Engine {
                     render_trace_tree(&events, &entries, scoped, &representation, &mut out);
                 }
             }
-            Err(message) => {
+            Err(error) => {
                 // The real resolution aborted — surface where. A capability denial is
-                // the authority dimension made visible (`cap ✗`); endpoints word it
-                // differently, so match the shared signals.
-                let denied = message.contains("capability")
-                    || message.contains("authoriz")
-                    || message.contains("urn:cap:");
-                let tag = if denied { "cap ✗ denied" } else { "error" };
-                out.push(format!("{}   {tag}: {message}", short_iri(iri.as_str())));
+                // the authority dimension made visible (`cap ✗`). The kernel's own
+                // `require_cap` now returns a *typed* `Error::Denied`, so recognize that
+                // structurally; modules that still spell a denial as an `Endpoint` string
+                // (ikigai-fs, until it adopts the typed variant) are bridged by the
+                // "does not grant" phrase they share with the kernel's message.
+                let tag = if is_denial(&error) {
+                    "cap ✗ denied"
+                } else {
+                    "error"
+                };
+                out.push(format!("{}   {tag}: {error}", short_iri(iri.as_str())));
             }
         }
         Ok(out.join("\n"))
@@ -1021,12 +1026,16 @@ impl Engine {
     ) -> Result<Staged, String> {
         let capability = self.capability.borrow().clone();
         let (representation, status) = match incoming {
-            Some(prov) => {
-                self.resolver
-                    .issue_as_async_with_incoming(request, &capability, prov)
-                    .await?
-            }
-            None => self.resolver.issue_as_async(request, &capability).await?,
+            Some(prov) => self
+                .resolver
+                .issue_as_async_with_incoming(request, &capability, prov)
+                .await
+                .map_err(|e| e.to_string())?,
+            None => self
+                .resolver
+                .issue_as_async(request, &capability)
+                .await
+                .map_err(|e| e.to_string())?,
         };
         let mut stats = self.cache.get();
         stats.record(status);
@@ -1545,6 +1554,15 @@ fn cache_word(status: CacheStatus) -> &'static str {
         CacheStatus::Miss => "computed",
         CacheStatus::Uncacheable => "uncacheable",
     }
+}
+
+/// Whether an error is a capability denial, for the trace annotation. Prefers the
+/// kernel's typed `Error::Denied`; falls back to the "does not grant" phrase for
+/// modules (e.g. ikigai-fs) that still return a denial as an `Endpoint` string —
+/// remove that arm once those modules adopt the typed variant.
+fn is_denial(error: &ikigai_core::Error) -> bool {
+    matches!(error, ikigai_core::Error::Denied(_))
+        || matches!(error, ikigai_core::Error::Endpoint(m) if m.contains("does not grant"))
 }
 
 /// Split off the first whitespace-delimited token; trim the remainder.
