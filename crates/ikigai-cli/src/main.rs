@@ -35,7 +35,8 @@ usage:
   ikigai --daemon              headless: timers, the watcher, and the standing sync — for launchd
   ikigai --name <instance>     name this instance (scopes <name>.* config properties; defaults
                                repl / daemon / serve by mode)
-  ikigai cert generate         create the pinned QUIC certificates in your config dir
+  ikigai cert generate         create the pinned QUIC certificates (--dir <d> for a dedicated set)
+  ikigai cert add-client <n>   mint an extra client identity into clients/<n>.{crt,key}
   ikigai -c '<command>' ...    run command(s) non-interactively, then exit
   ikigai -h | --help           show this help
 
@@ -45,8 +46,13 @@ inside the REPL: source, describe, help, quit (type `help` for details)";
 use ikigai_engine::Engine;
 
 /// Per-role certificate-path overrides for QUIC, shared by `serve` and `--connect`.
+/// `cert_dir` relocates the whole set (the four default filenames + the `clients/`
+/// trust dir) so a dedicated identity — e.g. a calendar-federation server — lives in
+/// its own directory instead of the default `<config>/ikigai-cli/quic/`. The
+/// per-file overrides still win over the directory default.
 #[derive(Default)]
 struct Certs {
+    cert_dir: Option<String>,
     server_cert: Option<String>,
     server_key: Option<String>,
     client_cert: Option<String>,
@@ -77,6 +83,19 @@ enum Mode {
         scopes: Vec<String>,
     },
     CertGenerate {
+        force: bool,
+        /// `--dir <d>`: write the pair into `<d>` instead of the default quic dir, so a
+        /// dedicated identity (a calendar server, say) doesn't clobber the default pair.
+        dir: Option<String>,
+    },
+    /// `cert add-client <name>`: mint an ADDITIONAL client identity into
+    /// `<certdir>/clients/<name>.{crt,key}`. The server already trusts every
+    /// `clients/*.crt`, so this is how you add a second device/principal without
+    /// touching the existing certs. (What AUTHORITY each gets is the identity→grant
+    /// policy — a later step; today every trusted client shares the server's ceiling.)
+    CertAddClient {
+        name: String,
+        cert_dir: Option<String>,
         force: bool,
     },
 }
@@ -113,6 +132,7 @@ fn cert_flag(
     certs: &mut Certs,
 ) -> Result<bool, String> {
     let slot = match arg {
+        "--cert-dir" => &mut certs.cert_dir,
         "--server-cert" => &mut certs.server_cert,
         "--server-key" => &mut certs.server_key,
         "--client-cert" => &mut certs.client_cert,
@@ -135,18 +155,61 @@ fn parse_args() -> Result<Option<Mode>, String> {
         return match argv.next().as_deref() {
             Some("generate") => {
                 let mut force = false;
-                for arg in argv {
+                let mut dir = None;
+                while let Some(arg) = argv.next() {
                     match arg.as_str() {
                         "--force" => force = true,
+                        "--dir" => {
+                            dir = Some(
+                                argv.next()
+                                    .ok_or_else(|| "--dir needs a path".to_string())?,
+                            )
+                        }
                         other => {
                             return Err(format!("unknown argument after `cert generate`: {other}"))
                         }
                     }
                 }
-                Ok(Some(Mode::CertGenerate { force }))
+                Ok(Some(Mode::CertGenerate { force, dir }))
+            }
+            Some("add-client") => {
+                let mut name = None;
+                let mut cert_dir = None;
+                let mut force = false;
+                while let Some(arg) = argv.next() {
+                    match arg.as_str() {
+                        "--force" => force = true,
+                        "--cert-dir" => {
+                            cert_dir = Some(
+                                argv.next()
+                                    .ok_or_else(|| "--cert-dir needs a path".to_string())?,
+                            )
+                        }
+                        other if other.starts_with('-') => {
+                            return Err(format!(
+                                "unknown argument after `cert add-client`: {other}"
+                            ))
+                        }
+                        _ if name.is_none() => name = Some(arg),
+                        other => {
+                            return Err(format!(
+                                "unexpected argument after `cert add-client`: {other}"
+                            ))
+                        }
+                    }
+                }
+                let name =
+                    name.ok_or_else(|| "usage: `ikigai cert add-client <name>`".to_string())?;
+                Ok(Some(Mode::CertAddClient {
+                    name,
+                    cert_dir,
+                    force,
+                }))
             }
             Some(other) => Err(format!("unknown `cert` subcommand: {other}")),
-            None => Err("usage: `ikigai cert generate`".to_string()),
+            None => {
+                Err("usage: `ikigai cert generate` | `ikigai cert add-client <name>`".to_string())
+            }
         };
     }
 
@@ -286,7 +349,12 @@ fn main() {
     match mode {
         Mode::Daemon => daemon(),
         Mode::Mcp { grants, scopes } => mcp(grants, scopes),
-        Mode::CertGenerate { force } => cert_generate(force),
+        Mode::CertGenerate { force, dir } => cert_generate(force, dir),
+        Mode::CertAddClient {
+            name,
+            cert_dir,
+            force,
+        } => cert_add_client(&name, cert_dir, force),
         Mode::Serve {
             target,
             certs,
@@ -645,8 +713,8 @@ fn run_repl(engine: Engine, plain: bool, commands: &[String]) {
 // --- `cert generate` --------------------------------------------------------
 
 #[cfg(all(feature = "embedded", feature = "quic"))]
-fn cert_generate(force: bool) -> ! {
-    match quic::generate(force) {
+fn cert_generate(force: bool, dir: Option<String>) -> ! {
+    match quic::generate(force, dir.map(std::path::PathBuf::from)) {
         Ok(dir) => {
             println!(
                 "wrote server.{{crt,key}} and client.{{crt,key}} to {}",
@@ -665,9 +733,37 @@ fn cert_generate(force: bool) -> ! {
     }
 }
 
+#[cfg(all(feature = "embedded", feature = "quic"))]
+fn cert_add_client(name: &str, cert_dir: Option<String>, force: bool) -> ! {
+    let certs = Certs {
+        cert_dir,
+        ..Default::default()
+    };
+    match quic::add_client(name, &certs, force) {
+        Ok(path) => {
+            println!("wrote a new client identity to {}", path.display());
+            println!(
+                "the server trusts it on next start (it reads clients/*.crt); to use it, copy \
+                 {name}.crt, {name}.key, and server.crt to the client machine."
+            );
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("ikigai: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 #[cfg(all(feature = "embedded", not(feature = "quic")))]
-fn cert_generate(_force: bool) -> ! {
+fn cert_generate(_force: bool, _dir: Option<String>) -> ! {
     eprintln!("ikigai: `cert generate` needs the `quic` feature");
+    std::process::exit(1);
+}
+
+#[cfg(all(feature = "embedded", not(feature = "quic")))]
+fn cert_add_client(_name: &str, _cert_dir: Option<String>, _force: bool) -> ! {
+    eprintln!("ikigai: `cert add-client` needs the `quic` feature");
     std::process::exit(1);
 }
 

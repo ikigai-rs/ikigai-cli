@@ -26,16 +26,30 @@ fn dir() -> Result<PathBuf, String> {
     Ok(parent.join("quic"))
 }
 
-/// The default path for one of the four certificate/key files.
-fn default_path(name: &str) -> Result<PathBuf, String> {
-    Ok(dir()?.join(name))
+/// The base certificate directory: an explicit `--cert-dir`, else the default
+/// `<config>/ikigai-cli/quic/`. Relocating it moves the whole set — the four
+/// default filenames and the `clients/` trust dir — so a dedicated identity lives
+/// apart from the default pair.
+fn base_dir(certs: &Certs) -> Result<PathBuf, String> {
+    match &certs.cert_dir {
+        Some(d) => Ok(PathBuf::from(d)),
+        None => dir(),
+    }
 }
 
-/// Generate a server and a client identity into the quic directory (created
-/// `0700`, keys `0600`). Refuses to overwrite unless `force`. Returns the
-/// directory.
-pub fn generate(force: bool) -> Result<PathBuf, String> {
-    let dir = dir()?;
+/// The default path for one of the four certificate/key files, under `certs`' dir.
+fn default_path(name: &str, certs: &Certs) -> Result<PathBuf, String> {
+    Ok(base_dir(certs)?.join(name))
+}
+
+/// Generate a server and a client identity into `dir_override` (else the default
+/// quic directory), created `0700`, keys `0600`. Refuses to overwrite unless
+/// `force`. Returns the directory.
+pub fn generate(force: bool, dir_override: Option<PathBuf>) -> Result<PathBuf, String> {
+    let dir = match dir_override {
+        Some(d) => d,
+        None => dir()?,
+    };
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     restrict(&dir, 0o700)?;
 
@@ -75,22 +89,44 @@ fn write(path: &std::path::Path, contents: &str, mode: u32, force: bool) -> Resu
 /// The server's identity (its cert + key).
 pub fn server_identity(certs: &Certs) -> Result<Identity, String> {
     Ok(Identity {
-        cert_pem: read(certs.server_cert.clone(), "server.crt")?,
-        key_pem: read(certs.server_key.clone(), "server.key")?,
+        cert_pem: read(certs.server_cert.clone(), "server.crt", certs)?,
+        key_pem: read(certs.server_key.clone(), "server.key", certs)?,
     })
 }
 
 /// The client's identity (its cert + key).
 pub fn client_identity(certs: &Certs) -> Result<Identity, String> {
     Ok(Identity {
-        cert_pem: read(certs.client_cert.clone(), "client.crt")?,
-        key_pem: read(certs.client_key.clone(), "client.key")?,
+        cert_pem: read(certs.client_cert.clone(), "client.crt", certs)?,
+        key_pem: read(certs.client_key.clone(), "client.key", certs)?,
     })
 }
 
 /// The client certificate the server pins.
 pub fn trusted_client_cert(certs: &Certs) -> Result<String, String> {
-    read(certs.client_cert.clone(), "client.crt")
+    read(certs.client_cert.clone(), "client.crt", certs)
+}
+
+/// Mint an additional client identity into `<certdir>/clients/<name>.{crt,key}`.
+/// The server trusts every `clients/*.crt` (see [`trusted_client_certs`]), so this
+/// adds a principal without disturbing the existing certs. Returns the `.crt` path.
+pub fn add_client(name: &str, certs: &Certs, force: bool) -> Result<PathBuf, String> {
+    if name.is_empty() || name.contains('/') || name.contains("..") {
+        return Err(format!("invalid client name: {name:?}"));
+    }
+    let clients = base_dir(certs)?.join("clients");
+    std::fs::create_dir_all(&clients).map_err(|e| format!("create {}: {e}", clients.display()))?;
+    restrict(&clients, 0o700)?;
+    let identity = ikigai_quic::generate();
+    let crt = clients.join(format!("{name}.crt"));
+    write(&crt, &identity.cert_pem, 0o600, force)?;
+    write(
+        &clients.join(format!("{name}.key")),
+        &identity.key_pem,
+        0o600,
+        force,
+    )?;
+    Ok(crt)
 }
 
 /// Every client certificate the server accepts — the configured `client.crt` plus any
@@ -98,7 +134,7 @@ pub fn trusted_client_cert(certs: &Certs) -> Result<String, String> {
 /// distinct identity (its own `ws/<id>` workspace), so multi-tenant is "add a cert".
 pub fn trusted_client_certs(certs: &Certs) -> Result<Vec<String>, String> {
     let mut pems = vec![trusted_client_cert(certs)?];
-    if let Ok(entries) = dir()
+    if let Ok(entries) = base_dir(certs)
         .map(|d| d.join("clients"))
         .and_then(|clients| std::fs::read_dir(&clients).map_err(|e| e.to_string()))
     {
@@ -116,14 +152,15 @@ pub fn trusted_client_certs(certs: &Certs) -> Result<Vec<String>, String> {
 
 /// The server certificate the client pins.
 pub fn trusted_server_cert(certs: &Certs) -> Result<String, String> {
-    read(certs.server_cert.clone(), "server.crt")
+    read(certs.server_cert.clone(), "server.crt", certs)
 }
 
-/// Read a PEM file from an explicit path or the default for `default_name`.
-fn read(explicit: Option<String>, default_name: &str) -> Result<String, String> {
+/// Read a PEM file from an explicit path or the default for `default_name` (under
+/// `certs`' base directory).
+fn read(explicit: Option<String>, default_name: &str, certs: &Certs) -> Result<String, String> {
     let path = match explicit {
         Some(path) => PathBuf::from(path),
-        None => default_path(default_name)?,
+        None => default_path(default_name, certs)?,
     };
     std::fs::read_to_string(&path).map_err(|e| {
         format!(
