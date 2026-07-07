@@ -1451,7 +1451,14 @@ fn selection_turtle(
         let comment = match (chosen, rank) {
             (Some(_), 0) => rationale.unwrap_or("chosen").to_string(),
             (Some(_), _) => "considered, not chosen".to_string(),
-            (None, _) => "candidate — give goal= to disambiguate".to_string(),
+            // No pick. `rationale` distinguishes WHY: absent = no goal was given
+            // (the funnel wants disambiguation); present = a goal WAS given but the
+            // residual could not choose (unreachable / capability-denied / unparseable)
+            // and it degraded to the deterministic list — surfaced so the reason (e.g.
+            // a denied urn:llm:ask) is visible in the graph, not silently a "give goal=".
+            (None, _) => rationale
+                .unwrap_or("candidate — give goal= to disambiguate")
+                .to_string(),
         };
         ttl.push_str(&format!(
             " ;\n    rdfs:comment \"{}\" .\n",
@@ -1544,7 +1551,10 @@ Authorized candidate actions:
                 ),
             )
             .with_arg("prompt", ikigai_core::ArgRef::Inline(prompt.into_bytes()));
-        let picked = match inv.issue(ask).await {
+        // A goal WAS given, so any non-pick here is a residual *failure*, not a
+        // missing goal — capture WHY (unreachable / capability-denied / unparseable)
+        // so the degraded graph says so instead of the misleading "give goal=".
+        let outcome: std::result::Result<(usize, String), String> = match inv.issue(ask).await {
             Ok(reply) => {
                 let text = String::from_utf8_lossy(&reply.bytes).to_string();
                 // Parse the declared form first ("CHOICE: 5 — …"): a model that
@@ -1567,14 +1577,19 @@ Authorized candidate actions:
                     .and_then(|n| n.checked_sub(1))
                     .filter(|i| *i < candidates.len())
                     .map(|index| (index, format!("goal: {goal} — {}", text.trim())))
+                    .ok_or_else(|| {
+                        "goal set, but the residual returned no parseable choice — \
+                         deterministic ranked list"
+                            .to_string()
+                    })
             }
-            Err(_) => None,
+            Err(e) => Err(format!(
+                "goal set, but the residual was unavailable ({e}) — deterministic ranked list"
+            )),
         };
-        let ttl = match picked {
-            Some((index, rationale)) => {
-                selection_turtle(&candidates, Some(index), Some(&rationale))
-            }
-            None => selection_turtle(&candidates, None, None),
+        let ttl = match outcome {
+            Ok((index, rationale)) => selection_turtle(&candidates, Some(index), Some(&rationale)),
+            Err(reason) => selection_turtle(&candidates, None, Some(&reason)),
         };
         Ok(Representation::new(
             ReprType::new("text/turtle").with_param("charset", "utf-8"),
@@ -2715,6 +2730,44 @@ mod tests {
         assert!(repr.repr_type.media_type == "text/turtle");
         assert!(ttl.matches("a ik:ActionMatch").count() > 1, "{ttl}");
         assert!(ttl.contains("give goal= to disambiguate"), "{ttl}");
+    }
+
+    #[test]
+    fn selection_turtle_distinguishes_no_goal_from_a_failed_residual() {
+        let cands = vec![
+            SelectCandidate {
+                action: "urn:ikigai:endpoint:a:action:source".to_string(),
+                endpoint: "urn:a".to_string(),
+                verb: "Source".to_string(),
+                requires: vec![],
+                missing_optional: 0,
+            },
+            SelectCandidate {
+                action: "urn:ikigai:endpoint:b:action:source".to_string(),
+                endpoint: "urn:b".to_string(),
+                verb: "Source".to_string(),
+                requires: vec![],
+                missing_optional: 0,
+            },
+        ];
+        // No goal was given: the funnel invites disambiguation.
+        let no_goal = selection_turtle(&cands, None, None);
+        assert!(no_goal.contains("give goal= to disambiguate"), "{no_goal}");
+
+        // A goal WAS given but the residual failed (e.g. urn:llm:ask denied on
+        // localhost): the reason is surfaced in the graph, NOT the misleading
+        // "give goal=" — so a capability denial can't masquerade as user error.
+        let reason = "goal set, but the residual was unavailable \
+                      (capability does not allow reaching localhost) — deterministic ranked list";
+        let degraded = selection_turtle(&cands, None, Some(reason));
+        assert!(
+            !degraded.contains("give goal= to disambiguate"),
+            "a failed residual must not read as a missing goal: {degraded}"
+        );
+        assert!(
+            degraded.contains("the residual was unavailable"),
+            "{degraded}"
+        );
     }
 
     #[test]
