@@ -1352,6 +1352,16 @@ impl Tracer for TraceCollector {
 /// Reconstruct the execution tree from recorded events — linked by each event's
 /// `(span, parent)` — and render it. The root is the invocation with no parent (the
 /// traced request itself); `repr` is the assembled result, shown on that root line.
+/// Render a node's authority for a trace line: `root` (full), `∅` (no scopes), or
+/// the comma-joined scope set.
+fn render_cap(cap: &Option<Vec<String>>) -> String {
+    match cap {
+        None => "root".to_string(),
+        Some(scopes) if scopes.is_empty() => "∅".to_string(),
+        Some(scopes) => scopes.join(","),
+    }
+}
+
 fn render_trace_tree(
     events: &[TraceEvent],
     entries: &[ikigai_core::SpaceEntry],
@@ -1380,6 +1390,7 @@ fn render_trace_tree(
             &children,
             entries,
             scoped,
+            None,
             Some(repr),
             String::new(),
             true,
@@ -1398,6 +1409,7 @@ fn render_trace_event(
     children: &BTreeMap<u64, Vec<&TraceEvent>>,
     entries: &[ikigai_core::SpaceEntry],
     scoped: bool,
+    parent_cap: Option<&Option<Vec<String>>>,
     root_repr: Option<&Representation>,
     prefix: String,
     is_root: bool,
@@ -1426,7 +1438,16 @@ fn render_trace_event(
         }
         _ => "—".to_string(),
     };
-    let cap_note = if scoped { " · cap ✓" } else { "" };
+    // Authority: a hop that *changed* it (an attenuation, or a mount clamp against a
+    // remote principal) names the new scopes; a uniform node under a scoped session
+    // is simply marked authorized; a root session stays uncluttered.
+    let cap_note = match parent_cap {
+        Some(parent) if parent != &event.capability => {
+            format!(" · cap ↓ {}", render_cap(&event.capability))
+        }
+        _ if scoped => " · cap ✓".to_string(),
+        _ => String::new(),
+    };
     let mut line = format!(
         "{prefix}{branch}{label}   {endpoint} · {cache} · {} · {dur}{cap_note}",
         event.thread,
@@ -1457,6 +1478,7 @@ fn render_trace_event(
             children,
             entries,
             scoped,
+            Some(&event.capability),
             None,
             child_prefix.clone(),
             false,
@@ -1821,6 +1843,43 @@ mod tests {
         assert!(denied.contains("cap ✗"), "{denied}");
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_hop_that_changes_authority_is_annotated() {
+        use ikigai_core::Time;
+        // A root under full authority with a child resolved under a *narrower* one —
+        // what a mount clamp against a remote principal produces.
+        let ev =
+            |target: &str, span: u64, parent: Option<u64>, cap: Option<Vec<String>>| TraceEvent {
+                target: target.to_string(),
+                thread: "w".to_string(),
+                started: Some(Time::from_millis(0)),
+                ended: Some(Time::from_millis(0)),
+                cache_hit: false,
+                span,
+                parent,
+                capability: cap,
+            };
+        let events = vec![
+            ev("urn:local:mount", 0, None, None),
+            ev(
+                "urn:remote:leaf",
+                1,
+                Some(0),
+                Some(vec!["urn:cap:fs:read".to_string()]),
+            ),
+        ];
+        let repr = Representation::new(ReprType::new("text/plain"), b"x".to_vec());
+        let mut out = Vec::new();
+        render_trace_tree(&events, &[], false, &repr, &mut out);
+
+        // The root stays uncluttered; the child, whose authority differs, names it.
+        assert!(!out[0].contains("· cap"), "root uncluttered: {out:#?}");
+        assert!(
+            out[1].contains("· cap ↓ urn:cap:fs:read"),
+            "the attenuated hop is annotated: {out:#?}"
+        );
     }
 
     #[test]

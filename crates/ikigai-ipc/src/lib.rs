@@ -378,6 +378,53 @@ mod tests {
     }
 
     #[test]
+    fn a_trace_through_a_mount_stitches_the_remote_subtree() {
+        use ikigai_core::{Fallback, Space};
+        use ikigai_resolve::{RemoteSpace, SpanCollector};
+
+        let path = socket_path("mount-trace");
+        let server = serve_one(&path, kernel());
+
+        let client = connect(&path).unwrap();
+        let local = Fallback::new(vec![
+            Arc::new(EndpointSpace::new()) as Arc<dyn Space>,
+            Arc::new(RemoteSpace::new(Arc::new(client))) as Arc<dyn Space>,
+        ]);
+        let local_kernel = Kernel::new(Arc::new(local));
+
+        // Trace the LOCAL kernel resolving a remote-only resource. The forward is
+        // traced too, and its span is re-based under the mount node.
+        let collector = Arc::new(SpanCollector::default());
+        local_kernel.set_tracer(collector.clone());
+        let (representation, _status) =
+            Resolver::issue_as(&local_kernel, upper("hi"), &Capability::root()).unwrap();
+        local_kernel.clear_tracer();
+        assert_eq!(representation.bytes, b"HI");
+
+        // Two nodes: the local mount node (the trace root) and the remote resolution
+        // stitched beneath it — not collapsed into one.
+        let events = collector.take();
+        assert_eq!(
+            events.len(),
+            2,
+            "mount node + stitched remote node: {events:?}"
+        );
+        let root = events.iter().find(|e| e.parent.is_none()).expect("a root");
+        let child = events
+            .iter()
+            .find(|e| e.parent == Some(root.span))
+            .expect("a node stitched under the mount");
+        assert_eq!(
+            child.target, "urn:fn:toUpper",
+            "the remote node under the mount"
+        );
+
+        drop(local_kernel);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn is_cached_and_entries_round_trip() {
         let path = socket_path("probe");
         let server = serve_one(&path, kernel());

@@ -102,10 +102,26 @@ struct ForwardingEndpoint {
 #[async_trait]
 impl Endpoint for ForwardingEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation, Error> {
-        self.resolver
-            .issue_as(self.request.clone(), inv.capability)
-            .map(|(representation, _status)| representation)
-            .map_err(Error::Endpoint)
+        // Off the trace path: a plain forward.
+        if inv.trace_span().is_none() {
+            return self
+                .resolver
+                .issue_as(self.request.clone(), inv.capability)
+                .map(|(representation, _status)| representation)
+                .map_err(Error::Endpoint);
+        }
+        // The local kernel is recording: trace the forward too — install a collector
+        // on the resolver so the round-trip goes as a traced call — then hand the
+        // returned remote subtree to the local trace, which re-bases it under this
+        // mount node (`inv.record_subtree`). So the remote execution shows stitched
+        // into the tree instead of collapsed to one node.
+        let collector = Arc::new(SpanCollector::default());
+        self.resolver.set_tracer(collector.clone());
+        let result = self.resolver.issue_as(self.request.clone(), inv.capability);
+        self.resolver.clear_tracer();
+        let (representation, _status) = result.map_err(Error::Endpoint)?;
+        inv.record_subtree(collector.take());
+        Ok(representation)
     }
 
     fn name(&self) -> &str {
