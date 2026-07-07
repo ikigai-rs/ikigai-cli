@@ -2099,7 +2099,16 @@ fn runbook_jury_demo() -> FnEndpoint {
 /// only resolves while the demo is on (OFF by default; `--demo` or `demo on` turns it
 /// on at runtime, no kernel rebuild). The CLI thus reads as a tool by default.
 fn root_space() -> Arc<dyn Space> {
-    Arc::new(Fallback::new(vec![
+    root_space_with_mounts(Vec::new())
+}
+
+/// The embedded root space, plus a `RemoteSpace` mount per `(prefix, resolver)` —
+/// each tried after every local space, so a resource the local kernel lacks under
+/// `prefix` forwards to the remote (with the mount prefix rewritten to `urn:` first).
+fn root_space_with_mounts(
+    mounts: Vec<(String, Arc<dyn ikigai_resolve::Resolver>)>,
+) -> Arc<dyn Space> {
+    let mut spaces: Vec<Arc<dyn Space>> = vec![
         Arc::new(local_space("Embedded (Native)")) as Arc<dyn Space>,
         Arc::new(http_space()) as Arc<dyn Space>,
         Arc::new(llm_space()) as Arc<dyn Space>,
@@ -2153,7 +2162,24 @@ fn root_space() -> Arc<dyn Space> {
                 .bind(Exact::new("urn:data:ollama-offline"), ollama_offline()),
             on: demo_flag(),
         }) as Arc<dyn Space>,
-    ]))
+    ];
+    // Remote mounts, tried after every local space. Rewrite `<prefix>rest` → `urn:rest`
+    // before forwarding, so the remote kernel (which serves `urn:*`) resolves it and a
+    // `trace` stitches the remote execution under this mount node.
+    for (prefix, resolver) in mounts {
+        let strip = prefix.clone();
+        let remote = Arc::new(ikigai_resolve::RemoteSpace::new(resolver));
+        let rewritten = ikigai_core::Rewrite::new(remote, move |iri| {
+            iri.as_str()
+                .strip_prefix(&strip)
+                .and_then(|rest| ikigai_core::Iri::parse(format!("urn:{rest}")).ok())
+        });
+        spaces.push(Arc::new(ikigai_core::Mount::new(
+            prefix,
+            Arc::new(rewritten),
+        )));
+    }
+    Arc::new(Fallback::new(spaces))
 }
 
 /// `rdfs:subClassOf` axioms for type-aware action selection — parsed from the runbook's RDFS
@@ -2181,13 +2207,24 @@ pub fn kernel() -> Kernel {
 /// does. The returned `Arc` is what the engine drives, so the watcher and the
 /// engine share one kernel and one cache.
 pub fn watched_kernel() -> Arc<Kernel> {
+    watched_kernel_with_mounts(Vec::new())
+}
+
+/// Like [`watched_kernel`], but composing one or more **remote kernels** into the
+/// local resolution graph. Each `(prefix, resolver)` mounts a `RemoteSpace` at
+/// `prefix` (rewriting `<prefix>rest` → `urn:rest` before forwarding), so a resource
+/// under the mount resolves on the remote kernel — and a `trace` stitches the
+/// remote execution under the mount node. Drives the `--mount` flag.
+pub fn watched_kernel_with_mounts(
+    mounts: Vec<(String, Arc<dyn ikigai_resolve::Resolver>)>,
+) -> Arc<Kernel> {
     // Inject the process scheduler so re-entrant fan-out (e.g. `compose`'s `$a{}`
     // markers) runs concurrently on it; single-threaded by default, a pool under
     // `IKIGAI_SCHEDULER=pool[:N]`. The same scheduler is injected as a read-only
     // reporter so `urn:kernel:scheduler` surfaces its live state intrinsically. The
     // runbook is mounted but gated by `demo_flag()` (off by default).
     let sched = Arc::new(scheduler());
-    let kernel = Kernel::with_meta_renderer(root_space(), Arc::new(CliRenderer))
+    let kernel = Kernel::with_meta_renderer(root_space_with_mounts(mounts), Arc::new(CliRenderer))
         .with_clock(Arc::new(SystemClock))
         .with_subclass_axioms(subclass_axioms())
         .with_scheduler_reporter(sched.clone())

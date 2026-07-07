@@ -1798,6 +1798,7 @@ dependencies = [
  "futures",
  "ikigai-core",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

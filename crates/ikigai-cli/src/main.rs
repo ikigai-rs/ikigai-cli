@@ -29,6 +29,7 @@ usage:
   ikigai --plain               force the line REPL (also used automatically when piped)
   ikigai --demo                mount the interactive runbook (urn:runbook:*); off by default
   ikigai --connect [<target>]  attach the REPL to a kernel server (a Unix path, or quic://host:port)
+  ikigai --mount <pfx>=<sock>  compose a remote kernel into the local one at prefix <pfx>
   ikigai serve [<target>]      run a kernel server (a Unix socket path, or quic://addr to bind)
   ikigai --daemon              headless: timers, the watcher, and the standing sync — for launchd
   ikigai --name <instance>     name this instance (scopes <name>.* config properties; defaults
@@ -84,6 +85,10 @@ struct ReplArgs {
     /// `None` = the embedded in-process kernel; `Some` = attach to a server, with
     /// `Some(None)` meaning the default Unix socket.
     connect: Option<Option<String>>,
+    /// Remote kernels to compose into the local one: `(prefix, socket)` pairs from
+    /// `--mount <prefix>=<socket>`. Each mounts a `RemoteSpace` so a resource under
+    /// `prefix` resolves on the remote kernel. Embedded (non-`--connect`) only.
+    mounts: Vec<(String, String)>,
     certs: Certs,
 }
 
@@ -209,6 +214,16 @@ fn parse_args() -> Result<Option<Mode>, String> {
                 };
                 repl.connect = Some(target);
             }
+            "--mount" => {
+                // `--mount <prefix>=<socket>`: compose a remote kernel at `<prefix>`.
+                let spec = argv
+                    .next()
+                    .ok_or_else(|| "--mount needs <prefix>=<socket>".to_string())?;
+                let (prefix, socket) = spec
+                    .split_once('=')
+                    .ok_or_else(|| format!("--mount expects <prefix>=<socket>, got `{spec}`"))?;
+                repl.mounts.push((prefix.to_string(), socket.to_string()));
+            }
             "-c" | "--command" => {
                 let command = argv
                     .next()
@@ -262,7 +277,7 @@ fn main() {
             if args.demo {
                 ikigai_embedded::demo_flag().store(true, std::sync::atomic::Ordering::SeqCst);
             }
-            let engine = build_engine(args.connect, &args.certs).unwrap_or_else(|e| {
+            let engine = build_engine(args.connect, args.mounts, &args.certs).unwrap_or_else(|e| {
                 eprintln!("ikigai: {e}");
                 std::process::exit(1);
             });
@@ -445,22 +460,55 @@ fn with_profiles(engine: Engine) -> Engine {
 /// Build the engine over the chosen backend: the embedded kernel, or — with
 /// `--connect` — an IPC or QUIC client, dispatched by the target.
 #[cfg(feature = "embedded")]
-fn build_engine(connect: Option<Option<String>>, certs: &Certs) -> Result<Engine, String> {
+fn build_engine(
+    connect: Option<Option<String>>,
+    mounts: Vec<(String, String)>,
+    certs: &Certs,
+) -> Result<Engine, String> {
     match connect {
         // The watched kernel: cached workspace reads also invalidate on an
         // out-of-band file change (an editor), not just a `sink` through the REPL.
         // The same process scheduler drives both the kernel's fan-out and the
         // engine's `( a ; b )` / `..` parallelism, so `IKIGAI_SCHEDULER=pool:N`
-        // governs all of it.
-        None => Ok(with_profiles(
-            Engine::new(ikigai_embedded::watched_kernel())
-                .with_spawner(std::sync::Arc::new(ikigai_embedded::scheduler())),
-        )),
-        Some(target) => match target.as_deref() {
-            Some(t) if is_quic(t) => connect_quic(t, certs),
-            _ => connect_ipc(target),
-        },
+        // governs all of it. Any `--mount`s compose remote kernels into it.
+        None => {
+            let kernel = if mounts.is_empty() {
+                ikigai_embedded::watched_kernel()
+            } else {
+                let mut resolved = Vec::new();
+                for (prefix, socket) in mounts {
+                    resolved.push((prefix, connect_mount(&socket)?));
+                }
+                ikigai_embedded::watched_kernel_with_mounts(resolved)
+            };
+            Ok(with_profiles(Engine::new(kernel).with_spawner(
+                std::sync::Arc::new(ikigai_embedded::scheduler()),
+            )))
+        }
+        Some(target) => {
+            if !mounts.is_empty() {
+                return Err("--mount composes into the embedded kernel; drop --connect".to_string());
+            }
+            match target.as_deref() {
+                Some(t) if is_quic(t) => connect_quic(t, certs),
+                _ => connect_ipc(target),
+            }
+        }
     }
+}
+
+/// Connect a `--mount` target as a [`Resolver`](ikigai_resolve::Resolver) to compose
+/// a remote kernel into the local graph.
+#[cfg(all(feature = "embedded", feature = "ipc"))]
+fn connect_mount(socket: &str) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
+    let resolver = ikigai_ipc::connect(std::path::Path::new(socket))
+        .map_err(|e| format!("--mount: connect {socket}: {e}"))?;
+    Ok(std::sync::Arc::new(resolver))
+}
+
+#[cfg(all(feature = "embedded", not(feature = "ipc")))]
+fn connect_mount(_socket: &str) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
+    Err("--mount requires the `ipc` feature (Unix only)".to_string())
 }
 
 /// Drive the engine: one-shot `-c`, else the full-screen TUI on a terminal, else
