@@ -2102,11 +2102,12 @@ fn root_space() -> Arc<dyn Space> {
     root_space_with_mounts(Vec::new())
 }
 
-/// The embedded root space, plus a `RemoteSpace` mount per `(prefix, resolver)` —
-/// each tried after every local space, so a resource the local kernel lacks under
-/// `prefix` forwards to the remote (with the mount prefix rewritten to `urn:` first).
+/// The embedded root space, plus a `MountedRemote` per `(prefix, origin, resolver)`
+/// — each tried after every local space, so a resource the local kernel lacks under
+/// `prefix` forwards to the remote, and the remote's catalog appears re-prefixed and
+/// tagged with `origin`.
 fn root_space_with_mounts(
-    mounts: Vec<(String, Arc<dyn ikigai_resolve::Resolver>)>,
+    mounts: Vec<(String, String, Arc<dyn ikigai_resolve::Resolver>)>,
 ) -> Arc<dyn Space> {
     let mut spaces: Vec<Arc<dyn Space>> = vec![
         Arc::new(local_space("Embedded (Native)")) as Arc<dyn Space>,
@@ -2163,20 +2164,14 @@ fn root_space_with_mounts(
             on: demo_flag(),
         }) as Arc<dyn Space>,
     ];
-    // Remote mounts, tried after every local space. Rewrite `<prefix>rest` → `urn:rest`
-    // before forwarding, so the remote kernel (which serves `urn:*`) resolves it and a
-    // `trace` stitches the remote execution under this mount node.
-    for (prefix, resolver) in mounts {
-        let strip = prefix.clone();
-        let remote = Arc::new(ikigai_resolve::RemoteSpace::new(resolver));
-        let rewritten = ikigai_core::Rewrite::new(remote, move |iri| {
-            iri.as_str()
-                .strip_prefix(&strip)
-                .and_then(|rest| ikigai_core::Iri::parse(format!("urn:{rest}")).ok())
-        });
-        spaces.push(Arc::new(ikigai_core::Mount::new(
-            prefix,
-            Arc::new(rewritten),
+    // Remote mounts, tried after every local space. `MountedRemote` rewrites
+    // `<prefix>rest` → `urn:rest` before forwarding (so the remote, which serves
+    // `urn:*`, resolves it and a `trace` stitches its execution under this mount
+    // node) AND surfaces the remote's catalog back re-prefixed + tagged with its
+    // origin, so a federated `list` shows where each mounted resource resolves.
+    for (prefix, origin, resolver) in mounts {
+        spaces.push(Arc::new(ikigai_resolve::MountedRemote::new(
+            resolver, prefix, origin,
         )));
     }
     Arc::new(Fallback::new(spaces))
@@ -2216,7 +2211,7 @@ pub fn watched_kernel() -> Arc<Kernel> {
 /// under the mount resolves on the remote kernel — and a `trace` stitches the
 /// remote execution under the mount node. Drives the `--mount` flag.
 pub fn watched_kernel_with_mounts(
-    mounts: Vec<(String, Arc<dyn ikigai_resolve::Resolver>)>,
+    mounts: Vec<(String, String, Arc<dyn ikigai_resolve::Resolver>)>,
 ) -> Arc<Kernel> {
     // Inject the process scheduler so re-entrant fan-out (e.g. `compose`'s `$a{}`
     // markers) runs concurrently on it; single-threaded by default, a pool under

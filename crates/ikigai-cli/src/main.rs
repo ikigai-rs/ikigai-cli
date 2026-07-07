@@ -477,7 +477,9 @@ fn build_engine(
             } else {
                 let mut resolved = Vec::new();
                 for (prefix, socket) in mounts {
-                    resolved.push((prefix, connect_mount(&socket)?));
+                    // The socket is the mount's origin label, surfaced in the catalog.
+                    let resolver = connect_mount(&socket)?;
+                    resolved.push((prefix, socket, resolver));
                 }
                 ikigai_embedded::watched_kernel_with_mounts(resolved)
             };

@@ -73,10 +73,7 @@ pub fn scoped_entries(kernel: &Kernel, capability: &Capability) -> Vec<SpaceEntr
         .select_actions(&query)
         .into_iter()
         .filter(|m| seen.insert(m.endpoint.clone()))
-        .map(|m| SpaceEntry {
-            pattern: m.endpoint,
-            endpoint: m.id,
-        })
+        .map(|m| SpaceEntry::new(m.endpoint, m.id))
         .collect()
 }
 
@@ -165,6 +162,73 @@ impl Endpoint for ForwardingEndpoint {
             .ok()
             .and_then(|(repr, _status)| serde_json::from_slice(&repr.bytes).ok())
             .unwrap_or_else(|| Description::new("remote"))
+    }
+}
+
+/// A **prefix-mounted** remote kernel: requests under `prefix` are rewritten
+/// (`<prefix>rest` → `urn:rest`) and forwarded, and the remote's catalog is
+/// surfaced back **re-prefixed** (`urn:rest` → `<prefix>rest`) and tagged with
+/// `origin` — so a federated `list` shows *where* each mounted resource resolves,
+/// and a trace can name the mount node instead of rendering `?`. This is what
+/// `Mount` + `Rewrite` + [`RemoteSpace`] did, combined into one space so that
+/// entries actually flow (a `Rewrite` can't enumerate) and carry provenance.
+pub struct MountedRemote {
+    resolver: Arc<dyn Resolver>,
+    prefix: String,
+    origin: String,
+}
+
+impl MountedRemote {
+    /// Mount `resolver` at `prefix`, labelling its bindings `origin` in the catalog.
+    pub fn new(
+        resolver: Arc<dyn Resolver>,
+        prefix: impl Into<String>,
+        origin: impl Into<String>,
+    ) -> Self {
+        MountedRemote {
+            resolver,
+            prefix: prefix.into(),
+            origin: origin.into(),
+        }
+    }
+}
+
+impl Space for MountedRemote {
+    fn resolve(&self, request: &Request, _scope: &Scope) -> Resolution {
+        // Only our namespace; strip the alias prefix (→ `urn:`) before forwarding.
+        let Some(rest) = request.target.as_str().strip_prefix(&self.prefix) else {
+            return Resolution::Miss;
+        };
+        let Ok(target) = ikigai_core::Iri::parse(format!("urn:{rest}")) else {
+            return Resolution::Miss;
+        };
+        let mut forwarded = request.clone();
+        forwarded.target = target;
+        Resolution::Hit(Resolved {
+            endpoint: Arc::new(ForwardingEndpoint {
+                resolver: Arc::clone(&self.resolver),
+                request: forwarded,
+            }),
+            bindings: Bindings::new(),
+        })
+    }
+
+    fn entries(&self) -> Option<Vec<SpaceEntry>> {
+        // Surface the remote's catalog under the alias, tagged with its origin.
+        let entries = self.resolver.entries()?;
+        Some(
+            entries
+                .into_iter()
+                .map(|entry| {
+                    let pattern = entry
+                        .pattern
+                        .strip_prefix("urn:")
+                        .map(|rest| format!("{}{rest}", self.prefix))
+                        .unwrap_or(entry.pattern);
+                    SpaceEntry::new(pattern, entry.endpoint).with_origin(&self.origin)
+                })
+                .collect(),
+        )
     }
 }
 
