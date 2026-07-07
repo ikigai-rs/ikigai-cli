@@ -29,8 +29,9 @@ usage:
   ikigai --plain               force the line REPL (also used automatically when piped)
   ikigai --demo                mount the interactive runbook (urn:runbook:*); off by default
   ikigai --connect [<target>]  attach the REPL to a kernel server (a Unix path, or quic://host:port)
-  ikigai --mount <pfx>=<sock>  compose a remote kernel into the local one at prefix <pfx>
+  ikigai --mount <pfx>=<tgt>   compose a remote kernel at prefix <pfx> (<tgt> = Unix path or quic://host:port)
   ikigai serve [<target>]      run a kernel server (a Unix socket path, or quic://addr to bind)
+  ikigai serve <q> --cap <s>   serve under a fixed capability ceiling <s> every client is clamped to
   ikigai --daemon              headless: timers, the watcher, and the standing sync — for launchd
   ikigai --name <instance>     name this instance (scopes <name>.* config properties; defaults
                                repl / daemon / serve by mode)
@@ -61,6 +62,12 @@ enum Mode {
     Serve {
         target: Option<String>,
         certs: Certs,
+        /// `--cap <scope>` (repeatable): a fixed capability ceiling every
+        /// authenticated client is clamped to, instead of the default per-tenant
+        /// filesystem workspace. This is how a server shares exactly one narrow
+        /// affordance — e.g. `--cap urn:cap:personal:calendar:read:freebusy` serves
+        /// free/busy and nothing else, the clamp forbidding any client from widening.
+        caps: Vec<String>,
     },
     /// Serve the capability-scoped manifold as an MCP (Model Context Protocol)
     /// server over stdio. `grants`/`scopes` union into the session capability —
@@ -85,8 +92,9 @@ struct ReplArgs {
     /// `None` = the embedded in-process kernel; `Some` = attach to a server, with
     /// `Some(None)` meaning the default Unix socket.
     connect: Option<Option<String>>,
-    /// Remote kernels to compose into the local one: `(prefix, socket)` pairs from
-    /// `--mount <prefix>=<socket>`. Each mounts a `RemoteSpace` so a resource under
+    /// Remote kernels to compose into the local one: `(prefix, target)` pairs from
+    /// `--mount <prefix>=<target>`, where the target is a Unix socket path or a
+    /// `quic://host:port` URL. Each mounts a `RemoteSpace` so a resource under
     /// `prefix` resolves on the remote kernel. Embedded (non-`--connect`) only.
     mounts: Vec<(String, String)>,
     certs: Certs,
@@ -146,6 +154,7 @@ fn parse_args() -> Result<Option<Mode>, String> {
         argv.next();
         let mut target = None;
         let mut certs = Certs::default();
+        let mut caps = Vec::new();
         while let Some(arg) = argv.next() {
             if cert_flag(&arg, &mut argv, &mut certs)? {
                 continue;
@@ -158,6 +167,13 @@ fn parse_args() -> Result<Option<Mode>, String> {
                 ikigai_embedded::set_instance_name(name);
                 continue;
             }
+            if arg == "--cap" {
+                caps.push(
+                    argv.next()
+                        .ok_or_else(|| "--cap needs a capability IRI".to_string())?,
+                );
+                continue;
+            }
             if arg.starts_with('-') {
                 return Err(format!("unknown argument: {arg}"));
             } else if target.is_none() {
@@ -166,7 +182,11 @@ fn parse_args() -> Result<Option<Mode>, String> {
                 return Err(format!("unexpected argument after `serve`: {arg}"));
             }
         }
-        return Ok(Some(Mode::Serve { target, certs }));
+        return Ok(Some(Mode::Serve {
+            target,
+            certs,
+            caps,
+        }));
     }
 
     if argv.peek().map(String::as_str) == Some("mcp") {
@@ -267,8 +287,16 @@ fn main() {
         Mode::Daemon => daemon(),
         Mode::Mcp { grants, scopes } => mcp(grants, scopes),
         Mode::CertGenerate { force } => cert_generate(force),
-        Mode::Serve { target, certs } => match target.as_deref() {
-            Some(t) if is_quic(t) => serve_quic(t, &certs),
+        Mode::Serve {
+            target,
+            certs,
+            caps,
+        } => match target.as_deref() {
+            Some(t) if is_quic(t) => serve_quic(t, &certs, &caps),
+            _ if !caps.is_empty() => {
+                eprintln!("ikigai: --cap sets a per-connection ceiling and needs a quic:// target");
+                std::process::exit(2);
+            }
             _ => serve_ipc(target),
         },
         Mode::Repl(args) => {
@@ -514,10 +542,11 @@ fn build_engine(
                 ikigai_embedded::watched_kernel()
             } else {
                 let mut resolved = Vec::new();
-                for (prefix, socket) in mounts {
-                    // The socket is the mount's origin label, surfaced in the catalog.
-                    let resolver = connect_mount(&socket)?;
-                    resolved.push((prefix, socket, resolver));
+                for (prefix, target) in mounts {
+                    // The target (socket path or quic:// URL) is the mount's origin
+                    // label, surfaced in the catalog.
+                    let resolver = connect_mount(&target, certs)?;
+                    resolved.push((prefix, target, resolver));
                 }
                 ikigai_embedded::watched_kernel_with_mounts(resolved)
             };
@@ -538,17 +567,54 @@ fn build_engine(
 }
 
 /// Connect a `--mount` target as a [`Resolver`](ikigai_resolve::Resolver) to compose
-/// a remote kernel into the local graph.
+/// a remote kernel into the local graph. The target picks the transport the same way
+/// `--connect` does: `quic://host:port` for a remote kernel over mutually-pinned TLS
+/// (federation across machines), else a Unix socket path (a same-machine peer).
+#[cfg(feature = "embedded")]
+fn connect_mount(
+    target: &str,
+    certs: &Certs,
+) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
+    if is_quic(target) {
+        connect_mount_quic(target, certs)
+    } else {
+        connect_mount_ipc(target)
+    }
+}
+
+#[cfg(all(feature = "embedded", feature = "quic"))]
+fn connect_mount_quic(
+    target: &str,
+    certs: &Certs,
+) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
+    let addr = quic::parse_addr(target)?;
+    let identity = quic::client_identity(certs)?;
+    let trusted = quic::trusted_server_cert(certs)?;
+    let resolver = ikigai_quic::connect(addr, &identity, &trusted)
+        .map_err(|e| format!("--mount: connect {target}: {e}"))?;
+    Ok(std::sync::Arc::new(resolver))
+}
+
+#[cfg(all(feature = "embedded", not(feature = "quic")))]
+fn connect_mount_quic(
+    _target: &str,
+    _certs: &Certs,
+) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
+    Err("--mount of a quic:// target needs the `quic` feature".to_string())
+}
+
 #[cfg(all(feature = "embedded", feature = "ipc"))]
-fn connect_mount(socket: &str) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
+fn connect_mount_ipc(socket: &str) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
     let resolver = ikigai_ipc::connect(std::path::Path::new(socket))
         .map_err(|e| format!("--mount: connect {socket}: {e}"))?;
     Ok(std::sync::Arc::new(resolver))
 }
 
 #[cfg(all(feature = "embedded", not(feature = "ipc")))]
-fn connect_mount(_socket: &str) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
-    Err("--mount requires the `ipc` feature (Unix only)".to_string())
+fn connect_mount_ipc(
+    _socket: &str,
+) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
+    Err("--mount of a Unix socket needs the `ipc` feature (Unix only)".to_string())
 }
 
 /// Drive the engine: one-shot `-c`, else the full-screen TUI on a terminal, else
@@ -608,34 +674,51 @@ fn cert_generate(_force: bool) -> ! {
 // --- QUIC serve / connect ---------------------------------------------------
 
 #[cfg(all(feature = "embedded", feature = "quic"))]
-fn serve_quic(target: &str, certs: &Certs) -> ! {
+fn serve_quic(target: &str, certs: &Certs, caps: &[String]) -> ! {
+    let caps = caps.to_vec();
     let result = (|| -> Result<(), String> {
         let addr = quic::parse_addr(target)?;
         let identity = quic::server_identity(certs)?;
         let trusted = quic::trusted_client_certs(certs)?;
-        // Multi-tenant capability-on-the-wire: every connection is scoped to the
-        // authenticated client's own workspace segment, minted per-connection from
-        // *which* certificate authenticated. The cert IS the credential — the same
-        // identity→capability move as the browser passkey, over mTLS. Each tenant
-        // addresses files transparently under its own root (`urn:file:notes.txt`), and
-        // `source urn:host:identity` reports its `<id>`.
-        let root = ikigai_embedded::file_root();
+        // Capability-on-the-wire: every connection's ceiling is minted per-connection
+        // from *which* certificate authenticated. The cert IS the credential — the
+        // same identity→capability move as the browser passkey, over mTLS — and the
+        // server clamps any carried capability down to it (never widens).
+        //
+        // Two modes: with `--cap`, a FIXED ceiling shared by every authenticated
+        // client (`--cap urn:cap:personal:calendar:read:freebusy` = a free/busy share
+        // and nothing else). Without it, the default per-tenant filesystem workspace,
+        // where each client transparently roots at its own segment (`urn:file:x`).
         let minter: std::sync::Arc<dyn Fn(&str) -> ikigai_quic::Session + Send + Sync> =
-            std::sync::Arc::new(move |id: &str| {
-                let segment = root.join(id);
-                let _ = std::fs::create_dir_all(&segment); // the tenant's private dir
-                let seg = segment.display();
-                ikigai_quic::Session {
-                    capability: ikigai_core::Capability::root().attenuate([
-                        format!("urn:cap:fs:read:{seg}"),
-                        format!("urn:cap:fs:write:{seg}"),
-                        format!("urn:cap:fs:delete:{seg}"),
-                    ]),
+            if caps.is_empty() {
+                let root = ikigai_embedded::file_root();
+                std::sync::Arc::new(move |id: &str| {
+                    let segment = root.join(id);
+                    let _ = std::fs::create_dir_all(&segment); // the tenant's private dir
+                    let seg = segment.display();
+                    ikigai_quic::Session {
+                        capability: ikigai_core::Capability::root().attenuate([
+                            format!("urn:cap:fs:read:{seg}"),
+                            format!("urn:cap:fs:write:{seg}"),
+                            format!("urn:cap:fs:delete:{seg}"),
+                        ]),
+                        file_segment: id.to_string(),
+                    }
+                })
+            } else {
+                let ceiling = ikigai_core::Capability::scoped(caps.clone());
+                std::sync::Arc::new(move |id: &str| ikigai_quic::Session {
+                    capability: ceiling.clone(),
                     file_segment: id.to_string(),
-                }
-            });
+                })
+            };
+        let posture = if caps.is_empty() {
+            "per-client workspaces".to_string()
+        } else {
+            format!("fixed ceiling: {}", caps.join(", "))
+        };
         eprintln!(
-            "ikigai: serving on {target}  (per-client workspaces; {} trusted client cert(s))  (Ctrl-C to stop)",
+            "ikigai: serving on {target}  ({posture}; {} trusted client cert(s))  (Ctrl-C to stop)",
             trusted.len()
         );
         ikigai_quic::serve(
@@ -667,7 +750,7 @@ fn connect_quic(target: &str, certs: &Certs) -> Result<Engine, String> {
 }
 
 #[cfg(all(feature = "embedded", not(feature = "quic")))]
-fn serve_quic(_target: &str, _certs: &Certs) -> ! {
+fn serve_quic(_target: &str, _certs: &Certs, _caps: &[String]) -> ! {
     eprintln!("ikigai: `quic://` needs the `quic` feature");
     std::process::exit(1);
 }

@@ -617,6 +617,76 @@ mod tests {
         assert_eq!(cal_over_quic(scoped), "freebusy");
     }
 
+    /// Serve `gated_kernel` under a fixed `server_ceiling` (as `serve --cap` mints per
+    /// connection), then MOUNT that remote kernel into a fresh local kernel via a
+    /// `RemoteSpace` and resolve `urn:demo:cal` under `local_capability`. Returns what
+    /// the mounted resolution saw — DETAIL or freebusy — i.e. the authority that
+    /// actually governed after the server clamped the forwarded capability.
+    fn cal_through_mount(server_ceiling: Capability, local_capability: Capability) -> String {
+        use ikigai_core::{Fallback, Space};
+        use ikigai_resolve::{RemoteSpace, Resolver};
+
+        let server_id = generate();
+        let client_id = generate();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server_cfg =
+            server_config(&server_id, std::slice::from_ref(&client_id.cert_pem)).unwrap();
+        let rt = Runtime::new().unwrap();
+        let endpoint = rt
+            .block_on(async { quinn::Endpoint::server(server_cfg, addr) })
+            .unwrap();
+        let server_addr = endpoint.local_addr().unwrap();
+        let kernel = Arc::new(gated_kernel());
+        let session = Session {
+            capability: server_ceiling,
+            file_segment: String::new(),
+        };
+        let server = thread::spawn(move || {
+            rt.block_on(async move {
+                let incoming = endpoint.accept().await.unwrap();
+                let connection = incoming.await.unwrap();
+                serve_connection(&kernel, connection, &session).await;
+            });
+        });
+        let client = connect(server_addr, &client_id, &server_id.cert_pem).unwrap();
+        // Federation: compose the remote kernel into a LOCAL one as a fallback space.
+        let local = Fallback::new(vec![
+            Arc::new(EndpointSpace::new()) as Arc<dyn Space>,
+            Arc::new(RemoteSpace::new(Arc::new(client))) as Arc<dyn Space>,
+        ]);
+        let local_kernel = Kernel::new(Arc::new(local));
+        let cal = Request::new(Verb::Source, Iri::parse("urn:demo:cal").unwrap());
+        let (representation, _) =
+            Resolver::issue_as(&local_kernel, cal, &local_capability).unwrap();
+        drop(local_kernel);
+        server.join().unwrap();
+        String::from_utf8(representation.bytes).unwrap()
+    }
+
+    #[test]
+    fn a_mount_clamps_a_locally_root_client_to_the_servers_ceiling() {
+        // The federation guarantee: the laptop composes the remote kernel and resolves
+        // under its OWN (here root) authority, but the server's per-connection ceiling
+        // clamps the forwarded capability — the client cannot widen past what the remote
+        // grants. A freebusy-only ceiling → the mounted, locally-root client sees only
+        // freebusy. (The calendar story: `serve --cap …:read:freebusy` on the daemon →
+        // the laptop mounts it and gets free/busy, never detail.)
+        let freebusy = Capability::scoped(["urn:cap:demo:freebusy".to_string()]);
+        assert_eq!(
+            cal_through_mount(freebusy, Capability::root()),
+            "freebusy",
+            "a freebusy server ceiling clamps a locally-root mounted client"
+        );
+        // Control: a ceiling that DOES grant detail lets the same locally-root client
+        // see detail — proving the server's ceiling governs, not the client's authority.
+        let detail = Capability::scoped(["urn:cap:demo:detail".to_string()]);
+        assert_eq!(
+            cal_through_mount(detail, Capability::root()),
+            "DETAIL",
+            "a detail-granting ceiling lets the mounted client see detail"
+        );
+    }
+
     /// A kernel mimicking the file module enough to show wire-side rooting + scoping:
     /// `urn:file:{path}` echoes the (localized) path it received, gated by a prefix ACL
     /// over the session's `urn:cap:fs:read:<segment>` scopes — as ikigai-fs does for real
