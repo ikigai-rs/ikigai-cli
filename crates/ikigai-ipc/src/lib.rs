@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ikigai_core::{Capability, Kernel, Representation, Request, SpaceEntry, Tracer};
+use ikigai_core::{Capability, Error, Kernel, Representation, Request, SpaceEntry, Tracer};
 use ikigai_resolve::{scoped_entries, CacheStatus, Resolver, SpanCollector};
 use ikigai_wire::{read_message, write_message, Call, Reply, TraceContext};
 
@@ -88,25 +88,34 @@ impl IpcResolver {
     }
 }
 
-/// Turn a socket I/O error into the resolver's string error, naming a **timeout**
-/// (the read/write deadline elapsed) so a hung server is recognizable rather than a
-/// bare "resource temporarily unavailable" — and so the "timeout" marker is present
-/// for a caller that classifies it as transient.
-fn wire_error(e: io::Error) -> String {
+/// Classify a socket I/O error as a typed [`Error`] so the reliability overlays can
+/// act on it: a read/write deadline is a **transient** [`Timeout`](Error::Timeout),
+/// a refused/reset/broken connection a **transient** [`Unavailable`](Error::Unavailable)
+/// (the server is hung or gone — a Retry or Failover should move on); anything else
+/// is a generic endpoint error.
+fn wire_error(e: io::Error) -> Error {
     match e.kind() {
-        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
-            "timeout: no response from the kernel server (it may be hung or gone)".to_string()
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => Error::Timeout(
+            "no response from the kernel server (it may be hung or gone)".to_string(),
+        ),
+        io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::BrokenPipe
+        | io::ErrorKind::NotConnected => {
+            Error::Unavailable(format!("the kernel server is unreachable: {e}"))
         }
-        _ => e.to_string(),
+        _ => Error::Endpoint(e.to_string()),
     }
 }
 
 impl Resolver for IpcResolver {
-    fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), String> {
+    fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), Error> {
         match self.round_trip(Call::Issue(request)).map_err(wire_error)? {
             Reply::Resolved(representation, status) => Ok((representation, status)),
-            Reply::Error(message) => Err(message),
-            other => Err(format!("unexpected reply to Issue: {other:?}")),
+            Reply::Error(message) => Err(Error::Endpoint(message)),
+            other => Err(Error::Endpoint(format!(
+                "unexpected reply to Issue: {other:?}"
+            ))),
         }
     }
 
@@ -117,7 +126,7 @@ impl Resolver for IpcResolver {
         &self,
         request: Request,
         capability: &Capability,
-    ) -> Result<(Representation, CacheStatus), String> {
+    ) -> Result<(Representation, CacheStatus), Error> {
         // When a tracer is installed (the `trace` command), ask the server to record
         // the resolution and ship its spans back, then forward them to the tracer —
         // so the tree shows the *remote* kernel's execution. `parent_span` is None:
@@ -145,8 +154,10 @@ impl Resolver for IpcResolver {
                 }
                 Ok((representation, status))
             }
-            Reply::Error(message) => Err(message),
-            other => Err(format!("unexpected reply to IssueAs: {other:?}")),
+            Reply::Error(message) => Err(Error::Endpoint(message)),
+            other => Err(Error::Endpoint(format!(
+                "unexpected reply to IssueAs: {other:?}"
+            ))),
         }
     }
 
@@ -201,7 +212,7 @@ fn dispatch(kernel: &Kernel, call: Call) -> Reply {
     match call {
         Call::Issue(request) => match Resolver::issue(kernel, request) {
             Ok((representation, status)) => Reply::Resolved(representation, status),
-            Err(message) => Reply::Error(message),
+            Err(error) => Reply::Error(error.to_string()),
         },
         // The peer is the owner (peercred-verified in `serve`), so the principal's
         // entitlement is root and the carried capability is already ≤ root —
@@ -210,7 +221,7 @@ fn dispatch(kernel: &Kernel, call: Call) -> Reply {
         Call::IssueAs(request, capability) => {
             match Resolver::issue_as(kernel, request, &capability) {
                 Ok((representation, status)) => Reply::Resolved(representation, status),
-                Err(message) => Reply::Error(message),
+                Err(error) => Reply::Error(error.to_string()),
             }
         }
         Call::IsCached(request) => {
@@ -232,7 +243,7 @@ fn dispatch(kernel: &Kernel, call: Call) -> Reply {
                 Ok((representation, status)) => {
                     Reply::ResolvedTraced(representation, status, collector.take())
                 }
-                Err(message) => Reply::Error(message),
+                Err(error) => Reply::Error(error.to_string()),
             };
             Kernel::clear_tracer(kernel);
             reply
@@ -473,12 +484,50 @@ mod tests {
             start.elapsed() < Duration::from_secs(2),
             "returned promptly on the read timeout, not blocked forever"
         );
-        assert!(
-            result.unwrap_err().contains("timeout"),
-            "the hang is reported as a timeout"
-        );
+        // The hang is a *transient* Timeout — so a Retry/Failover above a mount to
+        // this server would act on it, not treat it as a permanent failure.
+        let err = result.unwrap_err();
+        assert!(matches!(err, Error::Timeout(_)), "{err:?}");
+        assert!(err.is_transient());
 
         drop(client);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_mount_to_a_hung_server_forwards_a_transient_error() {
+        use ikigai_core::{Fallback, Space};
+        use ikigai_resolve::RemoteSpace;
+
+        let path = socket_path("mount-hang");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_millis(400));
+                drop(stream);
+            }
+        });
+
+        // A local kernel that mounts the (hung) remote as a fallback.
+        let client = connect_with_timeout(&path, Some(Duration::from_millis(100))).unwrap();
+        let local = Fallback::new(vec![
+            Arc::new(EndpointSpace::new()) as Arc<dyn Space>,
+            Arc::new(RemoteSpace::new(Arc::new(client))) as Arc<dyn Space>,
+        ]);
+        let kernel = Kernel::new(Arc::new(local));
+
+        // Resolving a remote-only resource against the hung server yields a TRANSIENT
+        // error — so a Retry/Failover overlay above this kernel would act on it, the
+        // whole point of the structured Resolver boundary.
+        let err = Resolver::issue_as(&kernel, upper("hi"), &Capability::root()).unwrap_err();
+        assert!(
+            err.is_transient(),
+            "the mount forwards the hang as transient: {err:?}"
+        );
+
+        drop(kernel);
         server.join().unwrap();
         let _ = std::fs::remove_file(&path);
     }

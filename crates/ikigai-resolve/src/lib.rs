@@ -125,13 +125,14 @@ struct ForwardingEndpoint {
 #[async_trait]
 impl Endpoint for ForwardingEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation, Error> {
-        // Off the trace path: a plain forward.
+        // Off the trace path: a plain forward. The resolver already yields a typed
+        // Error, so a hung/unreachable remote surfaces as transient — a Retry or
+        // Failover above this mount can act on it, not a blanket permanent failure.
         if inv.trace_span().is_none() {
             return self
                 .resolver
                 .issue_as(self.request.clone(), inv.capability)
-                .map(|(representation, _status)| representation)
-                .map_err(Error::Endpoint);
+                .map(|(representation, _status)| representation);
         }
         // The local kernel is recording: trace the forward too — install a collector
         // on the resolver so the round-trip goes as a traced call — then hand the
@@ -142,7 +143,7 @@ impl Endpoint for ForwardingEndpoint {
         self.resolver.set_tracer(collector.clone());
         let result = self.resolver.issue_as(self.request.clone(), inv.capability);
         self.resolver.clear_tracer();
-        let (representation, _status) = result.map_err(Error::Endpoint)?;
+        let (representation, _status) = result?;
         inv.record_subtree(collector.take());
         Ok(representation)
     }
@@ -241,7 +242,7 @@ impl Space for MountedRemote {
 pub trait Resolver: Send + Sync {
     /// Resolve `request` under the resolver's default authority, and report its
     /// representation and cache outcome.
-    fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), String>;
+    fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), Error>;
 
     /// Resolve `request` under an explicit `capability`.
     ///
@@ -254,7 +255,7 @@ pub trait Resolver: Send + Sync {
         &self,
         request: Request,
         capability: &Capability,
-    ) -> Result<(Representation, CacheStatus), String> {
+    ) -> Result<(Representation, CacheStatus), Error> {
         let _ = capability;
         self.issue(request)
     }
@@ -270,7 +271,7 @@ pub trait Resolver: Send + Sync {
         &self,
         request: Request,
         capability: &Capability,
-    ) -> Result<(Representation, CacheStatus), String> {
+    ) -> Result<(Representation, CacheStatus), Error> {
         self.issue_as(request, capability)
     }
 
@@ -286,7 +287,7 @@ pub trait Resolver: Send + Sync {
         request: Request,
         capability: &Capability,
         incoming: Provenance,
-    ) -> Result<(Representation, CacheStatus), String> {
+    ) -> Result<(Representation, CacheStatus), Error> {
         let _ = incoming;
         self.issue_as_async(request, capability).await
     }
@@ -324,7 +325,7 @@ pub trait Resolver: Send + Sync {
 /// trusted, same-process path.
 #[async_trait]
 impl Resolver for Kernel {
-    fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), String> {
+    fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), Error> {
         self.issue_as(request, &Capability::root())
     }
 
@@ -332,14 +333,13 @@ impl Resolver for Kernel {
         &self,
         request: Request,
         capability: &Capability,
-    ) -> Result<(Representation, CacheStatus), String> {
+    ) -> Result<(Representation, CacheStatus), Error> {
         // Probe before issuing: a valid (thread-current) cached entry means a Hit;
         // a cut or absent one means we'll (re)compute. A cache-length delta would
         // misreport once golden-thread eviction is in play — evict + reinsert nets
         // zero — so the probe, not the delta, is the source of truth.
         let was_cached = Kernel::is_cached(self, &request, capability);
-        let representation =
-            block_on(Kernel::issue(self, request, capability)).map_err(|e| e.to_string())?;
+        let representation = block_on(Kernel::issue(self, request, capability))?;
         let status = cache_status(was_cached, &representation);
         Ok((representation, status))
     }
@@ -348,14 +348,12 @@ impl Resolver for Kernel {
         &self,
         request: Request,
         capability: &Capability,
-    ) -> Result<(Representation, CacheStatus), String> {
+    ) -> Result<(Representation, CacheStatus), Error> {
         // Same as `issue_as`, but awaits the kernel's async issue directly — no
         // `block_on`, so when the engine spawns this on the scheduler it parks
         // (freeing the worker for any sub-resolutions it fans out).
         let was_cached = Kernel::is_cached(self, &request, capability);
-        let representation = Kernel::issue(self, request, capability)
-            .await
-            .map_err(|e| e.to_string())?;
+        let representation = Kernel::issue(self, request, capability).await?;
         let status = cache_status(was_cached, &representation);
         Ok((representation, status))
     }
@@ -365,14 +363,13 @@ impl Resolver for Kernel {
         request: Request,
         capability: &Capability,
         incoming: Provenance,
-    ) -> Result<(Representation, CacheStatus), String> {
+    ) -> Result<(Representation, CacheStatus), Error> {
         // Thread the upstream pipe provenance into the kernel's dependency merge, so
         // the result's cacheability is no greater than its piped input's. `is_cached`
         // probes the same content-keyed entry the merged result would store under.
         let was_cached = Kernel::is_cached(self, &request, capability);
-        let representation = Kernel::issue_with_incoming(self, request, capability, incoming)
-            .await
-            .map_err(|e| e.to_string())?;
+        let representation =
+            Kernel::issue_with_incoming(self, request, capability, incoming).await?;
         let status = cache_status(was_cached, &representation);
         Ok((representation, status))
     }
@@ -414,7 +411,7 @@ fn cache_status(was_cached: bool, representation: &Representation) -> CacheStatu
 /// resolver's overrides (e.g. the kernel's `issue_as`/`transport`) are preserved.
 #[async_trait]
 impl<R: Resolver + ?Sized> Resolver for Arc<R> {
-    fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), String> {
+    fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), Error> {
         (**self).issue(request)
     }
 
@@ -422,7 +419,7 @@ impl<R: Resolver + ?Sized> Resolver for Arc<R> {
         &self,
         request: Request,
         capability: &Capability,
-    ) -> Result<(Representation, CacheStatus), String> {
+    ) -> Result<(Representation, CacheStatus), Error> {
         (**self).issue_as(request, capability)
     }
 
@@ -430,7 +427,7 @@ impl<R: Resolver + ?Sized> Resolver for Arc<R> {
         &self,
         request: Request,
         capability: &Capability,
-    ) -> Result<(Representation, CacheStatus), String> {
+    ) -> Result<(Representation, CacheStatus), Error> {
         // Delegate to the inner resolver's override (e.g. the kernel's true-async one).
         (**self).issue_as_async(request, capability).await
     }
@@ -440,7 +437,7 @@ impl<R: Resolver + ?Sized> Resolver for Arc<R> {
         request: Request,
         capability: &Capability,
         incoming: Provenance,
-    ) -> Result<(Representation, CacheStatus), String> {
+    ) -> Result<(Representation, CacheStatus), Error> {
         // Delegate so the inner resolver's override threads the pipe provenance —
         // otherwise the trait default would silently drop it here.
         (**self)

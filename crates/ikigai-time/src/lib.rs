@@ -384,7 +384,7 @@ impl JobRegistry {
         let outcome = match Iri::parse(target) {
             Ok(iri) => match resolver.issue_as(Request::new(verb, iri), &capability) {
                 Ok((rep, _status)) => one_line(&String::from_utf8_lossy(&rep.bytes)),
-                Err(e) => format!("error: {}", one_line(&e)),
+                Err(e) => format!("error: {}", one_line(&e.to_string())),
             },
             Err(e) => format!("error: bad target: {e}"),
         };
@@ -652,7 +652,7 @@ mod tests {
         fn issue(
             &self,
             _request: Request,
-        ) -> std::result::Result<(Representation, CacheStatus), String> {
+        ) -> std::result::Result<(Representation, CacheStatus), Error> {
             self.issued.fetch_add(1, Ordering::SeqCst);
             Ok((text("Hello, World".to_string()), CacheStatus::Uncacheable))
         }
