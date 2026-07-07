@@ -22,7 +22,7 @@ ikigai-personal = "0.5.2" # per-verb ActionSpecs + declared read caps
 # Capability-gated file/store module, linked as a published module crate.
 ikigai-fs = "0.1.4" # 0.1.4 = typed Error::Denied for capability denials
 # Outbound HTTP-client module (urn:httpGet…), linked as a published module crate.
-ikigai-http = "0.1.0"
+ikigai-http = "0.1.4" # 0.1.4 = typed Error::Denied for the host-ACL denial
 # Interactive runbook module (urn:runbook:*) — Linked Data demo tab since 0.1.3;
 # 0.1.5 adds the JSON-LD demo tab (expand/flatten/compact), which works here because
 # the CLI links its own pipe-fixed ikigai-engine.
@@ -49,7 +49,7 @@ ikigai-org = "0.1.3" # caret picks up 0.1.4 (cross-midnight fix) once published
 # first satellite-built module; pure text, wasm-clean, ArgSpec showcase.
 ikigai-text = "0.1.0"
 # Dev-tooling seam: git/gh/cargo as resources (urn:system:exec, urn:repo:*).
-ikigai-repo = "0.1.1" # 0.1.1 = urn:repo:list (enumerate repos under a root)
+ikigai-repo = "0.1.2" # 0.1.2 = typed Error::Denied for capability denials
 # LLM inference (urn:llm:ask + urn:llm:<provider>:ask + urn:llm:config): a facade grammar
 # over pluggable backends. OpenAI-compatible REST backend (Ollama/vLLM/llama.cpp/mlx_lm).
 ikigai-llm = "0.7.0" # installed: smallest-first with sizes (host co-load budgeting)
