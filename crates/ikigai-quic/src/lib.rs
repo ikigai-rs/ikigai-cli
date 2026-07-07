@@ -637,7 +637,7 @@ mod tests {
                     path.into_bytes(),
                 ))
             } else {
-                Err(Error::Endpoint(format!(
+                Err(Error::Denied(format!(
                     "capability does not grant read on `{path}`"
                 )))
             }
