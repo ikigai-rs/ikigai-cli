@@ -73,7 +73,7 @@ pub fn serve(
     let config = server_config(identity, trusted_client_cert_pems)?;
     let runtime = Runtime::new()?;
     runtime.block_on(async move {
-        let endpoint = quinn::Endpoint::server(config, addr)?;
+        let endpoint = bind_endpoint(config, addr)?;
         let kernel = Arc::new(kernel);
         while let Some(incoming) = endpoint.accept().await {
             let kernel = Arc::clone(&kernel);
@@ -90,6 +90,31 @@ pub fn serve(
         }
         Ok(())
     })
+}
+
+/// Bind the server endpoint. On a **wildcard** address (`0.0.0.0` or `[::]`), bind a
+/// single **dual-stack** IPv6 socket (`IPV6_V6ONLY` off) so it accepts BOTH IPv4
+/// (as v4-mapped) and IPv6 — a client dialing either family reaches it. This is the
+/// real fix for the `.local`-resolves-to-both-families-and-picks-IPv6 timeout: the
+/// server no longer cares which family the name resolved to. A specific bind address
+/// is honored as-is (`quinn::Endpoint::server`), single-family.
+fn bind_endpoint(config: quinn::ServerConfig, addr: SocketAddr) -> io::Result<quinn::Endpoint> {
+    if !addr.ip().is_unspecified() {
+        return quinn::Endpoint::server(config, addr);
+    }
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_only_v6(false)?; // dual-stack: also accept IPv4 (v4-mapped)
+    let bind = SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), addr.port());
+    socket.bind(&bind.into())?;
+    let udp: std::net::UdpSocket = socket.into();
+    udp.set_nonblocking(true)?;
+    quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(config),
+        udp,
+        Arc::new(quinn::TokioRuntime),
+    )
 }
 
 /// A stable id for the connection's authenticated client — a hash of its leaf
