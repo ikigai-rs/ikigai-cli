@@ -19,7 +19,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use ikigai_core::{Capability, Iri, Kernel, Representation, Request, SpaceEntry, Tracer};
-use ikigai_resolve::{CacheStatus, Resolver, SpanCollector};
+use ikigai_resolve::{scoped_entries, CacheStatus, Resolver, SpanCollector};
 use ikigai_wire::{decode, encode, Call, Reply, TraceContext};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::WebPkiSupportedAlgorithms;
@@ -167,7 +167,10 @@ fn dispatch(kernel: &Kernel, call: Call, session: &Session) -> Reply {
             localize(&mut request, &session.file_segment);
             Reply::Cached(Resolver::is_cached(kernel, &request, &session.capability))
         }
-        Call::Entries => Reply::Entries(Resolver::entries(kernel)),
+        // List the manifold the client's authenticated capability actually permits —
+        // never the full catalog. Affordance = authorization: a scoped principal must
+        // not even enumerate what it may not invoke (the leak this closes).
+        Call::Entries => Reply::Entries(Some(scoped_entries(kernel, &session.capability))),
         // Trace-over-the-wire: install a collector, resolve under the clamped
         // authority, ship the recorded spans back. `_ctx.parent_span` is for a
         // future mount-stitch. The kernel tracer is process-global, so concurrent
