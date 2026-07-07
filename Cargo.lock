@@ -1740,9 +1740,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-personal"
-version = "0.5.2"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fc4fcf8a219c7f3f02af04135363e54e9b0f392c780236dce535f617cc337a7"
+checksum = "cb5d7dd7e621e35ce8098619446fd0124b2e96426b9ba2bf039e803478dcb59e"
 dependencies = [
  "block2",
  "chrono",
