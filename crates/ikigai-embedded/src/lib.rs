@@ -2258,6 +2258,27 @@ fn root_space_with_mounts(
             on: demo_flag(),
         }) as Arc<dyn Space>,
     ];
+    // Guardrail for a real footgun: mounts are tried AFTER every local space, so a
+    // mount prefix that a local space already serves is silently shadowed — requests
+    // under it resolve locally and never reach the remote (e.g. `--mount urn:personal:=…`
+    // on a machine that has its own `urn:personal:*`). Warn and point at the fix: an
+    // alias prefix the local kernel doesn't serve (`urn:cal:…`) forces the remote.
+    let local_patterns: Vec<String> = spaces
+        .iter()
+        .filter_map(|s| s.entries())
+        .flatten()
+        .map(|e| e.pattern)
+        .collect();
+    for (prefix, _origin, _resolver) in &mounts {
+        if local_patterns
+            .iter()
+            .any(|p| p.starts_with(prefix.as_str()))
+        {
+            eprintln!(
+                "ikigai: warning: --mount prefix `{prefix}` is also served locally, so requests under it resolve LOCALLY, not via the mount; use an alias prefix the local kernel does not serve (e.g. `urn:cal:`) to reach the remote."
+            );
+        }
+    }
     // Remote mounts, tried after every local space. `MountedRemote` rewrites
     // `<prefix>rest` → `urn:rest` before forwarding (so the remote, which serves
     // `urn:*`, resolves it and a `trace` stitches its execution under this mount
