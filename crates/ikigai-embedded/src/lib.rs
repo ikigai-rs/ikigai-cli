@@ -1631,11 +1631,11 @@ fn local_space(nature: &'static str) -> EndpointSpace {
         )
         .bind(
             Exact::new("urn:personal:calendar"),
-            ikigai_personal::calendar(),
+            ikigai_personal::calendar(calendar_config()),
         )
         .bind(
             Exact::new("urn:personal:availability"),
-            ikigai_personal::availability(),
+            ikigai_personal::availability(calendar_config()),
         )
         .bind(
             Exact::new("urn:personal:calendars"),
@@ -1653,7 +1653,11 @@ fn local_space(nature: &'static str) -> EndpointSpace {
         // urn:personal:calendar:config (first grammar match wins).
         .bind(
             UriTemplate::parse("urn:personal:calendar:{period}").expect("valid template"),
-            ikigai_personal::calendar(),
+            ikigai_personal::calendar(calendar_config()),
+        )
+        .bind(
+            UriTemplate::parse("urn:personal:availability:{period}").expect("valid template"),
+            ikigai_personal::availability(calendar_config()),
         )
         .bind(
             // The org files, jailed to the configured org_dir and read THROUGH
@@ -1700,17 +1704,21 @@ pub fn calendar_server_space(nature: &'static str) -> EndpointSpace {
     base_space(nature)
         .bind(
             Exact::new("urn:personal:availability"),
-            ikigai_personal::availability(),
+            ikigai_personal::availability(calendar_config()),
         )
         .bind(
             Exact::new("urn:personal:calendar"),
-            ikigai_personal::calendar(),
+            ikigai_personal::calendar(calendar_config()),
         )
         // AFTER the exact bind: the period grammar (`urn:personal:calendar:this-week`)
         // must not shadow the bare `urn:personal:calendar` (first grammar match wins).
         .bind(
             UriTemplate::parse("urn:personal:calendar:{period}").expect("valid template"),
-            ikigai_personal::calendar(),
+            ikigai_personal::calendar(calendar_config()),
+        )
+        .bind(
+            UriTemplate::parse("urn:personal:availability:{period}").expect("valid template"),
+            ikigai_personal::availability(calendar_config()),
         )
 }
 
