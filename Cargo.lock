@@ -1848,9 +1848,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-sparql"
-version = "0.1.1"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3fe6945eae6f51230a53d5d216c26ca10ae6be8c25cd3d746c3f4b8db15999e"
+checksum = "d8fa62c186dd03f132d84f84cc0e8c4a946c035ae02b45fa74b2b181697a452b"
 dependencies = [
  "async-trait",
  "ikigai-core",
