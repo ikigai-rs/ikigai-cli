@@ -1591,9 +1591,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-cms"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d80ac110a334d744fa5f6516bd2a40b6e20e24d54d0dc8415d159f090897771"
+checksum = "dd7c999adfc6c6cdfa2461f9fae9000533e70c662120bc105a3ba44eb2778534"
 dependencies = [
  "ikigai-core",
 ]

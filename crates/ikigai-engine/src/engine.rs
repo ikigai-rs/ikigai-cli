@@ -656,10 +656,16 @@ impl Engine {
         let declared = declared_arguments(description.as_ref());
 
         // Split args into named (`key=value` with a declared key) and positional.
+        // `as` is reserved: it's the universal content-negotiation selector (which
+        // representation face to render), carried as an arg on the request, NOT
+        // endpoint input. So it's always named — otherwise, on an endpoint that
+        // doesn't declare `as`, it falls to positional and, in a pipe, collides
+        // with the piped value (`… | ep as=text/turtle` used to error).
         let mut named: Vec<(&str, &str)> = Vec::new();
         let mut positional: Vec<&str> = Vec::new();
         for arg in args {
             match arg.split_once('=') {
+                Some(("as", value)) => named.push(("as", value)),
                 Some((key, value)) if declared.iter().any(|name| name == key) => {
                     named.push((key, value))
                 }
@@ -2332,6 +2338,20 @@ mod tests {
         let err = output(builtin_engine().eval("source urn:fn:toUpper hi | urn:fn:toUpper x"))
             .unwrap_err();
         assert!(err.contains("from the pipe"), "got: {err}");
+    }
+
+    #[test]
+    fn as_conneg_rides_through_a_pipe_without_colliding_with_the_input() {
+        // `as=` is the content-negotiation selector, not endpoint input — in a pipe
+        // it must ride alongside the piped value, not be mistaken for a literal that
+        // collides with it (which used to raise "takes its input from the pipe").
+        assert_eq!(
+            output(
+                builtin_engine().eval("source urn:fn:toUpper hi | urn:fn:toUpper as=text/plain")
+            )
+            .unwrap(),
+            "HI"
+        );
     }
 
     #[test]
