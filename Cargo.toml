@@ -50,7 +50,7 @@ ikigai-org = "0.1.3" # caret picks up 0.1.4 (cross-midnight fix) once published
 ikigai-text = "0.1.0"
 # Semantic-CMS transreptors (urn:cms:*): personal content (org bookmarks/notes,
 # library metadata) as one RDF graph on the dc:subject tag axis.
-ikigai-cms = "0.1.0"
+ikigai-cms = "0.1.1" # 0.1.1 = stitch wrapped bookmark titles (no dropped entries)
 # Dev-tooling seam: git/gh/cargo as resources (urn:system:exec, urn:repo:*).
 ikigai-repo = "0.1.2" # 0.1.2 = typed Error::Denied for capability denials
 # LLM inference (urn:llm:ask + urn:llm:<provider>:ask + urn:llm:config): a facade grammar
