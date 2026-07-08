@@ -2220,6 +2220,9 @@ fn root_space_with_mounts(
         // compose with | and .. over the newline-list convention. First module built
         // by a satellite session.
         Arc::new(ikigai_text::space()) as Arc<dyn Space>,
+        // Semantic-CMS transreptors (urn:cms:*): personal content (org bookmarks/
+        // notes, library metadata) into one RDF graph on the dc:subject tag axis.
+        Arc::new(ikigai_cms::space()) as Arc<dyn Space>,
         // Dev-tooling platform seam (urn:system:exec + urn:repo:*) — git/gh/cargo
         // as capability-gated resources. Native subprocess seam; ikigai using the
         // tools that build ikigai.
