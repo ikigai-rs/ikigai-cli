@@ -736,6 +736,27 @@ fn events_by_uid(turtle: &str) -> std::collections::BTreeMap<String, ViewEvent> 
         .collect()
 }
 
+/// The uids of every event subject appearing in a (possibly partial) graph. Unlike
+/// [`events_by_uid`], this keeps a subject that carries only its *changed* triples — a
+/// triple-level diff of a time/location edit is exactly that (just the differing
+/// `ical:dtstart`/`dtend`, no `summary`), and reconstructing an event from it would drop
+/// it. The deriver maps these uids back to the FULL event in desired/current.
+fn subject_uids(turtle: &str) -> std::collections::BTreeSet<String> {
+    oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle)
+        .for_slice(turtle.as_bytes())
+        .filter_map(|quad| {
+            let quad = quad.ok()?;
+            let oxrdf::NamedOrBlankNode::NamedNode(subject) = &quad.subject else {
+                return None;
+            };
+            subject
+                .as_str()
+                .strip_prefix("urn:event:")
+                .map(str::to_string)
+        })
+        .collect()
+}
+
 /// `urn:view:ingest` — drain the phone-capture inbox (config `inbox`, e.g.
 /// Brian-New) into the org system of record: each event becomes an org heading
 /// (its iCal UID recorded as `:ID:`, which the org parser prefers — one
@@ -1187,14 +1208,18 @@ impl Endpoint for DeriveEndpoint {
         // Subjects in `removed` = gone or changed -> Delete (data from CURRENT).
         // Subjects in `added` = new or changed -> Sink (data from DESIRED).
         // A changed event is in both: delete first, recreate after = an update.
+        // Extract the SUBJECT uids from the diff graphs, not full events: a triple-level
+        // diff of a property-only edit carries just the changed triples (no summary), so
+        // reconstructing an event from the diff would drop it — the uid then maps back to
+        // the full event in desired/current.
         let desired_events = events_by_uid(&desired);
         let current_events = events_by_uid(&current);
-        let to_delete: Vec<&ViewEvent> = events_by_uid(&String::from_utf8_lossy(&removed.bytes))
-            .keys()
+        let to_delete: Vec<&ViewEvent> = subject_uids(&String::from_utf8_lossy(&removed.bytes))
+            .iter()
             .filter_map(|uid| current_events.get(uid))
             .collect();
-        let to_create: Vec<&ViewEvent> = events_by_uid(&String::from_utf8_lossy(&added.bytes))
-            .keys()
+        let to_create: Vec<&ViewEvent> = subject_uids(&String::from_utf8_lossy(&added.bytes))
+            .iter()
             .filter_map(|uid| desired_events.get(uid))
             .collect();
 
@@ -2685,6 +2710,26 @@ mod tests {
     use super::*;
     use futures::executor::block_on;
     use ikigai_core::{ArgRef, Capability, Iri, Request};
+
+    #[test]
+    fn a_property_only_change_is_not_dropped_by_the_deriver() {
+        // A triple-level diff of a time-only edit is just the changed dtstart/dtend —
+        // no summary. events_by_uid (needs summary+dtstart+dtend) drops it; the deriver
+        // used to extract its create/delete set from exactly this, so the change vanished.
+        let partial_diff = "@prefix ical: <http://www.w3.org/2002/12/cal/ical#> .\n\
+             <urn:event:4D7E3E55> ical:dtstart \"2026-07-20T10:00:00-07:00\" ;\n\
+             \x20   ical:dtend \"2026-07-20T11:30:00-07:00\" .\n";
+        assert!(
+            events_by_uid(partial_diff).is_empty(),
+            "the diff graph has no summary, so a full-event parse drops it"
+        );
+        // subject_uids still recovers the changed subject → the deriver maps it back to
+        // the full event in desired/current and applies the update.
+        assert!(
+            subject_uids(partial_diff).contains("4D7E3E55"),
+            "the changed subject's uid is recovered from the diff graph"
+        );
+    }
 
     #[test]
     fn calendar_server_space_exposes_only_the_calendar() {
