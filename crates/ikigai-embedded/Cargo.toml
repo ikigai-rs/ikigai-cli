@@ -13,6 +13,10 @@ ikigai-vocab = { workspace = true }
 ikigai-fn = { workspace = true }
 ikigai-personal = { workspace = true }
 ikigai-org = { workspace = true }
+# The consolidated-view (Brian-Busy) derivation, lifted out of this host crate into
+# its own focused, independently-tested crate. This host merely binds its endpoints
+# (urn:view:derive[:tick], urn:view:ingest), passing the resolved calendar config.
+ikigai-view = { workspace = true }
 ikigai-text = { workspace = true }
 ikigai-cms = { workspace = true }
 ikigai-repo = { workspace = true }
