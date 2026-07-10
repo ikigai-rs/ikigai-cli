@@ -1315,6 +1315,13 @@ impl Endpoint for DeriveEndpoint {
     }
 }
 
+/// A local-time stamp (`YYYY-MM-DD HH:MM:SS`) prefixed on every daemon-log derive
+/// report, so the heartbeat in `/tmp/ikigai-daemon.log` doubles as a freshness clock —
+/// you can see *when* the last sync ran, not just that one did.
+fn stamp() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
 /// `urn:view:derive:tick` — the standing-sync face of the derivation: issues
 /// `urn:view:derive` and reports the pass to stderr (the daemon log), so the
 /// timer leaves a heartbeat. Silence in the log then MEANS the sync is not
@@ -1332,10 +1339,11 @@ impl Endpoint for DeriveTickEndpoint {
             .await;
         match &result {
             Ok(report) => eprintln!(
-                "ikigai: timer → {}",
+                "{} ikigai: timer → {}",
+                stamp(),
                 String::from_utf8_lossy(&report.bytes).trim_end()
             ),
-            Err(e) => eprintln!("ikigai: timer → derive failed: {e}"),
+            Err(e) => eprintln!("{} ikigai: timer → derive failed: {e}", stamp()),
         }
         result
     }
@@ -2411,10 +2419,11 @@ pub fn startup_derive(kernel: &Arc<Kernel>) {
     );
     match ikigai_resolve::Resolver::issue(kernel.as_ref(), request) {
         Ok((report, _)) => eprintln!(
-            "ikigai: startup → {}",
+            "{} ikigai: startup → {}",
+            stamp(),
             String::from_utf8_lossy(&report.bytes).trim()
         ),
-        Err(e) => eprintln!("ikigai: startup → derive failed: {e}"),
+        Err(e) => eprintln!("{} ikigai: startup → derive failed: {e}", stamp()),
     }
 }
 
@@ -2537,10 +2546,11 @@ fn watch_org(kernel: Arc<Kernel>) {
             let outcome = ikigai_resolve::Resolver::issue(kernel.as_ref(), request);
             match outcome {
                 Ok((report, _)) => eprintln!(
-                    "ikigai: org change → {}",
+                    "{} ikigai: org change → {}",
+                    stamp(),
                     String::from_utf8_lossy(&report.bytes).trim()
                 ),
-                Err(e) => eprintln!("ikigai: org change → derive failed: {e}"),
+                Err(e) => eprintln!("{} ikigai: org change → derive failed: {e}", stamp()),
             }
             last_run = std::time::Instant::now();
         }
@@ -2596,10 +2606,16 @@ fn watch_store(kernel: Arc<Kernel>) {
             }
         }
         if watching == 0 {
-            eprintln!("ikigai: calendar store watcher could not attach");
+            eprintln!(
+                "{} ikigai: calendar store watcher could not attach",
+                stamp()
+            );
             return;
         }
-        eprintln!("ikigai: calendar store watcher active ({watching} location(s))");
+        eprintln!(
+            "{} ikigai: calendar store watcher active ({watching} location(s))",
+            stamp()
+        );
         for event in frx.iter().flatten() {
             if event.kind.is_access() {
                 continue;
@@ -2621,10 +2637,11 @@ fn watch_store(kernel: Arc<Kernel>) {
             );
             match ikigai_resolve::Resolver::issue(kernel.as_ref(), request) {
                 Ok((report, _)) => eprintln!(
-                    "ikigai: calendar change → {}",
+                    "{} ikigai: calendar change → {}",
+                    stamp(),
                     String::from_utf8_lossy(&report.bytes).trim()
                 ),
-                Err(e) => eprintln!("ikigai: calendar change → derive failed: {e}"),
+                Err(e) => eprintln!("{} ikigai: calendar change → derive failed: {e}", stamp()),
             }
             last_run = std::time::Instant::now();
         }
