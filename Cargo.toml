@@ -56,6 +56,10 @@ ikigai-repo = "0.1.2" # 0.1.2 = typed Error::Denied for capability denials
 # LLM inference (urn:llm:ask + urn:llm:<provider>:ask + urn:llm:config): a facade grammar
 # over pluggable backends. OpenAI-compatible REST backend (Ollama/vLLM/llama.cpp/mlx_lm).
 ikigai-llm = "0.7.0" # installed: smallest-first with sizes (host co-load budgeting)
+# The org⊕calendar consolidated-view (Brian-Busy) derivation — a workspace-local
+# composition crate that reconciles personal/org/rdf THROUGH the kernel. Not
+# published (no version pin); the CLI installs it from this path only.
+ikigai-view = { path = "crates/ikigai-view" }
 # Sibling workspace crates pinned to the current release: a published crate must
 # require its siblings at this version too, so the lockstep release publishes in
 # dependency order (resolve → wire → engine → …) and a crate can never build against

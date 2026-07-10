@@ -1637,6 +1637,7 @@ dependencies = [
  "ikigai-sparql",
  "ikigai-text",
  "ikigai-time",
+ "ikigai-view",
  "ikigai-vocab",
  "ikigai-xslt",
  "notify",
@@ -1884,6 +1885,18 @@ version = "0.1.11"
 dependencies = [
  "ikigai-core",
  "ikigai-resolve",
+]
+
+[[package]]
+name = "ikigai-view"
+version = "0.1.9"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures",
+ "ikigai-core",
+ "oxrdf",
+ "oxrdfio",
 ]
 
 [[package]]

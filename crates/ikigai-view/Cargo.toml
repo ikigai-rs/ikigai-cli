@@ -1,0 +1,25 @@
+[package]
+name = "ikigai-view"
+description = "The org⊕calendar consolidated-view (Brian-Busy) derivation: a thin composition crate that reconciles the org agenda ∪ source calendars into a view calendar, entirely through the kernel."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+# The kernel: the ONLY ikigai crate this links. personal/org/rdf are composed
+# entirely THROUGH the kernel (inv.issue), never linked — which is what keeps
+# this a thin composition crate correctly layered ABOVE them.
+ikigai-core = { workspace = true }
+# Turtle parsing (the event graph the calendar/org/diff endpoints all speak).
+oxrdf = "0.3"
+oxrdfio = "0.2"
+# Local time (OS timezone) for the rolling window, org timestamps, and the
+# tick heartbeat. `clock` only; no parsing/serde surface.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+async-trait = "0.1"
+
+[dev-dependencies]
+futures = { workspace = true }
