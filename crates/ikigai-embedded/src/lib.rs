@@ -1153,11 +1153,59 @@ fn view_ttl_str(s: &str) -> String {
 /// new/changed (identity carried as urn:event:{uid} — the round-trip that makes
 /// this idempotent). Drive it on a timer: `source urn:time:schedule
 /// target=urn:view:derive every=300s`.
-struct DeriveEndpoint;
+/// A healthy derive converges — `created 0 · removed 0`. A run of passes that keep
+/// changing the same events means something isn't round-tripping (the deriver rewrites it,
+/// the store-watcher re-fires the derive — an infinite loop that spams subscribers). After
+/// [`CHURN_LIMIT`] consecutive churning passes this breaker trips: further passes are
+/// skipped until the daemon restarts, containing a runaway to a handful of passes.
+#[derive(Default)]
+struct DeriveBreaker {
+    churn: std::sync::atomic::AtomicUsize,
+    tripped: std::sync::atomic::AtomicBool,
+}
+
+/// Consecutive churning passes before the breaker trips. Generous enough that a legitimate
+/// burst (a backlog catch-up, or a few rapid edits) — each of which converges on the next
+/// pass — never trips; only sustained non-convergence does.
+const CHURN_LIMIT: usize = 5;
+
+impl DeriveBreaker {
+    fn is_tripped(&self) -> bool {
+        self.tripped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record a pass by how many events it changed. `None` if it converged (counter
+    /// resets); `Some(streak)` if it churned — tripping at [`CHURN_LIMIT`].
+    fn record(&self, changed: usize) -> Option<usize> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if changed == 0 {
+            self.churn.store(0, Relaxed);
+            return None;
+        }
+        let streak = self.churn.fetch_add(1, Relaxed) + 1;
+        if streak >= CHURN_LIMIT {
+            self.tripped.store(true, Relaxed);
+        }
+        Some(streak)
+    }
+}
+
+struct DeriveEndpoint {
+    breaker: Arc<DeriveBreaker>,
+}
 
 #[async_trait::async_trait]
 impl Endpoint for DeriveEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        // Breaker tripped: skip the pass entirely (no diff, no writes) so a non-converging
+        // sync can't keep spamming. Restart the daemon after fixing the mismatch.
+        if self.breaker.is_tripped() {
+            return Ok(Representation::new(
+                ReprType::new("text/plain").with_param("charset", "utf-8"),
+                b"auto-sync PAUSED (breaker tripped - not converging); restart after fixing\n"
+                    .to_vec(),
+            ));
+        }
         let Some(config) = calendar_config() else {
             return Err(Error::Endpoint(
                 "urn:view:derive: no calendar config — see urn:personal:calendar:config"
@@ -1367,6 +1415,23 @@ impl Endpoint for DeriveEndpoint {
                 " · FAILED {failed} ({})",
                 first_failure.as_deref().unwrap_or("unknown")
             ));
+        }
+        // Circuit breaker: converge or contain. A churning pass surfaces WHAT keeps
+        // changing (the normalized diff names the mismatched field) and counts toward
+        // tripping; a converged pass resets it.
+        if let Some(streak) = self.breaker.record(created + deleted + failed) {
+            let churn = String::from_utf8_lossy(&added.bytes);
+            let sample = churn.lines().take(6).collect::<Vec<_>>().join(" | ");
+            report.push_str(&format!(
+                "\n  churn {streak}/{CHURN_LIMIT}: {}",
+                sample.trim()
+            ));
+            if self.breaker.is_tripped() {
+                report.push_str(
+                    "\n  NOT CONVERGING — auto-sync PAUSED. Exclude/normalize the churning \
+                     field above in the deriver, then restart the daemon.",
+                );
+            }
         }
         report.push('\n');
         Ok(Representation::new(
@@ -1729,7 +1794,12 @@ fn local_space(nature: &'static str) -> EndpointSpace {
             Exact::new("urn:personal:calendar:config"),
             ikigai_personal::calendar_config(calendar_config()),
         )
-        .bind(Exact::new("urn:view:derive"), DeriveEndpoint)
+        .bind(
+            Exact::new("urn:view:derive"),
+            DeriveEndpoint {
+                breaker: Arc::new(DeriveBreaker::default()),
+            },
+        )
         .bind(Exact::new("urn:view:derive:tick"), DeriveTickEndpoint)
         .bind(Exact::new("urn:agent:select"), AgentSelectEndpoint)
         .bind(Exact::new("urn:view:ingest"), IngestEndpoint)
@@ -2833,6 +2903,26 @@ mod tests {
         assert!(
             normalize_for_diff(&timed).contains("dtend"),
             "dtend is kept for non-all-day events"
+        );
+    }
+
+    #[test]
+    fn the_derive_breaker_contains_a_runaway() {
+        let b = DeriveBreaker::default();
+        // A churning pass followed by convergence never trips — a legitimate edit converges
+        // on the next pass, so the streak resets.
+        assert_eq!(b.record(3), Some(1));
+        assert_eq!(b.record(0), None);
+        assert!(!b.is_tripped());
+        // Sustained non-convergence trips exactly at the limit.
+        for expected in 1..CHURN_LIMIT {
+            assert_eq!(b.record(1), Some(expected));
+            assert!(!b.is_tripped());
+        }
+        assert_eq!(b.record(1), Some(CHURN_LIMIT));
+        assert!(
+            b.is_tripped(),
+            "auto-sync pauses after CHURN_LIMIT non-converging passes"
         );
     }
 
