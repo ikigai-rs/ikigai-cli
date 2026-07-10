@@ -757,19 +757,38 @@ fn subject_uids(turtle: &str) -> std::collections::BTreeSet<String> {
         .collect()
 }
 
-/// Re-serialize a graph (as N-Triples, which is valid Turtle) WITHOUT the `ik:calendar`
-/// provenance triple. That triple names the calendar an event lives on, so it always
-/// differs between a source ("Brian") and the derived view ("Brian-Busy") — comparing it
-/// would make the deriver see every event as changed on every pass (an infinite
-/// delete-recreate loop). Stripping it means the diff only reflects substantive edits.
-fn strip_calendar_provenance(turtle: &str) -> String {
+/// Re-serialize a graph (as N-Triples, which is valid Turtle) normalized for the
+/// convergence diff — dropping triples that always differ between a source and its derived
+/// copy for reasons that aren't real edits, so the deriver doesn't loop forever recreating
+/// them. The event DATA a create uses comes from the full graphs, not this.
+///
+/// Dropped:
+/// - **`ik:calendar`** — provenance naming the calendar an event lives on ("Brian" vs
+///   "Brian-Busy"); by construction it always differs source vs view.
+/// - **`ical:dtend` on all-day events** — the org face emits the *exclusive* next-midnight
+///   (iCal convention) while EventKit stores/reads all-day events with an *inclusive*
+///   `23:59:59` end; same span, different string, never converges.
+fn normalize_for_diff(turtle: &str) -> String {
     const IK_CALENDAR: &str = "https://ikigai-rs.dev/ns#calendar";
+    const IK_ALLDAY: &str = "https://ikigai-rs.dev/ns#allDay";
+    const ICAL_DTEND: &str = "http://www.w3.org/2002/12/cal/ical#dtend";
+    let quads: Vec<oxrdf::Quad> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle)
+        .for_slice(turtle.as_bytes())
+        .filter_map(|q| q.ok())
+        .collect();
+    // Subjects flagged all-day (the flag is only emitted when true).
+    let all_day: std::collections::HashSet<String> = quads
+        .iter()
+        .filter(|q| q.predicate.as_str() == IK_ALLDAY)
+        .map(|q| q.subject.to_string())
+        .collect();
     let mut out = String::new();
-    for quad in
-        oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle).for_slice(turtle.as_bytes())
-    {
-        let Ok(quad) = quad else { continue };
-        if quad.predicate.as_str() == IK_CALENDAR {
+    for quad in &quads {
+        let pred = quad.predicate.as_str();
+        if pred == IK_CALENDAR {
+            continue;
+        }
+        if pred == ICAL_DTEND && all_day.contains(&quad.subject.to_string()) {
             continue;
         }
         // N-Triples line: `<subject> <predicate> object .` (object Displays canonically).
@@ -1219,8 +1238,8 @@ impl Endpoint for DeriveEndpoint {
         // it always differs between a source and the derived view — comparing it would
         // flag every event as changed on every pass (an infinite delete-recreate loop).
         // The event DATA below still comes from the full desired/current graphs.
-        let desired_cmp = strip_calendar_provenance(&desired);
-        let current_cmp = strip_calendar_provenance(&current);
+        let desired_cmp = normalize_for_diff(&desired);
+        let current_cmp = normalize_for_diff(&current);
         let diff = |mode: &'static str, a: String, b: String| {
             Request::new(Verb::Source, Iri::parse("urn:rdf:diff").expect("valid IRI"))
                 .with_arg("content", ikigai_core::ArgRef::Inline(a.into_bytes()))
@@ -2774,10 +2793,7 @@ mod tests {
              ical:dtend \"2026-07-20T11:30:00-07:00\" ; ik:calendar \"Brian\" .\n";
         let view = src.replace("\"Brian\"", "\"Brian-Busy\"");
         let sorted = |t: &str| {
-            let mut v: Vec<String> = strip_calendar_provenance(t)
-                .lines()
-                .map(str::to_string)
-                .collect();
+            let mut v: Vec<String> = normalize_for_diff(t).lines().map(str::to_string).collect();
             v.sort();
             v
         };
@@ -2786,8 +2802,38 @@ mod tests {
             sorted(&view),
             "same event on different calendars = no substantive difference"
         );
-        assert!(!strip_calendar_provenance(src).contains("ns#calendar"));
-        assert!(strip_calendar_provenance(src).contains("dtstart"));
+        assert!(!normalize_for_diff(src).contains("ns#calendar"));
+        assert!(normalize_for_diff(src).contains("dtstart"));
+    }
+
+    #[test]
+    fn all_day_dtend_convention_does_not_count_as_a_change() {
+        // Same all-day span: the org face emits the exclusive next-midnight, EventKit reads
+        // back the inclusive 23:59:59 of the last day. Only dtend differs → after
+        // normalizing (dtend dropped for all-day) the two are the same set → converges.
+        let org = "@prefix ical: <http://www.w3.org/2002/12/cal/ical#> .\n\
+             @prefix ik: <https://ikigai-rs.dev/ns#> .\n\
+             <urn:event:U> ical:summary \"Span\" ; ical:dtstart \"2026-07-14T00:00:00-07:00\" ; \
+             ical:dtend \"2026-07-18T00:00:00-07:00\" ; ik:allDay true ; ik:calendar \"Brian\" .\n";
+        let busy = org
+            .replace("2026-07-18T00:00:00", "2026-07-17T23:59:59")
+            .replace("\"Brian\"", "\"Brian-Busy\"");
+        let sorted = |t: &str| {
+            let mut v: Vec<String> = normalize_for_diff(t).lines().map(str::to_string).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            sorted(org),
+            sorted(&busy),
+            "all-day end convention isn't a change"
+        );
+        // A TIMED event's dtend is still compared (not dropped).
+        let timed = org.replace("ik:allDay true ; ", "");
+        assert!(
+            normalize_for_diff(&timed).contains("dtend"),
+            "dtend is kept for non-all-day events"
+        );
     }
 
     #[test]
