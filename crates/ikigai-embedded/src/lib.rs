@@ -768,9 +768,14 @@ fn subject_uids(turtle: &str) -> std::collections::BTreeSet<String> {
 /// - **`ical:dtend` on all-day events** — the org face emits the *exclusive* next-midnight
 ///   (iCal convention) while EventKit stores/reads all-day events with an *inclusive*
 ///   `23:59:59` end; same span, different string, never converges.
+/// - **`ik:alert` on all-day events** — EventKit adds a *default* all-day alarm (9am the
+///   day before, i.e. 900 min) that the source never asked for, so a created all-day event
+///   reads back with an alert the desired lacks. Timed-event alerts are untouched (they
+///   round-trip and are source-controlled).
 fn normalize_for_diff(turtle: &str) -> String {
     const IK_CALENDAR: &str = "https://ikigai-rs.dev/ns#calendar";
     const IK_ALLDAY: &str = "https://ikigai-rs.dev/ns#allDay";
+    const IK_ALERT: &str = "https://ikigai-rs.dev/ns#alert";
     const ICAL_DTEND: &str = "http://www.w3.org/2002/12/cal/ical#dtend";
     let quads: Vec<oxrdf::Quad> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle)
         .for_slice(turtle.as_bytes())
@@ -788,7 +793,7 @@ fn normalize_for_diff(turtle: &str) -> String {
         if pred == IK_CALENDAR {
             continue;
         }
-        if pred == ICAL_DTEND && all_day.contains(&quad.subject.to_string()) {
+        if (pred == ICAL_DTEND || pred == IK_ALERT) && all_day.contains(&quad.subject.to_string()) {
             continue;
         }
         // N-Triples line: `<subject> <predicate> object .` (object Displays canonically).
@@ -1417,14 +1422,23 @@ impl Endpoint for DeriveEndpoint {
             ));
         }
         // Circuit breaker: converge or contain. A churning pass surfaces WHAT keeps
-        // changing (the normalized diff names the mismatched field) and counts toward
-        // tripping; a converged pass resets it.
+        // changing on BOTH sides — `+` = desired-not-view (created), `-` = view-not-desired
+        // (removed) — so a create OR a remove pass names the mismatched field; it counts
+        // toward tripping. A converged pass resets it.
         if let Some(streak) = self.breaker.record(created + deleted + failed) {
-            let churn = String::from_utf8_lossy(&added.bytes);
-            let sample = churn.lines().take(6).collect::<Vec<_>>().join(" | ");
+            let side = |label: &str, bytes: &[u8]| {
+                let text = String::from_utf8_lossy(bytes);
+                let lines: Vec<&str> = text.lines().take(4).collect();
+                if lines.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {label} {}", lines.join(" | ").trim())
+                }
+            };
             report.push_str(&format!(
-                "\n  churn {streak}/{CHURN_LIMIT}: {}",
-                sample.trim()
+                "\n  churn {streak}/{CHURN_LIMIT}:{}{}",
+                side("+", &added.bytes),
+                side("-", &removed.bytes),
             ));
             if self.breaker.is_tripped() {
                 report.push_str(
@@ -2878,16 +2892,18 @@ mod tests {
 
     #[test]
     fn all_day_dtend_convention_does_not_count_as_a_change() {
-        // Same all-day span: the org face emits the exclusive next-midnight, EventKit reads
-        // back the inclusive 23:59:59 of the last day. Only dtend differs → after
-        // normalizing (dtend dropped for all-day) the two are the same set → converges.
+        // Same all-day span. Two EventKit artifacts differ from the org source: the end
+        // convention (org emits the exclusive next-midnight, EventKit the inclusive
+        // 23:59:59) and a DEFAULT all-day alarm (900 = 9am the day before) EventKit adds
+        // that the source never asked for. Both are excluded for all-day → converges.
         let org = "@prefix ical: <http://www.w3.org/2002/12/cal/ical#> .\n\
              @prefix ik: <https://ikigai-rs.dev/ns#> .\n\
              <urn:event:U> ical:summary \"Span\" ; ical:dtstart \"2026-07-14T00:00:00-07:00\" ; \
              ical:dtend \"2026-07-18T00:00:00-07:00\" ; ik:allDay true ; ik:calendar \"Brian\" .\n";
         let busy = org
             .replace("2026-07-18T00:00:00", "2026-07-17T23:59:59")
-            .replace("\"Brian\"", "\"Brian-Busy\"");
+            .replace("\"Brian\"", "\"Brian-Busy\"")
+            .replace("ik:allDay true", "ik:allDay true ; ik:alert 900");
         let sorted = |t: &str| {
             let mut v: Vec<String> = normalize_for_diff(t).lines().map(str::to_string).collect();
             v.sort();
@@ -2896,14 +2912,16 @@ mod tests {
         assert_eq!(
             sorted(org),
             sorted(&busy),
-            "all-day end convention isn't a change"
+            "all-day end convention + default alarm aren't changes"
         );
-        // A TIMED event's dtend is still compared (not dropped).
-        let timed = org.replace("ik:allDay true ; ", "");
-        assert!(
-            normalize_for_diff(&timed).contains("dtend"),
-            "dtend is kept for non-all-day events"
+        // A TIMED event keeps both dtend and alert (they round-trip and are source-owned).
+        let timed = org.replace("ik:allDay true ; ", "").replace(
+            "ik:calendar \"Brian\" .",
+            "ik:calendar \"Brian\" ; ik:alert 60 .",
         );
+        let n = normalize_for_diff(&timed);
+        assert!(n.contains("dtend"), "dtend kept for non-all-day events");
+        assert!(n.contains("ns#alert"), "alert kept for non-all-day events");
     }
 
     #[test]
