@@ -757,6 +757,32 @@ fn subject_uids(turtle: &str) -> std::collections::BTreeSet<String> {
         .collect()
 }
 
+/// Re-serialize a graph (as N-Triples, which is valid Turtle) WITHOUT the `ik:calendar`
+/// provenance triple. That triple names the calendar an event lives on, so it always
+/// differs between a source ("Brian") and the derived view ("Brian-Busy") — comparing it
+/// would make the deriver see every event as changed on every pass (an infinite
+/// delete-recreate loop). Stripping it means the diff only reflects substantive edits.
+fn strip_calendar_provenance(turtle: &str) -> String {
+    const IK_CALENDAR: &str = "https://ikigai-rs.dev/ns#calendar";
+    let mut out = String::new();
+    for quad in
+        oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle).for_slice(turtle.as_bytes())
+    {
+        let Ok(quad) = quad else { continue };
+        if quad.predicate.as_str() == IK_CALENDAR {
+            continue;
+        }
+        // N-Triples line: `<subject> <predicate> object .` (object Displays canonically).
+        out.push_str(&quad.subject.to_string());
+        out.push(' ');
+        out.push_str(&quad.predicate.to_string());
+        out.push(' ');
+        out.push_str(&quad.object.to_string());
+        out.push_str(" .\n");
+    }
+    out
+}
+
 /// `urn:view:ingest` — drain the phone-capture inbox (config `inbox`, e.g.
 /// Brian-New) into the org system of record: each event becomes an org heading
 /// (its iCal UID recorded as `:ID:`, which the org parser prefers — one
@@ -1188,7 +1214,13 @@ impl Endpoint for DeriveEndpoint {
             .await?;
         let current = String::from_utf8_lossy(&current.bytes).to_string();
 
-        // THE DELTA — urn:rdf:diff through the kernel, both directions.
+        // THE DELTA — urn:rdf:diff through the kernel, both directions. Compare with the
+        // `ik:calendar` provenance stripped: it names the calendar an event lives on, so
+        // it always differs between a source and the derived view — comparing it would
+        // flag every event as changed on every pass (an infinite delete-recreate loop).
+        // The event DATA below still comes from the full desired/current graphs.
+        let desired_cmp = strip_calendar_provenance(&desired);
+        let current_cmp = strip_calendar_provenance(&current);
         let diff = |mode: &'static str, a: String, b: String| {
             Request::new(Verb::Source, Iri::parse("urn:rdf:diff").expect("valid IRI"))
                 .with_arg("content", ikigai_core::ArgRef::Inline(a.into_bytes()))
@@ -1199,10 +1231,10 @@ impl Endpoint for DeriveEndpoint {
                 )
         };
         let added = inv
-            .issue(diff("added", desired.clone(), current.clone()))
+            .issue(diff("added", desired_cmp.clone(), current_cmp.clone()))
             .await?;
         let removed = inv
-            .issue(diff("removed", desired.clone(), current.clone()))
+            .issue(diff("removed", desired_cmp.clone(), current_cmp))
             .await?;
 
         // Subjects in `removed` = gone or changed -> Delete (data from CURRENT).
@@ -2729,6 +2761,33 @@ mod tests {
             subject_uids(partial_diff).contains("4D7E3E55"),
             "the changed subject's uid is recovered from the diff graph"
         );
+    }
+
+    #[test]
+    fn calendar_provenance_does_not_count_as_a_change() {
+        // A source event and its Brian-Busy copy differ ONLY in ik:calendar (the calendar
+        // it lives on). Stripped, the two are the same triple set — so the diff finds
+        // nothing to sync, and the derive converges instead of looping forever.
+        let src = "@prefix ical: <http://www.w3.org/2002/12/cal/ical#> .\n\
+             @prefix ik: <https://ikigai-rs.dev/ns#> .\n\
+             <urn:event:X> ical:summary \"E\" ; ical:dtstart \"2026-07-20T10:00:00-07:00\" ; \
+             ical:dtend \"2026-07-20T11:30:00-07:00\" ; ik:calendar \"Brian\" .\n";
+        let view = src.replace("\"Brian\"", "\"Brian-Busy\"");
+        let sorted = |t: &str| {
+            let mut v: Vec<String> = strip_calendar_provenance(t)
+                .lines()
+                .map(str::to_string)
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            sorted(src),
+            sorted(&view),
+            "same event on different calendars = no substantive difference"
+        );
+        assert!(!strip_calendar_provenance(src).contains("ns#calendar"));
+        assert!(strip_calendar_provenance(src).contains("dtstart"));
     }
 
     #[test]
