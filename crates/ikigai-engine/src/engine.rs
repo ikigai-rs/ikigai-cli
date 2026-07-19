@@ -308,6 +308,36 @@ impl Engine {
         block_on(self.eval_async(line))
     }
 
+    /// Evaluate an arbitrary Lisp program as one unit — the entry point the TUI's
+    /// scratch buffer uses. Unlike [`eval`](Self::eval), which paren-sniffs a single
+    /// line, this routes the whole (possibly multi-line) `src` straight to
+    /// `urn:lisp:eval` — the SAME seam as the paren-sniff, `:lisp` mode, and `:load` —
+    /// so a buffer that opens with a comment or a blank line still evaluates as Lisp.
+    /// Returns [`Action::Output`] carrying the result, or [`Action::Noop`] for an empty
+    /// program. Synchronous `block_on` over [`eval_lisp_async`](Self::eval_lisp_async),
+    /// like [`eval`].
+    pub fn eval_lisp(&self, src: &str) -> Action {
+        block_on(self.eval_lisp_async(src))
+    }
+
+    /// The async form of [`eval_lisp`](Self::eval_lisp) — a browser frontend drives
+    /// this directly (where `block_on` would deadlock on a JS Promise).
+    pub async fn eval_lisp_async(&self, src: &str) -> Action {
+        if src.trim().is_empty() {
+            return Action::Noop;
+        }
+        // Each eval starts a fresh cache tally (like `eval_async`), read back into the
+        // entry once resolved. Runs under the session capability, so a session lacking
+        // `urn:cap:lisp` is denied cleanly by the endpoint.
+        self.cache.set(CacheStats::default());
+        let result = self.run_lisp(src).await;
+        Action::Output(Entry {
+            input: src.to_string(),
+            result,
+            cache: self.cache.get(),
+        })
+    }
+
     /// The resources bound in the kernel's space, or `None` if it can't enumerate —
     /// the same list `list` shows. A frontend uses it to discover bound resources
     /// (e.g. the TUI enumerating `urn:runbook:*` to build its demo tabs).
@@ -1877,6 +1907,52 @@ mod tests {
             Action::Output(entry) => entry,
             _ => panic!("expected Action::Output"),
         }
+    }
+
+    /// An engine with a stand-in `urn:lisp:eval` that echoes its `in` argument — so a
+    /// test can prove `eval_lisp` routes the whole buffer there (as `in`) without
+    /// pulling in the real Steel interpreter.
+    fn lisp_echo_engine() -> Engine {
+        let eval = FnEndpoint::new("lisp-eval", |inv: &Invocation<'_>| {
+            let src = inv.inline_str("in")?;
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("evaluated: {src}").into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("lisp-eval")
+                .verb(Verb::Source)
+                .verb(Verb::Meta)
+                .input(ArgSpec::new("in").summary("the program"))
+                .output("text/plain"),
+        );
+        Engine::new(Kernel::with_meta_renderer(
+            Arc::new(EndpointSpace::new().bind(Exact::new("urn:lisp:eval"), eval)),
+            Arc::new(JsonRenderer),
+        ))
+    }
+
+    #[test]
+    fn eval_lisp_routes_the_whole_buffer_to_urn_lisp_eval() {
+        let engine = lisp_echo_engine();
+        // A multi-line program that does NOT begin with `(` (a leading comment). The
+        // single-line paren-sniff would miss it, but `eval_lisp` routes it straight to
+        // the Lisp endpoint with the whole buffer as the `in` argument.
+        let src = "; a scratch program\n(define x 1)\n(+ x 2)";
+        let out = match engine.eval_lisp(src) {
+            Action::Output(entry) => entry.result.unwrap(),
+            _ => panic!("expected Action::Output"),
+        };
+        assert_eq!(out, format!("evaluated: {src}"));
+    }
+
+    #[test]
+    fn eval_lisp_on_an_empty_buffer_is_a_noop() {
+        assert!(matches!(
+            lisp_echo_engine().eval_lisp("   \n  "),
+            Action::Noop
+        ));
     }
 
     #[test]
