@@ -40,6 +40,13 @@ const TAB_DOCS: usize = 2;
 const TAB_CONTROL: usize = 3;
 const TAB_DEMO_BASE: usize = 4;
 
+/// The `state.demos` index for a tab, or `None` if `tab` is a core (non-demo) tab.
+/// Single source of truth for the demo offset so it can't drift when tabs are
+/// added — inserting the Scratch tab once broke a hardcoded `-3` in `run_step`.
+fn demo_index(tab: usize) -> Option<usize> {
+    tab.checked_sub(TAB_DEMO_BASE)
+}
+
 /// Run the TUI to completion, restoring the terminal on the way out.
 pub fn run(engine: Engine, keys: Keybindings) -> io::Result<()> {
     let mut terminal = ratatui::init();
@@ -425,8 +432,8 @@ fn load_demos(state: &mut State, engine: &Engine) {
 /// Run step `idx` of the demo on the current tab, capturing its output (or error)
 /// into `demo_out` for display on the page.
 fn run_step(state: &mut State, engine: &Engine, idx: usize) {
-    // Demo tabs start at index 3 (after REPL, Docs, and Control).
-    let Some(demo) = state.demos.get(state.tab.wrapping_sub(3)) else {
+    // Which demo this tab shows (via the shared offset — see `demo_index`).
+    let Some(demo) = demo_index(state.tab).and_then(|i| state.demos.get(i)) else {
         return;
     };
     let Some(step) = demo.steps.get(idx) else {
@@ -1243,7 +1250,7 @@ fn draw(frame: &mut Frame, state: &State) {
         let max = (lines.len() as u16).saturating_sub(chunks[1].height);
         let scroll_y = state.scroll_back.min(max);
         frame.render_widget(Paragraph::new(lines).scroll((scroll_y, 0)), chunks[1]);
-    } else if let Some(demo) = state.demos.get(state.tab - TAB_DEMO_BASE) {
+    } else if let Some(demo) = demo_index(state.tab).and_then(|i| state.demos.get(i)) {
         let page = Paragraph::new(demo_lines(demo, &state.demo_out)).wrap(Wrap { trim: false });
         frame.render_widget(page, chunks[1]);
     }
@@ -1478,6 +1485,19 @@ mod tests {
     fn render(width: u16, height: u16, state: &State) {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| draw(frame, state)).unwrap();
+    }
+
+    #[test]
+    fn demo_index_maps_tabs_to_demos_after_the_scratch_tab() {
+        // Regression: adding the Scratch tab shifted the demo base 3 → 4. Core tabs
+        // are not demos; the first demo tab (TAB_DEMO_BASE) is demos[0], not demos[1]
+        // — the off-by-one that made a number key on Constraints run ZeroTrust's step.
+        assert_eq!(demo_index(TAB_REPL), None);
+        assert_eq!(demo_index(TAB_SCRATCH), None);
+        assert_eq!(demo_index(TAB_DOCS), None);
+        assert_eq!(demo_index(TAB_CONTROL), None);
+        assert_eq!(demo_index(TAB_DEMO_BASE), Some(0));
+        assert_eq!(demo_index(TAB_DEMO_BASE + 1), Some(1));
     }
 
     // The interactive loop can't run headless, but `draw` can — exercise it at
