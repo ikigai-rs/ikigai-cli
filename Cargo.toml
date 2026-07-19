@@ -32,6 +32,8 @@ ikigai-rdf = "0.1.3" # + urn:rdf:union / urn:rdf:diff (graph set ops, with= carr
 ikigai-sparql = "0.1.5" # 0.1.5 = unique id per query form (no 4× tool collision) + optional graph/as
 # Content sniffing + sniff-and-dispatch (urn:sniff, urn:transrept:auto).
 ikigai-sniff = "0.1.1"
+# Neutral s-expr foundation: Sexpr datum + urn:sparql:from-sexpr transreptor (text/x-sexpr → SPARQL).
+ikigai-sexpr = "0.1.0"
 # XSLT transform module (urn:xslt:transform) — linked natively (no download cost in a
 # native binary; the dynamic/lazy form is a browser/WASI concern).
 ikigai-xslt = "0.1.0"

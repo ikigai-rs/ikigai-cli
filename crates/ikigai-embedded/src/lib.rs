@@ -1683,6 +1683,10 @@ fn root_space_with_mounts(
         // tools that build ikigai.
         Arc::new(ikigai_repo::space()) as Arc<dyn Space>,
         Arc::new(ikigai_sparql::space()) as Arc<dyn Space>,
+        // Neutral s-expr → SPARQL transreptor (urn:sparql:from-sexpr, text/x-sexpr →
+        // application/sparql-query): pipe an s-expr query in, feed the emitted SPARQL to
+        // urn:sparql:select. A pure transreptor (no lisp engine); safe in the shared space.
+        Arc::new(ikigai_sexpr::space()) as Arc<dyn Space>,
         Arc::new(ikigai_xslt::space()) as Arc<dyn Space>,
         // JSON-LD operators (urn:jsonld:expand/compact/flatten) — linked natively (the heavy
         // json-ld tree is a browser-wasm concern, lazy-loaded there; native links it).
