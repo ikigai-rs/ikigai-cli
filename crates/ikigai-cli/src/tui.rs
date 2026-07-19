@@ -26,6 +26,14 @@ use ikigai_engine::{Action, CacheStats, Engine, Entry, HELP};
 /// How many transcript lines PgUp/PgDn move.
 const SCROLL_STEP: u16 = 5;
 
+// Tab indices in the always-present tab strip. REPL and Scratch are always shown;
+// Docs, Control, and the per-runbook demo pages join only while the demo is on.
+const TAB_REPL: usize = 0;
+const TAB_SCRATCH: usize = 1;
+const TAB_DOCS: usize = 2;
+const TAB_CONTROL: usize = 3;
+const TAB_DEMO_BASE: usize = 4;
+
 /// Run the TUI to completion, restoring the terminal on the way out.
 pub fn run(engine: Engine, keys: Keybindings) -> io::Result<()> {
     let mut terminal = ratatui::init();
@@ -161,6 +169,22 @@ struct State {
     /// (a cache hit within the minute — recomputes only on the minute). Empty until the
     /// first fetch. The colon blinks per second, computed at draw time.
     clock: String,
+    /// The persistent multi-line Lisp scratch buffer (the "Scratch (Lisp)" tab). A
+    /// single `String` with `\n`s — the same representation as `input`, so the shared
+    /// [`edit_text`] core drives it unchanged; only vertical line motion, line-relative
+    /// Home/End, and Enter-inserts-a-newline differ (handled in [`scratch_edit`]).
+    scratch: String,
+    /// Byte offset of the cursor within `scratch`, always on a `char` boundary.
+    scratch_cursor: usize,
+    /// The scratch buffer's mark (a byte offset); with the cursor it bounds the region
+    /// an eval submits (the whole buffer when unset).
+    scratch_mark: Option<usize>,
+    /// The most recent scratch evaluation's result, shown beneath the buffer (also
+    /// pushed to the transcript). `None` until the first eval.
+    scratch_result: Option<Result<String, String>>,
+    /// Whether a first emacs `C-c` is armed, awaiting the second to evaluate the buffer
+    /// (`C-c C-c`). Set only in the Scratch tab under the emacs scheme.
+    scratch_cc: bool,
 }
 
 /// One step of a runbook demo, as carried by the `application/json` representation.
@@ -179,12 +203,14 @@ struct DemoData {
 }
 
 impl State {
-    /// The active region as sorted byte offsets `(lo, hi)`, or `None` when no
-    /// mark is set. The mark is clamped to the current length, defending against
-    /// a stale offset even though edits clear it.
-    fn region(&self) -> Option<(usize, usize)> {
-        let mark = self.mark?.min(self.input.len());
-        Some((mark.min(self.cursor), mark.max(self.cursor)))
+    /// The number of tabs in the strip: REPL and Scratch always, plus Docs, Control,
+    /// and one page per runbook demo while the demo is on.
+    fn tab_count(&self) -> usize {
+        if self.demos.is_empty() {
+            2
+        } else {
+            TAB_DEMO_BASE + self.demos.len()
+        }
     }
 }
 
@@ -217,7 +243,10 @@ fn event_loop(
             state.demos.clear();
             state.docs.clear();
             state.control.clear();
-            state.tab = 0;
+            // Docs/Control/demo pages just went away; fall back to REPL if one was up.
+            if state.tab >= state.tab_count() {
+                state.tab = TAB_REPL;
+            }
             state.demo_out.clear();
         }
 
@@ -229,7 +258,7 @@ fn event_loop(
         // just to display itself; the colon blink is unaffected (it's computed at draw).
         if last_refresh.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
             state.clock = clock_text(engine);
-            if state.tab == 2 {
+            if state.tab == TAB_CONTROL {
                 if let Action::Output(out) =
                     engine.eval("source urn:fn:compose src=urn:data:control")
                 {
@@ -250,33 +279,41 @@ fn event_loop(
             if key.kind != KeyEventKind::Press {
                 continue;
             }
-            // Ctrl-C always exits, on any tab (demo pages don't run the editor that
-            // would otherwise decode it).
-            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            // Tab/BackTab cycle the always-present tab strip (REPL · Scratch, plus
+            // Docs · Control · the demo pages while the demo is on).
+            match key.code {
+                KeyCode::Tab => {
+                    state.tab = (state.tab + 1) % state.tab_count();
+                    state.demo_out.clear();
+                    state.scroll_back = 0; // each tab opens fresh
+                    continue;
+                }
+                KeyCode::BackTab => {
+                    let n = state.tab_count();
+                    state.tab = (state.tab + n - 1) % n;
+                    state.demo_out.clear();
+                    state.scroll_back = 0;
+                    continue;
+                }
+                _ => {}
+            }
+            // Ctrl-C exits on every tab EXCEPT Scratch, where the editor owns it (the
+            // emacs `C-c C-c` eval chord; a lone Ctrl-C under vi still quits, handled
+            // inside `scratch_key`).
+            if key.code == KeyCode::Char('c')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+                && state.tab != TAB_SCRATCH
+            {
                 return Ok(());
             }
-            // With tabs shown, Tab/BackTab cycle them regardless of which tab is up,
-            // and a demo page is a browse view (number keys run steps; no text entry).
-            if !state.demos.is_empty() {
-                let n = state.demos.len() + 3; // REPL, Docs, Control, then one tab per demo
-                match key.code {
-                    KeyCode::Tab => {
-                        state.tab = (state.tab + 1) % n;
-                        state.demo_out.clear();
-                        state.scroll_back = 0; // each tab opens fresh
-                        continue;
+            match state.tab {
+                TAB_SCRATCH => {
+                    if scratch_key(&mut state, engine, key) {
+                        return Ok(());
                     }
-                    KeyCode::BackTab => {
-                        state.tab = (state.tab + n - 1) % n;
-                        state.demo_out.clear();
-                        state.scroll_back = 0;
-                        continue;
-                    }
-                    _ => {}
                 }
-                if state.tab == 1 || state.tab == 2 {
-                    // The Docs (1) and Control (2) tabs: scrollable text views
-                    // (top-anchored), no text entry.
+                TAB_DOCS | TAB_CONTROL => {
+                    // Scrollable text views (top-anchored), no text entry.
                     match key.code {
                         KeyCode::PageDown => {
                             state.scroll_back = state.scroll_back.saturating_add(SCROLL_STEP);
@@ -285,14 +322,13 @@ fn event_loop(
                             state.scroll_back = state.scroll_back.saturating_sub(SCROLL_STEP);
                         }
                         KeyCode::Esc => {
-                            state.tab = 0;
+                            state.tab = TAB_REPL;
                             state.scroll_back = 0;
                         }
                         _ => {}
                     }
-                    continue;
                 }
-                if state.tab > 2 {
+                t if t >= TAB_DEMO_BASE => {
                     // A demo page is a browse view: number keys run steps, no text entry.
                     match key.code {
                         KeyCode::Char(c @ '1'..='9') => {
@@ -302,21 +338,22 @@ fn event_loop(
                         // fully reachable from the number row.
                         KeyCode::Char('0') => run_step(&mut state, engine, 9),
                         KeyCode::Esc => {
-                            state.tab = 0;
+                            state.tab = TAB_REPL;
                             state.demo_out.clear();
                         }
                         _ => {}
                     }
-                    continue;
                 }
-            }
-            // The REPL tab (or the demo off entirely): the normal line editor.
-            match decode(key, &state) {
-                Edit::Quit => return Ok(()),
-                // `submit` evaluates the line and reports whether to quit.
-                Edit::Submit if submit(&mut state, engine) => return Ok(()),
-                Edit::Submit => {}
-                action => apply(&mut state, action),
+                _ => {
+                    // The REPL tab: the normal line editor.
+                    match decode(key, &state) {
+                        Edit::Quit => return Ok(()),
+                        // `submit` evaluates the line and reports whether to quit.
+                        Edit::Submit if submit(&mut state, engine) => return Ok(()),
+                        Edit::Submit => {}
+                        action => apply(&mut state, action),
+                    }
+                }
             }
         }
     }
@@ -417,10 +454,16 @@ fn run_step(state: &mut State, engine: &Engine, idx: usize) {
 /// Decode a key press into an [`Edit`] under the active scheme, given the state
 /// the decoding depends on (whether the line is empty for Emacs; the vi mode).
 fn decode(key: KeyEvent, state: &State) -> Edit {
-    match state.keys {
+    decode_line(key, state.keys, state.vi_mode, state.input.is_empty())
+}
+
+/// Decode a key under an explicit scheme/mode/emptiness — the scheme-dispatch core
+/// shared by the REPL line ([`decode`]) and the Scratch buffer ([`scratch_key`]).
+fn decode_line(key: KeyEvent, keys: Keybindings, vi_mode: ViMode, input_empty: bool) -> Edit {
+    match keys {
         // `Native` is the platform's terminal default, which is Emacs everywhere.
-        Keybindings::Emacs | Keybindings::Native => emacs(key, state.input.is_empty()),
-        Keybindings::Vi => vi(key, state.vi_mode),
+        Keybindings::Emacs | Keybindings::Native => emacs(key, input_empty),
+        Keybindings::Vi => vi(key, vi_mode),
     }
 }
 
@@ -577,58 +620,13 @@ fn apply(state: &mut State, action: Edit) {
     }
 }
 
-/// Apply a line-editing action to the state. `Submit`/`Quit` are handled by the
-/// caller (control flow); everything else mutates the buffer, cursor, history
-/// browsing, scrollback, or vi mode here. Pure (no I/O) so it is fully testable;
-/// clipboard sync lives in [`apply`].
+/// Apply a line-editing action to the REPL input line. History recall, scrollback,
+/// and clearing the line are REPL-specific; every text edit is delegated to the
+/// shared [`edit_text`] core (so the REPL line and the Scratch buffer edit
+/// identically). Pure (no I/O) so it is fully testable; clipboard sync lives in
+/// [`apply`].
 fn edit(state: &mut State, action: Edit) {
-    // Any edit to the text invalidates the mark (its byte offset would shift);
-    // movement and the mark/copy/cut commands manage it themselves.
     match action {
-        Edit::Insert(c) => {
-            state.input.insert(state.cursor, c);
-            state.cursor += c.len_utf8();
-            state.mark = None;
-        }
-        Edit::DeleteLeft => {
-            if state.cursor > 0 {
-                let from = prev_boundary(&state.input, state.cursor);
-                state.input.replace_range(from..state.cursor, "");
-                state.cursor = from;
-            }
-            state.mark = None;
-        }
-        Edit::DeleteRight => {
-            let to = next_boundary(&state.input, state.cursor);
-            state.input.replace_range(state.cursor..to, "");
-            state.mark = None;
-        }
-        Edit::Left => state.cursor = prev_boundary(&state.input, state.cursor),
-        Edit::Right => state.cursor = next_boundary(&state.input, state.cursor),
-        Edit::WordLeft => state.cursor = word_left(&state.input, state.cursor),
-        Edit::WordRight => state.cursor = word_right(&state.input, state.cursor),
-        Edit::Home => state.cursor = 0,
-        Edit::End => state.cursor = state.input.len(),
-        Edit::KillToEnd => kill(state, state.cursor, state.input.len()),
-        Edit::KillToStart => kill(state, 0, state.cursor),
-        Edit::SetMark => state.mark = Some(state.cursor),
-        Edit::Copy => {
-            if let Some((lo, hi)) = state.region() {
-                state.kill = state.input[lo..hi].to_string();
-            }
-            state.mark = None;
-        }
-        Edit::Cut => match state.region() {
-            Some((lo, hi)) => kill(state, lo, hi),
-            // No region: cut the previous word (readline `Ctrl-W`).
-            None => kill(state, word_left(&state.input, state.cursor), state.cursor),
-        },
-        Edit::Yank => {
-            let yanked = state.kill.clone();
-            state.input.insert_str(state.cursor, &yanked);
-            state.cursor += yanked.len();
-            state.mark = None;
-        }
         Edit::HistoryPrev => recall(state, -1),
         Edit::HistoryNext => recall(state, 1),
         Edit::ScrollUp => state.scroll_back = state.scroll_back.saturating_add(SCROLL_STEP),
@@ -638,49 +636,140 @@ fn edit(state: &mut State, action: Edit) {
             state.cursor = 0;
             state.mark = None;
         }
-        Edit::ViInsert => state.vi_mode = ViMode::Insert,
-        Edit::ViNormal => state.vi_mode = ViMode::Normal,
+        other => edit_text(
+            &mut state.input,
+            &mut state.cursor,
+            &mut state.mark,
+            &mut state.kill,
+            &mut state.vi_mode,
+            other,
+        ),
+    }
+}
+
+/// The one editor core: apply a text-editing action to a `(text, cursor, mark)`
+/// buffer, using `kill` as the shared kill-ring and `vi_mode` for the modal ops. Both
+/// the single-line REPL input and the multi-line Scratch buffer call it, so
+/// char/word/kill/yank/mark and the vi operators behave identically in each. `Home`/
+/// `End` are line-relative (start/end of the cursor's line) — for the single-line REPL
+/// that is simply the whole line. The callers handle the non-text actions (history,
+/// scroll, vertical line motion, submit).
+fn edit_text(
+    text: &mut String,
+    cursor: &mut usize,
+    mark: &mut Option<usize>,
+    kill: &mut String,
+    vi_mode: &mut ViMode,
+    action: Edit,
+) {
+    // Any edit to the text invalidates the mark (its byte offset would shift);
+    // movement and the mark/copy/cut commands manage it themselves.
+    match action {
+        Edit::Insert(c) => {
+            text.insert(*cursor, c);
+            *cursor += c.len_utf8();
+            *mark = None;
+        }
+        Edit::DeleteLeft => {
+            if *cursor > 0 {
+                let from = prev_boundary(text, *cursor);
+                text.replace_range(from..*cursor, "");
+                *cursor = from;
+            }
+            *mark = None;
+        }
+        Edit::DeleteRight => {
+            let to = next_boundary(text, *cursor);
+            text.replace_range(*cursor..to, "");
+            *mark = None;
+        }
+        Edit::Left => *cursor = prev_boundary(text, *cursor),
+        Edit::Right => *cursor = next_boundary(text, *cursor),
+        Edit::WordLeft => *cursor = word_left(text, *cursor),
+        Edit::WordRight => *cursor = word_right(text, *cursor),
+        Edit::Home => *cursor = line_start(text, *cursor),
+        Edit::End => *cursor = line_end(text, *cursor),
+        Edit::KillToEnd => {
+            let hi = line_end(text, *cursor);
+            kill_range(text, cursor, mark, kill, *cursor, hi);
+        }
+        Edit::KillToStart => {
+            let lo = line_start(text, *cursor);
+            kill_range(text, cursor, mark, kill, lo, *cursor);
+        }
+        Edit::SetMark => *mark = Some(*cursor),
+        Edit::Copy => {
+            if let Some((lo, hi)) = region(text, *cursor, *mark) {
+                *kill = text[lo..hi].to_string();
+            }
+            *mark = None;
+        }
+        Edit::Cut => match region(text, *cursor, *mark) {
+            Some((lo, hi)) => kill_range(text, cursor, mark, kill, lo, hi),
+            // No region: cut the previous word (readline `Ctrl-W`).
+            None => {
+                let lo = word_left(text, *cursor);
+                kill_range(text, cursor, mark, kill, lo, *cursor);
+            }
+        },
+        Edit::Yank => {
+            let yanked = kill.clone();
+            text.insert_str(*cursor, &yanked);
+            *cursor += yanked.len();
+            *mark = None;
+        }
+        Edit::ViInsert => *vi_mode = ViMode::Insert,
+        Edit::ViNormal => *vi_mode = ViMode::Normal,
         Edit::ViAppend => {
-            state.cursor = next_boundary(&state.input, state.cursor);
-            state.vi_mode = ViMode::Insert;
+            *cursor = next_boundary(text, *cursor);
+            *vi_mode = ViMode::Insert;
         }
         Edit::ViInsertHome => {
-            state.cursor = 0;
-            state.vi_mode = ViMode::Insert;
+            *cursor = line_start(text, *cursor);
+            *vi_mode = ViMode::Insert;
         }
         Edit::ViAppendEnd => {
-            state.cursor = state.input.len();
-            state.vi_mode = ViMode::Insert;
+            *cursor = line_end(text, *cursor);
+            *vi_mode = ViMode::Insert;
         }
         Edit::ViChangeToEnd => {
-            kill(state, state.cursor, state.input.len());
-            state.vi_mode = ViMode::Insert;
+            let hi = line_end(text, *cursor);
+            kill_range(text, cursor, mark, kill, *cursor, hi);
+            *vi_mode = ViMode::Insert;
         }
-        Edit::ViWordFwd => state.cursor = vi_word_forward(&state.input, state.cursor),
-        Edit::ViWordEnd => state.cursor = vi_word_end(&state.input, state.cursor),
-        Edit::ViOperator(op) => state.vi_mode = ViMode::Operator(op),
+        Edit::ViWordFwd => *cursor = vi_word_forward(text, *cursor),
+        Edit::ViWordEnd => *cursor = vi_word_end(text, *cursor),
+        Edit::ViOperator(op) => *vi_mode = ViMode::Operator(op),
         Edit::ViMotionApply(motion) => {
-            if let ViMode::Operator(op) = state.vi_mode {
-                let (lo, hi) = vi_range(&state.input, state.cursor, op, motion);
+            if let ViMode::Operator(op) = *vi_mode {
+                let (lo, hi) = vi_range(text, *cursor, op, motion);
                 match op {
                     ViOp::Delete => {
-                        kill(state, lo, hi);
-                        state.vi_mode = ViMode::Normal;
+                        kill_range(text, cursor, mark, kill, lo, hi);
+                        *vi_mode = ViMode::Normal;
                     }
                     ViOp::Change => {
-                        kill(state, lo, hi);
-                        state.vi_mode = ViMode::Insert;
+                        kill_range(text, cursor, mark, kill, lo, hi);
+                        *vi_mode = ViMode::Insert;
                     }
                     ViOp::Yank => {
-                        state.kill = state.input[lo..hi].to_string();
-                        state.cursor = lo;
-                        state.mark = None;
-                        state.vi_mode = ViMode::Normal;
+                        *kill = text[lo..hi].to_string();
+                        *cursor = lo;
+                        *mark = None;
+                        *vi_mode = ViMode::Normal;
                     }
                 }
             }
         }
-        Edit::Submit | Edit::Quit | Edit::Ignore => {}
+        // Non-text actions are handled by the callers (`edit` / `scratch_edit`).
+        Edit::HistoryPrev
+        | Edit::HistoryNext
+        | Edit::ScrollUp
+        | Edit::ScrollDown
+        | Edit::Clear
+        | Edit::Submit
+        | Edit::Quit
+        | Edit::Ignore => {}
     }
 }
 
@@ -731,13 +820,192 @@ fn vi_word_end(s: &str, cursor: usize) -> usize {
     }
 }
 
-/// Move the byte range `lo..hi` of `input` into the kill buffer, leaving the
-/// cursor at `lo`. The range must be on `char` boundaries.
-fn kill(state: &mut State, lo: usize, hi: usize) {
-    state.kill = state.input[lo..hi].to_string();
-    state.input.replace_range(lo..hi, "");
-    state.cursor = lo;
-    state.mark = None;
+/// Move the byte range `lo..hi` of `text` into `kill`, leaving the cursor at `lo` and
+/// clearing the mark. The range must be on `char` boundaries.
+fn kill_range(
+    text: &mut String,
+    cursor: &mut usize,
+    mark: &mut Option<usize>,
+    kill: &mut String,
+    lo: usize,
+    hi: usize,
+) {
+    *kill = text[lo..hi].to_string();
+    text.replace_range(lo..hi, "");
+    *cursor = lo;
+    *mark = None;
+}
+
+/// The active region of a `(text, cursor, mark)` buffer as sorted byte offsets, or
+/// `None` when no mark is set. The mark is clamped to the current length, defending
+/// against a stale offset even though edits clear it.
+fn region(text: &str, cursor: usize, mark: Option<usize>) -> Option<(usize, usize)> {
+    let mark = mark?.min(text.len());
+    Some((mark.min(cursor), mark.max(cursor)))
+}
+
+/// Byte offset of the start of the line containing `cursor` (just after the previous
+/// `\n`, or `0` on the first line).
+fn line_start(s: &str, cursor: usize) -> usize {
+    s[..cursor].rfind('\n').map_or(0, |i| i + 1)
+}
+
+/// Byte offset of the end of the line containing `cursor` (the next `\n`, or the end
+/// of the text on the last line).
+fn line_end(s: &str, cursor: usize) -> usize {
+    s[cursor..].find('\n').map_or(s.len(), |i| cursor + i)
+}
+
+/// Move the cursor up one line, keeping the same visual column (clamped to the shorter
+/// line). Stays put on the first line.
+fn line_up(s: &str, cursor: usize) -> usize {
+    let start = line_start(s, cursor);
+    if start == 0 {
+        return cursor;
+    }
+    let col = s[start..cursor].chars().count();
+    let prev_start = line_start(s, start - 1);
+    byte_at_col(s, prev_start, start - 1, col)
+}
+
+/// Move the cursor down one line, keeping the same visual column. Stays put on the
+/// last line.
+fn line_down(s: &str, cursor: usize) -> usize {
+    let end = line_end(s, cursor);
+    if end == s.len() {
+        return cursor;
+    }
+    let col = s[line_start(s, cursor)..cursor].chars().count();
+    let next_start = end + 1;
+    byte_at_col(s, next_start, line_end(s, next_start), col)
+}
+
+/// The byte offset `col` characters into the line `start..end`, clamped to `end`.
+fn byte_at_col(s: &str, start: usize, end: usize, col: usize) -> usize {
+    let mut i = start;
+    for _ in 0..col {
+        if i >= end {
+            break;
+        }
+        i = next_boundary(s, i);
+    }
+    i.min(end)
+}
+
+/// The cursor's zero-based `(row, column)` in the buffer — row is the count of
+/// newlines before it, column the characters since the line start. Used to place the
+/// terminal cursor in the multi-line Scratch view.
+fn cursor_row_col(s: &str, cursor: usize) -> (u16, u16) {
+    let row = s[..cursor].matches('\n').count() as u16;
+    let col = s[line_start(s, cursor)..cursor].chars().count() as u16;
+    (row, col)
+}
+
+/// The text a Scratch evaluation submits: the marked region if a (non-empty) mark is
+/// set, else the whole buffer. Pure, so the region logic is testable without an engine.
+fn scratch_eval_src(text: &str, cursor: usize, mark: Option<usize>) -> String {
+    match region(text, cursor, mark) {
+        Some((lo, hi)) if hi > lo => text[lo..hi].to_string(),
+        _ => text.to_string(),
+    }
+}
+
+/// Handle a key press while the Scratch (Lisp) tab is active; returns `true` if the
+/// editor should quit. Eval bindings are checked first — `Ctrl-Enter` / `Alt-Enter`
+/// (either scheme) and the emacs `C-c C-c` chord — then the key is decoded by the
+/// active scheme and applied to the buffer, with `Enter` alone inserting a newline
+/// (this is an editor, not the REPL input line).
+fn scratch_key(state: &mut State, engine: &Engine, key: KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let emacs = matches!(state.keys, Keybindings::Emacs | Keybindings::Native);
+
+    // Ctrl-Enter / Alt-Enter evaluate on either scheme. (Terminals that don't report a
+    // modifier on Enter fall back to the emacs `C-c C-c` chord below.)
+    if key.code == KeyCode::Enter && (ctrl || alt) {
+        state.scratch_cc = false;
+        eval_scratch(state, engine);
+        return false;
+    }
+    // Emacs `C-c C-c`: the first Ctrl-C arms, the second evaluates. In the Scratch tab
+    // Ctrl-C is this chord (not quit) under the emacs scheme.
+    if emacs && ctrl && key.code == KeyCode::Char('c') {
+        if state.scratch_cc {
+            state.scratch_cc = false;
+            eval_scratch(state, engine);
+        } else {
+            state.scratch_cc = true;
+        }
+        return false;
+    }
+    // Any other key disarms a half-entered chord.
+    state.scratch_cc = false;
+
+    // Under a non-emacs scheme, a lone Ctrl-C still quits (parity with the REPL).
+    if ctrl && key.code == KeyCode::Char('c') {
+        return true;
+    }
+
+    match decode_line(key, state.keys, state.vi_mode, state.scratch.is_empty()) {
+        // Enter alone inserts a newline rather than submitting.
+        Edit::Submit => apply_scratch(state, Edit::Insert('\n')),
+        // A quit action (e.g. emacs Ctrl-D on an empty buffer) leaves the editor.
+        Edit::Quit => return true,
+        action => apply_scratch(state, action),
+    }
+    false
+}
+
+/// Apply a Scratch edit, syncing the shared kill-ring with the system clipboard around
+/// the pure [`scratch_edit`] — the same best-effort flow as [`apply`].
+fn apply_scratch(state: &mut State, action: Edit) {
+    if action == Edit::Yank {
+        if let Some(text) = clipboard::paste() {
+            state.kill = text;
+        }
+    }
+    let before = state.kill.clone();
+    scratch_edit(state, action);
+    if state.kill != before {
+        clipboard::copy(&state.kill);
+    }
+}
+
+/// Apply an editing action to the multi-line Scratch buffer. Vertical line motion
+/// (Up/Down — decoded as `HistoryPrev`/`HistoryNext`, which are exactly the keys emacs
+/// `C-p`/`C-n` and vi `k`/`j` produce) is handled here; every text edit is delegated to
+/// the shared [`edit_text`] core, so the buffer gets the same char/word/kill/yank/mark/
+/// vi editing as the REPL line. Pure (no I/O); clipboard sync lives in [`apply_scratch`].
+fn scratch_edit(state: &mut State, action: Edit) {
+    match action {
+        Edit::HistoryPrev => state.scratch_cursor = line_up(&state.scratch, state.scratch_cursor),
+        Edit::HistoryNext => state.scratch_cursor = line_down(&state.scratch, state.scratch_cursor),
+        // PgUp/PgDn and emacs `Esc` (Clear) are inert here — the view auto-scrolls to
+        // the cursor, and Esc must not wipe the buffer.
+        Edit::ScrollUp | Edit::ScrollDown | Edit::Clear => {}
+        other => edit_text(
+            &mut state.scratch,
+            &mut state.scratch_cursor,
+            &mut state.scratch_mark,
+            &mut state.kill,
+            &mut state.vi_mode,
+            other,
+        ),
+    }
+}
+
+/// Evaluate the Scratch buffer (or its marked region) through the engine's Lisp path
+/// (`urn:lisp:eval`), pushing the result to the transcript and keeping it for the
+/// in-place readout beneath the buffer.
+fn eval_scratch(state: &mut State, engine: &Engine) {
+    let src = scratch_eval_src(&state.scratch, state.scratch_cursor, state.scratch_mark);
+    if src.trim().is_empty() {
+        return;
+    }
+    if let Action::Output(entry) = engine.eval_lisp(&src) {
+        state.scratch_result = Some(entry.result.clone());
+        state.transcript.push(entry);
+    }
 }
 
 /// Byte offset of the `char` boundary just left of `cursor` (the cursor itself
@@ -899,91 +1167,100 @@ fn draw(frame: &mut Frame, state: &State) {
         top[1],
     );
 
-    if state.demos.is_empty() {
-        // No demo tabs: the usual title/help line (left of the clock).
-        let title = Line::from(vec![
-            format!("ikigai {} ", env!("CARGO_PKG_VERSION")).bold(),
-            "— REPL".into(),
-            format!(
-                "  (help · demo on → tabs · ↑↓ history · {} · PgUp/PgDn · Ctrl-C)",
-                mode_label(state)
-            )
-            .dim(),
-        ]);
-        frame.render_widget(Paragraph::new(title), top[0]);
-    } else {
-        // Row 1: the core tabs (REPL/Docs/Control), left of the clock.
-        let core = Tabs::new(vec![
-            Line::from("REPL"),
-            Line::from("Docs"),
-            Line::from("Control"),
-        ])
-        .select(if state.tab < 3 { state.tab } else { 3 }) // 3 = out of range ⇒ no highlight
+    // Row 1: the core tabs, left of the clock. REPL and Scratch are always present;
+    // Docs and Control join while the demo is on (its per-runbook pages wrap to row 2).
+    let mut core_titles = vec![Line::from("REPL"), Line::from("Scratch")];
+    if !state.demos.is_empty() {
+        core_titles.push(Line::from("Docs"));
+        core_titles.push(Line::from("Control"));
+    }
+    let core_len = core_titles.len();
+    let core = Tabs::new(core_titles)
+        .select(if state.tab < core_len {
+            state.tab
+        } else {
+            core_len
+        }) // demo tab ⇒ no highlight
         .highlight_style(Style::new().reversed())
         .divider("  ");
-        frame.render_widget(core, top[0]);
+    frame.render_widget(core, top[0]);
 
-        // Row 2: the demo tabs, wrapped onto their own full-width line — only when the
-        // top strip actually has a second row (a degenerately short terminal may not).
-        if chunks[0].height >= 2 {
-            let demo_row = Rect {
-                y: chunks[0].y + 1,
-                height: 1,
-                ..chunks[0]
-            };
-            let demo_titles: Vec<Line> = state
-                .demos
-                .iter()
-                .map(|d| Line::from(d.label.clone()))
-                .collect();
-            let demo_tabs = Tabs::new(demo_titles)
-                .select(if state.tab >= 3 {
-                    state.tab - 3
-                } else {
-                    state.demos.len() // out of range ⇒ no highlight
-                })
-                .highlight_style(Style::new().reversed())
-                .divider(" ");
-            frame.render_widget(demo_tabs, demo_row);
-        }
+    // Row 2: the demo tabs, wrapped onto their own full-width line — only while the demo
+    // is on and the top strip actually has a second row (a degenerate terminal may not).
+    if !state.demos.is_empty() && chunks[0].height >= 2 {
+        let demo_row = Rect {
+            y: chunks[0].y + 1,
+            height: 1,
+            ..chunks[0]
+        };
+        let demo_titles: Vec<Line> = state
+            .demos
+            .iter()
+            .map(|d| Line::from(d.label.clone()))
+            .collect();
+        let demo_tabs = Tabs::new(demo_titles)
+            .select(if state.tab >= TAB_DEMO_BASE {
+                state.tab - TAB_DEMO_BASE
+            } else {
+                state.demos.len() // out of range ⇒ no highlight
+            })
+            .highlight_style(Style::new().reversed())
+            .divider(" ");
+        frame.render_widget(demo_tabs, demo_row);
     }
 
-    // Main area: REPL transcript on tab 0, the Docs page on tab 1, a demo page beyond.
-    if state.tab == 0 {
+    // Main area: REPL transcript, the Scratch editor, the Docs/Control text views, or a
+    // demo page — by the active tab.
+    if state.tab == TAB_REPL {
         let lines = transcript_lines(&state.transcript);
         let bottom = (lines.len() as u16).saturating_sub(chunks[1].height);
         let scroll_y = bottom.saturating_sub(state.scroll_back);
         frame.render_widget(Paragraph::new(lines).scroll((scroll_y, 0)), chunks[1]);
-    } else if state.tab == 1 {
+    } else if state.tab == TAB_SCRATCH {
+        draw_scratch(frame, state, chunks[1]);
+    } else if state.tab == TAB_DOCS {
         // Docs: top-anchored, `scroll_back` is the offset down from the top.
         let lines = docs_lines(&state.docs);
         let max = (lines.len() as u16).saturating_sub(chunks[1].height);
         let scroll_y = state.scroll_back.min(max);
         frame.render_widget(Paragraph::new(lines).scroll((scroll_y, 0)), chunks[1]);
-    } else if state.tab == 2 {
+    } else if state.tab == TAB_CONTROL {
         // Control: the composed scheduler + cache readout, top-anchored like Docs.
         let lines = control_lines(&state.control);
         let max = (lines.len() as u16).saturating_sub(chunks[1].height);
         let scroll_y = state.scroll_back.min(max);
         frame.render_widget(Paragraph::new(lines).scroll((scroll_y, 0)), chunks[1]);
-    } else if let Some(demo) = state.demos.get(state.tab - 3) {
+    } else if let Some(demo) = state.demos.get(state.tab - TAB_DEMO_BASE) {
         let page = Paragraph::new(demo_lines(demo, &state.demo_out)).wrap(Wrap { trim: false });
         frame.render_widget(page, chunks[1]);
     }
 
-    // Bottom row: the editable request line on the REPL tab; a static hint on the
-    // Docs page (scroll-only) and on a demo page (browse-only — keys run steps).
-    if state.tab == 0 {
-        let input = Paragraph::new(state.input.as_str())
-            .block(Block::default().borders(Borders::ALL).title(" request "));
+    // Bottom row: the editable request line on the REPL tab; a keybinding hint on the
+    // Scratch, Docs/Control, and demo tabs (the Scratch cursor lives in its own box
+    // above, so nothing is placed here for it).
+    if state.tab == TAB_REPL {
+        let input = Paragraph::new(state.input.as_str()).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Line::from(format!(" request · {} ", mode_label(state)))),
+        );
         frame.render_widget(input, chunks[2]);
         // Place the cursor at its column — the display width before it — inside the
         // 1-cell border, clamped so a long line can't draw past the box.
         let col = state.input[..state.cursor].chars().count() as u16;
         let cursor_x = (chunks[2].x + 1 + col).min(chunks[2].x + chunks[2].width.saturating_sub(1));
         frame.set_cursor_position(Position::new(cursor_x, chunks[2].y + 1));
-    } else if state.tab == 1 || state.tab == 2 {
-        let title = if state.tab == 1 {
+    } else if state.tab == TAB_SCRATCH {
+        let hint = if matches!(state.keys, Keybindings::Vi) {
+            "Ctrl-Enter / Alt-Enter evaluate · Enter newline · Tab switch · Ctrl-C exit"
+        } else {
+            "Ctrl-Enter / Alt-Enter / C-c C-c evaluate · Enter newline · Tab switch"
+        };
+        let hint = Paragraph::new(hint.dim())
+            .block(Block::default().borders(Borders::ALL).title(" lisp "));
+        frame.render_widget(hint, chunks[2]);
+    } else if state.tab == TAB_DOCS || state.tab == TAB_CONTROL {
+        let title = if state.tab == TAB_DOCS {
             " docs "
         } else {
             " control "
@@ -1000,6 +1277,68 @@ fn draw(frame: &mut Frame, state: &State) {
         .block(Block::default().borders(Borders::ALL).title(" runbook "));
         frame.render_widget(hint, chunks[2]);
     }
+}
+
+/// Draw the Scratch (Lisp) tab into `area`: the editable buffer (bordered, cursor
+/// placed, auto-scrolled to keep the cursor visible) above the most recent eval result.
+fn draw_scratch(frame: &mut Frame, state: &State, area: Rect) {
+    let result_h = match &state.scratch_result {
+        Some(Ok(out)) => (out.lines().count() as u16 + 1).clamp(1, 8),
+        Some(Err(_)) => 2,
+        None => 0,
+    };
+    let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(result_h)]).split(area);
+
+    let (crow, ccol) = cursor_row_col(&state.scratch, state.scratch_cursor);
+    // Auto-scroll so the cursor row stays within the bordered inner height.
+    let inner_h = parts[0].height.saturating_sub(2);
+    let scroll_y = crow.saturating_sub(inner_h.saturating_sub(1));
+    let buf = Paragraph::new(scratch_lines(&state.scratch))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Line::from(format!(
+                    " scratch (lisp) · {} ",
+                    mode_label(state)
+                ))),
+        )
+        .scroll((scroll_y, 0));
+    frame.render_widget(buf, parts[0]);
+
+    // Place the terminal cursor inside the border, clamped to the box.
+    let cx = (parts[0].x + 1 + ccol).min(parts[0].x + parts[0].width.saturating_sub(1));
+    let cy = (parts[0].y + 1 + crow.saturating_sub(scroll_y))
+        .min(parts[0].y + parts[0].height.saturating_sub(1));
+    frame.set_cursor_position(Position::new(cx, cy));
+
+    if result_h > 0 {
+        if let Some(result) = &state.scratch_result {
+            frame.render_widget(Paragraph::new(scratch_result_lines(result)), parts[1]);
+        }
+    }
+}
+
+/// The scratch buffer as plain lines (one per `\n`-separated line; a trailing newline
+/// yields a final empty line so the cursor there is visible). An empty buffer shows a
+/// dim placeholder.
+fn scratch_lines(buf: &str) -> Vec<Line<'static>> {
+    if buf.is_empty() {
+        return vec![Line::from(
+            "(empty — type Lisp, then Ctrl-Enter to evaluate)".dim(),
+        )];
+    }
+    buf.split('\n').map(|l| Line::from(l.to_string())).collect()
+}
+
+/// The last scratch eval result shown beneath the buffer: a dim header, then the output
+/// (green) or the error (red).
+fn scratch_result_lines(result: &Result<String, String>) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from("─ result ─".dim())];
+    match result {
+        Ok(out) => lines.extend(out.lines().map(|l| Line::from(l.to_string().green()))),
+        Err(err) => lines.push(Line::from(format!("error: {err}").red())),
+    }
+    lines
 }
 
 /// Render the Docs page: a header naming the resource, then the catalog text (Turtle).
@@ -1186,17 +1525,20 @@ mod tests {
         state.control =
             "scheduler\n  backend    single\n  threads    1\ncache\n  entries  3".into();
 
-        state.tab = 0; // tab strip shown, REPL transcript beneath
+        state.tab = TAB_REPL; // tab strip shown, REPL transcript beneath
         render(80, 24, &state);
         render(1, 1, &state); // degenerate size with tabs present
 
-        state.tab = 1; // Docs page
+        state.tab = TAB_SCRATCH; // the Scratch (Lisp) editor
         render(80, 24, &state);
 
-        state.tab = 2; // Control page (scheduler + cache readout)
+        state.tab = TAB_DOCS; // Docs page
         render(80, 24, &state);
 
-        state.tab = 3; // the demo page (demos now start at index 3), no step run yet
+        state.tab = TAB_CONTROL; // Control page (scheduler + cache readout)
+        render(80, 24, &state);
+
+        state.tab = TAB_DEMO_BASE; // the demo page (demos start at index 4), no step run yet
         render(80, 24, &state);
 
         state.demo_out = "$ source urn:fn:toUpper hello\nHELLO".into();
@@ -1332,7 +1674,7 @@ mod tests {
         edit(&mut s, Edit::SetMark);
         edit(&mut s, Edit::Insert('x'));
         assert_eq!(s.mark, None);
-        assert!(s.region().is_none());
+        assert!(region(&s.input, s.cursor, s.mark).is_none());
     }
 
     #[test]
@@ -1627,5 +1969,109 @@ mod tests {
         recall(&mut state, 1); // past newest → fresh empty line
         assert_eq!(state.input, "");
         assert_eq!(state.history_pos, None);
+    }
+
+    // --- Scratch (Lisp) buffer: multi-line editing logic ---------------------
+
+    fn scratch_state(buf: &str, cursor: usize) -> State {
+        State {
+            scratch: buf.to_string(),
+            scratch_cursor: cursor,
+            ..State::default()
+        }
+    }
+
+    #[test]
+    fn scratch_enter_inserts_a_newline_not_submits() {
+        // In the Scratch tab a decoded Submit becomes an inserted newline.
+        let mut s = scratch_state("(+ 1", 4);
+        apply_scratch(&mut s, Edit::Insert('\n'));
+        apply_scratch(&mut s, Edit::Insert('2'));
+        assert_eq!(s.scratch, "(+ 1\n2");
+        assert_eq!(s.scratch_cursor, 6);
+    }
+
+    #[test]
+    fn scratch_up_down_move_across_lines_keeping_column() {
+        // Cursor at column 3 of line 2 ("ghi|jkl").
+        let mut s = scratch_state("abcdef\nghijkl\nmno", 10);
+        apply_scratch(&mut s, Edit::HistoryPrev); // up → column 3 of line 1
+        assert_eq!(s.scratch_cursor, 3); // "abc|def"
+        apply_scratch(&mut s, Edit::HistoryNext); // back down to line 2
+        assert_eq!(s.scratch_cursor, 10);
+        apply_scratch(&mut s, Edit::HistoryNext); // down to the short last line, column clamped
+        assert_eq!(s.scratch_cursor, 17); // end of "mno"
+        apply_scratch(&mut s, Edit::HistoryNext); // already on the last line → stays put
+        assert_eq!(s.scratch_cursor, 17);
+    }
+
+    #[test]
+    fn scratch_home_end_are_line_relative() {
+        let mut s = scratch_state("foo\nbarbaz", 8); // within line 2
+        apply_scratch(&mut s, Edit::Home);
+        assert_eq!(s.scratch_cursor, 4); // start of line 2
+        apply_scratch(&mut s, Edit::End);
+        assert_eq!(s.scratch_cursor, 10); // end of line 2 (end of buffer)
+    }
+
+    #[test]
+    fn scratch_reuses_the_shared_kill_op_line_relative() {
+        // Kill-to-end operates on the CURRENT line only (line-relative End), proving the
+        // scratch buffer drives the SAME `edit_text` core the REPL line uses.
+        let mut s = scratch_state("foo bar\nbaz", 4); // before "bar" on line 1
+        apply_scratch(&mut s, Edit::KillToEnd);
+        assert_eq!(s.scratch, "foo \nbaz");
+        assert_eq!(s.kill, "bar");
+    }
+
+    #[test]
+    fn scratch_eval_src_picks_the_region_or_whole_buffer() {
+        // No mark → the whole buffer is evaluated.
+        assert_eq!(scratch_eval_src("(+ 1 2)", 7, None), "(+ 1 2)");
+        // A mark → only the region between mark and cursor.
+        assert_eq!(scratch_eval_src("(+ 1 2)(+ 3 4)", 14, Some(7)), "(+ 3 4)");
+        // A collapsed mark (mark == cursor) falls back to the whole buffer.
+        assert_eq!(scratch_eval_src("(+ 1 2)", 3, Some(3)), "(+ 1 2)");
+    }
+
+    #[test]
+    fn cursor_row_col_tracks_line_and_column() {
+        assert_eq!(cursor_row_col("abc", 2), (0, 2));
+        assert_eq!(cursor_row_col("abc\nde", 5), (1, 1));
+        assert_eq!(cursor_row_col("abc\n", 4), (1, 0)); // trailing newline → next line, col 0
+    }
+
+    #[test]
+    fn scratch_setmark_then_move_bounds_the_eval_region() {
+        // Set the mark, move to the end of the first form, and the region is that form.
+        let mut s = scratch_state("(a)\n(b)", 0);
+        apply_scratch(&mut s, Edit::SetMark);
+        apply_scratch(&mut s, Edit::End); // to end of line 1 (offset 3)
+        let src = scratch_eval_src(&s.scratch, s.scratch_cursor, s.scratch_mark);
+        assert_eq!(src, "(a)");
+    }
+
+    #[test]
+    fn draws_the_scratch_tab_without_panicking() {
+        let mut state = State {
+            scratch: "(+ 1 2)\n(list 1 2 3)".into(),
+            scratch_cursor: 5,
+            tab: TAB_SCRATCH,
+            ..State::default()
+        };
+        render(80, 24, &state);
+        render(1, 1, &state); // degenerate
+
+        state.scratch_result = Some(Ok("3".into()));
+        render(80, 24, &state);
+
+        state.scratch_result = Some(Err("unbound symbol: foo".into()));
+        render(20, 6, &state); // narrow, with an error readout
+
+        // An empty buffer renders the placeholder without panicking.
+        state.scratch.clear();
+        state.scratch_cursor = 0;
+        state.scratch_result = None;
+        render(80, 24, &state);
     }
 }
