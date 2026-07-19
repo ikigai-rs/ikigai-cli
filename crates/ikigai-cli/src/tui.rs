@@ -9,6 +9,12 @@
 //! `native`) or modal [`vi`]. Kill/yank flows through the system clipboard (see
 //! [`apply`] and [`clipboard`]). Enter submits, PgUp/PgDn scroll the transcript,
 //! Ctrl-C quits.
+//!
+//! A "Scratch (Lisp)" tab (reached with Tab/BackTab) hosts a multi-line buffer that
+//! evaluates arbitrary Lisp through the engine's `urn:lisp:eval` path. There, **F5** is
+//! the reliable eval key (`Ctrl-Enter`/`Alt-Enter` also work where the terminal reports
+//! the modifier; under emacs `C-c C-c` is a chord), and Enter inserts a newline. The
+//! same shared editor core ([`edit_text`]) drives both the input line and this buffer.
 
 use std::io;
 
@@ -920,8 +926,15 @@ fn scratch_key(state: &mut State, engine: &Engine, key: KeyEvent) -> bool {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let emacs = matches!(state.keys, Keybindings::Emacs | Keybindings::Native);
 
-    // Ctrl-Enter / Alt-Enter evaluate on either scheme. (Terminals that don't report a
-    // modifier on Enter fall back to the emacs `C-c C-c` chord below.)
+    // F5 is the reliable, scheme-independent eval key: unlike Ctrl-Enter/Alt-Enter it
+    // carries no modifier a terminal might drop, so it works everywhere on both schemes.
+    if key.code == KeyCode::F(5) {
+        state.scratch_cc = false;
+        eval_scratch(state, engine);
+        return false;
+    }
+    // Ctrl-Enter / Alt-Enter also evaluate on either scheme, where the terminal reports
+    // the modifier on Enter; otherwise fall back to F5 (or the emacs `C-c C-c` chord).
     if key.code == KeyCode::Enter && (ctrl || alt) {
         state.scratch_cc = false;
         eval_scratch(state, engine);
@@ -1252,9 +1265,9 @@ fn draw(frame: &mut Frame, state: &State) {
         frame.set_cursor_position(Position::new(cursor_x, chunks[2].y + 1));
     } else if state.tab == TAB_SCRATCH {
         let hint = if matches!(state.keys, Keybindings::Vi) {
-            "Ctrl-Enter / Alt-Enter evaluate · Enter newline · Tab switch · Ctrl-C exit"
+            "F5 evaluate (or Ctrl/Alt-Enter) · Enter newline · Tab switch · Ctrl-C exit"
         } else {
-            "Ctrl-Enter / Alt-Enter / C-c C-c evaluate · Enter newline · Tab switch"
+            "F5 evaluate (or Ctrl/Alt-Enter · C-c C-c) · Enter newline · Tab switch"
         };
         let hint = Paragraph::new(hint.dim())
             .block(Block::default().borders(Borders::ALL).title(" lisp "));
@@ -1323,9 +1336,7 @@ fn draw_scratch(frame: &mut Frame, state: &State, area: Rect) {
 /// dim placeholder.
 fn scratch_lines(buf: &str) -> Vec<Line<'static>> {
     if buf.is_empty() {
-        return vec![Line::from(
-            "(empty — type Lisp, then Ctrl-Enter to evaluate)".dim(),
-        )];
+        return vec![Line::from("(empty — type Lisp, then F5 to evaluate)".dim())];
     }
     buf.split('\n').map(|l| Line::from(l.to_string())).collect()
 }
@@ -2049,6 +2060,46 @@ mod tests {
         apply_scratch(&mut s, Edit::End); // to end of line 1 (offset 3)
         let src = scratch_eval_src(&s.scratch, s.scratch_cursor, s.scratch_mark);
         assert_eq!(src, "(a)");
+    }
+
+    /// A minimal engine whose `urn:lisp:eval` echoes its `in` argument — enough to
+    /// observe that a key routed through `scratch_key` reaches the eval path.
+    fn echo_lisp_engine() -> Engine {
+        use ikigai_core::{
+            EndpointSpace, Exact, FnEndpoint, Invocation, Kernel, ReprType, Representation,
+        };
+        let eval = FnEndpoint::new("lisp", |inv: &Invocation<'_>| {
+            let src = inv.inline_str("in")?;
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("ok: {src}").into_bytes(),
+            ))
+        });
+        let space = EndpointSpace::new().bind(Exact::new("urn:lisp:eval"), eval);
+        Engine::new(Kernel::new(std::sync::Arc::new(space)))
+    }
+
+    #[test]
+    fn scratch_f5_triggers_an_eval() {
+        // F5 in the Scratch tab evaluates the buffer via `urn:lisp:eval` on either
+        // scheme — the reliable, terminal-independent eval key.
+        let engine = echo_lisp_engine();
+        for keys in [Keybindings::Emacs, Keybindings::Vi] {
+            let mut s = State {
+                scratch: "(+ 1 2)".into(),
+                scratch_cursor: 7,
+                keys,
+                ..State::default()
+            };
+            let quit = scratch_key(&mut s, &engine, key(KeyCode::F(5), KeyModifiers::NONE));
+            assert!(!quit, "F5 must not quit");
+            assert_eq!(s.scratch_result, Some(Ok("ok: (+ 1 2)".to_string())));
+            assert_eq!(
+                s.transcript.len(),
+                1,
+                "result also appended to the transcript"
+            );
+        }
     }
 
     #[test]
