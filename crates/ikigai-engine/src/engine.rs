@@ -85,6 +85,9 @@ commands:
   sink <iri> [k=v …] <content>  SINK into a resource: leading k=v name declared args, the rest is content
   delete <iri> [k=v …]       DELETE a resource (the delete verb)
   describe <iri> [type]      META a resource; `type` defaults to text/turtle
+  (<sexpr>)                  evaluate a Lisp form (leading `(` routes to urn:lisp:eval)
+  :lisp                      enter multi-line Lisp mode; a blank line evaluates, `:lisp` cancels
+  :load <uri> [cap=<scope>]  read a script resource and evaluate it as Lisp (cap= narrows first)
   cache <iri> [args]         report whether resolving it would hit the cache (no resolve)
   cap [scope…]               show the session capability, narrow it to `scope`s, or `cap reset`
                              (`net-<host>` is shorthand for the `urn:cap:net:<host>` scope)
@@ -119,6 +122,8 @@ try:
   source urn:demo:split \"a,b,c\" | ( urn:fn:toUpper ; urn:fn:reverseList )
   sink urn:file:notes.txt remember the milk
   source urn:file:notes.txt
+  (+ 1 2)
+  (source \"urn:fn:toUpper\" \"hi\")
   cap read-only ; sink urn:file:notes.txt nope   (write now refused)
   describe urn:fn:toUpper text/turtle";
 
@@ -219,6 +224,11 @@ pub struct Engine {
     /// maps over single `source` stages resolve concurrently on it. Absent ⇒ those
     /// run sequentially (the default; the browser frontend has no scheduler).
     spawner: Option<Arc<dyn Spawner>>,
+    /// The `:lisp` multi-line buffer. `Some` while in Lisp mode: each subsequent
+    /// line accumulates here until a blank line (submit) or another `:lisp`
+    /// (cancel). `None` in the normal verb-grammar mode. Interior-mutable so the
+    /// `&self` eval path can toggle and accumulate; the REPL is single-threaded.
+    lisp_buffer: RefCell<Option<Vec<String>>>,
 }
 
 impl Engine {
@@ -238,6 +248,7 @@ impl Engine {
             identity: RefCell::new(identity),
             profiles: RefCell::new(HashMap::new()),
             spawner: None,
+            lisp_buffer: RefCell::new(None),
         }
     }
 
@@ -309,13 +320,20 @@ impl Engine {
     /// blocking; the non-resolving commands stay synchronous.
     pub async fn eval_async(&self, line: &str) -> Action {
         let line = line.trim();
+
+        // `:lisp` multi-line mode: while a buffer is open every line accumulates
+        // (a blank line submits, another `:lisp` cancels), so this is checked
+        // before the empty-line short-circuit below.
+        if self.lisp_buffer.borrow().is_some() {
+            return self.eval_lisp_mode(line).await;
+        }
+
         if line.is_empty() {
             return Action::Noop;
         }
         // Each `run` during this line accumulates into `self.cache`; reset it
         // first, then read it back into the entry once the command has resolved.
         self.cache.set(CacheStats::default());
-        let (cmd, rest) = split_first_word(line);
         let output = |this: &Self, result| {
             Action::Output(Entry {
                 input: line.to_string(),
@@ -323,6 +341,15 @@ impl Engine {
                 cache: this.cache.get(),
             })
         };
+
+        // Paren-sniff: a line whose first non-whitespace char is `(` is a Lisp
+        // form — route it to `urn:lisp:eval` instead of the verb grammar. Every
+        // frontend inherits this because it lives here in the engine.
+        if line.starts_with('(') {
+            return output(self, self.run_lisp(line).await);
+        }
+
+        let (cmd, rest) = split_first_word(line);
         match cmd {
             "quit" | "exit" => Action::Quit,
             "help" | "?" => Action::Help,
@@ -336,6 +363,8 @@ impl Engine {
             "demo" => output(self, self.run_demo(rest).await),
             "history" => output(self, self.run_history(rest).await),
             "trace" => output(self, self.run_trace(rest).await),
+            ":lisp" => output(self, self.enter_lisp_mode()),
+            ":load" => output(self, self.run_load(rest).await),
             "source" | "src" => output(self, self.run_pipeline(rest).await),
             "sink" => output(self, self.run_sink(rest).await),
             "delete" | "del" => output(self, self.run_delete(rest).await),
@@ -363,6 +392,112 @@ impl Engine {
             .run_pipeline_node(&pipeline, None, root_provenance())
             .await?
             .text)
+    }
+
+    /// Evaluate an s-expression as Lisp: issue `source urn:lisp:eval` with the
+    /// source as its `in` argument. The one seam every Lisp surface routes through
+    /// — the paren-sniff, `:lisp` mode, `:load`, and the CLI's `-e`. The eval runs
+    /// under the session capability, so a `cap`/`login`-narrowed session that lacks
+    /// `urn:cap:lisp` is denied cleanly (a typed `Denied`, surfaced as an error).
+    async fn run_lisp(&self, src: &str) -> Result<String, String> {
+        let iri = parse_target("urn:lisp:eval")?;
+        let request =
+            Request::new(Verb::Source, iri).with_arg("in", ArgRef::Inline(src.as_bytes().to_vec()));
+        self.run(request).await
+    }
+
+    /// `:lisp` — open the multi-line Lisp buffer. Subsequent lines accumulate
+    /// (handled by [`eval_lisp_mode`](Self::eval_lisp_mode)) until a blank line
+    /// evaluates them as one program.
+    fn enter_lisp_mode(&self) -> Result<String, String> {
+        *self.lisp_buffer.borrow_mut() = Some(Vec::new());
+        Ok("lisp mode — enter forms; a blank line evaluates, `:lisp` cancels".to_string())
+    }
+
+    /// Handle a line while the `:lisp` buffer is open: a blank line (or `:end`)
+    /// evaluates the accumulated program; a bare `:lisp` cancels; anything else is
+    /// appended. Returns the evaluated [`Action`] on submit, else `Noop` (the line
+    /// was buffered).
+    async fn eval_lisp_mode(&self, line: &str) -> Action {
+        if line == ":lisp" {
+            *self.lisp_buffer.borrow_mut() = None;
+            self.cache.set(CacheStats::default());
+            return Action::Output(Entry {
+                input: line.to_string(),
+                result: Ok("lisp mode cancelled".to_string()),
+                cache: CacheStats::default(),
+            });
+        }
+        if !line.is_empty() && line != ":end" {
+            if let Some(buffer) = self.lisp_buffer.borrow_mut().as_mut() {
+                buffer.push(line.to_string());
+            }
+            return Action::Noop;
+        }
+        // Blank line or `:end`: close the buffer and evaluate what accumulated.
+        let program = self.lisp_buffer.borrow_mut().take().unwrap_or_default();
+        if program.is_empty() {
+            return Action::Noop;
+        }
+        let src = program.join("\n");
+        self.cache.set(CacheStats::default());
+        let result = self.run_lisp(&src).await;
+        Action::Output(Entry {
+            input: src,
+            result,
+            cache: self.cache.get(),
+        })
+    }
+
+    /// `:load <uri> [cap=<scope>]` — read a script *resource* through the kernel
+    /// and evaluate it as Lisp (sugar over `source <uri>` → `source urn:lisp:eval`).
+    /// `cap=<scope>` narrows the session capability for the duration of the load —
+    /// for an untrusted external script, so both the read and the eval run under the
+    /// reduced authority — then restores it, so the narrowing never leaks into later
+    /// commands. `<scope>` accepts a registered profile name or a comma-separated
+    /// scope list (with the same `net-<host>` shorthand as `cap`).
+    async fn run_load(&self, rest: &str) -> Result<String, String> {
+        let rest = rest.trim();
+        let mut uri: Option<&str> = None;
+        let mut cap: Option<&str> = None;
+        for word in rest.split_whitespace() {
+            match word.split_once('=') {
+                Some(("cap", scope)) => cap = Some(scope),
+                _ if uri.is_none() => uri = Some(word),
+                _ => {
+                    return Err(format!(
+                        "unexpected token `{word}` (usage: `:load <uri> [cap=<scope>]`)"
+                    ))
+                }
+            }
+        }
+        let uri = uri.ok_or("usage: `:load <uri> [cap=<scope>]`")?;
+        let iri = parse_target(uri)?;
+
+        // Narrow just for this load, if asked, saving the prior capability to restore.
+        let saved = cap.map(|scope| {
+            let prev = self.capability.borrow().clone();
+            let scopes: Vec<String> = match self.profiles.borrow().get(scope) {
+                Some(scopes) => scopes.clone(),
+                None => scope.split(',').map(expand_cap_shorthand).collect(),
+            };
+            let narrowed = self.capability.borrow().attenuate(scopes);
+            *self.capability.borrow_mut() = narrowed;
+            prev
+        });
+
+        // Read the script through the kernel, then evaluate it — both under the
+        // (possibly narrowed) session capability.
+        let outcome = async {
+            let script = self.run(Request::new(Verb::Source, iri)).await?;
+            self.run_lisp(&script).await
+        }
+        .await;
+
+        if let Some(prev) = saved {
+            *self.capability.borrow_mut() = prev;
+        }
+        outcome
     }
 
     /// Run a parsed pipeline. `incoming` is the value flowing in from an enclosing

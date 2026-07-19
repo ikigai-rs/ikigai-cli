@@ -38,6 +38,8 @@ usage:
   ikigai cert generate         create the pinned QUIC certificates (--dir <d> for a dedicated set)
   ikigai cert add-client <n>   mint an extra client identity into clients/<n>.{crt,key}
   ikigai -c '<command>' ...    run command(s) non-interactively, then exit
+  ikigai -e '<sexpr>' ...       evaluate a Lisp s-expression (urn:lisp:eval), then exit
+  ikigai --load <uri> [--cap <s>]  read a script resource and evaluate it as Lisp (--cap narrows first)
   ikigai -h | --help           show this help
 
 QUIC: --server-cert/--server-key name the server's identity, --client-cert/--client-key the client's
@@ -311,6 +313,32 @@ fn parse_args() -> Result<Option<Mode>, String> {
                 let command = argv
                     .next()
                     .ok_or_else(|| format!("{arg} requires a command argument"))?;
+                repl.commands.push(command);
+            }
+            "-e" | "--eval" => {
+                // Evaluate a Lisp s-expression: pushed verbatim into the command
+                // stream, where the engine's paren-sniff routes it to urn:lisp:eval.
+                // Runs in argv order alongside any `-c`/`--load`, then the process exits.
+                let sexpr = argv
+                    .next()
+                    .ok_or_else(|| format!("{arg} requires an s-expression argument"))?;
+                repl.commands.push(sexpr);
+            }
+            "--load" => {
+                // `--load <uri> [--cap <scope>]`: read a script resource and evaluate
+                // it as Lisp. Synthesized into the engine's `:load` command so the CLI
+                // and REPL share one path; `--cap` becomes the `cap=<scope>` narrowing.
+                let uri = argv
+                    .next()
+                    .ok_or_else(|| "--load requires a <uri> argument".to_string())?;
+                let mut command = format!(":load {uri}");
+                if argv.peek().map(String::as_str) == Some("--cap") {
+                    argv.next();
+                    let scope = argv
+                        .next()
+                        .ok_or_else(|| "--cap requires a capability scope".to_string())?;
+                    command.push_str(&format!(" cap={scope}"));
+                }
                 repl.commands.push(command);
             }
             other => return Err(format!("unknown argument: {other}")),
@@ -588,6 +616,11 @@ fn with_profiles(engine: Engine) -> Engine {
         "agent",
         ["urn:cap:personal:calendar:read:freebusy".to_string(), read],
     );
+    // The Lisp cap on its own — so `cap lisp` / `login lisp` reads friendlier than the
+    // bare scope, and `:load … cap=lisp` narrows an untrusted script to "may eval, but
+    // reaches no other authority." Additive; the embedded REPL's default root session
+    // already covers `urn:cap:lisp`, so this is only needed after a narrowing.
+    engine.define_cap_profile("lisp", ["urn:cap:lisp"]);
     engine
 }
 
