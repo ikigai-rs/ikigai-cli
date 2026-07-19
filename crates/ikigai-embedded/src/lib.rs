@@ -1094,6 +1094,12 @@ fn local_space(nature: &'static str) -> EndpointSpace {
             ikigai_view::DeriveTickEndpoint::new(),
         )
         .bind(Exact::new("urn:agent:select"), AgentSelectEndpoint)
+        // The Lisp evaluator — bound into the LOCAL (embedded/native) space only,
+        // never `base_space`/`served_space`: it runs arbitrary code, so it stays off
+        // served/remote transports and is gated by `urn:cap:lisp` (the embedded REPL's
+        // default session is root, which covers it; a `cap`/`login`-narrowed session
+        // must hold `urn:cap:lisp` explicitly).
+        .bind(Exact::new("urn:lisp:eval"), ikigai_lisp::eval())
         .bind(
             Exact::new("urn:view:ingest"),
             ikigai_view::IngestEndpoint::new(view_config()),

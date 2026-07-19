@@ -20,6 +20,9 @@ ikigai-view = { workspace = true }
 ikigai-text = { workspace = true }
 ikigai-cms = { workspace = true }
 ikigai-repo = { workspace = true }
+# Steel-backed Lisp evaluator (urn:lisp:eval) — bound into the embedded/native
+# host space only (it evaluates arbitrary code), cap-gated by urn:cap:lisp.
+ikigai-lisp = { workspace = true }
 ikigai-fs = { workspace = true }
 ikigai-http = { workspace = true }
 ikigai-runbook = { workspace = true }
