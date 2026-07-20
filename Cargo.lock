@@ -2003,9 +2003,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-sexpr"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50b2cf54c1b411ed0827998e3aa2ad8fd3325ad1418ac6aa994b04f99373fc5d"
+checksum = "bc816a2cd3a882a027a9a796015b256bcad6169a302e355a0ef4b880502daacb"
 dependencies = [
  "async-trait",
  "ikigai-core",
