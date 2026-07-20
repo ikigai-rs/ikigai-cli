@@ -36,6 +36,9 @@ ikigai-sniff = "0.1.1"
 ikigai-sexpr = "0.1.0"
 # Signing + verification: urn:sign:sign (cap-gated) / urn:sign:verify (open), Ed25519.
 ikigai-sign = "0.1.0"
+# Secrets custody: urn:secret:{name} (cap-gated read) + urn:secret:generate/unlock
+# (Ed25519 keygen + Touch ID), macOS Keychain backend. Owner-only, not served.
+ikigai-secret = "0.1.2"
 # XSLT transform module (urn:xslt:transform) — linked natively (no download cost in a
 # native binary; the dynamic/lazy form is a browser/WASI concern).
 ikigai-xslt = "0.1.0"

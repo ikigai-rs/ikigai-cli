@@ -1691,6 +1691,12 @@ fn root_space_with_mounts(
         // urn:sign:verify): sign any representation, verify it later; a signature is
         // an RDF graph, keys are kernel-resolved resources (urn:file:*, urn:secret:*).
         Arc::new(ikigai_sign::space()) as Arc<dyn Space>,
+        // Secrets custody (urn:secret:{name} cap-gated read + urn:secret:generate/unlock
+        // — Ed25519 keygen behind `urn:cap:secret:generate` + Touch ID, macOS Keychain
+        // backend). Mounted in the embedded root only (this list is not in `served_space`),
+        // so keys are owner-only and never reachable over the wire. `key=urn:secret:<name>`
+        // then feeds `urn:sign:sign`.
+        Arc::new(ikigai_secret::space(ikigai_secret::default_backend())) as Arc<dyn Space>,
         Arc::new(ikigai_xslt::space()) as Arc<dyn Space>,
         // JSON-LD operators (urn:jsonld:expand/compact/flatten) — linked natively (the heavy
         // json-ld tree is a browser-wasm concern, lazy-loaded there; native links it).
