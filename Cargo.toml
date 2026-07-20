@@ -34,6 +34,8 @@ ikigai-sparql = "0.1.5" # 0.1.5 = unique id per query form (no 4× tool collisio
 ikigai-sniff = "0.1.1"
 # Neutral s-expr foundation: Sexpr datum + urn:sparql:from-sexpr transreptor (text/x-sexpr → SPARQL).
 ikigai-sexpr = "0.1.0"
+# Signing + verification: urn:sign:sign (cap-gated) / urn:sign:verify (open), Ed25519.
+ikigai-sign = "0.1.0"
 # XSLT transform module (urn:xslt:transform) — linked natively (no download cost in a
 # native binary; the dynamic/lazy form is a browser/WASI concern).
 ikigai-xslt = "0.1.0"

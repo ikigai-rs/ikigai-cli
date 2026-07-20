@@ -30,6 +30,7 @@ ikigai-rdf = { workspace = true }
 ikigai-sparql = { workspace = true }
 ikigai-sniff = { workspace = true }
 ikigai-sexpr = { workspace = true }
+ikigai-sign = { workspace = true }
 ikigai-xslt = { workspace = true }
 ikigai-jsonld = { workspace = true }
 ikigai-shacl = { workspace = true }

@@ -242,6 +242,45 @@ OS GUI shortcuts (⌘C etc.), so terminal-native editing *is* readline/Emacs. Th
 demo space is composed in `ikigai-embedded`; a real host binds its own
 endpoints there.
 
+## Lisp, s-expressions, and signing
+
+The embedded host mounts a family of modules that make **code, queries, and graphs
+one substrate** — all addressable as `urn:*` resources, composable with `|`.
+
+**Lisp** ([`ikigai-lisp`](https://github.com/ikigai-rs/ikigai-lisp)) — `urn:lisp:eval`
+runs an s-expression whose builtins *are* the kernel verbs. In the REPL a line
+starting with `(` evaluates as Lisp; from the command line `-e` evaluates an
+expression and `--load <uri>` runs a script:
+
+```bash
+ikigai -e '(source "urn:fn:toUpper" "hi")'      # -> HI
+ikigai -e '(cacheable (+ 1 2))'                 # opt-in cacheable eval
+```
+
+`:lisp` opens a multi-line mode; the TUI has a **Scratch (Lisp) tab** where `F5`
+evaluates the buffer.
+
+**S-expressions as an RDF surface** ([`ikigai-sexpr`](https://github.com/ikigai-rs/ikigai-sexpr))
+— write queries and graphs *as data*, transrepted on the fly:
+
+```bash
+source urn:file:q.sexpr | urn:sparql:from-sexpr | urn:sparql:select  # query -> SPARQL -> run
+source urn:file:g.sexpr | urn:rdf:from-sexpr                         # graph -> Turtle
+source urn:file:prog.sexpr | urn:sexpr:to-rdf | urn:sexpr:from-rdf   # code <-> graph, losslessly
+```
+
+**Signing** ([`ikigai-sign`](https://github.com/ikigai-rs/ikigai-sign)) — sign any
+representation, verify it later; the signature is an RDF graph and keys are
+resources:
+
+```bash
+source urn:file:msg | urn:sign:sign key=urn:file:key.pem   # -> a signature graph
+```
+
+Together these are the beginnings of **portable, verifiable code**: encode a
+program as a content-addressed graph, sign that graph, and it can be shipped and
+checked on the far side.
+
 ## Instance names and the daemon
 
 Every process has an **instance name** — `repl`, `serve`, or `daemon` by mode,

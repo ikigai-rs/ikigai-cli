@@ -1687,6 +1687,10 @@ fn root_space_with_mounts(
         // application/sparql-query): pipe an s-expr query in, feed the emitted SPARQL to
         // urn:sparql:select. A pure transreptor (no lisp engine); safe in the shared space.
         Arc::new(ikigai_sexpr::space()) as Arc<dyn Space>,
+        // Signing + verification (urn:sign:sign — cap-gated `urn:cap:sign` — and
+        // urn:sign:verify): sign any representation, verify it later; a signature is
+        // an RDF graph, keys are kernel-resolved resources (urn:file:*, urn:secret:*).
+        Arc::new(ikigai_sign::space()) as Arc<dyn Space>,
         Arc::new(ikigai_xslt::space()) as Arc<dyn Space>,
         // JSON-LD operators (urn:jsonld:expand/compact/flatten) — linked natively (the heavy
         // json-ld tree is a browser-wasm concern, lazy-loaded there; native links it).
