@@ -580,7 +580,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -2218,9 +2218,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-secret"
-version = "0.1.2"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14776b53182865f011d741ff181a68991bca3f48ddd468b9ddfecf7c23e04421"
+checksum = "01ba8aea75aabf0a23f7211c6fcc3b57f5857169e72036a0671b49685f8b6fe8"
 dependencies = [
  "async-trait",
  "ed25519-dalek",
@@ -3502,6 +3502,7 @@ dependencies = [
  "oxrdf",
  "oxrdfio",
  "oxsdatatypes",
+ "rand 0.8.6",
  "rand 0.9.4",
  "rustc-hash",
  "siphasher",
@@ -3549,7 +3550,7 @@ dependencies = [
  "oxilangtag",
  "oxiri",
  "oxsdatatypes",
- "rand 0.9.4",
+ "rand 0.8.6",
  "sha2",
  "thiserror 2.0.18",
 ]
@@ -5196,7 +5197,7 @@ dependencies = [
  "oxiri",
  "oxrdf",
  "oxsdatatypes",
- "rand 0.9.4",
+ "rand 0.8.6",
  "regex",
  "rustc-hash",
  "sha1",
@@ -5217,7 +5218,7 @@ dependencies = [
  "oxiri",
  "oxrdf",
  "peg",
- "rand 0.9.4",
+ "rand 0.8.6",
  "thiserror 2.0.18",
 ]
 
@@ -5228,7 +5229,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aed7a854b8ea67618f8ce69aabb0e904d7704226060e9d5a2930eb3136c3fa3b"
 dependencies = [
  "oxrdf",
- "rand 0.9.4",
+ "rand 0.8.6",
  "spargebra",
 ]
 
@@ -6452,7 +6453,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
