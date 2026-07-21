@@ -71,16 +71,35 @@ pub fn fixed_cap(scopes: Vec<String>) -> CapFn {
     Arc::new(move |_req| Capability::scoped(scopes.clone()))
 }
 
+/// Per-server state shared across connections: the kernel, the capability function,
+/// and the tombstone ledger that makes DELETE idempotent.
+struct Shared {
+    kernel: Arc<Kernel>,
+    cap_fn: CapFn,
+    /// IRIs deleted through this server, with when — a resource we already deleted
+    /// answers a repeat DELETE with 204 (idempotent) rather than 404, for a bounded
+    /// window. In-process only (lost on restart); a persistent ledger is a later step.
+    tombstones: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+}
+
+/// How long a tombstone makes a repeat DELETE idempotent (204) before the resource
+/// reverts to reporting 404.
+const TOMBSTONE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
 /// Serve `kernel` over HTTP on `addr`, resolving each request under `cap_fn(request)`.
 /// One request per connection (`Connection: close`). Runs until the listener errors.
 pub async fn serve(kernel: Arc<Kernel>, cap_fn: CapFn, addr: SocketAddr) -> std::io::Result<()> {
+    let shared = Arc::new(Shared {
+        kernel,
+        cap_fn,
+        tombstones: std::sync::Mutex::new(std::collections::HashMap::new()),
+    });
     let listener = TcpListener::bind(addr).await?;
     loop {
         let (sock, _) = listener.accept().await?;
-        let kernel = Arc::clone(&kernel);
-        let cap_fn = Arc::clone(&cap_fn);
+        let shared = Arc::clone(&shared);
         tokio::spawn(async move {
-            let _ = handle(sock, kernel, cap_fn).await;
+            let _ = handle(sock, shared).await;
         });
     }
 }
@@ -123,7 +142,7 @@ impl Resp {
     }
 }
 
-async fn handle(mut sock: TcpStream, kernel: Arc<Kernel>, cap_fn: CapFn) -> std::io::Result<()> {
+async fn handle(mut sock: TcpStream, shared: Arc<Shared>) -> std::io::Result<()> {
     // Read up to the end of the headers (blank line).
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
@@ -172,13 +191,15 @@ async fn handle(mut sock: TcpStream, kernel: Arc<Kernel>, cap_fn: CapFn) -> std:
     }
     req.body = body;
 
-    let resp = respond(&kernel, &cap_fn, &req).await;
+    let resp = respond(&shared, &req).await;
     write(&mut sock, resp).await
 }
 
 /// The core adapter: method → verb (gated by `describe().verbs`), path → iri,
 /// query → args, body → piped `content`, Accept → conneg, resolved under the cap.
-async fn respond(kernel: &Kernel, cap_fn: &CapFn, req: &HttpRequest) -> Resp {
+async fn respond(shared: &Shared, req: &HttpRequest) -> Resp {
+    let kernel = &shared.kernel;
+    let cap_fn = &shared.cap_fn;
     let iri_str = iri_from_path(&req.path);
     let iri = match Iri::parse(&iri_str) {
         Ok(i) => i,
@@ -213,7 +234,7 @@ async fn respond(kernel: &Kernel, cap_fn: &CapFn, req: &HttpRequest) -> Resp {
     // Build the request. Query params are inspectable inputs (filters/data) the
     // composition can read; a write verb carries the body as the piped `content`,
     // with the request Content-Type surfaced as `content-type`.
-    let mut request = Request::new(verb, iri);
+    let mut request = Request::new(verb, iri.clone());
     if let Some(accept) = req.header("accept") {
         let media = first_media(accept);
         if !media.is_empty() && media != "*/*" {
@@ -233,12 +254,116 @@ async fn respond(kernel: &Kernel, cap_fn: &CapFn, req: &HttpRequest) -> Resp {
     }
 
     let cap = cap_fn(req);
+
+    // Write-side preconditions (optimistic concurrency): If-Match / If-None-Match are
+    // checked against the resource's CURRENT ETag before the mutation runs — a lost-update
+    // guard for Sink and a conditional guard for Delete. Failing → 412 (or 403 if the cap
+    // can't even read to check). Reads carry no precondition here (304 is handled below).
+    if verb.is_mutating() && has_precondition(req) {
+        if let Some(resp) = check_write_precondition(kernel, &iri, &cap, req).await {
+            return resp;
+        }
+    }
+
     match kernel.issue(request, &cap).await {
         // Reads project a strong ETag + Cache-Control and honour `If-None-Match` (→304).
         Ok(repr) if verb == Verb::Source => read_resp(&req.method, req, repr),
+        Ok(repr) if verb == Verb::Delete => {
+            record_tombstone(shared, &iri_str);
+            write_resp(verb, repr)
+        }
         Ok(repr) => write_resp(verb, repr),
+        // A DELETE of an already-absent resource is idempotent (204) within the tombstone
+        // window; otherwise it's a genuine 404.
+        Err(ikigai_core::Error::NotFound(_)) if verb == Verb::Delete => {
+            if tombstoned(shared, &iri_str) {
+                Resp::status(204, "No Content")
+            } else {
+                Resp::text(404, "Not Found", "not found")
+            }
+        }
         Err(e) => error_resp(&e),
     }
+}
+
+/// Whether the request carries a write precondition header.
+fn has_precondition(req: &HttpRequest) -> bool {
+    req.header("if-match").is_some() || req.header("if-none-match").is_some()
+}
+
+/// Check `If-Match` / `If-None-Match` against the resource's current state (fetched via
+/// `Source` under the same cap). Returns `Some(resp)` to short-circuit (412/403), or
+/// `None` if the precondition holds and the write should proceed.
+async fn check_write_precondition(
+    kernel: &Kernel,
+    iri: &Iri,
+    cap: &Capability,
+    req: &HttpRequest,
+) -> Option<Resp> {
+    // Current state: Some(etag) if it exists and is readable, None if absent.
+    let current = match kernel
+        .issue(Request::new(Verb::Source, iri.clone()), cap)
+        .await
+    {
+        Ok(repr) => Some(etag_of(&repr)),
+        Err(ikigai_core::Error::NotFound(_)) => None,
+        // Can't read to verify (denied) — surface that rather than guessing.
+        Err(ikigai_core::Error::Denied(m)) => {
+            return Some(error_resp(&ikigai_core::Error::Denied(m)))
+        }
+        // Any other read failure: treat as "can't confirm existence" → absent.
+        Err(_) => None,
+    };
+    let failed = |detail: &str| Some(Resp::text(412, "Precondition Failed", detail));
+
+    // If-Match: the resource must exist and (for a list) match. `*` = must exist.
+    if let Some(im) = req.header("if-match") {
+        match &current {
+            Some(etag) if im.trim() == "*" || etag_list_contains(im, etag) => {}
+            _ => return failed("if-match precondition failed"),
+        }
+    }
+    // If-None-Match: `*` = must NOT exist (create-only); a list must NOT match.
+    if let Some(inm) = req.header("if-none-match") {
+        let hit = match &current {
+            Some(etag) => inm.trim() == "*" || etag_list_contains(inm, etag),
+            None => false,
+        };
+        if hit {
+            return failed("if-none-match precondition failed");
+        }
+    }
+    None
+}
+
+/// Whether a comma-separated ETag list contains the given (strong) validator, ignoring
+/// any `W/` weakness prefix (we only mint strong tags).
+fn etag_list_contains(header: &str, etag: &str) -> bool {
+    let bare = etag.trim_start_matches("W/");
+    header
+        .split(',')
+        .any(|tok| tok.trim().trim_start_matches("W/") == bare)
+}
+
+/// Record that we deleted `iri`, so a repeat DELETE is idempotent for a bounded window.
+fn record_tombstone(shared: &Shared, iri: &str) {
+    if let Ok(mut t) = shared.tombstones.lock() {
+        t.insert(iri.to_string(), std::time::Instant::now());
+    }
+}
+
+/// Whether `iri` has a live (unexpired) tombstone — i.e. we deleted it recently.
+/// Prunes the entry when it has aged past the TTL.
+fn tombstoned(shared: &Shared, iri: &str) -> bool {
+    if let Ok(mut t) = shared.tombstones.lock() {
+        if let Some(at) = t.get(iri) {
+            if at.elapsed() < TOMBSTONE_TTL {
+                return true;
+            }
+            t.remove(iri);
+        }
+    }
+    false
 }
 
 /// A `405` carrying the resource's `Allow` list.
@@ -558,6 +683,51 @@ mod tests {
             Err(Error::NotFound("no such thing".into()))
         })
         .with_description(Description::new("missing").verb(Verb::Source));
+        // A read-write doc: Source returns a fixed "v1"; Sink echoes the body. Declares
+        // Source+Sink, so conditional writes can read its current ETag.
+        let doc = FnEndpoint::new("doc", |inv: &Invocation<'_>| {
+            if inv.request.verb == Verb::Source {
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    b"v1".to_vec(),
+                ))
+            } else {
+                let body = inv.inline_arg("content").unwrap_or(b"v1");
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    body.to_vec(),
+                ))
+            }
+        })
+        .with_description(Description::new("doc").verb(Verb::Source).verb(Verb::Sink));
+        // An absent-but-writable resource: Source → NotFound, Sink → Ok (create).
+        let newdoc = FnEndpoint::new("newdoc", |inv: &Invocation<'_>| {
+            if inv.request.verb == Verb::Source {
+                Err(Error::NotFound("not yet".into()))
+            } else {
+                Ok(Representation::new(ReprType::new("text/plain"), Vec::new()))
+            }
+        })
+        .with_description(
+            Description::new("newdoc")
+                .verb(Verb::Source)
+                .verb(Verb::Sink),
+        );
+        // A resource that exists once: first Delete succeeds, later Deletes → NotFound.
+        let present = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let vanishing = FnEndpoint::new("vanishing", move |_inv: &Invocation<'_>| {
+            if present.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                Ok(Representation::new(ReprType::new("text/plain"), Vec::new()))
+            } else {
+                Err(Error::NotFound("already gone".into()))
+            }
+        })
+        .with_description(Description::new("vanishing").verb(Verb::Delete));
+        // A resource that never existed: Delete always → NotFound.
+        let ghost = FnEndpoint::new("ghost", |_inv: &Invocation<'_>| {
+            Err(Error::NotFound("never here".into()))
+        })
+        .with_description(Description::new("ghost").verb(Verb::Delete));
         let space = EndpointSpace::new()
             .bind(Exact::new("urn:test:id:hello"), hello)
             .bind(Exact::new("urn:test:guarded"), guarded)
@@ -565,7 +735,11 @@ mod tests {
             .bind(Exact::new("urn:test:echo"), echo)
             .bind(Exact::new("urn:test:deletable"), deletable)
             .bind(Exact::new("urn:test:cacheable"), cacheable)
-            .bind(Exact::new("urn:test:missing"), missing);
+            .bind(Exact::new("urn:test:missing"), missing)
+            .bind(Exact::new("urn:test:doc"), doc)
+            .bind(Exact::new("urn:test:newdoc"), newdoc)
+            .bind(Exact::new("urn:test:vanishing"), vanishing)
+            .bind(Exact::new("urn:test:ghost"), ghost);
         Arc::new(Kernel::new(Arc::new(space)))
     }
 
@@ -773,6 +947,78 @@ mod tests {
     async fn a_not_found_endpoint_is_404() {
         let addr = start().await;
         let resp = roundtrip(addr, "GET /test/missing HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(resp.starts_with("HTTP/1.1 404 Not Found"), "got: {resp}");
+    }
+
+    #[tokio::test]
+    async fn if_match_matching_etag_allows_the_write() {
+        let addr = start().await;
+        let etag =
+            etag_of_response(&roundtrip(addr, "GET /test/doc HTTP/1.1\r\nHost: x\r\n\r\n").await);
+        let resp = roundtrip(
+            addr,
+            &format!(
+                "PUT /test/doc HTTP/1.1\r\nHost: x\r\nIf-Match: {etag}\r\nContent-Length: 2\r\n\r\nv2"
+            ),
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
+        assert!(resp.ends_with("v2"), "got: {resp}");
+    }
+
+    #[tokio::test]
+    async fn if_match_wrong_etag_is_412() {
+        let addr = start().await;
+        let resp = roundtrip(
+            addr,
+            "PUT /test/doc HTTP/1.1\r\nHost: x\r\nIf-Match: \"nope\"\r\nContent-Length: 2\r\n\r\nv2",
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 412 Precondition Failed"),
+            "got: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn if_none_match_star_on_existing_is_412() {
+        let addr = start().await;
+        // doc exists (Source → v1) → create-only guard fails.
+        let resp = roundtrip(
+            addr,
+            "PUT /test/doc HTTP/1.1\r\nHost: x\r\nIf-None-Match: *\r\nContent-Length: 2\r\n\r\nv2",
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 412"), "got: {resp}");
+    }
+
+    #[tokio::test]
+    async fn if_none_match_star_on_absent_allows_create() {
+        let addr = start().await;
+        // newdoc's Source → NotFound → create-only guard passes → the write runs.
+        let resp = roundtrip(
+            addr,
+            "PUT /test/newdoc HTTP/1.1\r\nHost: x\r\nIf-None-Match: *\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 204"), "got: {resp}");
+    }
+
+    #[tokio::test]
+    async fn delete_is_idempotent_via_tombstone() {
+        let addr = start().await;
+        // First DELETE succeeds (204) and lays a tombstone.
+        let first = roundtrip(addr, "DELETE /test/vanishing HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(first.starts_with("HTTP/1.1 204"), "first: {first}");
+        // Second DELETE: the endpoint now reports NotFound, but the tombstone → 204.
+        let second = roundtrip(addr, "DELETE /test/vanishing HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(second.starts_with("HTTP/1.1 204"), "second: {second}");
+    }
+
+    #[tokio::test]
+    async fn delete_of_never_existing_is_404() {
+        let addr = start().await;
+        let resp = roundtrip(addr, "DELETE /test/ghost HTTP/1.1\r\nHost: x\r\n\r\n").await;
         assert!(resp.starts_with("HTTP/1.1 404 Not Found"), "got: {resp}");
     }
 }
