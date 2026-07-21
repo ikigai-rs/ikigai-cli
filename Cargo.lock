@@ -2679,6 +2679,7 @@ dependencies = [
  "blake3",
  "futures",
  "ikigai-core",
+ "serde_json",
  "tokio",
 ]
 
