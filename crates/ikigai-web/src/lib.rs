@@ -12,7 +12,8 @@
 //!   OPTIONS → the allow-list. The allow-list and the `405` gate come from the endpoint's
 //!   declared `describe().verbs` — an endpoint that declares no verbs isn't pre-empted.
 //! - **path ↔ iri**: `/account/id/alice` → `urn:account:id:alice` (singular noun, partition
-//!   key baked in). The path is canonical.
+//!   key baked in) is the mechanical default; a [`RouteTable`] carries the *variations* —
+//!   path patterns → IRI templates with optional per-route capability / CORS / CSP.
 //! - **Accept ↔ conneg**: the `Accept` header drives the `as=` transreptor selection.
 //! - **query + body → inputs**: query params become inspectable request args; a write's body
 //!   is the piped `content`, with the request Content-Type surfaced as `content-type`.
@@ -87,6 +88,9 @@ pub struct EdgeConfig {
     pub security: Option<SecurityHeaders>,
     /// Cross-origin policy. Default = closed (no `Access-Control-Allow-Origin`).
     pub cors: CorsPolicy,
+    /// The route table: path patterns → IRI templates, with optional per-route cap/CORS/CSP.
+    /// Default empty → every path uses the mechanical `/noun/partition/key` → `urn:` default.
+    pub routes: RouteTable,
 }
 
 impl Default for EdgeConfig {
@@ -95,7 +99,95 @@ impl Default for EdgeConfig {
             trust_proxy: false,
             security: Some(SecurityHeaders::default()),
             cors: CorsPolicy::default(),
+            routes: RouteTable::default(),
         }
+    }
+}
+
+/// A single route: a path pattern → an IRI template, with optional per-route overrides. The
+/// pattern and template share `{var}` capture names (`/book/{host}` → `urn:schedule:{host}`).
+#[derive(Clone)]
+pub struct Route {
+    /// Path pattern; `{var}` captures exactly one segment, a literal must match exactly.
+    pub pattern: String,
+    /// IRI template; each `{var}` from the pattern is substituted in.
+    pub iri_template: String,
+    /// Per-route capability ceiling (scopes). `None` → the server's `cap_fn` applies.
+    pub cap: Option<Vec<String>>,
+    /// Per-route CORS policy. `None` → the server default.
+    pub cors: Option<CorsPolicy>,
+    /// Per-route `Content-Security-Policy` (e.g. a looser CSP for an HTML/CoD face). `None` →
+    /// the server default.
+    pub csp: Option<String>,
+}
+
+/// An ordered set of [`Route`]s. **First match wins**; a path matching none falls through to
+/// the mechanical `/noun/partition/key` → `urn:` default. The map carries only the *variations*
+/// from that default (aliases, per-route policy) — the default handles the 90% case.
+#[derive(Clone, Default)]
+pub struct RouteTable {
+    pub routes: Vec<Route>,
+}
+
+/// A resolved route match: the target IRI plus the per-route overrides (all owned, so it
+/// threads cleanly through the async request path).
+#[derive(Clone)]
+struct Matched {
+    iri: String,
+    cap: Option<Vec<String>>,
+    cors: Option<CorsPolicy>,
+    csp: Option<String>,
+}
+
+impl RouteTable {
+    /// A table from an ordered list of routes.
+    pub fn new(routes: Vec<Route>) -> Self {
+        RouteTable { routes }
+    }
+
+    /// Match `path` against the routes in order; the first hit resolves the IRI template with
+    /// the captured vars and returns it with the route's overrides. `None` → fall through.
+    fn match_path(&self, path: &str) -> Option<Matched> {
+        let segs: Vec<&str> = path
+            .trim_matches('/')
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+        for route in &self.routes {
+            let pat: Vec<&str> = route
+                .pattern
+                .trim_matches('/')
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .collect();
+            if pat.len() != segs.len() {
+                continue;
+            }
+            let mut binds: Vec<(&str, &str)> = Vec::new();
+            let mut matched = true;
+            for (p, s) in pat.iter().zip(&segs) {
+                if let Some(var) = p.strip_prefix('{').and_then(|v| v.strip_suffix('}')) {
+                    binds.push((var, s));
+                } else if p != s {
+                    matched = false;
+                    break;
+                }
+            }
+            if !matched {
+                continue;
+            }
+            let mut iri = route.iri_template.clone();
+            for (var, val) in &binds {
+                iri = iri.replace(&format!("{{{var}}}"), val);
+            }
+            return Some(Matched {
+                iri,
+                cap: route.cap.clone(),
+                cors: route.cors.clone(),
+                csp: route.csp.clone(),
+            });
+        }
+        None
     }
 }
 
@@ -283,17 +375,25 @@ async fn handle(mut sock: TcpStream, shared: Arc<Shared>) -> std::io::Result<()>
     }
     req.body = body;
 
-    let mut resp = respond(&shared, &req).await;
-    apply_edge_policy(&mut resp, &shared.config, &req);
+    // Resolve the route once; it drives the target IRI + per-route cap (in respond) and the
+    // per-route CORS/CSP (in the policy layer). No match → the mechanical default throughout.
+    let matched = shared.config.routes.match_path(&req.path);
+    let mut resp = respond(&shared, &req, matched.as_ref()).await;
+    apply_edge_policy(&mut resp, &shared.config, &req, matched.as_ref());
     write(&mut sock, resp).await
 }
 
 /// The core adapter: method → verb (gated by `describe().verbs`), path → iri,
 /// query → args, body → piped `content`, Accept → conneg, resolved under the cap.
-async fn respond(shared: &Shared, req: &HttpRequest) -> Resp {
+async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) -> Resp {
     let kernel = &shared.kernel;
     let cap_fn = &shared.cap_fn;
-    let iri_str = iri_from_path(&req.path);
+    // A matched route supplies the target IRI (from its template); otherwise the mechanical
+    // `/noun/partition/key` → `urn:` default.
+    let iri_str = match matched {
+        Some(m) => m.iri.clone(),
+        None => iri_from_path(&req.path),
+    };
     let iri = match Iri::parse(&iri_str) {
         Ok(i) => i,
         Err(_) => return Resp::text(400, "Bad Request", "not a resource path"),
@@ -346,7 +446,12 @@ async fn respond(shared: &Shared, req: &HttpRequest) -> Resp {
         }
     }
 
-    let cap = cap_fn(req);
+    // A matched route may pin a per-route capability ceiling (the multi-tenant seam);
+    // otherwise the server-wide `cap_fn` applies.
+    let cap = match matched.and_then(|m| m.cap.as_ref()) {
+        Some(scopes) => Capability::scoped(scopes.clone()),
+        None => cap_fn(req),
+    };
 
     // Write-side preconditions (optimistic concurrency): If-Match / If-None-Match are
     // checked against the resource's CURRENT ETag before the mutation runs — a lost-update
@@ -710,11 +815,23 @@ fn error_resp(e: &ikigai_core::Error) -> Resp {
 /// Layer the edge policy onto every response: security headers, and CORS headers when the
 /// request's `Origin` is allowed. HSTS rides only on an HTTPS request (via a trusted proxy's
 /// `X-Forwarded-Proto`). Applied uniformly in `handle`, so it covers 2xx, 4xx, and 5xx alike.
-fn apply_edge_policy(resp: &mut Resp, config: &EdgeConfig, req: &HttpRequest) {
+fn apply_edge_policy(
+    resp: &mut Resp,
+    config: &EdgeConfig,
+    req: &HttpRequest,
+    matched: Option<&Matched>,
+) {
+    // A matched route may override the CSP (e.g. a looser one for an HTML/CoD face) and the
+    // CORS policy; otherwise the server-wide defaults apply.
+    let csp_override = matched.and_then(|m| m.csp.as_deref());
+    let cors = matched
+        .and_then(|m| m.cors.as_ref())
+        .unwrap_or(&config.cors);
+
     if let Some(sec) = &config.security {
-        if let Some(csp) = &sec.csp {
+        if let Some(csp) = csp_override.or(sec.csp.as_deref()) {
             resp.headers
-                .push(("Content-Security-Policy".to_string(), csp.clone()));
+                .push(("Content-Security-Policy".to_string(), csp.to_string()));
         }
         if sec.nosniff {
             resp.headers
@@ -732,18 +849,18 @@ fn apply_edge_policy(resp: &mut Resp, config: &EdgeConfig, req: &HttpRequest) {
         }
     }
 
-    // CORS: only when the request carries an Origin the policy allows.
+    // CORS: only when the request carries an Origin the (effective) policy allows.
     let Some(origin) = req.header("origin") else {
         return;
     };
-    let Some(allow_origin) = cors_allow_origin(&config.cors, origin) else {
+    let Some(allow_origin) = cors_allow_origin(cors, origin) else {
         return; // origin not allowed → no CORS headers (the browser blocks it)
     };
     resp.headers
         .push(("Access-Control-Allow-Origin".to_string(), allow_origin));
     resp.headers
         .push(("Vary".to_string(), "Origin".to_string()));
-    if config.cors.allow_credentials {
+    if cors.allow_credentials {
         resp.headers.push((
             "Access-Control-Allow-Credentials".to_string(),
             "true".to_string(),
@@ -753,10 +870,10 @@ fn apply_edge_policy(resp: &mut Resp, config: &EdgeConfig, req: &HttpRequest) {
     let is_preflight =
         req.method == "OPTIONS" && req.header("access-control-request-method").is_some();
     if is_preflight {
-        let methods = if config.cors.allowed_methods.is_empty() {
+        let methods = if cors.allowed_methods.is_empty() {
             resp.allow.clone().unwrap_or_default()
         } else {
-            config.cors.allowed_methods.join(", ")
+            cors.allowed_methods.join(", ")
         };
         if !methods.is_empty() {
             resp.headers
@@ -767,16 +884,16 @@ fn apply_edge_policy(resp: &mut Resp, config: &EdgeConfig, req: &HttpRequest) {
                 .unwrap_or("")
                 .to_string()
         } else {
-            config.cors.allowed_headers.join(", ")
+            cors.allowed_headers.join(", ")
         };
         if !headers.is_empty() {
             resp.headers
                 .push(("Access-Control-Allow-Headers".to_string(), headers));
         }
-        if config.cors.max_age > 0 {
+        if cors.max_age > 0 {
             resp.headers.push((
                 "Access-Control-Max-Age".to_string(),
-                config.cors.max_age.to_string(),
+                cors.max_age.to_string(),
             ));
         }
     }
@@ -1511,6 +1628,141 @@ mod tests {
         assert!(
             resp.contains("Access-Control-Allow-Methods:"),
             "preflight should advertise methods, got: {resp}"
+        );
+    }
+
+    // A route with no per-route overrides.
+    fn plain_route(pattern: &str, iri_template: &str) -> Route {
+        Route {
+            pattern: pattern.to_string(),
+            iri_template: iri_template.to_string(),
+            cap: None,
+            cors: None,
+            csp: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_route_rewrites_the_path_to_an_iri() {
+        let addr = start_with(EdgeConfig {
+            routes: RouteTable::new(vec![plain_route("/alias", "urn:test:id:hello")]),
+            ..Default::default()
+        })
+        .await;
+        let resp = roundtrip(addr, "GET /alias HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
+        assert!(resp.ends_with("hi"), "got: {resp}");
+    }
+
+    #[tokio::test]
+    async fn a_route_template_substitutes_captured_vars() {
+        let addr = start_with(EdgeConfig {
+            routes: RouteTable::new(vec![plain_route("/thing/{id}", "urn:test:id:{id}")]),
+            ..Default::default()
+        })
+        .await;
+        let resp = roundtrip(addr, "GET /thing/hello HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
+        assert!(
+            resp.ends_with("hi"),
+            "capture should resolve to hello, got: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unmatched_path_falls_through_to_the_default() {
+        let addr = start_with(EdgeConfig {
+            routes: RouteTable::new(vec![plain_route("/alias", "urn:test:id:hello")]),
+            ..Default::default()
+        })
+        .await;
+        // /test/id/hello matches no route → mechanical urn:test:id:hello.
+        let resp = roundtrip(addr, "GET /test/id/hello HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
+        assert!(resp.ends_with("hi"), "got: {resp}");
+    }
+
+    #[tokio::test]
+    async fn a_route_can_pin_a_per_route_capability() {
+        // The server is public (no cap); the route grants urn:cap:test so the guarded
+        // resource resolves. This is the per-route multi-tenant seam.
+        let addr = start_with(EdgeConfig {
+            routes: RouteTable::new(vec![Route {
+                pattern: "/secret".to_string(),
+                iri_template: "urn:test:guarded".to_string(),
+                cap: Some(vec!["urn:cap:test".to_string()]),
+                cors: None,
+                csp: None,
+            }]),
+            ..Default::default()
+        })
+        .await;
+        let resp = roundtrip(addr, "GET /secret HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK"),
+            "route cap should grant access, got: {resp}"
+        );
+        assert!(resp.ends_with("secret"), "got: {resp}");
+        // The same guarded resource under the mechanical default (no route cap) → 403.
+        let denied = roundtrip(addr, "GET /test/guarded HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(denied.starts_with("HTTP/1.1 403"), "got: {denied}");
+    }
+
+    #[tokio::test]
+    async fn a_route_can_override_csp() {
+        let addr = start_with(EdgeConfig {
+            routes: RouteTable::new(vec![Route {
+                pattern: "/page".to_string(),
+                iri_template: "urn:test:id:hello".to_string(),
+                cap: None,
+                cors: None,
+                csp: Some("default-src 'none'".to_string()),
+            }]),
+            ..Default::default()
+        })
+        .await;
+        let resp = roundtrip(addr, "GET /page HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(
+            resp.contains("Content-Security-Policy: default-src 'none'"),
+            "route CSP should win, got: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_route_can_open_cors_while_the_server_stays_closed() {
+        let addr = start_with(EdgeConfig {
+            routes: RouteTable::new(vec![Route {
+                pattern: "/api".to_string(),
+                iri_template: "urn:test:id:hello".to_string(),
+                cap: None,
+                cors: Some(CorsPolicy {
+                    allowed_origins: vec!["https://client.example".to_string()],
+                    ..Default::default()
+                }),
+                csp: None,
+            }]),
+            ..Default::default()
+        })
+        .await;
+        // The route opens CORS to the client origin.
+        let open = roundtrip(
+            addr,
+            "GET /api HTTP/1.1\r\nHost: x\r\nOrigin: https://client.example\r\n\r\n",
+        )
+        .await;
+        assert!(
+            open.contains("Access-Control-Allow-Origin: https://client.example"),
+            "got: {open}"
+        );
+        // A non-routed path keeps the server default (closed) for the same origin.
+        let closed = roundtrip(
+            addr,
+            "GET /test/id/hello HTTP/1.1\r\nHost: x\r\nOrigin: https://client.example\r\n\r\n",
+        )
+        .await;
+        assert!(
+            !closed.contains("Access-Control-Allow-Origin"),
+            "server default stays closed off-route, got: {closed}"
         );
     }
 }
