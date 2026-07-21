@@ -36,6 +36,9 @@ ikigai-sniff = "0.1.1"
 ikigai-sexpr = "0.1.0"
 # Signing + verification: urn:sign:sign (cap-gated) / urn:sign:verify (open), Ed25519.
 ikigai-sign = "0.1.0"
+# Public-key encryption (urn:encrypt:encrypt/decrypt, age/X25519) — the dual of sign.
+# Keys resolved through the kernel (urn:secret:<id>.enc). Embedded-only (off the wire).
+ikigai-encrypt = "0.1.0"
 # Secrets custody: urn:secret:{name} (cap-gated read) + urn:secret:generate/unlock
 # (Ed25519 keygen + Touch ID), macOS Keychain backend. Owner-only, not served.
 ikigai-secret = "0.1.2"
