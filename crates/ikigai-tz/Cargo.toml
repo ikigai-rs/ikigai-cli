@@ -1,0 +1,19 @@
+[package]
+name = "ikigai-tz"
+description = "Timezone conversion module: urn:tz:convert (IANA/DST-correct) + urn:tz:now (zoned clock)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+ikigai-core = { workspace = true }
+# Datetime arithmetic + RFC 3339 parse/format. `clock` for Utc::now/Local; no serde.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# The IANA time-zone database (bundled) — DST- and offset-correct conversions.
+chrono-tz = "0.10"
+
+[dev-dependencies]
+futures = { workspace = true }
