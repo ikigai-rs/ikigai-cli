@@ -13,6 +13,9 @@ ikigai-core = { workspace = true }
 # Minimal async I/O for the accept loop + per-connection handler (hand-rolled HTTP/1.1,
 # mirroring ikigai-cms-web's serve_http — Apache fronts it, so parsing stays small).
 tokio = { version = "1", features = ["net", "io-util", "rt", "rt-multi-thread", "macros", "time"] }
+# Strong ETag = a content hash of the representation (type + bytes). Same hash family
+# core uses for content addressing; keeps the validator stable and collision-resistant.
+blake3 = "1"
 
 [dev-dependencies]
 futures = { workspace = true }
