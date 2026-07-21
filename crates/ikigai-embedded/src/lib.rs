@@ -579,6 +579,8 @@ fn base_space(nature: &'static str) -> EndpointSpace {
         .bind(Exact::new("urn:data:about"), about())
         .bind(Exact::new("urn:demo:greeter"), greeter())
         .bind(Exact::new("urn:time:now"), clock_now())
+        .bind(Exact::new("urn:tz:convert"), ikigai_tz::convert())
+        .bind(Exact::new("urn:tz:now"), ikigai_tz::now())
         .bind(Exact::new("urn:style:catalog"), catalog_cards_xsl())
         .bind(Exact::new("urn:host:info"), host_info(nature))
         .bind(Exact::new("urn:host:demo"), host_demo())
