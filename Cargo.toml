@@ -76,10 +76,6 @@ ikigai-view = { path = "crates/ikigai-view" }
 # Timezone conversion (urn:tz:convert, IANA/DST-correct) + a zoned clock (urn:tz:now).
 # Workspace-local, not published; keeps the tzdata dependency out of the lean modules.
 ikigai-tz = { path = "crates/ikigai-tz" }
-# Inbound HTTP transport: serve the kernel over HTTP (method↔verb, path↔iri, cap-per-request).
-# Workspace-local, not published; keeps Tokio out of the lean modules (only the `web`-featured
-# CLI pulls it, exactly as `quic` gates quinn/rustls/tokio).
-ikigai-web = { path = "crates/ikigai-web" }
 # Sibling workspace crates pinned to the current release: a published crate must
 # require its siblings at this version too, so the lockstep release publishes in
 # dependency order (resolve → wire → engine → …) and a crate can never build against
@@ -88,6 +84,9 @@ ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.1.9" }
 ikigai-wire = { path = "crates/ikigai-wire", version = "0.1.9" }
 ikigai-scheduler = { path = "crates/ikigai-scheduler", version = "0.1.9" }
 ikigai-time = { path = "crates/ikigai-time", version = "0.1.11" }
+# Inbound HTTP transport (method↔verb, path↔iri, cap-per-request). A published
+# transport like ipc/quic/mcp; only the `web`-featured CLI pulls it (and Tokio).
+ikigai-web = { path = "crates/ikigai-web", version = "0.1.9" }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
