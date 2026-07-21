@@ -74,11 +74,84 @@ pub fn fixed_cap(scopes: Vec<String>) -> CapFn {
     Arc::new(move |_req| Capability::scoped(scopes.clone()))
 }
 
-/// Per-server state shared across connections: the kernel, the capability function,
-/// and the tombstone ledger that makes DELETE idempotent.
+/// Edge response policy: security headers, CORS, and whether to trust a fronting proxy's
+/// `X-Forwarded-*`. [`Default`] is a safe public-edge posture — strict security headers,
+/// CORS **closed**, proxy **not** trusted. (Per-route policy is a later slice; this is the
+/// server-wide baseline.)
+#[derive(Clone)]
+pub struct EdgeConfig {
+    /// Trust `X-Forwarded-Proto`/`-For` from the upstream. Enable ONLY behind a proxy you
+    /// control (Apache) — a direct client could otherwise spoof them.
+    pub trust_proxy: bool,
+    /// Outbound security headers. `None` sends none (e.g. when the fronting proxy owns them).
+    pub security: Option<SecurityHeaders>,
+    /// Cross-origin policy. Default = closed (no `Access-Control-Allow-Origin`).
+    pub cors: CorsPolicy,
+}
+
+impl Default for EdgeConfig {
+    fn default() -> Self {
+        EdgeConfig {
+            trust_proxy: false,
+            security: Some(SecurityHeaders::default()),
+            cors: CorsPolicy::default(),
+        }
+    }
+}
+
+/// Outbound security response headers. Defaults are strict — safe for an API/data face; an
+/// HTML/CoD face loosens `csp` per route (a later slice). `frame-ancestors 'none'` in the
+/// CSP subsumes `X-Frame-Options`.
+#[derive(Clone)]
+pub struct SecurityHeaders {
+    /// `Content-Security-Policy`. Default locks everything to same-origin and forbids framing.
+    pub csp: Option<String>,
+    /// `X-Content-Type-Options: nosniff` (default on).
+    pub nosniff: bool,
+    /// `Referrer-Policy` (default `no-referrer`).
+    pub referrer_policy: Option<String>,
+    /// `Strict-Transport-Security` — emitted ONLY on an HTTPS request (per RFC 6797), which
+    /// behind a trusted proxy means `X-Forwarded-Proto: https`.
+    pub hsts: Option<String>,
+}
+
+impl Default for SecurityHeaders {
+    fn default() -> Self {
+        SecurityHeaders {
+            csp: Some(
+                "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+                    .to_string(),
+            ),
+            nosniff: true,
+            referrer_policy: Some("no-referrer".to_string()),
+            hsts: Some("max-age=31536000; includeSubDomains".to_string()),
+        }
+    }
+}
+
+/// Cross-origin resource sharing. `Default` = **closed** (no cross-origin access). Populate
+/// `allowed_origins` to allow specific origins, or a single `*` for any (avoid `*` with
+/// credentials — the code echoes the concrete origin in that case, per the Fetch spec).
+#[derive(Clone, Default)]
+pub struct CorsPolicy {
+    /// Exact origins allowed (e.g. `https://app.example.com`), or a single `*`.
+    pub allowed_origins: Vec<String>,
+    /// Methods advertised on preflight. Empty → the resource's own `Allow` list.
+    pub allowed_methods: Vec<String>,
+    /// Request headers allowed on preflight. Empty → echo the requested ones.
+    pub allowed_headers: Vec<String>,
+    /// Send `Access-Control-Allow-Credentials: true`.
+    pub allow_credentials: bool,
+    /// `Access-Control-Max-Age` (preflight cache seconds); 0 → omit.
+    pub max_age: u32,
+}
+
+/// Per-server state shared across connections: the kernel, the capability function, the
+/// edge policy, and the tombstone ledger that makes DELETE idempotent.
 struct Shared {
     kernel: Arc<Kernel>,
     cap_fn: CapFn,
+    config: EdgeConfig,
     /// IRIs deleted through this server, with when — a resource we already deleted
     /// answers a repeat DELETE with 204 (idempotent) rather than 404, for a bounded
     /// window. In-process only (lost on restart); a persistent ledger is a later step.
@@ -89,12 +162,25 @@ struct Shared {
 /// reverts to reporting 404.
 const TOMBSTONE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
-/// Serve `kernel` over HTTP on `addr`, resolving each request under `cap_fn(request)`.
-/// One request per connection (`Connection: close`). Runs until the listener errors.
+/// Serve `kernel` over HTTP on `addr` under the default edge policy (strict security
+/// headers, CORS closed, proxy not trusted). See [`serve_with`] to configure it.
 pub async fn serve(kernel: Arc<Kernel>, cap_fn: CapFn, addr: SocketAddr) -> std::io::Result<()> {
+    serve_with(kernel, cap_fn, addr, EdgeConfig::default()).await
+}
+
+/// Serve `kernel` over HTTP on `addr`, resolving each request under `cap_fn(request)` and
+/// applying `config` (security headers, CORS, proxy trust). One request per connection
+/// (`Connection: close`). Runs until the listener errors.
+pub async fn serve_with(
+    kernel: Arc<Kernel>,
+    cap_fn: CapFn,
+    addr: SocketAddr,
+    config: EdgeConfig,
+) -> std::io::Result<()> {
     let shared = Arc::new(Shared {
         kernel,
         cap_fn,
+        config,
         tombstones: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
     let listener = TcpListener::bind(addr).await?;
@@ -119,6 +205,8 @@ struct Resp {
     etag: Option<String>,
     /// `Cache-Control`, projected from the representation's [`Expiry`](ikigai_core::Expiry).
     cache_control: Option<String>,
+    /// Extra headers layered on by the edge policy (security headers, CORS).
+    headers: Vec<(String, String)>,
 }
 
 impl Resp {
@@ -133,6 +221,7 @@ impl Resp {
             allow: None,
             etag: None,
             cache_control: None,
+            headers: Vec::new(),
         }
     }
 
@@ -194,7 +283,8 @@ async fn handle(mut sock: TcpStream, shared: Arc<Shared>) -> std::io::Result<()>
     }
     req.body = body;
 
-    let resp = respond(&shared, &req).await;
+    let mut resp = respond(&shared, &req).await;
+    apply_edge_policy(&mut resp, &shared.config, &req);
     write(&mut sock, resp).await
 }
 
@@ -617,6 +707,108 @@ fn error_resp(e: &ikigai_core::Error) -> Resp {
     Resp::text(status, reason, &format!("{e}"))
 }
 
+/// Layer the edge policy onto every response: security headers, and CORS headers when the
+/// request's `Origin` is allowed. HSTS rides only on an HTTPS request (via a trusted proxy's
+/// `X-Forwarded-Proto`). Applied uniformly in `handle`, so it covers 2xx, 4xx, and 5xx alike.
+fn apply_edge_policy(resp: &mut Resp, config: &EdgeConfig, req: &HttpRequest) {
+    if let Some(sec) = &config.security {
+        if let Some(csp) = &sec.csp {
+            resp.headers
+                .push(("Content-Security-Policy".to_string(), csp.clone()));
+        }
+        if sec.nosniff {
+            resp.headers
+                .push(("X-Content-Type-Options".to_string(), "nosniff".to_string()));
+        }
+        if let Some(rp) = &sec.referrer_policy {
+            resp.headers
+                .push(("Referrer-Policy".to_string(), rp.clone()));
+        }
+        if let Some(hsts) = &sec.hsts {
+            if request_is_https(config, req) {
+                resp.headers
+                    .push(("Strict-Transport-Security".to_string(), hsts.clone()));
+            }
+        }
+    }
+
+    // CORS: only when the request carries an Origin the policy allows.
+    let Some(origin) = req.header("origin") else {
+        return;
+    };
+    let Some(allow_origin) = cors_allow_origin(&config.cors, origin) else {
+        return; // origin not allowed → no CORS headers (the browser blocks it)
+    };
+    resp.headers
+        .push(("Access-Control-Allow-Origin".to_string(), allow_origin));
+    resp.headers
+        .push(("Vary".to_string(), "Origin".to_string()));
+    if config.cors.allow_credentials {
+        resp.headers.push((
+            "Access-Control-Allow-Credentials".to_string(),
+            "true".to_string(),
+        ));
+    }
+    // Preflight (OPTIONS carrying Access-Control-Request-Method) gets the method/header lists.
+    let is_preflight =
+        req.method == "OPTIONS" && req.header("access-control-request-method").is_some();
+    if is_preflight {
+        let methods = if config.cors.allowed_methods.is_empty() {
+            resp.allow.clone().unwrap_or_default()
+        } else {
+            config.cors.allowed_methods.join(", ")
+        };
+        if !methods.is_empty() {
+            resp.headers
+                .push(("Access-Control-Allow-Methods".to_string(), methods));
+        }
+        let headers = if config.cors.allowed_headers.is_empty() {
+            req.header("access-control-request-headers")
+                .unwrap_or("")
+                .to_string()
+        } else {
+            config.cors.allowed_headers.join(", ")
+        };
+        if !headers.is_empty() {
+            resp.headers
+                .push(("Access-Control-Allow-Headers".to_string(), headers));
+        }
+        if config.cors.max_age > 0 {
+            resp.headers.push((
+                "Access-Control-Max-Age".to_string(),
+                config.cors.max_age.to_string(),
+            ));
+        }
+    }
+}
+
+/// Whether the request arrived over HTTPS — true only when a trusted proxy says so via
+/// `X-Forwarded-Proto: https` (we never infer it from an untrusted client).
+fn request_is_https(config: &EdgeConfig, req: &HttpRequest) -> bool {
+    config.trust_proxy
+        && req
+            .header("x-forwarded-proto")
+            .map(|p| p.eq_ignore_ascii_case("https"))
+            .unwrap_or(false)
+}
+
+/// The `Access-Control-Allow-Origin` value for an origin, or `None` if disallowed. `*`
+/// allows any, but with credentials the concrete origin is echoed instead (per the spec,
+/// `*` is invalid with credentials).
+fn cors_allow_origin(cors: &CorsPolicy, origin: &str) -> Option<String> {
+    if cors.allowed_origins.iter().any(|o| o == origin) {
+        return Some(origin.to_string());
+    }
+    if cors.allowed_origins.iter().any(|o| o == "*") {
+        return Some(if cors.allow_credentials {
+            origin.to_string()
+        } else {
+            "*".to_string()
+        });
+    }
+    None
+}
+
 /// `/account/id/alice` → `urn:account:id:alice` (singular noun, partition key baked in).
 fn iri_from_path(path: &str) -> String {
     let joined = path
@@ -724,6 +916,9 @@ async fn write(sock: &mut TcpStream, resp: Resp) -> std::io::Result<()> {
     }
     if let Some(cc) = resp.cache_control {
         head.push_str(&format!("Cache-Control: {cc}\r\n"));
+    }
+    for (name, value) in &resp.headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
     }
     head.push_str(&format!("Content-Length: {}\r\n", resp.body.len()));
     head.push_str("Connection: close\r\n\r\n");
@@ -880,12 +1075,16 @@ mod tests {
     }
 
     async fn start() -> SocketAddr {
+        start_with(EdgeConfig::default()).await
+    }
+
+    async fn start_with(config: EdgeConfig) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener); // free the port for serve() to rebind (racy but fine for a test)
         let kernel = test_kernel();
         tokio::spawn(async move {
-            let _ = serve(kernel, public_cap(), addr).await;
+            let _ = serve_with(kernel, public_cap(), addr, config).await;
         });
         // give serve() a moment to bind
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1206,6 +1405,112 @@ mod tests {
         assert!(
             resp.starts_with("HTTP/1.1 422 Unprocessable Content"),
             "got: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn security_headers_are_on_by_default() {
+        let addr = start().await;
+        let resp = roundtrip(addr, "GET /test/id/hello HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(
+            resp.contains("Content-Security-Policy: default-src 'self'"),
+            "got: {resp}"
+        );
+        assert!(
+            resp.contains("X-Content-Type-Options: nosniff"),
+            "got: {resp}"
+        );
+        assert!(resp.contains("Referrer-Policy: no-referrer"), "got: {resp}");
+    }
+
+    #[tokio::test]
+    async fn hsts_needs_https_and_a_trusted_proxy() {
+        // Default config does not trust the proxy → no HSTS even with the header.
+        let untrusting = start().await;
+        let r1 = roundtrip(
+            untrusting,
+            "GET /test/id/hello HTTP/1.1\r\nHost: x\r\nX-Forwarded-Proto: https\r\n\r\n",
+        )
+        .await;
+        assert!(!r1.contains("Strict-Transport-Security"), "got: {r1}");
+
+        // Trusting the proxy + X-Forwarded-Proto: https → HSTS present.
+        let trusting = start_with(EdgeConfig {
+            trust_proxy: true,
+            ..Default::default()
+        })
+        .await;
+        let r2 = roundtrip(
+            trusting,
+            "GET /test/id/hello HTTP/1.1\r\nHost: x\r\nX-Forwarded-Proto: https\r\n\r\n",
+        )
+        .await;
+        assert!(
+            r2.contains("Strict-Transport-Security: max-age=31536000"),
+            "got: {r2}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_is_closed_by_default() {
+        let addr = start().await;
+        let resp = roundtrip(
+            addr,
+            "GET /test/id/hello HTTP/1.1\r\nHost: x\r\nOrigin: https://evil.example\r\n\r\n",
+        )
+        .await;
+        assert!(
+            !resp.contains("Access-Control-Allow-Origin"),
+            "closed CORS must not echo an origin, got: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_echoes_an_allowed_origin() {
+        let addr = start_with(EdgeConfig {
+            cors: CorsPolicy {
+                allowed_origins: vec!["https://app.example".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await;
+        let resp = roundtrip(
+            addr,
+            "GET /test/id/hello HTTP/1.1\r\nHost: x\r\nOrigin: https://app.example\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.contains("Access-Control-Allow-Origin: https://app.example"),
+            "got: {resp}"
+        );
+        assert!(resp.contains("Vary: Origin"), "got: {resp}");
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_advertises_methods() {
+        let addr = start_with(EdgeConfig {
+            cors: CorsPolicy {
+                allowed_origins: vec!["https://app.example".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await;
+        // Preflight for a PUT on a Source+Sink resource.
+        let resp = roundtrip(
+            addr,
+            "OPTIONS /test/doc HTTP/1.1\r\nHost: x\r\nOrigin: https://app.example\r\nAccess-Control-Request-Method: PUT\r\n\r\n",
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 204"), "got: {resp}");
+        assert!(
+            resp.contains("Access-Control-Allow-Origin: https://app.example"),
+            "got: {resp}"
+        );
+        assert!(
+            resp.contains("Access-Control-Allow-Methods:"),
+            "preflight should advertise methods, got: {resp}"
         );
     }
 }

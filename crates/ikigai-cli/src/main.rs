@@ -33,6 +33,7 @@ usage:
   ikigai serve [<target>]      run a kernel server (a Unix socket path, or quic://addr to bind)
   ikigai serve <q> --cap <s>   serve under a fixed capability ceiling <s> every client is clamped to
   ikigai serve --http <port>   serve the inbound HTTP face (loopback; front with TLS at your proxy)
+                               [--trust-proxy: honor X-Forwarded-*; --cors-origin <o>: allow a CORS origin]
   ikigai --daemon              headless: timers, the watcher, and the standing sync — for launchd
   ikigai --name <instance>     name this instance (scopes <name>.* config properties; defaults
                                repl / daemon / serve by mode)
@@ -81,6 +82,12 @@ enum Mode {
         /// A bare port binds `127.0.0.1:<port>` (loopback — TLS terminates at the
         /// fronting proxy, e.g. Apache); a full `host:port` overrides the bind.
         http: Option<String>,
+        /// `--trust-proxy`: honor `X-Forwarded-Proto`/`-For` from the upstream (enable
+        /// ONLY behind a proxy you control, e.g. Apache). Drives HTTPS detection for HSTS.
+        trust_proxy: bool,
+        /// `--cors-origin <origin>` (repeatable): allow this cross-origin (exact, or `*`).
+        /// Empty = CORS closed (the safe default).
+        cors_origins: Vec<String>,
     },
     /// Serve the capability-scoped manifold as an MCP (Model Context Protocol)
     /// server over stdio. `grants`/`scopes` union into the session capability —
@@ -226,6 +233,8 @@ fn parse_args() -> Result<Option<Mode>, String> {
         let mut certs = Certs::default();
         let mut caps = Vec::new();
         let mut http = None;
+        let mut trust_proxy = false;
+        let mut cors_origins = Vec::new();
         while let Some(arg) = argv.next() {
             if cert_flag(&arg, &mut argv, &mut certs)? {
                 continue;
@@ -252,6 +261,17 @@ fn parse_args() -> Result<Option<Mode>, String> {
                 );
                 continue;
             }
+            if arg == "--trust-proxy" {
+                trust_proxy = true;
+                continue;
+            }
+            if arg == "--cors-origin" {
+                cors_origins.push(
+                    argv.next()
+                        .ok_or_else(|| "--cors-origin needs an origin (or `*`)".to_string())?,
+                );
+                continue;
+            }
             if arg.starts_with('-') {
                 return Err(format!("unknown argument: {arg}"));
             } else if target.is_none() {
@@ -265,6 +285,8 @@ fn parse_args() -> Result<Option<Mode>, String> {
             certs,
             caps,
             http,
+            trust_proxy,
+            cors_origins,
         }));
     }
 
@@ -402,9 +424,11 @@ fn main() {
             certs,
             caps,
             http,
+            trust_proxy,
+            cors_origins,
         } => match (http, target.as_deref()) {
             // The inbound HTTP face takes precedence over IPC/QUIC when `--http` is given.
-            (Some(bind), _) => serve_http(&bind, &caps),
+            (Some(bind), _) => serve_http(&bind, &caps, trust_proxy, &cors_origins),
             (None, Some(t)) if is_quic(t) => serve_quic(t, &certs, &caps),
             (None, _) if !caps.is_empty() => {
                 eprintln!("ikigai: --cap sets a per-connection ceiling and needs a quic:// target");
@@ -963,7 +987,7 @@ fn serve_ipc(_path: Option<String>) -> ! {
 /// S0 resolves every request under the public capability; the per-tenant door (the
 /// identity→capability lookup) fills the same seam in a later slice.
 #[cfg(all(feature = "embedded", feature = "web"))]
-fn serve_http(bind: &str, caps: &[String]) -> ! {
+fn serve_http(bind: &str, caps: &[String], trust_proxy: bool, cors_origins: &[String]) -> ! {
     use std::net::SocketAddr;
     let addr: SocketAddr = if let Ok(port) = bind.parse::<u16>() {
         SocketAddr::from(([127, 0, 0, 1], port))
@@ -988,7 +1012,27 @@ fn serve_http(bind: &str, caps: &[String]) -> ! {
             format!("ceiling: {}", caps.join(", ")),
         )
     };
-    eprintln!("ikigai: serving HTTP on {addr}  ({posture}; terminate TLS at your proxy)  (Ctrl-C to stop)");
+    // The edge response policy: strict security headers by default; `--trust-proxy` honors
+    // the fronting proxy's X-Forwarded-Proto (→ HSTS on HTTPS); `--cors-origin` opens CORS
+    // to named origins (closed otherwise).
+    let mut config = ikigai_web::EdgeConfig {
+        trust_proxy,
+        ..Default::default()
+    };
+    config.cors.allowed_origins = cors_origins.to_vec();
+    let cors_note = if cors_origins.is_empty() {
+        "CORS closed".to_string()
+    } else {
+        format!("CORS: {}", cors_origins.join(", "))
+    };
+    let proxy_note = if trust_proxy {
+        "trusting X-Forwarded-*"
+    } else {
+        "no proxy trust"
+    };
+    eprintln!(
+        "ikigai: serving HTTP on {addr}  ({posture}; {cors_note}; {proxy_note}; terminate TLS at your proxy)  (Ctrl-C to stop)"
+    );
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -999,7 +1043,7 @@ fn serve_http(bind: &str, caps: &[String]) -> ! {
             std::process::exit(1);
         }
     };
-    match runtime.block_on(ikigai_web::serve(kernel, cap_fn, addr)) {
+    match runtime.block_on(ikigai_web::serve_with(kernel, cap_fn, addr, config)) {
         Ok(()) => std::process::exit(0),
         Err(e) => {
             eprintln!("ikigai: HTTP serve error: {e}");
@@ -1009,7 +1053,7 @@ fn serve_http(bind: &str, caps: &[String]) -> ! {
 }
 
 #[cfg(not(all(feature = "embedded", feature = "web")))]
-fn serve_http(_bind: &str, _caps: &[String]) -> ! {
+fn serve_http(_bind: &str, _caps: &[String], _trust_proxy: bool, _cors_origins: &[String]) -> ! {
     eprintln!("ikigai: the inbound HTTP face needs the `web` feature (build with --features web)");
     std::process::exit(1);
 }
