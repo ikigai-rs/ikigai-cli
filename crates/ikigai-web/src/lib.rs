@@ -16,6 +16,9 @@
 //! - **Accept ↔ conneg**: the `Accept` header drives the `as=` transreptor selection.
 //! - **query + body → inputs**: query params become inspectable request args; a write's body
 //!   is the piped `content`, with the request Content-Type surfaced as `content-type`.
+//! - **PATCH is read-modify-write**: the request Content-Type selects a strategy from a
+//!   registry (RFC 7386 JSON Merge Patch today) that transforms the current representation
+//!   before it is Sunk; conditional (`If-Match`) writes get optimistic-concurrency (→412).
 //! - **`cap_of(request)` is the multi-tenant door** — every request resolves under a
 //!   capability derived from its identity. A public default (or a fixed `--cap` ceiling that
 //!   narrows the edge); a per-user capability (magic-link / passkey) fills the same seam later.
@@ -265,6 +268,12 @@ async fn respond(shared: &Shared, req: &HttpRequest) -> Resp {
         }
     }
 
+    // PATCH is read-modify-write: the request Content-Type selects a patch strategy from
+    // the registry, which transforms the current representation before it is Sunk.
+    if req.method == "PATCH" {
+        return apply_patch(kernel, &iri, &cap, req).await;
+    }
+
     match kernel.issue(request, &cap).await {
         // Reads project a strong ETag + Cache-Control and honour `If-None-Match` (→304).
         Ok(repr) if verb == Verb::Source => read_resp(&req.method, req, repr),
@@ -289,6 +298,107 @@ async fn respond(shared: &Shared, req: &HttpRequest) -> Resp {
 /// Whether the request carries a write precondition header.
 fn has_precondition(req: &HttpRequest) -> bool {
     req.header("if-match").is_some() || req.header("if-none-match").is_some()
+}
+
+/// A patch strategy: transform the current representation's bytes with the patch body →
+/// the new bytes (or a reason it couldn't).
+type PatchStrategy = fn(&[u8], &[u8]) -> Result<Vec<u8>, String>;
+
+/// The PATCH content-type registry: request `Content-Type` → a patch strategy, extensible
+/// per media type. Today RFC 7386 JSON Merge Patch; json-patch (RFC 6902), SPARQL Update,
+/// LDP, and Solid PATCH are future registry entries (some routed through kernel resources).
+fn patch_strategy(content_type: &str) -> Option<PatchStrategy> {
+    match content_type {
+        "application/merge-patch+json" => Some(merge_patch_json),
+        _ => None,
+    }
+}
+
+/// PATCH = read-modify-write. Select a strategy by `Content-Type` (unknown → 415), Source
+/// the current representation (absent → 404, denied → 403), apply the patch (malformed →
+/// 422), and Sink the result — returning it with a fresh `ETag` for chained updates.
+async fn apply_patch(kernel: &Kernel, iri: &Iri, cap: &Capability, req: &HttpRequest) -> Resp {
+    let ct = req
+        .header("content-type")
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim();
+    let strategy = match patch_strategy(ct) {
+        Some(s) => s,
+        None => {
+            return Resp::text(
+                415,
+                "Unsupported Media Type",
+                "no patch strategy for this Content-Type",
+            )
+        }
+    };
+    let current = match kernel
+        .issue(Request::new(Verb::Source, iri.clone()), cap)
+        .await
+    {
+        Ok(repr) => repr,
+        Err(e) => return error_resp(&e), // NotFound → 404, Denied → 403
+    };
+    let patched = match strategy(&current.bytes, &req.body) {
+        Ok(bytes) => bytes,
+        Err(detail) => return Resp::text(422, "Unprocessable Content", &detail),
+    };
+    let sink = Request::new(Verb::Sink, iri.clone())
+        .with_arg("content", ArgRef::Inline(patched))
+        .with_arg(
+            "content-type",
+            ArgRef::Inline(media_type_of(&current).into_bytes()),
+        );
+    match kernel.issue(sink, cap).await {
+        Ok(repr) if repr.bytes.is_empty() => Resp::status(204, "No Content"),
+        Ok(repr) => {
+            let etag = etag_of(&repr);
+            Resp {
+                content_type: media_type_of(&repr),
+                body: repr.bytes,
+                etag: Some(etag),
+                ..Resp::status(200, "OK")
+            }
+        }
+        Err(e) => error_resp(&e),
+    }
+}
+
+/// RFC 7386 JSON Merge Patch: recursively merge the patch object into the current value;
+/// a `null` value deletes that key; a non-object patch replaces the target wholesale.
+fn merge_patch_json(current: &[u8], patch: &[u8]) -> Result<Vec<u8>, String> {
+    let mut target: serde_json::Value = if current.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(current).map_err(|e| format!("current is not JSON: {e}"))?
+    };
+    let patch: serde_json::Value =
+        serde_json::from_slice(patch).map_err(|e| format!("patch is not JSON: {e}"))?;
+    merge_json(&mut target, &patch);
+    serde_json::to_vec(&target).map_err(|e| e.to_string())
+}
+
+/// The recursive core of RFC 7386.
+fn merge_json(target: &mut serde_json::Value, patch: &serde_json::Value) {
+    use serde_json::Value;
+    if let Value::Object(patch_map) = patch {
+        if !target.is_object() {
+            *target = Value::Object(serde_json::Map::new());
+        }
+        let tmap = target.as_object_mut().expect("just set to object");
+        for (k, v) in patch_map {
+            if v.is_null() {
+                tmap.remove(k);
+            } else {
+                merge_json(tmap.entry(k.clone()).or_insert(Value::Null), v);
+            }
+        }
+    } else {
+        *target = patch.clone();
+    }
 }
 
 /// Check `If-Match` / `If-None-Match` against the resource's current state (fetched via
@@ -728,6 +838,22 @@ mod tests {
             Err(Error::NotFound("never here".into()))
         })
         .with_description(Description::new("ghost").verb(Verb::Delete));
+        // A JSON doc for PATCH: Source → {"a":1,"b":2}; Sink echoes the (patched) body.
+        let jdoc = FnEndpoint::new("jdoc", |inv: &Invocation<'_>| {
+            if inv.request.verb == Verb::Source {
+                Ok(Representation::new(
+                    ReprType::new("application/json"),
+                    br#"{"a":1,"b":2}"#.to_vec(),
+                ))
+            } else {
+                let body = inv.inline_arg("content").unwrap_or(b"");
+                Ok(Representation::new(
+                    ReprType::new("application/json"),
+                    body.to_vec(),
+                ))
+            }
+        })
+        .with_description(Description::new("jdoc").verb(Verb::Source).verb(Verb::Sink));
         let space = EndpointSpace::new()
             .bind(Exact::new("urn:test:id:hello"), hello)
             .bind(Exact::new("urn:test:guarded"), guarded)
@@ -739,7 +865,8 @@ mod tests {
             .bind(Exact::new("urn:test:doc"), doc)
             .bind(Exact::new("urn:test:newdoc"), newdoc)
             .bind(Exact::new("urn:test:vanishing"), vanishing)
-            .bind(Exact::new("urn:test:ghost"), ghost);
+            .bind(Exact::new("urn:test:ghost"), ghost)
+            .bind(Exact::new("urn:test:jdoc"), jdoc);
         Arc::new(Kernel::new(Arc::new(space)))
     }
 
@@ -1020,5 +1147,65 @@ mod tests {
         let addr = start().await;
         let resp = roundtrip(addr, "DELETE /test/ghost HTTP/1.1\r\nHost: x\r\n\r\n").await;
         assert!(resp.starts_with("HTTP/1.1 404 Not Found"), "got: {resp}");
+    }
+
+    // A raw PATCH request with a merge-patch body.
+    fn merge_patch(path: &str, body: &str) -> String {
+        format!(
+            "PATCH {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/merge-patch+json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn patch_merges_json() {
+        let addr = start().await;
+        // current {"a":1,"b":2} + patch {"b":3,"c":4} → {"a":1,"b":3,"c":4}
+        let resp = roundtrip(addr, &merge_patch("/test/jdoc", r#"{"b":3,"c":4}"#)).await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
+        assert!(resp.ends_with(r#"{"a":1,"b":3,"c":4}"#), "got: {resp}");
+        assert!(
+            resp.contains("ETag: "),
+            "PATCH should return a fresh ETag, got: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_null_deletes_a_key() {
+        let addr = start().await;
+        let resp = roundtrip(addr, &merge_patch("/test/jdoc", r#"{"a":null}"#)).await;
+        assert!(resp.ends_with(r#"{"b":2}"#), "got: {resp}");
+    }
+
+    #[tokio::test]
+    async fn patch_unsupported_content_type_is_415() {
+        let addr = start().await;
+        let resp = roundtrip(
+            addr,
+            "PATCH /test/jdoc HTTP/1.1\r\nHost: x\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nhi",
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 415 Unsupported Media Type"),
+            "got: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_of_absent_resource_is_404() {
+        let addr = start().await;
+        // newdoc's Source → NotFound → nothing to patch.
+        let resp = roundtrip(addr, &merge_patch("/test/newdoc", r#"{"a":1}"#)).await;
+        assert!(resp.starts_with("HTTP/1.1 404 Not Found"), "got: {resp}");
+    }
+
+    #[tokio::test]
+    async fn patch_with_malformed_body_is_422() {
+        let addr = start().await;
+        let resp = roundtrip(addr, &merge_patch("/test/jdoc", "not json")).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 422 Unprocessable Content"),
+            "got: {resp}"
+        );
     }
 }
