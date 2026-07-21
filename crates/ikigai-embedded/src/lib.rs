@@ -1693,6 +1693,10 @@ fn root_space_with_mounts(
         // urn:sign:verify): sign any representation, verify it later; a signature is
         // an RDF graph, keys are kernel-resolved resources (urn:file:*, urn:secret:*).
         Arc::new(ikigai_sign::space()) as Arc<dyn Space>,
+        // Public-key encryption (urn:encrypt:encrypt — open — and urn:encrypt:decrypt —
+        // cap `urn:cap:decrypt`): the dual of sign, age/X25519. Keys are kernel-resolved
+        // resources (urn:secret:<id>.enc / .enc.pub). Embedded-only, with the crypto family.
+        Arc::new(ikigai_encrypt::space()) as Arc<dyn Space>,
         // Secrets custody (urn:secret:{name} cap-gated read + urn:secret:generate/unlock
         // — Ed25519 keygen behind `urn:cap:secret:generate` + Touch ID, macOS Keychain
         // backend). Mounted in the embedded root only (this list is not in `served_space`),

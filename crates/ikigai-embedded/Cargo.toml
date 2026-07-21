@@ -31,6 +31,8 @@ ikigai-sparql = { workspace = true }
 ikigai-sniff = { workspace = true }
 ikigai-sexpr = { workspace = true }
 ikigai-sign = { workspace = true }
+# Public-key encryption (urn:encrypt:encrypt/decrypt, age/X25519) — dual of sign, embedded-only.
+ikigai-encrypt = { workspace = true }
 # Timezone conversion (urn:tz:convert) + zoned clock (urn:tz:now) — pure, bound in base_space.
 ikigai-tz = { workspace = true }
 ikigai-secret = { workspace = true }
