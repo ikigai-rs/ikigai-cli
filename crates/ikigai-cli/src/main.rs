@@ -404,7 +404,7 @@ fn main() {
             http,
         } => match (http, target.as_deref()) {
             // The inbound HTTP face takes precedence over IPC/QUIC when `--http` is given.
-            (Some(bind), _) => serve_http(&bind),
+            (Some(bind), _) => serve_http(&bind, &caps),
             (None, Some(t)) if is_quic(t) => serve_quic(t, &certs, &caps),
             (None, _) if !caps.is_empty() => {
                 eprintln!("ikigai: --cap sets a per-connection ceiling and needs a quic:// target");
@@ -963,7 +963,7 @@ fn serve_ipc(_path: Option<String>) -> ! {
 /// S0 resolves every request under the public capability; the per-tenant door (the
 /// identity→capability lookup) fills the same seam in a later slice.
 #[cfg(all(feature = "embedded", feature = "web"))]
-fn serve_http(bind: &str) -> ! {
+fn serve_http(bind: &str, caps: &[String]) -> ! {
     use std::net::SocketAddr;
     let addr: SocketAddr = if let Ok(port) = bind.parse::<u16>() {
         SocketAddr::from(([127, 0, 0, 1], port))
@@ -977,7 +977,18 @@ fn serve_http(bind: &str) -> ! {
         }
     };
     let kernel = std::sync::Arc::new(ikigai_embedded::kernel_for("Remote (HTTP)"));
-    eprintln!("ikigai: serving HTTP on {addr}  (public cap; terminate TLS at your proxy)  (Ctrl-C to stop)");
+    // `--cap` clamps every request to a fixed ceiling — how the public HTTP face is
+    // narrowed for the edge (a request can reach only what the ceiling grants). Without
+    // it, the public (empty-scope) capability: only cap-free resources resolve.
+    let (cap_fn, posture) = if caps.is_empty() {
+        (ikigai_web::public_cap(), "public cap".to_string())
+    } else {
+        (
+            ikigai_web::fixed_cap(caps.to_vec()),
+            format!("ceiling: {}", caps.join(", ")),
+        )
+    };
+    eprintln!("ikigai: serving HTTP on {addr}  ({posture}; terminate TLS at your proxy)  (Ctrl-C to stop)");
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -988,7 +999,7 @@ fn serve_http(bind: &str) -> ! {
             std::process::exit(1);
         }
     };
-    match runtime.block_on(ikigai_web::serve(kernel, ikigai_web::public_cap(), addr)) {
+    match runtime.block_on(ikigai_web::serve(kernel, cap_fn, addr)) {
         Ok(()) => std::process::exit(0),
         Err(e) => {
             eprintln!("ikigai: HTTP serve error: {e}");
@@ -998,7 +1009,7 @@ fn serve_http(bind: &str) -> ! {
 }
 
 #[cfg(not(all(feature = "embedded", feature = "web")))]
-fn serve_http(_bind: &str) -> ! {
+fn serve_http(_bind: &str, _caps: &[String]) -> ! {
     eprintln!("ikigai: the inbound HTTP face needs the `web` feature (build with --features web)");
     std::process::exit(1);
 }

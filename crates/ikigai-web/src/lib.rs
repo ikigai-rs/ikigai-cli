@@ -8,14 +8,17 @@
 //!    →  Representation  →  HTTP response
 //! ```
 //!
-//! - **method ↔ verb**: GET/HEAD → `Source`, OPTIONS → the allow-list; write verbs land in a
-//!   later slice. An unsupported method is `405` with `Allow`.
+//! - **method ↔ verb**: GET/HEAD → `Source`, PUT/POST/PATCH → `Sink`, DELETE → `Delete`,
+//!   OPTIONS → the allow-list. The allow-list and the `405` gate come from the endpoint's
+//!   declared `describe().verbs` — an endpoint that declares no verbs isn't pre-empted.
 //! - **path ↔ iri**: `/account/id/alice` → `urn:account:id:alice` (singular noun, partition
 //!   key baked in). The path is canonical.
 //! - **Accept ↔ conneg**: the `Accept` header drives the `as=` transreptor selection.
+//! - **query + body → inputs**: query params become inspectable request args; a write's body
+//!   is the piped `content`, with the request Content-Type surfaced as `content-type`.
 //! - **`cap_of(request)` is the multi-tenant door** — every request resolves under a
-//!   capability derived from its identity. This slice ships a public default; a per-user
-//!   capability (magic-link / passkey) fills the same seam later.
+//!   capability derived from its identity. A public default (or a fixed `--cap` ceiling that
+//!   narrows the edge); a per-user capability (magic-link / passkey) fills the same seam later.
 //! - **typed error → status**: `Denied`→403, invalid/missing arg→400, transient→503, else 500.
 //!
 //! App logic — scheduling, forms, policy — stays in resources, compositions, and
@@ -60,6 +63,14 @@ pub fn public_cap() -> CapFn {
     Arc::new(|_req| Capability::scoped(Vec::<String>::new()))
 }
 
+/// A fixed capability ceiling for every request — the `--cap` clamp. This is how the
+/// public HTTP face is narrowed for the edge: a request can reach only what the ceiling
+/// grants, never widening it (the same posture the QUIC server's `--cap` takes). An
+/// empty `scopes` is equivalent to [`public_cap`].
+pub fn fixed_cap(scopes: Vec<String>) -> CapFn {
+    Arc::new(move |_req| Capability::scoped(scopes.clone()))
+}
+
 /// Serve `kernel` over HTTP on `addr`, resolving each request under `cap_fn(request)`.
 /// One request per connection (`Connection: close`). Runs until the listener errors.
 pub async fn serve(kernel: Arc<Kernel>, cap_fn: CapFn, addr: SocketAddr) -> std::io::Result<()> {
@@ -80,7 +91,8 @@ struct Resp {
     reason: &'static str,
     content_type: String,
     body: Vec<u8>,
-    allow: Option<&'static str>,
+    /// The `Allow` header value (the resource's method set), when relevant.
+    allow: Option<String>,
 }
 
 impl Resp {
@@ -148,55 +160,141 @@ async fn handle(mut sock: TcpStream, kernel: Arc<Kernel>, cap_fn: CapFn) -> std:
     write(&mut sock, resp).await
 }
 
-/// The core adapter: method → verb, path → iri, Accept → conneg, resolve under the cap.
+/// The core adapter: method → verb (gated by `describe().verbs`), path → iri,
+/// query → args, body → piped `content`, Accept → conneg, resolved under the cap.
 async fn respond(kernel: &Kernel, cap_fn: &CapFn, req: &HttpRequest) -> Resp {
-    let verb = match req.method.as_str() {
-        "GET" | "HEAD" => Verb::Source,
-        // S0 ships the read path + the allow-list; write verbs are the next slice.
-        "OPTIONS" => {
-            return Resp {
-                status: 204,
-                reason: "No Content",
-                content_type: String::new(),
-                body: Vec::new(),
-                allow: Some("GET, HEAD, OPTIONS"),
-            }
-        }
-        _ => {
-            let mut r = Resp::text(405, "Method Not Allowed", "method not allowed");
-            r.allow = Some("GET, HEAD, OPTIONS");
-            return r;
-        }
-    };
-
     let iri_str = iri_from_path(&req.path);
     let iri = match Iri::parse(&iri_str) {
         Ok(i) => i,
         Err(_) => return Resp::text(400, "Bad Request", "not a resource path"),
     };
 
+    // Declared verbs drive the Allow list and the 405 gate. An endpoint that declares
+    // NO verbs (or an unknown IRI) is not pre-empted — resolution runs and the
+    // kernel/endpoint reports the outcome. Declare verbs for a precise OPTIONS/405.
+    let described = kernel.describe(&iri);
+    let declared: &[Verb] = described
+        .as_ref()
+        .map(|d| d.verbs.as_slice())
+        .unwrap_or(&[]);
+    let allow = allow_header(declared);
+
+    if req.method == "OPTIONS" {
+        return Resp {
+            status: 204,
+            reason: "No Content",
+            content_type: String::new(),
+            body: Vec::new(),
+            allow: Some(allow),
+        };
+    }
+
+    let verb = match verb_for_method(&req.method) {
+        Some(v) => v,
+        None => return method_not_allowed(allow),
+    };
+    if !declared.is_empty() && !declared.contains(&verb) {
+        return method_not_allowed(allow);
+    }
+
+    // Build the request. Query params are inspectable inputs (filters/data) the
+    // composition can read; a write verb carries the body as the piped `content`,
+    // with the request Content-Type surfaced as `content-type`.
     let mut request = Request::new(verb, iri);
-    // Accept → `as=` conneg (skip the wildcard).
     if let Some(accept) = req.header("accept") {
         let media = first_media(accept);
         if !media.is_empty() && media != "*/*" {
             request = request.with_arg("as", ArgRef::Inline(media.into_bytes()));
         }
     }
+    for (k, v) in &req.query {
+        if k != "as" && k != "content" {
+            request = request.with_arg(k.clone(), ArgRef::Inline(v.clone().into_bytes()));
+        }
+    }
+    if verb == Verb::Sink {
+        request = request.with_arg("content", ArgRef::Inline(req.body.clone()));
+        if let Some(ct) = req.header("content-type") {
+            request = request.with_arg("content-type", ArgRef::Inline(ct.as_bytes().to_vec()));
+        }
+    }
 
     let cap = cap_fn(req);
     match kernel.issue(request, &cap).await {
-        Ok(repr) => {
-            let head_only = req.method == "HEAD";
-            Resp {
-                status: 200,
-                reason: "OK",
-                content_type: media_type_of(&repr),
-                body: if head_only { Vec::new() } else { repr.bytes },
-                allow: None,
-            }
-        }
+        Ok(repr) => success_resp(&req.method, verb, repr),
         Err(e) => error_resp(&e),
+    }
+}
+
+/// A `405` carrying the resource's `Allow` list.
+fn method_not_allowed(allow: String) -> Resp {
+    let mut r = Resp::text(405, "Method Not Allowed", "method not allowed");
+    r.allow = Some(allow);
+    r
+}
+
+/// Shape a success response by method/verb: HEAD → headers only; DELETE → 204; a
+/// write returning no body → 204; otherwise 200 with the representation.
+fn success_resp(method: &str, verb: Verb, repr: ikigai_core::Representation) -> Resp {
+    if method == "HEAD" {
+        return Resp {
+            status: 200,
+            reason: "OK",
+            content_type: media_type_of(&repr),
+            body: Vec::new(),
+            allow: None,
+        };
+    }
+    if verb == Verb::Delete || (verb == Verb::Sink && repr.bytes.is_empty()) {
+        return Resp {
+            status: 204,
+            reason: "No Content",
+            content_type: String::new(),
+            body: Vec::new(),
+            allow: None,
+        };
+    }
+    Resp {
+        status: 200,
+        reason: "OK",
+        content_type: media_type_of(&repr),
+        body: repr.bytes,
+        allow: None,
+    }
+}
+
+/// The HTTP methods a resource offers, from its declared verbs. An endpoint that
+/// declares no verbs falls back to the conservative read set (it isn't gated, but
+/// OPTIONS can't enumerate what wasn't declared). HEAD rides with GET; OPTIONS always.
+fn allow_header(verbs: &[Verb]) -> String {
+    if verbs.is_empty() {
+        return "GET, HEAD, OPTIONS".to_string();
+    }
+    let mut methods: Vec<&str> = Vec::new();
+    if verbs.contains(&Verb::Source) {
+        methods.push("GET");
+        methods.push("HEAD");
+    }
+    if verbs.contains(&Verb::Sink) {
+        methods.push("POST");
+        methods.push("PUT");
+        methods.push("PATCH");
+    }
+    if verbs.contains(&Verb::Delete) {
+        methods.push("DELETE");
+    }
+    methods.push("OPTIONS");
+    methods.join(", ")
+}
+
+/// The kernel verb an HTTP method maps to. `None` for OPTIONS (handled specially) and
+/// for methods the transport doesn't support (→ 405).
+fn verb_for_method(method: &str) -> Option<Verb> {
+    match method {
+        "GET" | "HEAD" => Some(Verb::Source),
+        "PUT" | "POST" | "PATCH" => Some(Verb::Sink),
+        "DELETE" => Some(Verb::Delete),
+        _ => None,
     }
 }
 
@@ -326,18 +424,21 @@ async fn write(sock: &mut TcpStream, resp: Resp) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use ikigai_core::{
-        EndpointSpace, Error, Exact, FnEndpoint, Invocation, ReprType, Representation,
+        Description, EndpointSpace, Error, Exact, FnEndpoint, Invocation, ReprType, Representation,
     };
     use std::sync::Arc;
 
-    // A kernel with two endpoints: a plain resource and a cap-denied one.
+    // A kernel exercising the verbs: a Source-only resource, a cap-denied one, a
+    // Sink that echoes its piped `content`, a Source that echoes a query arg, and a
+    // Delete. Verbs are declared so the Allow list and the 405 gate are exercised.
     fn test_kernel() -> Arc<Kernel> {
         let hello = FnEndpoint::new("hello", |_inv: &Invocation<'_>| {
             Ok(Representation::new(
                 ReprType::new("text/plain").with_param("charset", "utf-8"),
                 b"hi".to_vec(),
             ))
-        });
+        })
+        .with_description(Description::new("hello").verb(Verb::Source));
         let guarded = FnEndpoint::new("guarded", |inv: &Invocation<'_>| {
             if !inv.capability.allows("urn:cap:test") {
                 return Err(Error::Denied("needs urn:cap:test".into()));
@@ -347,9 +448,35 @@ mod tests {
                 b"secret".to_vec(),
             ))
         });
+        // A writer: echoes the piped `content` back (declares Sink).
+        let writable = FnEndpoint::new("writable", |inv: &Invocation<'_>| {
+            let body = inv.inline_arg("content").unwrap_or(b"");
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                body.to_vec(),
+            ))
+        })
+        .with_description(Description::new("writable").verb(Verb::Sink));
+        // A reader echoing a query arg (params are inspectable inputs).
+        let echo = FnEndpoint::new("echo", |inv: &Invocation<'_>| {
+            let name = inv.inline_str("name").unwrap_or("");
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                name.as_bytes().to_vec(),
+            ))
+        })
+        .with_description(Description::new("echo").verb(Verb::Source));
+        // A deletable resource (declares Delete).
+        let deletable = FnEndpoint::new("deletable", |_inv: &Invocation<'_>| {
+            Ok(Representation::new(ReprType::new("text/plain"), Vec::new()))
+        })
+        .with_description(Description::new("deletable").verb(Verb::Delete));
         let space = EndpointSpace::new()
             .bind(Exact::new("urn:test:id:hello"), hello)
-            .bind(Exact::new("urn:test:guarded"), guarded);
+            .bind(Exact::new("urn:test:guarded"), guarded)
+            .bind(Exact::new("urn:test:writable"), writable)
+            .bind(Exact::new("urn:test:echo"), echo)
+            .bind(Exact::new("urn:test:deletable"), deletable);
         Arc::new(Kernel::new(Arc::new(space)))
     }
 
@@ -431,6 +558,64 @@ mod tests {
         assert_eq!(
             iri_from_path("/account/status/new"),
             "urn:account:status:new"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_writes_the_body_as_piped_content() {
+        let addr = start().await;
+        let resp = roundtrip(
+            addr,
+            "PUT /test/writable HTTP/1.1\r\nHost: x\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello",
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
+        assert!(resp.ends_with("hello"), "body should echo, got: {resp}");
+    }
+
+    #[tokio::test]
+    async fn query_params_are_visible_as_args() {
+        let addr = start().await;
+        let resp = roundtrip(
+            addr,
+            "GET /test/echo?name=priya HTTP/1.1\r\nHost: x\r\n\r\n",
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
+        assert!(resp.ends_with("priya"), "arg should echo, got: {resp}");
+    }
+
+    #[tokio::test]
+    async fn delete_returns_204() {
+        let addr = start().await;
+        let resp = roundtrip(addr, "DELETE /test/deletable HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(resp.starts_with("HTTP/1.1 204 No Content"), "got: {resp}");
+    }
+
+    #[tokio::test]
+    async fn options_reflects_declared_verbs() {
+        let addr = start().await;
+        // writable declares Sink → POST/PUT/PATCH offered, plus OPTIONS.
+        let resp = roundtrip(addr, "OPTIONS /test/writable HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(resp.starts_with("HTTP/1.1 204"), "got: {resp}");
+        assert!(
+            resp.contains("Allow: POST, PUT, PATCH, OPTIONS"),
+            "got: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_declared_verb_gap_is_405() {
+        let addr = start().await;
+        // writable declares Sink only → GET is not offered.
+        let resp = roundtrip(addr, "GET /test/writable HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(
+            resp.starts_with("HTTP/1.1 405 Method Not Allowed"),
+            "got: {resp}"
+        );
+        assert!(
+            resp.contains("Allow: POST, PUT, PATCH, OPTIONS"),
+            "got: {resp}"
         );
     }
 }
