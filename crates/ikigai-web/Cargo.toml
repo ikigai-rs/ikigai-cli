@@ -1,0 +1,19 @@
+[package]
+name = "ikigai-web"
+description = "Inbound HTTP transport: serve an ikigai kernel over HTTP. Maps HTTP method↔verb, Accept↔conneg, path↔iri, and a capability-per-request (the multi-tenant door). A thin adapter — app logic stays in resources/compositions/caps."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+# The kernel it serves.
+ikigai-core = { workspace = true }
+# Minimal async I/O for the accept loop + per-connection handler (hand-rolled HTTP/1.1,
+# mirroring ikigai-cms-web's serve_http — Apache fronts it, so parsing stays small).
+tokio = { version = "1", features = ["net", "io-util", "rt", "rt-multi-thread", "macros", "time"] }
+
+[dev-dependencies]
+futures = { workspace = true }
