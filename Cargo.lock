@@ -2262,8 +2262,10 @@ dependencies = [
  "ikigai-mcp",
  "ikigai-quic",
  "ikigai-resolve",
+ "ikigai-web",
  "ratatui",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

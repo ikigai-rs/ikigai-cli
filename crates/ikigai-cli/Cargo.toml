@@ -16,6 +16,7 @@ default = ["embedded", "ipc"]
 embedded = ["dep:ikigai-embedded"]
 ipc = ["dep:ikigai-ipc"]   # Unix only; the dep is empty elsewhere
 quic = ["dep:ikigai-quic"] # opt-in; pulls quinn/rustls/tokio
+web = ["dep:ikigai-web", "dep:tokio"] # opt-in inbound HTTP face; pulls Tokio (like quic)
 
 [dependencies]
 ikigai-core = { workspace = true }
@@ -28,6 +29,12 @@ ikigai-embedded = { path = "../ikigai-embedded", version = "0.1.6", optional = t
 ikigai-mcp = { path = "../ikigai-mcp", version = "0.1.9" }
 ikigai-ipc = { path = "../ikigai-ipc", version = "0.1.6", optional = true }
 ikigai-quic = { path = "../ikigai-quic", version = "0.1.6", optional = true }
+# Inbound HTTP face — workspace-local (path only, not published), gated behind `web`.
+ikigai-web = { workspace = true, optional = true }
+# A runtime for the `web` serve loop (ikigai-web is async). Feature-gated so the
+# default/wasm binary never pulls Tokio; matches the `quic` transport's posture.
+# net+time so the runtime's `enable_all()` has the io+time drivers on its own.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time"], optional = true }
 
 # The full-screen TUI is native-only (crossterm). The browser frontend (ratzilla)
 # lands in a later slice; on wasm the binary falls back to the line REPL.
