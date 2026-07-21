@@ -32,6 +32,7 @@ usage:
   ikigai --mount <pfx>=<tgt>   compose a remote kernel at prefix <pfx> (<tgt> = Unix path or quic://host:port)
   ikigai serve [<target>]      run a kernel server (a Unix socket path, or quic://addr to bind)
   ikigai serve <q> --cap <s>   serve under a fixed capability ceiling <s> every client is clamped to
+  ikigai serve --http <port>   serve the inbound HTTP face (loopback; front with TLS at your proxy)
   ikigai --daemon              headless: timers, the watcher, and the standing sync — for launchd
   ikigai --name <instance>     name this instance (scopes <name>.* config properties; defaults
                                repl / daemon / serve by mode)
@@ -76,6 +77,10 @@ enum Mode {
         /// affordance — e.g. `--cap urn:cap:personal:calendar:read:freebusy` serves
         /// free/busy and nothing else, the clamp forbidding any client from widening.
         caps: Vec<String>,
+        /// `--http <port|addr>`: serve the inbound HTTP face instead of IPC/QUIC.
+        /// A bare port binds `127.0.0.1:<port>` (loopback — TLS terminates at the
+        /// fronting proxy, e.g. Apache); a full `host:port` overrides the bind.
+        http: Option<String>,
     },
     /// Serve the capability-scoped manifold as an MCP (Model Context Protocol)
     /// server over stdio. `grants`/`scopes` union into the session capability —
@@ -220,6 +225,7 @@ fn parse_args() -> Result<Option<Mode>, String> {
         let mut target = None;
         let mut certs = Certs::default();
         let mut caps = Vec::new();
+        let mut http = None;
         while let Some(arg) = argv.next() {
             if cert_flag(&arg, &mut argv, &mut certs)? {
                 continue;
@@ -239,6 +245,13 @@ fn parse_args() -> Result<Option<Mode>, String> {
                 );
                 continue;
             }
+            if arg == "--http" {
+                http = Some(
+                    argv.next()
+                        .ok_or_else(|| "--http needs a port or host:port".to_string())?,
+                );
+                continue;
+            }
             if arg.starts_with('-') {
                 return Err(format!("unknown argument: {arg}"));
             } else if target.is_none() {
@@ -251,6 +264,7 @@ fn parse_args() -> Result<Option<Mode>, String> {
             target,
             certs,
             caps,
+            http,
         }));
     }
 
@@ -387,13 +401,16 @@ fn main() {
             target,
             certs,
             caps,
-        } => match target.as_deref() {
-            Some(t) if is_quic(t) => serve_quic(t, &certs, &caps),
-            _ if !caps.is_empty() => {
+            http,
+        } => match (http, target.as_deref()) {
+            // The inbound HTTP face takes precedence over IPC/QUIC when `--http` is given.
+            (Some(bind), _) => serve_http(&bind),
+            (None, Some(t)) if is_quic(t) => serve_quic(t, &certs, &caps),
+            (None, _) if !caps.is_empty() => {
                 eprintln!("ikigai: --cap sets a per-connection ceiling and needs a quic:// target");
                 std::process::exit(2);
             }
-            _ => serve_ipc(target),
+            (None, _) => serve_ipc(target),
         },
         Mode::Repl(args) => {
             // `--demo` seeds the runtime demo flag; `demo on`/`off` (→ urn:host:demo)
@@ -936,6 +953,53 @@ fn ipc_socket(path: Option<String>) -> std::path::PathBuf {
 #[cfg(all(feature = "embedded", not(all(feature = "ipc", unix))))]
 fn serve_ipc(_path: Option<String>) -> ! {
     eprintln!("ikigai: a Unix-socket server needs the `ipc` feature on a Unix platform");
+    std::process::exit(1);
+}
+
+/// The inbound HTTP face: serve the embedded kernel over HTTP. TLS is expected to
+/// terminate at the fronting proxy (Apache holds the cert), so a bare `--http <port>`
+/// binds loopback (`127.0.0.1`) — never a cleartext socket on the public interface.
+/// A full `host:port` overrides the bind (e.g. `0.0.0.0:8080` behind a firewall).
+/// S0 resolves every request under the public capability; the per-tenant door (the
+/// identity→capability lookup) fills the same seam in a later slice.
+#[cfg(all(feature = "embedded", feature = "web"))]
+fn serve_http(bind: &str) -> ! {
+    use std::net::SocketAddr;
+    let addr: SocketAddr = if let Ok(port) = bind.parse::<u16>() {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    } else {
+        match bind.parse() {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("ikigai: --http wants a port or host:port ({bind}: {e})");
+                std::process::exit(2);
+            }
+        }
+    };
+    let kernel = std::sync::Arc::new(ikigai_embedded::kernel_for("Remote (HTTP)"));
+    eprintln!("ikigai: serving HTTP on {addr}  (public cap; terminate TLS at your proxy)  (Ctrl-C to stop)");
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("ikigai: could not start the async runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+    match runtime.block_on(ikigai_web::serve(kernel, ikigai_web::public_cap(), addr)) {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("ikigai: HTTP serve error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(not(all(feature = "embedded", feature = "web")))]
+fn serve_http(_bind: &str) -> ! {
+    eprintln!("ikigai: the inbound HTTP face needs the `web` feature (build with --features web)");
     std::process::exit(1);
 }
 
