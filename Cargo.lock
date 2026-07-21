@@ -2671,6 +2671,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ikigai-web"
+version = "0.1.9"
+dependencies = [
+ "futures",
+ "ikigai-core",
+ "tokio",
+]
+
+[[package]]
 name = "ikigai-wire"
 version = "0.1.9"
 dependencies = [
