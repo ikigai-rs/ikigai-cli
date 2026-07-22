@@ -160,6 +160,7 @@ fn the_join_link_prefers_the_real_url_and_falls_back_to_the_notes() {
                 .to_string(),
         ),
         url: Some("https://teams.microsoft.com/l/meetup-join/primary".to_string()),
+        attendees: Vec::new(),
         alerts: Vec::new(),
     };
     assert_eq!(
@@ -190,6 +191,7 @@ fn a_captured_invite_becomes_a_heading_with_drawers_and_a_body() {
             "Agenda:\n* budget\n\nJoin: https://teams.microsoft.com/l/meetup-join/abc".to_string(),
         ),
         url: None,
+        attendees: vec!["Ada Lovelace".to_string(), "grace@example.com".to_string()],
         alerts: Vec::new(),
     };
     let heading = org_heading(&event);
@@ -206,24 +208,36 @@ fn a_captured_invite_becomes_a_heading_with_drawers_and_a_body() {
         heading.contains(",* budget"),
         "leading '*' must not become a new headline: {heading}"
     );
+    // Attendees close the body — read-only in EventKit, the org record is
+    // where they live.
+    let attendees_at = heading
+        .find("Attendees: Ada Lovelace, grace@example.com")
+        .expect("attendee line present");
+    assert!(
+        attendees_at > body_at,
+        "attendees follow the description: {heading}"
+    );
 }
 
 #[test]
 fn a_real_url_does_not_count_as_a_change_but_the_description_does() {
     // The view copy can never echo ical:url (its URL field is the identity
-    // token), so the source's link must not churn the diff. ical:description
-    // DOES round-trip through .notes and stays comparable.
+    // token) nor ical:attendee (read-only in EventKit), so a source's link and
+    // attendee list must not churn the diff. ical:description DOES round-trip
+    // through .notes and stays comparable.
     let src = "@prefix ical: <http://www.w3.org/2002/12/cal/ical#> .\n\
          @prefix ik: <https://ikigai-rs.dev/ns#> .\n\
          <urn:event:X> ical:summary \"E\" ; ical:dtstart \"2026-07-20T10:00:00-07:00\" ; \
          ical:dtend \"2026-07-20T11:30:00-07:00\" ; \
          ical:description \"https://teams.microsoft.com/l/meetup-join/abc\" ; \
+         ical:attendee \"Ada\" ; ical:attendee \"Grace\" ; \
          ical:url \"https://teams.microsoft.com/l/meetup-join/abc\" ; ik:calendar \"Bosatsu\" .\n";
     let view = src
         .replace(
             " ical:url \"https://teams.microsoft.com/l/meetup-join/abc\" ;",
             "",
         )
+        .replace(" ical:attendee \"Ada\" ; ical:attendee \"Grace\" ;", "")
         .replace("\"Bosatsu\"", "\"Brian-Busy\"");
     let sorted = |t: &str| {
         let mut v: Vec<String> = normalize_for_diff(t).lines().map(str::to_string).collect();
