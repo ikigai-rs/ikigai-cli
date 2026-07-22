@@ -1272,16 +1272,30 @@ fn parse_config_assignment(rest: &str) -> Result<(&'static str, String), String>
 /// The names of a target's declared by-value arguments, in declaration order.
 /// Binding inputs (captured from the IRI) and an absent contract yield none.
 fn declared_arguments(description: Option<&Description>) -> Vec<String> {
-    description
-        .map(|description| {
-            description
-                .inputs
-                .iter()
-                .filter(|input| input.source == InputSource::Argument)
-                .map(|input| input.name.clone())
-                .collect()
-        })
-        .unwrap_or_default()
+    let Some(description) = description else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = Vec::new();
+    let mut add = |input: &ikigai_core::ArgSpec| {
+        if input.source == InputSource::Argument && !names.iter().any(|n| n == &input.name) {
+            names.push(input.name.clone());
+        }
+    };
+    // The flat inputs (the single-verb / 93% authoring form)...
+    for input in &description.inputs {
+        add(input);
+    }
+    // ...plus every per-verb ActionSpec's inputs, so an argument declared on a specific
+    // verb — a multi-verb endpoint like the tuplespace, whose `take` (Delete) takes
+    // `match=`/`tuple=` — is recognized and routed as a named argument too, not mistaken
+    // for positional content. `action_specs()` normalizes both authoring forms (a
+    // flat-only verb synthesizes a spec from `inputs`), so this de-dupes cleanly.
+    for action in description.action_specs() {
+        for input in &action.inputs {
+            add(input);
+        }
+    }
+    names
 }
 
 /// How a stage's output feeds the next stage.
@@ -3057,5 +3071,27 @@ mod tests {
         let binding = Description::new("echo").input(ArgSpec::new("message").binding());
         assert!(declared_arguments(Some(&binding)).is_empty());
         assert!(declared_arguments(None).is_empty());
+    }
+
+    #[test]
+    fn declared_arguments_includes_per_verb_action_inputs() {
+        use ikigai_core::{ActionSpec, Verb};
+        // A multi-verb endpoint that authors per-verb ActionSpecs (no flat inputs) — its
+        // arguments must still be recognized as named args, deduped across verbs.
+        let description = Description::new("space")
+            .action(
+                ActionSpec::new(Verb::Source)
+                    .input(ArgSpec::new("tuple"))
+                    .input(ArgSpec::new("match")),
+            )
+            .action(
+                ActionSpec::new(Verb::Delete)
+                    .input(ArgSpec::new("tuple"))
+                    .input(ArgSpec::new("match")),
+            );
+        assert_eq!(
+            declared_arguments(Some(&description)),
+            vec!["tuple", "match"]
+        );
     }
 }
