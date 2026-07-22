@@ -95,6 +95,11 @@ pub struct EdgeConfig {
     /// the host may swap it (e.g. when a watched route file changes) without a restart; each
     /// request reads whatever the handle currently holds. `None` → the static `routes`.
     pub live_routes: Option<LiveRoutes>,
+    /// Routes-only: an un-routed path is **not** part of the public surface — it 404s instead
+    /// of falling through to the mechanical `/noun/partition/key` → `urn:` default. This turns
+    /// the route table into an exhaustive allow-list (no accidental export), the right posture
+    /// for a public edge. Default `false` (fall-through on).
+    pub routes_only: bool,
 }
 
 /// A shared, swappable [`RouteTable`] for hot-reload. The server reads the current table per
@@ -123,6 +128,7 @@ impl Default for EdgeConfig {
             cors: CorsPolicy::default(),
             routes: RouteTable::default(),
             live_routes: None,
+            routes_only: false,
         }
     }
 }
@@ -425,6 +431,11 @@ async fn handle(mut sock: TcpStream, shared: Arc<Shared>) -> std::io::Result<()>
 /// The core adapter: method → verb (gated by `describe().verbs`), path → iri,
 /// query → args, body → piped `content`, Accept → conneg, resolved under the cap.
 async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) -> Resp {
+    // Routes-only edge: an un-routed path is not part of the public surface — 404 before it
+    // can reach the mechanical default (the exhaustive-allow-list posture).
+    if shared.config.routes_only && matched.is_none() {
+        return Resp::text(404, "Not Found", "no route");
+    }
     let kernel = &shared.kernel;
     let cap_fn = &shared.cap_fn;
     // A matched route supplies the target IRI (from its template); otherwise the mechanical
@@ -1930,6 +1941,22 @@ mod tests {
         // The same guarded resource under the mechanical default (no route cap) → 403.
         let denied = roundtrip(addr, "GET /test/guarded HTTP/1.1\r\nHost: x\r\n\r\n").await;
         assert!(denied.starts_with("HTTP/1.1 403"), "got: {denied}");
+    }
+
+    #[tokio::test]
+    async fn routes_only_404s_unrouted_paths_but_serves_routed_ones() {
+        let addr = start_with(EdgeConfig {
+            routes_only: true,
+            routes: RouteTable::new(vec![plain_route("/alias", "urn:test:id:hello")]),
+            ..Default::default()
+        })
+        .await;
+        // A routed path resolves.
+        let routed = roundtrip(addr, "GET /alias HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(routed.starts_with("HTTP/1.1 200 OK"), "got: {routed}");
+        // An un-routed path 404s instead of hitting the mechanical default.
+        let unrouted = roundtrip(addr, "GET /test/id/hello HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(unrouted.starts_with("HTTP/1.1 404"), "got: {unrouted}");
     }
 
     #[tokio::test]
