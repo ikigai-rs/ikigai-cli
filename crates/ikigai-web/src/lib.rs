@@ -1036,9 +1036,14 @@ fn openapi_of(desc: &ikigai_core::Description, path: &str) -> serde_json::Value 
             _ => continue, // Meta / Exists aren't projected as HTTP operations
         };
         let mut op = Map::new();
-        if !action.summary.is_empty() {
-            op.insert("summary".to_string(), json!(action.summary));
-        }
+        // A summary is required by strict linters; fall back to a synthesized one.
+        let summary = if action.summary.is_empty() {
+            format!("{} {path}", method.to_uppercase())
+        } else {
+            action.summary.clone()
+        };
+        op.insert("summary".to_string(), json!(summary));
+        op.insert("operationId".to_string(), json!(operation_id(method, path)));
         if action.verb == Verb::Sink {
             let (props, required) = schema_properties(&action.inputs);
             op.insert(
@@ -1069,7 +1074,11 @@ fn openapi_of(desc: &ikigai_core::Description, path: &str) -> serde_json::Value 
         }
         op.insert(
             "responses".to_string(),
-            json!({ "200": { "description": "OK" } }),
+            json!({
+                "200": { "description": "OK" },
+                "400": { "description": "Bad Request" },
+                "404": { "description": "Not Found" }
+            }),
         );
         ops.insert(method.to_string(), Value::Object(op));
     }
@@ -1082,8 +1091,21 @@ fn openapi_of(desc: &ikigai_core::Description, path: &str) -> serde_json::Value 
     json!({
         "openapi": "3.1.0",
         "info": { "title": title, "version": "0", "description": desc.summary },
+        // A relative server → "same origin as this document", valid regardless of scheme/host.
+        "servers": [ { "url": "/" } ],
         "paths": { path: Value::Object(ops) }
     })
+}
+
+/// A stable `operationId` from the method + path, e.g. `get_host_history`.
+fn operation_id(method: &str, path: &str) -> String {
+    let slug: String = path
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("{method}{}", slug.trim_end_matches('_'))
+        .trim_end_matches('_')
+        .to_string()
 }
 
 /// The JSON-Schema object properties + required list for a set of inputs (a write's body).
@@ -1947,9 +1969,12 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(body).expect("openapi json");
         assert_eq!(v["openapi"], "3.1.0");
         assert_eq!(v["info"]["title"], "Availability");
+        assert_eq!(v["servers"][0]["url"], "/"); // a server for tooling (Swagger UI etc.)
         let op = &v["paths"]["/test/booking"];
         // Source → get (params), Sink → post (requestBody).
         assert!(op["get"].is_object() && op["post"].is_object(), "got: {v}");
+        assert!(op["get"]["operationId"].is_string()); // for code generators
+        assert!(op["post"]["responses"]["400"].is_object()); // a documented 4xx
         let schema = &op["post"]["requestBody"]["content"]["application/json"]["schema"];
         assert_eq!(schema["properties"]["slot"]["type"], "string"); // xsd:dateTime → string
         assert_eq!(schema["properties"]["preference"]["enum"][0], "morning");
