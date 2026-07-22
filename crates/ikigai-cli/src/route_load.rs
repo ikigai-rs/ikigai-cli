@@ -67,6 +67,9 @@ pub async fn load_route_table(
     if looks_like_json(&peek.bytes) {
         return parse_json_routes(&peek.bytes);
     }
+    if routes_iri.ends_with(".yaml") || routes_iri.ends_with(".yml") {
+        return parse_yaml_routes(&peek.bytes);
+    }
     // An RDF graph → query it through the kernel's SPARQL (dogfood).
     let select = Iri::parse("urn:sparql:select").map_err(|e| e.to_string())?;
     let request = Request::new(Verb::Source, select)
@@ -103,6 +106,21 @@ fn looks_like_json(bytes: &[u8]) -> bool {
 pub fn parse_json_routes(bytes: &[u8]) -> Result<RouteTable, String> {
     let v: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|e| format!("route JSON: {e}"))?;
+    routes_from_value(&v)
+}
+
+/// The same non-LD route shape authored in YAML — which parses to the same value tree, so it
+/// shares [`routes_from_value`]. (YAML is a superset of JSON; a Turtle graph isn't valid YAML,
+/// so YAML is selected by the resource's `.yaml`/`.yml` suffix, not by sniffing.)
+pub fn parse_yaml_routes(bytes: &[u8]) -> Result<RouteTable, String> {
+    let v: serde_json::Value =
+        serde_yaml::from_slice(bytes).map_err(|e| format!("route YAML: {e}"))?;
+    routes_from_value(&v)
+}
+
+/// Build the [`RouteTable`] from a parsed non-LD route document (JSON or YAML → the same
+/// value tree).
+fn routes_from_value(v: &serde_json::Value) -> Result<RouteTable, String> {
     let arr = v
         .get("routes")
         .and_then(|r| r.as_array())
@@ -328,6 +346,35 @@ mod tests {
         assert_eq!(cors.max_age, 600);
         // The bare home route has no cap/cors/csp.
         assert!(table.routes[0].cap.is_none() && table.routes[0].cors.is_none());
+    }
+
+    #[test]
+    fn yaml_route_file_parses_to_the_same_table() {
+        let yaml = br#"
+routes:
+  - id: api
+    order: 20
+    match: "/api/{what}"
+    target: "urn:kernel:{what}"
+    cap: [urn:cap:a, urn:cap:b]
+    cors:
+      origin: [https://app.example]
+      maxAge: 600
+  - id: home
+    order: 10
+    match: "/"
+    target: urn:host:info
+"#;
+        let table = parse_yaml_routes(yaml).unwrap();
+        assert_eq!(table.routes.len(), 2);
+        assert_eq!(table.routes[0].pattern, "/"); // order 10 first
+        let api = &table.routes[1];
+        assert_eq!(api.iri_template, "urn:kernel:{what}");
+        assert_eq!(
+            api.cap.as_deref(),
+            Some(&["urn:cap:a".to_string(), "urn:cap:b".to_string()][..])
+        );
+        assert_eq!(api.cors.as_ref().unwrap().max_age, 600);
     }
 
     #[test]
