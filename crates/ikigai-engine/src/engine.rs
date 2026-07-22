@@ -83,6 +83,7 @@ commands:
   source a [input] .. b      map: run `b` per newline-item of `a`'s output, rejoin
   source a | ( b ; c )       fork: fan the input to each branch, join their outputs
   sink <iri> [k=v …] <content>  SINK into a resource: leading k=v name declared args, the rest is content
+  source a | sink <iri> [k=v …]  pipeline write-terminal: store the piped value as the sink's content
   delete <iri> [k=v …]       DELETE a resource (the delete verb)
   describe <iri> [type]      META a resource; `type` defaults to text/turtle
   (<sexpr>)                  evaluate a Lisp form (leading `(` routes to urn:lisp:eval)
@@ -121,6 +122,7 @@ try:
   source urn:demo:split \"a,b,c\" .. urn:fn:toUpper
   source urn:demo:split \"a,b,c\" | ( urn:fn:toUpper ; urn:fn:reverseList )
   sink urn:file:notes.txt remember the milk
+  source urn:fn:toUpper hello | sink urn:file:shout.txt
   source urn:file:notes.txt
   (+ 1 2)
   (source \"urn:fn:toUpper\" \"hi\")
@@ -572,6 +574,11 @@ impl Engine {
                     let (target, args) = words.split_first().ok_or("expected an IRI")?;
                     self.run_source(target, args, incoming, prov).await
                 }
+                Node::Sink(words) => {
+                    let (target, args) = words.split_first().ok_or("`sink` needs a target IRI")?;
+                    let request = self.sink_request(target, args, incoming).await?;
+                    self.run_staged(request, Some(prov)).await
+                }
                 Node::Fork(branches) => {
                     // Concurrent path: when every branch is a lone `source` stage and a
                     // scheduler is injected, resolve them on it in parallel.
@@ -922,6 +929,56 @@ impl Engine {
             }
         }
         Ok(request)
+    }
+
+    /// Build the `Sink` [`Request`] for a `sink <iri> [key=value …]` pipeline
+    /// stage — the write dual of [`source_request`](Self::source_request). Leading
+    /// words shaped `key=value` whose key is a *declared* argument of the target
+    /// (or the reserved conneg selector `as`) are routed as named arguments; the
+    /// piped upstream value fills `content`. Unlike the top-level `sink` command,
+    /// whose content is the verbatim spec remainder, a pipeline sink's content is
+    /// the previous stage's output — so a stray positional word (which would have
+    /// nowhere to go) is a usage error rather than silent content.
+    async fn sink_request(
+        &self,
+        target: &str,
+        args: &[String],
+        incoming: Option<&str>,
+    ) -> Result<Request, String> {
+        let iri = parse_target(target)?;
+
+        // The contract is only consulted to recognise named arguments; a bare
+        // `… | sink <iri>` (content-only, the common case) skips the lookup.
+        let declared = if args.iter().any(|arg| arg.contains('=')) {
+            declared_arguments(self.describe_struct(&iri).await.as_ref())
+        } else {
+            Vec::new()
+        };
+
+        let mut request = Request::new(Verb::Sink, iri.clone());
+        for arg in args {
+            match arg.split_once('=') {
+                // `as` is the universal conneg selector (carried as an arg, not
+                // endpoint input), so it is always a named argument.
+                Some(("as", value)) => {
+                    request = request.with_arg("as", ArgRef::Inline(value.as_bytes().to_vec()));
+                }
+                Some((key, value)) if declared.iter().any(|name| name == key) => {
+                    request = request.with_arg(key, ArgRef::Inline(value.as_bytes().to_vec()));
+                }
+                _ => {
+                    return Err(format!(
+                        "`sink {}` takes its content from the pipe — name arguments with \
+                         `key=value` (unexpected `{arg}`)",
+                        iri.as_str()
+                    ))
+                }
+            }
+        }
+
+        // The piped upstream value is the content (empty if nothing flows in).
+        let content = incoming.unwrap_or("");
+        Ok(request.with_arg("content", ArgRef::Inline(content.as_bytes().to_vec())))
     }
 
     /// Report whether resolving `spec` would be served from the cache, without
@@ -1327,6 +1384,12 @@ fn single_source_branches(branches: &[Pipeline]) -> Option<Vec<&[String]>> {
 enum Node {
     /// A `source` leaf: the first word is the IRI, the rest the literal input.
     Source(Vec<String>),
+    /// A `sink` leaf: a stage written `sink <iri> [key=value …]`. The first word
+    /// is the target IRI, the rest leading named arguments; the piped upstream
+    /// value fills the sink's `content`. This is the pipeline write-terminal —
+    /// `A | B | sink <iri>` stores `B`'s output — mirroring the top-level `sink`
+    /// command, whose content instead comes verbatim from the spec.
+    Sink(Vec<String>),
     /// A `( … ; … )` fork: each branch is run on the same input, outputs joined.
     Fork(Vec<Pipeline>),
 }
@@ -1507,7 +1570,15 @@ impl Parser {
                     words.push(w.clone());
                     self.pos += 1;
                 }
-                Ok(Node::Source(words))
+                // A stage led by the bare keyword `sink` is a write-terminal:
+                // `… | sink <iri> [key=value …]` sinks the piped value into `<iri>`.
+                // (A source target is always a scheme'd IRI, never the bare word
+                // `sink`, so this keyword can't shadow a real resource.)
+                if words.first().map(String::as_str) == Some("sink") {
+                    Ok(Node::Sink(words.split_off(1)))
+                } else {
+                    Ok(Node::Source(words))
+                }
             }
             Some(Token::Close) => Err("empty fork branch or group `()`".to_string()),
             _ => Err("expected an IRI".to_string()),
@@ -2044,6 +2115,65 @@ mod tests {
             output(engine.eval("delete urn:test:write url=https://h/p")).unwrap(),
             "Delete url=https://h/p content="
         );
+    }
+
+    /// An engine with both a `toUpper` source and the `urn:test:write` sink, so a
+    /// pipeline can *produce* a value and then *store* it into a sink terminal.
+    fn pipe_sink_engine() -> Engine {
+        let endpoint = FnEndpoint::new("write", |inv: &Invocation<'_>| {
+            let url = inv.inline_str("url").unwrap_or("");
+            let content = inv.inline_str("content").unwrap_or("");
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("{:?} url={url} content={content}", inv.request.verb).into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("write")
+                .verb(Verb::Sink)
+                .input(ArgSpec::new("url").summary("the target URL"))
+                .input(ArgSpec::new("content").summary("the body")),
+        );
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:fn:toUpper"), builtins::to_upper())
+            .bind(Exact::new("urn:test:write"), endpoint);
+        Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ))
+    }
+
+    #[test]
+    fn pipeline_sink_terminal_stores_the_piped_value() {
+        // `A | sink <iri>` routes the upstream stage's output into the sink's
+        // `content` (the regression: `sink` as a non-first stage used to be read as
+        // a `source` of the bare IRI `sink` → "No scheme found").
+        let engine = pipe_sink_engine();
+        assert_eq!(
+            output(engine.eval("source urn:fn:toUpper hello | sink urn:test:write")).unwrap(),
+            "Sink url= content=HELLO"
+        );
+    }
+
+    #[test]
+    fn pipeline_sink_terminal_takes_leading_named_args_then_the_pipe() {
+        // Leading `key=value` for a declared arg is named; the pipe still fills content.
+        let engine = pipe_sink_engine();
+        assert_eq!(
+            output(engine.eval("source urn:fn:toUpper hi | sink urn:test:write url=https://h/p"))
+                .unwrap(),
+            "Sink url=https://h/p content=HI"
+        );
+    }
+
+    #[test]
+    fn pipeline_sink_terminal_rejects_a_stray_positional_word() {
+        // A piped sink's content is the pipe, so a bare (non-`key=value`) word has
+        // nowhere to go — that's a usage error, not silent content.
+        let engine = pipe_sink_engine();
+        let err =
+            output(engine.eval("source urn:fn:toUpper hi | sink urn:test:write junk")).unwrap_err();
+        assert!(err.contains("takes its content from the pipe"), "{err}");
     }
 
     #[test]
@@ -2705,6 +2835,23 @@ mod tests {
                             }],
                         },
                     ]),
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_spec_reads_a_trailing_sink_as_a_sink_node() {
+        // `source a | sink urn:x k=v` — the `sink`-led stage parses to a Sink node
+        // carrying the target IRI and its args (the keyword is stripped), not a
+        // Source of the bare word `sink`.
+        assert_eq!(
+            parse_spec("urn:a | sink urn:x k=v").unwrap(),
+            Pipeline {
+                first: Node::Source(vec!["urn:a".into()]),
+                rest: vec![Step {
+                    connector: Connector::Pipe,
+                    node: Node::Sink(vec!["urn:x".into(), "k=v".into()]),
                 }],
             }
         );
