@@ -146,6 +146,101 @@ fn the_derive_breaker_contains_a_runaway() {
     );
 }
 
+#[test]
+fn the_join_link_prefers_the_real_url_and_falls_back_to_the_notes() {
+    let mut event = ViewEvent {
+        uid: "T1".to_string(),
+        title: "Planning".to_string(),
+        start: "2026-07-23T09:00:00".to_string(),
+        end: "2026-07-23T10:00:00".to_string(),
+        all_day: false,
+        location: None,
+        description: Some(
+            "Microsoft Teams meeting\nJoin: <https://teams.microsoft.com/l/meetup-join/abc>.\nSee you there"
+                .to_string(),
+        ),
+        url: Some("https://teams.microsoft.com/l/meetup-join/primary".to_string()),
+        alerts: Vec::new(),
+    };
+    assert_eq!(
+        join_link(&event).as_deref(),
+        Some("https://teams.microsoft.com/l/meetup-join/primary"),
+        "a real Teams URL on the event wins"
+    );
+    event.url = Some("urn:not-a-teams-link".to_string());
+    assert_eq!(
+        join_link(&event).as_deref(),
+        Some("https://teams.microsoft.com/l/meetup-join/abc"),
+        "else the narrow match in the notes, unwrapped from <>. and punctuation"
+    );
+    event.description = Some("no link here".to_string());
+    assert_eq!(join_link(&event), None);
+}
+
+#[test]
+fn a_captured_invite_becomes_a_heading_with_drawers_and_a_body() {
+    let event = ViewEvent {
+        uid: "cap-1".to_string(),
+        title: "Quarterly sync".to_string(),
+        start: "2026-07-23T09:00:00".to_string(),
+        end: "2026-07-23T10:00:00".to_string(),
+        all_day: false,
+        location: Some("Microsoft Teams Meeting".to_string()),
+        description: Some(
+            "Agenda:\n* budget\n\nJoin: https://teams.microsoft.com/l/meetup-join/abc".to_string(),
+        ),
+        url: None,
+        alerts: Vec::new(),
+    };
+    let heading = org_heading(&event);
+    assert!(heading.contains(":ID: cap-1"));
+    assert!(heading.contains(":LOCATION: Microsoft Teams Meeting"));
+    assert!(heading.contains(":URL: https://teams.microsoft.com/l/meetup-join/abc"));
+    // The full description is the heading body, AFTER the stamp (body text must
+    // not be able to hijack the entry's :ID:/:ALERT: or precede the timestamp).
+    let stamp_at = heading.find("<2026-07-23").expect("stamp present");
+    let body_at = heading.find("Agenda:").expect("body present");
+    assert!(body_at > stamp_at, "body comes after the stamp: {heading}");
+    // A body line that looks like a headline gets org's comma escape.
+    assert!(
+        heading.contains(",* budget"),
+        "leading '*' must not become a new headline: {heading}"
+    );
+}
+
+#[test]
+fn a_real_url_does_not_count_as_a_change_but_the_description_does() {
+    // The view copy can never echo ical:url (its URL field is the identity
+    // token), so the source's link must not churn the diff. ical:description
+    // DOES round-trip through .notes and stays comparable.
+    let src = "@prefix ical: <http://www.w3.org/2002/12/cal/ical#> .\n\
+         @prefix ik: <https://ikigai-rs.dev/ns#> .\n\
+         <urn:event:X> ical:summary \"E\" ; ical:dtstart \"2026-07-20T10:00:00-07:00\" ; \
+         ical:dtend \"2026-07-20T11:30:00-07:00\" ; \
+         ical:description \"https://teams.microsoft.com/l/meetup-join/abc\" ; \
+         ical:url \"https://teams.microsoft.com/l/meetup-join/abc\" ; ik:calendar \"Bosatsu\" .\n";
+    let view = src
+        .replace(
+            " ical:url \"https://teams.microsoft.com/l/meetup-join/abc\" ;",
+            "",
+        )
+        .replace("\"Bosatsu\"", "\"Brian-Busy\"");
+    let sorted = |t: &str| {
+        let mut v: Vec<String> = normalize_for_diff(t).lines().map(str::to_string).collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        sorted(src),
+        sorted(&view),
+        "a source-only ical:url is not a substantive difference"
+    );
+    assert!(
+        normalize_for_diff(src).contains("description"),
+        "ical:description stays in the convergence diff"
+    );
+}
+
 // ---- the hermetic reconciliation harness ------------------------------------
 
 /// One event held by the fake calendar store, in the shape the deriver's
@@ -158,6 +253,7 @@ struct StoredEvent {
     end: String,
     all_day: bool,
     location: Option<String>,
+    description: Option<String>,
     alerts: Vec<u32>,
 }
 
@@ -177,6 +273,9 @@ impl StoredEvent {
         }
         if let Some(loc) = &self.location {
             props.push(format!("ical:location {}", ttl(loc)));
+        }
+        if let Some(description) = &self.description {
+            props.push(format!("ical:description {}", ttl(description)));
         }
         for minutes in &self.alerts {
             props.push(format!("ik:alert {minutes}"));
@@ -259,6 +358,7 @@ impl Endpoint for FakeCalendar {
                         .map(|v| v == "true")
                         .unwrap_or(false),
                     location: inv.inline_str("location").ok().map(str::to_string),
+                    description: inv.inline_str("description").ok().map(str::to_string),
                     alerts,
                 };
                 self.store.lock().unwrap().insert((calendar, uid), event);
@@ -425,6 +525,7 @@ fn event(uid: &str, title: &str, start: &str, end: &str) -> StoredEvent {
         end: end.to_string(),
         all_day: false,
         location: None,
+        description: None,
         alerts: Vec::new(),
     }
 }
@@ -559,6 +660,43 @@ fn a_second_pass_is_a_no_op() {
         calendar.events_in("View").len(),
         1,
         "still exactly one event"
+    );
+}
+
+#[test]
+fn a_linked_event_carries_its_description_and_converges() {
+    // An org event whose :URL: drawer emitted the join link as ical:description:
+    // the pass must write it into the view copy (the wife's join button), and —
+    // because the fake store echoes it back like EKEvent .notes does — the
+    // second pass must converge instead of delete-recreating the linked event.
+    let mut linked = event(
+        "L1",
+        "Planning call",
+        "2026-07-23T09:00:00",
+        "2026-07-23T10:00:00",
+    );
+    linked.description = Some("https://teams.microsoft.com/l/meetup-join/abc".to_string());
+    linked.location = Some("Microsoft Teams Meeting".to_string());
+    let desired = format!("{ORG_HEADER}{}", linked.to_turtle());
+    let (kernel, calendar) = harness(&desired);
+
+    let first = derive(&kernel);
+    assert!(
+        first.contains("created 1 · removed 0"),
+        "first pass creates the linked event: {first}"
+    );
+    let view = calendar.events_in("View");
+    assert_eq!(
+        view[0].description.as_deref(),
+        Some("https://teams.microsoft.com/l/meetup-join/abc"),
+        "the join link landed in the view copy's notes"
+    );
+    assert_eq!(view[0].location.as_deref(), Some("Microsoft Teams Meeting"));
+
+    let second = derive(&kernel);
+    assert!(
+        second.contains("created 0 · removed 0"),
+        "a linked event round-trips and converges: {second}"
     );
 }
 
