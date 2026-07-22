@@ -447,6 +447,30 @@ impl SpaceReactor {
         (!uri.is_empty()).then(|| uri.to_string())
     }
 
+    /// The capability a space's handler runs under: the scopes listed in `<root>/<name>/cap`
+    /// (one per line; blank lines and `#` comments ignored), else the reactor's default. This
+    /// is how a space grants its handler *exactly* the authority it needs — the bookings space
+    /// grants `{urn:cap:lisp, urn:cap:personal:calendar:read:freebusy, urn:cap:llm, urn:cap:space:out}`
+    /// — never root, never the dropper's. Same inspectable file convention as `handler`.
+    fn capability_for(&self, name: &str) -> Capability {
+        match std::fs::read_to_string(self.root.join(name).join("cap")) {
+            Ok(raw) => {
+                let scopes: Vec<String> = raw
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .map(String::from)
+                    .collect();
+                if scopes.is_empty() {
+                    self.capability.clone()
+                } else {
+                    Capability::scoped(scopes)
+                }
+            }
+            Err(_) => self.capability.clone(),
+        }
+    }
+
     /// Process every pending tuple in a space's inbox — the startup catch-up pass, and the
     /// deterministic entry the live watcher and the tests both drive. Returns each
     /// `(tuple id, outcome)`.
@@ -495,7 +519,7 @@ impl SpaceReactor {
                 ikigai_resolve::Resolver::issue_as(
                     self.resolver.as_ref(),
                     request,
-                    &self.capability,
+                    &self.capability_for(name),
                 )
                 .map(|_| ())
                 .map_err(|e| e.to_string())
@@ -1101,6 +1125,40 @@ mod tests {
             None
         );
         assert_eq!(inbox_tuple(root, Path::new("/elsewhere/x.tuple")), None);
+    }
+
+    #[test]
+    fn a_space_cap_file_overrides_the_reactor_default() {
+        // A space's `cap` file grants its handler exactly the authority it needs — the
+        // booking payoff's per-space cap. When present, it wins over the reactor default.
+        let root = reactive_root("react-percap", "jobs", "urn:test:handler");
+        std::fs::write(
+            root.join("jobs").join("cap"),
+            "urn:cap:from-file\n# a comment, and a blank line below\n\n",
+        )
+        .unwrap();
+        let k = Kernel::new(Arc::new(space(root.clone())));
+        let cap = Capability::scoped(vec![CAP_OUT.to_string()]);
+        let id = out(&k, &cap, "urn:space:jobs", b"work");
+
+        let mock = Arc::new(MockResolver::new(true));
+        // The reactor default is urn:cap:demo — the cap file must win over it.
+        let reactor = SpaceReactor::new(
+            root,
+            mock.clone(),
+            Capability::scoped(vec!["urn:cap:demo".to_string()]),
+        );
+        assert_eq!(reactor.process("jobs", &id), Outcome::Handled);
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].1.allows("urn:cap:from-file"),
+            "the cap file's scope is granted"
+        );
+        assert!(
+            !calls[0].1.allows("urn:cap:demo"),
+            "the reactor default is NOT used when a cap file is present"
+        );
     }
 
     #[test]
