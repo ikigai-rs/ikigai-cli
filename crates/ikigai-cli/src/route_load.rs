@@ -1,10 +1,12 @@
 //! Load an [`ikigai_web::RouteTable`] from an RDF route resource (e.g. `urn:web:routes`).
 //!
-//! The route table is *authored data* — a graph of `ik:Route` nodes — so it's queried
-//! through the kernel's own SPARQL (`urn:sparql:select` over the route graph) rather than
-//! parsed with a bespoke RDF reader wired into the HTTP transport. The route resource is
-//! resolved by IRI, so it can be a watched file (`urn:file:web/routes.ttl` → golden-thread
-//! reload), a mounted config resource, or anything else the kernel can `Source`.
+//! The route table is *authored data*. An RDF route graph (`ik:Route` nodes, in Turtle /
+//! JSON-LD / …) is queried through the kernel's own SPARQL (`urn:sparql:select`) rather than
+//! parsed with a bespoke RDF reader in the transport. A plain **non-LD JSON** route file is
+//! parsed directly — the LD-allergy authoring face — so a developer can write routes without
+//! touching RDF. The loader sniffs which it is. The route resource is resolved by IRI, so it
+//! can be a watched file (`urn:file:web/routes.ttl` → hot-reload), a mounted config resource,
+//! or anything else the kernel can `Source`.
 
 use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request, Verb};
 use ikigai_web::{CorsPolicy, Route, RouteTable};
@@ -48,12 +50,24 @@ pub fn watch_path(routes_iri: &str, file_root: &std::path::Path) -> Option<std::
         .map(|rel| file_root.join(rel.trim_start_matches('/')))
 }
 
-/// Query `routes_iri` through the kernel's SPARQL and build the [`RouteTable`].
+/// Load the [`RouteTable`] from `routes_iri`, choosing the parser by format: a plain-JSON
+/// route file (the non-LD authoring face) is parsed directly; anything else is treated as an
+/// RDF route graph and queried through the kernel's SPARQL.
 pub async fn load_route_table(
     kernel: &Kernel,
     routes_iri: &str,
     cap: &Capability,
 ) -> Result<RouteTable, String> {
+    // Peek the resource to pick the format.
+    let iri = Iri::parse(routes_iri).map_err(|e| format!("bad routes IRI `{routes_iri}`: {e}"))?;
+    let peek = kernel
+        .issue(Request::new(Verb::Source, iri), cap)
+        .await
+        .map_err(|e| format!("resolving {routes_iri}: {e}"))?;
+    if looks_like_json(&peek.bytes) {
+        return parse_json_routes(&peek.bytes);
+    }
+    // An RDF graph → query it through the kernel's SPARQL (dogfood).
     let select = Iri::parse("urn:sparql:select").map_err(|e| e.to_string())?;
     let request = Request::new(Verb::Source, select)
         .with_arg("query", ArgRef::Inline(ROUTE_QUERY.as_bytes().to_vec()))
@@ -63,6 +77,94 @@ pub async fn load_route_table(
         .await
         .map_err(|e| format!("querying {routes_iri}: {e}"))?;
     parse_route_solutions(&repr.bytes)
+}
+
+/// The first non-whitespace byte is `{` — a JSON object (the non-LD route face). A Turtle
+/// graph never starts that way (`@prefix`, `<…>`, `#`, `PREFIX`…), so this cleanly splits the
+/// two authoring formats without a media-type dependency.
+fn looks_like_json(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .map(|b| *b == b'{')
+        .unwrap_or(false)
+}
+
+/// Parse the plain non-LD route JSON directly into a [`RouteTable`] — no `@`-noise, no RDF:
+/// the LD-allergy authoring face. Shape:
+///
+/// ```json
+/// { "routes": [ { "match": "/book/{host}", "target": "urn:schedule:{host}",
+///                 "order": 10, "cap": ["urn:cap:…"], "csp": "…",
+///                 "cors": { "origin": ["https://…"], "maxAge": 600 } } ] }
+/// ```
+///
+/// Extra keys (e.g. a friendly `"id"`) are ignored; `order` sorts (first-match-wins).
+pub fn parse_json_routes(bytes: &[u8]) -> Result<RouteTable, String> {
+    let v: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| format!("route JSON: {e}"))?;
+    let arr = v
+        .get("routes")
+        .and_then(|r| r.as_array())
+        .ok_or_else(|| "route JSON: missing a `routes` array".to_string())?;
+    let strs = |val: &serde_json::Value, k: &str| -> Vec<String> {
+        val.get(k)
+            .and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut ordered: Vec<(i64, Route)> = Vec::new();
+    for r in arr {
+        let (pattern, iri_template) = match (
+            r.get("match").and_then(|x| x.as_str()),
+            r.get("target").and_then(|x| x.as_str()),
+        ) {
+            (Some(m), Some(t)) => (m.to_string(), t.to_string()),
+            _ => continue,
+        };
+        let cors = r.get("cors").filter(|c| c.is_object()).and_then(|c| {
+            let origins = strs(c, "origin");
+            let methods = strs(c, "method");
+            let headers = strs(c, "header");
+            let credentials = c
+                .get("credentials")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false);
+            let max_age = c.get("maxAge").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+            let empty = origins.is_empty()
+                && methods.is_empty()
+                && headers.is_empty()
+                && !credentials
+                && max_age == 0;
+            (!empty).then_some(CorsPolicy {
+                allowed_origins: origins,
+                allowed_methods: methods,
+                allowed_headers: headers,
+                allow_credentials: credentials,
+                max_age,
+            })
+        });
+        let caps = strs(r, "cap");
+        let order = r.get("order").and_then(|x| x.as_i64()).unwrap_or(0);
+        ordered.push((
+            order,
+            Route {
+                pattern,
+                iri_template,
+                cap: (!caps.is_empty()).then_some(caps),
+                cors,
+                csp: r.get("csp").and_then(|x| x.as_str()).map(String::from),
+            },
+        ));
+    }
+    ordered.sort_by_key(|(o, _)| *o);
+    Ok(RouteTable::new(
+        ordered.into_iter().map(|(_, r)| r).collect(),
+    ))
 }
 
 /// Parse SPARQL SELECT results (`application/sparql-results+json`) into a [`RouteTable`].
@@ -198,6 +300,44 @@ mod tests {
     fn no_bindings_is_an_empty_table() {
         let json = br#"{"head":{"vars":[]},"results":{"bindings":[]}}"#;
         assert_eq!(parse_route_solutions(json).unwrap().routes.len(), 0);
+    }
+
+    #[test]
+    fn json_route_file_parses_directly() {
+        let json = br#"{
+          "routes": [
+            { "id": "api", "order": 20, "match": "/api/{what}", "target": "urn:kernel:{what}",
+              "cap": ["urn:cap:a", "urn:cap:b"],
+              "cors": { "origin": ["https://app.example"], "maxAge": 600 } },
+            { "id": "home", "order": 10, "match": "/", "target": "urn:host:info" }
+          ]
+        }"#;
+        let table = parse_json_routes(json).unwrap();
+        assert_eq!(table.routes.len(), 2);
+        // sorted by order → home (10) first, api (20) second
+        assert_eq!(table.routes[0].pattern, "/");
+        assert_eq!(table.routes[1].pattern, "/api/{what}");
+        let api = &table.routes[1];
+        assert_eq!(api.iri_template, "urn:kernel:{what}");
+        assert_eq!(
+            api.cap.as_deref(),
+            Some(&["urn:cap:a".to_string(), "urn:cap:b".to_string()][..])
+        );
+        let cors = api.cors.as_ref().unwrap();
+        assert_eq!(cors.allowed_origins, vec!["https://app.example"]);
+        assert_eq!(cors.max_age, 600);
+        // The bare home route has no cap/cors/csp.
+        assert!(table.routes[0].cap.is_none() && table.routes[0].cors.is_none());
+    }
+
+    #[test]
+    fn looks_like_json_splits_the_formats() {
+        assert!(looks_like_json(b"  \n { \"routes\": [] }"));
+        assert!(!looks_like_json(
+            b"@prefix ik: <https://ikigai-rs.dev/ns#> ."
+        ));
+        assert!(!looks_like_json(b"# a comment\n@prefix ik: <...> ."));
+        assert!(!looks_like_json(b""));
     }
 
     #[test]

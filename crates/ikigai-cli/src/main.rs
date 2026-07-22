@@ -36,7 +36,8 @@ usage:
   ikigai serve <q> --cap <s>   serve under a fixed capability ceiling <s> every client is clamped to
   ikigai serve --http <port>   serve the inbound HTTP face (loopback; front with TLS at your proxy)
                                [--trust-proxy: honor X-Forwarded-*; --cors-origin <o>: allow a CORS origin;
-                                --routes <iri>: load the ik:Route table (a urn:file: route hot-reloads)]
+                                --routes <iri>: load routes from an RDF or plain-JSON resource
+                                (a urn:file: route hot-reloads on change)]
   ikigai --daemon              headless: timers, the watcher, and the standing sync — for launchd
   ikigai --name <instance>     name this instance (scopes <name>.* config properties; defaults
                                repl / daemon / serve by mode)
