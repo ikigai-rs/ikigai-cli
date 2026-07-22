@@ -10,6 +10,11 @@ publish = false
 
 [dependencies]
 ikigai-core = { workspace = true }
+# The reactor fires a space's handler by resolving it through a kernel handle — held
+# behind the Resolver trait (like the time transport's JobRegistry), installed after the
+# kernel is built. The handler runs under the reactor's OWN configured capability, never
+# the dropper's.
+ikigai-resolve = { workspace = true }
 async-trait = "0.1"
 # Content-addressed tuple ids (same hash family core uses for content addressing).
 blake3 = "1"
