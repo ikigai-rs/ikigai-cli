@@ -1685,6 +1685,10 @@ fn root_space_with_mounts(
         // tools that build ikigai.
         Arc::new(ikigai_repo::space()) as Arc<dyn Space>,
         Arc::new(ikigai_sparql::space()) as Arc<dyn Space>,
+        // The intray / tuplespace (urn:space:{name}: out=Sink, rd=Source) — a dir-backed
+        // space under file_root/spaces/. The scheduling booking-inbox drops into it; the
+        // reactive/sealed slices land on top. Cap-gated (urn:cap:space:out / :read).
+        Arc::new(ikigai_intray::space(file_root().join("spaces"))) as Arc<dyn Space>,
         // Neutral s-expr → SPARQL transreptor (urn:sparql:from-sexpr, text/x-sexpr →
         // application/sparql-query): pipe an s-expr query in, feed the emitted SPARQL to
         // urn:sparql:select. A pure transreptor (no lisp engine); safe in the shared space.

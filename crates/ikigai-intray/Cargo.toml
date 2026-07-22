@@ -1,0 +1,18 @@
+[package]
+name = "ikigai-intray"
+description = "The intray as a tuplespace: urn:space:{name} — Sink drops a tuple (out), Source lists or reads one (rd). A physical, capability-gated space; later slices add take, associative match, the reactive engine, and encrypt-on-drop."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+ikigai-core = { workspace = true }
+async-trait = "0.1"
+# Content-addressed tuple ids (same hash family core uses for content addressing).
+blake3 = "1"
+
+[dev-dependencies]
+futures = { workspace = true }
