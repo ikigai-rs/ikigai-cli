@@ -15,6 +15,9 @@ ikigai-core = { workspace = true }
 # kernel is built. The handler runs under the reactor's OWN configured capability, never
 # the dropper's.
 ikigai-resolve = { workspace = true }
+# The live watcher fires the reactor on each drop — the same fs-notify the embedded host
+# already uses for golden-thread freshness. Native/embedded-only, like the rest of this crate.
+notify = "6"
 async-trait = "0.1"
 # Content-addressed tuple ids (same hash family core uses for content addressing).
 blake3 = "1"
