@@ -37,7 +37,7 @@ usage:
   ikigai serve --http <port>   serve the inbound HTTP face (loopback; front with TLS at your proxy)
                                [--trust-proxy: honor X-Forwarded-*; --cors-origin <o>: allow a CORS origin;
                                 --routes <iri>: load routes from an RDF or plain-JSON resource
-                                (a urn:file: route hot-reloads on change)]
+                                (a urn:file: route hot-reloads); --routes-only: un-routed → 404]
   ikigai --daemon              headless: timers, the watcher, and the standing sync — for launchd
   ikigai --name <instance>     name this instance (scopes <name>.* config properties; defaults
                                repl / daemon / serve by mode)
@@ -95,6 +95,9 @@ enum Mode {
         /// `--routes <iri>`: load the route table from this RDF resource (`ik:Route` graph),
         /// e.g. `urn:web:routes` or a watched `urn:file:web/routes.ttl`.
         routes: Option<String>,
+        /// `--routes-only`: an un-routed path 404s instead of falling through to the mechanical
+        /// default — the route table becomes an exhaustive allow-list (the public-edge posture).
+        routes_only: bool,
     },
     /// Serve the capability-scoped manifold as an MCP (Model Context Protocol)
     /// server over stdio. `grants`/`scopes` union into the session capability —
@@ -243,6 +246,7 @@ fn parse_args() -> Result<Option<Mode>, String> {
         let mut trust_proxy = false;
         let mut cors_origins = Vec::new();
         let mut routes = None;
+        let mut routes_only = false;
         while let Some(arg) = argv.next() {
             if cert_flag(&arg, &mut argv, &mut certs)? {
                 continue;
@@ -287,6 +291,10 @@ fn parse_args() -> Result<Option<Mode>, String> {
                 );
                 continue;
             }
+            if arg == "--routes-only" {
+                routes_only = true;
+                continue;
+            }
             if arg.starts_with('-') {
                 return Err(format!("unknown argument: {arg}"));
             } else if target.is_none() {
@@ -303,6 +311,7 @@ fn parse_args() -> Result<Option<Mode>, String> {
             trust_proxy,
             cors_origins,
             routes,
+            routes_only,
         }));
     }
 
@@ -443,11 +452,17 @@ fn main() {
             trust_proxy,
             cors_origins,
             routes,
+            routes_only,
         } => match (http, target.as_deref()) {
             // The inbound HTTP face takes precedence over IPC/QUIC when `--http` is given.
-            (Some(bind), _) => {
-                serve_http(&bind, &caps, trust_proxy, &cors_origins, routes.as_deref())
-            }
+            (Some(bind), _) => serve_http(
+                &bind,
+                &caps,
+                trust_proxy,
+                &cors_origins,
+                routes.as_deref(),
+                routes_only,
+            ),
             (None, Some(t)) if is_quic(t) => serve_quic(t, &certs, &caps),
             (None, _) if !caps.is_empty() => {
                 eprintln!("ikigai: --cap sets a per-connection ceiling and needs a quic:// target");
@@ -1012,6 +1027,7 @@ fn serve_http(
     trust_proxy: bool,
     cors_origins: &[String],
     routes: Option<&str>,
+    routes_only: bool,
 ) -> ! {
     use std::net::SocketAddr;
     let addr: SocketAddr = if let Ok(port) = bind.parse::<u16>() {
@@ -1042,6 +1058,7 @@ fn serve_http(
     // to named origins (closed otherwise).
     let mut config = ikigai_web::EdgeConfig {
         trust_proxy,
+        routes_only,
         ..Default::default()
     };
     config.cors.allowed_origins = cors_origins.to_vec();
@@ -1119,6 +1136,11 @@ fn serve_http(
         }
         None => "mechanical routing".to_string(),
     };
+    let route_note = if routes_only {
+        format!("{route_note}, routes-only (un-routed → 404)")
+    } else {
+        route_note
+    };
     let cors_note = if cors_origins.is_empty() {
         "CORS closed".to_string()
     } else {
@@ -1148,6 +1170,7 @@ fn serve_http(
     _trust_proxy: bool,
     _cors_origins: &[String],
     _routes: Option<&str>,
+    _routes_only: bool,
 ) -> ! {
     eprintln!("ikigai: the inbound HTTP face needs the `web` feature (build with --features web)");
     std::process::exit(1);
