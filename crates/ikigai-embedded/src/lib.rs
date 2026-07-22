@@ -1832,6 +1832,22 @@ pub fn watched_kernel_with_mounts(
     // module's tests if brought into scope.
     let registry = time_registry();
     registry.set_resolver(Arc::clone(&kernel) as Arc<dyn ikigai_resolve::Resolver>);
+    // The reactive tuplespace: watch file_root/spaces and fire each reactive space's handler
+    // on a drop (inbox → outbox/error). Like the scheduler, it holds the kernel as a Resolver
+    // installed now that the kernel exists. Handlers run under a SCOPED processing authority —
+    // the tuplespace verbs only, so a handler can compose within the fabric (drop results,
+    // read/take from spaces) but not touch fs/net/exec — NEVER root, NEVER the dropper's cap.
+    // A space with no `handler` file is left alone, so this is safe over the whole tree.
+    let reactor = Arc::new(ikigai_intray::SpaceReactor::new(
+        file_root().join("spaces"),
+        Arc::clone(&kernel) as Arc<dyn ikigai_resolve::Resolver>,
+        ikigai_core::Capability::scoped(vec![
+            ikigai_intray::CAP_OUT.to_string(),
+            ikigai_intray::CAP_READ.to_string(),
+            ikigai_intray::CAP_TAKE.to_string(),
+        ]),
+    ));
+    reactor.watch();
     // Register the tab-bar clock's 1s timer as a PERSISTENT time-transport job, so it
     // shows on the Control tab's Time-jobs readout (the cache demo, live) and a demo
     // cancel-all leaves it running. Mirrors the browser nav clock.

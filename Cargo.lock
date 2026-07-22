@@ -2440,6 +2440,7 @@ dependencies = [
  "futures",
  "ikigai-core",
  "ikigai-resolve",
+ "notify",
  "oxigraph",
 ]
 

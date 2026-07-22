@@ -18,12 +18,14 @@
 //! than Linda's positional match — the whole graph-pattern language, not field equality —
 //! and a non-RDF tuple simply never matches a template (take it by id or FIFO instead).
 //!
-//! The space is *physical and inspectable* — tuples are files under a jailed root — which
-//! is the seed of the inbox/outbox/error state machine. Later slices add the **reactive
-//! engine** (a watcher fires a handler on drop; inbox→outbox→error) and **encrypt-on-drop**
-//! (sign-then-encrypt to the owner's key — both primitives already shipped). Two things
-//! Linda never had and this does: `out`/`take` are **capability-gated**, and tuples can be
-//! **sealed** so the space holds ciphertext it cannot read.
+//! The space is *physical and inspectable* — tuples are files under a jailed root, moving
+//! through an **inbox → outbox → error** state machine. The [`SpaceReactor`] makes a space
+//! ACTIVE (Linda's `eval`): a `handler` file names a URI, and a dropped tuple is claimed,
+//! fired at that handler under the reactor's own scoped authority, and moved to `outbox`
+//! (handled) or `error` (dead-letter). A later slice adds **encrypt-on-drop** (sign-then-
+//! encrypt to the owner's key — both primitives already shipped). Two things Linda never had
+//! and this does: `out`/`take` are **capability-gated**, and tuples can be **sealed** so the
+//! space holds ciphertext it cannot read.
 #![forbid(unsafe_code)]
 
 use async_trait::async_trait;
@@ -31,6 +33,7 @@ use ikigai_core::{
     ActionSpec, ArgRef, Capability, Description, Endpoint, EndpointSpace, Error, Invocation, Iri,
     ReprType, Representation, Request, Result, UriTemplate, Verb,
 };
+use notify::{RecursiveMode, Watcher};
 use oxigraph::io::{RdfFormat, RdfParser};
 use oxigraph::sparql::{QueryResults, SparqlEvaluator};
 use oxigraph::store::Store;
@@ -478,8 +481,15 @@ impl SpaceReactor {
         // dead-letters the tuple rather than losing it.
         let result = match Iri::parse(&handler) {
             Ok(iri) => {
+                // Offer the tuple under BOTH conventional piped-input names — `content`
+                // (CLAUDE.md's piped-fallback) and `in` (the text/engine family) — since
+                // extra args are tolerated and endpoints split between the two. (A fuller
+                // version would Meta-describe the handler and route to its sole declared
+                // input, the way the engine pipes a value; that needs structured describe
+                // access the Resolver doesn't expose yet.)
                 let request = Request::new(Verb::Source, iri)
-                    .with_arg("content", ArgRef::Inline(bytes))
+                    .with_arg("content", ArgRef::Inline(bytes.clone()))
+                    .with_arg("in", ArgRef::Inline(bytes))
                     .with_arg("space", ArgRef::Inline(name.as_bytes().to_vec()))
                     .with_arg("tuple", ArgRef::Inline(id.as_bytes().to_vec()));
                 ikigai_resolve::Resolver::issue_as(
@@ -540,6 +550,78 @@ impl SpaceReactor {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(format!("claim: {e}")),
         }
+    }
+
+    /// The names of the spaces currently on disk (the immediate subdirectories of `root`).
+    fn space_names(&self) -> Vec<String> {
+        match std::fs::read_dir(&self.root) {
+            Ok(entries) => entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| e.file_name().to_str().map(String::from))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Go live: drain what's already pending (startup catch-up), then watch the spaces root
+    /// and `process` each tuple as it lands. Returns immediately; the watch runs on a
+    /// background thread for the life of the process (the `Arc<Self>` keeps the reactor alive).
+    /// A non-reactive space (no `handler` file) is simply skipped — this is safe to call over
+    /// the whole tree.
+    pub fn watch(self: Arc<Self>) {
+        for name in self.space_names() {
+            let _ = self.drain(&name);
+        }
+        // Canonicalize so the paths `notify` reports (it resolves symlinks — macOS maps
+        // /var → /private/var) line up with `root` when we strip the prefix.
+        let root = self
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| self.root.clone());
+        std::fs::create_dir_all(&root).ok();
+        std::thread::spawn(move || {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut watcher = match notify::recommended_watcher(move |res| {
+                let _ = tx.send(res);
+            }) {
+                Ok(w) => w,
+                Err(_) => return,
+            };
+            if watcher.watch(&root, RecursiveMode::Recursive).is_err() {
+                return;
+            }
+            // `watcher` is held to the end of this scope, keeping the watch alive; the loop
+            // blocks until the process exits.
+            for event in rx.iter().flatten() {
+                if event.kind.is_access() {
+                    continue; // a read doesn't add a tuple
+                }
+                for path in &event.paths {
+                    if let Some((name, id)) = inbox_tuple(&root, path) {
+                        self.process(&name, &id);
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Map a filesystem path to the `(space, tuple id)` it names, iff it is a tuple freshly in an
+/// inbox: `<root>/<space>/inbox/<id>.tuple`. Anything else (an outbox move, a staging file, a
+/// handler edit) yields `None`, so the watcher only fires on genuine drops.
+fn inbox_tuple(root: &Path, path: &Path) -> Option<(String, String)> {
+    let rel = path.strip_prefix(root).ok()?;
+    let parts: Vec<&str> = rel
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    match parts.as_slice() {
+        [space, "inbox", file] => {
+            let id = file.strip_suffix(".tuple")?;
+            Some((space.to_string(), id.to_string()))
+        }
+        _ => None,
     }
 }
 
@@ -994,6 +1076,31 @@ mod tests {
             id,
             "tuple stays in inbox"
         );
+    }
+
+    #[test]
+    fn inbox_tuple_matches_only_genuine_drops() {
+        let root = Path::new("/spaces");
+        // A real drop: <root>/<space>/inbox/<id>.tuple
+        assert_eq!(
+            inbox_tuple(root, Path::new("/spaces/jobs/inbox/abc123.tuple")),
+            Some(("jobs".to_string(), "abc123".to_string()))
+        );
+        // Not a drop: an outbox move, a staging file, the handler, a non-tuple, outside root.
+        assert_eq!(
+            inbox_tuple(root, Path::new("/spaces/jobs/outbox/abc.tuple")),
+            None
+        );
+        assert_eq!(
+            inbox_tuple(root, Path::new("/spaces/jobs/.processing/abc.tuple")),
+            None
+        );
+        assert_eq!(inbox_tuple(root, Path::new("/spaces/jobs/handler")), None);
+        assert_eq!(
+            inbox_tuple(root, Path::new("/spaces/jobs/inbox/abc.err")),
+            None
+        );
+        assert_eq!(inbox_tuple(root, Path::new("/elsewhere/x.tuple")), None);
     }
 
     #[test]
