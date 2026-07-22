@@ -36,7 +36,7 @@ usage:
   ikigai serve <q> --cap <s>   serve under a fixed capability ceiling <s> every client is clamped to
   ikigai serve --http <port>   serve the inbound HTTP face (loopback; front with TLS at your proxy)
                                [--trust-proxy: honor X-Forwarded-*; --cors-origin <o>: allow a CORS origin;
-                                --routes <iri>: load the ik:Route table from an RDF resource]
+                                --routes <iri>: load the ik:Route table (a urn:file: route hot-reloads)]
   ikigai --daemon              headless: timers, the watcher, and the standing sync — for launchd
   ikigai --name <instance>     name this instance (scopes <name>.* config properties; defaults
                                repl / daemon / serve by mode)
@@ -1057,24 +1057,63 @@ fn serve_http(
     };
     // `--routes <iri>`: load the route table from an RDF resource, queried through the
     // kernel's SPARQL on a plain (no-daemon) loader kernel. A load failure is fatal — a
-    // misconfigured edge should not silently fall back to the bare default routing.
+    // misconfigured edge should not silently fall back to the bare default routing. When the
+    // resource is a `urn:file:` route file, a poller hot-reloads it on change (no restart).
     let route_note = match routes {
         Some(iri) => {
             let loader = ikigai_embedded::kernel();
-            match runtime.block_on(route_load::load_route_table(
+            let table = match runtime.block_on(route_load::load_route_table(
                 &loader,
                 iri,
                 &ikigai_core::Capability::root(),
             )) {
-                Ok(table) => {
-                    let n = table.routes.len();
-                    config.routes = table;
-                    format!("{n} route(s) from {iri}")
-                }
+                Ok(t) => t,
                 Err(e) => {
                     eprintln!("ikigai: route load failed ({e})");
                     std::process::exit(1);
                 }
+            };
+            let n = table.routes.len();
+            let live = ikigai_web::live_routes(table);
+            config.live_routes = Some(live.clone());
+
+            // Hot-reload: poll the watched file's mtime; on change re-query on a FRESH kernel
+            // (so no stale cache) and swap the live handle.
+            if let Some(path) = route_load::watch_path(iri, &ikigai_embedded::file_root()) {
+                let iri_owned = iri.to_string();
+                runtime.spawn(async move {
+                    let mtime =
+                        |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+                    let mut last = mtime(&path);
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        let now = mtime(&path);
+                        if now == last {
+                            continue;
+                        }
+                        last = now;
+                        let loader = ikigai_embedded::kernel();
+                        match route_load::load_route_table(
+                            &loader,
+                            &iri_owned,
+                            &ikigai_core::Capability::root(),
+                        )
+                        .await
+                        {
+                            Ok(t) => {
+                                let m = t.routes.len();
+                                ikigai_web::swap_routes(&live, t);
+                                eprintln!("ikigai: reloaded {m} route(s) from {iri_owned}");
+                            }
+                            Err(e) => eprintln!(
+                                "ikigai: route reload failed ({e}) — keeping the current table"
+                            ),
+                        }
+                    }
+                });
+                format!("{n} route(s) from {iri}, watching")
+            } else {
+                format!("{n} route(s) from {iri}")
             }
         }
         None => "mechanical routing".to_string(),
