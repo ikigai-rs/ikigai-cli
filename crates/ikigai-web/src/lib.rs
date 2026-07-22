@@ -91,6 +91,28 @@ pub struct EdgeConfig {
     /// The route table: path patterns → IRI templates, with optional per-route cap/CORS/CSP.
     /// Default empty → every path uses the mechanical `/noun/partition/key` → `urn:` default.
     pub routes: RouteTable,
+    /// A live, swappable route handle for hot-reload. When set, it supersedes `routes` and
+    /// the host may swap it (e.g. when a watched route file changes) without a restart; each
+    /// request reads whatever the handle currently holds. `None` → the static `routes`.
+    pub live_routes: Option<LiveRoutes>,
+}
+
+/// A shared, swappable [`RouteTable`] for hot-reload. The server reads the current table per
+/// request (a cheap `Arc` clone); the host swaps it in place via
+/// [`swap_routes`](LiveRoutes) — no restart. Build one with [`live_routes`].
+pub type LiveRoutes = Arc<std::sync::RwLock<Arc<RouteTable>>>;
+
+/// Wrap a [`RouteTable`] in a swappable [`LiveRoutes`] handle. Keep a clone to `store` an
+/// updated table into later (the server holds the other clone).
+pub fn live_routes(table: RouteTable) -> LiveRoutes {
+    Arc::new(std::sync::RwLock::new(Arc::new(table)))
+}
+
+/// Swap the table a [`LiveRoutes`] handle serves. Takes effect on the next request.
+pub fn swap_routes(handle: &LiveRoutes, table: RouteTable) {
+    if let Ok(mut w) = handle.write() {
+        *w = Arc::new(table);
+    }
 }
 
 impl Default for EdgeConfig {
@@ -100,6 +122,7 @@ impl Default for EdgeConfig {
             security: Some(SecurityHeaders::default()),
             cors: CorsPolicy::default(),
             routes: RouteTable::default(),
+            live_routes: None,
         }
     }
 }
@@ -244,6 +267,9 @@ struct Shared {
     kernel: Arc<Kernel>,
     cap_fn: CapFn,
     config: EdgeConfig,
+    /// The live route table read per request — the config's `live_routes` handle, or a
+    /// fresh wrap of its static `routes`. Reading is a cheap `Arc` clone.
+    routes: LiveRoutes,
     /// IRIs deleted through this server, with when — a resource we already deleted
     /// answers a repeat DELETE with 204 (idempotent) rather than 404, for a bounded
     /// window. In-process only (lost on restart); a persistent ledger is a later step.
@@ -269,10 +295,17 @@ pub async fn serve_with(
     addr: SocketAddr,
     config: EdgeConfig,
 ) -> std::io::Result<()> {
+    // The live route handle: the config's own (so the host can hot-swap it), or a fresh
+    // wrap of the static routes when no live handle was supplied.
+    let routes = config
+        .live_routes
+        .clone()
+        .unwrap_or_else(|| live_routes(config.routes.clone()));
     let shared = Arc::new(Shared {
         kernel,
         cap_fn,
         config,
+        routes,
         tombstones: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
     let listener = TcpListener::bind(addr).await?;
@@ -377,7 +410,13 @@ async fn handle(mut sock: TcpStream, shared: Arc<Shared>) -> std::io::Result<()>
 
     // Resolve the route once; it drives the target IRI + per-route cap (in respond) and the
     // per-route CORS/CSP (in the policy layer). No match → the mechanical default throughout.
-    let matched = shared.config.routes.match_path(&req.path);
+    // Read the current route table (hot-swappable); a cheap Arc clone, held only for the match.
+    let table = shared
+        .routes
+        .read()
+        .map(|g| Arc::clone(&g))
+        .unwrap_or_else(|_| Arc::new(RouteTable::default()));
+    let matched = table.match_path(&req.path);
     let mut resp = respond(&shared, &req, matched.as_ref()).await;
     apply_edge_policy(&mut resp, &shared.config, &req, matched.as_ref());
     write(&mut sock, resp).await

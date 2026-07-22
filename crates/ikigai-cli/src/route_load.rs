@@ -39,6 +39,15 @@ GROUP BY ?route ?match ?target ?order ?csp ?corsCredentials ?corsMaxAge
 ORDER BY ?order
 "#;
 
+/// If `routes_iri` is a `urn:file:<rel>` resource, its path under `file_root` — the file to
+/// watch for hot-reload. Other IRIs (a mounted config resource, a remote) have no local
+/// mtime to poll, so they return `None` (loaded once, no auto-reload).
+pub fn watch_path(routes_iri: &str, file_root: &std::path::Path) -> Option<std::path::PathBuf> {
+    routes_iri
+        .strip_prefix("urn:file:")
+        .map(|rel| file_root.join(rel.trim_start_matches('/')))
+}
+
 /// Query `routes_iri` through the kernel's SPARQL and build the [`RouteTable`].
 pub async fn load_route_table(
     kernel: &Kernel,
@@ -189,5 +198,17 @@ mod tests {
     fn no_bindings_is_an_empty_table() {
         let json = br#"{"head":{"vars":[]},"results":{"bindings":[]}}"#;
         assert_eq!(parse_route_solutions(json).unwrap().routes.len(), 0);
+    }
+
+    #[test]
+    fn watch_path_only_resolves_urn_file_resources() {
+        let root = std::path::Path::new("/root");
+        assert_eq!(
+            watch_path("urn:file:web/routes.ttl", root),
+            Some(std::path::PathBuf::from("/root/web/routes.ttl"))
+        );
+        // A non-file resource has no local mtime to poll.
+        assert_eq!(watch_path("urn:web:routes", root), None);
+        assert_eq!(watch_path("https://example.com/routes.ttl", root), None);
     }
 }
