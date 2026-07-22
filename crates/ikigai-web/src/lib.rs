@@ -448,6 +448,15 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
         .unwrap_or(&[]);
     let allow = allow_header(declared);
 
+    // `?description` (a reserved query param) is the self-description face: a GET projects the
+    // resource's `describe()` into an API description — OpenAPI today, Hydra/Turtle by conneg
+    // later. It's what a code-on-demand client reads to generate a form for the resource.
+    if (req.method == "GET" || req.method == "HEAD")
+        && req.query.iter().any(|(k, _)| k == "description")
+    {
+        return describe_response(described.as_ref(), &req.path, req.method == "HEAD");
+    }
+
     if req.method == "OPTIONS" {
         return Resp {
             allow: Some(allow),
@@ -994,6 +1003,132 @@ fn media_type_of(repr: &ikigai_core::Representation) -> String {
     repr.repr_type.to_string()
 }
 
+/// `?description` → project the resource's `describe()` into an API description. Today this
+/// emits OpenAPI 3.1 (JSON) — the format a code-on-demand client turns into a form; Hydra
+/// (`application/ld+json`) and the raw Turtle manifold are the conneg follow-ups. A resource
+/// with no description (unknown IRI) → 404.
+fn describe_response(desc: Option<&ikigai_core::Description>, path: &str, head_only: bool) -> Resp {
+    let Some(desc) = desc else {
+        return Resp::text(404, "Not Found", "no such resource to describe");
+    };
+    let body = serde_json::to_vec_pretty(&openapi_of(desc, path)).unwrap_or_default();
+    Resp {
+        content_type: "application/vnd.oai.openapi+json; charset=utf-8".to_string(),
+        body: if head_only { Vec::new() } else { body },
+        etag: None,
+        ..Resp::status(200, "OK")
+    }
+}
+
+/// Project a [`Description`](ikigai_core::Description) to a minimal OpenAPI 3.1 document at
+/// `path`: one operation per declared verb (Source→get, Sink→post, Delete→delete), with a
+/// write verb's inputs as the request-body schema and a read verb's as query parameters.
+fn openapi_of(desc: &ikigai_core::Description, path: &str) -> serde_json::Value {
+    use ikigai_core::Verb;
+    use serde_json::{json, Map, Value};
+
+    let mut ops = Map::new();
+    for action in desc.action_specs() {
+        let method = match action.verb {
+            Verb::Source => "get",
+            Verb::Sink => "post",
+            Verb::Delete => "delete",
+            _ => continue, // Meta / Exists aren't projected as HTTP operations
+        };
+        let mut op = Map::new();
+        if !action.summary.is_empty() {
+            op.insert("summary".to_string(), json!(action.summary));
+        }
+        if action.verb == Verb::Sink {
+            let (props, required) = schema_properties(&action.inputs);
+            op.insert(
+                "requestBody".to_string(),
+                json!({
+                    "content": { "application/json": {
+                        "schema": { "type": "object", "properties": props, "required": required }
+                    } }
+                }),
+            );
+        } else {
+            let params: Vec<Value> = action
+                .inputs
+                .iter()
+                .map(|a| {
+                    json!({
+                        "name": a.name,
+                        "in": "query",
+                        "required": a.required,
+                        "description": a.summary,
+                        "schema": arg_schema(a),
+                    })
+                })
+                .collect();
+            if !params.is_empty() {
+                op.insert("parameters".to_string(), json!(params));
+            }
+        }
+        op.insert(
+            "responses".to_string(),
+            json!({ "200": { "description": "OK" } }),
+        );
+        ops.insert(method.to_string(), Value::Object(op));
+    }
+
+    let title = if desc.title.is_empty() {
+        desc.id.clone()
+    } else {
+        desc.title.clone()
+    };
+    json!({
+        "openapi": "3.1.0",
+        "info": { "title": title, "version": "0", "description": desc.summary },
+        "paths": { path: Value::Object(ops) }
+    })
+}
+
+/// The JSON-Schema object properties + required list for a set of inputs (a write's body).
+fn schema_properties(inputs: &[ikigai_core::ArgSpec]) -> (serde_json::Value, Vec<String>) {
+    use serde_json::{Map, Value};
+    let mut props = Map::new();
+    let mut required = Vec::new();
+    for a in inputs {
+        props.insert(a.name.clone(), arg_schema(a));
+        if a.required {
+            required.push(a.name.clone());
+        }
+    }
+    (Value::Object(props), required)
+}
+
+/// One input's JSON-Schema: type from its `class` (XSD datatype), `enum` from `one_of`,
+/// `default`, and its summary as the description.
+fn arg_schema(a: &ikigai_core::ArgSpec) -> serde_json::Value {
+    use serde_json::{json, Map, Value};
+    let ty = a.class.as_deref().map(xsd_to_json_type).unwrap_or("string");
+    let mut s = Map::new();
+    s.insert("type".to_string(), json!(ty));
+    if !a.summary.is_empty() {
+        s.insert("description".to_string(), json!(a.summary));
+    }
+    if !a.one_of.is_empty() {
+        s.insert("enum".to_string(), json!(a.one_of));
+    }
+    if let Some(d) = &a.default {
+        s.insert("default".to_string(), json!(d));
+    }
+    Value::Object(s)
+}
+
+/// Map an XSD datatype IRI to a JSON-Schema primitive type (default `string`).
+fn xsd_to_json_type(class: &str) -> &'static str {
+    match class {
+        c if c.ends_with("#integer") || c.ends_with("#int") || c.ends_with("#long") => "integer",
+        c if c.ends_with("#boolean") => "boolean",
+        c if c.ends_with("#decimal") || c.ends_with("#double") || c.ends_with("#float") => "number",
+        _ => "string",
+    }
+}
+
 /// Parse the request line + headers (body is read separately). Header names are lowercased.
 fn parse_head(head: &str) -> Option<HttpRequest> {
     let mut lines = head.split("\r\n");
@@ -1087,7 +1222,8 @@ async fn write(sock: &mut TcpStream, resp: Resp) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use ikigai_core::{
-        Description, EndpointSpace, Error, Exact, FnEndpoint, Invocation, ReprType, Representation,
+        ArgSpec, Description, EndpointSpace, Error, Exact, FnEndpoint, Invocation, ReprType,
+        Representation,
     };
     use std::sync::Arc;
 
@@ -1205,7 +1341,34 @@ mod tests {
             }
         })
         .with_description(Description::new("jdoc").verb(Verb::Source).verb(Verb::Sink));
+        // An availability-shaped resource: GET reads it, POST books against it, with declared
+        // inputs (the `?description` → OpenAPI source).
+        let booking = FnEndpoint::new("booking", |_inv: &Invocation<'_>| {
+            Ok(Representation::new(
+                ReprType::new("application/json"),
+                b"{}".to_vec(),
+            ))
+        })
+        .with_description(
+            Description::new("booking")
+                .title("Availability")
+                .verb(Verb::Source)
+                .verb(Verb::Sink)
+                .input(
+                    ArgSpec::new("slot")
+                        .class("http://www.w3.org/2001/XMLSchema#dateTime")
+                        .summary("the requested time"),
+                )
+                .input(ArgSpec::new("timezone").summary("an IANA zone"))
+                .input(ArgSpec::new("email"))
+                .input(
+                    ArgSpec::new("preference")
+                        .optional()
+                        .one_of(["morning", "afternoon"]),
+                ),
+        );
         let space = EndpointSpace::new()
+            .bind(Exact::new("urn:test:booking"), booking)
             .bind(Exact::new("urn:test:id:hello"), hello)
             .bind(Exact::new("urn:test:guarded"), guarded)
             .bind(Exact::new("urn:test:writable"), writable)
@@ -1765,6 +1928,42 @@ mod tests {
             resp.contains("Content-Security-Policy: default-src 'none'"),
             "route CSP should win, got: {resp}"
         );
+    }
+
+    #[tokio::test]
+    async fn description_projects_openapi() {
+        let addr = start().await;
+        let resp = roundtrip(
+            addr,
+            "GET /test/booking?description HTTP/1.1\r\nHost: x\r\n\r\n",
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
+        assert!(
+            resp.contains("Content-Type: application/vnd.oai.openapi+json"),
+            "got: {resp}"
+        );
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        let v: serde_json::Value = serde_json::from_str(body).expect("openapi json");
+        assert_eq!(v["openapi"], "3.1.0");
+        assert_eq!(v["info"]["title"], "Availability");
+        let op = &v["paths"]["/test/booking"];
+        // Source → get (params), Sink → post (requestBody).
+        assert!(op["get"].is_object() && op["post"].is_object(), "got: {v}");
+        let schema = &op["post"]["requestBody"]["content"]["application/json"]["schema"];
+        assert_eq!(schema["properties"]["slot"]["type"], "string"); // xsd:dateTime → string
+        assert_eq!(schema["properties"]["preference"]["enum"][0], "morning");
+        // slot/timezone/email required, preference optional.
+        let required = schema["required"].as_array().unwrap();
+        assert!(required.iter().any(|r| r == "slot") && required.iter().any(|r| r == "email"));
+        assert!(!required.iter().any(|r| r == "preference"));
+    }
+
+    #[tokio::test]
+    async fn description_of_unknown_resource_is_404() {
+        let addr = start().await;
+        let resp = roundtrip(addr, "GET /nope/x?description HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(resp.starts_with("HTTP/1.1 404"), "got: {resp}");
     }
 
     #[tokio::test]
