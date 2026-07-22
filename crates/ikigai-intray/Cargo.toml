@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-intray"
-description = "The intray as a tuplespace: urn:space:{name} — Sink drops a tuple (out), Source lists or reads one (rd). A physical, capability-gated space; later slices add take, associative match, the reactive engine, and encrypt-on-drop."
+description = "The intray as a tuplespace: urn:space:{name} — Sink drops a tuple (out), Source lists/reads/filters (rd), Delete atomically takes one (in), associative match via SPARQL ASK. A physical, capability-gated space; later slices add the reactive engine and encrypt-on-drop."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,6 +13,10 @@ ikigai-core = { workspace = true }
 async-trait = "0.1"
 # Content-addressed tuple ids (same hash family core uses for content addressing).
 blake3 = "1"
+# Associative match: a tuple's graph is loaded and tested against a SPARQL ASK. Already
+# in the build graph via ikigai-sparql; the space is embedded-only (publish=false) so the
+# heavy Oxigraph dependency is acceptable here.
+oxigraph = "0.5"
 
 [dev-dependencies]
 futures = { workspace = true }

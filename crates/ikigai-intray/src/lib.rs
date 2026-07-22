@@ -6,16 +6,24 @@
 //!
 //! - **`out`** — **Sink** a tuple into the space. Content-addressed (blake3), so an
 //!   identical drop is idempotent.
-//! - **`rd`** — **Source** the space: list the tuple ids, or read one with `tuple=<id>`.
-//!   Non-destructive (Linda's `rd`).
+//! - **`rd`** — **Source** the space: list the tuple ids, read one with `tuple=<id>`, or
+//!   list the ids of tuples matching a `match=<ASK>` template. Non-destructive.
+//! - **`take`** — **Delete** a tuple, *returning its content*: claim a specific tuple
+//!   (`tuple=<id>`), the first tuple matching a `match=<ASK>` template, or any tuple
+//!   (no selector = a work-queue pop). Destructive and **atomic** — a rename-based
+//!   compare-and-swap means two racers never both claim the same tuple.
 //!
-//! The space is *physical and inspectable* — tuples are files under a jailed root — which is
-//! the seed of the inbox/outbox/error state machine. Later slices add **`in`** (take — the
-//! destructive read), **associative match** (a SPARQL/SHACL template, strictly more than
-//! Linda's positional match), the **reactive engine** (a watcher fires a handler on drop),
-//! and **encrypt-on-drop** (sign-then-encrypt to the owner's key — both primitives already
-//! shipped). Two things Linda never had and this does: `out` is **capability-gated**, and
-//! tuples can be **sealed** so the space holds ciphertext it cannot read.
+//! **Associative match** is a SPARQL ASK over the tuple's graph (`match=<query>`): a tuple
+//! matches iff the ASK holds when its Turtle is the default graph. This is strictly more
+//! than Linda's positional match — the whole graph-pattern language, not field equality —
+//! and a non-RDF tuple simply never matches a template (take it by id or FIFO instead).
+//!
+//! The space is *physical and inspectable* — tuples are files under a jailed root — which
+//! is the seed of the inbox/outbox/error state machine. Later slices add the **reactive
+//! engine** (a watcher fires a handler on drop; inbox→outbox→error) and **encrypt-on-drop**
+//! (sign-then-encrypt to the owner's key — both primitives already shipped). Two things
+//! Linda never had and this does: `out`/`take` are **capability-gated**, and tuples can be
+//! **sealed** so the space holds ciphertext it cannot read.
 #![forbid(unsafe_code)]
 
 use async_trait::async_trait;
@@ -23,15 +31,21 @@ use ikigai_core::{
     ActionSpec, Description, Endpoint, EndpointSpace, Error, Invocation, ReprType, Representation,
     Result, UriTemplate, Verb,
 };
-use std::path::PathBuf;
+use oxigraph::io::{RdfFormat, RdfParser};
+use oxigraph::sparql::{QueryResults, SparqlEvaluator};
+use oxigraph::store::Store;
+use std::path::{Path, PathBuf};
 
 /// The tuplespace URI template: `urn:space:{name}` — the `{name}` is the space's identity.
 pub const SPACE_TEMPLATE: &str = "urn:space:{name}";
 
 /// `out` (dropping a tuple) requires this capability — the gate a stranger drops under.
 pub const CAP_OUT: &str = "urn:cap:space:out";
-/// `rd` (reading the space) requires this capability.
+/// `rd` (reading the space, non-destructively) requires this capability.
 pub const CAP_READ: &str = "urn:cap:space:read";
+/// `take` (removing a tuple) requires this capability — strictly more authority than read,
+/// so a reader can observe the space without being able to consume from it.
+pub const CAP_TAKE: &str = "urn:cap:space:take";
 
 /// Mount the tuplespace at `urn:space:{name}`, backed by a directory under `root`
 /// (`<root>/<name>/inbox/`). A host links this into its kernel.
@@ -56,6 +70,106 @@ impl SpaceEndpoint {
     /// The inbox directory of a named space. The name is a single segment (validated).
     fn inbox(&self, name: &str) -> PathBuf {
         self.root.join(name).join("inbox")
+    }
+
+    /// The tuple ids currently in a space's inbox, sorted (a deterministic scan order — note
+    /// this is id order, not arrival order; a FIFO queue is a later refinement).
+    fn list_ids(inbox: &Path) -> Vec<String> {
+        let mut ids: Vec<String> = match std::fs::read_dir(inbox) {
+            Ok(entries) => entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    e.file_name()
+                        .to_str()
+                        .and_then(|n| n.strip_suffix(".tuple"))
+                        .map(String::from)
+                })
+                .collect(),
+            Err(_) => Vec::new(), // an empty/absent space lists nothing
+        };
+        ids.sort();
+        ids
+    }
+
+    /// Atomically claim a tuple by id: rename it out of the inbox into a private staging
+    /// dir, read it, and remove it. **This is the compare-and-swap the whole tier turns on.**
+    /// `rename` is atomic on POSIX, so if two takers race the same id exactly one rename
+    /// finds the source present; the loser gets `NotFound` → `Ok(None)` and moves on.
+    fn claim(&self, name: &str, id: &str) -> Result<Option<Vec<u8>>> {
+        if id.is_empty() || id.contains(['/', '\\', '.']) {
+            return Err(Error::InvalidArgument {
+                name: "tuple".to_string(),
+                detail: "a tuple id is a content hash".to_string(),
+            });
+        }
+        let src = self.inbox(name).join(format!("{id}.tuple"));
+        let staging = self.root.join(name).join(".taking");
+        std::fs::create_dir_all(&staging)
+            .map_err(|e| Error::Endpoint(format!("space `{name}`: staging: {e}")))?;
+        let staged = staging.join(format!("{id}.tuple"));
+        match std::fs::rename(&src, &staged) {
+            Ok(()) => {
+                let bytes = std::fs::read(&staged)
+                    .map_err(|e| Error::Endpoint(format!("space `{name}`: take read: {e}")))?;
+                let _ = std::fs::remove_file(&staged);
+                Ok(Some(bytes))
+            }
+            // The source is gone — someone else claimed it first (or it never existed).
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::Endpoint(format!("space `{name}`: take: {e}"))),
+        }
+    }
+}
+
+/// Validate that a `match=` argument is a syntactically valid **ASK** query (so a mistaken
+/// SELECT fails loudly rather than silently matching nothing). Runs it once against an empty
+/// store — cheap, and the only way to confirm the query's result shape is Boolean.
+fn validate_ask(query: &str) -> Result<()> {
+    let store = Store::new().map_err(|e| Error::Endpoint(format!("match: store init: {e}")))?;
+    let prepared =
+        SparqlEvaluator::new()
+            .parse_query(query)
+            .map_err(|e| Error::InvalidArgument {
+                name: "match".to_string(),
+                detail: format!("SPARQL syntax error: {e}"),
+            })?;
+    match prepared
+        .on_store(&store)
+        .execute()
+        .map_err(|e| Error::Endpoint(format!("match: evaluation: {e}")))?
+    {
+        QueryResults::Boolean(_) => Ok(()),
+        _ => Err(Error::InvalidArgument {
+            name: "match".to_string(),
+            detail: "an associative match must be an ASK query".to_string(),
+        }),
+    }
+}
+
+/// Does a tuple's graph satisfy the ASK? The tuple is parsed as Turtle into the default
+/// graph; a tuple that isn't valid RDF simply never matches a SPARQL template.
+fn tuple_matches(query: &str, bytes: &[u8]) -> Result<bool> {
+    let store = Store::new().map_err(|e| Error::Endpoint(format!("match: store init: {e}")))?;
+    if store
+        .load_from_slice(RdfParser::from_format(RdfFormat::Turtle), bytes)
+        .is_err()
+    {
+        return Ok(false); // non-RDF tuple: no template matches it
+    }
+    let prepared =
+        SparqlEvaluator::new()
+            .parse_query(query)
+            .map_err(|e| Error::InvalidArgument {
+                name: "match".to_string(),
+                detail: format!("SPARQL syntax error: {e}"),
+            })?;
+    match prepared
+        .on_store(&store)
+        .execute()
+        .map_err(|e| Error::Endpoint(format!("match: evaluation: {e}")))?
+    {
+        QueryResults::Boolean(b) => Ok(b),
+        _ => Ok(false),
     }
 }
 
@@ -96,7 +210,8 @@ impl Endpoint for SpaceEndpoint {
                     id.into_bytes(),
                 ))
             }
-            // rd: read the space — one tuple (`tuple=<id>`) or the list of ids. Non-destructive.
+            // rd: read the space — one tuple (`tuple=<id>`), the ids matching a `match=<ASK>`
+            // template, or all ids. Non-destructive.
             Verb::Source => {
                 if !inv.capability.allows(CAP_READ) {
                     return Err(Error::Denied(format!("reading a space needs `{CAP_READ}`")));
@@ -115,29 +230,77 @@ impl Endpoint for SpaceEndpoint {
                         ReprType::new("application/octet-stream"),
                         bytes,
                     ))
-                } else {
-                    // The tuple ids, one per line (the newline-list `..` map convention).
-                    let mut ids: Vec<String> = match std::fs::read_dir(&inbox) {
-                        Ok(entries) => entries
-                            .filter_map(|e| e.ok())
-                            .filter_map(|e| {
-                                e.file_name()
-                                    .to_str()
-                                    .and_then(|n| n.strip_suffix(".tuple"))
-                                    .map(String::from)
-                            })
-                            .collect(),
-                        Err(_) => Vec::new(), // an empty/absent space lists nothing
-                    };
-                    ids.sort();
+                } else if let Ok(query) = inv.inline_str("match") {
+                    // Associative rd: the ids of tuples whose graph satisfies the ASK.
+                    validate_ask(query)?;
+                    let mut hits = Vec::new();
+                    for id in Self::list_ids(&inbox) {
+                        if let Ok(bytes) = std::fs::read(inbox.join(format!("{id}.tuple"))) {
+                            if tuple_matches(query, &bytes)? {
+                                hits.push(id);
+                            }
+                        }
+                    }
                     Ok(Representation::new(
                         ReprType::new("text/plain").with_param("charset", "utf-8"),
-                        ids.join("\n").into_bytes(),
+                        hits.join("\n").into_bytes(),
+                    ))
+                } else {
+                    // The tuple ids, one per line (the newline-list `..` map convention).
+                    Ok(Representation::new(
+                        ReprType::new("text/plain").with_param("charset", "utf-8"),
+                        Self::list_ids(&inbox).join("\n").into_bytes(),
                     ))
                 }
             }
+            // take: remove a tuple and return its content (Linda's `in`). Atomic per tuple.
+            Verb::Delete => {
+                if !inv.capability.allows(CAP_TAKE) {
+                    return Err(Error::Denied(format!(
+                        "taking from a space needs `{CAP_TAKE}`"
+                    )));
+                }
+                // A specific tuple by id: claim it, or NotFound if already taken/absent.
+                if let Ok(id) = inv.inline_str("tuple") {
+                    return match self.claim(name, id)? {
+                        Some(bytes) => Ok(Representation::new(
+                            ReprType::new("application/octet-stream"),
+                            bytes,
+                        )),
+                        None => Err(Error::NotFound(format!(
+                            "no tuple `{id}` to take in space `{name}`"
+                        ))),
+                    };
+                }
+                // Otherwise take the first tuple matching the template (or any). We scan
+                // deterministically and claim the first that both matches and we win the
+                // race for; a lost claim just moves to the next candidate.
+                let matcher = inv.inline_str("match").ok();
+                if let Some(query) = matcher {
+                    validate_ask(query)?;
+                }
+                for id in Self::list_ids(&inbox) {
+                    if let Some(query) = matcher {
+                        match std::fs::read(inbox.join(format!("{id}.tuple"))) {
+                            Ok(bytes) if !tuple_matches(query, &bytes)? => continue,
+                            Ok(_) => {}
+                            Err(_) => continue, // vanished between listing and read
+                        }
+                    }
+                    if let Some(bytes) = self.claim(name, &id)? {
+                        return Ok(Representation::new(
+                            ReprType::new("application/octet-stream"),
+                            bytes,
+                        ));
+                    }
+                }
+                Err(Error::NotFound(match matcher {
+                    Some(_) => format!("no matching tuple to take in space `{name}`"),
+                    None => format!("space `{name}` is empty"),
+                }))
+            }
             v => Err(Error::Endpoint(format!(
-                "urn:space:* answers Source (rd) and Sink (out), not {v:?}"
+                "urn:space:* answers Source (rd), Sink (out), and Delete (take), not {v:?}"
             ))),
         }
     }
@@ -147,16 +310,22 @@ impl Endpoint for SpaceEndpoint {
         Description::new("space")
             .title("Tuplespace")
             .summary(
-                "A physical tuplespace (Linda `out`/`rd`): Sink drops a content-addressed tuple; \
-                 Source lists the tuple ids, or reads one with `tuple=<id>`.",
+                "A physical tuplespace (Linda `out`/`rd`/`take`): Sink drops a content-addressed \
+                 tuple; Source lists the ids (or those matching a `match=<ASK>` template), or \
+                 reads one with `tuple=<id>`; Delete atomically takes a tuple and returns it.",
             )
             .action(
                 ActionSpec::new(Verb::Source)
-                    .summary("rd — list the tuple ids, or read one (`tuple=<id>`)")
+                    .summary("rd — list the tuple ids, read one (`tuple=<id>`), or filter (`match=<ASK>`)")
                     .input(
                         ArgSpec::new("tuple")
                             .optional()
                             .summary("a tuple id to read; omit to list"),
+                    )
+                    .input(
+                        ArgSpec::new("match")
+                            .optional()
+                            .summary("a SPARQL ASK; list only the tuple ids whose graph satisfies it"),
                     )
                     .requires(CAP_READ),
             )
@@ -164,6 +333,21 @@ impl Endpoint for SpaceEndpoint {
                 ActionSpec::new(Verb::Sink)
                     .summary("out — drop a tuple (the piped content) into the space")
                     .requires(CAP_OUT),
+            )
+            .action(
+                ActionSpec::new(Verb::Delete)
+                    .summary("take — atomically remove a tuple and return it (by id, by match, or any)")
+                    .input(
+                        ArgSpec::new("tuple")
+                            .optional()
+                            .summary("take this specific tuple id"),
+                    )
+                    .input(
+                        ArgSpec::new("match")
+                            .optional()
+                            .summary("a SPARQL ASK; take the first tuple whose graph satisfies it"),
+                    )
+                    .requires(CAP_TAKE),
             )
     }
 }
@@ -173,7 +357,7 @@ mod tests {
     use super::*;
     use futures::executor::block_on;
     use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     fn kernel_at(sub: &str) -> Kernel {
         let root = std::env::temp_dir().join("ikigai-intray-test").join(sub);
@@ -185,21 +369,25 @@ mod tests {
         Iri::parse(s).unwrap()
     }
 
+    /// Drop a tuple into a space, returning its id.
+    fn out(k: &Kernel, cap: &Capability, space_iri: &str, content: &[u8]) -> String {
+        let r = block_on(
+            k.issue(
+                Request::new(Verb::Sink, iri(space_iri))
+                    .with_arg("content", ArgRef::Inline(content.to_vec())),
+                cap,
+            ),
+        )
+        .unwrap();
+        String::from_utf8(r.bytes).unwrap()
+    }
+
     #[test]
     fn out_then_rd_roundtrips_a_tuple() {
         let k = kernel_at("space-rt");
         let cap = Capability::scoped(vec![CAP_OUT.to_string(), CAP_READ.to_string()]);
 
-        // out → a content-addressed id.
-        let out = block_on(
-            k.issue(
-                Request::new(Verb::Sink, iri("urn:space:bookings"))
-                    .with_arg("content", ArgRef::Inline(b"a booking".to_vec())),
-                &cap,
-            ),
-        )
-        .unwrap();
-        let id = String::from_utf8(out.bytes).unwrap();
+        let id = out(&k, &cap, "urn:space:bookings", b"a booking");
         assert_eq!(id.len(), 64, "blake3 hex id");
 
         // rd (list) → the one id.
@@ -219,15 +407,8 @@ mod tests {
         assert_eq!(tuple.bytes, b"a booking");
 
         // An identical drop is idempotent (same content hash → same id, still one tuple).
-        let again = block_on(
-            k.issue(
-                Request::new(Verb::Sink, iri("urn:space:bookings"))
-                    .with_arg("content", ArgRef::Inline(b"a booking".to_vec())),
-                &cap,
-            ),
-        )
-        .unwrap();
-        assert_eq!(String::from_utf8(again.bytes).unwrap(), id);
+        let again = out(&k, &cap, "urn:space:bookings", b"a booking");
+        assert_eq!(again, id);
         let list2 =
             block_on(k.issue(Request::new(Verb::Source, iri("urn:space:bookings")), &cap)).unwrap();
         assert_eq!(
@@ -267,5 +448,186 @@ mod tests {
             ),
         );
         assert!(matches!(r, Err(Error::NotFound(_))), "got: {r:?}");
+    }
+
+    #[test]
+    fn take_removes_and_returns_a_tuple() {
+        let k = kernel_at("space-take");
+        let cap = Capability::scoped(vec![
+            CAP_OUT.to_string(),
+            CAP_READ.to_string(),
+            CAP_TAKE.to_string(),
+        ]);
+        let id = out(&k, &cap, "urn:space:q", b"payload");
+
+        // take (by id) → the content, and the space is now empty.
+        let taken = block_on(
+            k.issue(
+                Request::new(Verb::Delete, iri("urn:space:q"))
+                    .with_arg("tuple", ArgRef::Inline(id.clone().into_bytes())),
+                &cap,
+            ),
+        )
+        .unwrap();
+        assert_eq!(taken.bytes, b"payload");
+        let list = block_on(k.issue(Request::new(Verb::Source, iri("urn:space:q")), &cap)).unwrap();
+        assert!(list.bytes.is_empty(), "space drained");
+
+        // Taking it again → NotFound (a tuple is consumed exactly once).
+        let again = block_on(
+            k.issue(
+                Request::new(Verb::Delete, iri("urn:space:q"))
+                    .with_arg("tuple", ArgRef::Inline(id.into_bytes())),
+                &cap,
+            ),
+        );
+        assert!(matches!(again, Err(Error::NotFound(_))), "got: {again:?}");
+    }
+
+    #[test]
+    fn take_any_is_a_work_queue() {
+        let k = kernel_at("space-queue");
+        let cap = Capability::scoped(vec![CAP_OUT.to_string(), CAP_TAKE.to_string()]);
+        let mut dropped = std::collections::HashSet::new();
+        for i in 0..3 {
+            dropped.insert(out(
+                &k,
+                &cap,
+                "urn:space:jobs",
+                format!("job {i}").as_bytes(),
+            ));
+        }
+        // Three no-selector takes drain the three distinct tuples...
+        let mut got = std::collections::HashSet::new();
+        for _ in 0..3 {
+            let r =
+                block_on(k.issue(Request::new(Verb::Delete, iri("urn:space:jobs")), &cap)).unwrap();
+            got.insert(blake3::hash(&r.bytes).to_hex().to_string());
+        }
+        assert_eq!(got, dropped, "each tuple taken exactly once");
+        // ...and the fourth finds the space empty.
+        let empty = block_on(k.issue(Request::new(Verb::Delete, iri("urn:space:jobs")), &cap));
+        assert!(matches!(empty, Err(Error::NotFound(_))), "got: {empty:?}");
+    }
+
+    #[test]
+    fn take_is_capability_gated() {
+        let k = kernel_at("space-take-cap");
+        let full = Capability::scoped(vec![CAP_OUT.to_string(), CAP_TAKE.to_string()]);
+        let id = out(&k, &full, "urn:space:z", b"x");
+        // Holding read (but not take) is not enough to consume.
+        let read_only = Capability::scoped(vec![CAP_READ.to_string()]);
+        let denied = block_on(
+            k.issue(
+                Request::new(Verb::Delete, iri("urn:space:z"))
+                    .with_arg("tuple", ArgRef::Inline(id.into_bytes())),
+                &read_only,
+            ),
+        );
+        assert!(matches!(denied, Err(Error::Denied(_))), "got: {denied:?}");
+    }
+
+    #[test]
+    fn associative_match_selects_by_graph() {
+        let k = kernel_at("space-match");
+        let cap = Capability::scoped(vec![
+            CAP_OUT.to_string(),
+            CAP_READ.to_string(),
+            CAP_TAKE.to_string(),
+        ]);
+        let person = b"@prefix foaf: <http://xmlns.com/foaf/0.1/> .\n\
+                       <urn:p:alice> a foaf:Person ; foaf:name \"Alice\" .";
+        let place = b"@prefix foaf: <http://xmlns.com/foaf/0.1/> .\n\
+                      <urn:pl:cafe> a foaf:Organization ; foaf:name \"Cafe\" .";
+        let person_id = out(&k, &cap, "urn:space:people", person);
+        let _place_id = out(&k, &cap, "urn:space:people", place);
+
+        let ask = b"PREFIX foaf: <http://xmlns.com/foaf/0.1/> ASK { ?s a foaf:Person }".to_vec();
+
+        // rd with match → only the person tuple's id.
+        let hits = block_on(
+            k.issue(
+                Request::new(Verb::Source, iri("urn:space:people"))
+                    .with_arg("match", ArgRef::Inline(ask.clone())),
+                &cap,
+            ),
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(hits.bytes).unwrap(), person_id);
+
+        // take with match → the person tuple; the place tuple stays behind.
+        let taken = block_on(
+            k.issue(
+                Request::new(Verb::Delete, iri("urn:space:people"))
+                    .with_arg("match", ArgRef::Inline(ask)),
+                &cap,
+            ),
+        )
+        .unwrap();
+        assert_eq!(taken.bytes, person);
+        let remaining =
+            block_on(k.issue(Request::new(Verb::Source, iri("urn:space:people")), &cap)).unwrap();
+        assert_eq!(
+            String::from_utf8(remaining.bytes).unwrap(),
+            _place_id,
+            "place remains"
+        );
+    }
+
+    #[test]
+    fn a_non_ask_match_is_rejected() {
+        let k = kernel_at("space-badmatch");
+        let cap = Capability::scoped(vec![CAP_OUT.to_string(), CAP_READ.to_string()]);
+        out(&k, &cap, "urn:space:m", b"@prefix : <urn:> .\n:a :b :c .");
+        let bad = block_on(k.issue(
+            Request::new(Verb::Source, iri("urn:space:m")).with_arg(
+                "match",
+                ArgRef::Inline(b"SELECT * WHERE { ?s ?p ?o }".to_vec()),
+            ),
+            &cap,
+        ));
+        assert!(
+            matches!(bad, Err(Error::InvalidArgument { ref name, .. }) if name == "match"),
+            "got: {bad:?}"
+        );
+    }
+
+    /// The compare-and-swap under contention: many threads take from one space; every tuple
+    /// must be claimed exactly once — no duplicates, no losses.
+    #[test]
+    fn concurrent_takes_claim_each_tuple_once() {
+        let k = Arc::new(kernel_at("space-cas"));
+        let cap = Capability::scoped(vec![CAP_OUT.to_string(), CAP_TAKE.to_string()]);
+        const N: usize = 60;
+        for i in 0..N {
+            out(&k, &cap, "urn:space:race", format!("token {i}").as_bytes());
+        }
+
+        let taken: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let k = Arc::clone(&k);
+            let cap = cap.clone();
+            let taken = Arc::clone(&taken);
+            handles.push(std::thread::spawn(move || loop {
+                match block_on(k.issue(Request::new(Verb::Delete, iri("urn:space:race")), &cap)) {
+                    Ok(r) => taken.lock().unwrap().push(r.bytes),
+                    Err(Error::NotFound(_)) => break, // space drained
+                    Err(e) => panic!("unexpected take error: {e:?}"),
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let mut got = taken.lock().unwrap().clone();
+        got.sort();
+        got.dedup();
+        assert_eq!(
+            got.len(),
+            N,
+            "every tuple claimed exactly once, none duplicated"
+        );
     }
 }
