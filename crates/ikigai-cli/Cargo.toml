@@ -16,7 +16,7 @@ default = ["embedded", "ipc"]
 embedded = ["dep:ikigai-embedded"]
 ipc = ["dep:ikigai-ipc"]   # Unix only; the dep is empty elsewhere
 quic = ["dep:ikigai-quic"] # opt-in; pulls quinn/rustls/tokio
-web = ["dep:ikigai-web", "dep:tokio"] # opt-in inbound HTTP face; pulls Tokio (like quic)
+web = ["dep:ikigai-web", "dep:tokio", "dep:serde_yaml"] # opt-in inbound HTTP face; pulls Tokio (like quic)
 
 [dependencies]
 ikigai-core = { workspace = true }
@@ -35,6 +35,10 @@ ikigai-web = { workspace = true, optional = true }
 # default/wasm binary never pulls Tokio; matches the `quic` transport's posture.
 # net+time so the runtime's `enable_all()` has the io+time drivers on its own.
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time"], optional = true }
+# YAML authoring of the non-LD route table (parses to the same value tree as JSON). Only the
+# `web`-featured loader uses it. (serde_yaml 0.9 is archived-but-stable; swap to serde_yml if
+# a maintained fork is preferred.)
+serde_yaml = { version = "0.9", optional = true }
 
 # The full-screen TUI is native-only (crossterm). The browser frontend (ratzilla)
 # lands in a later slice; on wasm the binary falls back to the line REPL.
