@@ -2469,9 +2469,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-lisp"
-version = "0.1.5"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5463e946855f266da3d7a967309a20ca8cea20dc2f54b77aa478aaec7593ec77"
+checksum = "b189c7b9c1a4b3ee2a578e15a8812c7307d03209d4b34e1ef1f7db5108ebaa6d"
 dependencies = [
  "async-trait",
  "crossbeam-channel",
