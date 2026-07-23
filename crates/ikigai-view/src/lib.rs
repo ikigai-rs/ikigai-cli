@@ -248,23 +248,69 @@ fn alert_token(minutes: u32) -> String {
     }
 }
 
-/// The join link for a captured event: the event's real URL when it is already
-/// a Teams link, else the first Teams URL found in the notes (the narrow match
-/// — a stable, single-line token fit for a drawer property).
+/// Hosts that mark a URL as a meeting join link. Matched against the URL's HOST as
+/// either an exact match or a subdomain (`us02web.zoom.us`, `acme.webex.com`) — never
+/// a bare substring, so a lookalike domain (`evilzoom.us`) is not mistaken for the
+/// real one. Add a provider here; nothing else needs to change.
+const MEETING_HOSTS: [&str; 6] = [
+    "teams.microsoft.com",
+    "zoom.us",
+    "meet.google.com",
+    "webex.com",
+    "meet.jit.si",
+    "gotomeeting.com",
+];
+
+/// Does `url` point at a known conferencing host? Compares the host only (userinfo and
+/// port stripped), so query strings and paths can't spoof the match.
+fn is_meeting_url(url: &str) -> bool {
+    let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+    MEETING_HOSTS
+        .iter()
+        .any(|h| host == *h || host.ends_with(&format!(".{h}")))
+}
+
+/// The URL token starting at `at`: up to the first whitespace or delimiter, with
+/// trailing sentence punctuation trimmed (a link at the end of a sentence).
+fn url_token(text: &str, at: usize) -> String {
+    let token: String = text[at..]
+        .chars()
+        .take_while(|c| !c.is_whitespace() && !"<>\"'".contains(*c))
+        .collect();
+    token.trim_end_matches(['.', ',', ')', ';']).to_string()
+}
+
+/// The join link for a captured event: the event's own URL when it names a known
+/// conferencing host, else the FIRST such link in the notes. Provider-agnostic (see
+/// [`MEETING_HOSTS`]) — a stable, single-line token fit for a drawer property. A URL
+/// that isn't a known meeting host is ignored, so an invite footer's unsubscribe or
+/// doc link never lands in `:URL:`.
 fn join_link(event: &ViewEvent) -> Option<String> {
-    const TEAMS: &str = "https://teams.microsoft.com/";
     if let Some(url) = &event.url {
-        if url.starts_with(TEAMS) {
+        if is_meeting_url(url) {
             return Some(url.clone());
         }
     }
     let notes = event.description.as_deref()?;
-    let at = notes.find(TEAMS)?;
-    let link: String = notes[at..]
-        .chars()
-        .take_while(|c| !c.is_whitespace() && !"<>\"'".contains(*c))
-        .collect();
-    Some(link.trim_end_matches(['.', ',', ')', ';']).to_string())
+    let mut from = 0;
+    while let Some(rel) = notes[from..].find("http") {
+        let at = from + rel;
+        let candidate = url_token(notes, at);
+        if is_meeting_url(&candidate) {
+            return Some(candidate);
+        }
+        // Past this "http" — 4 ASCII bytes, so `from` stays on a char boundary.
+        from = at + 4;
+    }
+    None
 }
 
 /// One captured event as an org heading: title, a `:PROPERTIES:` drawer carrying
