@@ -1171,6 +1171,12 @@ fn served_space(nature: &'static str) -> EndpointSpace {
             UriTemplate::parse(ikigai_intray::SPACE_TEMPLATE).expect("SPACE_TEMPLATE is valid"),
             ikigai_intray::SpaceEndpoint::new(file_root().join("spaces")),
         )
+        // Attribution for handed-out links. The edge grants `urn:cap:client:read` and
+        // nothing filesystem-shaped, so this can name a client and do nothing else.
+        .bind(
+            UriTemplate::parse(CLIENT_TEMPLATE).expect("CLIENT_TEMPLATE is valid"),
+            ClientRegistry::new(file_root()),
+        )
 }
 
 /// A purpose-built kernel for a calendar-federation server (`ikigai serve quic://…
@@ -1948,6 +1954,86 @@ pub fn watched_kernel_with_mounts(
     kernel
 }
 
+/// Where a handed-out link's token is looked up. See [`ClientRegistry`].
+const CLIENT_TEMPLATE: &str = "urn:client:{token}";
+
+/// The capability to look up a client record — deliberately its OWN grant, not filesystem
+/// authority. See [`ClientRegistry`].
+pub const CAP_CLIENT_READ: &str = "urn:cap:client:read";
+
+/// Who a handed-out booking link belongs to: `urn:client:{token}` → the JSON record at
+/// `<workspace>/clients/<token>.json`.
+///
+/// Bound on the public edge so a submission carrying a link token can say WHO it came
+/// from. The point of it being an endpoint rather than a plain file read is the capability:
+/// the edge grants `urn:cap:client:read`, which buys exactly one thing — "given a token,
+/// tell me the client" — and not the filesystem authority that reading the file directly
+/// would need. A door that can attribute a booking still cannot read anything else.
+///
+/// Administration is the file system, on purpose: issue a client by writing the file,
+/// revoke by deleting it. There is no registry format to keep, and nothing to restart.
+struct ClientRegistry {
+    root: PathBuf,
+}
+
+impl ClientRegistry {
+    fn new(root: PathBuf) -> Self {
+        ClientRegistry { root }
+    }
+}
+
+#[async_trait::async_trait]
+impl Endpoint for ClientRegistry {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        if !inv.capability.allows(CAP_CLIENT_READ) {
+            return Err(Error::Denied(format!(
+                "reading a client record requires `{CAP_CLIENT_READ}`"
+            )));
+        }
+        if inv.request.verb != Verb::Source {
+            return Err(Error::Endpoint(format!(
+                "a client record is read with Source, not {:?}",
+                inv.request.verb
+            )));
+        }
+        // The token becomes a FILENAME, so it is re-checked here rather than trusted from
+        // whoever built the IRI — this is the last place before it touches a path.
+        let token = inv
+            .request
+            .target
+            .as_str()
+            .rsplit(':')
+            .next()
+            .unwrap_or_default();
+        if !ikigai_intake::token_shaped(token) {
+            return Err(Error::NotFound(format!("no client `{token}`")));
+        }
+        let path = self.root.join("clients").join(format!("{token}.json"));
+        let bytes = std::fs::read(&path)
+            .map_err(|_| Error::NotFound("no client for that token".to_string()))?;
+        Ok(Representation::new(
+            ReprType::new("application/json"),
+            bytes,
+        ))
+    }
+
+    fn name(&self) -> &str {
+        "client"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("client")
+            .title("Client record")
+            .summary(
+                "Who a handed-out link belongs to. Issue a client by writing \
+                 clients/<token>.json in the workspace; revoke by deleting it.",
+            )
+            .verb(Verb::Source)
+            .requires(CAP_CLIENT_READ)
+            .output("application/json")
+    }
+}
+
 /// The public contact form's accepted fields. Each `summary` is human-facing on purpose:
 /// it is what `?description` projects and a generated form renders as the field's LABEL,
 /// so the validation and the UI come from ONE declaration and cannot drift.
@@ -1965,6 +2051,7 @@ fn contact_intake() -> ikigai_intake::IntakeConfig {
         email_field: Some("email".to_string()),
         honeypot: Some("_honey".to_string()),
         requires: "urn:cap:contact:submit".to_string(),
+        clients: Some(CLIENT_TEMPLATE.to_string()),
     }
 }
 
@@ -1996,6 +2083,7 @@ fn booking_intake() -> ikigai_intake::IntakeConfig {
         email_field: Some("email".to_string()),
         honeypot: Some("_honey".to_string()),
         requires: "urn:cap:booking:submit".to_string(),
+        clients: Some(CLIENT_TEMPLATE.to_string()),
     }
 }
 

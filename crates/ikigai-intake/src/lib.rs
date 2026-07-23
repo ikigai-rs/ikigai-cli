@@ -104,6 +104,38 @@ pub struct IntakeConfig {
     pub honeypot: Option<String>,
     /// The capability a submitter must hold. A public route grants exactly this.
     pub requires: String,
+    /// Where to look up the **link token** a submission arrived with, as an IRI template
+    /// containing `{token}` — e.g. `urn:client:{token}`. `None` (the default) ignores
+    /// tokens entirely.
+    ///
+    /// A token is a bearer credential handed out in a link. Resolving it turns
+    /// "somebody on the internet" into "whoever I gave this link to", which the handler
+    /// can act on. It is not authority: the endpoint is capability-gated either way, and
+    /// a submission with no token, an unknown one, or a revoked one is still an ordinary
+    /// public submission — a rotated link should stop *attributing*, not start rejecting.
+    pub clients: Option<String>,
+}
+
+/// The query argument a link token arrives in (`…/booking/submit?k=TOKEN`).
+///
+/// It rides the URL rather than the form so it never becomes a field in the generated UI,
+/// and — because only DECLARED fields are carried — the raw token never reaches the tuple.
+/// What lands there is the resolved identity, not the credential that proved it.
+pub const TOKEN_ARG: &str = "k";
+
+/// The field a resolved token is recorded under.
+pub const VIA_FIELD: &str = "via";
+
+/// Is this a token we are willing to put in an IRI?
+///
+/// The token is substituted into a template that a host may well resolve to a path, so it
+/// is checked against a strict alphabet BEFORE it is interpolated anywhere — `..` and `/`
+/// can never appear. Belt and braces: whatever the template resolves to validates too.
+pub fn token_shaped(token: &str) -> bool {
+    (8..=64).contains(&token.len())
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// Build the intake endpoint described by `config`.
@@ -155,6 +187,24 @@ fn percent_decode(input: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Resolve `template` for `token` and return the client's id, or `None` for any failure.
+///
+/// Returns the record's own `id` when it has one, so the identity recorded in the tuple is
+/// a name Brian chose ("acme-jane") rather than the secret in the URL. A record without an
+/// id falls back to the token, which is why tokens should be opaque either way.
+async fn lookup_client(inv: &Invocation<'_>, template: &str, token: &str) -> Option<String> {
+    let iri = Iri::parse(template.replace("{token}", token)).ok()?;
+    let found = inv.issue(Request::new(Verb::Source, iri)).await.ok()?;
+    let text = std::str::from_utf8(&found.bytes).ok()?;
+    let record: serde_json::Value = serde_json::from_str(text).ok()?;
+    let id = record
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or(token)
+        .trim();
+    (!id.is_empty()).then(|| id.to_string())
 }
 
 /// Parse a submission body into (field, value) pairs. JSON when it starts with `{`
@@ -310,6 +360,21 @@ impl Endpoint for IntakeEndpoint {
             }
         }
 
+        // A LINK TOKEN, if one came along, is resolved to WHO the link was given to. The
+        // lookup is best-effort by design: an absent, malformed, unknown or revoked token
+        // leaves the submission anonymous rather than refusing it, so rotating a link
+        // degrades a customer to an ordinary visitor instead of locking them out.
+        if let Some(template) = &config.clients {
+            if let Ok(token) = inv.inline_str(TOKEN_ARG) {
+                let token = token.trim();
+                if token_shaped(token) {
+                    if let Some(id) = lookup_client(inv, template, token).await {
+                        carried.push((VIA_FIELD.to_string(), id));
+                    }
+                }
+            }
+        }
+
         // PROVENANCE comes from the TRANSPORT, never the body. The web layer sets these
         // from the connection (`client` from the proxy's forwarded-for, `received` from
         // its clock); a submitter cannot forge them, because only DECLARED body fields are
@@ -388,7 +453,7 @@ impl Endpoint for IntakeEndpoint {
 mod tests {
     use super::*;
     use futures::executor::block_on;
-    use ikigai_core::{Capability, EndpointSpace, Exact, Kernel};
+    use ikigai_core::{Capability, EndpointSpace, Exact, Kernel, UriTemplate};
     use std::sync::{Arc, Mutex};
 
     /// A stand-in space that records the tuples dropped into it.
@@ -420,6 +485,7 @@ mod tests {
             email_field: Some("email".to_string()),
             honeypot: Some("_honey".to_string()),
             requires: "urn:cap:contact:submit".to_string(),
+            clients: None,
         }
     }
 
@@ -461,6 +527,126 @@ mod tests {
         );
         assert!(tuple.contains(r#"(message "Hello there")"#), "{tuple}");
         assert!(tuple.starts_with('(') && tuple.ends_with(')'));
+    }
+
+    /// A stand-in client registry: one known token, and a record of what was asked for.
+    struct Registry {
+        asked: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Endpoint for Registry {
+        async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+            let iri = inv.request.target.as_str().to_string();
+            self.asked.lock().unwrap().push(iri.clone());
+            if iri == "urn:client:tok-abcdefgh" {
+                return Ok(Representation::new(
+                    ReprType::new("application/json"),
+                    br#"{"id":"acme-jane","note":"retainer"}"#.to_vec(),
+                ));
+            }
+            Err(Error::NotFound("no such client".into()))
+        }
+        fn name(&self) -> &str {
+            "client"
+        }
+    }
+
+    /// A kernel, the tuples dropped into its space, and the IRIs the registry was asked for.
+    type TokenedKernel = (Kernel, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>);
+
+    /// An intake that resolves link tokens, plus the registry's record of lookups.
+    fn tokened_kernel() -> TokenedKernel {
+        let mut cfg = config();
+        cfg.clients = Some("urn:client:{token}".to_string());
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:contact:submit"), submit(cfg))
+            .bind(
+                Exact::new("urn:space:contact"),
+                RecordingSpace {
+                    dropped: dropped.clone(),
+                },
+            )
+            .bind(
+                UriTemplate::parse("urn:client:{token}").unwrap(),
+                Registry {
+                    asked: asked.clone(),
+                },
+            );
+        (Kernel::new(Arc::new(space)), dropped, asked)
+    }
+
+    fn with_token(body: &str, token: &str) -> Request {
+        post(body).with_arg(TOKEN_ARG, ArgRef::Inline(token.as_bytes().to_vec()))
+    }
+
+    #[test]
+    fn a_known_token_attributes_the_submission_without_storing_the_token() {
+        let (k, dropped, _) = tokened_kernel();
+        block_on(k.issue(
+            with_token("name=X&email=x%40y.com&message=hi", "tok-abcdefgh"),
+            &cap(),
+        ))
+        .unwrap();
+        let tuple = dropped.lock().unwrap()[0].clone();
+        // The RECORD's id lands — a name chosen by the person who issued the link…
+        assert!(tuple.contains(r#"(via "acme-jane")"#), "{tuple}");
+        // …and the secret that proved it does NOT. The tuple names an identity, and the
+        // credential stays at the door.
+        assert!(
+            !tuple.contains("tok-abcdefgh"),
+            "token must not persist: {tuple}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_token_is_still_an_ordinary_submission() {
+        let (k, dropped, _) = tokened_kernel();
+        // Revoking a link (deleting the record) must degrade a customer to a visitor, not
+        // lock them out — so this is accepted, just unattributed.
+        block_on(k.issue(
+            with_token("name=X&email=x%40y.com&message=hi", "tok-revoked1"),
+            &cap(),
+        ))
+        .unwrap();
+        let tuple = dropped.lock().unwrap()[0].clone();
+        assert!(tuple.contains(r#"(name "X")"#), "accepted: {tuple}");
+        assert!(!tuple.contains("(via "), "not attributed: {tuple}");
+    }
+
+    #[test]
+    fn a_submission_without_a_token_is_unaffected() {
+        let (k, dropped, asked) = tokened_kernel();
+        block_on(k.issue(post("name=X&email=x%40y.com&message=hi"), &cap())).unwrap();
+        assert!(!dropped.lock().unwrap()[0].contains("(via "));
+        assert!(asked.lock().unwrap().is_empty(), "no lookup attempted");
+    }
+
+    #[test]
+    fn a_token_that_could_escape_the_template_never_reaches_the_registry() {
+        let (k, dropped, asked) = tokened_kernel();
+        // A token is interpolated into an IRI a host may resolve to a PATH. These are
+        // refused on shape, before the substitution — the registry is never even asked.
+        for bad in [
+            "../../etc/passwd",
+            "tok/../../secret",
+            "urn:file:secrets",
+            "short",
+            "tok abcdefgh",
+        ] {
+            block_on(k.issue(with_token("name=X&email=x%40y.com&message=hi", bad), &cap()))
+                .unwrap();
+        }
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "malformed tokens were passed through: {:?}",
+            asked.lock().unwrap()
+        );
+        // All five still submitted normally, just unattributed.
+        assert_eq!(dropped.lock().unwrap().len(), 5);
+        assert!(dropped.lock().unwrap().iter().all(|t| !t.contains("(via ")));
     }
 
     /// An intake with a zone field, to exercise the tzdata check.
