@@ -59,6 +59,11 @@ ikigai-resolve = { workspace = true }
 serde_json = { workspace = true }
 # OS randomness for minting a client link token.
 getrandom = "0.2"
+# Ed25519 over standard PKCS8/SPKI keys — the decide-link token. Same crate and key formats
+# ikigai-sign uses, so a `urn:secret:generate type=ed25519` key loads in both.
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "pkcs8", "pem"] }
+# URL-safe base64 for the token (it rides in a query string).
+base64 = "0.22"
 # Local time (OS timezone) for urn:time:now (the nav/REPL clock). `clock` feature =
 # Local::now; default-features off to skip the unused parsing/serde surface.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
