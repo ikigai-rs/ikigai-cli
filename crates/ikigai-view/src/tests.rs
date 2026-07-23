@@ -147,6 +147,69 @@ fn the_derive_breaker_contains_a_runaway() {
 }
 
 #[test]
+fn attendees_are_separated_by_something_a_name_cannot_contain() {
+    // Corporate directories hand back `Last, First`. Joined with ", " these three
+    // people read as five — the real rendering seen in the live agenda.
+    let event = ViewEvent {
+        uid: "A1".to_string(),
+        title: "Programme".to_string(),
+        start: "2026-08-06T08:00:00-07:00".to_string(),
+        end: "2026-08-06T08:40:00-07:00".to_string(),
+        all_day: false,
+        location: None,
+        description: None,
+        url: None,
+        attendees: vec![
+            "Brian Sletten".to_string(),
+            "Luthra, Sandeep (ELS-LOW)".to_string(),
+            "Engel-McMaster, Jason (ELS-LOW)".to_string(),
+        ],
+        alerts: Vec::new(),
+    };
+    let heading = org_heading(&event);
+    assert!(
+        heading.contains("Attendees: Brian Sletten · Luthra, Sandeep (ELS-LOW) · Engel-McMaster, Jason (ELS-LOW)"),
+        "three attendees stay legibly three: {heading}"
+    );
+}
+
+#[test]
+fn the_join_link_prefers_a_join_path_over_other_links_on_the_same_host() {
+    // A Teams body carries several teams.microsoft.com URLs. Only document order made
+    // the right one win before; now the JOIN path wins even when it comes last.
+    let event = ViewEvent {
+        uid: "A2".to_string(),
+        title: "Programme".to_string(),
+        start: "2026-08-06T08:00:00-07:00".to_string(),
+        end: "2026-08-06T08:40:00-07:00".to_string(),
+        all_day: false,
+        location: None,
+        description: Some(
+            "Meeting options<https://teams.microsoft.com/meetingOptions/?organizerId=x> \
+             then Join: https://teams.microsoft.com/meet/241525919228137?p=abc"
+                .to_string(),
+        ),
+        url: None,
+        attendees: Vec::new(),
+        alerts: Vec::new(),
+    };
+    assert_eq!(
+        join_link(&event).as_deref(),
+        Some("https://teams.microsoft.com/meet/241525919228137?p=abc"),
+        "the /meet/ join link beats the earlier /meetingOptions/ link"
+    );
+    // With no join-shaped path, the first link on a meeting host still wins.
+    let fallback = ViewEvent {
+        description: Some("only https://teams.microsoft.com/meetingOptions/?x=1 here".to_string()),
+        ..event
+    };
+    assert_eq!(
+        join_link(&fallback).as_deref(),
+        Some("https://teams.microsoft.com/meetingOptions/?x=1")
+    );
+}
+
+#[test]
 fn a_flattened_location_does_not_count_as_a_change() {
     // The org `:LOCATION:` drawer is a SINGLE-LINE value, so the round-trip flattens
     // newlines to spaces. An event in both org and a source calendar then offers both
@@ -305,7 +368,7 @@ fn a_captured_invite_becomes_a_heading_with_drawers_and_a_body() {
     // Attendees close the body — read-only in EventKit, the org record is
     // where they live.
     let attendees_at = heading
-        .find("Attendees: Ada Lovelace, grace@example.com")
+        .find("Attendees: Ada Lovelace · grace@example.com")
         .expect("attendee line present");
     assert!(
         attendees_at > body_at,
