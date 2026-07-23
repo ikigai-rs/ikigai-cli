@@ -1822,6 +1822,17 @@ fn root_space_with_mounts(
             ikigai_lisp::program("contact", program),
         )) as Arc<dyn Space>);
     }
+    // The human step. `confirm.scm` reads the confirmations space, and on approval writes
+    // the calendar and emails the requester. Unlike the two handlers above, NO space fires
+    // it — it is invoked by hand (`sink urn:booking:confirm (approve …)`), because deciding
+    // to give someone your time is the one step that is meant to wait for a person. Bound in
+    // the host kernel only: it reaches the calendar, which never leaves this machine.
+    if let Ok(program) = std::fs::read_to_string(file_root().join("confirm.scm")) {
+        spaces.push(Arc::new(ikigai_core::EndpointSpace::new().bind(
+            Exact::new("urn:booking:confirm"),
+            ikigai_lisp::program("confirm", program),
+        )) as Arc<dyn Space>);
+    }
     // Issuing a client link is a HOST action, so it is bound here and deliberately NOT in
     // `served_space`: the public edge may name a client (`urn:cap:client:read`), but only
     // this side may mint one. The registry is bound here too, so an issued link can be
