@@ -14,9 +14,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use ikigai_core::{
-    ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, Fallback, FnEndpoint, Invocation,
-    Iri, Kernel, MetaRenderer, ReprType, Representation, Request, Resolution, Result, Scope, Space,
-    SpaceEntry, SystemClock, Time, UriTemplate, Verb,
+    ActionSpec, ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, Fallback,
+    FnEndpoint, Invocation, Iri, Kernel, MetaRenderer, ReprType, Representation, Request,
+    Resolution, Result, Scope, Space, SpaceEntry, SystemClock, Time, UriTemplate, Verb,
 };
 use ikigai_scheduler::Scheduler;
 use ikigai_time::JobRegistry;
@@ -1822,6 +1822,21 @@ fn root_space_with_mounts(
             ikigai_lisp::program("contact", program),
         )) as Arc<dyn Space>);
     }
+    // Issuing a client link is a HOST action, so it is bound here and deliberately NOT in
+    // `served_space`: the public edge may name a client (`urn:cap:client:read`), but only
+    // this side may mint one. The registry is bound here too, so an issued link can be
+    // read back locally without going through the edge.
+    spaces.push(Arc::new(
+        ikigai_core::EndpointSpace::new()
+            .bind(
+                Exact::new("urn:client:issue"),
+                ClientIssue { root: file_root() },
+            )
+            .bind(
+                UriTemplate::parse(CLIENT_TEMPLATE).expect("CLIENT_TEMPLATE is valid"),
+                ClientRegistry::new(file_root()),
+            ),
+    ) as Arc<dyn Space>);
     // Guardrail for a real footgun: mounts are tried AFTER every local space, so a
     // mount prefix that a local space already serves is silently shadowed — requests
     // under it resolve locally and never reach the remote (e.g. `--mount urn:personal:=…`
@@ -2034,6 +2049,222 @@ impl Endpoint for ClientRegistry {
     }
 }
 
+/// The capability to ISSUE a client link. Deliberately distinct from reading one, and
+/// never granted to the public edge: the door may name a client, only the host may mint one.
+pub const CAP_CLIENT_ISSUE: &str = "urn:cap:client:issue";
+
+/// Where an issued link points. Override with `IKIGAI_BOOKING_URL`.
+fn booking_url() -> String {
+    std::env::var("IKIGAI_BOOKING_URL")
+        .unwrap_or_else(|_| "https://www.bosatsu.net/book.html".to_string())
+}
+
+/// Percent-encode a query VALUE (RFC 3986 unreserved set kept, everything else escaped).
+fn urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// A URL-safe opaque token. 16 bytes of OS randomness, hex — inside the alphabet and
+/// length `ikigai_intake::token_shaped` will accept.
+fn mint_token() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|e| Error::Endpoint(format!("no randomness available: {e}")))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// A human name reduced to an id: `"Jane Doe"` → `"jane-doe"`.
+fn slug(name: &str) -> String {
+    let mut out = String::new();
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.extend(ch.to_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+/// Issue a booking link for a client: `urn:client:issue`.
+///
+/// Mints a token, writes `<workspace>/clients/<token>.json`, and answers with the link to
+/// send. The whole administration surface is two file operations — this writes the record,
+/// and revoking is `rm` — so there is no registry to keep consistent and nothing to restart.
+///
+/// The optional `earliest`/`latest` are the reason this exists rather than a shell script:
+/// they ride in the record, get attested into the submission as `via-earliest` (never
+/// confusable with a field the visitor typed), and let one client book outside the hours
+/// everyone else sees. Policy travels with identity.
+struct ClientIssue {
+    root: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl Endpoint for ClientIssue {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        if !inv.capability.allows(CAP_CLIENT_ISSUE) {
+            return Err(Error::Denied(format!(
+                "issuing a client link requires `{CAP_CLIENT_ISSUE}`"
+            )));
+        }
+        if inv.request.verb != Verb::Sink {
+            return Err(Error::Endpoint(format!(
+                "issue a client with Sink, not {:?}",
+                inv.request.verb
+            )));
+        }
+
+        let arg = |name: &str| {
+            inv.inline_str(name)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        let name = arg("name").ok_or_else(|| Error::MissingArgument("name".to_string()))?;
+        let id = arg("id").unwrap_or_else(|| slug(&name));
+        if id.is_empty() {
+            return Err(Error::InvalidArgument {
+                name: "id".to_string(),
+                detail: "a client needs an id (or a name to derive one from)".to_string(),
+            });
+        }
+
+        let mut record = serde_json::Map::new();
+        record.insert("id".to_string(), serde_json::Value::String(id.clone()));
+        record.insert("name".to_string(), serde_json::Value::String(name.clone()));
+        for field in ["email", "organisation", "note"] {
+            if let Some(value) = arg(field) {
+                record.insert(field.to_string(), serde_json::Value::String(value));
+            }
+        }
+        // An hour outside 0..=23 would silently produce a window nobody can book in.
+        for field in ["earliest", "latest"] {
+            if let Some(value) = arg(field) {
+                let hour: u8 = value.parse().ok().filter(|h| *h <= 23).ok_or_else(|| {
+                    Error::InvalidArgument {
+                        name: field.to_string(),
+                        detail: format!("`{value}` is not an hour 0..23"),
+                    }
+                })?;
+                record.insert(field.to_string(), serde_json::Value::from(hour));
+            }
+        }
+
+        let token = mint_token()?;
+        let dir = self.root.join("clients");
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| Error::Endpoint(format!("cannot create {}: {e}", dir.display())))?;
+        let path = dir.join(format!("{token}.json"));
+        let body = serde_json::to_vec_pretty(&serde_json::Value::Object(record))
+            .map_err(|e| Error::Endpoint(format!("cannot serialise the record: {e}")))?;
+        std::fs::write(&path, &body)
+            .map_err(|e| Error::Endpoint(format!("cannot write {}: {e}", path.display())))?;
+
+        let mut link = format!("{}?k={}", booking_url(), token);
+        // Pre-fill what we already know, so the client types as little as possible. These
+        // are convenience only — they are editable, unlike the token.
+        for (param, value) in [("name", Some(name.clone())), ("email", arg("email"))] {
+            if let Some(value) = value {
+                link.push_str(&format!("&{param}={}", urlencode(&value)));
+            }
+        }
+
+        // Sending is opt-in and never the default: minting a link is local and reversible,
+        // putting it in someone's inbox is neither.
+        let mut sent = String::new();
+        if arg("send").is_some_and(|v| matches!(v.as_str(), "yes" | "true" | "1")) {
+            let to = arg("email").ok_or_else(|| Error::InvalidArgument {
+                name: "send".to_string(),
+                detail: "nothing to send to — this client has no `email`".to_string(),
+            })?;
+            let text = format!(
+                "Hello {name},\n\nHere is your personal link for scheduling time with me. \
+                 It stays valid, so keep it somewhere you'll find it again:\n\n{link}\n\n\
+                 Offer whichever hours suit you and I'll confirm one.\n\nBrian\n"
+            );
+            inv.issue(
+                Request::new(
+                    Verb::Sink,
+                    Iri::parse("urn:email:send").expect("literal IRI"),
+                )
+                .with_arg("to", ArgRef::Inline(to.clone().into_bytes()))
+                .with_arg("subject", ArgRef::Inline(b"Your scheduling link".to_vec()))
+                .with_arg("content", ArgRef::Inline(text.into_bytes())),
+            )
+            .await?;
+            sent = format!("sent to {to}\n");
+        }
+
+        Ok(Representation::new(
+            ReprType::new("text/plain").with_param("charset", "utf-8"),
+            format!("{link}\nclient: {id}\nrecord: {}\n{sent}", path.display()).into_bytes(),
+        ))
+    }
+
+    fn name(&self) -> &str {
+        "client-issue"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("client-issue")
+            .title("Issue a client booking link")
+            .summary(
+                "Mints a token, writes the client record, and answers with the link to \
+                 send. Revoke by deleting the record. `earliest`/`latest` widen the \
+                 booking window for this client alone.",
+            )
+            .action(
+                ActionSpec::new(Verb::Sink)
+                    .summary("issue — mint a durable booking link for one client")
+                    .requires(CAP_CLIENT_ISSUE)
+                    .input(ArgSpec::new("name").summary("the client's name"))
+                    .input(
+                        ArgSpec::new("id")
+                            .optional()
+                            .summary("short id recorded on their bookings (default: from name)"),
+                    )
+                    .input(
+                        ArgSpec::new("email")
+                            .optional()
+                            .summary("pre-filled in the link, and where `send=yes` posts it"),
+                    )
+                    .input(ArgSpec::new("organisation").optional().summary("their org"))
+                    .input(
+                        ArgSpec::new("note")
+                            .optional()
+                            .summary("a note to yourself"),
+                    )
+                    .input(
+                        ArgSpec::new("earliest")
+                            .optional()
+                            .summary("earliest bookable hour for THIS client, host-local 0..23"),
+                    )
+                    .input(
+                        ArgSpec::new("latest")
+                            .optional()
+                            .summary("latest bookable hour for THIS client, host-local 0..23"),
+                    )
+                    .input(
+                        ArgSpec::new("send")
+                            .optional()
+                            .one_of(["yes", "no"])
+                            .summary("email the link to them (default no)"),
+                    ),
+            )
+            .output("text/plain; charset=utf-8")
+    }
+}
+
 /// The public contact form's accepted fields. Each `summary` is human-facing on purpose:
 /// it is what `?description` projects and a generated form renders as the field's LABEL,
 /// so the validation and the UI come from ONE declaration and cannot drift.
@@ -2052,6 +2283,7 @@ fn contact_intake() -> ikigai_intake::IntakeConfig {
         honeypot: Some("_honey".to_string()),
         requires: "urn:cap:contact:submit".to_string(),
         clients: Some(CLIENT_TEMPLATE.to_string()),
+        attests: Vec::new(),
     }
 }
 
@@ -2084,6 +2316,10 @@ fn booking_intake() -> ikigai_intake::IntakeConfig {
         honeypot: Some("_honey".to_string()),
         requires: "urn:cap:booking:submit".to_string(),
         clients: Some(CLIENT_TEMPLATE.to_string()),
+        // A client's own booking window rides in as `via-earliest`/`via-latest`, which the
+        // handler may widen on — and which the visitor cannot type, because the submitted
+        // field would be `earliest`, not `via-earliest`.
+        attests: vec!["earliest".to_string(), "latest".to_string()],
     }
 }
 
@@ -2403,6 +2639,109 @@ mod tests {
     use super::*;
     use futures::executor::block_on;
     use ikigai_core::{ArgRef, Capability, Iri, Request};
+
+    /// A kernel with just the client endpoints, rooted at a scratch directory.
+    fn client_kernel(root: std::path::PathBuf) -> Kernel {
+        let space = EndpointSpace::new()
+            .bind(
+                Exact::new("urn:client:issue"),
+                ClientIssue { root: root.clone() },
+            )
+            .bind(
+                UriTemplate::parse(CLIENT_TEMPLATE).unwrap(),
+                ClientRegistry::new(root),
+            );
+        Kernel::new(Arc::new(space))
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ikigai-client-test-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn issuing_a_link_writes_a_record_the_registry_can_read_back() {
+        let root = scratch("issue");
+        let k = client_kernel(root.clone());
+        let out = block_on(
+            k.issue(
+                Request::new(Verb::Sink, Iri::parse("urn:client:issue").unwrap())
+                    .with_arg("name", ArgRef::Inline(b"Nigel Ashworth".to_vec()))
+                    .with_arg("earliest", ArgRef::Inline(b"7".to_vec())),
+                &Capability::scoped([CAP_CLIENT_ISSUE]),
+            ),
+        )
+        .unwrap();
+        let text = String::from_utf8(out.bytes.clone()).unwrap();
+        assert!(text.contains("?k="), "answers with a link: {text}");
+        // The id is derived from the name when one isn't given.
+        assert!(text.contains("client: nigel-ashworth"), "{text}");
+
+        // And the token in that link resolves through the registry to the same record.
+        let token = text
+            .split("?k=")
+            .nth(1)
+            .and_then(|s| s.split(['&', '\n']).next())
+            .unwrap()
+            .to_string();
+        let record = block_on(k.issue(
+            Request::new(
+                Verb::Source,
+                Iri::parse(format!("urn:client:{token}")).unwrap(),
+            ),
+            &Capability::scoped([CAP_CLIENT_READ]),
+        ))
+        .unwrap();
+        let json = String::from_utf8(record.bytes.clone()).unwrap();
+        assert!(json.contains("\"earliest\": 7"), "policy travels: {json}");
+    }
+
+    #[test]
+    fn minting_and_reading_are_separate_authorities() {
+        let root = scratch("caps");
+        let k = client_kernel(root);
+        // The public edge holds read, and must not be able to mint itself a client.
+        let denied = block_on(
+            k.issue(
+                Request::new(Verb::Sink, Iri::parse("urn:client:issue").unwrap())
+                    .with_arg("name", ArgRef::Inline(b"Sneaky".to_vec())),
+                &Capability::scoped([CAP_CLIENT_READ]),
+            ),
+        )
+        .unwrap_err();
+        assert!(matches!(denied, Error::Denied(_)), "{denied:?}");
+    }
+
+    #[test]
+    fn an_hour_outside_the_clock_is_refused() {
+        let root = scratch("hours");
+        let k = client_kernel(root);
+        let err = block_on(
+            k.issue(
+                Request::new(Verb::Sink, Iri::parse("urn:client:issue").unwrap())
+                    .with_arg("name", ArgRef::Inline(b"X".to_vec()))
+                    .with_arg("earliest", ArgRef::Inline(b"25".to_vec())),
+                &Capability::scoped([CAP_CLIENT_ISSUE]),
+            ),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not an hour"), "{err}");
+    }
+
+    #[test]
+    fn a_token_shaped_like_a_path_is_not_found_rather_than_followed() {
+        let root = scratch("traversal");
+        std::fs::write(root.join("secret.json"), b"{}").unwrap();
+        let k = client_kernel(root);
+        let err = block_on(k.issue(
+            Request::new(Verb::Source, Iri::parse("urn:client:../secret").unwrap()),
+            &Capability::scoped([CAP_CLIENT_READ]),
+        ))
+        .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+    }
 
     #[test]
     fn calendar_server_space_exposes_only_the_calendar() {

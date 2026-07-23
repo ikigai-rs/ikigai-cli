@@ -114,6 +114,18 @@ pub struct IntakeConfig {
     /// a submission with no token, an unknown one, or a revoked one is still an ordinary
     /// public submission — a rotated link should stop *attributing*, not start rejecting.
     pub clients: Option<String>,
+    /// Fields to copy out of a resolved client record into the tuple, each prefixed
+    /// `via-` — e.g. `earliest` lands as `(via-earliest "7")`.
+    ///
+    /// This is how a per-client POLICY reaches the handler. The handler cannot look the
+    /// client up itself: the tuple records the client's *id*, deliberately not the token,
+    /// and the registry is keyed by token. So the door — which does hold the token, for
+    /// exactly one instant — copies across what the handler will need.
+    ///
+    /// The `via-` prefix is doing real work: it marks these as ATTESTED by whoever issued
+    /// the link, as opposed to the sibling fields the submitter typed. A handler that
+    /// widens a booking window on `via-earliest` must never widen it on `earliest`.
+    pub attests: Vec<String>,
 }
 
 /// The query argument a link token arrives in (`…/booking/submit?k=TOKEN`).
@@ -189,12 +201,18 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Resolve `template` for `token` and return the client's id, or `None` for any failure.
+/// Resolve `template` for `token`, returning `(id, attested fields)` — or `None` for any
+/// failure, which is always treated as "no token".
 ///
-/// Returns the record's own `id` when it has one, so the identity recorded in the tuple is
-/// a name Brian chose ("acme-jane") rather than the secret in the URL. A record without an
-/// id falls back to the token, which is why tokens should be opaque either way.
-async fn lookup_client(inv: &Invocation<'_>, template: &str, token: &str) -> Option<String> {
+/// The id is the record's own when it has one, so what lands in the tuple is a name chosen
+/// by whoever issued the link ("acme-jane") rather than the secret from the URL. A record
+/// without an id falls back to the token, which is one more reason tokens stay opaque.
+async fn lookup_client(
+    inv: &Invocation<'_>,
+    template: &str,
+    token: &str,
+    attests: &[String],
+) -> Option<(String, Vec<(String, String)>)> {
     let iri = Iri::parse(template.replace("{token}", token)).ok()?;
     let found = inv.issue(Request::new(Verb::Source, iri)).await.ok()?;
     let text = std::str::from_utf8(&found.bytes).ok()?;
@@ -204,7 +222,23 @@ async fn lookup_client(inv: &Invocation<'_>, template: &str, token: &str) -> Opt
         .and_then(|v| v.as_str())
         .unwrap_or(token)
         .trim();
-    (!id.is_empty()).then(|| id.to_string())
+    if id.is_empty() {
+        return None;
+    }
+    // Only the fields the intake was configured to carry — a record may hold notes and
+    // contact details that are nobody's business downstream.
+    let carried = attests
+        .iter()
+        .filter_map(|name| {
+            let value = match record.get(name)? {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Null => return None,
+                other => other.to_string(),
+            };
+            (!value.is_empty()).then(|| (format!("via-{name}"), value))
+        })
+        .collect();
+    Some((id.to_string(), carried))
 }
 
 /// Parse a submission body into (field, value) pairs. JSON when it starts with `{`
@@ -368,8 +402,11 @@ impl Endpoint for IntakeEndpoint {
             if let Ok(token) = inv.inline_str(TOKEN_ARG) {
                 let token = token.trim();
                 if token_shaped(token) {
-                    if let Some(id) = lookup_client(inv, template, token).await {
+                    if let Some((id, attested)) =
+                        lookup_client(inv, template, token, &config.attests).await
+                    {
                         carried.push((VIA_FIELD.to_string(), id));
+                        carried.extend(attested);
                     }
                 }
             }
@@ -486,6 +523,7 @@ mod tests {
             honeypot: Some("_honey".to_string()),
             requires: "urn:cap:contact:submit".to_string(),
             clients: None,
+            attests: Vec::new(),
         }
     }
 
