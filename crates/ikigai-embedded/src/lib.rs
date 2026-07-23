@@ -1740,6 +1740,17 @@ fn root_space_with_mounts(
             on: demo_flag(),
         }) as Arc<dyn Space>,
     ];
+    // The booking handler: `schedule.scm` bound as an endpoint (`ikigai_lisp::program` — the
+    // program IS the endpoint), IF the workspace provides `booking-handler.scm`. The reactive
+    // `bookings` space fires `urn:booking:handle` on each dropped request, under that space's
+    // own scoped `cap` file. The request reaches the program as DATA via `(input)`, never as
+    // code. Absent the file, the endpoint simply isn't bound.
+    if let Ok(program) = std::fs::read_to_string(file_root().join("booking-handler.scm")) {
+        spaces.push(Arc::new(ikigai_core::EndpointSpace::new().bind(
+            Exact::new("urn:booking:handle"),
+            ikigai_lisp::program("booking", program),
+        )) as Arc<dyn Space>);
+    }
     // Guardrail for a real footgun: mounts are tried AFTER every local space, so a
     // mount prefix that a local space already serves is silently shadowed — requests
     // under it resolve locally and never reach the remote (e.g. `--mount urn:personal:=…`

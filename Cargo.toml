@@ -65,7 +65,7 @@ ikigai-cms = "0.1.1" # 0.1.1 = stitch wrapped bookmark titles (no dropped entrie
 ikigai-repo = "0.1.2" # 0.1.2 = typed Error::Denied for capability denials
 # Steel-backed Lisp evaluator (urn:lisp:eval): code is a resource, builtins ARE the
 # cap-scoped kernel verbs. Embedded-only (arbitrary code); gated by urn:cap:lisp.
-ikigai-lisp = "0.1.0"
+ikigai-lisp = "0.1.6" # (input) + program() — a stored Lisp program bound as an endpoint
 # LLM inference (urn:llm:ask + urn:llm:<provider>:ask + urn:llm:config): a facade grammar
 # over pluggable backends. OpenAI-compatible REST backend (Ollama/vLLM/llama.cpp/mlx_lm).
 ikigai-llm = "0.7.0" # installed: smallest-first with sizes (host co-load budgeting)
