@@ -19,6 +19,8 @@ use ikigai_core::{
     Resolution, Result, Scope, Space, SpaceEntry, SystemClock, Time, UriTemplate, Verb,
 };
 use ikigai_scheduler::Scheduler;
+
+pub mod decide;
 use ikigai_time::JobRegistry;
 use ikigai_vocab::TurtleRenderer;
 use notify::{RecursiveMode, Watcher};
@@ -1171,6 +1173,15 @@ fn served_space(nature: &'static str) -> EndpointSpace {
             UriTemplate::parse(ikigai_intray::SPACE_TEMPLATE).expect("SPACE_TEMPLATE is valid"),
             ikigai_intray::SpaceEndpoint::new(file_root().join("spaces")),
         )
+        // The emailed decision links: /calendar-request/{approve,decline}. Public — the
+        // signed token IS the authorisation, and this host only RECORDS the decision into a
+        // space. It reads a public key from a file and needs no secret authority at all.
+        .bind(
+            UriTemplate::parse("urn:calendar-request:{action}").expect("valid template"),
+            decide::CalendarRequest {
+                key_path: decide::public_key_path(),
+            },
+        )
         // Attribution for handed-out links. The edge grants `urn:cap:client:read` and
         // nothing filesystem-shaped, so this can name a client and do nothing else.
         .bind(
@@ -1844,6 +1855,19 @@ fn root_space_with_mounts(
             ikigai_lisp::program("drain", program),
         )) as Arc<dyn Space>);
     }
+    // The two halves of the decision loop that must stay on this machine: minting a link
+    // (it signs, so it touches the private key) and acting on a decision that came back
+    // (it re-verifies, then writes the calendar). Never in `served_space`.
+    spaces.push(Arc::new(
+        ikigai_core::EndpointSpace::new()
+            .bind(Exact::new("urn:decide:link"), decide::DecideLink)
+            .bind(
+                Exact::new("urn:decide:accept"),
+                decide::DecideAccept {
+                    key_path: decide::public_key_path(),
+                },
+            ),
+    ) as Arc<dyn Space>);
     // Issuing a client link is a HOST action, so it is bound here and deliberately NOT in
     // `served_space`: the public edge may name a client (`urn:cap:client:read`), but only
     // this side may mint one. The registry is bound here too, so an issued link can be
