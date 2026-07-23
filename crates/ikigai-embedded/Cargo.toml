@@ -36,6 +36,7 @@ ikigai-encrypt = { workspace = true }
 # Timezone conversion (urn:tz:convert) + zoned clock (urn:tz:now) — pure, bound in base_space.
 ikigai-tz = { workspace = true }
 ikigai-intray = { workspace = true }
+ikigai-email = { workspace = true }
 ikigai-secret = { workspace = true }
 ikigai-xslt = { workspace = true }
 ikigai-jsonld = { workspace = true }
