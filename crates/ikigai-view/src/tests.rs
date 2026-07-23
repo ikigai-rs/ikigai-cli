@@ -147,6 +147,39 @@ fn the_derive_breaker_contains_a_runaway() {
 }
 
 #[test]
+fn a_flattened_location_does_not_count_as_a_change() {
+    // The org `:LOCATION:` drawer is a SINGLE-LINE value, so the round-trip flattens
+    // newlines to spaces. An event in both org and a source calendar then offers both
+    // forms, and a byte comparison called them different on EVERY pass — the churn that
+    // tripped the breaker live (real values from the daemon log).
+    let with_newline = "@prefix ical: <http://www.w3.org/2002/12/cal/ical#> .\n\
+         <urn:event:4D7E3E55> ical:summary \"Visit\" ; \
+         ical:dtstart \"2026-07-23T09:00:00-07:00\" ; ical:dtend \"2026-07-23T10:00:00-07:00\" ; \
+         ical:location \"7580 Autumn Wind Ct\\nNewcastle, CA, United States\" .\n";
+    let flattened = with_newline.replace("Ct\\nNewcastle", "Ct Newcastle");
+    let sorted = |t: &str| {
+        let mut v: Vec<String> = normalize_for_diff(t).lines().map(str::to_string).collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        sorted(with_newline),
+        sorted(&flattened),
+        "newline vs the flattened drawer form is the same location — must converge"
+    );
+    // Double spaces collapse too (the Maidu Dental case), on both sides alike.
+    let doubled = with_newline.replace("Ct\\nNewcastle", "Ct  Newcastle");
+    assert_eq!(sorted(&doubled), sorted(&flattened));
+    // A REAL location change still registers.
+    let moved = with_newline.replace("Autumn Wind Ct", "Autumn Wind Ave");
+    assert_ne!(
+        sorted(&moved),
+        sorted(&flattened),
+        "a real move is a change"
+    );
+}
+
+#[test]
 fn the_join_link_prefers_the_real_url_and_falls_back_to_the_notes() {
     let mut event = ViewEvent {
         uid: "T1".to_string(),

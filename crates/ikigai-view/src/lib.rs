@@ -194,6 +194,7 @@ fn normalize_for_diff(turtle: &str) -> String {
     const ICAL_DTEND: &str = "http://www.w3.org/2002/12/cal/ical#dtend";
     const ICAL_URL: &str = "http://www.w3.org/2002/12/cal/ical#url";
     const ICAL_ATTENDEE: &str = "http://www.w3.org/2002/12/cal/ical#attendee";
+    const ICAL_LOCATION: &str = "http://www.w3.org/2002/12/cal/ical#location";
     let quads: Vec<oxrdf::Quad> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle)
         .for_slice(turtle.as_bytes())
         .filter_map(|q| q.ok())
@@ -218,6 +219,26 @@ fn normalize_for_diff(turtle: &str) -> String {
         out.push(' ');
         out.push_str(&quad.predicate.to_string());
         out.push(' ');
+        // A location can reach the diff in two equivalent forms: the calendar's
+        // original (which may contain newlines) and the org round-trip's copy, where
+        // `:LOCATION:` — a SINGLE-LINE drawer value — flattened every newline to a
+        // space. An event present in both org and a source calendar therefore offers
+        // both, and a byte comparison calls them different on every pass forever
+        // (the derive rewrites, the next diff disagrees, the breaker eventually trips).
+        // Compare locations with whitespace canonicalized so the lossy-but-equivalent
+        // form converges, while a REAL location change still registers.
+        if pred == ICAL_LOCATION {
+            if let oxrdf::Term::Literal(literal) = &quad.object {
+                let flat = literal
+                    .value()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                out.push_str(&oxrdf::Literal::new_simple_literal(flat).to_string());
+                out.push_str(" .\n");
+                continue;
+            }
+        }
         out.push_str(&quad.object.to_string());
         out.push_str(" .\n");
     }
