@@ -2506,9 +2506,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-org"
-version = "0.1.4"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32b0b00b7639b19d0e6e94f64b822d6111e5236454f21e5bab144a35b2696fdb"
+checksum = "bae6bf119de0b36e958065b94174d07372fad5c54fd4c60e3af39532f1beea7c"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2517,9 +2517,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-personal"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb5d7dd7e621e35ce8098619446fd0124b2e96426b9ba2bf039e803478dcb59e"
+checksum = "87e291cc3350217ccc15486383b40e7bb2c447ac268950a7fad6eeef80f24540"
 dependencies = [
  "block2 0.6.2",
  "chrono",

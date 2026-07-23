@@ -58,6 +58,16 @@ struct ViewEvent {
     end: String,
     all_day: bool,
     location: Option<String>,
+    /// The notes body (ical:description) — a captured invite's full text, or
+    /// (on org-sourced events) just the join link the :URL: drawer carries.
+    description: Option<String>,
+    /// The event's REAL URL (ical:url) — a Teams invite's join link as read
+    /// from the source. Never written back: the Sink's URL field is the
+    /// urn:event:{uid} identity token, so the link travels via `description`.
+    url: Option<String>,
+    /// Attendees (ical:attendee, multi-valued, store order) — read-only in
+    /// EventKit, so they inform the org record's body and are never written.
+    attendees: Vec<String>,
     /// Alarms: minutes before start (ik:alert, multi-valued).
     alerts: Vec<u32>,
 }
@@ -68,6 +78,7 @@ fn events_by_uid(turtle: &str) -> BTreeMap<String, ViewEvent> {
     const IK: &str = "https://ikigai-rs.dev/ns#";
     let mut props: BTreeMap<String, BTreeMap<String, String>> = Default::default();
     let mut alert_map: BTreeMap<String, Vec<u32>> = Default::default();
+    let mut attendee_map: BTreeMap<String, Vec<String>> = Default::default();
     for quad in
         oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle).for_slice(turtle.as_bytes())
     {
@@ -83,11 +94,16 @@ fn events_by_uid(turtle: &str) -> BTreeMap<String, ViewEvent> {
             oxrdf::Term::NamedNode(n) => n.as_str().to_string(),
             _ => continue,
         };
-        // ik:alert is MULTI-valued — collect separately from the single-valued props.
+        // ik:alert and ical:attendee are MULTI-valued — collect separately from
+        // the single-valued props (that map keeps one value per predicate).
         if quad.predicate.as_str() == "https://ikigai-rs.dev/ns#alert" {
             if let Ok(minutes) = value.parse::<u32>() {
                 alert_map.entry(uid.to_string()).or_default().push(minutes);
             }
+            continue;
+        }
+        if quad.predicate.as_str() == "http://www.w3.org/2002/12/cal/ical#attendee" {
+            attendee_map.entry(uid.to_string()).or_default().push(value);
             continue;
         }
         props
@@ -101,6 +117,7 @@ fn events_by_uid(turtle: &str) -> BTreeMap<String, ViewEvent> {
             let mut alerts = alert_map.get(&uid).cloned().unwrap_or_default();
             alerts.sort_unstable();
             alerts.dedup();
+            let attendees = attendee_map.get(&uid).cloned().unwrap_or_default();
             Some((
                 uid.clone(),
                 ViewEvent {
@@ -115,6 +132,9 @@ fn events_by_uid(turtle: &str) -> BTreeMap<String, ViewEvent> {
                         .map(|v| v == "true")
                         .unwrap_or(false),
                     location: p.get(&format!("{ICAL}location")).cloned(),
+                    description: p.get(&format!("{ICAL}description")).cloned(),
+                    url: p.get(&format!("{ICAL}url")).cloned(),
+                    attendees,
                     alerts,
                 },
             ))
@@ -158,11 +178,22 @@ fn subject_uids(turtle: &str) -> BTreeSet<String> {
 ///   day before, i.e. 900 min) that the source never asked for, so a created all-day event
 ///   reads back with an alert the desired lacks. Timed-event alerts are untouched (they
 ///   round-trip and are source-controlled).
+/// - **`ical:url`** — a source event's real URL (a Teams invite's join link). It can
+///   never round-trip: the create deliberately writes the `urn:event:{uid}` identity
+///   token into the view copy's URL field, so the view reads back no `ical:url` and
+///   comparing it would churn every linked event. The link still reaches the view via
+///   `ical:description` (EKEvent .notes) — which IS kept in the diff: a note round-trips
+///   through .notes as written, and if EventKit ever normalizes it the breaker will name
+///   it (exclude it here then, like the all-day fields).
+/// - **`ical:attendee`** — attendees are READ-ONLY in EventKit, so a view copy can never
+///   carry them; they reach the org record's body at ingest instead.
 fn normalize_for_diff(turtle: &str) -> String {
     const IK_CALENDAR: &str = "https://ikigai-rs.dev/ns#calendar";
     const IK_ALLDAY: &str = "https://ikigai-rs.dev/ns#allDay";
     const IK_ALERT: &str = "https://ikigai-rs.dev/ns#alert";
     const ICAL_DTEND: &str = "http://www.w3.org/2002/12/cal/ical#dtend";
+    const ICAL_URL: &str = "http://www.w3.org/2002/12/cal/ical#url";
+    const ICAL_ATTENDEE: &str = "http://www.w3.org/2002/12/cal/ical#attendee";
     let quads: Vec<oxrdf::Quad> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle)
         .for_slice(turtle.as_bytes())
         .filter_map(|q| q.ok())
@@ -176,7 +207,7 @@ fn normalize_for_diff(turtle: &str) -> String {
     let mut out = String::new();
     for quad in &quads {
         let pred = quad.predicate.as_str();
-        if pred == IK_CALENDAR {
+        if pred == IK_CALENDAR || pred == ICAL_URL || pred == ICAL_ATTENDEE {
             continue;
         }
         if (pred == ICAL_DTEND || pred == IK_ALERT) && all_day.contains(&quad.subject.to_string()) {
@@ -217,19 +248,86 @@ fn alert_token(minutes: u32) -> String {
     }
 }
 
+/// The join link for a captured event: the event's real URL when it is already
+/// a Teams link, else the first Teams URL found in the notes (the narrow match
+/// — a stable, single-line token fit for a drawer property).
+fn join_link(event: &ViewEvent) -> Option<String> {
+    const TEAMS: &str = "https://teams.microsoft.com/";
+    if let Some(url) = &event.url {
+        if url.starts_with(TEAMS) {
+            return Some(url.clone());
+        }
+    }
+    let notes = event.description.as_deref()?;
+    let at = notes.find(TEAMS)?;
+    let link: String = notes[at..]
+        .chars()
+        .take_while(|c| !c.is_whitespace() && !"<>\"'".contains(*c))
+        .collect();
+    Some(link.trim_end_matches(['.', ',', ')', ';']).to_string())
+}
+
 /// One captured event as an org heading: title, a `:PROPERTIES:` drawer carrying
-/// the identity, and an active timestamp the agenda parser round-trips.
+/// the identity (plus `:LOCATION:`/`:URL:` when known), an active timestamp the
+/// agenda parser round-trips, and the FULL description plus the attendee list
+/// as the heading body — that's for reading in org; only the drawer link
+/// re-surfaces to the derived calendar.
 fn org_heading(event: &ViewEvent) -> String {
     let stamp = org_stamp(event);
+    let mut drawer = format!("  :PROPERTIES:\n  :ID: {}\n", event.uid);
+    if let Some(location) = &event.location {
+        // Drawer properties are single-line by construction.
+        drawer.push_str(&format!("  :LOCATION: {}\n", location.replace('\n', " ")));
+    }
+    if let Some(link) = join_link(event) {
+        drawer.push_str(&format!("  :URL: {link}\n"));
+    }
+    drawer.push_str("  :END:\n");
     let alert = if event.alerts.is_empty() {
         String::new()
     } else {
         let tokens: Vec<String> = event.alerts.iter().map(|m| alert_token(*m)).collect();
         format!("  :ALERT: {}\n", tokens.join(" "))
     };
+    // The body comes LAST: the agenda parser reads :ID:/:ALERT: lines anywhere
+    // under a headline, so untrusted invite text placed before the stamp could
+    // hijack the entry's identity or alarms. Lines that would parse as a new
+    // headline (leading '*') get org's comma escape.
+    let body: String = event
+        .description
+        .as_deref()
+        .map(|text| {
+            text.lines()
+                .map(|line| {
+                    let escaped = if line.trim_start().starts_with('*') {
+                        format!(",{line}")
+                    } else {
+                        line.to_string()
+                    };
+                    match escaped.trim_end() {
+                        "" => "\n".to_string(),
+                        line => format!("  {line}\n"),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // Attendees close the body (same after-the-stamp discipline; names are
+    // invite data). Read-only in EventKit — the org record is where they live.
+    let attendees = if event.attendees.is_empty() {
+        String::new()
+    } else {
+        let names: Vec<String> = event
+            .attendees
+            .iter()
+            .map(|name| name.replace('\n', " "))
+            .collect();
+        let separator = if body.is_empty() { "" } else { "\n" };
+        format!("{separator}  Attendees: {}\n", names.join(", "))
+    };
     format!(
-        "\n* {}\n  :PROPERTIES:\n  :ID: {}\n  :END:\n{alert}  {stamp}\n",
-        event.title, event.uid
+        "\n* {}\n{drawer}{alert}  {stamp}\n{body}{attendees}",
+        event.title
     )
 }
 
@@ -255,8 +353,8 @@ fn org_stamp(event: &ViewEvent) -> String {
 }
 
 /// Apply a source's projection mode to its event graph (Turtle in, Turtle out).
-/// `busy`: titles become "Busy (<source>)", locations and alarms are withheld.
-/// Anything else (or no mode) passes through untouched.
+/// `busy`: titles become "Busy (<source>)"; locations, descriptions, links, and
+/// alarms are withheld. Anything else (or no mode) passes through untouched.
 fn project_source(turtle: String, source: &str, mode: Option<&str>) -> String {
     if mode != Some("busy") {
         return turtle;
@@ -630,6 +728,16 @@ impl Endpoint for DeriveEndpoint {
             if let Some(location) = &event.location {
                 request =
                     request.with_arg("location", ArgRef::Inline(location.as_bytes().to_vec()));
+            }
+            // The description (a captured invite's join link, or a source
+            // event's notes) rides into the view copy's .notes. The event's
+            // real URL is deliberately NOT passed: the Sink's URL field is the
+            // urn:event:{uid} identity token.
+            if let Some(description) = &event.description {
+                request = request.with_arg(
+                    "description",
+                    ArgRef::Inline(description.as_bytes().to_vec()),
+                );
             }
             if !event.alerts.is_empty() {
                 let minutes: Vec<String> = event.alerts.iter().map(u32::to_string).collect();
