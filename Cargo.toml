@@ -18,7 +18,7 @@ ikigai-vocab = "0.1.33" # + event terms (ik:calendar/allDay/alert) + LLM trait t
 # The reusable function library, linked in as a published module crate.
 ikigai-fn = "0.1.2" # + urn:fn:conditional (the lazy branch: if/then/else are URIs)
 # Personal contexts (urn:personal:*), macOS-backed, linked as a published module.
-ikigai-personal = "0.6.0" # calendar reads scoped to the configured view (Brian-Busy); busy/free honored
+ikigai-personal = "0.7.0" # notes/URL/attendees on the graph face + description= Sink (detail preservation)
 # Capability-gated file/store module, linked as a published module crate.
 ikigai-fs = "0.1.4" # 0.1.4 = typed Error::Denied for capability denials
 # Outbound HTTP-client module (urn:httpGet…), linked as a published module crate.
@@ -54,7 +54,7 @@ ikigai-shacl = "0.1.0"
 # The org-mode agenda (urn:org:agenda:{period}) — reads org files through the
 # kernel (urn:orgfile:*) and speaks the same skolemized event graph as the
 # calendar, so the two union/diff as graphs.
-ikigai-org = "0.1.3" # caret picks up 0.1.4 (cross-midnight fix) once published
+ikigai-org = "0.1.5" # :LOCATION:/:URL: drawers -> ical:location + join link as ical:description
 # Unix-like text endpoints (urn:text:wc/head/tail/grep/sort/uniq/nl/rev) — the
 # first satellite-built module; pure text, wasm-clean, ArgSpec showcase.
 ikigai-text = "0.1.0"
