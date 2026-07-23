@@ -1985,7 +1985,9 @@ fn booking_intake() -> ikigai_intake::IntakeConfig {
                 "hours",
                 "Hours that suit you, in YOUR timezone (24-hour, space separated — e.g. 9 10 14)",
             ),
-            F::required("zone", "Your timezone (IANA, e.g. Europe/London)"),
+            // No "e.g. Europe/London" hint: a generated form offers a zone picker, and the
+            // label is what it renders. The server still checks the name against tzdata.
+            F::required("zone", "Your timezone").iana_zone(),
             F::optional(
                 "preference",
                 "Anything to note? (e.g. nothing before 10, not right after lunch)",
