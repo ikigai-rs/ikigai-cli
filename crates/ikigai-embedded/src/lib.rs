@@ -1833,6 +1833,17 @@ fn root_space_with_mounts(
             ikigai_lisp::program("confirm", program),
         )) as Arc<dyn Space>);
     }
+    // The drain. `drain.scm` reads the EDGE's bookings space (mounted here at `urn:edge:` —
+    // see `--mount`) and delivers each tuple into the LOCAL bookings space, where dropping it
+    // fires `urn:booking:handle`. It is bound here and scheduled below; the edge itself never
+    // runs it (the edge is the airlock — it only accepts and holds). No mount → the drain
+    // simply finds nothing to read and reports zero.
+    if let Ok(program) = std::fs::read_to_string(file_root().join("drain.scm")) {
+        spaces.push(Arc::new(ikigai_core::EndpointSpace::new().bind(
+            Exact::new("urn:booking:drain"),
+            ikigai_lisp::program("drain", program),
+        )) as Arc<dyn Space>);
+    }
     // Issuing a client link is a HOST action, so it is bound here and deliberately NOT in
     // `served_space`: the public edge may name a client (`urn:cap:client:read`), but only
     // this side may mint one. The registry is bound here too, so an issued link can be
@@ -1977,7 +1988,36 @@ pub fn watched_kernel_with_mounts(
             true,
         );
     }
+    // The standing drain: when `IKIGAI_DRAIN_EVERY` is set (e.g. "30s"), pull bookings from
+    // the mounted edge on that cadence. Same clock pattern as the derive tick, and it shows
+    // on the Control tab's Time-jobs readout. Only meaningful with the edge mounted at
+    // `urn:edge:` and `drain.scm` in the workspace; absent either, the job is harmless.
+    if let Some(every) = drain_every() {
+        let _ = registry.schedule_persistent(
+            "urn:booking:drain".to_string(),
+            Verb::Source,
+            ikigai_time::Schedule::Every(every),
+            true,
+        );
+    }
     kernel
+}
+
+/// How often to drain the edge, from `IKIGAI_DRAIN_EVERY` (`30s`, `5m`, `1h`). `None`
+/// disables it — the drain still runs on demand, just not on a timer. A floor of 15s keeps
+/// a fat-fingered `1s` from hammering the wire.
+fn drain_every() -> Option<std::time::Duration> {
+    let spec = std::env::var("IKIGAI_DRAIN_EVERY").ok()?;
+    let spec = spec.trim();
+    let (digits, unit) = spec.split_at(spec.len().saturating_sub(1));
+    let n: u64 = digits.parse().ok()?;
+    let seconds = match unit {
+        "s" => n,
+        "m" => n * 60,
+        "h" => n * 3600,
+        _ => return None,
+    };
+    (seconds >= 15).then(|| std::time::Duration::from_secs(seconds))
 }
 
 /// Where a handed-out link's token is looked up. See [`ClientRegistry`].
