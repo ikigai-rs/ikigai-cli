@@ -1701,6 +1701,26 @@ fn root_space_with_mounts(
             ));
             ikigai_email::space(config, transport)
         }) as Arc<dyn Space>,
+        // The public contact form's front door (urn:contact:submit): parses an untrusted
+        // urlencoded/JSON body, keeps only these declared fields, escapes them into a
+        // tuple, and drops it into the reactive `contact` space — where the handler emails
+        // it on. Field names match the form on bosatsu.net, `_honey` included.
+        Arc::new(ikigai_core::EndpointSpace::new().bind(
+            Exact::new("urn:contact:submit"),
+            ikigai_intake::submit(ikigai_intake::IntakeConfig {
+                id: "contact".to_string(),
+                space: "urn:space:contact".to_string(),
+                required: vec![
+                    "name".to_string(),
+                    "email".to_string(),
+                    "message".to_string(),
+                ],
+                optional: vec!["organisation".to_string()],
+                email_field: Some("email".to_string()),
+                honeypot: Some("_honey".to_string()),
+                requires: "urn:cap:contact:submit".to_string(),
+            }),
+        )) as Arc<dyn Space>,
         // Neutral s-expr → SPARQL transreptor (urn:sparql:from-sexpr, text/x-sexpr →
         // application/sparql-query): pipe an s-expr query in, feed the emitted SPARQL to
         // urn:sparql:select. A pure transreptor (no lisp engine); safe in the shared space.
