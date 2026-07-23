@@ -1140,10 +1140,37 @@ fn local_space(nature: &'static str) -> EndpointSpace {
 /// and the capability path-ACL refuses any other segment. The personal space stays OFF
 /// the wire — owner-only, no per-tenant story yet.
 fn served_space(nature: &'static str) -> EndpointSpace {
-    base_space(nature).bind(
-        UriTemplate::parse(ikigai_fs::FILE_TEMPLATE).expect("FILE_TEMPLATE is valid"),
-        ikigai_fs::FileEndpoint::new(file_root()).cacheable(),
-    )
+    base_space(nature)
+        .bind(
+            UriTemplate::parse(ikigai_fs::FILE_TEMPLATE).expect("FILE_TEMPLATE is valid"),
+            ikigai_fs::FileEndpoint::new(file_root()).cacheable(),
+        )
+        // The PUBLIC front doors: a contact enquiry and a booking request. These are the
+        // only new things a stranger can name, and all they can do is drop a validated
+        // tuple into a space.
+        //
+        // The privileged half deliberately is NOT here: the reactor that emails an enquiry
+        // (and runs schedule.scm against the real calendar) lives in the DAEMON's kernel,
+        // not this internet-facing one. So this process never holds `email:send` and never
+        // touches EventKit — the TUPLESPACE IS THE AIRLOCK between them.
+        //
+        // The space binding below is what lets an intake complete its drop. It is reachable
+        // only through a declared route: run the public edge with `--routes-only` so an
+        // un-routed path (a direct POST to some other space) is a 404, and grant a ceiling
+        // of exactly {contact:submit, booking:submit, space:out}. Route table = the surface
+        // allowlist, capability = the authority ceiling; a bug in one still leaves the other.
+        .bind(
+            Exact::new("urn:contact:submit"),
+            ikigai_intake::submit(contact_intake()),
+        )
+        .bind(
+            Exact::new("urn:booking:submit"),
+            ikigai_intake::submit(booking_intake()),
+        )
+        .bind(
+            UriTemplate::parse(ikigai_intray::SPACE_TEMPLATE).expect("SPACE_TEMPLATE is valid"),
+            ikigai_intray::SpaceEndpoint::new(file_root().join("spaces")),
+        )
 }
 
 /// A purpose-built kernel for a calendar-federation server (`ikigai serve quic://…
@@ -1701,6 +1728,23 @@ fn root_space_with_mounts(
             ));
             ikigai_email::space(config, transport)
         }) as Arc<dyn Space>,
+        // The public contact form's front door (urn:contact:submit): parses an untrusted
+        // urlencoded/JSON body, keeps only these declared fields, escapes them into a
+        // tuple, and drops it into the reactive `contact` space — where the handler emails
+        // it on. Field names match the form on bosatsu.net, `_honey` included.
+        Arc::new(ikigai_core::EndpointSpace::new().bind(
+            Exact::new("urn:contact:submit"),
+            ikigai_intake::submit(contact_intake()),
+        )) as Arc<dyn Space>,
+        // The booking front door (urn:booking:submit): the visitor offers THEIR hours and
+        // zone; the reactive `bookings` space fires schedule.scm, which finds a mutually
+        // free slot. Brian's freebusy never leaves the machine — the visitor never sees a
+        // calendar, only proposes availability. These field summaries are what a generated
+        // form renders as labels, so the UI and the validation cannot drift apart.
+        Arc::new(ikigai_core::EndpointSpace::new().bind(
+            Exact::new("urn:booking:submit"),
+            ikigai_intake::submit(booking_intake()),
+        )) as Arc<dyn Space>,
         // Neutral s-expr → SPARQL transreptor (urn:sparql:from-sexpr, text/x-sexpr →
         // application/sparql-query): pipe an s-expr query in, feed the emitted SPARQL to
         // urn:sparql:select. A pure transreptor (no lisp engine); safe in the shared space.
@@ -1902,6 +1946,55 @@ pub fn watched_kernel_with_mounts(
         );
     }
     kernel
+}
+
+/// The public contact form's accepted fields. Each `summary` is human-facing on purpose:
+/// it is what `?description` projects and a generated form renders as the field's LABEL,
+/// so the validation and the UI come from ONE declaration and cannot drift.
+fn contact_intake() -> ikigai_intake::IntakeConfig {
+    use ikigai_intake::IntakeField as F;
+    ikigai_intake::IntakeConfig {
+        id: "contact".to_string(),
+        space: "urn:space:contact".to_string(),
+        fields: vec![
+            F::required("name", "Your name"),
+            F::required("email", "Your email address"),
+            F::optional("organisation", "Organisation"),
+            F::required("message", "Your message"),
+        ],
+        email_field: Some("email".to_string()),
+        honeypot: Some("_honey".to_string()),
+        requires: "urn:cap:contact:submit".to_string(),
+    }
+}
+
+/// The public booking request's accepted fields. The visitor offers THEIR hours and zone;
+/// the handler finds a mutually free slot. The host's freebusy never leaves the machine —
+/// a visitor never sees a calendar, they only propose availability.
+fn booking_intake() -> ikigai_intake::IntakeConfig {
+    use ikigai_intake::IntakeField as F;
+    ikigai_intake::IntakeConfig {
+        id: "booking".to_string(),
+        space: "urn:space:bookings".to_string(),
+        fields: vec![
+            F::required("name", "Your name"),
+            F::required("email", "Your email address"),
+            F::required("period", "When would you like to meet?")
+                .one_of(["week", "today", "tomorrow"]),
+            F::required(
+                "hours",
+                "Hours that suit you, in YOUR timezone (24-hour, space separated — e.g. 9 10 14)",
+            ),
+            F::required("zone", "Your timezone (IANA, e.g. Europe/London)"),
+            F::optional(
+                "preference",
+                "Anything to note? (e.g. nothing before 10, not right after lunch)",
+            ),
+        ],
+        email_field: Some("email".to_string()),
+        honeypot: Some("_honey".to_string()),
+        requires: "urn:cap:booking:submit".to_string(),
+    }
 }
 
 /// Where outbound mail is submitted and who it says it is from. Defaults to a local MTA

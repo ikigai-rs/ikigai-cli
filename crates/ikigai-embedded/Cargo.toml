@@ -37,6 +37,7 @@ ikigai-encrypt = { workspace = true }
 ikigai-tz = { workspace = true }
 ikigai-intray = { workspace = true }
 ikigai-email = { workspace = true }
+ikigai-intake = { workspace = true }
 ikigai-secret = { workspace = true }
 ikigai-xslt = { workspace = true }
 ikigai-jsonld = { workspace = true }
