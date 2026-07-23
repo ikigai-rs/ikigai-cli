@@ -178,6 +178,70 @@ fn urlencode(value: &str) -> String {
     out
 }
 
+/// Percent-decode a form value over BYTES.
+///
+/// Over bytes, not `&str` offsets: slicing a `&str` at a computed offset panics when a `%`
+/// precedes a multibyte character — the same defect `ikigai-intake` documents.
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hex = |b: u8| match b {
+                    b'0'..=b'9' => Some(b - b'0'),
+                    b'a'..=b'f' => Some(b - b'a' + 10),
+                    b'A'..=b'F' => Some(b - b'A' + 10),
+                    _ => None,
+                };
+                match (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                    (Some(hi), Some(lo)) => {
+                        out.push((hi << 4) | lo);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// One parameter, from the query string OR — on a form POST — the urlencoded body.
+///
+/// A browser submitting `<form method=post>` puts its fields in the BODY, which the HTTP
+/// face hands over as the piped `content`; a GET puts them in the query, which arrives as
+/// named args. The same resource answers both, so it looks in both places.
+fn param(inv: &Invocation<'_>, name: &str) -> String {
+    if let Ok(v) = inv.inline_str(name) {
+        let v = v.trim();
+        if !v.is_empty() {
+            return v.to_string();
+        }
+    }
+    if let Ok(body) = inv.inline_str("content") {
+        for pair in body.trim().split('&') {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            if percent_decode(k) == name {
+                return percent_decode(v).trim().to_string();
+            }
+        }
+    }
+    String::new()
+}
+
 /// One `(name "value")` field out of a tuple, unescaping `\"` and `\\`.
 ///
 /// The decision tuple uses the same shape every other tuple in the system does, so this is
@@ -341,9 +405,8 @@ fn action_of(inv: &Invocation<'_>) -> String {
 impl Endpoint for CalendarRequest {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         let action = action_of(inv);
-        let arg = |name: &str| inv.inline_str(name).unwrap_or("").trim().to_string();
-        let (id, token) = (arg("id"), arg("t"));
-        let exp: i64 = arg("exp").parse().unwrap_or(0);
+        let (id, token) = (param(inv, "id"), param(inv, "t"));
+        let exp: i64 = param(inv, "exp").parse().unwrap_or(0);
 
         let key = verifying_key_at(&self.key_path)?;
         if !token_valid(&id, &action, exp, &token, &key, now_secs()) {
@@ -725,6 +788,23 @@ mod endpoint_tests {
         fn dropped(&self) -> Vec<String> {
             self.dropped.lock().unwrap().clone()
         }
+
+        /// POST the way a browser actually does it: fields in a urlencoded BODY, not the query.
+        fn post_form(&self, action: &str, id: &str, exp: i64, token: &str) -> String {
+            let body = format!("id={id}&exp={exp}&t={token}");
+            let rep = block_on(
+                self.kernel.issue(
+                    Request::new(
+                        Verb::Sink,
+                        Iri::parse(format!("urn:calendar-request:{action}")).unwrap(),
+                    )
+                    .with_arg("content", ArgRef::Inline(body.into_bytes())),
+                    &Capability::root(),
+                ),
+            )
+            .expect("the page should render");
+            String::from_utf8(rep.bytes.clone()).unwrap()
+        }
     }
 
     #[test]
@@ -793,5 +873,29 @@ mod endpoint_tests {
             .contains("didn't work"));
 
         assert!(w.dropped().is_empty(), "neither is recorded");
+    }
+
+    #[test]
+    fn a_browser_form_post_carries_its_fields_in_the_body() {
+        // The shape a real <form method=post> sends. Reading only query args made every
+        // browser submission fail while curl-with-query-params passed — caught by running
+        // it, not by a unit test, so it gets one now.
+        let w = world("formpost");
+        let (exp, token) = w.valid("approve");
+        let html = w.post_form("approve", ID, exp, &token);
+        assert!(html.contains("Recorded"), "{html}");
+        assert_eq!(w.dropped().len(), 1);
+        assert_eq!(field(&w.dropped()[0], "id").as_deref(), Some(ID));
+    }
+
+    #[test]
+    fn a_forged_token_in_a_form_body_is_refused_too() {
+        let w = world("formforged");
+        let (exp, _) = w.valid("approve");
+        let forged = mint_token(ID, "approve", exp, &SigningKey::from_bytes(&[9u8; 32]));
+        assert!(w
+            .post_form("approve", ID, exp, &forged)
+            .contains("didn't work"));
+        assert!(w.dropped().is_empty());
     }
 }
