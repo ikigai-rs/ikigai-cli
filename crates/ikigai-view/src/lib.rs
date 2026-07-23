@@ -314,6 +314,21 @@ fn url_token(text: &str, at: usize) -> String {
 /// [`MEETING_HOSTS`]) — a stable, single-line token fit for a drawer property. A URL
 /// that isn't a known meeting host is ignored, so an invite footer's unsubscribe or
 /// doc link never lands in `:URL:`.
+/// Path fragments that mark a conferencing URL as the actual JOIN link, as opposed to
+/// the other same-host links an invite carries (Teams bodies also include a "System
+/// reference" link and a `/meetingOptions/` link). Preferred over mere host match.
+const JOIN_PATHS: [&str; 4] = ["/meet/", "/l/meetup-join/", "/j/", "/meeting/"];
+
+/// The join link for a captured event: the event's own URL when it names a known
+/// conferencing host, else the best such link in the notes. Provider-agnostic (see
+/// [`MEETING_HOSTS`]) — a stable, single-line token fit for a drawer property. A URL
+/// that isn't a known meeting host is ignored, so an invite footer's unsubscribe or
+/// doc link never lands in `:URL:`.
+///
+/// Among several links on a meeting host, one whose path looks like a JOIN (see
+/// [`JOIN_PATHS`]) wins over one that doesn't — a Teams body carries the join link
+/// plus "System reference" and "Meeting options" on the same host, and only document
+/// order made the right one win before.
 fn join_link(event: &ViewEvent) -> Option<String> {
     if let Some(url) = &event.url {
         if is_meeting_url(url) {
@@ -321,17 +336,21 @@ fn join_link(event: &ViewEvent) -> Option<String> {
         }
     }
     let notes = event.description.as_deref()?;
+    let mut first_on_host: Option<String> = None;
     let mut from = 0;
     while let Some(rel) = notes[from..].find("http") {
         let at = from + rel;
         let candidate = url_token(notes, at);
         if is_meeting_url(&candidate) {
-            return Some(candidate);
+            if JOIN_PATHS.iter().any(|p| candidate.contains(p)) {
+                return Some(candidate);
+            }
+            first_on_host.get_or_insert(candidate);
         }
         // Past this "http" — 4 ASCII bytes, so `from` stays on a char boundary.
         from = at + 4;
     }
-    None
+    first_on_host
 }
 
 /// One captured event as an org heading: title, a `:PROPERTIES:` drawer carrying
@@ -390,7 +409,11 @@ fn org_heading(event: &ViewEvent) -> String {
             .map(|name| name.replace('\n', " "))
             .collect();
         let separator = if body.is_empty() { "" } else { "\n" };
-        format!("{separator}  Attendees: {}\n", names.join(", "))
+        // Joined with " · ", NOT ", ": corporate directories hand back `Last, First`
+        // names, so a comma separator collides with the data — three attendees
+        // ("Brian Sletten", "Luthra, Sandeep", "Engel-McMaster, Jason") rendered as a
+        // comma list read as five people. A middle dot cannot appear in a name.
+        format!("{separator}  Attendees: {}\n", names.join(" · "))
     };
     format!(
         "\n* {}\n{drawer}{alert}  {stamp}\n{body}{attendees}",
