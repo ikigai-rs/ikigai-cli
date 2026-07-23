@@ -32,6 +32,49 @@ use ikigai_core::{
 
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
+/// One accepted field. The `summary` is human-facing on purpose: it becomes the
+/// `ArgSpec` summary, which is what `?description` projects and a generated form renders
+/// as the field's LABEL — so the same declaration drives validation *and* the UI.
+#[derive(Clone, Debug)]
+pub struct IntakeField {
+    pub name: String,
+    pub required: bool,
+    /// The label/help a generated form shows. Write it for a human.
+    pub summary: String,
+    /// Allowed values, if constrained — a generated form renders these as a select.
+    pub one_of: Vec<String>,
+}
+
+impl IntakeField {
+    /// A required free-text field.
+    pub fn required(name: impl Into<String>, summary: impl Into<String>) -> Self {
+        IntakeField {
+            name: name.into(),
+            required: true,
+            summary: summary.into(),
+            one_of: Vec::new(),
+        }
+    }
+    /// An optional free-text field.
+    pub fn optional(name: impl Into<String>, summary: impl Into<String>) -> Self {
+        IntakeField {
+            name: name.into(),
+            required: false,
+            summary: summary.into(),
+            one_of: Vec::new(),
+        }
+    }
+    /// Constrain this field to `values` (rendered as a select).
+    pub fn one_of<I, S>(mut self, values: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.one_of = values.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
 /// What a form intake accepts and where it lands.
 #[derive(Clone, Debug)]
 pub struct IntakeConfig {
@@ -39,10 +82,8 @@ pub struct IntakeConfig {
     pub id: String,
     /// The space a validated submission is dropped into (`urn:space:contact`).
     pub space: String,
-    /// Fields that must be present and non-empty.
-    pub required: Vec<String>,
-    /// Fields carried through when present.
-    pub optional: Vec<String>,
+    /// The accepted fields, in the order a generated form should show them.
+    pub fields: Vec<IntakeField>,
     /// A field validated as an email address, if any (also used as the handler's reply-to).
     pub email_field: Option<String>,
     /// A honeypot input that must arrive empty — bots fill it, humans never see it.
@@ -208,22 +249,31 @@ impl Endpoint for IntakeEndpoint {
 
         // Only DECLARED fields are carried — an undeclared key never reaches the tuple.
         let mut carried: Vec<(String, String)> = Vec::new();
-        for name in &config.required {
-            match get(name) {
-                Some(value) if !value.is_empty() => carried.push((name.clone(), value)),
-                _ => {
+        for field in &config.fields {
+            let value = get(&field.name).filter(|v| !v.is_empty());
+            match value {
+                Some(value) => {
+                    // A constrained field must hold one of its declared values — the same
+                    // list a generated form renders as a select, enforced server-side
+                    // because the form is only a suggestion to a submitter.
+                    if !field.one_of.is_empty() && !field.one_of.contains(&value) {
+                        return Err(Error::InvalidArgument {
+                            name: field.name.clone(),
+                            detail: format!(
+                                "`{value}` is not one of: {}",
+                                field.one_of.join(", ")
+                            ),
+                        });
+                    }
+                    carried.push((field.name.clone(), value));
+                }
+                None if field.required => {
                     return Err(Error::InvalidArgument {
-                        name: name.clone(),
-                        detail: format!("`{name}` is required"),
+                        name: field.name.clone(),
+                        detail: format!("`{}` is required", field.name),
                     })
                 }
-            }
-        }
-        for name in &config.optional {
-            if let Some(value) = get(name) {
-                if !value.is_empty() {
-                    carried.push((name.clone(), value));
-                }
+                None => {}
             }
         }
         if let Some(email_field) = &config.email_field {
@@ -282,20 +332,20 @@ impl Endpoint for IntakeEndpoint {
         let mut action = ActionSpec::new(Verb::Sink)
             .summary("submit — validate a public form submission and drop it as a tuple")
             .requires(&self.config.requires);
-        for name in &self.config.required {
-            action = action.input(
-                ArgSpec::new(name.clone())
-                    .summary(format!("`{name}` (required)"))
-                    .class(XSD_STRING),
-            );
-        }
-        for name in &self.config.optional {
-            action = action.input(
-                ArgSpec::new(name.clone())
-                    .optional()
-                    .summary(format!("`{name}` (optional)"))
-                    .class(XSD_STRING),
-            );
+        // These ArgSpecs ARE the form: `?description` projects them, and a generated UI
+        // renders each summary as a label and each `one_of` as a select. One declaration,
+        // validated here and rendered there — they cannot drift.
+        for field in &self.config.fields {
+            let mut spec = ArgSpec::new(field.name.clone())
+                .summary(field.summary.clone())
+                .class(XSD_STRING);
+            if !field.required {
+                spec = spec.optional();
+            }
+            if !field.one_of.is_empty() {
+                spec = spec.one_of(field.one_of.clone());
+            }
+            action = action.input(spec);
         }
         Description::new(self.config.id.clone())
             .title("Form intake")
@@ -338,12 +388,12 @@ mod tests {
         IntakeConfig {
             id: "contact".to_string(),
             space: "urn:space:contact".to_string(),
-            required: vec![
-                "name".to_string(),
-                "email".to_string(),
-                "message".to_string(),
+            fields: vec![
+                IntakeField::required("name", "Your name"),
+                IntakeField::required("email", "Your email address"),
+                IntakeField::optional("organisation", "Organisation (optional)"),
+                IntakeField::required("message", "Your message"),
             ],
-            optional: vec!["organisation".to_string()],
             email_field: Some("email".to_string()),
             honeypot: Some("_honey".to_string()),
             requires: "urn:cap:contact:submit".to_string(),
