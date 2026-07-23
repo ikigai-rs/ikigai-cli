@@ -259,10 +259,7 @@ impl Endpoint for IntakeEndpoint {
                     if !field.one_of.is_empty() && !field.one_of.contains(&value) {
                         return Err(Error::InvalidArgument {
                             name: field.name.clone(),
-                            detail: format!(
-                                "`{value}` is not one of: {}",
-                                field.one_of.join(", ")
-                            ),
+                            detail: format!("`{value}` is not one of: {}", field.one_of.join(", ")),
                         });
                     }
                     carried.push((field.name.clone(), value));
