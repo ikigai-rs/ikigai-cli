@@ -237,6 +237,20 @@ impl Endpoint for IntakeEndpoint {
             }
         }
 
+        // PROVENANCE comes from the TRANSPORT, never the body. The web layer sets these
+        // from the connection (`client` from the proxy's forwarded-for, `received` from
+        // its clock); a submitter cannot forge them, because only DECLARED body fields are
+        // carried above — a `client=` input in the form is simply dropped like any other
+        // undeclared key. Keeping the two sources separate is the whole point.
+        for name in ["received", "client"] {
+            if let Ok(value) = inv.inline_str(name) {
+                let value = value.trim();
+                if !value.is_empty() {
+                    carried.push((name.to_string(), value.to_string()));
+                }
+            }
+        }
+
         // The tuple: an s-expression of escaped DATA, exactly what the handler's `read`
         // parses. Values cannot break out of their literal, so a hostile message is text.
         let tuple = format!(
@@ -450,6 +464,29 @@ mod tests {
         assert!(
             matches!(err, Error::InvalidArgument { ref name, .. } if name == "email"),
             "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn provenance_comes_from_the_transport_and_cannot_be_forged_in_the_body() {
+        let (k, dropped) = kernel();
+        // The body TRIES to claim a different client; the transport arg is the real one.
+        let request = post("name=X&email=x%40y.com&message=hi&client=1.2.3.4")
+            .with_arg("client", ArgRef::Inline(b"203.0.113.9".to_vec()))
+            .with_arg("received", ArgRef::Inline(b"2026-07-22T19:40:00Z".to_vec()));
+        block_on(k.issue(request, &cap())).unwrap();
+        let tuple = dropped.lock().unwrap()[0].clone();
+        assert!(
+            tuple.contains(r#"(client "203.0.113.9")"#),
+            "the transport's client wins: {tuple}"
+        );
+        assert!(
+            !tuple.contains("1.2.3.4"),
+            "a body field cannot forge provenance: {tuple}"
+        );
+        assert!(
+            tuple.contains(r#"(received "2026-07-22T19:40:00Z")"#),
+            "{tuple}"
         );
     }
 
