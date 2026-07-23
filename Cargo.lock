@@ -2465,6 +2465,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ikigai-intake"
+version = "0.1.9"
+dependencies = [
+ "async-trait",
+ "futures",
+ "ikigai-core",
+ "serde_json",
+]
+
+[[package]]
 name = "ikigai-intray"
 version = "0.1.9"
 dependencies = [

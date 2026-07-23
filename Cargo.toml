@@ -83,6 +83,9 @@ ikigai-intray = { path = "crates/ikigai-intray" }
 # that relays onward. Workspace-local, not published; the contact service and the
 # scheduling confirm-link both need it.
 ikigai-email = { path = "crates/ikigai-email" }
+# Public form intake (urn:*:submit): parse an untrusted urlencoded/JSON body, validate
+# declared fields, drop an escaped s-expr tuple into a space. Contact + booking share it.
+ikigai-intake = { path = "crates/ikigai-intake" }
 # Sibling workspace crates pinned to the current release: a published crate must
 # require its siblings at this version too, so the lockstep release publishes in
 # dependency order (resolve → wire → engine → …) and a crate can never build against
