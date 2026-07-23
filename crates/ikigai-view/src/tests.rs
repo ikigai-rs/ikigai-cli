@@ -179,6 +179,67 @@ fn the_join_link_prefers_the_real_url_and_falls_back_to_the_notes() {
 }
 
 #[test]
+fn the_join_link_is_provider_agnostic_and_host_matched() {
+    let event = |url: Option<&str>, notes: Option<&str>| ViewEvent {
+        uid: "T2".to_string(),
+        title: "Sync".to_string(),
+        start: "2026-07-23T09:00:00".to_string(),
+        end: "2026-07-23T10:00:00".to_string(),
+        all_day: false,
+        location: None,
+        description: notes.map(str::to_string),
+        url: url.map(str::to_string),
+        attendees: Vec::new(),
+        alerts: Vec::new(),
+    };
+
+    // A provider subdomain matches (zoom/webex put the tenant in the host).
+    assert_eq!(
+        join_link(&event(
+            None,
+            Some("Join: https://us02web.zoom.us/j/123?pwd=x")
+        ))
+        .as_deref(),
+        Some("https://us02web.zoom.us/j/123?pwd=x")
+    );
+    assert_eq!(
+        join_link(&event(Some("https://acme.webex.com/meet/brian"), None)).as_deref(),
+        Some("https://acme.webex.com/meet/brian")
+    );
+    // Google Meet + Jitsi on the event's own URL.
+    assert_eq!(
+        join_link(&event(Some("https://meet.google.com/abc-defg-hij"), None)).as_deref(),
+        Some("https://meet.google.com/abc-defg-hij")
+    );
+
+    // A LOOKALIKE host must NOT match (substring matching would wrongly accept this).
+    assert_eq!(
+        join_link(&event(Some("https://evilzoom.us/j/1"), None)),
+        None
+    );
+
+    // A non-meeting URL earlier in the notes is skipped; the real link is still found.
+    assert_eq!(
+        join_link(&event(
+            None,
+            Some("Unsubscribe: https://mail.example.com/u/1\nJoin: https://zoom.us/j/9 thanks")
+        ))
+        .as_deref(),
+        Some("https://zoom.us/j/9"),
+        "scan past non-meeting URLs rather than stopping at the first http"
+    );
+
+    // No known host anywhere → nothing lands in :URL:.
+    assert_eq!(
+        join_link(&event(
+            Some("https://docs.example.com/agenda"),
+            Some("notes with https://example.com/x only")
+        )),
+        None
+    );
+}
+
+#[test]
 fn a_captured_invite_becomes_a_heading_with_drawers_and_a_body() {
     let event = ViewEvent {
         uid: "cap-1".to_string(),
