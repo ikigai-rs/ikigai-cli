@@ -1,0 +1,23 @@
+[package]
+name = "ikigai-email"
+description = "Outbound email as a resource: urn:email:send — a capability-gated Sink that submits a message over SMTP (localhost Postfix relaying onward, the deliverable path). Typed transient/permanent failures so the reliability overlays can engage."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+ikigai-core = { workspace = true }
+async-trait = "0.1"
+# Blocking SMTP submission — no async runtime, so it works under the CLI's
+# `futures::block_on` like the rest of the embedded host. Submission goes to a local
+# Postfix (which relays onward through a transactional service), so no TLS/auth here.
+lettre = { version = "0.11", default-features = false, features = [
+    "builder",
+    "smtp-transport",
+] }
+
+[dev-dependencies]
+futures = { workspace = true }
