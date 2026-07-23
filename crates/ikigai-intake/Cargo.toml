@@ -12,6 +12,9 @@ publish = false
 ikigai-core = { workspace = true }
 async-trait = "0.1"
 serde_json = { workspace = true }
+# The IANA time-zone database, so a submitted zone is checked against real tzdata at the
+# door rather than trusted and blown up on later. Already in the tree via ikigai-tz.
+chrono-tz = "0.10"
 
 [dev-dependencies]
 futures = { workspace = true }

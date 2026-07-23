@@ -2470,6 +2470,7 @@ name = "ikigai-intake"
 version = "0.1.9"
 dependencies = [
  "async-trait",
+ "chrono-tz",
  "futures",
  "ikigai-core",
  "serde_json",

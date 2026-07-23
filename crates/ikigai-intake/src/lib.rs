@@ -43,6 +43,13 @@ pub struct IntakeField {
     pub summary: String,
     /// Allowed values, if constrained — a generated form renders these as a select.
     pub one_of: Vec<String>,
+    /// Validate this field as an IANA time zone (`Europe/London`).
+    ///
+    /// Not expressed as `one_of`: the tzdata list is ~400 names and would dominate the
+    /// `?description` every consumer fetches. The check lives here instead, so a generated
+    /// form is free to build its own picker from whatever tzdata it has (a browser ships
+    /// its own) while the server stays the authority on what it will accept.
+    pub iana_zone: bool,
 }
 
 impl IntakeField {
@@ -53,6 +60,7 @@ impl IntakeField {
             required: true,
             summary: summary.into(),
             one_of: Vec::new(),
+            iana_zone: false,
         }
     }
     /// An optional free-text field.
@@ -62,6 +70,7 @@ impl IntakeField {
             required: false,
             summary: summary.into(),
             one_of: Vec::new(),
+            iana_zone: false,
         }
     }
     /// Constrain this field to `values` (rendered as a select).
@@ -71,6 +80,11 @@ impl IntakeField {
         S: Into<String>,
     {
         self.one_of = values.into_iter().map(Into::into).collect();
+        self
+    }
+    /// Require this field to name an IANA time zone.
+    pub fn iana_zone(mut self) -> Self {
+        self.iana_zone = true;
         self
     }
 }
@@ -262,6 +276,18 @@ impl Endpoint for IntakeEndpoint {
                             detail: format!("`{value}` is not one of: {}", field.one_of.join(", ")),
                         });
                     }
+                    // A zone must be one the tzdata knows, checked at the DOOR. Otherwise a
+                    // typo is accepted here and only fails later inside the handler, where
+                    // there is no longer anyone to tell — the submitter is long gone.
+                    if field.iana_zone && value.parse::<chrono_tz::Tz>().is_err() {
+                        return Err(Error::InvalidArgument {
+                            name: field.name.clone(),
+                            detail: format!(
+                                "`{value}` is not a known time zone \
+                                 (an IANA name like `Europe/London`)"
+                            ),
+                        });
+                    }
                     carried.push((field.name.clone(), value));
                 }
                 None if field.required => {
@@ -435,6 +461,73 @@ mod tests {
         );
         assert!(tuple.contains(r#"(message "Hello there")"#), "{tuple}");
         assert!(tuple.starts_with('(') && tuple.ends_with(')'));
+    }
+
+    /// An intake with a zone field, to exercise the tzdata check.
+    fn zoned_kernel() -> (Kernel, Arc<Mutex<Vec<String>>>) {
+        let mut cfg = config();
+        cfg.fields
+            .push(IntakeField::required("zone", "Your timezone").iana_zone());
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:contact:submit"), submit(cfg))
+            .bind(
+                Exact::new("urn:space:contact"),
+                RecordingSpace {
+                    dropped: dropped.clone(),
+                },
+            );
+        (Kernel::new(Arc::new(space)), dropped)
+    }
+
+    #[test]
+    fn a_real_zone_is_accepted() {
+        let (k, dropped) = zoned_kernel();
+        block_on(k.issue(
+            post("name=X&email=x%40y.com&message=hi&zone=Australia%2FLord_Howe"),
+            &cap(),
+        ))
+        .unwrap();
+        // A half-hour-off oddity, deliberately: it must survive as the submitter wrote it.
+        assert!(
+            dropped.lock().unwrap()[0].contains(r#"(zone "Australia/Lord_Howe")"#),
+            "{:?}",
+            dropped.lock().unwrap()[0]
+        );
+    }
+
+    #[test]
+    fn a_zone_that_tzdata_does_not_know_is_refused_at_the_door() {
+        let (k, dropped) = zoned_kernel();
+        let err = block_on(k.issue(
+            post("name=X&email=x%40y.com&message=hi&zone=Europe%2FLundun"),
+            &cap(),
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("not a known time zone"),
+            "should say what's wrong: {err}"
+        );
+        // And nothing reached the space — the handler is never handed a zone it can't use.
+        assert!(dropped.lock().unwrap().is_empty(), "nothing dropped");
+    }
+
+    #[test]
+    fn a_zone_is_not_an_offset_or_an_abbreviation() {
+        let (k, _) = zoned_kernel();
+        // "PST" and "+05:30" are the two things people reach for instead of a zone name;
+        // neither survives DST arithmetic, so neither is accepted.
+        for bad in ["PST", "%2B05%3A30"] {
+            let err = block_on(k.issue(
+                post(&format!("name=X&email=x%40y.com&message=hi&zone={bad}")),
+                &cap(),
+            ))
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("not a known time zone"),
+                "{bad}: {err}"
+            );
+        }
     }
 
     #[test]
