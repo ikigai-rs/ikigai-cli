@@ -2374,6 +2374,7 @@ dependencies = [
  "futures",
  "ikigai-cms",
  "ikigai-core",
+ "ikigai-email",
  "ikigai-encrypt",
  "ikigai-fn",
  "ikigai-fs",

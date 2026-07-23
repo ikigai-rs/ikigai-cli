@@ -1689,6 +1689,18 @@ fn root_space_with_mounts(
         // space under file_root/spaces/. The scheduling booking-inbox drops into it; the
         // reactive/sealed slices land on top. Cap-gated (urn:cap:space:out / :read).
         Arc::new(ikigai_intray::space(file_root().join("spaces"))) as Arc<dyn Space>,
+        // Outbound mail (urn:email:send) — a cap-gated Sink submitting to the LOCAL MTA,
+        // which relays onward through a transactional service (so DKIM/SPF and relay
+        // credentials stay in the MTA, not here). The contact-request handler and the
+        // scheduling confirm-link both reach you through this.
+        Arc::new({
+            let config = email_config();
+            let transport = Arc::new(ikigai_email::SmtpSubmission::new(
+                config.host.clone(),
+                config.port,
+            ));
+            ikigai_email::space(config, transport)
+        }) as Arc<dyn Space>,
         // Neutral s-expr → SPARQL transreptor (urn:sparql:from-sexpr, text/x-sexpr →
         // application/sparql-query): pipe an s-expr query in, feed the emitted SPARQL to
         // urn:sparql:select. A pure transreptor (no lisp engine); safe in the shared space.
@@ -1749,6 +1761,15 @@ fn root_space_with_mounts(
         spaces.push(Arc::new(ikigai_core::EndpointSpace::new().bind(
             Exact::new("urn:booking:handle"),
             ikigai_lisp::program("booking", program),
+        )) as Arc<dyn Space>);
+    }
+    // Likewise the contact handler: the reactive `contact` space fires urn:contact:handle
+    // on each dropped enquiry, and the program emails it on via urn:email:send. Same
+    // "the program IS the endpoint" shape — a public enquiry is DATA read with `(input)`.
+    if let Ok(program) = std::fs::read_to_string(file_root().join("contact-handler.scm")) {
+        spaces.push(Arc::new(ikigai_core::EndpointSpace::new().bind(
+            Exact::new("urn:contact:handle"),
+            ikigai_lisp::program("contact", program),
         )) as Arc<dyn Space>);
     }
     // Guardrail for a real footgun: mounts are tried AFTER every local space, so a
@@ -1881,6 +1902,22 @@ pub fn watched_kernel_with_mounts(
         );
     }
     kernel
+}
+
+/// Where outbound mail is submitted and who it says it is from. Defaults to a local MTA
+/// on the standard port — the deliverable path, since that MTA owns the onward relay and
+/// its credentials. Overridable per deployment (the edge and a laptop differ) without a
+/// rebuild: `IKIGAI_SMTP_HOST`, `IKIGAI_SMTP_PORT`, `IKIGAI_MAIL_FROM`.
+fn email_config() -> ikigai_email::EmailConfig {
+    let default = ikigai_email::EmailConfig::default();
+    ikigai_email::EmailConfig {
+        host: std::env::var("IKIGAI_SMTP_HOST").unwrap_or(default.host),
+        port: std::env::var("IKIGAI_SMTP_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(default.port),
+        from: std::env::var("IKIGAI_MAIL_FROM").unwrap_or(default.from),
+    }
 }
 
 /// This process's INSTANCE NAME — the key config properties are scoped by
