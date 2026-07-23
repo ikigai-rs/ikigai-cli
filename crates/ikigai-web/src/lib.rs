@@ -31,7 +31,7 @@
 #![forbid(unsafe_code)]
 
 use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request, Verb};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -46,6 +46,9 @@ pub struct HttpRequest {
     /// Header names are lowercased.
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// The connection's peer address, when the caller knows it (the accept loop sets it).
+    /// The socket's own view — the one thing on a request a submitter cannot author.
+    pub peer: Option<IpAddr>,
 }
 
 impl HttpRequest {
@@ -316,10 +319,10 @@ pub async fn serve_with(
     });
     let listener = TcpListener::bind(addr).await?;
     loop {
-        let (sock, _) = listener.accept().await?;
+        let (sock, peer) = listener.accept().await?;
         let shared = Arc::clone(&shared);
         tokio::spawn(async move {
-            let _ = handle(sock, shared).await;
+            let _ = handle(sock, peer.ip(), shared).await;
         });
     }
 }
@@ -365,7 +368,7 @@ impl Resp {
     }
 }
 
-async fn handle(mut sock: TcpStream, shared: Arc<Shared>) -> std::io::Result<()> {
+async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::io::Result<()> {
     // Read up to the end of the headers (blank line).
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
@@ -413,6 +416,7 @@ async fn handle(mut sock: TcpStream, shared: Arc<Shared>) -> std::io::Result<()>
         }
     }
     req.body = body;
+    req.peer = Some(peer);
 
     // Resolve the route once; it drives the target IRI + per-route cap (in respond) and the
     // per-route CORS/CSP (in the policy layer). No match → the mechanical default throughout.
@@ -494,7 +498,11 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
         }
     }
     for (k, v) in &req.query {
-        if k != "as" && k != "content" {
+        // `as`/`content` are the adapter's own. On a write, so are the provenance names:
+        // the transport supplies them below, and a submitter must not be able to forge an
+        // origin by appending `?client=…` to the URL.
+        let reserved = k == "as" || k == "content" || (verb.is_mutating() && is_provenance(k));
+        if !reserved {
             request = request.with_arg(k.clone(), ArgRef::Inline(v.clone().into_bytes()));
         }
     }
@@ -502,6 +510,21 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
         request = request.with_arg("content", ArgRef::Inline(req.body.clone()));
         if let Some(ct) = req.header("content-type") {
             request = request.with_arg("content-type", ArgRef::Inline(ct.as_bytes().to_vec()));
+        }
+    }
+
+    // PROVENANCE on a write: who sent it, and when — read off the CONNECTION, never the
+    // payload. A public form endpoint records these alongside the submitted fields, so a
+    // stored submission carries an origin its submitter did not get to choose.
+    //
+    // Writes only, and not for want of tidiness: an argument is part of a request's content
+    // address, which is the kernel's cache key. A per-request timestamp on a read would give
+    // every GET a fresh key and quietly defeat the representation cache. Mutating verbs are
+    // never cached, so attaching it there costs nothing.
+    if verb.is_mutating() {
+        request = request.with_arg("received", ArgRef::Inline(now_rfc3339().into_bytes()));
+        if let Some(client) = client_ip(req, &shared.config) {
+            request = request.with_arg("client", ArgRef::Inline(client.into_bytes()));
         }
     }
 
@@ -1194,7 +1217,39 @@ fn parse_head(head: &str) -> Option<HttpRequest> {
         query,
         headers,
         body: Vec::new(),
+        peer: None,
     })
+}
+
+/// The argument names the transport owns on a write. A request may carry them in its
+/// query string, but they are dropped there — provenance the submitter can author is
+/// not provenance.
+fn is_provenance(name: &str) -> bool {
+    name == "received" || name == "client"
+}
+
+/// The submitter's address.
+///
+/// Untrusted, this is the socket peer: the only address nobody can lie about. Behind a
+/// proxy we trust (`--trust-proxy`), the peer is the proxy, so `X-Forwarded-For` carries
+/// the real client — but note it is the LAST entry we want, not the first. A proxy that
+/// appends leaves any header the client itself sent sitting in front of the hop the proxy
+/// actually observed; the leftmost entries are attacker-authored. With one trusted hop,
+/// the rightmost entry is the address our proxy saw the connection come from.
+fn client_ip(req: &HttpRequest, config: &EdgeConfig) -> Option<String> {
+    if config.trust_proxy {
+        if let Some(forwarded) = req.header("x-forwarded-for") {
+            if let Some(hop) = forwarded.rsplit(',').map(str::trim).find(|h| !h.is_empty()) {
+                return Some(hop.to_string());
+            }
+        }
+    }
+    req.peer.map(|ip| ip.to_string())
+}
+
+/// Now, as RFC 3339 UTC — the lexical form `urn:tz:*` and the schedulers already parse.
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 /// Minimal percent-decoding (`%XX` and `+`→space in query values).
@@ -1400,7 +1455,26 @@ mod tests {
                         .one_of(["morning", "afternoon"]),
                 ),
         );
+        // Echoes back the provenance the transport attached, so a test can see exactly what
+        // the endpoint was told about who called and when.
+        let provenance = FnEndpoint::new("provenance", |inv: &Invocation<'_>| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!(
+                    "received={} client={}",
+                    inv.inline_str("received").unwrap_or("-"),
+                    inv.inline_str("client").unwrap_or("-")
+                )
+                .into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("provenance")
+                .verb(Verb::Source)
+                .verb(Verb::Sink),
+        );
         let space = EndpointSpace::new()
+            .bind(Exact::new("urn:test:provenance"), provenance)
             .bind(Exact::new("urn:test:booking"), booking)
             .bind(Exact::new("urn:test:id:hello"), hello)
             .bind(Exact::new("urn:test:guarded"), guarded)
@@ -1441,6 +1515,86 @@ mod tests {
         // give serve() a moment to bind
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         addr
+    }
+
+    #[tokio::test]
+    async fn a_write_carries_the_connections_provenance() {
+        let addr = start().await;
+        let out = roundtrip(
+            addr,
+            "POST /test/provenance HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nhi",
+        )
+        .await;
+        // The clock's stamp, and the loopback peer the socket actually reported.
+        assert!(
+            out.contains("received=20") && out.contains("client=127.0.0.1"),
+            "provenance should reach the endpoint: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_carries_no_provenance_so_it_stays_cacheable() {
+        let addr = start().await;
+        let out = roundtrip(addr, "GET /test/provenance HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        // A per-request timestamp is part of the content address; on a read it would give
+        // every GET a distinct cache key.
+        assert!(
+            out.contains("received=- client=-"),
+            "a read must not be stamped: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provenance_in_the_query_string_cannot_forge_an_origin() {
+        let addr = start().await;
+        let out = roundtrip(
+            addr,
+            "POST /test/provenance?client=1.2.3.4&received=1999-01-01T00:00:00Z HTTP/1.1\r\n\
+             Host: x\r\nContent-Length: 2\r\n\r\nhi",
+        )
+        .await;
+        assert!(
+            !out.contains("1.2.3.4") && !out.contains("1999"),
+            "the submitter's own claim must be dropped: {out}"
+        );
+        assert!(out.contains("client=127.0.0.1"), "the socket wins: {out}");
+    }
+
+    #[tokio::test]
+    async fn an_untrusted_forwarded_for_is_ignored() {
+        let addr = start().await;
+        let out = roundtrip(
+            addr,
+            "POST /test/provenance HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 9.9.9.9\r\n\
+             Content-Length: 2\r\n\r\nhi",
+        )
+        .await;
+        // Anyone can send that header. Without --trust-proxy it is not evidence.
+        assert!(
+            out.contains("client=127.0.0.1") && !out.contains("9.9.9.9"),
+            "unproxied XFF must not win: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_trusted_proxy_supplies_the_client_and_a_prepended_hop_cannot_spoof_it() {
+        let addr = start_with(EdgeConfig {
+            trust_proxy: true,
+            ..EdgeConfig::default()
+        })
+        .await;
+        // A client that sends its own XFF has its value APPENDED to by the proxy, so the
+        // forged hop sits on the left and the address the proxy saw sits on the right.
+        let out = roundtrip(
+            addr,
+            "POST /test/provenance HTTP/1.1\r\nHost: x\r\n\
+             X-Forwarded-For: 6.6.6.6, 203.0.113.9\r\nContent-Length: 2\r\n\r\nhi",
+        )
+        .await;
+        assert!(
+            out.contains("client=203.0.113.9") && !out.contains("6.6.6.6"),
+            "the rightmost hop is the one our proxy observed: {out}"
+        );
     }
 
     #[tokio::test]
