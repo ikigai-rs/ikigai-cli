@@ -19,6 +19,9 @@ tokio = { version = "1", features = ["net", "io-util", "rt", "rt-multi-thread", 
 blake3 = "1"
 # The first PATCH strategy: RFC 7386 JSON Merge Patch over serde_json values.
 serde_json = "1"
+# The clock behind a write's `received` provenance, formatted RFC 3339. `clock` only —
+# no zone database needed here (the edge always stamps UTC).
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [dev-dependencies]
 futures = { workspace = true }

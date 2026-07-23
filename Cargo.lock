@@ -2778,6 +2778,7 @@ name = "ikigai-web"
 version = "0.1.9"
 dependencies = [
  "blake3",
+ "chrono",
  "futures",
  "ikigai-core",
  "serde_json",
