@@ -1,0 +1,17 @@
+[package]
+name = "ikigai-intake"
+description = "Public form intake: parse an untrusted urlencoded/JSON submission, validate it against declared fields, and drop it into a tuplespace as an escaped s-expression. The front door for contact enquiries and booking requests."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+ikigai-core = { workspace = true }
+async-trait = "0.1"
+serde_json = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true }
