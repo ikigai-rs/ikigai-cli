@@ -2372,6 +2372,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "getrandom 0.2.17",
  "ikigai-cms",
  "ikigai-core",
  "ikigai-email",
