@@ -79,6 +79,10 @@ ikigai-tz = { path = "crates/ikigai-tz" }
 # The intray / tuplespace (urn:space:{name}: out/rd). Workspace-local, not published;
 # a dir-backed space under file_root. The scheduling booking-inbox drops into it.
 ikigai-intray = { path = "crates/ikigai-intray" }
+# Outbound email (urn:email:send): a cap-gated Sink submitting over SMTP to a local MTA
+# that relays onward. Workspace-local, not published; the contact service and the
+# scheduling confirm-link both need it.
+ikigai-email = { path = "crates/ikigai-email" }
 # Sibling workspace crates pinned to the current release: a published crate must
 # require its siblings at this version too, so the lockstep release publishes in
 # dependency order (resolve → wire → engine → …) and a crate can never build against
