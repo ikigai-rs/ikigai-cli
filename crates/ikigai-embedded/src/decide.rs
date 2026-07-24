@@ -82,9 +82,9 @@ fn payload(id: &str, action: &str, exp: i64) -> String {
     format!("{id}|{action}|{exp}")
 }
 
-/// The two actions a link may carry. Anything else is refused before a key is even loaded.
+/// The actions a link may carry. Anything else is refused before a key is even loaded.
 fn known_action(action: &str) -> bool {
-    action == "approve" || action == "decline"
+    matches!(action, "approve" | "decline" | "block")
 }
 
 /// A booking id is a content hash; it also becomes part of a signed payload and a filename
@@ -317,7 +317,7 @@ impl Endpoint for DecideLink {
         let exp = now_secs() + TTL_SECONDS;
         let base = decide_base();
         let mut out = String::new();
-        for action in ["approve", "decline"] {
+        for action in ["approve", "decline", "block"] {
             let token = mint_token(&id, action, exp, &key);
             out.push_str(&format!(
                 "{base}/{action}?id={}&exp={exp}&t={}\n",
@@ -464,10 +464,10 @@ impl Endpoint for CalendarRequest {
                     .with_arg("content", ArgRef::Inline(tuple.into_bytes())),
                 )
                 .await?;
-                let what = if action == "approve" {
-                    "Approved — the invitation goes out once your Mac picks this up."
-                } else {
-                    "Declined — they'll be told, and asked to suggest other times."
+                let what = match action.as_str() {
+                    "approve" => "Approved — the invitation goes out once your Mac picks this up.",
+                    "block" => "Blocked — this and future requests from that address are dropped.",
+                    _ => "Declined — they'll be told, and asked to suggest other times.",
                 };
                 Ok(page("Recorded", &format!("<p>{what}</p>")))
             }
