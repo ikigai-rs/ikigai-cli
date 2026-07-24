@@ -126,6 +126,14 @@ pub struct IntakeConfig {
     /// the link, as opposed to the sibling fields the submitter typed. A handler that
     /// widens a booking window on `via-earliest` must never widen it on `earliest`.
     pub attests: Vec<String>,
+    /// Where to send the browser after a successful submit. `None` (the default) returns a
+    /// plain `received` body — right for an API caller or a form that posts over fetch.
+    /// `Some(url)` returns a small HTML page that confirms and then redirects there — right
+    /// for a plain form POST, so the visitor lands back on the site instead of on a bare word.
+    ///
+    /// The URL is a fixed part of the configuration, never a submitted value, so this is not
+    /// an open redirect. It is HTML-escaped into the page defensively all the same.
+    pub redirect: Option<String>,
 }
 
 /// The query argument a link token arrives in (`…/booking/submit?k=TOKEN`).
@@ -153,6 +161,54 @@ pub fn token_shaped(token: &str) -> bool {
 /// Build the intake endpoint described by `config`.
 pub fn submit(config: IntakeConfig) -> IntakeEndpoint {
     IntakeEndpoint { config }
+}
+
+/// Escape a string for an HTML attribute / text context — enough for a URL and a page.
+fn html_escape(s: &str) -> String {
+    s.chars()
+        .flat_map(|c| match c {
+            '&' => "&amp;".chars().collect::<Vec<_>>(),
+            '<' => "&lt;".chars().collect(),
+            '>' => "&gt;".chars().collect(),
+            '"' => "&quot;".chars().collect(),
+            '\'' => "&#39;".chars().collect(),
+            c => vec![c],
+        })
+        .collect()
+}
+
+/// The response to a submission the endpoint accepted (a real one, or a honeypot hit that must
+/// look identical). With no `redirect`, a plain `received` body; with one, a small self-
+/// contained HTML page that confirms and bounces back to the site.
+fn accepted(config: &IntakeConfig) -> Representation {
+    match &config.redirect {
+        None => Representation::new(
+            ReprType::new("text/plain").with_param("charset", "utf-8"),
+            b"received\n".to_vec(),
+        ),
+        Some(url) => {
+            let url = html_escape(url);
+            // A meta refresh drives the redirect — works with no JS, no external anything — and
+            // a manual link covers the case where even that is blocked. The 2s pause lets the
+            // visitor read the confirmation before the page changes under them.
+            let page = format!(
+                "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+                 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+                 <meta http-equiv=\"refresh\" content=\"2;url={url}\">\
+                 <title>Received</title>\
+                 <style>body{{font-family:system-ui,sans-serif;max-width:32rem;margin:20vh auto;\
+                 padding:0 1.5rem;text-align:center;line-height:1.5}}a{{color:inherit}}</style>\
+                 </head><body><h1>Thank you</h1>\
+                 <p>Your message was received. Taking you back to the site\u{2026}</p>\
+                 <p><a href=\"{url}\">Continue</a> if you are not redirected.</p>\
+                 </body></html>"
+            );
+            Representation::new(
+                ReprType::new("text/html").with_param("charset", "utf-8"),
+                page.into_bytes(),
+            )
+        }
+    }
 }
 
 /// The intake endpoint. See the [module docs](crate).
@@ -335,13 +391,11 @@ impl Endpoint for IntakeEndpoint {
         };
 
         // The honeypot: bots fill every input. A filled one is accepted-looking and
-        // discarded, so a spammer learns nothing from the response.
+        // discarded, so a spammer learns nothing from the response — including the redirect,
+        // so the accepted page is byte-identical to a real submission's.
         if let Some(trap) = &config.honeypot {
             if get(trap).map(|v| !v.is_empty()).unwrap_or(false) {
-                return Ok(Representation::new(
-                    ReprType::new("text/plain").with_param("charset", "utf-8"),
-                    b"received\n".to_vec(),
-                ));
+                return Ok(accepted(config));
             }
         }
 
@@ -443,10 +497,7 @@ impl Endpoint for IntakeEndpoint {
         )
         .await?;
 
-        Ok(Representation::new(
-            ReprType::new("text/plain").with_param("charset", "utf-8"),
-            b"received\n".to_vec(),
-        ))
+        Ok(accepted(config))
     }
 
     fn name(&self) -> &str {
@@ -524,6 +575,7 @@ mod tests {
             requires: "urn:cap:contact:submit".to_string(),
             clients: None,
             attests: Vec::new(),
+            redirect: None,
         }
     }
 
@@ -565,6 +617,87 @@ mod tests {
         );
         assert!(tuple.contains(r#"(message "Hello there")"#), "{tuple}");
         assert!(tuple.starts_with('(') && tuple.ends_with(')'));
+    }
+
+    /// A kernel whose contact intake redirects on success, plus the tuples it drops.
+    fn redirecting_kernel(url: &str) -> (Kernel, Arc<Mutex<Vec<String>>>) {
+        let mut cfg = config();
+        cfg.redirect = Some(url.to_string());
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:contact:submit"), submit(cfg))
+            .bind(
+                Exact::new("urn:space:contact"),
+                RecordingSpace {
+                    dropped: dropped.clone(),
+                },
+            );
+        (Kernel::new(Arc::new(space)), dropped)
+    }
+
+    #[test]
+    fn without_a_redirect_the_response_is_plain_received() {
+        let (k, _) = kernel();
+        let rep = block_on(k.issue(post("name=A&email=a%40x.example&message=hi"), &cap())).unwrap();
+        assert_eq!(rep.repr_type.media_type, "text/plain");
+        assert_eq!(String::from_utf8(rep.bytes).unwrap(), "received\n");
+    }
+
+    #[test]
+    fn with_a_redirect_the_response_is_an_html_page_to_the_url() {
+        let (k, dropped) = redirecting_kernel("https://bosatsu.net");
+        let rep = block_on(k.issue(post("name=A&email=a%40x.example&message=hi"), &cap())).unwrap();
+        // The submission still lands as a tuple — the redirect changes only the response.
+        assert_eq!(dropped.lock().unwrap().len(), 1);
+        assert_eq!(rep.repr_type.media_type, "text/html");
+        let page = String::from_utf8(rep.bytes).unwrap();
+        assert!(page.contains("<!doctype html>"), "{page}");
+        assert!(
+            page.contains(r#"content="2;url=https://bosatsu.net""#),
+            "meta refresh to the url: {page}"
+        );
+        assert!(
+            page.contains(r#"<a href="https://bosatsu.net">"#),
+            "manual link: {page}"
+        );
+    }
+
+    #[test]
+    fn the_honeypot_response_is_identical_to_a_real_one() {
+        // A bot that trips the honeypot must get the SAME accepted page as a human — including
+        // the redirect — or the response itself tells it which submissions were dropped.
+        let (k, dropped) = redirecting_kernel("https://bosatsu.net");
+        let real = block_on(k.issue(post("name=A&email=a%40x.example&message=hi"), &cap()))
+            .unwrap()
+            .bytes;
+        let trapped = block_on(k.issue(
+            post("name=A&email=a%40x.example&message=hi&_honey=iam+a+bot"),
+            &cap(),
+        ))
+        .unwrap()
+        .bytes;
+        assert_eq!(real, trapped, "the two responses must be byte-identical");
+        // …and the honeypot really did discard it: only the real one dropped a tuple.
+        assert_eq!(dropped.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_redirect_url_is_html_escaped() {
+        // The URL is config, not user input, but it is escaped defensively — a stray quote
+        // must not break out of the attribute.
+        let (k, _) = redirecting_kernel(r#"https://x.example/?a=1&b="2""#);
+        let page = String::from_utf8(
+            block_on(k.issue(post("name=A&email=a%40x.example&message=hi"), &cap()))
+                .unwrap()
+                .bytes,
+        )
+        .unwrap();
+        assert!(page.contains("&amp;"), "ampersand escaped: {page}");
+        assert!(page.contains("&quot;"), "quote escaped: {page}");
+        assert!(
+            !page.contains(r#"b="2""#),
+            "no raw quote in the page: {page}"
+        );
     }
 
     /// A stand-in client registry: one known token, and a record of what was asked for.

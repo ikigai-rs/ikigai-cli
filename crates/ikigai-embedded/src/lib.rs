@@ -2386,6 +2386,9 @@ fn contact_intake() -> ikigai_intake::IntakeConfig {
         requires: "urn:cap:contact:submit".to_string(),
         clients: Some(CLIENT_TEMPLATE.to_string()),
         attests: Vec::new(),
+        // A plain form POST lands the browser on the response, so send it back to the site
+        // rather than dead-ending on a bare "received".
+        redirect: Some("https://bosatsu.net".to_string()),
     }
 }
 
@@ -2422,6 +2425,9 @@ fn booking_intake() -> ikigai_intake::IntakeConfig {
         // handler may widen on — and which the visitor cannot type, because the submitted
         // field would be `earliest`, not `via-earliest`.
         attests: vec!["earliest".to_string(), "latest".to_string()],
+        // A booking is scheduled asynchronously; the plain `received` acknowledgement is right
+        // (there is no slot to show yet). Left un-redirected deliberately.
+        redirect: None,
     }
 }
 
