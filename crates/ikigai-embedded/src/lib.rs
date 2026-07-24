@@ -21,6 +21,7 @@ use ikigai_core::{
 use ikigai_scheduler::Scheduler;
 
 pub mod decide;
+pub mod decisions;
 use ikigai_time::JobRegistry;
 use ikigai_vocab::TurtleRenderer;
 use notify::{RecursiveMode, Watcher};
@@ -1865,6 +1866,12 @@ fn root_space_with_mounts(
                 Exact::new("urn:decide:accept"),
                 decide::DecideAccept {
                     key_path: decide::public_key_path(),
+                },
+            )
+            .bind(
+                Exact::new("urn:decisions"),
+                decisions::DecisionLog {
+                    path: decisions::log_path(),
                 },
             ),
     ) as Arc<dyn Space>);
