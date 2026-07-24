@@ -71,8 +71,13 @@ struct Certs {
 enum Mode {
     Repl(ReplArgs),
     /// Headless: build the watched kernel (timers, watcher, the standing sync)
-    /// and park — the launchd-agent face of the desktop machine.
-    Daemon,
+    /// and park — the launchd-agent face of the desktop machine. Carries any
+    /// `--mount`s so the standing DRAIN has an edge to pull from — without them the
+    /// drain job fires against a kernel that cannot resolve `urn:edge:` and pulls nothing.
+    Daemon {
+        mounts: Vec<(String, String)>,
+        certs: Certs,
+    },
     Serve {
         target: Option<String>,
         certs: Certs,
@@ -406,7 +411,10 @@ fn parse_args() -> Result<Option<Mode>, String> {
         }
     }
     if daemon {
-        return Ok(Some(Mode::Daemon));
+        return Ok(Some(Mode::Daemon {
+            mounts: repl.mounts,
+            certs: repl.certs,
+        }));
     }
     Ok(Some(Mode::Repl(repl)))
 }
@@ -429,14 +437,14 @@ fn main() {
     // set during parsing) wins because set_instance_name is first-write-wins.
     #[cfg(feature = "embedded")]
     ikigai_embedded::set_instance_name(match &mode {
-        Mode::Daemon => "daemon",
+        Mode::Daemon { .. } => "daemon",
         Mode::Serve { .. } => "serve",
         Mode::Mcp { .. } => "mcp",
         _ => "repl",
     });
 
     match mode {
-        Mode::Daemon => daemon(),
+        Mode::Daemon { mounts, certs } => daemon(mounts, certs),
         Mode::Mcp { grants, scopes } => mcp(grants, scopes),
         Mode::CertGenerate { force, dir } => cert_generate(force, dir),
         Mode::CertAddClient {
@@ -490,12 +498,33 @@ fn main() {
 /// consolidated-view sync all live in it — then park. This is what a
 /// LaunchAgent runs: the desktop machine as a quiet, always-on resolver.
 #[cfg(feature = "embedded")]
-fn daemon() {
+fn daemon(mounts: Vec<(String, String)>, certs: Certs) {
     // watched_kernel(), NOT kernel_for(): the watchers, the time transport's
     // kernel handle, and the standing-sync registration all live in the
     // watched constructor — a bare served-space kernel would park with the
     // banner up and nothing actually scheduled.
-    let kernel = ikigai_embedded::watched_kernel();
+    //
+    // Compose any `--mount`s into that kernel, exactly as the REPL path does. This is what
+    // the standing drain resolves `urn:edge:` through; a daemon that ignored its mounts
+    // would schedule the drain and then pull nothing from a prefix it cannot resolve.
+    let kernel = if mounts.is_empty() {
+        ikigai_embedded::watched_kernel()
+    } else {
+        let mut resolved = Vec::new();
+        for (prefix, target) in mounts {
+            match connect_mount(&target, &certs) {
+                Ok(resolver) => resolved.push((prefix, target, resolver)),
+                // A mount that will not connect is fatal here: the daemon's whole reason to
+                // hold a mount is the drain, and a silent no-op is the failure mode this is
+                // fixing. Say so and exit rather than park looking healthy.
+                Err(e) => {
+                    eprintln!("ikigai: --mount {target}: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        ikigai_embedded::watched_kernel_with_mounts(resolved)
+    };
     let name = ikigai_embedded::instance_name();
     match ikigai_embedded::standing_sync_interval() {
         Some(every) => eprintln!(
@@ -517,7 +546,7 @@ fn daemon() {
 }
 
 #[cfg(not(feature = "embedded"))]
-fn daemon() {
+fn daemon(_mounts: Vec<(String, String)>, _certs: Certs) {
     eprintln!("ikigai: --daemon requires the embedded feature");
     std::process::exit(2);
 }
