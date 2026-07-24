@@ -594,6 +594,18 @@ impl SpaceReactor {
     /// A non-reactive space (no `handler` file) is simply skipped — this is safe to call over
     /// the whole tree.
     pub fn watch(self: Arc<Self>) {
+        // Make every known space's inbox exist BEFORE the watch is established.
+        //
+        // A recursive watch only covers directories that are there when it starts; one
+        // created later is picked up by watching its parent for the create, which races
+        // with a tuple written immediately after. On a fresh machine no inbox exists yet,
+        // so the FIRST tuple a space ever receives is the one most likely to be missed —
+        // and a missed tuple is silent, sitting in an inbox nobody looks at again until
+        // something restarts. Creating them up front removes the race for known spaces.
+        for name in self.space_names() {
+            let _ = std::fs::create_dir_all(self.root.join(&name).join("inbox"));
+        }
+        // Anything already waiting (including tuples missed while this was not running).
         for name in self.space_names() {
             let _ = self.drain(&name);
         }
@@ -1029,6 +1041,33 @@ mod tests {
         assert!(
             !calls[0].1.allows("urn:cap:anything-else"),
             "the handler runs under the reactor's scoped authority, not root"
+        );
+    }
+
+    #[test]
+    fn watching_creates_each_inbox_before_a_tuple_can_race_it() {
+        // A recursive watch only covers directories that exist when it starts; one created
+        // later is caught by watching its parent, which races a tuple written immediately
+        // after. On a fresh machine NO inbox exists, so the first tuple a space ever
+        // receives is the likeliest to be missed — and a missed tuple is silent, sitting in
+        // an inbox nothing re-reads until a restart. Observed in production on the first
+        // enquiry a new edge received.
+        let root = reactive_root("watch-precreate", "contact", "urn:contact:handle");
+        assert!(
+            !root.join("contact").join("inbox").exists(),
+            "precondition: a fresh space has no inbox"
+        );
+
+        let reactor = Arc::new(SpaceReactor::new(
+            root.clone(),
+            Arc::new(MockResolver::new(true)),
+            Capability::root(),
+        ));
+        reactor.watch();
+
+        assert!(
+            root.join("contact").join("inbox").is_dir(),
+            "watch() must create the inbox up front, so no drop can land in an unwatched directory"
         );
     }
 
