@@ -71,6 +71,11 @@ pub struct Outgoing {
     pub reply_to: Option<String>,
     pub subject: String,
     pub body: String,
+    /// An optional iCalendar invite (a full VCALENDAR). When present the message is a proper
+    /// iMIP invitation — a `multipart/alternative` of the plain body and a
+    /// `text/calendar; method=REQUEST` part — so a mail client shows an add-to-calendar /
+    /// RSVP card. It carries its OWN `METHOD` line; the transport does not add one.
+    pub ics: Option<String>,
 }
 
 /// Why a delivery failed, split the way the kernel's error taxonomy needs: a `Transient`
@@ -169,12 +174,21 @@ impl Endpoint for SendEndpoint {
             .map_err(|_| Error::MissingArgument("content".to_string()))?
             .to_string();
 
+        // An optional calendar invite. Not header-checked (it is a body part, not a
+        // header) but it must be non-empty to count.
+        let ics = inv
+            .inline_str("ics")
+            .ok()
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty());
+
         let message = Outgoing {
             from: self.config.from.clone(),
             to,
             reply_to,
             subject,
             body,
+            ics,
         };
         match self.transport.deliver(&message) {
             Ok(receipt) => Ok(Representation::new(
@@ -248,30 +262,56 @@ impl SmtpSubmission {
     }
 }
 
+/// Build the wire message from an [`Outgoing`] — plain, or an iMIP invitation when it
+/// carries an `.ics`. Split out from delivery so the MIME structure is provable without an
+/// SMTP server.
+fn build_message(message: &Outgoing) -> std::result::Result<lettre::Message, MailError> {
+    let mut builder = lettre::Message::builder()
+        .from(
+            message
+                .from
+                .parse()
+                .map_err(|e| MailError::Permanent(format!("bad From `{}`: {e}", message.from)))?,
+        )
+        .to(message
+            .to
+            .parse()
+            .map_err(|e| MailError::Permanent(format!("bad To `{}`: {e}", message.to)))?)
+        .subject(message.subject.clone());
+    if let Some(reply_to) = &message.reply_to {
+        builder = builder.reply_to(
+            reply_to
+                .parse()
+                .map_err(|e| MailError::Permanent(format!("bad Reply-To: {e}")))?,
+        );
+    }
+    match &message.ics {
+        None => builder
+            .body(message.body.clone())
+            .map_err(|e| MailError::Permanent(format!("building the message: {e}"))),
+        Some(ics) => {
+            use lettre::message::{header, MultiPart, SinglePart};
+            // iMIP: the plain body and the invite as two alternatives of the same
+            // message. A client that understands calendars shows the RSVP card; one that
+            // does not falls back to the text. The `method=REQUEST` on the part is what
+            // makes it an invitation rather than a mere event to file.
+            let calendar =
+                header::ContentType::parse("text/calendar; charset=utf-8; method=REQUEST")
+                    .map_err(|e| MailError::Permanent(format!("calendar content-type: {e}")))?;
+            let alternative = MultiPart::alternative()
+                .singlepart(SinglePart::plain(message.body.clone()))
+                .singlepart(SinglePart::builder().header(calendar).body(ics.clone()));
+            builder
+                .multipart(alternative)
+                .map_err(|e| MailError::Permanent(format!("building the invite: {e}")))
+        }
+    }
+}
+
 impl MailTransport for SmtpSubmission {
     fn deliver(&self, message: &Outgoing) -> std::result::Result<String, MailError> {
         use lettre::Transport as _;
-        let mut builder =
-            lettre::Message::builder()
-                .from(message.from.parse().map_err(|e| {
-                    MailError::Permanent(format!("bad From `{}`: {e}", message.from))
-                })?)
-                .to(message
-                    .to
-                    .parse()
-                    .map_err(|e| MailError::Permanent(format!("bad To `{}`: {e}", message.to)))?)
-                .subject(message.subject.clone());
-        if let Some(reply_to) = &message.reply_to {
-            builder = builder.reply_to(
-                reply_to
-                    .parse()
-                    .map_err(|e| MailError::Permanent(format!("bad Reply-To: {e}")))?,
-            );
-        }
-        let email = builder
-            .body(message.body.clone())
-            .map_err(|e| MailError::Permanent(format!("building the message: {e}")))?;
-
+        let email = build_message(message)?;
         let mailer = lettre::SmtpTransport::builder_dangerous(&self.host)
             .port(self.port)
             .build();
@@ -468,5 +508,89 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, Error::Denied(_)), "got: {err:?}");
         assert!(mail.sent.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod ics_tests {
+    use super::*;
+
+    fn msg(ics: Option<&str>) -> Outgoing {
+        Outgoing {
+            from: "brian@bosatsu.net".to_string(),
+            to: "nigel@ukclient.example".to_string(),
+            reply_to: None,
+            subject: "Your meeting is confirmed".to_string(),
+            body: "We're on for tomorrow.".to_string(),
+            ics: ics.map(str::to_string),
+        }
+    }
+
+    const INVITE: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\n\
+                          UID:abc@bosatsu.net\r\nSUMMARY:Call with Brian Sletten\r\n\
+                          END:VEVENT\r\nEND:VCALENDAR\r\n";
+
+    /// A wire-bytes rendering of the built message, for structural assertions.
+    fn wire(m: &Outgoing) -> String {
+        String::from_utf8(build_message(m).unwrap().formatted()).unwrap()
+    }
+
+    #[test]
+    fn a_plain_message_has_no_calendar_part() {
+        let w = wire(&msg(None));
+        assert!(w.contains("We're on for tomorrow."), "body present");
+        assert!(
+            !w.contains("text/calendar"),
+            "no invite when none was given: {w}"
+        );
+    }
+
+    #[test]
+    fn an_invite_is_an_imip_alternative_with_the_calendar() {
+        let w = wire(&msg(Some(INVITE)));
+        // The interactive-invite signal: a text/calendar part carrying method=REQUEST.
+        assert!(w.contains("multipart/alternative"), "{w}");
+        assert!(w.to_lowercase().contains("text/calendar"), "{w}");
+        assert!(w.to_lowercase().contains("method=request"), "{w}");
+        // The plain body survives as the fallback alternative.
+        assert!(w.contains("We're on for tomorrow."), "{w}");
+        // And the invite itself is in there.
+        assert!(w.contains("SUMMARY:Call with Brian Sletten"), "{w}");
+    }
+
+    #[test]
+    fn the_endpoint_carries_an_ics_arg_through() {
+        use futures::executor::block_on;
+        use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request, Verb};
+        // Reach the transport through the endpoint, and check the recorded Outgoing.
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Outgoing>::new()));
+        struct Rec(std::sync::Arc<std::sync::Mutex<Vec<Outgoing>>>);
+        impl MailTransport for Rec {
+            fn deliver(&self, m: &Outgoing) -> std::result::Result<String, MailError> {
+                self.0.lock().unwrap().push(m.clone());
+                Ok("250".into())
+            }
+        }
+        let kernel = Kernel::new(std::sync::Arc::new(space(
+            EmailConfig::default(),
+            std::sync::Arc::new(Rec(sent.clone())),
+        )));
+        block_on(
+            kernel.issue(
+                Request::new(Verb::Sink, Iri::parse("urn:email:send").unwrap())
+                    .with_arg("to", ArgRef::Inline(b"nigel@ukclient.example".to_vec()))
+                    .with_arg("subject", ArgRef::Inline(b"Confirmed".to_vec()))
+                    .with_arg("content", ArgRef::Inline(b"body".to_vec()))
+                    .with_arg("ics", ArgRef::Inline(INVITE.as_bytes().to_vec())),
+                &Capability::scoped([CAP_SEND]),
+            ),
+        )
+        .unwrap();
+        let got = sent.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(
+            got[0].ics.as_deref().unwrap().contains("METHOD:REQUEST"),
+            "ics threaded through"
+        );
     }
 }
