@@ -1847,6 +1847,16 @@ fn root_space_with_mounts(
             ikigai_lisp::program("confirm", program),
         )) as Arc<dyn Space>);
     }
+    // Recording a drained contact. `contact-record.scm` takes a person tuple the edge dropped
+    // (the contact handler runs on the edge, which has no people ledger) and sinks it into
+    // `urn:people`. The drain delivers to it (see drain.scm's people leg). Host-only, beside
+    // confirm — it reaches the ledger, which never leaves this machine.
+    if let Ok(program) = std::fs::read_to_string(file_root().join("contact-record.scm")) {
+        spaces.push(Arc::new(ikigai_core::EndpointSpace::new().bind(
+            Exact::new("urn:contact:record"),
+            ikigai_lisp::program("contact-record", program),
+        )) as Arc<dyn Space>);
+    }
     // The drain. `drain.scm` reads the EDGE's bookings space (mounted here at `urn:edge:` —
     // see `--mount`) and delivers each tuple into the LOCAL bookings space, where dropping it
     // fires `urn:booking:handle`. It is bound here and scheduled below; the edge itself never
