@@ -17,6 +17,7 @@
 //! (the meeting time, for the human record), and `at` (when the decision was made).
 
 use crate::file_root;
+use crate::jsonl::{field, json_str, now_rfc3339, read_lines};
 use ikigai_core::{
     ActionSpec, ArgSpec, Description, Endpoint, Error, Invocation, ReprType, Representation,
     Result, Verb,
@@ -30,63 +31,6 @@ pub const CAP_DECISIONS_READ: &str = "urn:cap:decisions:read";
 /// The append-only log file.
 pub fn log_path() -> std::path::PathBuf {
     file_root().join("decisions.jsonl")
-}
-
-/// A JSON string literal — the values here are names, emails and RFC-3339 stamps, but a
-/// quote or backslash must still not break the line, since each record is one line.
-fn json_str(value: &str) -> String {
-    let mut out = String::from("\"");
-    for c in value.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-/// Pull a string field out of one JSONL record. A deliberately small reader: the records
-/// are written by [`DecisionLog`] itself, so the shapes are known and flat.
-fn field(line: &str, name: &str) -> Option<String> {
-    let key = format!("\"{name}\":\"");
-    let start = line.find(&key)? + key.len();
-    let mut out = String::new();
-    let mut chars = line[start..].chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => match chars.next()? {
-                'n' => out.push('\n'),
-                't' => out.push('\t'),
-                'r' => out.push('\r'),
-                other => out.push(other),
-            },
-            '"' => return Some(out),
-            c => out.push(c),
-        }
-    }
-    None
-}
-
-fn now_rfc3339() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-}
-
-/// Read the log, newest line first. Absent file → empty (nothing decided yet).
-fn read_lines(path: &std::path::Path) -> Vec<String> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    text.lines()
-        .filter(|l| !l.trim().is_empty())
-        .rev()
-        .map(str::to_string)
-        .collect()
 }
 
 /// Emails with a `block` decision — case-folded, deduplicated, most-recent first.
@@ -151,19 +95,7 @@ impl Endpoint for DecisionLog {
                     json_str(&arg("when")),
                     json_str(&now_rfc3339()),
                 );
-                let path = &self.path;
-                if let Some(dir) = path.parent() {
-                    std::fs::create_dir_all(dir)
-                        .map_err(|e| Error::Endpoint(format!("decisions dir: {e}")))?;
-                }
-                use std::io::Write;
-                let mut file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .map_err(|e| Error::Endpoint(format!("open {}: {e}", path.display())))?;
-                file.write_all(record.as_bytes())
-                    .map_err(|e| Error::Endpoint(format!("append: {e}")))?;
+                crate::jsonl::append(&self.path, &record, "decisions")?;
                 Ok(Representation::new(
                     ReprType::new("text/plain"),
                     b"recorded".to_vec(),

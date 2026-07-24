@@ -22,6 +22,8 @@ use ikigai_scheduler::Scheduler;
 
 pub mod decide;
 pub mod decisions;
+pub mod jsonl;
+pub mod people;
 use ikigai_time::JobRegistry;
 use ikigai_vocab::TurtleRenderer;
 use notify::{RecursiveMode, Watcher};
@@ -1872,6 +1874,14 @@ fn root_space_with_mounts(
                 Exact::new("urn:decisions"),
                 decisions::DecisionLog {
                     path: decisions::log_path(),
+                },
+            )
+            // The people ledger: a durable roster captured at ingestion. Host-only, like the
+            // decision log beside it — a private contact list never belongs on the served edge.
+            .bind(
+                Exact::new("urn:people"),
+                people::PeopleLedger {
+                    path: people::ledger_path(),
                 },
             ),
     ) as Arc<dyn Space>);
