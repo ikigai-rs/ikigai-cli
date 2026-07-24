@@ -245,8 +245,9 @@ pub fn connect(
     })?;
     Ok(QuicResolver {
         runtime,
-        _endpoint: endpoint,
-        connection,
+        endpoint,
+        addr,
+        connection: Mutex::new(connection),
         tracer: Mutex::new(None),
     })
 }
@@ -254,9 +255,15 @@ pub fn connect(
 /// A [`Resolver`] backed by a kernel server over QUIC.
 pub struct QuicResolver {
     runtime: Runtime,
-    /// Kept alive for the duration of the connection.
-    _endpoint: quinn::Endpoint,
-    connection: quinn::Connection,
+    /// The client endpoint — kept alive, and reused to re-`connect` when the current
+    /// connection has died (see [`round_trip`](Self::round_trip)).
+    endpoint: quinn::Endpoint,
+    /// The server address, held so a dropped connection can be re-established.
+    addr: SocketAddr,
+    /// Swappable so a stale connection can be replaced in place: a long-lived resolver
+    /// (a daemon's mount) must survive the peer restarting or an idle timeout, not wedge
+    /// on the one connection it opened at startup.
+    connection: Mutex<quinn::Connection>,
     /// The tracer the `trace` command installs; when set, a resolution is sent as
     /// [`Call::IssueTraced`] and the server's returned spans are forwarded here.
     tracer: Mutex<Option<Arc<dyn Tracer>>>,
@@ -264,15 +271,50 @@ pub struct QuicResolver {
 
 impl QuicResolver {
     /// One call → one bidirectional stream → one reply.
+    ///
+    /// A QUIC connection does not live forever: the peer may restart, or an idle spell may
+    /// let it time out. A resolver that opened its connection once at startup — a daemon's
+    /// standing mount — would then fail every call thereafter, silently, forever. So a
+    /// transport failure is not fatal here: reconnect once and try again. A failure that
+    /// survives the reconnect (the peer is genuinely down) surfaces as normal, for the
+    /// reliability overlays to treat as the transient [`Unavailable`](Error::Unavailable)
+    /// it is.
     fn round_trip(&self, call: Call) -> io::Result<Reply> {
         let request = encode(&call)?;
         self.runtime.block_on(async {
-            let (mut send, mut recv) = self.connection.open_bi().await.map_err(other)?;
-            send.write_all(&request).await.map_err(other)?;
-            send.finish().map_err(other)?;
-            let bytes = recv.read_to_end(MAX_MESSAGE).await.map_err(other)?;
-            decode(&bytes)
+            match self.attempt(&request).await {
+                Ok(reply) => Ok(reply),
+                Err(_) => {
+                    self.reconnect().await?;
+                    self.attempt(&request).await
+                }
+            }
         })
+    }
+
+    /// One attempt on the current connection. Cloning the connection out of the lock
+    /// (cheap — it is an `Arc` inside) keeps the guard from being held across an await.
+    async fn attempt(&self, request: &[u8]) -> io::Result<Reply> {
+        let connection = { self.connection.lock().unwrap().clone() };
+        let (mut send, mut recv) = connection.open_bi().await.map_err(other)?;
+        send.write_all(request).await.map_err(other)?;
+        send.finish().map_err(other)?;
+        let bytes = recv.read_to_end(MAX_MESSAGE).await.map_err(other)?;
+        decode(&bytes)
+    }
+
+    /// Re-establish the connection through the surviving endpoint, reusing the same pinned
+    /// identity and trust (they live in the endpoint's default client config). The lock is
+    /// taken only to swap the result in, after the await completes.
+    async fn reconnect(&self) -> io::Result<()> {
+        let connection = self
+            .endpoint
+            .connect(self.addr, "ikigai")
+            .map_err(other)?
+            .await
+            .map_err(other)?;
+        *self.connection.lock().unwrap() = connection;
+        Ok(())
     }
 }
 
@@ -280,13 +322,9 @@ impl Drop for QuicResolver {
     fn drop(&mut self) {
         // Tell the peer we're done so it stops promptly instead of waiting out
         // the idle timeout; then let the endpoint flush the close frame.
-        self.connection.close(0u32.into(), b"bye");
+        self.connection.lock().unwrap().close(0u32.into(), b"bye");
         let _ = self.runtime.block_on(async {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(1),
-                self._endpoint.wait_idle(),
-            )
-            .await
+            tokio::time::timeout(std::time::Duration::from_secs(1), self.endpoint.wait_idle()).await
         });
     }
 }
@@ -893,5 +931,85 @@ mod tests {
             .and_then(|client| client.issue(upper("hi")).map_err(other));
         assert!(result.is_err());
         server.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use super::*;
+    use ikigai_core::{ArgRef, Capability, Verb};
+    use std::sync::Arc;
+    use std::thread;
+
+    fn upper(text: &str) -> Request {
+        Request::new(Verb::Source, Iri::parse("urn:fn:toUpper").unwrap())
+            .with_arg("in", ArgRef::Inline(text.as_bytes().to_vec()))
+    }
+
+    /// Serve exactly one connection on `server_cfg` at `addr`, then return — the caller
+    /// spawns this again to simulate a server that went away and came back.
+    fn serve_one(server_cfg: quinn::ServerConfig, addr: SocketAddr) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let rt = Runtime::new().unwrap();
+            rt.block_on(async move {
+                let endpoint = quinn::Endpoint::server(server_cfg, addr).unwrap();
+                let session = Session {
+                    capability: Capability::root(),
+                    file_segment: String::new(),
+                };
+                let kernel = Arc::new(Kernel::new(Arc::new(
+                    ikigai_core::EndpointSpace::new().bind(
+                        ikigai_core::Exact::new("urn:fn:toUpper"),
+                        ikigai_core::builtins::to_upper(),
+                    ),
+                )));
+                if let Some(incoming) = endpoint.accept().await {
+                    if let Ok(connection) = incoming.await {
+                        serve_connection(&kernel, connection, &session).await;
+                    }
+                }
+                // Let the close frame flush before the endpoint drops.
+                endpoint.wait_idle().await;
+            });
+        })
+    }
+
+    #[test]
+    fn a_resolver_survives_the_server_going_away_and_coming_back() {
+        let server_id = generate();
+        let client_id = generate();
+
+        // A FIXED port, so the second server instance is reachable at the same address the
+        // resolver already knows — exactly the "same edge, restarted" case.
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = || server_config(&server_id, std::slice::from_ref(&client_id.cert_pem)).unwrap();
+        // Bind once to claim a concrete port, then hand that port to the servers.
+        let probe = Runtime::new()
+            .unwrap()
+            .block_on(async { quinn::Endpoint::server(cfg(), addr).unwrap() });
+        let port = probe.local_addr().unwrap();
+        drop(probe);
+
+        // First server instance.
+        let first = serve_one(cfg(), port);
+        let client = connect(port, &client_id, &server_id.cert_pem).unwrap();
+        assert_eq!(client.issue(upper("one")).unwrap().0.bytes, b"ONE");
+
+        // The server goes away — this is what leaves the resolver holding a dead connection.
+        first.join().unwrap();
+
+        // It comes back at the same address, and the resolver — which never restarted —
+        // must recover on its own rather than fail forever.
+        let second = serve_one(cfg(), port);
+        // Give the new instance a moment to bind.
+        thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(
+            client.issue(upper("two")).unwrap().0.bytes,
+            b"TWO",
+            "the resolver reconnected to the restarted server"
+        );
+
+        drop(client);
+        second.join().unwrap();
     }
 }
