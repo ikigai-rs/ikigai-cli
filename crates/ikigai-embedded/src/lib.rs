@@ -2405,8 +2405,18 @@ fn booking_intake() -> ikigai_intake::IntakeConfig {
         fields: vec![
             F::required("name", "Your name"),
             F::required("email", "Your email address"),
-            F::required("period", "When would you like to meet?")
-                .one_of(["week", "today", "tomorrow"]),
+            F::required("period", "When would you like to meet?").one_of([
+                "week",
+                "next-week",
+                "month",
+                "today",
+                "tomorrow",
+            ]),
+            // The specific-date picker, optional: a chosen date overrides the period above.
+            // The handler validates the shape and the availability endpoint the substance —
+            // this is the convenience half. A generated form renders it as an HTML5 date input
+            // (keyed on the field name, the same way the zone field becomes a picker).
+            F::optional("date", "Or pick a specific date"),
             F::required(
                 "hours",
                 "Hours that suit you, in YOUR timezone (24-hour, space separated — e.g. 9 10 14)",
