@@ -1,19 +1,31 @@
-//! Host configuration, read from `<file_root>/config.toml`.
+//! Host configuration, read from `$XDG_CONFIG_HOME/ikigai/config.toml` (falling back to
+//! `~/.config/ikigai/config.toml`).
 //!
 //! The one place the daemon and the CLI both read — so they cannot diverge the way a shell
 //! env var and a launchd plist just did (the mail `from` that was set for one process and not
 //! the other). A minimal `key = "value"` scanner; dotted keys like `mail.from` are ordinary
 //! keys to it. It grows a real TOML parser if and when the config outgrows a flat map.
 //!
+//! Deliberately in the CONFIG dir, NOT `file_root()`: `IKIGAI_FILES` repoints the workspace
+//! *data* dir, but a *setting* like the mail sender shouldn't move with it. This is the shared
+//! ikigai config home — `grants.json` already lives beside it, and the CLI's own settings
+//! (keybindings) read the same `config.toml`.
+//!
 //! Settings that already had environment variables keep them as an override — the file is the
-//! home, the env is an escape hatch for CI and containers. `[`email_config`](crate::email_config)
+//! home, the env is an escape hatch for CI and containers. [`email_config`](crate::email_config)
 //! reads `mail.from` / `mail.host` / `mail.port` this way.
 
-use crate::file_root;
-
-/// `<file_root>/config.toml` — the host config file (alongside the workspace and the logs).
+/// `$XDG_CONFIG_HOME/ikigai/config.toml`, or `~/.config/ikigai/config.toml` when
+/// `XDG_CONFIG_HOME` is unset. Independent of `IKIGAI_FILES` (see the module note).
 pub fn config_path() -> std::path::PathBuf {
-    file_root().join("config.toml")
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME")
+                .map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from);
+            home.join(".config")
+        });
+    base.join("ikigai").join("config.toml")
 }
 
 /// The value of `key` in the host config, or `None` if the file or the key is absent.

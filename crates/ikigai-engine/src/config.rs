@@ -1,9 +1,11 @@
-//! User configuration, read from `$XDG_CONFIG_HOME/ikigai-cli/config.toml`
-//! (falling back to `$HOME/.config/ikigai-cli/config.toml`).
+//! User configuration, read from `$XDG_CONFIG_HOME/ikigai/config.toml`
+//! (falling back to `$HOME/.config/ikigai/config.toml`).
 //!
-//! Only one property exists today — `keybindings` — so the reader is a minimal
-//! `key = value` scanner rather than a full TOML parser; it grows a real parser
-//! if and when the config does.
+//! One shared config home for the whole tool: `grants.json` already lives in
+//! `~/.config/ikigai/`, and the host reads `mail.*` from this same `config.toml`
+//! (see `ikigai-embedded`'s `config` module). The CLI's own `keybindings` key is
+//! read here. A minimal `key = value` scanner rather than a full TOML parser; it
+//! grows a real parser if and when the config does.
 
 use std::path::PathBuf;
 
@@ -56,13 +58,14 @@ pub fn keybindings_supported(value: &str) -> bool {
     Keybindings::parse(value).is_some()
 }
 
-/// `$XDG_CONFIG_HOME/ikigai-cli/config.toml`, or `$HOME/.config/...` when
-/// `XDG_CONFIG_HOME` is unset. `None` if neither base directory is known.
+/// `$XDG_CONFIG_HOME/ikigai/config.toml`, or `$HOME/.config/...` when
+/// `XDG_CONFIG_HOME` is unset. `None` if neither base directory is known. The
+/// same file the host reads `mail.*` from — one shared config home.
 pub fn path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    Some(base.join("ikigai-cli").join("config.toml"))
+    Some(base.join("ikigai").join("config.toml"))
 }
 
 /// The stored value of `key`, or `None` if the file or key is absent.

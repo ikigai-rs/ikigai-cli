@@ -2445,8 +2445,8 @@ fn booking_intake() -> ikigai_intake::IntakeConfig {
 }
 
 /// Where outbound mail is submitted and who it says it is from. Read from the host config
-/// file (`<file_root>/config.toml`: `mail.host` / `mail.port` / `mail.from`) — the one place
-/// the daemon and the CLI both read, so they cannot diverge. The matching environment
+/// file (`~/.config/ikigai/config.toml`: `mail.host` / `mail.port` / `mail.from`) — the one
+/// place the daemon and the CLI both read, so they cannot diverge. The matching environment
 /// variables remain as an override for CI and containers.
 ///
 /// The host and port default to a local MTA on the standard port (the deliverable path, since
