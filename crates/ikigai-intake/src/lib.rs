@@ -179,7 +179,8 @@ fn html_escape(s: &str) -> String {
 
 /// The response to a submission the endpoint accepted (a real one, or a honeypot hit that must
 /// look identical). With no `redirect`, a plain `received` body; with one, a small self-
-/// contained HTML page that confirms and bounces back to the site.
+/// contained HTML shim that bounces straight to the redirect URL (a styled confirmation page
+/// on the site, which carries the actual "message received" wording).
 fn accepted(config: &IntakeConfig) -> Representation {
     match &config.redirect {
         None => Representation::new(
@@ -189,17 +190,20 @@ fn accepted(config: &IntakeConfig) -> Representation {
         Some(url) => {
             let url = html_escape(url);
             // A meta refresh drives the redirect — works with no JS, no external anything — and
-            // a manual link covers the case where even that is blocked. The 2s pause lets the
-            // visitor read the confirmation before the page changes under them.
+            // a manual link covers the case where even that is blocked. This page is a bare
+            // SHIM, not the confirmation: the redirect target is the site's own styled
+            // thank-you page, which carries the "message received" wording. So the refresh is
+            // instant (`0;url=`) and the copy is neutral — no second "Thank you" flashing
+            // before the real one, and no interstitial CSS to keep in sync with the site.
             let page = format!(
                 "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
                  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-                 <meta http-equiv=\"refresh\" content=\"2;url={url}\">\
-                 <title>Received</title>\
+                 <meta http-equiv=\"refresh\" content=\"0;url={url}\">\
+                 <title>Redirecting\u{2026}</title>\
                  <style>body{{font-family:system-ui,sans-serif;max-width:32rem;margin:20vh auto;\
                  padding:0 1.5rem;text-align:center;line-height:1.5}}a{{color:inherit}}</style>\
-                 </head><body><h1>Thank you</h1>\
-                 <p>Your message was received. Taking you back to the site\u{2026}</p>\
+                 </head><body>\
+                 <p>Taking you to the confirmation\u{2026}</p>\
                  <p><a href=\"{url}\">Continue</a> if you are not redirected.</p>\
                  </body></html>"
             );
@@ -653,7 +657,7 @@ mod tests {
         let page = String::from_utf8(rep.bytes).unwrap();
         assert!(page.contains("<!doctype html>"), "{page}");
         assert!(
-            page.contains(r#"content="2;url=https://bosatsu.net""#),
+            page.contains(r#"content="0;url=https://bosatsu.net""#),
             "meta refresh to the url: {page}"
         );
         assert!(
