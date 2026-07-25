@@ -160,6 +160,16 @@ impl Endpoint for SendEndpoint {
                 inv.request.verb
             )));
         }
+        // Refuse rather than ship a sender nobody owns. An unconfigured `from` otherwise goes
+        // out as a placeholder (e.g. `ikigai@localhost`), which any sender-aligned relay
+        // rejects — silently, from the caller's side. The host sets this once, in one place.
+        if self.config.from.trim().is_empty() {
+            return Err(Error::Endpoint(
+                "email has no configured sender — set `mail.from` in the host config \
+                 (~/.ikigai/config.toml, or IKIGAI_MAIL_FROM) before sending"
+                    .to_string(),
+            ));
+        }
 
         let to = address_like("to", inv.inline_str("to").unwrap_or_default())?;
         let subject = header_safe("subject", inv.inline_str("subject").unwrap_or_default())?;
@@ -401,6 +411,34 @@ mod tests {
         assert_eq!(sent[0].from, "site@bosatsu.net", "the configured From");
         assert_eq!(sent[0].reply_to.as_deref(), Some("someone@example.com"));
         assert_eq!(sent[0].body, "Hello, I would like to talk.");
+    }
+
+    #[test]
+    fn a_send_with_no_configured_sender_is_refused() {
+        // An unset `from` must fail loudly and actionably, not silently ship a placeholder
+        // sender that a sender-aligned relay rejects (the bug this guards against).
+        let config = EmailConfig {
+            host: "localhost".to_string(),
+            port: 25,
+            from: "   ".to_string(),
+        };
+        let mail = FakeMail::ok();
+        let k = Kernel::new(Arc::new(space(config, mail.clone())));
+        let err = block_on(k.issue(
+            send_request(&[
+                ("to", "brian@bosatsu.net"),
+                ("subject", "x"),
+                ("content", "y"),
+            ]),
+            &cap(),
+        ))
+        .unwrap_err();
+        assert!(matches!(err, Error::Endpoint(_)), "{err:?}");
+        assert!(err.to_string().contains("mail.from"), "actionable: {err}");
+        assert!(
+            mail.sent.lock().unwrap().is_empty(),
+            "refused before the transport"
+        );
     }
 
     #[test]
