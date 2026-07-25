@@ -2418,9 +2418,14 @@ fn booking_intake() -> ikigai_intake::IntakeConfig {
             // this is the convenience half. A generated form renders it as an HTML5 date input
             // (keyed on the field name, the same way the zone field becomes a picker).
             F::optional("date", "Or pick a specific date"),
-            F::required(
+            // Optional: absence is "I'm flexible," not a malformed request. Blank defaults to
+            // business hours (the handler's `visitor-hours-for`); a preference still only ranks
+            // within them, never widens them. A non-blank value that isn't clock-hours is still
+            // rejected by the handler. The generated form drops the required marker from the
+            // ?description automatically — bosatsu-www needs no change.
+            F::optional(
                 "hours",
-                "Hours that suit you, in YOUR timezone (24-hour, space separated — e.g. 9 10 14)",
+                "Hours that suit you, in YOUR timezone (24-hour, space separated — e.g. 9 10 14); leave blank for any business hour",
             ),
             // No "e.g. Europe/London" hint: a generated form offers a zone picker, and the
             // label is what it renders. The server still checks the name against tzdata.
