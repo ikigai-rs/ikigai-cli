@@ -166,7 +166,7 @@ impl Endpoint for SendEndpoint {
         if self.config.from.trim().is_empty() {
             return Err(Error::Endpoint(
                 "email has no configured sender — set `mail.from` in the host config \
-                 (~/.ikigai/config.toml, or IKIGAI_MAIL_FROM) before sending"
+                 (~/.config/ikigai/config.toml, or IKIGAI_MAIL_FROM) before sending"
                     .to_string(),
             ));
         }
