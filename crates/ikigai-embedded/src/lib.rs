@@ -20,6 +20,7 @@ use ikigai_core::{
 };
 use ikigai_scheduler::Scheduler;
 
+pub mod config;
 pub mod decide;
 pub mod decisions;
 pub mod jsonl;
@@ -2443,19 +2444,25 @@ fn booking_intake() -> ikigai_intake::IntakeConfig {
     }
 }
 
-/// Where outbound mail is submitted and who it says it is from. Defaults to a local MTA
-/// on the standard port — the deliverable path, since that MTA owns the onward relay and
-/// its credentials. Overridable per deployment (the edge and a laptop differ) without a
-/// rebuild: `IKIGAI_SMTP_HOST`, `IKIGAI_SMTP_PORT`, `IKIGAI_MAIL_FROM`.
+/// Where outbound mail is submitted and who it says it is from. Read from the host config
+/// file (`<file_root>/config.toml`: `mail.host` / `mail.port` / `mail.from`) — the one place
+/// the daemon and the CLI both read, so they cannot diverge. The matching environment
+/// variables remain as an override for CI and containers.
+///
+/// The host and port default to a local MTA on the standard port (the deliverable path, since
+/// that MTA owns the onward relay and its credentials). `from` has NO usable default: unset
+/// means unconfigured, and `urn:email:send` refuses to send with an empty sender rather than
+/// ship a placeholder (`ikigai@localhost`) that a sender-aligned relay silently rejects.
 fn email_config() -> ikigai_email::EmailConfig {
     let default = ikigai_email::EmailConfig::default();
+    // File first (the home), then the env var (the escape hatch).
+    let setting = |key: &str, env: &str| config::get(key).or_else(|| std::env::var(env).ok());
     ikigai_email::EmailConfig {
-        host: std::env::var("IKIGAI_SMTP_HOST").unwrap_or(default.host),
-        port: std::env::var("IKIGAI_SMTP_PORT")
-            .ok()
+        host: setting("mail.host", "IKIGAI_SMTP_HOST").unwrap_or(default.host),
+        port: setting("mail.port", "IKIGAI_SMTP_PORT")
             .and_then(|p| p.parse().ok())
             .unwrap_or(default.port),
-        from: std::env::var("IKIGAI_MAIL_FROM").unwrap_or(default.from),
+        from: setting("mail.from", "IKIGAI_MAIL_FROM").unwrap_or_default(),
     }
 }
 
