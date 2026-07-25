@@ -2386,9 +2386,11 @@ fn contact_intake() -> ikigai_intake::IntakeConfig {
         requires: "urn:cap:contact:submit".to_string(),
         clients: Some(CLIENT_TEMPLATE.to_string()),
         attests: Vec::new(),
-        // A plain form POST lands the browser on the response, so send it back to the site
-        // rather than dead-ending on a bare "received".
-        redirect: Some("https://bosatsu.net".to_string()),
+        // A plain form POST (JS off) lands the browser on the response, so send it to the
+        // site's own styled confirmation page rather than dead-ending on a bare "received".
+        // The confirmation lives in bosatsu.net's own template (header, footer, fonts), so
+        // there is no interstitial CSS here to keep in sync with the site.
+        redirect: Some("https://www.bosatsu.net/thanks.html".to_string()),
     }
 }
 
