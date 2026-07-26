@@ -83,8 +83,9 @@ fn payload(id: &str, action: &str, exp: i64) -> String {
 }
 
 /// The actions a link may carry. Anything else is refused before a key is even loaded.
+/// `approve-zoom` is approve plus a scheduled Zoom (the confirm handler's `approve-zoom` command).
 fn known_action(action: &str) -> bool {
-    matches!(action, "approve" | "decline" | "block")
+    matches!(action, "approve" | "approve-zoom" | "decline" | "block")
 }
 
 /// A booking id is a content hash; it also becomes part of a signed payload and a filename
@@ -317,7 +318,9 @@ impl Endpoint for DecideLink {
         let exp = now_secs() + TTL_SECONDS;
         let base = decide_base();
         let mut out = String::new();
-        for action in ["approve", "decline", "block"] {
+        // `approve-zoom` is APPENDED, not inserted: a consumer that labels links by position
+        // (the notify email) keeps the first three correct even before it learns the fourth.
+        for action in ["approve", "decline", "block", "approve-zoom"] {
             let token = mint_token(&id, action, exp, &key);
             out.push_str(&format!(
                 "{base}/{action}?id={}&exp={exp}&t={}\n",
@@ -337,10 +340,10 @@ impl Endpoint for DecideLink {
 
     fn describe(&self) -> Description {
         Description::new("decide-link")
-            .title("Mint approve/decline links")
+            .title("Mint the decide links")
             .summary(
-                "Two signed, expiring URLs for one pending booking — the approve link and \
-                 the decline link, one per line, ready to email.",
+                "Signed, expiring URLs for one pending booking — approve, decline, block, and \
+                 approve-with-Zoom — one per line, ready to email.",
             )
             .action(
                 ActionSpec::new(Verb::Source)
@@ -423,16 +426,24 @@ impl Endpoint for CalendarRequest {
         match inv.request.verb {
             // SHOW: what this link would do, and a button to do it.
             Verb::Source => {
-                let (verb_word, note) = if action == "approve" {
-                    (
+                let (verb_word, note) = match action.as_str() {
+                    "approve" => (
                         "Approve",
                         "The invitation goes out once your Mac picks this up.",
-                    )
-                } else {
-                    (
+                    ),
+                    "approve-zoom" => (
+                        "Approve + Zoom",
+                        "A Zoom is scheduled and the invitation — with the join link — goes out \
+                         once your Mac picks this up.",
+                    ),
+                    "block" => (
+                        "Block",
+                        "This and future requests from that address are dropped, silently.",
+                    ),
+                    _ => (
                         "Decline",
                         "They'll be told, and asked to suggest other times.",
-                    )
+                    ),
                 };
                 Ok(page(
                     &format!("{verb_word} this request?"),
@@ -466,6 +477,10 @@ impl Endpoint for CalendarRequest {
                 .await?;
                 let what = match action.as_str() {
                     "approve" => "Approved — the invitation goes out once your Mac picks this up.",
+                    "approve-zoom" => {
+                        "Approved with Zoom — a meeting is scheduled and the invitation, with the \
+                         join link, goes out once your Mac picks this up."
+                    }
                     "block" => "Blocked — this and future requests from that address are dropped.",
                     _ => "Declined — they'll be told, and asked to suggest other times.",
                 };
@@ -597,6 +612,19 @@ mod tests {
         let k = key();
         let t = mint_token(ID, "approve", EXP, &k);
         assert!(token_valid(ID, "approve", EXP, &t, &k.verifying_key(), NOW));
+    }
+
+    #[test]
+    fn approve_zoom_is_a_known_action_whose_token_round_trips_and_does_not_forge() {
+        assert!(known_action("approve-zoom"));
+        let k = key();
+        let v = k.verifying_key();
+        let t = mint_token(ID, "approve-zoom", EXP, &k);
+        assert!(token_valid(ID, "approve-zoom", EXP, &t, &v, NOW));
+        // An approve token is NOT an approve-zoom token — the action is in the signed payload,
+        // so a plain-accept link can't be swapped into one that also books a Zoom.
+        let a = mint_token(ID, "approve", EXP, &k);
+        assert!(!token_valid(ID, "approve-zoom", EXP, &a, &v, NOW));
     }
 
     #[test]
