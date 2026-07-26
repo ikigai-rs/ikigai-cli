@@ -2387,6 +2387,7 @@ dependencies = [
  "ikigai-jsonld",
  "ikigai-lisp",
  "ikigai-llm",
+ "ikigai-meeting",
  "ikigai-org",
  "ikigai-personal",
  "ikigai-rdf",
@@ -2550,6 +2551,19 @@ dependencies = [
  "ikigai-core",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "ikigai-meeting"
+version = "0.1.0"
+source = "git+https://github.com/ikigai-rs/ikigai-meeting?rev=1e9675bc4561919713fe3131c4904fa9fce5bd8b#1e9675bc4561919713fe3131c4904fa9fce5bd8b"
+dependencies = [
+ "async-trait",
+ "ikigai-core",
+ "ikigai-http",
+ "serde",
+ "serde_json",
+ "url",
 ]
 
 [[package]]
