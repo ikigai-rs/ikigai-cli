@@ -41,7 +41,7 @@ ikigai-sign = "0.1.0"
 ikigai-encrypt = "0.1.0"
 # Secrets custody: urn:secret:{name} (cap-gated read) + urn:secret:generate/unlock
 # (Ed25519 keygen + Touch ID), macOS Keychain backend. Owner-only, not served.
-ikigai-secret = "0.1.2"
+ikigai-secret = "0.1.5" # 0.1.5 = the urn:secret Sink write face (owns the item's ACL → silent reads)
 # XSLT transform module (urn:xslt:transform) — linked natively (no download cost in a
 # native binary; the dynamic/lazy form is a browser/WASI concern).
 ikigai-xslt = "0.1.0"
