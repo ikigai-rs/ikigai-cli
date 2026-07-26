@@ -69,6 +69,11 @@ ikigai-lisp = "0.1.6" # (input) + program() — a stored Lisp program bound as a
 # LLM inference (urn:llm:ask + urn:llm:<provider>:ask + urn:llm:config): a facade grammar
 # over pluggable backends. OpenAI-compatible REST backend (Ollama/vLLM/llama.cpp/mlx_lm).
 ikigai-llm = "0.7.0" # installed: smallest-first with sizes (host co-load budgeting)
+# Video-conference scheduling (urn:meeting:schedule + urn:meeting:<provider>:schedule): a facade
+# over provider backends, Zoom first. A git dependency pinned to the published repo until the crate
+# is on crates.io — a committable, CI-resolvable bridge (NOT a local path override), to be swapped
+# for a `= "0.1.x"` version pin after the first publish.
+ikigai-meeting = { git = "https://github.com/ikigai-rs/ikigai-meeting", rev = "1e9675bc4561919713fe3131c4904fa9fce5bd8b" }
 # The org⊕calendar consolidated-view (Brian-Busy) derivation — a workspace-local
 # composition crate that reconciles personal/org/rdf THROUGH the kernel. Not
 # published (no version pin); the CLI installs it from this path only.

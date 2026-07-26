@@ -1297,6 +1297,33 @@ fn llm_space() -> EndpointSpace {
     ikigai_llm::space(Arc::new(UreqTransport), llm_registry())
 }
 
+/// The meeting module (`urn:meeting:schedule` + `urn:meeting:zoom:schedule`) on the native ureq
+/// transport. Reads the Zoom Server-to-Server OAuth credentials from the keystore through a
+/// [`HostSecrets`] reader (the same Keychain backend the `urn:secret:*` space uses), so the crate
+/// links neither an HTTP client nor the keystore. Embedded-root only (not served over the wire),
+/// alongside the secret/sign/encrypt family.
+fn meeting_space() -> EndpointSpace {
+    ikigai_meeting::space(
+        Arc::new(UreqTransport),
+        Arc::new(HostSecrets(ikigai_secret::default_backend())),
+        ikigai_meeting::ZoomConfig::default(),
+    )
+}
+
+/// Bridges the keystore to `ikigai_meeting::SecretReader`: resolve a secret by name from the same
+/// backend the `urn:secret:*` space reads. (Per-invocation secret-cap gating is a later refinement;
+/// today the embedded-only reachability of the meeting endpoint plus its net-cap check are the
+/// authority boundary.)
+struct HostSecrets(Arc<dyn ikigai_secret::Backend>);
+
+impl ikigai_meeting::SecretReader for HostSecrets {
+    fn read(&self, name: &str) -> ikigai_core::Result<Vec<u8>> {
+        self.0.get(name)?.ok_or_else(|| {
+            ikigai_core::Error::Endpoint(format!("secret `{name}` is not in the keystore"))
+        })
+    }
+}
+
 /// The LLM provider registry: a hand-editable JSON file pointed at by
 /// `IKIGAI_LLM_CONFIG` (see ikigai-llm's `Registry::from_json`), else a local
 /// Ollama default. Load-time — a config edit needs a restart; live-reload (the
@@ -1712,6 +1739,9 @@ fn root_space_with_mounts(
         Arc::new(local_space("Embedded (Native)")) as Arc<dyn Space>,
         Arc::new(http_space()) as Arc<dyn Space>,
         Arc::new(llm_space()) as Arc<dyn Space>,
+        // Video-conference scheduling (urn:meeting:schedule + urn:meeting:zoom:schedule). Reads
+        // the Zoom creds from the keystore; embedded-root only (not served over the wire).
+        Arc::new(meeting_space()) as Arc<dyn Space>,
         // The org agenda (urn:org:agenda[:{period}]) over the configured org
         // files, which it reads through the kernel via urn:orgfile:*.
         Arc::new(ikigai_org::space(

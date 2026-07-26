@@ -44,6 +44,9 @@ ikigai-jsonld = { workspace = true }
 ikigai-shacl = { workspace = true }
 # LLM inference (urn:llm:ask + urn:llm:<provider>:ask), on the native ureq transport.
 ikigai-llm = { workspace = true }
+# Video-conference scheduling (urn:meeting:schedule + urn:meeting:zoom:schedule), on the same
+# native transport; reads the Zoom creds from the keystore via a SecretReader (below).
+ikigai-meeting = { workspace = true }
 # Parse the LLM annotation graph (IKIGAI_LLM_ANNOTATIONS, Turtle) into the
 # (subject, predicate, object) facts Registry::apply_annotations consumes. The
 # same pure-Rust Oxigraph crates ikigai-rdf already pulls into this tree.
