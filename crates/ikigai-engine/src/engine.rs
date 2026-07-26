@@ -231,6 +231,11 @@ pub struct Engine {
     /// (cancel). `None` in the normal verb-grammar mode. Interior-mutable so the
     /// `&self` eval path can toggle and accumulate; the REPL is single-threaded.
     lisp_buffer: RefCell<Option<Vec<String>>>,
+    /// A one-shot piped-stdin payload for a batch (`-c`) run. When the CLI is fed content on a
+    /// non-TTY stdin (`… | ikigai -c 'sink <iri>'`), the first content-less `sink` uses this as
+    /// its `content` — so a secret can be piped in and never touch the command line (argv/`ps`)
+    /// or the shell history. `take`n on use, so it feeds exactly one write.
+    piped_input: RefCell<Option<Vec<u8>>>,
 }
 
 impl Engine {
@@ -251,7 +256,15 @@ impl Engine {
             profiles: RefCell::new(HashMap::new()),
             spawner: None,
             lisp_buffer: RefCell::new(None),
+            piped_input: RefCell::new(None),
         }
+    }
+
+    /// Provide a one-shot piped-stdin payload for a batch run: a content-less `sink <iri>` then
+    /// reads it as `content`. The CLI sets this from a non-TTY stdin so a secret piped in
+    /// (`printf %s "$v" | ikigai -c 'sink urn:secret:<name>'`) never lands on the command line.
+    pub fn set_piped_input(&self, bytes: Vec<u8>) {
+        *self.piped_input.borrow_mut() = Some(bytes);
     }
 
     /// Inject the scheduler (as a [`Spawner`]) so `( a ; b )` forks and `..` maps
@@ -799,8 +812,15 @@ impl Engine {
             request = request.with_arg(key, ArgRef::Inline(value.into_bytes()));
             tail = after;
         }
-        // The verbatim remainder is the content (empty for a no-body delete).
-        Ok(request.with_arg("content", ArgRef::Inline(tail.as_bytes().to_vec())))
+        // The verbatim remainder is the content. When a `sink` carries none, a one-shot piped
+        // stdin payload feeds it instead — so a value (e.g. a secret) can be piped in without
+        // ever appearing on the command line. Empty otherwise (e.g. a no-body delete).
+        let content = if tail.is_empty() && verb == Verb::Sink {
+            self.piped_input.borrow_mut().take().unwrap_or_default()
+        } else {
+            tail.as_bytes().to_vec()
+        };
+        Ok(request.with_arg("content", ArgRef::Inline(content)))
     }
 
     /// Build the `Source` [`Request`] for a stage without issuing it — shared by
@@ -2038,6 +2058,42 @@ mod tests {
             lisp_echo_engine().eval_lisp("   \n  "),
             Action::Noop
         ));
+    }
+
+    #[test]
+    fn a_content_less_sink_reads_the_one_shot_piped_input() {
+        // A sink that echoes its `content` back, so a test can see what reached it.
+        let echo = FnEndpoint::new("echo", |inv: &Invocation<'_>| {
+            let body = inv.inline_str("content").unwrap_or("");
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("stored:{body}").into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("echo")
+                .verb(Verb::Sink)
+                .input(ArgSpec::new("content").summary("the body"))
+                .output("text/plain"),
+        );
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(EndpointSpace::new().bind(Exact::new("urn:echo"), echo)),
+            Arc::new(JsonRenderer),
+        ));
+        let run = |e: &Engine, cmd: &str| match e.eval(cmd) {
+            Action::Output(entry) => entry.result.unwrap(),
+            _ => panic!("expected Action::Output"),
+        };
+        engine.set_piped_input(b"s3cr3t".to_vec());
+        // A content-less `sink` reads the piped payload as its content — the value never on
+        // the command line.
+        assert_eq!(run(&engine, "sink urn:echo"), "stored:s3cr3t");
+        // Consumed after one write: a second content-less sink gets nothing.
+        assert_eq!(run(&engine, "sink urn:echo"), "stored:");
+        // An explicit command-line content is used verbatim and does NOT touch the pipe.
+        engine.set_piped_input(b"piped".to_vec());
+        assert_eq!(run(&engine, "sink urn:echo typed"), "stored:typed");
+        assert_eq!(run(&engine, "sink urn:echo"), "stored:piped");
     }
 
     #[test]

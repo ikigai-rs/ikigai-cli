@@ -827,6 +827,19 @@ fn connect_mount_ipc(
 #[cfg(feature = "embedded")]
 fn run_repl(engine: Engine, plain: bool, commands: &[String]) {
     if !commands.is_empty() {
+        // A batch fed on a NON-TTY stdin (`printf %s "$v" | ikigai -c 'sink urn:secret:x'`)
+        // routes that stdin to the first content-less `sink` — so a secret is piped in, never
+        // placed on the command line. A TTY stdin is left alone (nothing to read, no block).
+        #[cfg(not(target_family = "wasm"))]
+        {
+            use std::io::{IsTerminal, Read};
+            if !std::io::stdin().is_terminal() {
+                let mut buf = Vec::new();
+                if std::io::stdin().read_to_end(&mut buf).is_ok() && !buf.is_empty() {
+                    engine.set_piped_input(buf);
+                }
+            }
+        }
         std::process::exit(repl::run_commands(engine, commands));
     }
     #[cfg(not(target_family = "wasm"))]
