@@ -224,8 +224,9 @@ impl Endpoint for SendEndpoint {
         Description::new("send")
             .title("Send email")
             .summary(
-                "Submit a message over SMTP. The body is the piped content; `to` and \
-                 `subject` are required, `reply_to` optional. Envelope fields are rejected \
+                "Submit a message over SMTP. The body is the `content` (piped or explicit); \
+                 `to` and `subject` are required, `reply_to` optional. An optional `ics` \
+                 VCALENDAR makes it an iMIP calendar invitation. Envelope fields are rejected \
                  if they contain control characters (SMTP header injection). Submission \
                  goes to a local MTA that relays onward, so DKIM/SPF and relay credentials \
                  stay in the MTA. A refused or greylisted submission is a TRANSIENT error, \
@@ -245,9 +246,27 @@ impl Endpoint for SendEndpoint {
                             .class(XSD_STRING),
                     )
                     .input(
+                        ArgSpec::new("content")
+                            .summary(
+                                "the message body — this endpoint's piped content, or an \
+                                      explicit `content` argument",
+                            )
+                            .class(XSD_STRING),
+                    )
+                    .input(
                         ArgSpec::new("reply_to")
                             .optional()
                             .summary("an optional Reply-To (e.g. the enquirer's address)")
+                            .class(XSD_STRING),
+                    )
+                    .input(
+                        ArgSpec::new("ics")
+                            .optional()
+                            .summary(
+                                "an iCalendar document (a VCALENDAR, e.g. METHOD:REQUEST) \
+                                      sent as a text/calendar iMIP part, so the message is an \
+                                      add-to-calendar / RSVP invitation",
+                            )
                             .class(XSD_STRING),
                     )
                     .requires(CAP_SEND),
