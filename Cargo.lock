@@ -2556,7 +2556,8 @@ dependencies = [
 [[package]]
 name = "ikigai-meeting"
 version = "0.1.0"
-source = "git+https://github.com/ikigai-rs/ikigai-meeting?rev=1e9675bc4561919713fe3131c4904fa9fce5bd8b#1e9675bc4561919713fe3131c4904fa9fce5bd8b"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "58e345783304f766573b713d2811ca2b32964c11bb41461e77ca3d5a8ce11046"
 dependencies = [
  "async-trait",
  "ikigai-core",
