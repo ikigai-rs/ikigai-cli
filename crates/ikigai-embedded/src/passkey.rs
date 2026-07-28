@@ -71,11 +71,22 @@ fn origin() -> String {
     std::env::var("IKIGAI_PASSKEY_ORIGIN").unwrap_or_else(|_| "https://ikigai-rs.dev".to_string())
 }
 
+/// The workspace root the passkey files live under. In production this is [`file_root`]; the
+/// tests override it per-thread (each test runs on its own thread) so parallel tests never share
+/// a credential file — a global env-var override would race across them.
+fn store_root() -> std::path::PathBuf {
+    #[cfg(test)]
+    if let Some(p) = tests::test_root() {
+        return p;
+    }
+    file_root()
+}
+
 fn credentials_path() -> std::path::PathBuf {
-    file_root().join("passkey-credentials.json")
+    store_root().join("passkey-credentials.json")
 }
 fn enroll_window_path() -> std::path::PathBuf {
-    file_root().join("passkey-enroll.open")
+    store_root().join("passkey-enroll.open")
 }
 
 // =====================================================================================
@@ -427,12 +438,23 @@ mod tests {
     use p256::pkcs8::EncodePublicKey;
     use sha2::{Digest, Sha256};
 
-    // Isolate file_root() per test so credential/window files never collide across tests.
+    thread_local! {
+        static TEST_ROOT: std::cell::RefCell<Option<std::path::PathBuf>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// The current thread's override root, if a test set one. `store_root()` consults this.
+    pub(super) fn test_root() -> Option<std::path::PathBuf> {
+        TEST_ROOT.with(|r| r.borrow().clone())
+    }
+
+    // Give this test its own workspace root — set on THIS thread only, so parallel tests never
+    // collide on the credential/window files (a global env var would race across them).
     fn isolate(name: &str) {
         let dir = std::env::temp_dir().join(format!("ikigai-passkey-ep-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("IKIGAI_FILES", &dir);
+        TEST_ROOT.with(|r| *r.borrow_mut() = Some(dir));
     }
 
     /// A stand-in authenticator: a fixed P-256 key that signs assertions as a device would.
