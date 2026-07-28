@@ -449,12 +449,13 @@ impl Endpoint for CalendarRequest {
                     &format!("{verb_word} this request?"),
                     &format!(
                         "<p>Booking <code>{id}</code>.</p>\
-                         <form method=\"post\">\
+                         <form method=\"post\" id=\"act\">\
                          <input type=hidden name=id value=\"{id}\">\
                          <input type=hidden name=exp value=\"{exp}\">\
                          <input type=hidden name=t value=\"{token}\">\
                          <button style=\"font:inherit;padding:.6rem 1.2rem\">{verb_word}</button>\
-                         </form><p style=\"color:#666\">{note}</p>"
+                         </form><p style=\"color:#666\">{note}</p>{js}",
+                        js = crate::passkey::DECISION_PASSKEY_JS,
                     ),
                 ))
             }
