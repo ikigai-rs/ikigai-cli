@@ -304,6 +304,21 @@ pub async fn serve_with(
     addr: SocketAddr,
     config: EdgeConfig,
 ) -> std::io::Result<()> {
+    let listener = TcpListener::bind(addr).await?;
+    serve_with_listener(kernel, cap_fn, listener, config).await
+}
+
+/// Like [`serve_with`], but drives an already-bound listener. Binding before this call
+/// lets a caller learn the actual `local_addr()` (e.g. an ephemeral `:0` port) and start
+/// accepting from a socket that is already listening — no bind/rebind window, so a client
+/// that connects the instant it has the address lands in the accept backlog rather than
+/// racing the bind.
+pub async fn serve_with_listener(
+    kernel: Arc<Kernel>,
+    cap_fn: CapFn,
+    listener: TcpListener,
+    config: EdgeConfig,
+) -> std::io::Result<()> {
     // The live route handle: the config's own (so the host can hot-swap it), or a fresh
     // wrap of the static routes when no live handle was supplied.
     let routes = config
@@ -317,7 +332,6 @@ pub async fn serve_with(
         routes,
         tombstones: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
-    let listener = TcpListener::bind(addr).await?;
     loop {
         let (sock, peer) = listener.accept().await?;
         let shared = Arc::clone(&shared);
@@ -1493,11 +1507,29 @@ mod tests {
 
     // Drive one request through the socket and return the raw response.
     async fn roundtrip(addr: SocketAddr, raw: &str) -> String {
-        let mut c = TcpStream::connect(addr).await.unwrap();
+        let mut c = connect(addr).await;
         c.write_all(raw.as_bytes()).await.unwrap();
         let mut out = Vec::new();
         c.read_to_end(&mut out).await.unwrap();
         String::from_utf8_lossy(&out).into_owned()
+    }
+
+    // Connect to the (already-listening) test server. The listener is bound before its addr
+    // is handed out, so the first attempt normally lands in the accept backlog; the bounded
+    // retry is belt-and-suspenders against a transient loopback hiccup under CI load, so a
+    // single dropped SYN never fails the whole test.
+    async fn connect(addr: SocketAddr) -> TcpStream {
+        let mut last = None;
+        for _ in 0..50 {
+            match TcpStream::connect(addr).await {
+                Ok(sock) => return sock,
+                Err(e) => {
+                    last = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+        }
+        panic!("could not connect to {addr}: {}", last.unwrap());
     }
 
     async fn start() -> SocketAddr {
@@ -1505,15 +1537,16 @@ mod tests {
     }
 
     async fn start_with(config: EdgeConfig) -> SocketAddr {
+        // Bind the ephemeral port here and hand the live listener to the server. Because the
+        // socket is already listening before we return `addr`, any connect the caller makes
+        // queues in the accept backlog — there is no bind/rebind window and no need to sleep
+        // hoping the server is up. Deterministic in place of the old drop-and-rebind race.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        drop(listener); // free the port for serve() to rebind (racy but fine for a test)
         let kernel = test_kernel();
         tokio::spawn(async move {
-            let _ = serve_with(kernel, public_cap(), addr, config).await;
+            let _ = serve_with_listener(kernel, public_cap(), listener, config).await;
         });
-        // give serve() a moment to bind
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         addr
     }
 
