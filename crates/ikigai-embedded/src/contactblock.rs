@@ -250,14 +250,15 @@ impl Endpoint for ContactBlock {
                 "Block this sender?",
                 &format!(
                     "<p>Future enquiries from <code>{email}</code> will be dropped, silently.</p>\
-                     <form method=\"post\">\
+                     <form method=\"post\" id=\"act\">\
                      <input type=hidden name=email value=\"{email}\">\
                      <input type=hidden name=exp value=\"{exp}\">\
                      <input type=hidden name=t value=\"{token}\">\
                      <button style=\"font:inherit;padding:.6rem 1.2rem\">Block</button>\
                      </form>\
                      <p style=\"color:#666\">They are told nothing; from their side the form still \
-                     accepts. You can undo this on the box.</p>"
+                     accepts. You can undo this on the box.</p>{js}",
+                    js = crate::passkey::DECISION_PASSKEY_JS,
                 ),
             )),
             // ACT: record the intent. The daemon's reactor writes the blocklist when it drains.

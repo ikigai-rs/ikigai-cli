@@ -157,6 +157,77 @@ pub fn is_enrolled() -> bool {
 }
 
 // =====================================================================================
+// Browser glue. The one piece that runs on the device, not the edge.
+// =====================================================================================
+
+/// The ceremony a decision page runs. The page's form must have `id="act"`. On submit it asks
+/// the edge for a challenge; if a passkey is enrolled it runs `navigator.credentials.get`, adds
+/// the assertion to the form as `pk_*` fields, and submits — otherwise it just submits (the gate
+/// is inert). `form.submit()` does not re-fire the submit handler, so there is no re-entrancy.
+pub(crate) const DECISION_PASSKEY_JS: &str = r#"<p id=pkstatus style="color:#666"></p>
+<script>
+(function(){
+  var form=document.getElementById('act'); if(!form) return;
+  var status=document.getElementById('pkstatus');
+  form.addEventListener('submit', function(ev){ ev.preventDefault(); run(); });
+  function run(){
+    status.textContent='';
+    fetch('/passkey/challenge',{headers:{accept:'application/json'}})
+      .then(function(r){return r.json();})
+      .then(function(opt){
+        if(!opt.enrolled){ form.submit(); return; }
+        status.textContent='Confirm with your passkey…';
+        return navigator.credentials.get({publicKey:{
+          challenge:u(opt.challenge), rpId:opt.rpId,
+          allowCredentials:(opt.allowCredentials||[]).map(function(c){return {type:'public-key',id:u(c.id)};}),
+          userVerification:opt.userVerification||'preferred', timeout:60000
+        }}).then(function(a){
+          add('pk_id',b(a.rawId)); add('pk_auth',b(a.response.authenticatorData));
+          add('pk_client',b(a.response.clientDataJSON)); add('pk_sig',b(a.response.signature));
+          form.submit();
+        });
+      })
+      .catch(function(e){ status.textContent='Passkey step failed ('+((e&&e.message)||e)+'). Reopen the link to retry.'; });
+  }
+  function add(n,v){ var i=document.createElement('input'); i.type='hidden'; i.name=n; i.value=v; form.appendChild(i); }
+  function u(s){ s=s.replace(/-/g,'+').replace(/_/g,'/'); while(s.length%4)s+='='; var x=atob(s),y=new Uint8Array(x.length); for(var i=0;i<x.length;i++)y[i]=x.charCodeAt(i); return y.buffer; }
+  function b(buf){ var y=new Uint8Array(buf),s=''; for(var i=0;i<y.length;i++)s+=String.fromCharCode(y[i]); return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''); }
+})();
+</script>"#;
+
+/// The registration page body: a button that runs `navigator.credentials.create`, then POSTs the
+/// new credential id + its SPKI public key to `urn:passkey:register`.
+const REGISTER_PAGE_BODY: &str = r#"<p>Create a passkey for this site — your device will ask you to confirm with Face/Touch ID.</p>
+<button id=reg style="font:inherit;padding:.6rem 1.2rem">Create passkey</button>
+<p id=status style="color:#666"></p>
+<script>
+(function(){
+  var btn=document.getElementById('reg'), status=document.getElementById('status');
+  btn.addEventListener('click', function(){
+    status.textContent='Creating…';
+    fetch('/passkey/challenge').then(function(r){return r.json();}).then(function(opt){
+      return navigator.credentials.create({publicKey:{
+        rp:{id:opt.rpId, name:'ikigai'},
+        user:{id:new TextEncoder().encode('ikigai-owner'), name:'owner', displayName:'ikigai owner'},
+        challenge:u(opt.challenge),
+        pubKeyCredParams:[{type:'public-key',alg:-7}],
+        authenticatorSelection:{userVerification:'preferred',residentKey:'preferred'},
+        timeout:60000, attestation:'none'
+      }});
+    }).then(function(cred){
+      var spki=cred.response.getPublicKey && cred.response.getPublicKey();
+      if(!spki){ throw new Error('this browser did not expose the public key (needs WebAuthn L2)'); }
+      var body='id='+encodeURIComponent(b(cred.rawId))+'&spki='+encodeURIComponent(b(spki));
+      return fetch('/passkey/register',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:body});
+    }).then(function(res){ return res.text(); }).then(function(html){ document.open(); document.write(html); document.close(); })
+      .catch(function(e){ status.textContent='Registration failed: '+((e&&e.message)||e); });
+  });
+  function u(s){ s=s.replace(/-/g,'+').replace(/_/g,'/'); while(s.length%4)s+='='; var x=atob(s),y=new Uint8Array(x.length); for(var i=0;i<x.length;i++)y[i]=x.charCodeAt(i); return y.buffer; }
+  function b(buf){ var y=new Uint8Array(buf),s=''; for(var i=0;i<y.length;i++)s+=String.fromCharCode(y[i]); return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''); }
+})();
+</script>"#;
+
+// =====================================================================================
 // The gate — what a decision POST calls before it acts.
 // =====================================================================================
 
@@ -362,13 +433,7 @@ impl Endpoint for PasskeyRegister {
                          urn:passkey:enroll-open'</code>, then reload.</p>",
                     ));
                 }
-                // The page carries the create-ceremony glue-JS (added in the deploy slice); until
-                // then this is a functional placeholder that names what it will do.
-                Ok(page(
-                    "Register a passkey",
-                    "<p>Your device will ask you to create a passkey for this site.</p>\
-                     <p id=status></p>",
-                ))
+                Ok(page("Register a passkey", REGISTER_PAGE_BODY))
             }
             Verb::Sink => {
                 if !enrollment_open() {
