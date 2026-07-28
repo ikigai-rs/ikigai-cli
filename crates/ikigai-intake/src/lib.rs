@@ -134,6 +134,13 @@ pub struct IntakeConfig {
     /// The URL is a fixed part of the configuration, never a submitted value, so this is not
     /// an open redirect. It is HTML-escaped into the page defensively all the same.
     pub redirect: Option<String>,
+    /// Reject a submission whose `email_field` is on the `urn:decisions` blocklist, at the
+    /// door — before the tuple is ever dropped, so a blocked sender's message never reaches a
+    /// handler on either channel. The rejection is content-identical to the honeypot's
+    /// silent-accept (the sender learns nothing). FAIL-OPEN: an unreachable/denied blocklist
+    /// lets the submission through (a lost enquiry is worse than a leaked spam; the handler is
+    /// the backstop). Requires `email_field` set and `urn:cap:decisions:read` in the ceiling.
+    pub check_blocked: bool,
 }
 
 /// The query argument a link token arrives in (`…/booking/submit?k=TOKEN`).
@@ -452,6 +459,33 @@ impl Endpoint for IntakeEndpoint {
             }
         }
 
+        // Reject a BLOCKED sender at the door, on either channel — a response byte-identical
+        // to the honeypot's silent-accept, so a spammer learns nothing (no bounce, no "you're
+        // blocked"). Checked against the same `urn:decisions` the booking handler consults.
+        // FAIL-OPEN: only a definite "yes" blocks; an unreachable or unauthorised log lets the
+        // submission through, because a lost enquiry is worse than a leaked spam.
+        if config.check_blocked {
+            if let Some(email_field) = &config.email_field {
+                if let Some((_, email)) = carried.iter().find(|(k, _)| k == email_field) {
+                    let blocked = inv
+                        .issue(
+                            Request::new(
+                                Verb::Source,
+                                Iri::parse("urn:decisions").expect("literal"),
+                            )
+                            .with_arg("blocked", ArgRef::Inline(email.as_bytes().to_vec())),
+                        )
+                        .await
+                        .ok()
+                        .and_then(|r| String::from_utf8(r.bytes).ok())
+                        .is_some_and(|s| s.trim() == "yes");
+                    if blocked {
+                        return Ok(accepted(config));
+                    }
+                }
+            }
+        }
+
         // A LINK TOKEN, if one came along, is resolved to WHO the link was given to. The
         // lookup is best-effort by design: an absent, malformed, unknown or revoked token
         // leaves the submission anonymous rather than refusing it, so rotating a link
@@ -564,6 +598,23 @@ mod tests {
         }
     }
 
+    /// A stand-in `urn:decisions` that answers `blocked=<email>` — "yes" for exactly
+    /// `blocked` (case-insensitive, as the real log is), "no" otherwise.
+    struct StubDecisions {
+        blocked: String,
+    }
+    #[async_trait]
+    impl Endpoint for StubDecisions {
+        async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+            let email = inv.inline_str("blocked").unwrap_or_default();
+            let yes = email.eq_ignore_ascii_case(&self.blocked);
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                if yes { b"yes".to_vec() } else { b"no".to_vec() },
+            ))
+        }
+    }
+
     fn config() -> IntakeConfig {
         IntakeConfig {
             id: "contact".to_string(),
@@ -580,6 +631,7 @@ mod tests {
             clients: None,
             attests: Vec::new(),
             redirect: None,
+            check_blocked: false,
         }
     }
 
@@ -621,6 +673,88 @@ mod tests {
         );
         assert!(tuple.contains(r#"(message "Hello there")"#), "{tuple}");
         assert!(tuple.starts_with('(') && tuple.ends_with(')'));
+    }
+
+    /// A kernel whose intake checks a blocklist that blocks exactly `blocked_email`.
+    fn blocking_kernel(blocked_email: &str) -> (Kernel, Arc<Mutex<Vec<String>>>) {
+        let mut cfg = config();
+        cfg.check_blocked = true;
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:contact:submit"), submit(cfg))
+            .bind(
+                Exact::new("urn:space:contact"),
+                RecordingSpace {
+                    dropped: dropped.clone(),
+                },
+            )
+            .bind(
+                Exact::new("urn:decisions"),
+                StubDecisions {
+                    blocked: blocked_email.to_string(),
+                },
+            );
+        (Kernel::new(Arc::new(space)), dropped)
+    }
+
+    fn block_cap() -> Capability {
+        Capability::scoped(["urn:cap:contact:submit", "urn:cap:decisions:read"])
+    }
+
+    #[test]
+    fn a_blocked_sender_is_silently_dropped() {
+        let (k, dropped) = blocking_kernel("Spammer@X.example"); // block set differing in case
+        let rep = block_on(k.issue(
+            post("name=Spammer&email=spammer%40x.example&message=the+price"),
+            &block_cap(),
+        ))
+        .unwrap();
+        // Looks like success (byte-identical to the honeypot / a real accept)...
+        assert_eq!(String::from_utf8(rep.bytes).unwrap(), "received\n");
+        // ...but the message never dropped — it reaches no handler.
+        assert!(
+            dropped.lock().unwrap().is_empty(),
+            "a blocked sender's message must not drop"
+        );
+    }
+
+    #[test]
+    fn an_unblocked_sender_still_drops() {
+        let (k, dropped) = blocking_kernel("spammer@x.example");
+        block_on(k.issue(
+            post("name=Ada&email=ada%40example.com&message=hello"),
+            &block_cap(),
+        ))
+        .unwrap();
+        assert_eq!(
+            dropped.lock().unwrap().len(),
+            1,
+            "a normal sender still lands"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_blocklist_fails_open() {
+        // check_blocked is on, but urn:decisions is UNBOUND (an unreachable log) -> the
+        // submission goes through rather than being lost. A lost enquiry beats a leaked spam.
+        let mut cfg = config();
+        cfg.check_blocked = true;
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:contact:submit"), submit(cfg))
+            .bind(
+                Exact::new("urn:space:contact"),
+                RecordingSpace {
+                    dropped: dropped.clone(),
+                },
+            );
+        let k = Kernel::new(Arc::new(space));
+        block_on(k.issue(post("name=X&email=x%40y.example&message=hi"), &cap())).unwrap();
+        assert_eq!(
+            dropped.lock().unwrap().len(),
+            1,
+            "unreachable blocklist -> fail open"
+        );
     }
 
     /// A kernel whose contact intake redirects on success, plus the tuples it drops.
