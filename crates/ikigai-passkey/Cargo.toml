@@ -1,0 +1,19 @@
+[package]
+name = "ikigai-passkey"
+description = "A minimal single-user WebAuthn (ES256) assertion verifier: check a passkey assertion against one registered credential — origin, RP-ID, challenge, user-presence, monotonic sign-count, and the ECDSA-P256 signature over authenticatorData ‖ SHA256(clientDataJSON). No user database and no attestation trust; the enrollment context is the trust anchor. The second factor on the edge's decision links."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+# Held back from crates.io until the verifier has been exercised against a live device and the
+# challenge/session endpoints that consume it have settled.
+publish = false
+
+[dependencies]
+# ES256 (ECDSA over NIST P-256) is what Apple, Android and Windows platform authenticators
+# emit by default; `pem` pulls SPKI/PKCS8 so a registered public key can arrive as DER.
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
+sha2 = "0.10"
+serde_json = { workspace = true }
