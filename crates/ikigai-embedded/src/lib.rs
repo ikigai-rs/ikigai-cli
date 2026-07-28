@@ -21,6 +21,7 @@ use ikigai_core::{
 use ikigai_scheduler::Scheduler;
 
 pub mod config;
+pub mod contactblock;
 pub mod decide;
 pub mod decisions;
 pub mod jsonl;
@@ -1186,6 +1187,17 @@ fn served_space(nature: &'static str) -> EndpointSpace {
                 key_path: decide::public_key_path(),
             },
         )
+        // The emailed "block this sender" link: /contact-block. Same public shape as the
+        // calendar-request links — the signed token IS the authorisation, GET shows and POST
+        // RECORDS into a space. It reads only the contact-block PUBLIC key from a file and, like
+        // the decision links, holds no `decisions:write`: writing the blocklist is the daemon's
+        // apply reactor, never this internet-facing face (Phase 1's ceiling stays read-only).
+        .bind(
+            Exact::new("urn:contact-block"),
+            contactblock::ContactBlock {
+                key_path: contactblock::public_key_path(),
+            },
+        )
         // Attribution for handed-out links. The edge grants `urn:cap:client:read` and
         // nothing filesystem-shaped, so this can name a client and do nothing else.
         .bind(
@@ -1878,6 +1890,18 @@ fn root_space_with_mounts(
             ikigai_lisp::program("contact", program),
         )) as Arc<dyn Space>);
     }
+    // The block-apply reactor: the public `urn:contact-block` link RECORDS a verified block
+    // into `urn:space:contact-blocks`; the reactive `contact-blocks` space fires this program
+    // on each drop, under that space's own `cap` file (`urn:cap:decisions:write`), and it
+    // writes the block into the edge-local `urn:decisions`. Keeping the write here — off the
+    // internet-facing HTTP ceiling — is the whole point of the airlock. Same "the program IS
+    // the endpoint" shape; the drop reaches it as DATA via `(input)`.
+    if let Ok(program) = std::fs::read_to_string(file_root().join("contactblock-apply.scm")) {
+        spaces.push(Arc::new(ikigai_core::EndpointSpace::new().bind(
+            Exact::new("urn:contactblock:apply"),
+            ikigai_lisp::program("contactblock-apply", program),
+        )) as Arc<dyn Space>);
+    }
     // The human step. `confirm.scm` reads the confirmations space, and on approval writes
     // the calendar and emails the requester. Unlike the two handlers above, NO space fires
     // it — it is invoked by hand (`sink urn:booking:confirm (approve …)`), because deciding
@@ -1916,6 +1940,13 @@ fn root_space_with_mounts(
     spaces.push(Arc::new(
         ikigai_core::EndpointSpace::new()
             .bind(Exact::new("urn:decide:link"), decide::DecideLink)
+            // Minting a block link signs with the edge-local `contact-block.key`, so like the
+            // decision links above it is bound HERE (the daemon) and never in `served_space` —
+            // the internet-facing face gets the verify-only public half, never the signing one.
+            .bind(
+                Exact::new("urn:contactblock:link"),
+                contactblock::ContactBlockLink::default(),
+            )
             .bind(
                 Exact::new("urn:decide:accept"),
                 decide::DecideAccept {
