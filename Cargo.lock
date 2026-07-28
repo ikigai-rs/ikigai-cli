@@ -2464,6 +2464,7 @@ dependencies = [
  "ikigai-llm",
  "ikigai-meeting",
  "ikigai-org",
+ "ikigai-passkey",
  "ikigai-personal",
  "ikigai-rdf",
  "ikigai-repo",
@@ -2485,7 +2486,10 @@ dependencies = [
  "notify",
  "oxrdf",
  "oxrdfio",
+ "p256",
+ "serde",
  "serde_json",
+ "sha2 0.10.9",
  "ureq",
 ]
 

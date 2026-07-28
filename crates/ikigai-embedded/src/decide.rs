@@ -460,6 +460,15 @@ impl Endpoint for CalendarRequest {
             }
             // ACT: record the intent. The Mac does the real work when it next drains.
             Verb::Sink => {
+                // Passkey second factor — inert until a credential is enrolled, then required.
+                // The assertion rides in the POST body (pk_* fields the glue-JS adds).
+                if crate::passkey::require_passkey(inv).is_err() {
+                    return Ok(page(
+                        "Your passkey is needed",
+                        "<p>This decision needs a tap on your registered device. Reopen the \
+                         link and try again.</p>",
+                    ));
+                }
                 let tuple = format!(
                     "((decide {}) (id {}) (exp {}) (token {}))",
                     quoted(&action),

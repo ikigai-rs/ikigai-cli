@@ -25,6 +25,7 @@ pub mod contactblock;
 pub mod decide;
 pub mod decisions;
 pub mod jsonl;
+pub mod passkey;
 pub mod people;
 use ikigai_time::JobRegistry;
 use ikigai_vocab::TurtleRenderer;
@@ -1198,6 +1199,17 @@ fn served_space(nature: &'static str) -> EndpointSpace {
                 key_path: contactblock::public_key_path(),
             },
         )
+        // The passkey second factor's PUBLIC face: `urn:passkey:challenge` mints a login
+        // challenge, `urn:passkey:register` shows the enrolment page and stores a credential
+        // (only while a window opened at the box is live). Both read/verify against the edge's
+        // own credential + challenge stores; neither holds a signing key or `decisions:write`.
+        // The gate itself (`passkey::require_passkey`) is called inside the contact-block and
+        // calendar-request POSTs, and is inert until a credential is enrolled.
+        .bind(
+            Exact::new("urn:passkey:challenge"),
+            passkey::PasskeyChallenge,
+        )
+        .bind(Exact::new("urn:passkey:register"), passkey::PasskeyRegister)
         // Attribution for handed-out links. The edge grants `urn:cap:client:read` and
         // nothing filesystem-shaped, so this can name a client and do nothing else.
         .bind(
@@ -1946,6 +1958,15 @@ fn root_space_with_mounts(
             .bind(
                 Exact::new("urn:contactblock:link"),
                 contactblock::ContactBlockLink::default(),
+            )
+            // Opening a passkey enrollment window is a deliberate act at the box: cap-gated
+            // (`urn:cap:passkey:enroll`) and bound here, off the public face, so only
+            // `ikigai -c` on the machine can start the few-minute window in which a device
+            // may register. The register endpoint itself is public (it needs a browser), but
+            // it accepts a credential only while this window is open.
+            .bind(
+                Exact::new("urn:passkey:enroll-open"),
+                passkey::PasskeyEnrollOpen,
             )
             .bind(
                 Exact::new("urn:decide:accept"),
