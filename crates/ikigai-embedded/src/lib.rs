@@ -1192,6 +1192,17 @@ fn served_space(nature: &'static str) -> EndpointSpace {
             UriTemplate::parse(CLIENT_TEMPLATE).expect("CLIENT_TEMPLATE is valid"),
             ClientRegistry::new(file_root()),
         )
+        // The blocklist, EDGE-LOCAL. The public intake reads it (`blocked=<email>`) to reject a
+        // blocked sender at the door on either channel; recording a block is cap-gated
+        // (`urn:cap:decisions:write` — not in the public ceiling), so a stranger can never add
+        // one. Same `log_path` as the host root, so a manual `sink urn:decisions …` run on the
+        // box (under root) is the same file the served intake reads.
+        .bind(
+            Exact::new("urn:decisions"),
+            decisions::DecisionLog {
+                path: decisions::log_path(),
+            },
+        )
 }
 
 /// A purpose-built kernel for a calendar-federation server (`ikigai serve quic://…
@@ -2422,6 +2433,7 @@ fn contact_intake() -> ikigai_intake::IntakeConfig {
         // The confirmation lives in bosatsu.net's own template (header, footer, fonts), so
         // there is no interstitial CSS here to keep in sync with the site.
         redirect: Some("https://www.bosatsu.net/thanks.html".to_string()),
+        check_blocked: true,
     }
 }
 
@@ -2476,6 +2488,9 @@ fn booking_intake() -> ikigai_intake::IntakeConfig {
         // A booking is scheduled asynchronously; the plain `received` acknowledgement is right
         // (there is no slot to show yet). Left un-redirected deliberately.
         redirect: None,
+        // Reject a blocked scheduler at the edge, before the request drains to bug (bug's
+        // booking-handler `blocked?` stays as backstop).
+        check_blocked: true,
     }
 }
 
