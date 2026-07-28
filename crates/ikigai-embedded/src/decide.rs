@@ -73,7 +73,7 @@ fn decide_base() -> String {
         .unwrap_or_else(|_| "https://ikigai-rs.dev/calendar-request".to_string())
 }
 
-fn b64() -> base64::engine::general_purpose::GeneralPurpose {
+pub(crate) fn b64() -> base64::engine::general_purpose::GeneralPurpose {
     base64::engine::general_purpose::URL_SAFE_NO_PAD
 }
 
@@ -132,12 +132,12 @@ fn token_valid(
     .is_ok()
 }
 
-fn now_secs() -> i64 {
+pub(crate) fn now_secs() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
 /// Read the verifying key from `path`.
-fn verifying_key_at(path: &std::path::Path) -> Result<VerifyingKey> {
+pub(crate) fn verifying_key_at(path: &std::path::Path) -> Result<VerifyingKey> {
     let bytes = std::fs::read(path).map_err(|e| {
         Error::Endpoint(format!(
             "cannot read the decide public key at {}: {e}",
@@ -156,7 +156,7 @@ fn parse_verifying_key(bytes: &[u8]) -> std::result::Result<VerifyingKey, String
     VerifyingKey::from_public_key_der(bytes).map_err(|e| format!("not an SPKI Ed25519 key: {e}"))
 }
 
-fn parse_signing_key(bytes: &[u8]) -> std::result::Result<SigningKey, String> {
+pub(crate) fn parse_signing_key(bytes: &[u8]) -> std::result::Result<SigningKey, String> {
     if let Ok(pem) = std::str::from_utf8(bytes) {
         if let Ok(key) = SigningKey::from_pkcs8_pem(pem.trim()) {
             return Ok(key);
@@ -166,7 +166,7 @@ fn parse_signing_key(bytes: &[u8]) -> std::result::Result<SigningKey, String> {
 }
 
 /// Percent-encode a query VALUE (RFC 3986 unreserved kept).
-fn urlencode(value: &str) -> String {
+pub(crate) fn urlencode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for b in value.bytes() {
         match b {
@@ -225,7 +225,7 @@ fn percent_decode(input: &str) -> String {
 /// A browser submitting `<form method=post>` puts its fields in the BODY, which the HTTP
 /// face hands over as the piped `content`; a GET puts them in the query, which arrives as
 /// named args. The same resource answers both, so it looks in both places.
-fn param(inv: &Invocation<'_>, name: &str) -> String {
+pub(crate) fn param(inv: &Invocation<'_>, name: &str) -> String {
     if let Ok(v) = inv.inline_str(name) {
         let v = v.trim();
         if !v.is_empty() {
@@ -263,7 +263,7 @@ pub fn field(tuple: &str, name: &str) -> Option<String> {
 }
 
 /// Escape a value into a tuple literal.
-fn quoted(value: &str) -> String {
+pub(crate) fn quoted(value: &str) -> String {
     let mut out = String::from("\"");
     for c in value.chars() {
         match c {
@@ -379,7 +379,7 @@ pub struct CalendarRequest {
 
 /// A small self-contained page. No stylesheet to fetch — this renders on a phone, once,
 /// probably on cellular, and it should not depend on anything else being up.
-fn page(title: &str, body: &str) -> Representation {
+pub(crate) fn page(title: &str, body: &str) -> Representation {
     Representation::new(
         ReprType::new("text/html").with_param("charset", "utf-8"),
         format!(
