@@ -158,74 +158,111 @@ pub fn is_enrolled() -> bool {
 
 // =====================================================================================
 // Browser glue. The one piece that runs on the device, not the edge.
+//
+// Served as a SAME-ORIGIN FILE, not inline: the edge's strict CSP is `default-src 'self'`,
+// which forbids inline `<script>` but allows a script fetched from the same origin. So the
+// pages carry only a `<script src="/passkey/app.js">` tag and the ceremony lives in
+// `PASSKEY_APP_JS`, served by `urn:passkey:js` with a JavaScript content type (X-Content-Type-
+// Options: nosniff is set, so the MIME must be right). No CSP loosening anywhere.
 // =====================================================================================
 
-/// The ceremony a decision page runs. The page's form must have `id="act"`. On submit it asks
-/// the edge for a challenge; if a passkey is enrolled it runs `navigator.credentials.get`, adds
-/// the assertion to the form as `pk_*` fields, and submits — otherwise it just submits (the gate
-/// is inert). `form.submit()` does not re-fire the submit handler, so there is no re-entrancy.
-pub(crate) const DECISION_PASSKEY_JS: &str = r#"<p id=pkstatus style="color:#666"></p>
-<script>
-(function(){
-  var form=document.getElementById('act'); if(!form) return;
-  var status=document.getElementById('pkstatus');
-  form.addEventListener('submit', function(ev){ ev.preventDefault(); run(); });
-  function run(){
-    status.textContent='';
-    fetch('/passkey/challenge',{headers:{accept:'application/json'}})
-      .then(function(r){return r.json();})
-      .then(function(opt){
-        if(!opt.enrolled){ form.submit(); return; }
-        status.textContent='Confirm with your passkey…';
-        return navigator.credentials.get({publicKey:{
-          challenge:u(opt.challenge), rpId:opt.rpId,
-          allowCredentials:(opt.allowCredentials||[]).map(function(c){return {type:'public-key',id:u(c.id)};}),
-          userVerification:opt.userVerification||'preferred', timeout:60000
-        }}).then(function(a){
-          add('pk_id',b(a.rawId)); add('pk_auth',b(a.response.authenticatorData));
-          add('pk_client',b(a.response.clientDataJSON)); add('pk_sig',b(a.response.signature));
-          form.submit();
-        });
-      })
-      .catch(function(e){ status.textContent='Passkey step failed ('+((e&&e.message)||e)+'). Reopen the link to retry.'; });
-  }
-  function add(n,v){ var i=document.createElement('input'); i.type='hidden'; i.name=n; i.value=v; form.appendChild(i); }
-  function u(s){ s=s.replace(/-/g,'+').replace(/_/g,'/'); while(s.length%4)s+='='; var x=atob(s),y=new Uint8Array(x.length); for(var i=0;i<x.length;i++)y[i]=x.charCodeAt(i); return y.buffer; }
-  function b(buf){ var y=new Uint8Array(buf),s=''; for(var i=0;i<y.length;i++)s+=String.fromCharCode(y[i]); return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''); }
-})();
-</script>"#;
+/// What a decision page carries: a status line and the shared ceremony script. The page's form
+/// must have `id="act"`; `PASSKEY_APP_JS` wires it — on submit, fetch a challenge, run
+/// `navigator.credentials.get` if enrolled, attach the assertion as `pk_*` fields, submit.
+pub(crate) const DECISION_PASSKEY_JS: &str =
+    "<p id=pkstatus style=\"color:#666\"></p><script src=\"/passkey/app.js\"></script>";
 
-/// The registration page body: a button that runs `navigator.credentials.create`, then POSTs the
-/// new credential id + its SPKI public key to `urn:passkey:register`.
+/// The registration page body: a button (wired by `PASSKEY_APP_JS` via `id="reg"`) that runs
+/// `navigator.credentials.create`, then POSTs the new credential id + its SPKI public key.
 const REGISTER_PAGE_BODY: &str = r#"<p>Create a passkey for this site — your device will ask you to confirm with Face/Touch ID.</p>
 <button id=reg style="font:inherit;padding:.6rem 1.2rem">Create passkey</button>
 <p id=status style="color:#666"></p>
-<script>
-(function(){
-  var btn=document.getElementById('reg'), status=document.getElementById('status');
-  btn.addEventListener('click', function(){
-    status.textContent='Creating…';
-    fetch('/passkey/challenge').then(function(r){return r.json();}).then(function(opt){
-      return navigator.credentials.create({publicKey:{
-        rp:{id:opt.rpId, name:'ikigai'},
-        user:{id:new TextEncoder().encode('ikigai-owner'), name:'owner', displayName:'ikigai owner'},
-        challenge:u(opt.challenge),
-        pubKeyCredParams:[{type:'public-key',alg:-7}],
-        authenticatorSelection:{userVerification:'preferred',residentKey:'preferred'},
-        timeout:60000, attestation:'none'
-      }});
-    }).then(function(cred){
-      var spki=cred.response.getPublicKey && cred.response.getPublicKey();
-      if(!spki){ throw new Error('this browser did not expose the public key (needs WebAuthn L2)'); }
-      var body='id='+encodeURIComponent(b(cred.rawId))+'&spki='+encodeURIComponent(b(spki));
-      return fetch('/passkey/register',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:body});
-    }).then(function(res){ return res.text(); }).then(function(html){ document.open(); document.write(html); document.close(); })
-      .catch(function(e){ status.textContent='Registration failed: '+((e&&e.message)||e); });
-  });
+<script src="/passkey/app.js"></script>"#;
+
+/// The one ceremony script, served same-origin (see the section note on CSP). It wires whichever
+/// page it lands on: a decision form (`#act` → `navigator.credentials.get`) or the register
+/// button (`#reg` → `navigator.credentials.create`). `form.submit()` does not re-fire the submit
+/// handler, so the decision path has no re-entrancy.
+const PASSKEY_APP_JS: &str = r#"(function(){
+  var form=document.getElementById('act');
+  var reg=document.getElementById('reg');
+  if(form) decision(form);
+  if(reg) register(reg);
+
+  function decision(form){
+    var status=document.getElementById('pkstatus');
+    form.addEventListener('submit', function(ev){ ev.preventDefault();
+      status.textContent='';
+      fetch('/passkey/challenge',{headers:{accept:'application/json'}})
+        .then(function(r){return r.json();})
+        .then(function(opt){
+          if(!opt.enrolled){ form.submit(); return; }
+          status.textContent='Confirm with your passkey…';
+          return navigator.credentials.get({publicKey:{
+            challenge:u(opt.challenge), rpId:opt.rpId,
+            allowCredentials:(opt.allowCredentials||[]).map(function(c){return {type:'public-key',id:u(c.id)};}),
+            userVerification:opt.userVerification||'preferred', timeout:60000
+          }}).then(function(a){
+            add(form,'pk_id',b(a.rawId)); add(form,'pk_auth',b(a.response.authenticatorData));
+            add(form,'pk_client',b(a.response.clientDataJSON)); add(form,'pk_sig',b(a.response.signature));
+            form.submit();
+          });
+        })
+        .catch(function(e){ status.textContent='Passkey step failed ('+((e&&e.message)||e)+'). Reopen the link to retry.'; });
+    });
+  }
+
+  function register(btn){
+    var status=document.getElementById('status');
+    btn.addEventListener('click', function(){
+      status.textContent='Creating…';
+      fetch('/passkey/challenge').then(function(r){return r.json();}).then(function(opt){
+        return navigator.credentials.create({publicKey:{
+          rp:{id:opt.rpId, name:'ikigai'},
+          user:{id:new TextEncoder().encode('ikigai-owner'), name:'owner', displayName:'ikigai owner'},
+          challenge:u(opt.challenge),
+          pubKeyCredParams:[{type:'public-key',alg:-7}],
+          authenticatorSelection:{userVerification:'preferred',residentKey:'preferred'},
+          timeout:60000, attestation:'none'
+        }});
+      }).then(function(cred){
+        var spki=cred.response.getPublicKey && cred.response.getPublicKey();
+        if(!spki){ throw new Error('this browser did not expose the public key (needs WebAuthn L2)'); }
+        var body='id='+encodeURIComponent(b(cred.rawId))+'&spki='+encodeURIComponent(b(spki));
+        return fetch('/passkey/register',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:body});
+      }).then(function(res){ return res.text(); }).then(function(html){ document.open(); document.write(html); document.close(); })
+        .catch(function(e){ status.textContent='Registration failed: '+((e&&e.message)||e); });
+    });
+  }
+
+  function add(f,n,v){ var i=document.createElement('input'); i.type='hidden'; i.name=n; i.value=v; f.appendChild(i); }
   function u(s){ s=s.replace(/-/g,'+').replace(/_/g,'/'); while(s.length%4)s+='='; var x=atob(s),y=new Uint8Array(x.length); for(var i=0;i<x.length;i++)y[i]=x.charCodeAt(i); return y.buffer; }
   function b(buf){ var y=new Uint8Array(buf),s=''; for(var i=0;i<y.length;i++)s+=String.fromCharCode(y[i]); return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''); }
 })();
-</script>"#;
+"#;
+
+/// Serves [`PASSKEY_APP_JS`] as a same-origin JavaScript file so the strict edge CSP admits it.
+pub struct PasskeyJs;
+
+#[async_trait::async_trait]
+impl Endpoint for PasskeyJs {
+    async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
+        Ok(Representation::new(
+            ReprType::new("application/javascript").with_param("charset", "utf-8"),
+            PASSKEY_APP_JS.as_bytes().to_vec(),
+        ))
+    }
+    fn name(&self) -> &str {
+        "passkey-js"
+    }
+    fn describe(&self) -> Description {
+        Description::new("passkey-js")
+            .title("The passkey ceremony script")
+            .summary("The same-origin script the decision and register pages load to run the WebAuthn ceremony.")
+            .action(ActionSpec::new(Verb::Source).summary("the script"))
+            .output("application/javascript; charset=utf-8")
+    }
+}
 
 // =====================================================================================
 // The gate — what a decision POST calls before it acts.

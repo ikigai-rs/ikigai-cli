@@ -1210,6 +1210,10 @@ fn served_space(nature: &'static str) -> EndpointSpace {
             passkey::PasskeyChallenge,
         )
         .bind(Exact::new("urn:passkey:register"), passkey::PasskeyRegister)
+        // The ceremony script, served same-origin so the strict edge CSP (`default-src 'self'`,
+        // which forbids inline scripts) admits it — the decision + register pages carry only a
+        // `<script src="/passkey/app.js">` tag.
+        .bind(Exact::new("urn:passkey:js"), passkey::PasskeyJs)
         // Attribution for handed-out links. The edge grants `urn:cap:client:read` and
         // nothing filesystem-shaped, so this can name a client and do nothing else.
         .bind(
