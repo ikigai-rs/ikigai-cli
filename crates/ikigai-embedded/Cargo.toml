@@ -38,6 +38,9 @@ ikigai-tz = { workspace = true }
 ikigai-intray = { workspace = true }
 ikigai-email = { workspace = true }
 ikigai-intake = { workspace = true }
+ikigai-passkey = { workspace = true }
+# serde derive for the small passkey-credentials.json store.
+serde = { workspace = true }
 ikigai-secret = { workspace = true }
 ikigai-xslt = { workspace = true }
 ikigai-jsonld = { workspace = true }
@@ -80,3 +83,6 @@ async-trait = "0.1"
 
 [dev-dependencies]
 futures = { workspace = true }
+# The passkey endpoint tests play the authenticator: a fixed P-256 key signs assertions.
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
+sha2 = "0.10"
