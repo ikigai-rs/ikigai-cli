@@ -1447,11 +1447,12 @@ fn llm_annotation_facts() -> Vec<(String, String, String)> {
 
 /// The `urn:fn:compose` shape behind the Jury runbook tab: one question, two
 /// `urn:llm:ask` markers — built against what's ACTUALLY installed. Sources
-/// `urn:llm:ollama:installed` and forks to the first two distinct models (two
-/// personas of one model when only one is pulled), so the demo is portable: no
-/// hardcoded model name. If the list can't be read the markers carry no
-/// `model=` and the backend's own default-resolution (and the gated
-/// conditional's offline note) take over.
+/// `urn:llm:ollama:installed` with `supports=completion` (an embedder is often
+/// the smallest model installed, and a juror must be able to chat) and forks to
+/// the first two distinct models (two personas of one model when only one is
+/// pulled), so the demo is portable: no hardcoded model name. If the list can't
+/// be read the markers carry no `model=` and the backend's own
+/// default-resolution (and the gated conditional's offline note) take over.
 struct JuryShape;
 
 /// Total physical memory, best-effort — the machine attribute the jury's
@@ -1556,6 +1557,10 @@ impl Endpoint for JuryShape {
                 .with_arg(
                     "as",
                     ikigai_core::ArgRef::Inline(b"application/json".to_vec()),
+                )
+                .with_arg(
+                    "supports",
+                    ikigai_core::ArgRef::Inline(b"completion".to_vec()),
                 ),
             )
             .await
