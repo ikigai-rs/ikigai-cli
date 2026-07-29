@@ -1286,7 +1286,13 @@ impl ikigai_http::HttpTransport for UreqTransport {
         request: ikigai_http::HttpRequest,
     ) -> std::result::Result<ikigai_http::HttpResponse, String> {
         use std::io::Read;
-        let mut req = ureq::request(request.method.as_str(), &request.url);
+        // The HttpTransport contract (ikigai-http ≥ 0.1.7) forbids following
+        // redirects here: the ENDPOINT follows them, re-running the net-capability
+        // ACL against every hop — an auto-following agent would let a granted
+        // host 302 the request to an ungranted one. `redirects(0)` returns the
+        // 3xx as-is.
+        let agent = ureq::builder().redirects(0).build();
+        let mut req = agent.request(request.method.as_str(), &request.url);
         for (name, value) in &request.headers {
             req = req.set(name, value);
         }
