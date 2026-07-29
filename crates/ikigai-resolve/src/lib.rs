@@ -391,6 +391,25 @@ impl Resolver for Kernel {
     }
 }
 
+/// Resolve `request` on `kernel` recording the resolution's spans into `tracer`,
+/// with the same cache-status probe as [`Resolver::issue_as`]. This is the
+/// **per-call** traced path a wire server dispatches [`Call::IssueTraced`] on:
+/// each connection's trace records into its own collector
+/// ([`Kernel::issue_traced`]), so concurrent traced calls on the shared kernel
+/// can no longer interleave into one process-global tracer (the cross-tenant
+/// trace leak from the 2026-07-21 review).
+pub fn issue_traced_as(
+    kernel: &Kernel,
+    request: Request,
+    capability: &Capability,
+    tracer: Arc<dyn Tracer>,
+) -> Result<(Representation, CacheStatus), Error> {
+    let was_cached = Kernel::is_cached(kernel, &request, capability);
+    let representation = block_on(Kernel::issue_traced(kernel, request, capability, tracer))?;
+    let status = cache_status(was_cached, &representation);
+    Ok((representation, status))
+}
+
 /// The cache-status label for a resolved representation. Only `Always` is truly
 /// uncacheable; `Never` and a time-based `At` deadline are both cacheable (so an
 /// `At` read reports Hit/Miss, not Uncacheable).

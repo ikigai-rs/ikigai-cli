@@ -17,8 +17,10 @@ use serde::{Deserialize, Serialize};
 /// Bumped when the on-wire shape changes incompatibly. Not negotiated yet
 /// (client and server ship together) — it's here to fail loudly when that
 /// changes. v2 adds [`Call::IssueAs`] (capability-on-the-wire); v3 adds
-/// [`Call::IssueTraced`] / [`Reply::ResolvedTraced`] (trace-over-the-wire).
-pub const PROTOCOL_VERSION: u32 = 4;
+/// [`Call::IssueTraced`] / [`Reply::ResolvedTraced`] (trace-over-the-wire);
+/// v5 changes `TraceEvent`'s postcard layout (core 0.1.48 adds `notes` —
+/// endpoint span annotations).
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// The largest framed message accepted. Guards [`read_message`] against a bogus
 /// length header demanding a huge allocation; 64 MiB is far above any
@@ -147,6 +149,7 @@ mod tests {
                     span: 0,
                     parent: None,
                     capability: Some(vec!["urn:cap:demo".to_string()]),
+                    notes: vec![("model".to_string(), "llama3.2:3b".to_string())],
                 }],
             ),
         ];

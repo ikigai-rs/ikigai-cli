@@ -196,23 +196,23 @@ fn dispatch(kernel: &Kernel, call: Call, session: &Session) -> Reply {
         // never the full catalog. Affordance = authorization: a scoped principal must
         // not even enumerate what it may not invoke (the leak this closes).
         Call::Entries => Reply::Entries(Some(scoped_entries(kernel, &session.capability))),
-        // Trace-over-the-wire: install a collector, resolve under the clamped
-        // authority, ship the recorded spans back. `_ctx.parent_span` is for a
-        // future mount-stitch. The kernel tracer is process-global, so concurrent
-        // traced calls would interleave — acceptable for the one-shot `trace`.
+        // Trace-over-the-wire: resolve under the clamped authority with a
+        // PER-CALL collector (`issue_traced_as`), ship the recorded spans back.
+        // Each tenant's trace records into its own scope — concurrent traced
+        // calls can no longer interleave through the process-global tracer, which
+        // closes the cross-tenant trace leak (a tracing tenant observing another
+        // tenant's IRIs and cap scopes). `_ctx.parent_span` is for a future
+        // mount-stitch.
         Call::IssueTraced(mut request, carried, _ctx) => {
             localize(&mut request, &session.file_segment);
             let capability = session.capability.clamp(&carried);
             let collector = Arc::new(SpanCollector::default());
-            Kernel::set_tracer(kernel, collector.clone());
-            let reply = match Resolver::issue_as(kernel, request, &capability) {
+            match ikigai_resolve::issue_traced_as(kernel, request, &capability, collector.clone()) {
                 Ok((representation, status)) => {
                     Reply::ResolvedTraced(representation, status, collector.take())
                 }
                 Err(error) => Reply::Error(error.to_string()),
-            };
-            Kernel::clear_tracer(kernel);
-            reply
+            }
         }
     }
 }

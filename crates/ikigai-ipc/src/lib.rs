@@ -245,22 +245,20 @@ fn dispatch(kernel: &Kernel, call: Call) -> Reply {
         // whole capability-scoped manifold — but it goes through the same cap filter
         // as QUIC, not the raw catalog, so the two transports agree.
         Call::Entries => Reply::Entries(Some(scoped_entries(kernel, &Capability::root()))),
-        // Trace-over-the-wire: install a collector, resolve, ship the recorded spans
-        // back. `_ctx.parent_span` is for a future mount-stitch (re-parenting the
-        // subtree); a whole-session `--connect` trace ignores it. The kernel's tracer
-        // is process-global, so concurrent traced calls would interleave — fine for
-        // the one-shot interactive `trace`.
+        // Trace-over-the-wire: resolve with a PER-CALL collector
+        // (`issue_traced_as`), ship the recorded spans back. Each connection's
+        // trace records into its own scope, so concurrent traced calls no longer
+        // interleave through the process-global tracer. `_ctx.parent_span` is for
+        // a future mount-stitch (re-parenting the subtree); a whole-session
+        // `--connect` trace ignores it.
         Call::IssueTraced(request, capability, _ctx) => {
             let collector = Arc::new(SpanCollector::default());
-            Kernel::set_tracer(kernel, collector.clone());
-            let reply = match Resolver::issue_as(kernel, request, &capability) {
+            match ikigai_resolve::issue_traced_as(kernel, request, &capability, collector.clone()) {
                 Ok((representation, status)) => {
                     Reply::ResolvedTraced(representation, status, collector.take())
                 }
                 Err(error) => Reply::Error(error.to_string()),
-            };
-            Kernel::clear_tracer(kernel);
-            reply
+            }
         }
     }
 }

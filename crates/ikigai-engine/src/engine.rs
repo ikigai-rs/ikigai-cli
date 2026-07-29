@@ -1741,8 +1741,20 @@ fn render_trace_event(
         _ if scoped => " · cap ✓".to_string(),
         _ => String::new(),
     };
+    // Facts the endpoint attached to its own span (`Invocation::trace_note`) —
+    // e.g. the LLM facade's resolved model, or the HTTP client's redirect hops.
+    let notes = if event.notes.is_empty() {
+        String::new()
+    } else {
+        let rendered: Vec<String> = event
+            .notes
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+        format!(" · {}", rendered.join(" "))
+    };
     let mut line = format!(
-        "{prefix}{branch}{label}   {endpoint} · {cache} · {} · {dur}{cap_note}",
+        "{prefix}{branch}{label}   {endpoint} · {cache} · {} · {dur}{cap_note}{notes}",
         event.thread,
     );
     if let Some(repr) = root_repr {
@@ -2302,6 +2314,7 @@ mod tests {
                 span,
                 parent,
                 capability: cap,
+                notes: Vec::new(),
             };
         let events = vec![
             ev("urn:local:mount", 0, None, None),
@@ -2341,6 +2354,7 @@ mod tests {
                 span,
                 parent,
                 capability: None,
+                notes: Vec::new(),
             };
         let events = vec![
             ev("urn:fn:toUpper", "ikigai-sched-0", 4, Some(3), true), // grandchild, out of order
