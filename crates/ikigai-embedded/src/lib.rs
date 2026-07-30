@@ -10,7 +10,7 @@
 //! only its own endpoints: the demo `page` shape and `urn:host:info`.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use ikigai_core::{
@@ -1278,34 +1278,29 @@ pub fn calendar_server_kernel() -> Kernel {
 /// governor, composed IN FRONT of a base surface (`Fallback` — first hit wins, so
 /// the governed binding shadows any ungoverned one beneath). The governor bounds
 /// how long a shipped program may hold the CALLER (typed transient `Timeout` at
-/// the budget; `IKIGAI_EVAL_TIMEOUT_SECS`, default 10); the worker ceiling in
+/// the budget; `--eval-timeout <secs>`, default 10); the worker ceiling in
 /// ikigai-lisp bounds how many runaway workers can ever exist; the kernel's
 /// declared-`requires` floor enforces `urn:cap:lisp`; and on QUIC the
 /// connection's minted ceiling must GRANT that cap for eval to be visible or
 /// invocable at all. Together: cert-gated, cap-clamped, thread-bounded,
 /// time-boxed remote evaluation — the transport for portable code.
 fn with_wire_eval(base: Arc<dyn ikigai_core::Space>) -> Arc<dyn ikigai_core::Space> {
-    let budget = std::env::var("IKIGAI_EVAL_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(|secs| secs.max(1))
-        .unwrap_or(10);
+    let budget = EVAL_TIMEOUT_SECS.load(Ordering::Relaxed).max(1);
     let mut governed_space =
         EndpointSpace::new().bind(Exact::new("urn:lisp:eval"), ikigai_lisp::eval());
     let mut spaces: Vec<Arc<dyn ikigai_core::Space>> = Vec::new();
 
-    // The signed-program door (wire-eval L1.5): configured by IKIGAI_CODE_SIGNERS
-    // — comma-separated public-key resource IRIs (conventionally
-    // `urn:codekey:<file>`, served from the code-signers directory below). Absent
-    // ⇒ `urn:lisp:run` is NOT bound: the feature is absent, never defaulted to an
-    // empty-but-present trust set. The signature gates what may run; the
-    // connection's clamped capability still gates what it touches; the same
-    // Timeout governor fronts it.
+    // The signed-program door (wire-eval L1.5): configured by `--code-signer`
+    // (repeatable) — public-key resource IRIs, conventionally `urn:codekey:<file>`
+    // served from the code-signers directory below. None declared ⇒ `urn:lisp:run`
+    // is NOT bound: the feature is absent, never defaulted to an empty-but-present
+    // trust set. The signature gates what may run; the connection's clamped
+    // capability still gates what it touches; the same Timeout governor fronts it.
     if let Some(signers) = code_signers() {
         governed_space =
             governed_space.bind(Exact::new("urn:lisp:run"), ikigai_lisp::run_signed(signers));
         // The signer public keys as resources: `urn:codekey:{file}` from the
-        // code-signers directory (IKIGAI_CODE_SIGNERS_DIR, default
+        // code-signers directory (`--code-signers-dir`, default
         // `~/.config/ikigai/code-signers`) — via a dedicated OPEN endpoint, not
         // the fs module: public keys are public (that's the point of them), and
         // an fs-capped binding would demand an fs grant from a signed-only
@@ -1335,17 +1330,12 @@ fn with_wire_eval(base: Arc<dyn ikigai_core::Space>) -> Arc<dyn ikigai_core::Spa
     Arc::new(ikigai_core::Fallback::new(spaces))
 }
 
-/// The code-signing trust set: `IKIGAI_CODE_SIGNERS` as a comma-separated list
-/// of public-key resource IRIs. `None` when unset or empty — the signed-run door
-/// simply doesn't exist (a feature is absent, never silently defaulted).
+/// The code-signing trust set: public-key resource IRIs the host accepts
+/// signatures from, set by the CLI's `--code-signer` flag (repeatable) via
+/// [`set_code_signers`]. Empty ⇒ `None` ⇒ the signed-run door simply doesn't
+/// exist (a feature is absent, never silently defaulted).
 fn code_signers() -> Option<Vec<String>> {
-    let raw = std::env::var("IKIGAI_CODE_SIGNERS").ok()?;
-    let signers: Vec<String> = raw
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
+    let signers = CODE_SIGNERS.lock().expect("code signers lock").clone();
     if signers.is_empty() {
         None
     } else {
@@ -1353,17 +1343,55 @@ fn code_signers() -> Option<Vec<String>> {
     }
 }
 
+/// The trust set + its key directory, as configured by the host process before
+/// it builds a kernel. Process-global like the demo flag and the instance name:
+/// the CLI sets it while parsing `serve`'s flags, and the kernel builders read
+/// it. (Configuration arrives as flags — not environment variables.)
+static CODE_SIGNERS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// Wall-clock ceiling for a served eval, in seconds (`--eval-timeout`).
+static EVAL_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(10);
+static CODE_SIGNERS_DIR: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+/// Declare the code-signing trust set: the public-key resource IRIs whose
+/// signatures this host will run programs for (`--code-signer`, repeatable).
+/// Call before building a served kernel; with none set, `urn:lisp:run` is not
+/// bound at all.
+pub fn set_code_signers(signers: Vec<String>) {
+    *CODE_SIGNERS.lock().expect("code signers lock") = signers;
+}
+
+/// Whether a code-signing trust set was declared (`--code-signer`) — what the
+/// serve banner reports as the `signed-run` surface.
+pub fn code_signers_configured() -> bool {
+    code_signers().is_some()
+}
+
+/// Point `urn:codekey:{file}` at a directory other than the default
+/// `~/.config/ikigai/code-signers` (`--code-signers-dir`).
+pub fn set_code_signers_dir(dir: std::path::PathBuf) {
+    *CODE_SIGNERS_DIR.lock().expect("code signers dir lock") = Some(dir);
+}
+
+/// Set the wall-clock ceiling a served eval may run for (`--eval-timeout`,
+/// seconds; minimum 1). Default 10.
+pub fn set_eval_timeout_secs(secs: u64) {
+    EVAL_TIMEOUT_SECS.store(secs.max(1), Ordering::Relaxed);
+}
+
 /// Where the code-signing public keys live (`urn:codekey:{file}` resolves here):
-/// `IKIGAI_CODE_SIGNERS_DIR`, default `~/.config/ikigai/code-signers`.
+/// `--code-signers-dir` if given, else `~/.config/ikigai/code-signers`.
 fn code_signers_dir() -> std::path::PathBuf {
-    std::env::var("IKIGAI_CODE_SIGNERS_DIR")
+    if let Some(dir) = CODE_SIGNERS_DIR
+        .lock()
+        .expect("code signers dir lock")
+        .clone()
+    {
+        return dir;
+    }
+    std::env::var("HOME")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_default()
-                .join(".config/ikigai/code-signers")
-        })
+        .unwrap_or_default()
+        .join(".config/ikigai/code-signers")
 }
 
 /// `urn:codekey:{file}` — a code-signing PUBLIC key, served openly from the
@@ -1405,7 +1433,7 @@ impl Endpoint for CodeKey {
             .title("Code-signing public key")
             .summary(
                 "A code-signing PUBLIC key from the operator's signers directory \
-                 (IKIGAI_CODE_SIGNERS_DIR). Open — a public key exists to be read; placing a \
+                 (`--code-signers-dir`). Open — a public key exists to be read; placing a \
                  file in the directory is the act of publication. One plain file name, no \
                  traversal.",
             )
