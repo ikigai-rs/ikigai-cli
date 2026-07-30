@@ -65,7 +65,7 @@ ikigai-cms = "0.1.1" # 0.1.1 = stitch wrapped bookmark titles (no dropped entrie
 ikigai-repo = "0.1.2" # 0.1.2 = typed Error::Denied for capability denials
 # Steel-backed Lisp evaluator (urn:lisp:eval): code is a resource, builtins ARE the
 # cap-scoped kernel verbs. Embedded-only (arbitrary code); gated by urn:cap:lisp.
-ikigai-lisp = "0.1.8" # 0.1.8 = worker ceiling + async bridge (governed wire-eval); 0.1.6 (input)/program()
+ikigai-lisp = "0.1.9" # 0.1.9 = urn:lisp:run signed envelopes; 0.1.8 ceiling/async-bridge
 ikigai-throttle = "0.1.6" # Timeout overlay = the wire-eval L1 compute governor
 # LLM inference (urn:llm:ask + urn:llm:<provider>:ask + urn:llm:config): a facade grammar
 # over pluggable backends. OpenAI-compatible REST backend (Ollama/vLLM/llama.cpp/mlx_lm).
