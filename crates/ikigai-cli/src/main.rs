@@ -969,15 +969,24 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String]) -> ! {
         // still gates it (a freebusy ceiling → freebusy), but the manifold is also
         // minimal, so nothing but the calendar is even nameable over the wire.
         let personal = caps.iter().any(|c| c.starts_with("urn:cap:personal:"));
-        let kernel = if personal {
-            ikigai_embedded::calendar_server_kernel()
-        } else {
-            ikigai_embedded::kernel_for("Remote (QUIC)")
+        // Wire-eval L1: granting `urn:cap:lisp` in the ceiling is the operator's
+        // deliberate opt-in — the served kernel then fronts a Timeout-governed
+        // `urn:lisp:eval`, so an enrolled peer can ship s-exprs that compose with
+        // this machine's resources, cap-clamped, thread-bounded, and time-boxed.
+        // Without the grant the eval is neither bound nor (per the kernel's
+        // declared-requires floor) invocable.
+        let wire_eval = caps.iter().any(|c| c == "urn:cap:lisp");
+        let kernel = match (personal, wire_eval) {
+            (true, true) => ikigai_embedded::calendar_server_kernel_with_eval(),
+            (true, false) => ikigai_embedded::calendar_server_kernel(),
+            (false, true) => ikigai_embedded::kernel_for_with_eval("Remote (QUIC)"),
+            (false, false) => ikigai_embedded::kernel_for("Remote (QUIC)"),
         };
-        let surface = if personal {
-            "calendar-only"
-        } else {
-            "host + fs"
+        let surface = match (personal, wire_eval) {
+            (true, true) => "calendar-only + governed eval",
+            (true, false) => "calendar-only",
+            (false, true) => "host + fs + governed eval",
+            (false, false) => "host + fs",
         };
         eprintln!(
             "ikigai: serving on {target}  ({posture}; surface: {surface}; {} trusted client cert(s))  (Ctrl-C to stop)",

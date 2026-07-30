@@ -1274,6 +1274,49 @@ pub fn calendar_server_kernel() -> Kernel {
     )
 }
 
+/// The wire-eval L1 posture: `urn:lisp:eval` behind the wall-clock [`Timeout`]
+/// governor, composed IN FRONT of a base surface (`Fallback` — first hit wins, so
+/// the governed binding shadows any ungoverned one beneath). The governor bounds
+/// how long a shipped program may hold the CALLER (typed transient `Timeout` at
+/// the budget; `IKIGAI_EVAL_TIMEOUT_SECS`, default 10); the worker ceiling in
+/// ikigai-lisp bounds how many runaway workers can ever exist; the kernel's
+/// declared-`requires` floor enforces `urn:cap:lisp`; and on QUIC the
+/// connection's minted ceiling must GRANT that cap for eval to be visible or
+/// invocable at all. Together: cert-gated, cap-clamped, thread-bounded,
+/// time-boxed remote evaluation — the transport for portable code.
+fn with_wire_eval(base: Arc<dyn ikigai_core::Space>) -> Arc<dyn ikigai_core::Space> {
+    let budget = std::env::var("IKIGAI_EVAL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|secs| secs.max(1))
+        .unwrap_or(10);
+    let governed = ikigai_throttle::Timeout::new(
+        EndpointSpace::new().bind(Exact::new("urn:lisp:eval"), ikigai_lisp::eval()),
+        std::time::Duration::from_secs(budget),
+    );
+    Arc::new(ikigai_core::Fallback::new(vec![Arc::new(governed), base]))
+}
+
+/// [`calendar_server_kernel`] plus the governed wire-eval binding — the posture a
+/// personal-ceiling server runs when its `--cap` ceiling ALSO grants
+/// `urn:cap:lisp`: a trusted peer ships s-exprs that compose with this machine's
+/// calendar resources, under the clamp, the governor, and the worker ceiling.
+pub fn calendar_server_kernel_with_eval() -> Kernel {
+    Kernel::with_meta_renderer(
+        with_wire_eval(Arc::new(calendar_server_space("Calendar (QUIC)"))),
+        Arc::new(CliRenderer),
+    )
+}
+
+/// [`kernel_for`] plus the governed wire-eval binding — the default served
+/// surface for an operator whose `--cap` ceiling grants `urn:cap:lisp`.
+pub fn kernel_for_with_eval(nature: &'static str) -> Kernel {
+    Kernel::with_meta_renderer(
+        with_wire_eval(Arc::new(served_space(nature))),
+        Arc::new(CliRenderer),
+    )
+}
+
 /// The native HTTP transport backing the `urn:http*` endpoints: a blocking `ureq`
 /// client. Runtime-free, so it runs under the CLI's `futures::block_on` without
 /// pulling in Tokio — the executor stays chosen at the edge.
@@ -2867,7 +2910,14 @@ fn file_thread(root: &Path, path: &Path) -> Option<String> {
 /// principal. Distinct from [`kernel_for`], the QUIC kernel, which omits personal
 /// because a QUIC peer isn't authenticated yet.
 pub fn trusted_kernel_for(nature: &'static str) -> Kernel {
-    Kernel::with_meta_renderer(Arc::new(local_space(nature)), Arc::new(CliRenderer))
+    // The same-user IPC surface is the local space — which includes
+    // `urn:lisp:eval` — so the wire-eval governor fronts it here too: peercred
+    // makes the PEER trusted, but a runaway program shipped over the socket
+    // should still time out (typed, transient) instead of pinning the server.
+    Kernel::with_meta_renderer(
+        with_wire_eval(Arc::new(local_space(nature))),
+        Arc::new(CliRenderer),
+    )
 }
 
 /// Build a **served** kernel for an *unauthenticated* transport (QUIC), labelled

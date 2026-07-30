@@ -219,6 +219,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
+name = "async-lock"
+version = "3.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "290f7f2596bd5b78a9fec8088ccd89180d7f9f55b94b0576823bbbdc72ee8311"
+dependencies = [
+ "event-listener",
+ "event-listener-strategy",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1433,6 +1444,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "event-listener"
+version = "5.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a23add41df1562121a9393cb065eab5146a1242410f23a644851e90cfd669d2"
+dependencies = [
+ "parking",
+ "pin-project-lite",
+]
+
+[[package]]
+name = "event-listener-strategy"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8be9f3dfaaffdae2972880079a491a1a8bb7cbed0b8dd7a347f668b4150a3b93"
+dependencies = [
+ "event-listener",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "fancy-regex"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1696,6 +1727,12 @@ name = "futures-task"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "037711b3d59c33004d3856fbdc83b99d4ff37a24768fa1be9ce3538a1cde4393"
+
+[[package]]
+name = "futures-timer"
+version = "3.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af43fadb8a98512d547e37b4e92e0ced13e205c061b87b4623eff01d918d6968"
 
 [[package]]
 name = "futures-util"
@@ -2478,6 +2515,7 @@ dependencies = [
  "ikigai-sniff",
  "ikigai-sparql",
  "ikigai-text",
+ "ikigai-throttle",
  "ikigai-time",
  "ikigai-tz",
  "ikigai-view",
@@ -2597,12 +2635,13 @@ dependencies = [
 
 [[package]]
 name = "ikigai-lisp"
-version = "0.1.6"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b189c7b9c1a4b3ee2a578e15a8812c7307d03209d4b34e1ef1f7db5108ebaa6d"
+checksum = "acbc96dbebd9096a236bf32b4e20acbb999001e5fa3684594f6a6b54bfe2395d"
 dependencies = [
  "async-trait",
  "crossbeam-channel",
+ "futures",
  "ikigai-core",
  "ikigai-sexpr",
  "steel-core",
@@ -2838,6 +2877,19 @@ version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71d1d5023438e15bc7d69b51d42f0159d3dc873f1379de7a58c06c60299ff6a4"
 dependencies = [
+ "ikigai-core",
+]
+
+[[package]]
+name = "ikigai-throttle"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4372d0c5d987abd46b8c16afbd2155bad58fb8c7db460e0cd996e381ea64bdc2"
+dependencies = [
+ "async-lock",
+ "async-trait",
+ "futures",
+ "futures-timer",
  "ikigai-core",
 ]
 
@@ -4327,6 +4379,12 @@ dependencies = [
  "fnv",
  "unicode-width 0.2.2",
 ]
+
+[[package]]
+name = "parking"
+version = "2.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f38d5652c16fde515bb1ecef450ab0f6a219d619a7274976324d5e377f7dceba"
 
 [[package]]
 name = "parking_lot"
