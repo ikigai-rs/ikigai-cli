@@ -77,6 +77,52 @@ fn the_served_eval_is_governed_clamped_and_absent_without_optin() {
     );
 
     signed_run_door(&kernel);
+    demo_wakes_on_the_served_surface();
+}
+
+/// The regression that motivated serving the FULL root over IPC: a connected
+/// client's `demo on` (a remote sink of urn:host:demo) must actually wake the
+/// demo endpoints on the SERVED kernel — which requires the gated runbook to be
+/// mounted there at all. (It used to live only in the embedded root, so the flag
+/// flipped with nothing listening.)
+fn demo_wakes_on_the_served_surface() {
+    let kernel = ikigai_embedded::trusted_kernel_for("Remote (IPC)");
+    let cap = Capability::root();
+
+    // Off by default: the demo IRI is absent, exactly as a fresh server starts.
+    // (The flag is process-global; earlier sections never touch it.)
+    let err = block_on(kernel.issue(
+        Request::new(
+            Verb::Source,
+            Iri::parse("urn:demo:jury").expect("valid IRI"),
+        ),
+        &cap,
+    ))
+    .unwrap_err();
+    assert!(matches!(err, Error::Unresolved(_)), "got {err:?}");
+
+    // `demo on` exactly as a connected REPL sends it: a SINK of urn:host:demo
+    // through the served kernel.
+    let out = block_on(
+        kernel.issue(
+            Request::new(Verb::Sink, Iri::parse("urn:host:demo").expect("valid IRI"))
+                .with_arg("content", ArgRef::Inline(b"on".to_vec())),
+            &cap,
+        ),
+    )
+    .expect("the demo toggle is served");
+    assert_eq!(out.bytes, b"demo on\n");
+
+    // And the jury demo now resolves on the same served kernel — offline-safe:
+    // with no model provider reachable the shape still renders (with a note).
+    block_on(kernel.issue(
+        Request::new(
+            Verb::Source,
+            Iri::parse("urn:demo:jury").expect("valid IRI"),
+        ),
+        &cap,
+    ))
+    .expect("the demo endpoint woke on the served surface");
 }
 
 // The same fixed Ed25519 pair ikigai-sign's tests use (PKCS8 private + SPKI
