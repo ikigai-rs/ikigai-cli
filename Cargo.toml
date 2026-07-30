@@ -68,7 +68,7 @@ ikigai-repo = "0.1.2" # 0.1.2 = typed Error::Denied for capability denials
 ikigai-lisp = "0.1.6" # (input) + program() — a stored Lisp program bound as an endpoint
 # LLM inference (urn:llm:ask + urn:llm:<provider>:ask + urn:llm:config): a facade grammar
 # over pluggable backends. OpenAI-compatible REST backend (Ollama/vLLM/llama.cpp/mlx_lm).
-ikigai-llm = "0.8.0" # installed: supports= capability filter (chat-capable jurors)
+ikigai-llm = "0.9.0" # 0.9.0 = trace notes (model/provider/cost span labels)
 # Video-conference scheduling (urn:meeting:schedule + urn:meeting:<provider>:schedule): a facade
 # over provider backends, Zoom first. Now on crates.io — the git-rev bridge retired at first publish.
 ikigai-meeting = "0.1.0"
