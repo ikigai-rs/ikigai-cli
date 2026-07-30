@@ -1290,11 +1290,129 @@ fn with_wire_eval(base: Arc<dyn ikigai_core::Space>) -> Arc<dyn ikigai_core::Spa
         .and_then(|v| v.parse::<u64>().ok())
         .map(|secs| secs.max(1))
         .unwrap_or(10);
-    let governed = ikigai_throttle::Timeout::new(
-        EndpointSpace::new().bind(Exact::new("urn:lisp:eval"), ikigai_lisp::eval()),
-        std::time::Duration::from_secs(budget),
+    let mut governed_space =
+        EndpointSpace::new().bind(Exact::new("urn:lisp:eval"), ikigai_lisp::eval());
+    let mut spaces: Vec<Arc<dyn ikigai_core::Space>> = Vec::new();
+
+    // The signed-program door (wire-eval L1.5): configured by IKIGAI_CODE_SIGNERS
+    // — comma-separated public-key resource IRIs (conventionally
+    // `urn:codekey:<file>`, served from the code-signers directory below). Absent
+    // ⇒ `urn:lisp:run` is NOT bound: the feature is absent, never defaulted to an
+    // empty-but-present trust set. The signature gates what may run; the
+    // connection's clamped capability still gates what it touches; the same
+    // Timeout governor fronts it.
+    if let Some(signers) = code_signers() {
+        governed_space =
+            governed_space.bind(Exact::new("urn:lisp:run"), ikigai_lisp::run_signed(signers));
+        // The signer public keys as resources: `urn:codekey:{file}` from the
+        // code-signers directory (IKIGAI_CODE_SIGNERS_DIR, default
+        // `~/.config/ikigai/code-signers`) — via a dedicated OPEN endpoint, not
+        // the fs module: public keys are public (that's the point of them), and
+        // an fs-capped binding would demand an fs grant from a signed-only
+        // ceiling just to VERIFY (the kernel's requires-floor rightly refused
+        // exactly that in testing). Single path segment only; no traversal. The
+        // sign module mounts too, so `urn:lisp:run`'s kernel-issued
+        // `urn:sign:verify` resolves on served surfaces (verify is open + pure;
+        // `urn:sign:sign` stays gated by `urn:cap:sign`, which no served ceiling
+        // grants by default).
+        spaces.push(Arc::new(EndpointSpace::new().bind(
+            UriTemplate::parse("urn:codekey:{path}").expect("valid template"),
+            CodeKey {
+                dir: code_signers_dir(),
+            },
+        )));
+        spaces.push(Arc::new(ikigai_sign::space()));
+    }
+
+    spaces.insert(
+        0,
+        Arc::new(ikigai_throttle::Timeout::new(
+            governed_space,
+            std::time::Duration::from_secs(budget),
+        )),
     );
-    Arc::new(ikigai_core::Fallback::new(vec![Arc::new(governed), base]))
+    spaces.push(base);
+    Arc::new(ikigai_core::Fallback::new(spaces))
+}
+
+/// The code-signing trust set: `IKIGAI_CODE_SIGNERS` as a comma-separated list
+/// of public-key resource IRIs. `None` when unset or empty — the signed-run door
+/// simply doesn't exist (a feature is absent, never silently defaulted).
+fn code_signers() -> Option<Vec<String>> {
+    let raw = std::env::var("IKIGAI_CODE_SIGNERS").ok()?;
+    let signers: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if signers.is_empty() {
+        None
+    } else {
+        Some(signers)
+    }
+}
+
+/// Where the code-signing public keys live (`urn:codekey:{file}` resolves here):
+/// `IKIGAI_CODE_SIGNERS_DIR`, default `~/.config/ikigai/code-signers`.
+fn code_signers_dir() -> std::path::PathBuf {
+    std::env::var("IKIGAI_CODE_SIGNERS_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default()
+                .join(".config/ikigai/code-signers")
+        })
+}
+
+/// `urn:codekey:{file}` — a code-signing PUBLIC key, served openly from the
+/// operator-curated signers directory. Open by design: a public key's job is to
+/// be read (a signed-only ceiling must resolve it just to verify), and the
+/// operator placing a file in this one directory is the act of publication.
+/// Exactly one path segment — separators and traversal are refused, so nothing
+/// outside the directory is nameable.
+struct CodeKey {
+    dir: std::path::PathBuf,
+}
+
+#[async_trait::async_trait]
+impl Endpoint for CodeKey {
+    async fn invoke(&self, inv: &Invocation<'_>) -> ikigai_core::Result<Representation> {
+        let name = inv.bindings.get("path").ok_or_else(|| {
+            ikigai_core::Error::MissingArgument("path (the key file name)".to_string())
+        })?;
+        if name.contains('/') || name.contains("\\") || name.contains("..") || name.is_empty() {
+            return Err(ikigai_core::Error::Endpoint(format!(
+                "urn:codekey: `{name}` is not a plain file name"
+            )));
+        }
+        let path = self.dir.join(name);
+        let bytes = std::fs::read(&path)
+            .map_err(|e| ikigai_core::Error::NotFound(format!("code-signing key `{name}`: {e}")))?;
+        Ok(Representation::new(
+            ReprType::new("application/x-pem-file"),
+            bytes,
+        ))
+    }
+
+    fn name(&self) -> &str {
+        "codekey"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("codekey")
+            .title("Code-signing public key")
+            .summary(
+                "A code-signing PUBLIC key from the operator's signers directory \
+                 (IKIGAI_CODE_SIGNERS_DIR). Open — a public key exists to be read; placing a \
+                 file in the directory is the act of publication. One plain file name, no \
+                 traversal.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .output("application/x-pem-file")
+    }
 }
 
 /// [`calendar_server_kernel`] plus the governed wire-eval binding — the posture a

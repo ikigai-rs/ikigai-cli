@@ -975,18 +975,23 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String]) -> ! {
         // this machine's resources, cap-clamped, thread-bounded, and time-boxed.
         // Without the grant the eval is neither bound nor (per the kernel's
         // declared-requires floor) invocable.
-        let wire_eval = caps.iter().any(|c| c == "urn:cap:lisp");
+        let wire_eval = caps
+            .iter()
+            .any(|c| c == "urn:cap:lisp" || c == "urn:cap:lisp:run");
         let kernel = match (personal, wire_eval) {
             (true, true) => ikigai_embedded::calendar_server_kernel_with_eval(),
             (true, false) => ikigai_embedded::calendar_server_kernel(),
             (false, true) => ikigai_embedded::kernel_for_with_eval("Remote (QUIC)"),
             (false, false) => ikigai_embedded::kernel_for("Remote (QUIC)"),
         };
-        let surface = match (personal, wire_eval) {
-            (true, true) => "calendar-only + governed eval",
-            (true, false) => "calendar-only",
-            (false, true) => "host + fs + governed eval",
-            (false, false) => "host + fs",
+        let signed_door = std::env::var("IKIGAI_CODE_SIGNERS").is_ok();
+        let surface = match (personal, wire_eval, signed_door) {
+            (true, true, true) => "calendar-only + governed eval + signed-run",
+            (true, true, false) => "calendar-only + governed eval",
+            (true, false, _) => "calendar-only",
+            (false, true, true) => "host + fs + governed eval + signed-run",
+            (false, true, false) => "host + fs + governed eval",
+            (false, false, _) => "host + fs",
         };
         eprintln!(
             "ikigai: serving on {target}  ({posture}; surface: {surface}; {} trusted client cert(s))  (Ctrl-C to stop)",
