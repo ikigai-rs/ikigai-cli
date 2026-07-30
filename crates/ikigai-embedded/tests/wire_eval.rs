@@ -19,7 +19,14 @@ fn eval(src: &str) -> Request {
 
 #[test]
 fn the_served_eval_is_governed_clamped_and_absent_without_optin() {
-    std::env::set_var("IKIGAI_EVAL_TIMEOUT_SECS", "1");
+    std::env::set_var("IKIGAI_EVAL_TIMEOUT_SECS", "2");
+
+    // Warm the (global) worker pool through an ungoverned kernel first: a fresh
+    // worker builds its Steel template on first use, which on a slow CI runner
+    // in a debug build can alone exceed the tight budget below — the governed
+    // assertions are about the GOVERNOR, not template build speed.
+    let warm = ikigai_core::Kernel::new(std::sync::Arc::new(ikigai_lisp::space()));
+    block_on(warm.issue(eval("(+ 1 1)"), &Capability::root())).expect("warm-up eval");
 
     // 1. The opt-in posture: eval resolves, and a clamped ceiling that grants
     //    the cap can run a program — while a runaway is cut at the wall clock.
