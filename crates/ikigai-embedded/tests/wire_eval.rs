@@ -19,15 +19,15 @@ fn eval(src: &str) -> Request {
 
 #[test]
 fn the_served_eval_is_governed_clamped_and_absent_without_optin() {
-    // ALL env — including the signed-run door's — before any kernel exists;
-    // this single test fn owns the process env (see signed_run_door).
-    std::env::set_var("IKIGAI_EVAL_TIMEOUT_SECS", "2");
+    // ALL process-global config — including the signed-run door's — before any
+    // kernel exists; this single test fn owns it (see signed_run_door).
+    ikigai_embedded::set_eval_timeout_secs(2);
     let dir = std::env::temp_dir().join("ikigai-code-signers-test");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("signers dir");
     std::fs::write(dir.join("k1.pub"), K1_PUB).expect("write pub key");
-    std::env::set_var("IKIGAI_CODE_SIGNERS_DIR", &dir);
-    std::env::set_var("IKIGAI_CODE_SIGNERS", "urn:codekey:k1.pub");
+    ikigai_embedded::set_code_signers_dir(dir.clone());
+    ikigai_embedded::set_code_signers(vec!["urn:codekey:k1.pub".to_string()]);
 
     // Warm the (global) worker pool through an ungoverned kernel first: a fresh
     // worker builds its Steel template on first use, which on a slow CI runner
@@ -134,7 +134,7 @@ const K1_PUB: &str = "-----BEGIN PUBLIC KEY-----\n\
 MCowBQYDK2VwAyEAa9JuLzyLESJBF9LPZZ4RJk13iu5OhgKvLRQ3q0oQ4pE=\n\
 -----END PUBLIC KEY-----\n";
 
-/// The signed-run door on a SERVED kernel: `IKIGAI_CODE_SIGNERS` binds
+/// The signed-run door on a SERVED kernel: a declared trust set binds
 /// `urn:lisp:run`, the key resolves as `urn:codekey:{file}` from the signers
 /// dir, verification runs through the served kernel's own `urn:sign:verify`,
 /// and a ceiling holding ONLY `urn:cap:lisp:run` (+ freebusy) executes a

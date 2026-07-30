@@ -34,6 +34,10 @@ usage:
   ikigai --mount <pfx>=<tgt>   compose a remote kernel at prefix <pfx> (<tgt> = Unix path or quic://host:port)
   ikigai serve [<target>]      run a kernel server (a Unix socket path, or quic://addr to bind)
   ikigai serve <q> --cap <s>   serve under a fixed capability ceiling <s> every client is clamped to
+  ikigai serve … --code-signer <k>  accept SIGNED programs (urn:lisp:run) vouched for by key
+                               resource <k> (repeatable; --code-signers-dir sets where
+                               urn:codekey:{file} reads from). Without it the door is unbound.
+  ikigai serve … --eval-timeout <s>  wall-clock ceiling for a served eval (default 10s)
   ikigai serve --http <port>   serve the inbound HTTP face (loopback; front with TLS at your proxy)
                                [--trust-proxy: honor X-Forwarded-*; --cors-origin <o>: allow a CORS origin;
                                 --routes <iri>: load routes from an RDF or plain-JSON resource
@@ -247,6 +251,7 @@ fn parse_args() -> Result<Option<Mode>, String> {
         let mut target = None;
         let mut certs = Certs::default();
         let mut caps = Vec::new();
+        let mut code_signers: Vec<String> = Vec::new();
         let mut http = None;
         let mut trust_proxy = false;
         let mut cors_origins = Vec::new();
@@ -269,6 +274,37 @@ fn parse_args() -> Result<Option<Mode>, String> {
                     argv.next()
                         .ok_or_else(|| "--cap needs a capability IRI".to_string())?,
                 );
+                continue;
+            }
+            // Wire-eval L1.5: whose signatures this host will run programs for.
+            // Repeatable, like --cap. With none given, urn:lisp:run isn't bound.
+            if arg == "--code-signer" {
+                let signer = argv
+                    .next()
+                    .ok_or_else(|| "--code-signer needs a key resource IRI".to_string())?;
+                code_signers.push(signer);
+                continue;
+            }
+            if arg == "--code-signers-dir" {
+                let dir = argv
+                    .next()
+                    .ok_or_else(|| "--code-signers-dir needs a path".to_string())?;
+                #[cfg(feature = "embedded")]
+                ikigai_embedded::set_code_signers_dir(std::path::PathBuf::from(dir));
+                #[cfg(not(feature = "embedded"))]
+                let _ = dir;
+                continue;
+            }
+            if arg == "--eval-timeout" {
+                let secs = argv
+                    .next()
+                    .ok_or_else(|| "--eval-timeout needs seconds".to_string())?
+                    .parse::<u64>()
+                    .map_err(|_| "--eval-timeout needs a whole number of seconds".to_string())?;
+                #[cfg(feature = "embedded")]
+                ikigai_embedded::set_eval_timeout_secs(secs);
+                #[cfg(not(feature = "embedded"))]
+                let _ = secs;
                 continue;
             }
             if arg == "--http" {
@@ -308,6 +344,13 @@ fn parse_args() -> Result<Option<Mode>, String> {
                 return Err(format!("unexpected argument after `serve`: {arg}"));
             }
         }
+        // Declare the code-signing trust set for whichever serve mode follows:
+        // process-global, like the instance name, and read by the kernel
+        // builders. Empty ⇒ urn:lisp:run is never bound.
+        #[cfg(feature = "embedded")]
+        ikigai_embedded::set_code_signers(code_signers);
+        #[cfg(not(feature = "embedded"))]
+        let _ = code_signers;
         return Ok(Some(Mode::Serve {
             target,
             certs,
@@ -984,7 +1027,7 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String]) -> ! {
             (false, true) => ikigai_embedded::kernel_for_with_eval("Remote (QUIC)"),
             (false, false) => ikigai_embedded::kernel_for("Remote (QUIC)"),
         };
-        let signed_door = std::env::var("IKIGAI_CODE_SIGNERS").is_ok();
+        let signed_door = ikigai_embedded::code_signers_configured();
         let surface = match (personal, wire_eval, signed_door) {
             (true, true, true) => "calendar-only + governed eval + signed-run",
             (true, true, false) => "calendar-only + governed eval",

@@ -53,6 +53,27 @@ pub fn generate(force: bool, dir_override: Option<PathBuf>) -> Result<PathBuf, S
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     restrict(&dir, 0o700)?;
 
+    // Pre-flight: refuse if ANY target exists, before writing ANY of them.
+    // Writing cert-then-key per identity and failing partway used to leave a
+    // freshly generated `server.crt` beside a pre-existing `server.key` — a
+    // mismatched pair, which is worse than either clobbering or refusing: the
+    // server would present a certificate it has no key for, and every client
+    // pinning the old cert would break.
+    if !force {
+        let existing: Vec<String> = ["server.crt", "server.key", "client.crt", "client.key"]
+            .iter()
+            .map(|name| dir.join(name))
+            .filter(|path| path.exists())
+            .map(|path| path.display().to_string())
+            .collect();
+        if !existing.is_empty() {
+            return Err(format!(
+                "{} already exist(s) — nothing was written (use `--force` to replace the whole set)",
+                existing.join(", ")
+            ));
+        }
+    }
+
     for (name, identity) in [
         ("server", ikigai_quic::generate()),
         ("client", ikigai_quic::generate()),
