@@ -3028,14 +3028,20 @@ fn file_thread(root: &Path, path: &Path) -> Option<String> {
 /// principal. Distinct from [`kernel_for`], the QUIC kernel, which omits personal
 /// because a QUIC peer isn't authenticated yet.
 pub fn trusted_kernel_for(nature: &'static str) -> Kernel {
-    // The same-user IPC surface is the local space — which includes
-    // `urn:lisp:eval` — so the wire-eval governor fronts it here too: peercred
-    // makes the PEER trusted, but a runaway program shipped over the socket
-    // should still time out (typed, transient) instead of pinning the server.
-    Kernel::with_meta_renderer(
-        with_wire_eval(Arc::new(local_space(nature))),
-        Arc::new(CliRenderer),
-    )
+    // The same-user IPC surface is the FULL embedded root — llm, rdf, meeting,
+    // the demo-gated runbook, everything the terminal REPL gets. Peercred means
+    // the peer IS this user: the socket is a process boundary, not a trust
+    // boundary, so an emacs (or any local) client is the same principal as the
+    // terminal and deserves the same manifold. (Serving only `local_space` here
+    // was a pre-client-era artifact: `demo on` flipped the flag remotely while
+    // the gated runbook simply wasn't mounted to wake up.) The wire-eval
+    // governor still fronts it: trusted PEER ≠ trusted PROGRAM — a runaway
+    // shipped over the socket times out (typed, transient) instead of pinning
+    // the server.
+    let _ = nature;
+    Kernel::with_meta_renderer(with_wire_eval(root_space()), Arc::new(CliRenderer))
+        .with_clock(Arc::new(SystemClock))
+        .with_subclass_axioms(subclass_axioms())
 }
 
 /// Build a **served** kernel for an *unauthenticated* transport (QUIC), labelled
