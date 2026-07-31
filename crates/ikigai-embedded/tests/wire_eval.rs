@@ -141,7 +141,15 @@ MCowBQYDK2VwAyEAa9JuLzyLESJBF9LPZZ4RJk13iu5OhgKvLRQ3q0oQ4pE=\n\
 /// trusted program it could never have eval'd arbitrarily. (Continues the test
 /// above IN THE SAME test fn: env vars are process-global and integration-test
 /// fns run on parallel threads — two tests setting different budgets raced.)
-fn signed_run_door(kernel: &ikigai_core::Kernel) {
+fn signed_run_door(_governed_2s: &ikigai_core::Kernel) {
+    // A generous budget for THIS section, on its own kernel. The 2s ceiling above
+    // exists to prove a runaway is cut quickly; the signed path does strictly more
+    // work (verify through the kernel, THEN evaluate) and on a slow shared CI
+    // runner in a debug build it raced that ceiling — the failure was a flaky
+    // Timeout, not a real one. The budget is read when the kernel is BUILT, so
+    // raising it needs a fresh kernel.
+    ikigai_embedded::set_eval_timeout_secs(60);
+    let kernel = &ikigai_embedded::calendar_server_kernel_with_eval();
     // Sign the program through a scratch kernel holding the PRIVATE key — the
     // author's side; the served kernel only ever sees the public half.
     let author = ikigai_core::Kernel::new(std::sync::Arc::new(ikigai_sign::space().bind(
