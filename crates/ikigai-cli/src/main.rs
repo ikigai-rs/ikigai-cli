@@ -1095,31 +1095,35 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String]) -> ! {
         // and nothing else — instead of the default served kernel (host + fs). The clamp
         // still gates it (a freebusy ceiling → freebusy), but the manifold is also
         // minimal, so nothing but the calendar is even nameable over the wire.
-        let personal = caps.iter().any(|c| c.starts_with("urn:cap:personal:"));
-        // Wire-eval L1: granting `urn:cap:lisp` in the ceiling is the operator's
-        // deliberate opt-in — the served kernel then fronts a Timeout-governed
-        // `urn:lisp:eval`, so an enrolled peer can ship s-exprs that compose with
-        // this machine's resources, cap-clamped, thread-bounded, and time-boxed.
-        // Without the grant the eval is neither bound nor (per the kernel's
-        // declared-requires floor) invocable.
-        let wire_eval = caps
-            .iter()
-            .any(|c| c == "urn:cap:lisp" || c == "urn:cap:lisp:run");
-        let kernel = match (personal, wire_eval) {
-            (true, true) => ikigai_embedded::calendar_server_kernel_with_eval(),
-            (true, false) => ikigai_embedded::calendar_server_kernel(),
-            (false, true) => ikigai_embedded::kernel_for_with_eval("Remote (QUIC)"),
-            (false, false) => ikigai_embedded::kernel_for("Remote (QUIC)"),
+        // THE GRANT DECIDES THE SURFACE. Each optional face is switched on by the
+        // ceiling the operator set, so a capability that could never be exercised
+        // never puts its endpoints on the wire.
+        let surface = ikigai_embedded::ServedSurface {
+            personal: caps.iter().any(|c| c.starts_with("urn:cap:personal:")),
+            wire_eval: caps
+                .iter()
+                .any(|c| c == "urn:cap:lisp" || c == "urn:cap:lisp:run"),
+            // A net grant means "you may spend my inference": urn:llm:* becomes
+            // servable, still bounded by require_net to the granted provider hosts.
+            llm: caps.iter().any(|c| c.starts_with("urn:cap:net:")),
         };
+        let kernel = ikigai_embedded::served_kernel("Remote (QUIC)", surface);
         let signed_door = ikigai_embedded::code_signers_configured();
-        let surface = match (personal, wire_eval, signed_door) {
-            (true, true, true) => "calendar-only + governed eval + signed-run",
-            (true, true, false) => "calendar-only + governed eval",
-            (true, false, _) => "calendar-only",
-            (false, true, true) => "host + fs + governed eval + signed-run",
-            (false, true, false) => "host + fs + governed eval",
-            (false, false, _) => "host + fs",
-        };
+        let mut faces = vec![if surface.personal {
+            "calendar-only"
+        } else {
+            "host + fs"
+        }];
+        if surface.llm {
+            faces.push("llm");
+        }
+        if surface.wire_eval {
+            faces.push("governed eval");
+        }
+        if surface.wire_eval && signed_door {
+            faces.push("signed-run");
+        }
+        let surface = faces.join(" + ");
         eprintln!(
             "ikigai: serving on {target}  ({posture}; surface: {surface}; {} trusted client cert(s))  (Ctrl-C to stop)",
             trusted.len()
