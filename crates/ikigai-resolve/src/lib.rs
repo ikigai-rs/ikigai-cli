@@ -177,10 +177,28 @@ pub struct MountedRemote {
     resolver: Arc<dyn Resolver>,
     prefix: String,
     origin: String,
+    mode: MountMode,
+}
+
+/// How a mount relates the local namespace to the remote one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MountMode {
+    /// **Alias** — `<prefix>rest` is rewritten to `urn:rest` before forwarding, and
+    /// the remote's catalog comes back re-prefixed. The prefix is a LOCAL NAME for a
+    /// remote namespace, so it must not collide with anything served locally (a
+    /// local binding would win, and the mount would silently never be used).
+    Alias,
+    /// **Override** — the IRI is forwarded UNCHANGED, and the mount is composed
+    /// BEFORE the local spaces, so the namespace genuinely resolves on the remote
+    /// even when the local kernel binds it too. This is what makes
+    /// `--override urn:llm:=quic://peer` mean "my LLM lives over there" with no
+    /// alias and no rewriting at the call site.
+    Override,
 }
 
 impl MountedRemote {
-    /// Mount `resolver` at `prefix`, labelling its bindings `origin` in the catalog.
+    /// Mount `resolver` at `prefix` as an ALIAS (see [`MountMode::Alias`]),
+    /// labelling its bindings `origin` in the catalog.
     pub fn new(
         resolver: Arc<dyn Resolver>,
         prefix: impl Into<String>,
@@ -190,21 +208,43 @@ impl MountedRemote {
             resolver,
             prefix: prefix.into(),
             origin: origin.into(),
+            mode: MountMode::Alias,
+        }
+    }
+
+    /// Mount `resolver` at `prefix` as an OVERRIDE (see [`MountMode::Override`]):
+    /// IRIs forwarded unchanged. The caller is responsible for composing this
+    /// BEFORE the local spaces — precedence is the other half of the semantics.
+    pub fn overriding(
+        resolver: Arc<dyn Resolver>,
+        prefix: impl Into<String>,
+        origin: impl Into<String>,
+    ) -> Self {
+        MountedRemote {
+            resolver,
+            prefix: prefix.into(),
+            origin: origin.into(),
+            mode: MountMode::Override,
         }
     }
 }
 
 impl Space for MountedRemote {
     fn resolve(&self, request: &Request, _scope: &Scope) -> Resolution {
-        // Only our namespace; strip the alias prefix (→ `urn:`) before forwarding.
+        // Only our namespace.
         let Some(rest) = request.target.as_str().strip_prefix(&self.prefix) else {
             return Resolution::Miss;
         };
-        let Ok(target) = ikigai_core::Iri::parse(format!("urn:{rest}")) else {
-            return Resolution::Miss;
-        };
         let mut forwarded = request.clone();
-        forwarded.target = target;
+        if self.mode == MountMode::Alias {
+            // The prefix is a local ALIAS: strip it (→ `urn:`) before forwarding.
+            let Ok(target) = ikigai_core::Iri::parse(format!("urn:{rest}")) else {
+                return Resolution::Miss;
+            };
+            forwarded.target = target;
+        }
+        // An OVERRIDE forwards the IRI verbatim — the remote serves this very
+        // namespace, so there is nothing to rewrite.
         Resolution::Hit(Resolved {
             endpoint: Arc::new(ForwardingEndpoint {
                 resolver: Arc::clone(&self.resolver),
@@ -215,21 +255,35 @@ impl Space for MountedRemote {
     }
 
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
-        // Surface the remote's catalog under the alias, tagged with its origin.
         let entries = self.resolver.entries()?;
-        Some(
-            entries
-                .into_iter()
-                .map(|entry| {
-                    let pattern = entry
-                        .pattern
-                        .strip_prefix("urn:")
-                        .map(|rest| format!("{}{rest}", self.prefix))
-                        .unwrap_or(entry.pattern);
-                    SpaceEntry::new(pattern, entry.endpoint).with_origin(&self.origin)
-                })
-                .collect(),
-        )
+        match self.mode {
+            // Surface the remote's catalog under the alias, tagged with its origin.
+            MountMode::Alias => Some(
+                entries
+                    .into_iter()
+                    .map(|entry| {
+                        let pattern = entry
+                            .pattern
+                            .strip_prefix("urn:")
+                            .map(|rest| format!("{}{rest}", self.prefix))
+                            .unwrap_or(entry.pattern);
+                        SpaceEntry::new(pattern, entry.endpoint).with_origin(&self.origin)
+                    })
+                    .collect(),
+            ),
+            // An override claims exactly its namespace: surface the remote's
+            // bindings under it, unchanged, so a federated `list` shows the real
+            // IRIs (tagged with where they resolve) and nothing outside the prefix.
+            MountMode::Override => Some(
+                entries
+                    .into_iter()
+                    .filter(|entry| entry.pattern.starts_with(&self.prefix))
+                    .map(|entry| {
+                        SpaceEntry::new(entry.pattern, entry.endpoint).with_origin(&self.origin)
+                    })
+                    .collect(),
+            ),
+        }
     }
 }
 

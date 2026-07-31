@@ -45,6 +45,11 @@ usage:
   ikigai --daemon              headless: timers, the watcher, and the standing sync — for launchd
   ikigai --name <instance>     name this instance (scopes <name>.* config properties; defaults
                                repl / daemon / serve by mode)
+  ikigai --mount <p>=<t>       graft a remote namespace at prefix <p> (ALIAS: <p>rest → urn:rest
+                               on the remote, tried after local; --cert-dir after it is ITS cert set)
+  ikigai --override <p>=<t>    the SAME namespace, served remotely: IRIs forward unchanged and win
+                               over local. <p> may be a whole IRI, so a single resource can be
+                               rerouted; the most specific override wins
   ikigai cert generate         create the pinned QUIC certificates (--dir <d> for a dedicated set)
   ikigai cert add-client <n>   mint an extra client identity into clients/<n>.{crt,key}
   ikigai -c '<command>' ...    run command(s) non-interactively, then exit
@@ -163,6 +168,9 @@ struct Mount {
     prefix: String,
     target: String,
     certs: Certs,
+    /// `--override` rather than `--mount`: forward IRIs UNCHANGED and resolve
+    /// BEFORE the local spaces, so the namespace genuinely lives on the remote.
+    overrides: bool,
 }
 
 /// Whether a `serve`/`--connect` target names a QUIC endpoint.
@@ -449,6 +457,27 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                     prefix: prefix.to_string(),
                     target: socket.to_string(),
                     certs: repl.certs.clone(),
+                    overrides: false,
+                });
+            }
+            "--override" => {
+                // `--override <prefix>=<target>`: the SAME namespace, served by the
+                // remote. Unlike `--mount` the IRI is forwarded verbatim and the
+                // mount is tried BEFORE local spaces, so `--override
+                // urn:llm:=quic://peer:4433` sends `urn:llm:ask` to the peer even
+                // though this kernel binds it too — no alias, nothing to rewrite at
+                // the call site.
+                let spec = argv
+                    .next()
+                    .ok_or_else(|| "--override needs <prefix>=<target>".to_string())?;
+                let (prefix, target) = spec
+                    .split_once('=')
+                    .ok_or_else(|| format!("--override expects <prefix>=<target>, got `{spec}`"))?;
+                repl.mounts.push(Mount {
+                    prefix: prefix.to_string(),
+                    target: target.to_string(),
+                    certs: repl.certs.clone(),
+                    overrides: true,
                 });
             }
             "-c" | "--command" => {
@@ -592,9 +621,15 @@ fn daemon(mounts: Vec<Mount>) {
                 prefix,
                 target,
                 certs,
+                overrides,
             } = mount;
             match connect_mount(&target, &certs) {
-                Ok(resolver) => resolved.push((prefix, target, resolver)),
+                Ok(resolver) => resolved.push(ikigai_embedded::MountSpec {
+                    prefix,
+                    origin: target,
+                    resolver,
+                    overrides,
+                }),
                 // A mount that will not connect is fatal here: the daemon's whole reason to
                 // hold a mount is the drain, and a silent no-op is the failure mode this is
                 // fixing. Say so and exit rather than park looking healthy.
@@ -835,9 +870,15 @@ fn build_engine(
                         prefix,
                         target,
                         certs,
+                        overrides,
                     } = mount;
                     let resolver = connect_mount(&target, &certs)?;
-                    resolved.push((prefix, target, resolver));
+                    resolved.push(ikigai_embedded::MountSpec {
+                        prefix,
+                        origin: target,
+                        resolver,
+                        overrides,
+                    });
                 }
                 ikigai_embedded::watched_kernel_with_mounts(resolved)
             };
