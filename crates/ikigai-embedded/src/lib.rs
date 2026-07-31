@@ -1463,6 +1463,52 @@ pub fn kernel_for_with_eval(nature: &'static str) -> Kernel {
     )
 }
 
+/// Which optional faces a served kernel carries. Each is decided by the
+/// connection ceiling the operator set (`--cap`), not by a separate switch: the
+/// GRANT DECIDES THE SURFACE, so a capability that could never be exercised
+/// doesn't put the endpoints on the wire in the first place.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct ServedSurface {
+    /// A `urn:cap:personal:*` ceiling ⇒ the minimal calendar-only space instead
+    /// of the general served space.
+    pub personal: bool,
+    /// `urn:cap:lisp` / `urn:cap:lisp:run` ⇒ the governed eval + signed-run door.
+    pub wire_eval: bool,
+    /// A `urn:cap:net:*` ceiling ⇒ `urn:llm:*` is servable: a peer may spend THIS
+    /// machine's inference. Bounded by construction — the llm module only reaches
+    /// its configured providers, and `require_net` still checks the provider host
+    /// against the grant, so `--cap urn:cap:net:localhost` means "use my local
+    /// models, nothing else". The general HTTP client stays embedded-only, so this
+    /// grants no arbitrary outbound access. (`urn:llm:config` redacts API keys.)
+    pub llm: bool,
+}
+
+/// Build the served kernel for `surface`. One composer instead of a kernel
+/// function per combination.
+pub fn served_kernel(nature: &'static str, surface: ServedSurface) -> Kernel {
+    let base: Arc<dyn Space> = if surface.personal {
+        Arc::new(calendar_server_space(nature))
+    } else {
+        Arc::new(served_space(nature))
+    };
+    // The LLM face sits in front of the base surface (it binds its own namespace;
+    // order only matters for a prefix collision, and there is none).
+    let base: Arc<dyn Space> = if surface.llm {
+        Arc::new(ikigai_core::Fallback::new(vec![
+            Arc::new(llm_space()) as Arc<dyn Space>,
+            base,
+        ]))
+    } else {
+        base
+    };
+    let root = if surface.wire_eval {
+        with_wire_eval(base)
+    } else {
+        base
+    };
+    Kernel::with_meta_renderer(root, Arc::new(CliRenderer))
+}
+
 /// The native HTTP transport backing the `urn:http*` endpoints: a blocking `ureq`
 /// client. Runtime-free, so it runs under the CLI's `futures::block_on` without
 /// pulling in Tokio — the executor stays chosen at the edge.
