@@ -2265,14 +2265,14 @@ fn root_space_with_mounts(mounts: Vec<MountSpec>) -> Arc<dyn Space> {
         .collect();
     // Only ALIAS mounts can be silently shadowed by a local binding; an override
     // is *supposed* to claim a locally-served namespace, so warning would be noise.
-    for mount in mounts.iter().filter(|m| !m.overrides) {
+    for mount in mounts.iter().filter(|m| m.kind == MountKind::Alias) {
         let prefix = &mount.prefix;
         if local_patterns
             .iter()
             .any(|p| p.starts_with(prefix.as_str()))
         {
             eprintln!(
-                "ikigai: warning: --mount prefix `{prefix}` is also served locally, so requests under it resolve LOCALLY, not via the mount; use an alias prefix the local kernel does not serve (e.g. `urn:cal:`), or `--override {prefix}=<target>` to make the remote win."
+                "ikigai: warning: --mount prefix `{prefix}` is also served locally, so requests under it resolve LOCALLY, not via the mount; use an alias prefix the local kernel does not serve (e.g. `urn:cal:`), or `--override {prefix}=<target>` (remote wins) / `--prefer {prefix}=<target>` (remote when reachable, else local)."
             );
         }
     }
@@ -2287,40 +2287,62 @@ fn root_space_with_mounts(mounts: Vec<MountSpec>) -> Arc<dyn Space> {
     // live on a peer even though this kernel binds it too. Precedence is what makes
     // the override an override — the rewrite mode alone would still lose to a local
     // binding (`Fallback` = first hit wins).
-    let mut overrides: Vec<(usize, Arc<dyn Space>)> = Vec::new();
+    // Alias mounts join the local list; overrides/prefers go in FRONT of it, so
+    // the local spaces must be sealed into one space first — that sealed space is
+    // also what a `--prefer` mount falls back TO.
+    let mut fronting: Vec<MountSpec> = Vec::new();
     for mount in mounts {
-        let MountSpec {
-            prefix,
-            origin,
-            resolver,
-            overrides: is_override,
-        } = mount;
-        if is_override {
-            // Keyed by prefix length so the MOST SPECIFIC override wins regardless
-            // of declaration order: `--override urn:llm:=peerA --override
-            // urn:llm:ask=peerB` sends `urn:llm:ask` to peerB and the rest of
-            // `urn:llm:*` to peerA. A whole IRI is simply the most specific prefix
-            // there is, which is what makes single-RESOURCE overrides work.
-            let specificity = prefix.len();
-            overrides.push((
-                specificity,
-                Arc::new(ikigai_resolve::MountedRemote::overriding(
-                    resolver, prefix, origin,
-                )) as Arc<dyn Space>,
-            ));
-        } else {
+        if mount.kind == MountKind::Alias {
             spaces.push(Arc::new(ikigai_resolve::MountedRemote::new(
-                resolver, prefix, origin,
+                mount.resolver,
+                mount.prefix,
+                mount.origin,
             )));
+        } else {
+            fronting.push(mount);
         }
     }
-    if !overrides.is_empty() {
-        overrides.sort_by_key(|(specificity, _)| std::cmp::Reverse(*specificity));
-        let mut ordered: Vec<Arc<dyn Space>> = overrides.into_iter().map(|(_, s)| s).collect();
-        ordered.extend(spaces);
-        return Arc::new(Fallback::new(ordered));
+    if fronting.is_empty() {
+        return Arc::new(Fallback::new(spaces));
     }
-    Arc::new(Fallback::new(spaces))
+    // Ordered by prefix LENGTH, so the most specific mount wins regardless of
+    // declaration order: `--override urn:llm:=peerA --override urn:llm:ask=peerB`
+    // sends `urn:llm:ask` to peerB and the rest of `urn:llm:*` to peerA. A whole
+    // IRI is simply the most specific prefix there is, which is what makes
+    // single-RESOURCE overrides work.
+    fronting.sort_by_key(|mount| std::cmp::Reverse(mount.prefix.len()));
+    let local: Arc<dyn Space> = Arc::new(Fallback::new(spaces));
+    let mut ordered: Vec<Arc<dyn Space>> = Vec::new();
+    for MountSpec {
+        prefix,
+        origin,
+        resolver,
+        kind,
+    } in fronting
+    {
+        let remote = Arc::new(ikigai_resolve::MountedRemote::overriding(
+            resolver,
+            prefix.clone(),
+            origin,
+        )) as Arc<dyn Space>;
+        ordered.push(match kind {
+            // The failover pair must stay INSIDE the prefix. `Failover` resolves
+            // every target, so an unguarded `[remote, local]` would also answer
+            // for IRIs the local spaces bind but this mount never claimed —
+            // hitting before a less-specific override behind it and defeating it.
+            MountKind::Prefer => Arc::new(PrefixGuard {
+                prefix,
+                inner: Arc::new(ikigai_throttle::Failover::new(vec![
+                    Arc::clone(&remote),
+                    Arc::clone(&local),
+                ])),
+                catalog: remote,
+            }) as Arc<dyn Space>,
+            _ => remote,
+        });
+    }
+    ordered.push(local);
+    Arc::new(Fallback::new(ordered))
 }
 
 /// One remote mount: where it binds, a label for the catalog, the connected
@@ -2331,11 +2353,51 @@ pub struct MountSpec {
     /// A human label for the catalog (`origin`), usually the target string.
     pub origin: String,
     pub resolver: Arc<dyn ikigai_resolve::Resolver>,
-    /// `true` = an OVERRIDE mount: IRIs forward unchanged and the mount is composed
-    /// BEFORE the local spaces, so the namespace resolves remotely even when the
-    /// local kernel also binds it. `false` = the classic ALIAS mount, rewritten to
-    /// `urn:` and tried AFTER local.
-    pub overrides: bool,
+    pub kind: MountKind,
+}
+
+/// Confines a composed space to one IRI prefix.
+///
+/// Used for `--prefer`, whose inner space pairs a remote with the WHOLE local
+/// space; without this, that pair would claim every IRI the local kernel binds.
+/// The catalog comes from `catalog` alone, so a prefer-mount lists the remote's
+/// bindings rather than re-listing all of local under the mount's origin.
+struct PrefixGuard {
+    prefix: String,
+    inner: Arc<dyn Space>,
+    catalog: Arc<dyn Space>,
+}
+
+impl Space for PrefixGuard {
+    fn resolve(&self, request: &Request, scope: &Scope) -> Resolution {
+        if !request.target.as_str().starts_with(&self.prefix) {
+            return Resolution::Miss;
+        }
+        self.inner.resolve(request, scope)
+    }
+
+    fn entries(&self) -> Option<Vec<SpaceEntry>> {
+        self.catalog.entries()
+    }
+}
+
+/// The three relationships a mount can have with the local namespace.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MountKind {
+    /// `--mount`: the prefix is a LOCAL ALIAS for a remote namespace. IRIs are
+    /// rewritten (`<prefix>rest` → `urn:rest`) and the mount is tried AFTER the
+    /// local spaces, so it only ever catches what this kernel lacks.
+    Alias,
+    /// `--override`: the SAME namespace, served remotely. IRIs forward unchanged
+    /// and the mount is composed BEFORE the local spaces. If the remote is down,
+    /// the resolution FAILS — that is the point: you asked for that machine.
+    Override,
+    /// `--prefer`: like an override, but wrapped in a [`Failover`] over the local
+    /// spaces — the remote when it answers, this machine when it doesn't. Only
+    /// TRANSIENT failures fall through (a capability denial still propagates, and
+    /// a mutating verb is never replayed), so "graceful" never means "silently
+    /// ignored the answer the peer actually gave".
+    Prefer,
 }
 
 /// `rdfs:subClassOf` axioms for type-aware action selection — parsed from the runbook's RDFS
@@ -3179,6 +3241,132 @@ mod tests {
     use super::*;
     use futures::executor::block_on;
     use ikigai_core::{ArgRef, Capability, Iri, Request};
+
+    /// A mount target that is always down (or always denies), so the composition's
+    /// behaviour under failure can be asserted without a peer.
+    struct DeadPeer {
+        error: fn(String) -> ikigai_core::Error,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ikigai_resolve::Resolver for DeadPeer {
+        fn issue(
+            &self,
+            _request: Request,
+        ) -> std::result::Result<(Representation, ikigai_resolve::CacheStatus), ikigai_core::Error>
+        {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err((self.error)("peer".to_string()))
+        }
+
+        fn is_cached(&self, _request: &Request, _capability: &Capability) -> bool {
+            false
+        }
+
+        fn entries(&self) -> Option<Vec<SpaceEntry>> {
+            None
+        }
+    }
+
+    fn mount(
+        prefix: &str,
+        kind: MountKind,
+        error: fn(String) -> ikigai_core::Error,
+    ) -> (MountSpec, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (
+            MountSpec {
+                prefix: prefix.to_string(),
+                origin: "test://peer".to_string(),
+                resolver: Arc::new(DeadPeer {
+                    error,
+                    calls: Arc::clone(&calls),
+                }),
+                kind,
+            },
+            calls,
+        )
+    }
+
+    /// `urn:fn:toUpper` is bound locally, so it is a good probe for "did the local
+    /// binding get a chance to answer".
+    fn probe(space: &Arc<dyn Space>, iri: &str) -> std::result::Result<String, ikigai_core::Error> {
+        let kernel = Kernel::new(Arc::clone(space));
+        let request = Request::new(Verb::Source, Iri::parse(iri).unwrap())
+            .with_arg("in", ArgRef::Inline(b"hi".to_vec()));
+        let representation = block_on(kernel.issue(request, &Capability::root()))?;
+        Ok(String::from_utf8_lossy(&representation.bytes).to_string())
+    }
+
+    /// The point of `--prefer`: the peer is unreachable, so THIS machine answers.
+    #[test]
+    fn a_prefer_mount_falls_back_to_the_local_binding_when_the_peer_is_down() {
+        let (spec, calls) = mount(
+            "urn:fn:",
+            MountKind::Prefer,
+            ikigai_core::Error::Unavailable,
+        );
+        let space = root_space_with_mounts(vec![spec]);
+        let answer = probe(&space, "urn:fn:toUpper").expect("local must answer for a dead peer");
+        assert_eq!(answer, "HI");
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the peer must be TRIED first — preferring it is the whole point"
+        );
+    }
+
+    /// The same mount as an `--override` FAILS instead. You named that machine; a
+    /// silent local substitution would answer a question you did not ask.
+    #[test]
+    fn an_override_mount_fails_when_the_peer_is_down() {
+        let (spec, _) = mount(
+            "urn:fn:",
+            MountKind::Override,
+            ikigai_core::Error::Unavailable,
+        );
+        let space = root_space_with_mounts(vec![spec]);
+        let err = probe(&space, "urn:fn:toUpper").expect_err("an override must not fall back");
+        assert!(matches!(err, ikigai_core::Error::Unavailable(_)), "{err:?}");
+    }
+
+    /// A DENIAL is not a transient failure. If the peer answered "you may not", the
+    /// local binding must not quietly answer instead — that would turn a capability
+    /// boundary into a suggestion.
+    #[test]
+    fn a_prefer_mount_does_not_swallow_a_denial() {
+        let (spec, _) = mount("urn:fn:", MountKind::Prefer, ikigai_core::Error::Denied);
+        let space = root_space_with_mounts(vec![spec]);
+        let err = probe(&space, "urn:fn:toUpper").expect_err("a denial must propagate");
+        assert!(matches!(err, ikigai_core::Error::Denied(_)), "{err:?}");
+    }
+
+    /// A prefer-mount pairs its peer with the WHOLE local space, so without a prefix
+    /// guard it would answer for every IRI — hitting before a less-specific override
+    /// behind it and silently defeating it.
+    #[test]
+    fn a_prefer_mount_does_not_claim_iris_outside_its_prefix() {
+        let (prefer, prefer_calls) = mount(
+            "urn:llm:",
+            MountKind::Prefer,
+            ikigai_core::Error::Unavailable,
+        );
+        let (override_mount, override_calls) = mount(
+            "urn:fn:",
+            MountKind::Override,
+            ikigai_core::Error::Unavailable,
+        );
+        let space = root_space_with_mounts(vec![prefer, override_mount]);
+        let err = probe(&space, "urn:fn:toUpper")
+            .expect_err("the override still owns urn:fn:, despite the longer prefer prefix");
+        assert!(matches!(err, ikigai_core::Error::Unavailable(_)), "{err:?}");
+        assert_eq!(
+            prefer_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the urn:llm: mount must not see a urn:fn: request"
+        );
+        assert!(override_calls.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    }
 
     /// A kernel with just the client endpoints, rooted at a scratch directory.
     fn client_kernel(root: std::path::PathBuf) -> Kernel {

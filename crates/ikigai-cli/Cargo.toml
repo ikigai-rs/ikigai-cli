@@ -19,6 +19,7 @@ quic = ["dep:ikigai-quic"] # opt-in; pulls quinn/rustls/tokio
 web = ["dep:ikigai-web", "dep:tokio", "dep:serde_yaml"] # opt-in inbound HTTP face; pulls Tokio (like quic)
 
 [dependencies]
+async-trait = "0.1"
 ikigai-core = { workspace = true }
 # Sibling crates carry an explicit version (required to publish) pinned to this
 # release, so the binary always resolves them at the matching lockstep version.

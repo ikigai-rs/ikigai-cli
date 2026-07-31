@@ -50,6 +50,8 @@ usage:
   ikigai --override <p>=<t>    the SAME namespace, served remotely: IRIs forward unchanged and win
                                over local. <p> may be a whole IRI, so a single resource can be
                                rerouted; the most specific override wins
+  ikigai --prefer <p>=<t>      like --override, but falls back to the LOCAL binding when the peer
+                               is unreachable (transient failures only; denials still propagate)
   ikigai cert generate         create the pinned QUIC certificates (--dir <d> for a dedicated set)
   ikigai cert add-client <n>   mint an extra client identity into clients/<n>.{crt,key}
   ikigai -c '<command>' ...    run command(s) non-interactively, then exit
@@ -168,9 +170,7 @@ struct Mount {
     prefix: String,
     target: String,
     certs: Certs,
-    /// `--override` rather than `--mount`: forward IRIs UNCHANGED and resolve
-    /// BEFORE the local spaces, so the namespace genuinely lives on the remote.
-    overrides: bool,
+    kind: ikigai_embedded::MountKind,
 }
 
 /// Whether a `serve`/`--connect` target names a QUIC endpoint.
@@ -457,7 +457,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                     prefix: prefix.to_string(),
                     target: socket.to_string(),
                     certs: repl.certs.clone(),
-                    overrides: false,
+                    kind: ikigai_embedded::MountKind::Alias,
                 });
             }
             "--override" => {
@@ -477,7 +477,26 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                     prefix: prefix.to_string(),
                     target: target.to_string(),
                     certs: repl.certs.clone(),
-                    overrides: true,
+                    kind: ikigai_embedded::MountKind::Override,
+                });
+            }
+            "--prefer" => {
+                // `--prefer <prefix>=<target>`: an override that DEGRADES. The
+                // remote answers when it can; a transient failure (peer asleep,
+                // network gone) falls through to this machine's own binding. A
+                // capability denial is NOT transient and still propagates, and a
+                // mutating verb is never replayed.
+                let spec = argv
+                    .next()
+                    .ok_or_else(|| "--prefer needs <prefix>=<target>".to_string())?;
+                let (prefix, target) = spec
+                    .split_once('=')
+                    .ok_or_else(|| format!("--prefer expects <prefix>=<target>, got `{spec}`"))?;
+                repl.mounts.push(Mount {
+                    prefix: prefix.to_string(),
+                    target: target.to_string(),
+                    certs: repl.certs.clone(),
+                    kind: ikigai_embedded::MountKind::Prefer,
                 });
             }
             "-c" | "--command" => {
@@ -617,22 +636,13 @@ fn daemon(mounts: Vec<Mount>) {
         let mut resolved = Vec::new();
         for mount in mounts {
             // Each mount connects with ITS OWN certificates.
-            let Mount {
-                prefix,
-                target,
-                certs,
-                overrides,
-            } = mount;
-            match connect_mount(&target, &certs) {
-                Ok(resolver) => resolved.push(ikigai_embedded::MountSpec {
-                    prefix,
-                    origin: target,
-                    resolver,
-                    overrides,
-                }),
+            let target = mount.target.clone();
+            match resolve_mount(mount) {
+                Ok(spec) => resolved.push(spec),
                 // A mount that will not connect is fatal here: the daemon's whole reason to
                 // hold a mount is the drain, and a silent no-op is the failure mode this is
-                // fixing. Say so and exit rather than park looking healthy.
+                // fixing. Say so and exit rather than park looking healthy. (A --prefer
+                // mount never lands here — it connects on demand, by design.)
                 Err(e) => {
                     eprintln!("ikigai: --mount {target}: {e}");
                     std::process::exit(2);
@@ -866,19 +876,7 @@ fn build_engine(
                 for mount in mounts {
                     // The target (socket path or quic:// URL) is the mount's origin
                     // label, surfaced in the catalog; each mount pins its OWN peer.
-                    let Mount {
-                        prefix,
-                        target,
-                        certs,
-                        overrides,
-                    } = mount;
-                    let resolver = connect_mount(&target, &certs)?;
-                    resolved.push(ikigai_embedded::MountSpec {
-                        prefix,
-                        origin: target,
-                        resolver,
-                        overrides,
-                    });
+                    resolved.push(resolve_mount(mount)?);
                 }
                 ikigai_embedded::watched_kernel_with_mounts(resolved)
             };
@@ -903,6 +901,132 @@ fn build_engine(
 /// `--connect` does: `quic://host:port` for a remote kernel over mutually-pinned TLS
 /// (federation across machines), else a Unix socket path (a same-machine peer).
 #[cfg(feature = "embedded")]
+/// Turn a parsed [`Mount`] into a [`MountSpec`], connecting eagerly or lazily
+/// according to its kind.
+///
+/// `--mount` and `--override` connect NOW: you named that peer because you want
+/// its namespace, and a silent no-op is the failure mode worth being loud about.
+/// `--prefer` connects on demand — its whole contract is that the peer may be
+/// absent, so an absent peer at startup is normal operation, not an error.
+fn resolve_mount(mount: Mount) -> Result<ikigai_embedded::MountSpec, String> {
+    let Mount {
+        prefix,
+        target,
+        certs,
+        kind,
+    } = mount;
+    let resolver: std::sync::Arc<dyn ikigai_resolve::Resolver> =
+        if kind == ikigai_embedded::MountKind::Prefer {
+            std::sync::Arc::new(LazyResolver {
+                target: target.clone(),
+                certs,
+                inner: std::sync::Mutex::new(None),
+            })
+        } else {
+            connect_mount(&target, &certs)?
+        };
+    Ok(ikigai_embedded::MountSpec {
+        prefix,
+        origin: target,
+        resolver,
+        kind,
+    })
+}
+
+/// A mount that connects on FIRST USE, and re-tries on every use after a failure.
+///
+/// Why `--prefer` needs this: the eager path connects while the process starts, so
+/// a peer that is merely asleep at boot — the normal case for a laptop preferring a
+/// workstation — would be skipped for the life of the process, and never picked up
+/// when it woke. Deferring the connect makes "when it's around" mean *now*, not
+/// *at startup*.
+///
+/// A failure to connect is reported as the transient [`Error::Unavailable`] it is,
+/// which is exactly what makes the `Failover` above it fall through to the local
+/// binding.
+///
+/// Once connected, the resolver is KEPT even across failures — the transports
+/// re-establish their own connections (`QuicResolver::round_trip` redials on any
+/// transport error), so a peer that goes and returns is handled a layer down.
+/// Dropping it here instead looks tempting and wedges the REPL: `QuicResolver`'s
+/// `Drop` blocks on its runtime to flush the close frame, and doing that from
+/// inside a resolution — which is already running under a runtime — is exactly
+/// the context where blocking is not allowed.
+struct LazyResolver {
+    target: String,
+    certs: Certs,
+    inner: std::sync::Mutex<Option<std::sync::Arc<dyn ikigai_resolve::Resolver>>>,
+}
+
+impl LazyResolver {
+    /// The live resolver, dialing the peer if this is the first call (or the first
+    /// since a failure).
+    fn get(&self) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, ikigai_core::Error> {
+        if let Some(resolver) = self.inner.lock().unwrap().clone() {
+            return Ok(resolver);
+        }
+        let resolver = connect_mount(&self.target, &self.certs)
+            .map_err(|e| ikigai_core::Error::Unavailable(format!("{}: {e}", self.target)))?;
+        *self.inner.lock().unwrap() = Some(std::sync::Arc::clone(&resolver));
+        Ok(resolver)
+    }
+}
+
+#[async_trait::async_trait]
+impl ikigai_resolve::Resolver for LazyResolver {
+    fn issue(
+        &self,
+        request: ikigai_core::Request,
+    ) -> Result<(ikigai_core::Representation, ikigai_resolve::CacheStatus), ikigai_core::Error>
+    {
+        self.get()?.issue(request)
+    }
+
+    fn issue_as(
+        &self,
+        request: ikigai_core::Request,
+        capability: &ikigai_core::Capability,
+    ) -> Result<(ikigai_core::Representation, ikigai_resolve::CacheStatus), ikigai_core::Error>
+    {
+        self.get()?.issue_as(request, capability)
+    }
+
+    async fn issue_as_async(
+        &self,
+        request: ikigai_core::Request,
+        capability: &ikigai_core::Capability,
+    ) -> Result<(ikigai_core::Representation, ikigai_resolve::CacheStatus), ikigai_core::Error>
+    {
+        let resolver = self.get()?;
+        resolver.issue_as_async(request, capability).await
+    }
+
+    fn is_cached(
+        &self,
+        request: &ikigai_core::Request,
+        capability: &ikigai_core::Capability,
+    ) -> bool {
+        // An unreachable peer has nothing cached, and probing must not dial.
+        match self.inner.lock().unwrap().clone() {
+            Some(resolver) => resolver.is_cached(request, capability),
+            None => false,
+        }
+    }
+
+    fn entries(&self) -> Option<Vec<ikigai_core::SpaceEntry>> {
+        // Only if already connected: `catalog` must not block on dialing a peer
+        // that may be asleep.
+        self.inner.lock().unwrap().clone()?.entries()
+    }
+
+    fn transport(&self) -> String {
+        match self.inner.lock().unwrap().clone() {
+            Some(resolver) => resolver.transport(),
+            None => format!("{} · not connected", self.target),
+        }
+    }
+}
+
 fn connect_mount(
     target: &str,
     certs: &Certs,
@@ -1441,6 +1565,51 @@ mod mount_cert_tests {
             mounts[1].certs.cert_dir.as_deref(),
             Some("/certs/b"),
             "a mount's own cert flag overrides the inherited default"
+        );
+    }
+
+    /// The three mount forms are distinct kinds, and each carries its own certs.
+    #[test]
+    fn mount_override_and_prefer_are_distinct_kinds() {
+        let mounts = mounts_of(&[
+            "--mount",
+            "urn:cal:=quic://a.example:4433",
+            "--override",
+            "urn:personal:=quic://b.example:4433",
+            "--prefer",
+            "urn:llm:=quic://plasma.local:4433",
+            "--cert-dir",
+            "/certs/plasma",
+        ]);
+        assert_eq!(mounts[0].kind, ikigai_embedded::MountKind::Alias);
+        assert_eq!(mounts[1].kind, ikigai_embedded::MountKind::Override);
+        assert_eq!(mounts[2].kind, ikigai_embedded::MountKind::Prefer);
+        assert_eq!(mounts[2].prefix, "urn:llm:");
+        assert_eq!(mounts[2].target, "quic://plasma.local:4433");
+        assert_eq!(mounts[2].certs.cert_dir.as_deref(), Some("/certs/plasma"));
+    }
+
+    /// A `--prefer` mount must NOT dial while the process starts: the peer being
+    /// absent is its normal case, and an eager connect would both fail at boot and
+    /// never pick the peer up when it woke.
+    #[test]
+    fn a_prefer_mount_does_not_connect_at_startup() {
+        let mount = Mount {
+            prefix: "urn:llm:".to_string(),
+            // Nothing is listening here, and nothing should try.
+            target: "quic://127.0.0.1:1".to_string(),
+            certs: Certs::default(),
+            kind: ikigai_embedded::MountKind::Prefer,
+        };
+        let spec = resolve_mount(mount).expect("a prefer mount must not fail at startup");
+        assert!(
+            spec.resolver.entries().is_none(),
+            "an unconnected prefer mount has no catalog to report"
+        );
+        assert!(
+            spec.resolver.transport().contains("not connected"),
+            "transport should say the peer is not connected, got: {}",
+            spec.resolver.transport()
         );
     }
 
