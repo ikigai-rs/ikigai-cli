@@ -1971,9 +1971,7 @@ fn root_space() -> Arc<dyn Space> {
 /// — each tried after every local space, so a resource the local kernel lacks under
 /// `prefix` forwards to the remote, and the remote's catalog appears re-prefixed and
 /// tagged with `origin`.
-fn root_space_with_mounts(
-    mounts: Vec<(String, String, Arc<dyn ikigai_resolve::Resolver>)>,
-) -> Arc<dyn Space> {
+fn root_space_with_mounts(mounts: Vec<MountSpec>) -> Arc<dyn Space> {
     let mut spaces: Vec<Arc<dyn Space>> = vec![
         Arc::new(local_space("Embedded (Native)")) as Arc<dyn Space>,
         Arc::new(http_space()) as Arc<dyn Space>,
@@ -2219,27 +2217,79 @@ fn root_space_with_mounts(
         .flatten()
         .map(|e| e.pattern)
         .collect();
-    for (prefix, _origin, _resolver) in &mounts {
+    // Only ALIAS mounts can be silently shadowed by a local binding; an override
+    // is *supposed* to claim a locally-served namespace, so warning would be noise.
+    for mount in mounts.iter().filter(|m| !m.overrides) {
+        let prefix = &mount.prefix;
         if local_patterns
             .iter()
             .any(|p| p.starts_with(prefix.as_str()))
         {
             eprintln!(
-                "ikigai: warning: --mount prefix `{prefix}` is also served locally, so requests under it resolve LOCALLY, not via the mount; use an alias prefix the local kernel does not serve (e.g. `urn:cal:`) to reach the remote."
+                "ikigai: warning: --mount prefix `{prefix}` is also served locally, so requests under it resolve LOCALLY, not via the mount; use an alias prefix the local kernel does not serve (e.g. `urn:cal:`), or `--override {prefix}=<target>` to make the remote win."
             );
         }
     }
-    // Remote mounts, tried after every local space. `MountedRemote` rewrites
+    // ALIAS mounts are tried after every local space. `MountedRemote` rewrites
     // `<prefix>rest` → `urn:rest` before forwarding (so the remote, which serves
     // `urn:*`, resolves it and a `trace` stitches its execution under this mount
     // node) AND surfaces the remote's catalog back re-prefixed + tagged with its
     // origin, so a federated `list` shows where each mounted resource resolves.
-    for (prefix, origin, resolver) in mounts {
-        spaces.push(Arc::new(ikigai_resolve::MountedRemote::new(
-            resolver, prefix, origin,
-        )));
+    //
+    // OVERRIDE mounts are the other half of the story: they forward the IRI
+    // unchanged and are composed BEFORE the local spaces, so `urn:llm:` really can
+    // live on a peer even though this kernel binds it too. Precedence is what makes
+    // the override an override — the rewrite mode alone would still lose to a local
+    // binding (`Fallback` = first hit wins).
+    let mut overrides: Vec<(usize, Arc<dyn Space>)> = Vec::new();
+    for mount in mounts {
+        let MountSpec {
+            prefix,
+            origin,
+            resolver,
+            overrides: is_override,
+        } = mount;
+        if is_override {
+            // Keyed by prefix length so the MOST SPECIFIC override wins regardless
+            // of declaration order: `--override urn:llm:=peerA --override
+            // urn:llm:ask=peerB` sends `urn:llm:ask` to peerB and the rest of
+            // `urn:llm:*` to peerA. A whole IRI is simply the most specific prefix
+            // there is, which is what makes single-RESOURCE overrides work.
+            let specificity = prefix.len();
+            overrides.push((
+                specificity,
+                Arc::new(ikigai_resolve::MountedRemote::overriding(
+                    resolver, prefix, origin,
+                )) as Arc<dyn Space>,
+            ));
+        } else {
+            spaces.push(Arc::new(ikigai_resolve::MountedRemote::new(
+                resolver, prefix, origin,
+            )));
+        }
+    }
+    if !overrides.is_empty() {
+        overrides.sort_by_key(|(specificity, _)| std::cmp::Reverse(*specificity));
+        let mut ordered: Vec<Arc<dyn Space>> = overrides.into_iter().map(|(_, s)| s).collect();
+        ordered.extend(spaces);
+        return Arc::new(Fallback::new(ordered));
     }
     Arc::new(Fallback::new(spaces))
+}
+
+/// One remote mount: where it binds, a label for the catalog, the connected
+/// resolver, and whether it OVERRIDES the local namespace.
+pub struct MountSpec {
+    /// The IRI prefix this mount claims.
+    pub prefix: String,
+    /// A human label for the catalog (`origin`), usually the target string.
+    pub origin: String,
+    pub resolver: Arc<dyn ikigai_resolve::Resolver>,
+    /// `true` = an OVERRIDE mount: IRIs forward unchanged and the mount is composed
+    /// BEFORE the local spaces, so the namespace resolves remotely even when the
+    /// local kernel also binds it. `false` = the classic ALIAS mount, rewritten to
+    /// `urn:` and tried AFTER local.
+    pub overrides: bool,
 }
 
 /// `rdfs:subClassOf` axioms for type-aware action selection — parsed from the runbook's RDFS
@@ -2275,9 +2325,7 @@ pub fn watched_kernel() -> Arc<Kernel> {
 /// `prefix` (rewriting `<prefix>rest` → `urn:rest` before forwarding), so a resource
 /// under the mount resolves on the remote kernel — and a `trace` stitches the
 /// remote execution under the mount node. Drives the `--mount` flag.
-pub fn watched_kernel_with_mounts(
-    mounts: Vec<(String, String, Arc<dyn ikigai_resolve::Resolver>)>,
-) -> Arc<Kernel> {
+pub fn watched_kernel_with_mounts(mounts: Vec<MountSpec>) -> Arc<Kernel> {
     // Inject the process scheduler so re-entrant fan-out (e.g. `compose`'s `$a{}`
     // markers) runs concurrently on it; single-threaded by default, a pool under
     // `IKIGAI_SCHEDULER=pool[:N]`. The same scheduler is injected as a read-only
