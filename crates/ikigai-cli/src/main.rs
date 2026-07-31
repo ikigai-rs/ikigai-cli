@@ -62,7 +62,7 @@ use ikigai_engine::Engine;
 /// trust dir) so a dedicated identity — e.g. a calendar-federation server — lives in
 /// its own directory instead of the default `<config>/ikigai-cli/quic/`. The
 /// per-file overrides still win over the directory default.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Certs {
     cert_dir: Option<String>,
     server_cert: Option<String>,
@@ -79,8 +79,9 @@ enum Mode {
     /// `--mount`s so the standing DRAIN has an edge to pull from — without them the
     /// drain job fires against a kernel that cannot resolve `urn:edge:` and pulls nothing.
     Daemon {
-        mounts: Vec<(String, String)>,
-        certs: Certs,
+        /// Each mount carries its own certificates, so the daemon needs no
+        /// default set of its own (it never `--connect`s).
+        mounts: Vec<Mount>,
     },
     Serve {
         target: Option<String>,
@@ -134,7 +135,7 @@ enum Mode {
 }
 
 /// Options for the REPL mode.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct ReplArgs {
     plain: bool,
     /// Mount the interactive runbook (`urn:runbook:*`); off by default so the CLI is
@@ -144,11 +145,23 @@ struct ReplArgs {
     /// `None` = the embedded in-process kernel; `Some` = attach to a server, with
     /// `Some(None)` meaning the default Unix socket.
     connect: Option<Option<String>>,
-    /// Remote kernels to compose into the local one: `(prefix, target)` pairs from
-    /// `--mount <prefix>=<target>`, where the target is a Unix socket path or a
-    /// `quic://host:port` URL. Each mounts a `RemoteSpace` so a resource under
-    /// `prefix` resolves on the remote kernel. Embedded (non-`--connect`) only.
-    mounts: Vec<(String, String)>,
+    /// Remote kernels to compose into the local one, from `--mount <prefix>=<target>`
+    /// (a Unix socket path or a `quic://host:port` URL). Each mounts a `RemoteSpace`
+    /// so a resource under `prefix` resolves on the remote kernel. Embedded
+    /// (non-`--connect`) only. Each carries its OWN certificates — distinct peers
+    /// never share a cert set.
+    mounts: Vec<Mount>,
+    certs: Certs,
+}
+
+/// One `--mount`: where it binds, what it connects to, and the certificates for
+/// THAT connection. Cert flags following a `--mount` attach to it; cert flags
+/// before any mount form the default set (used by `--connect`, and by a mount
+/// that declares none of its own).
+#[derive(Clone)]
+struct Mount {
+    prefix: String,
+    target: String,
     certs: Certs,
 }
 
@@ -181,7 +194,13 @@ fn cert_flag(
 
 /// Parse argv. `Ok(None)` means a usage request was handled and we should exit 0.
 fn parse_args() -> Result<Option<Mode>, String> {
-    let mut argv = std::env::args().skip(1).peekable();
+    parse_argv(std::env::args().skip(1))
+}
+
+/// The argument parser proper, over any argv — so it can be tested without a
+/// process (which is how the per-mount certificate behaviour below is pinned).
+fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String> {
+    let mut argv = args.peekable();
 
     if argv.peek().map(String::as_str) == Some("cert") {
         argv.next();
@@ -386,7 +405,15 @@ fn parse_args() -> Result<Option<Mode>, String> {
     let mut repl = ReplArgs::default();
     let mut daemon = false;
     while let Some(arg) = argv.next() {
-        if cert_flag(&arg, &mut argv, &mut repl.certs)? {
+        // Certificates attach to the mount they FOLLOW — `--mount a=X --cert-dir A
+        // --mount b=Y --cert-dir B` gives each peer its own set (which is what
+        // ikigai-emacs has always emitted). Before any mount, they form the
+        // default set: what `--connect` uses, and what a later mount inherits.
+        let cert_target = match repl.mounts.last_mut() {
+            Some(mount) => &mut mount.certs,
+            None => &mut repl.certs,
+        };
+        if cert_flag(&arg, &mut argv, cert_target)? {
             continue;
         }
         match arg.as_str() {
@@ -416,7 +443,13 @@ fn parse_args() -> Result<Option<Mode>, String> {
                 let (prefix, socket) = spec
                     .split_once('=')
                     .ok_or_else(|| format!("--mount expects <prefix>=<socket>, got `{spec}`"))?;
-                repl.mounts.push((prefix.to_string(), socket.to_string()));
+                // Inherit whatever cert flags preceded this mount; any that FOLLOW
+                // it refine this mount alone (see the cert_flag dispatch above).
+                repl.mounts.push(Mount {
+                    prefix: prefix.to_string(),
+                    target: socket.to_string(),
+                    certs: repl.certs.clone(),
+                });
             }
             "-c" | "--command" => {
                 let command = argv
@@ -456,7 +489,6 @@ fn parse_args() -> Result<Option<Mode>, String> {
     if daemon {
         return Ok(Some(Mode::Daemon {
             mounts: repl.mounts,
-            certs: repl.certs,
         }));
     }
     Ok(Some(Mode::Repl(repl)))
@@ -487,7 +519,7 @@ fn main() {
     });
 
     match mode {
-        Mode::Daemon { mounts, certs } => daemon(mounts, certs),
+        Mode::Daemon { mounts } => daemon(mounts),
         Mode::Mcp { grants, scopes } => mcp(grants, scopes),
         Mode::CertGenerate { force, dir } => cert_generate(force, dir),
         Mode::CertAddClient {
@@ -541,7 +573,7 @@ fn main() {
 /// consolidated-view sync all live in it — then park. This is what a
 /// LaunchAgent runs: the desktop machine as a quiet, always-on resolver.
 #[cfg(feature = "embedded")]
-fn daemon(mounts: Vec<(String, String)>, certs: Certs) {
+fn daemon(mounts: Vec<Mount>) {
     // watched_kernel(), NOT kernel_for(): the watchers, the time transport's
     // kernel handle, and the standing-sync registration all live in the
     // watched constructor — a bare served-space kernel would park with the
@@ -554,7 +586,13 @@ fn daemon(mounts: Vec<(String, String)>, certs: Certs) {
         ikigai_embedded::watched_kernel()
     } else {
         let mut resolved = Vec::new();
-        for (prefix, target) in mounts {
+        for mount in mounts {
+            // Each mount connects with ITS OWN certificates.
+            let Mount {
+                prefix,
+                target,
+                certs,
+            } = mount;
             match connect_mount(&target, &certs) {
                 Ok(resolver) => resolved.push((prefix, target, resolver)),
                 // A mount that will not connect is fatal here: the daemon's whole reason to
@@ -589,7 +627,7 @@ fn daemon(mounts: Vec<(String, String)>, certs: Certs) {
 }
 
 #[cfg(not(feature = "embedded"))]
-fn daemon(_mounts: Vec<(String, String)>, _certs: Certs) {
+fn daemon(_mounts: Vec<Mount>) {
     eprintln!("ikigai: --daemon requires the embedded feature");
     std::process::exit(2);
 }
@@ -776,7 +814,7 @@ fn with_profiles(engine: Engine) -> Engine {
 #[cfg(feature = "embedded")]
 fn build_engine(
     connect: Option<Option<String>>,
-    mounts: Vec<(String, String)>,
+    mounts: Vec<Mount>,
     certs: &Certs,
 ) -> Result<Engine, String> {
     match connect {
@@ -790,10 +828,15 @@ fn build_engine(
                 ikigai_embedded::watched_kernel()
             } else {
                 let mut resolved = Vec::new();
-                for (prefix, target) in mounts {
+                for mount in mounts {
                     // The target (socket path or quic:// URL) is the mount's origin
-                    // label, surfaced in the catalog.
-                    let resolver = connect_mount(&target, certs)?;
+                    // label, surfaced in the catalog; each mount pins its OWN peer.
+                    let Mount {
+                        prefix,
+                        target,
+                        certs,
+                    } = mount;
+                    let resolver = connect_mount(&target, &certs)?;
                     resolved.push((prefix, target, resolver));
                 }
                 ikigai_embedded::watched_kernel_with_mounts(resolved)
@@ -1287,4 +1330,95 @@ fn main() {
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(1);
+}
+
+#[cfg(test)]
+mod mount_cert_tests {
+    use super::*;
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn mounts_of(args: &[&str]) -> Vec<Mount> {
+        match parse_argv(argv(args).into_iter()) {
+            Ok(Some(Mode::Repl(repl))) => repl.mounts,
+            Ok(Some(_)) => panic!("expected a repl mode, got another mode"),
+            Ok(None) => panic!("expected a repl mode, got no mode"),
+            Err(e) => panic!("parse failed: {e}"),
+        }
+    }
+
+    /// The bug this fixes: `--cert-dir` was a single global setting, so two mounts
+    /// with different certificate sets silently shared the LAST one — the second
+    /// peer's cert was pinned against the first peer's server, yielding
+    /// "server certificate does not match the pinned certificate". Certificates
+    /// now attach to the mount they follow.
+    #[test]
+    fn each_mount_keeps_its_own_certificates() {
+        let mounts = mounts_of(&[
+            "--mount",
+            "urn:personal:=quic://localhost:4433",
+            "--cert-dir",
+            "/certs/peer",
+            "--mount",
+            "urn:edge:=quic://edge.example:4433",
+            "--cert-dir",
+            "/certs/edge",
+        ]);
+        assert_eq!(mounts.len(), 2);
+        assert_eq!(mounts[0].prefix, "urn:personal:");
+        assert_eq!(mounts[0].certs.cert_dir.as_deref(), Some("/certs/peer"));
+        assert_eq!(mounts[1].prefix, "urn:edge:");
+        assert_eq!(
+            mounts[1].certs.cert_dir.as_deref(),
+            Some("/certs/edge"),
+            "the second mount must NOT inherit the first mount's cert dir"
+        );
+    }
+
+    /// Cert flags BEFORE any mount are the default set: later mounts inherit them
+    /// (and `--connect` uses them), so the single-peer form keeps working.
+    #[test]
+    fn certs_before_a_mount_are_the_default_inherited_by_mounts() {
+        let mounts = mounts_of(&[
+            "--cert-dir",
+            "/certs/default",
+            "--mount",
+            "urn:a:=quic://a.example:4433",
+            "--mount",
+            "urn:b:=quic://b.example:4433",
+            "--cert-dir",
+            "/certs/b",
+        ]);
+        assert_eq!(mounts[0].certs.cert_dir.as_deref(), Some("/certs/default"));
+        assert_eq!(
+            mounts[1].certs.cert_dir.as_deref(),
+            Some("/certs/b"),
+            "a mount's own cert flag overrides the inherited default"
+        );
+    }
+
+    /// Per-file overrides ride along with the mount too, not just --cert-dir.
+    #[test]
+    fn per_file_cert_overrides_are_also_per_mount() {
+        let mounts = mounts_of(&[
+            "--mount",
+            "urn:a:=quic://a.example:4433",
+            "--server-cert",
+            "/certs/a-server.crt",
+            "--mount",
+            "urn:b:=quic://b.example:4433",
+            "--server-cert",
+            "/certs/b-server.crt",
+        ]);
+        assert_eq!(
+            mounts[0].certs.server_cert.as_deref(),
+            Some("/certs/a-server.crt")
+        );
+        assert_eq!(
+            mounts[1].certs.server_cert.as_deref(),
+            Some("/certs/b-server.crt")
+        );
+    }
 }
