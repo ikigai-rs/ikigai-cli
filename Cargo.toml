@@ -26,7 +26,7 @@ ikigai-http = "0.1.7" # 0.1.7 = endpoint-owned redirects (transport must not fol
 # Interactive runbook module (urn:runbook:*) — Linked Data demo tab since 0.1.3;
 # 0.1.5 adds the JSON-LD demo tab (expand/flatten/compact), which works here because
 # the CLI links its own pipe-fixed ikigai-engine.
-ikigai-runbook = "0.1.10" # Basics: urn:fn:conditional branch (lazy) example
+ikigai-runbook = "0.1.11" # Lisp page: eval, verbs-as-functions, s-expr→RDF, sign/verify
 # Linked Data toolkit (separate ikigai-linkeddata repo): RDF transreption + SPARQL.
 ikigai-rdf = "0.1.3" # + urn:rdf:union / urn:rdf:diff (graph set ops, with= carries ?k=v args)
 ikigai-sparql = "0.1.5" # 0.1.5 = unique id per query form (no 4× tool collision) + optional graph/as
@@ -69,7 +69,7 @@ ikigai-lisp = "0.1.9" # 0.1.9 = urn:lisp:run signed envelopes; 0.1.8 ceiling/asy
 ikigai-throttle = "0.1.6" # Timeout overlay = the wire-eval L1 compute governor
 # LLM inference (urn:llm:ask + urn:llm:<provider>:ask + urn:llm:config): a facade grammar
 # over pluggable backends. OpenAI-compatible REST backend (Ollama/vLLM/llama.cpp/mlx_lm).
-ikigai-llm = "0.9.1" # 0.9.1 = wildcard net declaration (kernel-enforcement compatible) + trace notes
+ikigai-llm = "0.9.2" # 0.9.2 = description ids are labels (list shows IRI → name)
 # Video-conference scheduling (urn:meeting:schedule + urn:meeting:<provider>:schedule): a facade
 # over provider backends, Zoom first. Now on crates.io — the git-rev bridge retired at first publish.
 ikigai-meeting = "0.1.0"
