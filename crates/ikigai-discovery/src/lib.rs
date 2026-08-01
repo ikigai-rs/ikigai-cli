@@ -63,9 +63,31 @@ pub struct Peer {
 }
 
 impl Peer {
-    /// The first address, paired with the announced port — what a mount would dial.
+    /// The address a mount should dial, paired with the announced port.
+    ///
+    /// NOT simply the first: mdns-sd hands back a HashSet, so "first" varies run to run —
+    /// the same peer was reported as `192.168.4.178` and `[fe80::1]` on consecutive calls.
+    /// A mount that dials a different address each time is unreproducible, and a link-local
+    /// or loopback address may not reach the peer at all. So rank them and take the best.
     pub fn socket_addr(&self) -> Option<std::net::SocketAddr> {
-        self.addrs.first().map(|ip| (*ip, self.port).into())
+        let mut usable: Vec<&IpAddr> = self.addrs.iter().collect();
+        usable.sort_by_key(|ip| (address_rank(ip), ip.to_string()));
+        usable.first().map(|ip| (**ip, self.port).into())
+    }
+}
+
+/// Lower is better. A routable IPv4 first (what a LAN peer is actually reachable on), then
+/// routable IPv6, then link-local, and loopback last — a peer only reachable on loopback is
+/// on this very machine, which is the least useful answer to "where do I dial it".
+fn address_rank(ip: &IpAddr) -> u8 {
+    match ip {
+        IpAddr::V4(v4) if v4.is_loopback() => 4,
+        IpAddr::V4(v4) if v4.is_link_local() => 3,
+        IpAddr::V4(_) => 0,
+        IpAddr::V6(v6) if v6.is_loopback() => 4,
+        // No stable `is_unicast_link_local` on stable Rust: fe80::/10 by inspection.
+        IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80 => 3,
+        IpAddr::V6(_) => 1,
     }
 }
 
@@ -315,6 +337,33 @@ mod tests {
             s.present.insert("plasma".to_string(), peer("plasma"));
         }
         assert_eq!(browser.presence("plasma"), Presence::Present);
+    }
+
+    /// The address a mount dials must be DETERMINISTIC and routable. mdns-sd returns a
+    /// HashSet, so taking `.first()` reported the same peer as `192.168.4.178:4433` and
+    /// `[fe80::1]:4433` on consecutive calls — one of which a mount cannot use.
+    #[test]
+    fn the_dialled_address_prefers_routable_and_is_stable() {
+        let mut p = peer("plasma");
+        p.addrs = vec![
+            "fe80::1".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+            "192.168.4.178".parse().unwrap(),
+            "::1".parse().unwrap(),
+        ];
+        assert_eq!(
+            p.socket_addr().unwrap().to_string(),
+            "192.168.4.178:4433",
+            "a routable IPv4 beats link-local and loopback"
+        );
+
+        // Same set, different order in — same answer out.
+        p.addrs.reverse();
+        assert_eq!(p.socket_addr().unwrap().to_string(), "192.168.4.178:4433");
+
+        // With nothing routable, still deterministic rather than arbitrary.
+        p.addrs = vec!["fe80::2".parse().unwrap(), "fe80::1".parse().unwrap()];
+        assert_eq!(p.socket_addr().unwrap().to_string(), "[fe80::1]:4433");
     }
 
     #[test]
