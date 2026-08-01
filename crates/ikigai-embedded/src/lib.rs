@@ -1901,7 +1901,7 @@ fn catalog_descriptions(turtle: &str) -> std::collections::BTreeMap<String, Desc
         let mut actions: Vec<(String, Vec<String>)> = Vec::new();
         for verb in verbs.get(&endpoint).into_iter().flatten() {
             // Meta is every endpoint's self-description, not a selectable action.
-            if verb == "Meta" || seen_verbs.iter().any(|seen| *seen == verb) {
+            if verb == "Meta" || seen_verbs.contains(&verb) {
                 continue;
             }
             seen_verbs.push(verb);
