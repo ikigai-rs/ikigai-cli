@@ -1875,21 +1875,38 @@ fn catalog_descriptions(turtle: &str) -> std::collections::BTreeMap<String, Desc
         let summary = summaries.get(&endpoint).cloned().unwrap_or_default();
         // Declaration order is preserved by the parser, and it is the order a generated
         // function's positional parameters must follow.
-        let required: Vec<String> = inputs_of
-            .get(&endpoint)
-            .into_iter()
-            .flatten()
-            .filter(|i| input_required.get(*i).copied().unwrap_or(false))
-            .filter_map(|i| input_name.get(i).cloned())
-            .collect();
-        let actions: Vec<(String, Vec<String>)> = verbs
-            .get(&endpoint)
-            .into_iter()
-            .flatten()
+        let mut required: Vec<String> = Vec::new();
+        for input in inputs_of.get(&endpoint).into_iter().flatten() {
+            if !input_required.get(input).copied().unwrap_or(false) {
+                continue;
+            }
+            let Some(name) = input_name.get(input) else {
+                continue;
+            };
+            // DEDUPE BY NAME, keeping declaration order. The catalog concatenates every
+            // space, so a MOUNTED kernel describes the same endpoint again under the same
+            // skolem subject (`urn:ikigai:endpoint:llm-ask`) — and accumulating across both
+            // gave `prompt` twice, which generated
+            //     (defun ikigai-llm-ask (prompt prompt &rest args) …)
+            // an uncallable function. Only visible on a machine that actually has a mount,
+            // which is the machine that needs this most.
+            if !required.iter().any(|existing| existing == name) {
+                required.push(name.clone());
+            }
+        }
+        // Verbs dedupe for the same reason the inputs do: a mounted kernel describes the
+        // same endpoint again under the same subject, so `ik:verb "Source"` arrives twice
+        // and would emit the same defun twice.
+        let mut seen_verbs: Vec<&String> = Vec::new();
+        let mut actions: Vec<(String, Vec<String>)> = Vec::new();
+        for verb in verbs.get(&endpoint).into_iter().flatten() {
             // Meta is every endpoint's self-description, not a selectable action.
-            .filter(|v| *v != "Meta")
-            .map(|v| (v.clone(), required.clone()))
-            .collect();
+            if verb == "Meta" || seen_verbs.iter().any(|seen| *seen == verb) {
+                continue;
+            }
+            seen_verbs.push(verb);
+            actions.push((verb.clone(), required.clone()));
+        }
         if !actions.is_empty() {
             out.insert(id, (summary, actions));
         }
@@ -4309,6 +4326,29 @@ mod tests {
         );
         let out = aliases_scheme(&targets, "");
         assert!(out.contains("(define (mystery-go . rest)"), "{out}");
+    }
+
+    /// A MOUNTED kernel describes the same endpoint again, under the same skolem subject,
+    /// so the catalog carries it twice — and the required inputs were accumulated across
+    /// both. That generated `(defun ikigai-llm-ask (prompt prompt &rest args) …)`, which
+    /// Emacs refuses to call. Invisible without a mount; guaranteed with one.
+    #[test]
+    fn a_duplicated_endpoint_does_not_duplicate_its_arguments() {
+        let catalog = r#"@prefix ik: <https://ikigai-rs.dev/ns#> .
+<urn:ikigai:endpoint:llm-ask> a ik:Endpoint ; ik:id "llm-ask" ; ik:verb "Source" ;
+    ik:input [ ik:inputName "prompt" ; ik:required true ] ,
+             [ ik:inputName "model" ; ik:required false ] .
+<urn:ikigai:endpoint:llm-ask> a ik:Endpoint ; ik:id "llm-ask" ; ik:verb "Source" ;
+    ik:input [ ik:inputName "prompt" ; ik:required true ] ,
+             [ ik:inputName "model" ; ik:required false ] .
+"#;
+        let described = catalog_descriptions(catalog);
+        let (_summary, actions) = described.get("llm-ask").expect("parsed");
+        assert_eq!(
+            *actions,
+            vec![("Source".to_string(), vec!["prompt".to_string()])],
+            "one prompt, not two"
+        );
     }
 
     /// Inputs may be BLANK nodes in the catalog's Turtle.    /// Inputs may be BLANK nodes in the catalog's Turtle. Filtering to named subjects
