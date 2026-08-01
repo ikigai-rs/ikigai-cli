@@ -34,6 +34,8 @@ usage:
   ikigai --mount <pfx>=<tgt>   compose a remote kernel at prefix <pfx> (<tgt> = Unix path or quic://host:port)
   ikigai serve [<target>]      run a kernel server (a Unix socket path, or quic://addr to bind)
   ikigai serve <q> --cap <s>   serve under a fixed capability ceiling <s> every client is clamped to
+  ikigai serve <q> --announce  also advertise this kernel on the local network (mDNS), so clients
+                               can mount it by name; `source urn:peer:list` shows who is out there
   ikigai serve … --code-signer <k>  accept SIGNED programs (urn:lisp:run) vouched for by key
                                resource <k> (repeatable; --code-signers-dir sets where
                                urn:codekey:{file} reads from). Without it the door is unbound.
@@ -117,6 +119,10 @@ enum Mode {
         /// `--routes-only`: an un-routed path 404s instead of falling through to the mechanical
         /// default — the route table becomes an exhaustive allow-list (the public-edge posture).
         routes_only: bool,
+        /// `--announce`: advertise this kernel on the local network over mDNS, so clients
+        /// can mount it by name instead of by an address that moves. Opt-in — broadcasting
+        /// what a machine serves is a disclosure.
+        announce: bool,
     },
     /// Serve the capability-scoped manifold as an MCP (Model Context Protocol)
     /// server over stdio. `grants`/`scopes` union into the session capability —
@@ -292,8 +298,13 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
         let mut cors_origins = Vec::new();
         let mut routes = None;
         let mut routes_only = false;
+        let mut announce = false;
         while let Some(arg) = argv.next() {
             if cert_flag(&arg, &mut argv, &mut certs)? {
+                continue;
+            }
+            if arg == "--announce" {
+                announce = true;
                 continue;
             }
             if arg == "--name" {
@@ -395,6 +406,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
             cors_origins,
             routes,
             routes_only,
+            announce,
         }));
     }
 
@@ -590,6 +602,7 @@ fn main() {
             target,
             certs,
             caps,
+            announce,
             http,
             trust_proxy,
             cors_origins,
@@ -605,7 +618,7 @@ fn main() {
                 routes.as_deref(),
                 routes_only,
             ),
-            (None, Some(t)) if is_quic(t) => serve_quic(t, &certs, &caps),
+            (None, Some(t)) if is_quic(t) => serve_quic(t, &certs, &caps, announce),
             (None, _) if !caps.is_empty() => {
                 eprintln!("ikigai: --cap sets a per-connection ceiling and needs a quic:// target");
                 std::process::exit(2);
@@ -1194,7 +1207,7 @@ fn cert_add_client(_name: &str, _cert_dir: Option<String>, _force: bool) -> ! {
 // --- QUIC serve / connect ---------------------------------------------------
 
 #[cfg(all(feature = "embedded", feature = "quic"))]
-fn serve_quic(target: &str, certs: &Certs, caps: &[String]) -> ! {
+fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool) -> ! {
     let caps = caps.to_vec();
     let result = (|| -> Result<(), String> {
         let addr = quic::parse_addr(target)?;
@@ -1275,6 +1288,48 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String]) -> ! {
             "ikigai: serving on {target}  ({posture}; surface: {surface}; {} trusted client cert(s))  (Ctrl-C to stop)",
             trusted.len()
         );
+        // Announce on the local network, so a client can mount this kernel by NAME rather
+        // than by an address that moves. Opt-in: broadcasting what a machine serves is a
+        // disclosure, and a server on an untrusted network may want to be found only by
+        // those who were told where it is.
+        //
+        // What travels is what the banner already says — the name, the port, the surface,
+        // the ceiling. It is ADVERTISEMENT, not authority: the ceiling is enforced here at
+        // resolution time whatever the TXT record claims, and a listener still needs a
+        // pinned certificate to get a connection at all.
+        //
+        // Held for the process lifetime: dropping it sends the mDNS goodbye, which is what
+        // lets a peer distinguish "gone" from "never heard of".
+        let _announcement = if announce {
+            let name = ikigai_embedded::instance_name();
+            let wire_version = ikigai_wire::PROTOCOL_VERSION.to_string();
+            match ikigai_discovery::announce(
+                name,
+                addr.port(),
+                &[
+                    (ikigai_discovery::TXT_SURFACE, surface.as_str()),
+                    (ikigai_discovery::TXT_CEILING, posture.as_str()),
+                    (ikigai_discovery::TXT_VERSION, wire_version.as_str()),
+                ],
+            ) {
+                Ok(handle) => {
+                    eprintln!(
+                        "ikigai: announcing as \"{name}\" on {}",
+                        ikigai_discovery::SERVICE_TYPE
+                    );
+                    Some(handle)
+                }
+                // Not fatal: a kernel that cannot announce still serves everyone who knows
+                // its address. Loud, though — silently not announcing would look like a
+                // network with nobody on it.
+                Err(e) => {
+                    eprintln!("ikigai: warning: could not announce on this network: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         ikigai_quic::serve(kernel, addr, &identity, &trusted, minter).map_err(|e| e.to_string())
     })();
     match result {
@@ -1297,7 +1352,7 @@ fn connect_quic(target: &str, certs: &Certs) -> Result<Engine, String> {
 }
 
 #[cfg(all(feature = "embedded", not(feature = "quic")))]
-fn serve_quic(_target: &str, _certs: &Certs, _caps: &[String]) -> ! {
+fn serve_quic(_target: &str, _certs: &Certs, _caps: &[String], _announce: bool) -> ! {
     eprintln!("ikigai: `quic://` needs the `quic` feature");
     std::process::exit(1);
 }

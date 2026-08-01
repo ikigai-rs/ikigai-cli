@@ -1590,6 +1590,184 @@ fn meeting_space() -> EndpointSpace {
     )
 }
 
+/// The capability a peer listing needs. Discovery is local-network reconnaissance — who is
+/// out there, and what they claim to serve — so it is gated, not free.
+const CAP_NET_DISCOVER: &str = "urn:cap:net:discover";
+
+/// The process's mDNS browse, started ON FIRST USE and then kept.
+///
+/// Explicitly lazy: a background multicast listener is a daemon-ish thing, and "every
+/// process that builds a kernel silently starts one" is the pattern removed from the
+/// reactor. Resolving `urn:peer:*` IS the request for it, so starting it there is the
+/// honest trigger.
+static BROWSER: std::sync::OnceLock<Option<ikigai_discovery::Browser>> = std::sync::OnceLock::new();
+
+/// How long the FIRST listing waits for announcements to arrive. Multicast replies are not
+/// instant, so a browse started microseconds ago legitimately knows nothing; without this a
+/// first call would report an empty network and look like a broken feature. Later calls read
+/// the warm cache and return immediately.
+const FIRST_LISTEN: std::time::Duration = std::time::Duration::from_millis(1200);
+
+/// `urn:peer:list` — the ikigai kernels announcing themselves on this network.
+///
+/// Uncacheable: it is live platform state, and the answer changes when a laptop closes.
+struct PeerList;
+
+/// Does this machine hold a pinned server certificate for `name`?
+///
+/// The deployed convention is one directory per peer — `<config>/ikigai/quic-<name>/` holds
+/// that peer's `server.crt` plus our client identity (plasma has `quic-bug`, bug has
+/// `quic-plasma`). Holding one means "I could try": the peer must ALSO trust our client
+/// cert, and only a dial proves that. The narrower claim is the one worth reporting.
+fn holds_cert_for(name: &str) -> bool {
+    let Ok(home) = std::env::var("HOME") else {
+        return false;
+    };
+    std::path::PathBuf::from(home)
+        .join(".config/ikigai")
+        .join(format!("quic-{name}"))
+        .join("server.crt")
+        .exists()
+}
+
+#[async_trait::async_trait]
+impl Endpoint for PeerList {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        if !inv.capability.allows(CAP_NET_DISCOVER) {
+            return Err(Error::Denied(format!(
+                "listing peers requires `{CAP_NET_DISCOVER}`"
+            )));
+        }
+        let mut fresh = false;
+        let browser = BROWSER
+            .get_or_init(|| {
+                fresh = true;
+                ikigai_discovery::Browser::start().ok()
+            })
+            .as_ref()
+            .ok_or_else(|| {
+                Error::Endpoint("could not start an mDNS browse on this machine".to_string())
+            })?;
+        if fresh {
+            std::thread::sleep(FIRST_LISTEN);
+        }
+
+        let mut peers = browser.peers();
+        for peer in &mut peers {
+            peer.trusted = holds_cert_for(&peer.name);
+        }
+        // `trusted=yes` narrows to peers this machine could actually dial. Deliberately NOT
+        // the default: seeing an unenrolled peer is how you know there is something to
+        // enrol. What must never happen is CONNECTING to one, and that is the mount's
+        // business, not the listing's.
+        if inv
+            .inline_str("trusted")
+            .map(|v| v == "yes")
+            .unwrap_or(false)
+        {
+            peers.retain(|p| p.trusted);
+        }
+
+        let turtle = inv
+            .inline_str("as")
+            .map(|v| v.contains("turtle"))
+            .unwrap_or(false);
+        let body = if turtle {
+            peers_turtle(&peers)
+        } else {
+            peers_text(&peers)
+        };
+        let repr_type = if turtle { "text/turtle" } else { "text/plain" };
+        // Uncacheable by default (no .cacheable()) — live platform state: the answer
+        // changes when a laptop closes.
+        Ok(Representation::new(
+            ReprType::new(repr_type),
+            body.into_bytes(),
+        ))
+    }
+
+    fn name(&self) -> &str {
+        "peer-list"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("peer-list")
+            .summary("the ikigai kernels announcing themselves on this local network")
+            .verb(Verb::Source)
+            .action(
+                ActionSpec::new(Verb::Source)
+                    .summary("list — who is out there, and what they claim to serve")
+                    .input(
+                        ArgSpec::new("trusted")
+                            .optional()
+                            .one_of(["yes", "no"])
+                            .summary(
+                                "yes = only peers this machine holds a pinned certificate \
+                                 for (i.e. could dial)",
+                            ),
+                    )
+                    .input(
+                        ArgSpec::new("as")
+                            .optional()
+                            .one_of(["text/plain", "text/turtle"])
+                            .summary("the representation to return (default text/plain)"),
+                    )
+                    .requires(CAP_NET_DISCOVER),
+            )
+    }
+}
+
+fn peers_text(peers: &[ikigai_discovery::Peer]) -> String {
+    if peers.is_empty() {
+        // An empty network and a browse that has heard nothing YET look identical, and
+        // saying so is more honest than an empty list that reads as "nobody is there".
+        return "no peers heard announcing on this network\n".to_string();
+    }
+    peers
+        .iter()
+        .map(|p| {
+            let addr = p
+                .socket_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "(no address)".to_string());
+            format!(
+                "{}  {}  {}  {}\n",
+                p.name,
+                addr,
+                if p.trusted { "trusted" } else { "unenrolled" },
+                p.surface.as_deref().unwrap_or("(surface not advertised)")
+            )
+        })
+        .collect()
+}
+
+fn peers_turtle(peers: &[ikigai_discovery::Peer]) -> String {
+    let mut out = String::from(
+        "@prefix ik: <https://ikigai-rs.dev/ns#> .\n@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\n",
+    );
+    for p in peers {
+        // Skolemized, per the house rule: a stable IRI per peer name, never a blank node.
+        out.push_str(&format!("<urn:peer:{}> a ik:Peer ;\n", p.name));
+        out.push_str(&format!("    ik:peerName \"{}\" ;\n", p.name));
+        if let Some(addr) = p.socket_addr() {
+            out.push_str(&format!("    ik:peerAddress \"{addr}\" ;\n"));
+        }
+        if let Some(surface) = &p.surface {
+            out.push_str(&format!("    ik:peerSurface \"{surface}\" ;\n"));
+        }
+        if let Some(ceiling) = &p.ceiling {
+            out.push_str(&format!("    ik:peerCeiling \"{ceiling}\" ;\n"));
+        }
+        // `trusted` is OURS, not the peer's: whether this machine holds a cert for it. An
+        // announcement can claim anything; only the pinned cert decides who it is.
+        out.push_str(&format!(
+            "    ik:pinnedHere \"{}\"^^xsd:boolean .\n\n",
+            p.trusted
+        ));
+    }
+    out
+}
+
 /// Bridges the keystore to `ikigai_meeting::SecretReader`: resolve a secret by name from the same
 /// backend the `urn:secret:*` space reads. (Per-invocation secret-cap gating is a later refinement;
 /// today the embedded-only reachability of the meeting endpoint plus its net-cap check are the
@@ -2025,6 +2203,11 @@ fn root_space_with_mounts(mounts: Vec<MountSpec>) -> Arc<dyn Space> {
         // Video-conference scheduling (urn:meeting:schedule + urn:meeting:zoom:schedule). Reads
         // the Zoom creds from the keystore; embedded-root only (not served over the wire).
         Arc::new(meeting_space()) as Arc<dyn Space>,
+        // Who else is on this network (urn:peer:list). Embedded-root only, like the
+        // meeting endpoints: telling a remote caller what else is reachable from here is
+        // reconnaissance, and a served kernel has no business answering it.
+        Arc::new(EndpointSpace::new().bind(Exact::new("urn:peer:list"), PeerList))
+            as Arc<dyn Space>,
         // The org agenda (urn:org:agenda[:{period}]) over the configured org
         // files, which it reads through the kernel via urn:orgfile:*.
         Arc::new(ikigai_org::space(

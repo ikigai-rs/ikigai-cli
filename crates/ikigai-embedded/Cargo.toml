@@ -26,6 +26,7 @@ ikigai-lisp = { workspace = true }
 # The Timeout interception overlay fronting urn:lisp:eval on every SERVED surface
 # (wire-eval L1's wall-clock compute governor).
 ikigai-throttle = { workspace = true }
+ikigai-discovery = { path = "../ikigai-discovery", version = "0.1.9" }
 ikigai-fs = { workspace = true }
 ikigai-http = { workspace = true }
 ikigai-runbook = { workspace = true }

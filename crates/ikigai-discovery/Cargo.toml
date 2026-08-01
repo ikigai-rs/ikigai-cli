@@ -1,0 +1,14 @@
+[package]
+name = "ikigai-discovery"
+description = "Announce and find ikigai kernels on the local network over multicast DNS."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Pure Rust, and explicitly runtime-free (it drives its own thread and talks over
+# channels) — so discovery does not drag an async runtime into a kernel that
+# doesn't already have one.
+mdns-sd = { version = "0.20", default-features = false }
