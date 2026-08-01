@@ -236,11 +236,7 @@ pub fn connect(
         .expect("valid bind address");
         let mut endpoint = quinn::Endpoint::client(bind)?;
         endpoint.set_default_client_config(config);
-        let connection = endpoint
-            .connect(addr, "ikigai")
-            .map_err(other)?
-            .await
-            .map_err(other)?;
+        let connection = dial(&endpoint, addr).await?;
         io::Result::Ok((endpoint, connection))
     })?;
     Ok(QuicResolver {
@@ -307,12 +303,7 @@ impl QuicResolver {
     /// identity and trust (they live in the endpoint's default client config). The lock is
     /// taken only to swap the result in, after the await completes.
     async fn reconnect(&self) -> io::Result<()> {
-        let connection = self
-            .endpoint
-            .connect(self.addr, "ikigai")
-            .map_err(other)?
-            .await
-            .map_err(other)?;
+        let connection = dial(&self.endpoint, self.addr).await?;
         *self.connection.lock().unwrap() = connection;
         Ok(())
     }
@@ -455,6 +446,32 @@ fn server_config(
     Ok(quinn::ServerConfig::with_crypto(Arc::new(quic)))
 }
 
+/// How long a dial may run before the peer is declared unreachable.
+///
+/// Without this, quinn retries the handshake against a silent address for as long as its
+/// defaults allow, and a mount whose peer has gone BLOCKS the caller instead of failing.
+/// A closed port on loopback answers ICMP-unreachable and fails fast, which is why this
+/// hides in local testing — but a real LAN peer that stops responding just drops packets,
+/// and the caller hangs. Observed on bug↔plasma: `--override` took minutes to give up and
+/// `--prefer` appeared to hang outright, which defeats the entire point of a mount that is
+/// supposed to degrade to the local binding.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Dial with a bound: a peer that never answers must not block forever.
+async fn dial(endpoint: &quinn::Endpoint, addr: SocketAddr) -> io::Result<quinn::Connection> {
+    let connecting = endpoint.connect(addr, "ikigai").map_err(other)?;
+    match tokio::time::timeout(CONNECT_TIMEOUT, connecting).await {
+        Ok(result) => result.map_err(other),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "connect {addr}: timed out after {}s",
+                CONNECT_TIMEOUT.as_secs()
+            ),
+        )),
+    }
+}
+
 fn client_config(
     identity: &Identity,
     trusted_server_cert_pem: &str,
@@ -472,6 +489,11 @@ fn client_config(
         .map_err(other)?;
     tls.alpn_protocols = vec![ALPN.to_vec()];
     let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(other)?;
+    // NOTE: transport timeouts are deliberately left at quinn's defaults. An earlier version
+    // of this change also set `max_idle_timeout` + `keep_alive_interval`; the keep-alive made
+    // a DEAD peer take LONGER to notice (the reconnect test went 30s → 60s+), because a
+    // connection being pinged looks active. quinn's default idle timeout already bounds a
+    // peer that dies mid-request. Only the dial needed bounding.
     Ok(quinn::ClientConfig::new(Arc::new(quic)))
 }
 
@@ -854,6 +876,34 @@ mod tests {
     fn upper(text: &str) -> Request {
         Request::new(Verb::Source, Iri::parse("urn:fn:toUpper").unwrap())
             .with_arg("in", ArgRef::Inline(text.as_bytes().to_vec()))
+    }
+
+    /// A dial to a peer that never answers must FAIL, not hang.
+    ///
+    /// The regression: quinn's defaults retry the handshake for a very long time, so a mount
+    /// whose peer had gone blocked the caller. Loopback hides it — a closed port answers
+    /// ICMP-unreachable and fails fast — so this test binds a real UDP socket and simply
+    /// never speaks QUIC on it, which is what a silent LAN peer looks like. Measured on
+    /// bug↔plasma before the fix: ~60s of dead air before `--prefer` fell back to local.
+    #[test]
+    fn a_dial_to_a_silent_peer_times_out_rather_than_hanging() {
+        // Bound to a real socket, so packets are accepted and dropped rather than refused.
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = silent.local_addr().unwrap();
+        let server_id = generate();
+        let client_id = generate();
+
+        let started = std::time::Instant::now();
+        let result = connect(addr, &client_id, &server_id.cert_pem);
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "a silent peer must not appear to connect");
+        assert!(
+            elapsed < CONNECT_TIMEOUT * 3,
+            "must give up near the {}s bound, took {:?}",
+            CONNECT_TIMEOUT.as_secs(),
+            elapsed
+        );
     }
 
     #[test]
