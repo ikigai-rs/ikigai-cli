@@ -4041,8 +4041,30 @@ pub fn trusted_kernel_for(nature: &'static str) -> Kernel {
     // governor still fronts it: trusted PEER ≠ trusted PROGRAM — a runaway
     // shipped over the socket times out (typed, transient) instead of pinning
     // the server.
+    trusted_kernel_with_mounts(nature, Vec::new())
+}
+
+/// The trusted IPC surface, composing remote kernels into it.
+///
+/// THE HOST OWNS THE TOPOLOGY. A local client (Emacs, the REPL, MCP) then reaches a peer's
+/// resources by talking to this socket, without knowing where that peer is or holding its
+/// certificates — and without needing the platform permissions the discovery itself needs.
+/// On macOS that is the difference between working and not: multicast is granted per
+/// RESPONSIBLE process, so an `ikigai` spawned by Emacs.app inherits Emacs's grant rather
+/// than the one you gave your terminal, and a browse that is denied simply hears nothing.
+/// One daemon, granted once, removes that from every client's problem.
+///
+/// It is also what `ikigai.el`'s own docs already promised — "a connected host owns its own
+/// mounts, so a machine's transport and topology are a property of that host" — which was
+/// unachievable while only the REPL and `--daemon` could take mount flags.
+pub fn trusted_kernel_with_mounts(nature: &'static str, mounts: Vec<MountSpec>) -> Kernel {
     let _ = nature;
-    Kernel::with_meta_renderer(with_wire_eval(root_space()), Arc::new(CliRenderer))
+    let space = if mounts.is_empty() {
+        root_space()
+    } else {
+        root_space_with_mounts(mounts)
+    };
+    Kernel::with_meta_renderer(with_wire_eval(space), Arc::new(CliRenderer))
         .with_clock(Arc::new(SystemClock))
         .with_subclass_axioms(subclass_axioms())
 }

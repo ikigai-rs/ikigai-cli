@@ -36,6 +36,9 @@ usage:
   ikigai serve <q> --cap <s>   serve under a fixed capability ceiling <s> every client is clamped to
   ikigai serve <q> --announce  also advertise this kernel on the local network (mDNS), so clients
                                can mount it by name; `source urn:peer:list` shows who is out there
+  ikigai serve <s> --prefer …  a served host may take --mount/--override/--prefer too, so IT owns
+                               the topology: a local client reaches a peer through this socket
+                               without holding its certs or finding it itself
   ikigai serve … --code-signer <k>  accept SIGNED programs (urn:lisp:run) vouched for by key
                                resource <k> (repeatable; --code-signers-dir sets where
                                urn:codekey:{file} reads from). Without it the door is unbound.
@@ -125,6 +128,11 @@ enum Mode {
         /// can mount it by name instead of by an address that moves. Opt-in — broadcasting
         /// what a machine serves is a disclosure.
         announce: bool,
+        /// Remote kernels composed into the served surface (`--mount`/`--override`/
+        /// `--prefer`, same syntax as the REPL). THE HOST OWNS THE TOPOLOGY: a local client
+        /// then reaches a peer through this socket without knowing where it is, holding its
+        /// certificates, or needing the platform permission discovery requires.
+        mounts: Vec<Mount>,
     },
     /// Serve the capability-scoped manifold as an MCP (Model Context Protocol)
     /// server over stdio. `grants`/`scopes` union into the session capability —
@@ -301,12 +309,41 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
         let mut routes = None;
         let mut routes_only = false;
         let mut announce = false;
+        let mut mounts: Vec<Mount> = Vec::new();
         while let Some(arg) = argv.next() {
             if cert_flag(&arg, &mut argv, &mut certs)? {
+                // A cert flag FOLLOWING a mount belongs to that mount (the REPL's rule),
+                // so two peers with different identities never share a set. Flags before
+                // any mount are this server's own identity.
+                if let Some(mount) = mounts.last_mut() {
+                    mount.certs = certs.clone();
+                }
                 continue;
             }
             if arg == "--announce" {
                 announce = true;
+                continue;
+            }
+            if let Some(kind) = match arg.as_str() {
+                "--mount" => Some(ikigai_embedded::MountKind::Alias),
+                "--override" => Some(ikigai_embedded::MountKind::Override),
+                "--prefer" => Some(ikigai_embedded::MountKind::Prefer),
+                _ => None,
+            } {
+                let spec = argv
+                    .next()
+                    .ok_or_else(|| format!("{arg} needs <prefix>=<target>"))?;
+                let (prefix, target) = spec
+                    .split_once('=')
+                    .ok_or_else(|| format!("{arg} expects <prefix>=<target>, got `{spec}`"))?;
+                // Cert flags AFTER a mount attach to it (same rule as the REPL), so two
+                // peers with different identities never share a cert set.
+                mounts.push(Mount {
+                    prefix: prefix.to_string(),
+                    target: target.to_string(),
+                    certs: certs.clone(),
+                    kind,
+                });
                 continue;
             }
             if arg == "--name" {
@@ -409,6 +446,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
             routes,
             routes_only,
             announce,
+            mounts,
         }));
     }
 
@@ -605,6 +643,7 @@ fn main() {
             certs,
             caps,
             announce,
+            mounts,
             http,
             trust_proxy,
             cors_origins,
@@ -625,7 +664,7 @@ fn main() {
                 eprintln!("ikigai: --cap sets a per-connection ceiling and needs a quic:// target");
                 std::process::exit(2);
             }
-            (None, _) => serve_ipc(target),
+            (None, _) => serve_ipc(target, mounts),
         },
         Mode::Repl(args) => {
             // `--demo` seeds the runtime demo flag; `demo on`/`off` (→ urn:host:demo)
@@ -1446,10 +1485,34 @@ fn connect_quic(_target: &str, _certs: &Certs) -> Result<Engine, String> {
 // --- IPC serve / connect ----------------------------------------------------
 
 #[cfg(all(feature = "embedded", feature = "ipc", unix))]
-fn serve_ipc(path: Option<String>) -> ! {
+fn serve_ipc(path: Option<String>, mounts: Vec<Mount>) -> ! {
     let socket = ipc_socket(path);
-    eprintln!("ikigai: serving on {}  (Ctrl-C to stop)", socket.display());
-    match ikigai_ipc::serve(ikigai_embedded::trusted_kernel_for("Remote (IPC)"), &socket) {
+    // Connect the mounts BEFORE announcing readiness: a host that says it is serving and
+    // then cannot reach the peer it was told to compose is worse than one that refuses to
+    // start. (A `--prefer` mount is exempt — its peer being absent is normal, and it dials
+    // on demand.)
+    let mut resolved = Vec::new();
+    for mount in mounts {
+        let target = mount.target.clone();
+        match resolve_mount(mount) {
+            Ok(spec) => resolved.push(spec),
+            Err(e) => {
+                eprintln!("ikigai: --mount {target}: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+    let mounted = if resolved.is_empty() {
+        String::new()
+    } else {
+        format!("; {} mount(s)", resolved.len())
+    };
+    eprintln!(
+        "ikigai: serving on {}{mounted}  (Ctrl-C to stop)",
+        socket.display()
+    );
+    let kernel = ikigai_embedded::trusted_kernel_with_mounts("Remote (IPC)", resolved);
+    match ikigai_ipc::serve(kernel, &socket) {
         Ok(()) => std::process::exit(0),
         Err(e) => {
             eprintln!("ikigai: serve error: {e}");
@@ -1487,7 +1550,7 @@ fn ipc_socket(path: Option<String>) -> std::path::PathBuf {
 }
 
 #[cfg(all(feature = "embedded", not(all(feature = "ipc", unix))))]
-fn serve_ipc(_path: Option<String>) -> ! {
+fn serve_ipc(_path: Option<String>, _mounts: Vec<Mount>) -> ! {
     eprintln!("ikigai: a Unix-socket server needs the `ipc` feature on a Unix platform");
     std::process::exit(1);
 }
