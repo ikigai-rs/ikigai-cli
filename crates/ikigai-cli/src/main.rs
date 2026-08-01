@@ -54,6 +54,8 @@ usage:
                                rerouted; the most specific override wins
   ikigai --prefer <p>=<t>      like --override, but falls back to the LOCAL binding when the peer
                                is unreachable (transient failures only; denials still propagate)
+  <t> = peer:<name>            find that peer on the local network (mDNS) instead of naming an
+                               address; needs a pinned cert at <config>/ikigai/quic-<name>/
   ikigai --react               run the space reactor in this session — claims and executes tuples
                                dropped in the workspace. OFF by default; the daemon is the worker
   ikigai cert generate         create the pinned QUIC certificates (--dir <d> for a dedicated set)
@@ -1067,11 +1069,83 @@ fn connect_mount(
     target: &str,
     certs: &Certs,
 ) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
+    // `peer:<name>` — mount by NAME, letting mDNS supply the address. Addresses move
+    // (bug's `ipconfig getifaddr en0` came back empty during the mail work, because it was
+    // on another interface); a name does not.
+    if let Some(name) = target.strip_prefix("peer:") {
+        let (resolved, certs) = resolve_peer(name, certs)?;
+        return connect_mount_quic(&resolved, &certs);
+    }
     if is_quic(target) {
         connect_mount_quic(target, certs)
     } else {
         connect_mount_ipc(target)
     }
+}
+
+/// How long to listen before deciding a peer is not out there. Multicast replies are not
+/// instant, so a browse started microseconds ago legitimately knows nothing.
+#[cfg(all(feature = "embedded", feature = "quic"))]
+const PEER_DISCOVERY_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Turn `peer:<name>` into a dialable `quic://host:port` plus the certificates for it.
+///
+/// DISCOVERY SUPPLIES THE ADDRESS, NEVER THE TRUST. An announced name is
+/// attacker-controlled — anything on the LAN can claim to be `plasma` — so a named mount
+/// REQUIRES a pinned server certificate, by the deployed convention
+/// `<config>/ikigai/quic-<name>/`. An impostor gets a failed handshake; an unenrolled peer
+/// gets a refusal that says how to enrol it, rather than a connection.
+///
+/// That convention is also why this is ergonomic: the name determines both the address (by
+/// announcement) and the identity (by directory), so `--prefer urn:llm:=peer:plasma` needs
+/// no address and no `--cert-dir`.
+#[cfg(all(feature = "embedded", feature = "quic"))]
+fn resolve_peer(name: &str, certs: &Certs) -> Result<(String, Certs), String> {
+    let browser = ikigai_discovery::Browser::start()
+        .map_err(|e| format!("peer:{name}: could not browse this network: {e}"))?;
+    std::thread::sleep(PEER_DISCOVERY_WAIT);
+    let peer = browser.peer(name).ok_or_else(|| {
+        format!(
+            "peer:{name}: no peer is announcing under that name \
+             (`source urn:peer:list` shows who is). The peer must serve with `--announce`."
+        )
+    })?;
+    let addr = peer
+        .socket_addr()
+        .ok_or_else(|| format!("peer:{name}: announced no usable address"))?;
+
+    let mut certs = certs.clone();
+    if certs.cert_dir.is_none() && certs.server_cert.is_none() {
+        let dir = peer_cert_dir(name);
+        if !dir.join("server.crt").exists() {
+            return Err(format!(
+                "peer:{name}: found it at {addr}, but this machine holds no pinned \
+                 certificate for it ({}/server.crt). Discovery supplies an address, never \
+                 trust — enrol the peer first (on {name}: `ikigai cert add-client <this \
+                 host>`, then copy its server.crt here), or pass --cert-dir.",
+                dir.display()
+            ));
+        }
+        certs.cert_dir = Some(dir.display().to_string());
+    }
+    Ok((format!("quic://{addr}"), certs))
+}
+
+/// The conventional per-peer certificate directory: `<config>/ikigai/quic-<name>/`.
+/// plasma holds `quic-bug`, bug holds `quic-plasma`.
+#[cfg(all(feature = "embedded", feature = "quic"))]
+fn peer_cert_dir(name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".config/ikigai")
+        .join(format!("quic-{name}"))
+}
+
+/// Without the `quic` feature there is nothing to dial a discovered peer with.
+#[cfg(all(feature = "embedded", not(feature = "quic")))]
+fn resolve_peer(name: &str, _certs: &Certs) -> Result<(String, Certs), String> {
+    Err(format!(
+        "peer:{name}: mounting a discovered peer needs the `quic` feature"
+    ))
 }
 
 #[cfg(all(feature = "embedded", feature = "quic"))]
