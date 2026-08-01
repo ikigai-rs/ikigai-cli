@@ -2355,19 +2355,42 @@ fn llm_registry() -> ikigai_llm::Registry {
     registry
 }
 
-/// The declared registry: the `IKIGAI_LLM_CONFIG` file, else the Ollama default.
-fn llm_declared_registry() -> ikigai_llm::Registry {
+/// Where the LLM registry may be declared, in precedence order: the env var (an override
+/// for CI and containers), then the config home — the same place `calendar.json` and
+/// `config.toml` live, so a machine's LLM setup is configured like everything else.
+fn llm_config_candidates() -> Vec<(String, &'static str)> {
+    let mut candidates = Vec::new();
     if let Ok(path) = std::env::var("IKIGAI_LLM_CONFIG") {
-        match std::fs::read_to_string(&path) {
-            Ok(json) => match ikigai_llm::Registry::from_json(&json) {
-                Ok(registry) => return registry,
-                Err(e) => eprintln!(
-                    "ikigai: IKIGAI_LLM_CONFIG ({path}) parse error: {e:?} — using the default"
-                ),
-            },
-            Err(e) => eprintln!(
-                "ikigai: cannot read IKIGAI_LLM_CONFIG ({path}): {e:?} — using the default"
-            ),
+        candidates.push((path, "IKIGAI_LLM_CONFIG"));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let path = std::path::PathBuf::from(home).join(".config/ikigai/llm.json");
+        candidates.push((path.display().to_string(), "llm.json"));
+    }
+    candidates
+}
+
+/// The declared registry: the config-home `llm.json` (or `IKIGAI_LLM_CONFIG`), else the
+/// Ollama default.
+fn llm_declared_registry() -> ikigai_llm::Registry {
+    // The CONFIG HOME first, the environment variable only as an override.
+    //
+    // This used to be env-var ONLY, with no default path — so `~/.config/ikigai/llm.json`
+    // sat there being ignored, and a daemon (whose plist sets no environment) silently ran
+    // the built-in single-provider default. The failure was invisible until a `provider=`
+    // that plainly existed in the file resolved to nothing: `no endpoint resolved for
+    // urn:llm:big:ask`. `calendar.json` has always loaded from the config home; llm.json
+    // was the odd one out.
+    for (path, source) in llm_config_candidates() {
+        let Ok(json) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        match ikigai_llm::Registry::from_json(&json) {
+            Ok(registry) => return registry,
+            // LOUD: a config that exists but does not parse must never look like a config
+            // that is not there. Silently falling back to the default is how you end up
+            // debugging a provider you can see in the file.
+            Err(e) => eprintln!("ikigai: {source} ({path}) parse error: {e:?} — using the default"),
         }
     }
     let mut ollama = ikigai_llm::OpenAiConfig::ollama("llama3.2:3b");
