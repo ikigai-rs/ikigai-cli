@@ -1387,8 +1387,16 @@ fn serve_ipc(path: Option<String>) -> ! {
 #[cfg(all(feature = "embedded", feature = "ipc", unix))]
 fn connect_ipc(path: Option<String>) -> Result<Engine, String> {
     let socket = ipc_socket(path);
-    let resolver =
-        ikigai_ipc::connect(&socket).map_err(|e| format!("connect {}: {e}", socket.display()))?;
+    // `ipc.timeout` in the host config (seconds) overrides the default deadline. What it
+    // bounds is SILENCE from the server, and a long resolution is silent while it works —
+    // so a machine that routinely asks a 70B model a question wants a larger number than
+    // one that does not. Config home, not an environment variable.
+    let timeout = ikigai_embedded::config::get("ipc.timeout")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(ikigai_ipc::DEFAULT_TIMEOUT);
+    let resolver = ikigai_ipc::connect_with_timeout(&socket, Some(timeout))
+        .map_err(|e| format!("connect {}: {e}", socket.display()))?;
     Ok(with_profiles(Engine::new(resolver)))
 }
 
