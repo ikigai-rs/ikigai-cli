@@ -1965,25 +1965,36 @@ fn aliases_scheme(targets: &[AliasTarget], prefix: &str) -> String {
     out
 }
 
-/// The fixed runtime every generated elisp file carries — the transport, not the surface.
+/// The header of a generated elisp file.
 ///
-/// Kept in a real `.el` file rather than a string literal here: it is the only hand-written
-/// part, and layering Rust escaping over elisp escaping over regexp escaping is how a
-/// mangled `ikigai--quote` reaches someone's Emacs.
-const ELISP_RUNTIME: &str = include_str!("aliases.el");
+/// There is deliberately NO bundled runtime. `ikigai-emacs`'s `ikigai.el` already owns the
+/// transport (`--connect` vs embedded `--mount`s), the mount-alias rewriting, the quoting,
+/// and the stderr split that keeps cache tags out of stdout — and it defines
+/// `ikigai-invoke`, which is exactly the primitive these need. Shipping a second runtime
+/// would duplicate all of that AND collide on `ikigai-connect`/`ikigai-program`.
+const ELISP_HEADER: &str = ";;; -*- lexical-binding: t -*-\n\
+     ;;; Generated from an ikigai kernel's manifold — do not edit.\n\
+     ;;;\n\
+     ;;; One function per resource this capability may invoke, with the arguments that\n\
+     ;;; resource declares. Regenerate with:\n\
+     ;;;   ikigai -c 'source urn:lisp:aliases as=text/x-emacs-lisp' < /dev/null\n\
+     ;;;\n\
+     ;;; Transport, mounts and quoting come from ikigai.el.\n\n\
+     (require 'ikigai)\n\n";
 
 /// Emit the elisp face. Same targets, same rules — a different lisp.
 fn aliases_elisp(targets: &[AliasTarget], prefix: &str) -> String {
-    let mut out = String::from(ELISP_RUNTIME);
+    let mut out = String::from(ELISP_HEADER);
     let mut emitted = 0;
     for target in targets {
         if !prefix.is_empty() && !target.iri.starts_with(prefix) {
             continue;
         }
         for (verb, required) in &target.actions {
-            // `ikigai-` namespaces the whole surface, so these can live in an ordinary
-            // load-path without colliding with anything.
-            let name = format!("ikigai-{}", alias_name(&target.iri, verb));
+            // `ikigai-` namespaces the whole surface. Guarded against the handful of names
+            // ikigai.el already owns — `urn:eval:*` would otherwise generate `ikigai-eval`
+            // and redefine the function everything else here calls through.
+            let name = elisp_defun_name(&alias_name(&target.iri, verb));
             let binders: Vec<String> = required.iter().map(|r| safe_elisp_param(r)).collect();
             let params = if binders.is_empty() {
                 "&rest args".to_string()
@@ -2004,7 +2015,7 @@ fn aliases_elisp(targets: &[AliasTarget], prefix: &str) -> String {
                     .replace('"', "\\\"")
             };
             out.push_str(&format!(
-                "(defun {name} ({params})\n  \"{doc}\"\n  (ikigai--call \"{}\" \"{}\" (append (list{passed}) args)))\n\n",
+                "(defun {name} ({params})\n  \"{doc}\"\n  (apply #'ikigai-invoke '{} \"{}\"{passed} args))\n\n",
                 verb.to_lowercase(),
                 target.iri,
             ));
@@ -2016,6 +2027,28 @@ fn aliases_elisp(targets: &[AliasTarget], prefix: &str) -> String {
     }
     out.push_str("(provide 'ikigai-aliases)\n");
     out
+}
+
+/// Public names `ikigai.el` already defines. A generated defun must not redefine them —
+/// `ikigai-eval` in particular is what every alias calls through.
+const ELISP_TAKEN: &[&str] = &[
+    "ikigai-eval",
+    "ikigai-invoke",
+    "ikigai-repl",
+    "ikigai-eval-dwim",
+    "ikigai-schedule-zoom",
+    "ikigai-org-schedule-zoom",
+    "ikigai-org-email-invite",
+];
+
+/// `fn-toUpper` → `ikigai-fn-toUpper`, avoiding names ikigai.el owns.
+fn elisp_defun_name(stem: &str) -> String {
+    let name = format!("ikigai-{stem}");
+    if ELISP_TAKEN.contains(&name.as_str()) {
+        format!("{name}-resource")
+    } else {
+        name
+    }
 }
 
 /// A parameter name safe to bind in elisp. Unlike Scheme, elisp is a lisp-2, so `if` is a
@@ -4098,15 +4131,16 @@ mod tests {
             "docstring: {out}"
         );
         assert!(
-            out.contains(
-                "(ikigai--call \"source\" \"urn:fn:toUpper\" (append (list \"in\" in) args))"
-            ),
+            out.contains("(apply #'ikigai-invoke 'source \"urn:fn:toUpper\" \"in\" in args)"),
             "{out}"
         );
-        // The hand-written transport rides along, and the file is loadable on its own.
+        // NO bundled runtime: ikigai.el owns transport, mounts and quoting, and defines
+        // `ikigai-invoke`. A second runtime would duplicate all of that AND collide on
+        // `ikigai-connect`/`ikigai-program`.
+        assert!(out.contains("(require 'ikigai)"), "{out}");
         assert!(
-            out.contains("(defun ikigai--call"),
-            "runtime included: {out}"
+            !out.contains("defun ikigai--call"),
+            "no duplicate runtime: {out}"
         );
         assert!(out.ends_with("(provide 'ikigai-aliases)\n"), "{out}");
     }
@@ -4122,6 +4156,15 @@ mod tests {
         // `args` is the generated rest parameter; a declared argument of that name would
         // shadow it and silently drop every optional argument.
         assert_eq!(safe_elisp_param("args"), "args-value");
+    }
+
+    /// A generated defun must never redefine something ikigai.el owns — `ikigai-eval` in
+    /// particular is what every alias calls through.
+    #[test]
+    fn generated_names_do_not_clobber_the_package() {
+        assert_eq!(elisp_defun_name("fn-toUpper"), "ikigai-fn-toUpper");
+        assert_eq!(elisp_defun_name("eval"), "ikigai-eval-resource");
+        assert_eq!(elisp_defun_name("invoke"), "ikigai-invoke-resource");
     }
 
     /// A docstring is a string literal: an embedded quote in a summary would end it early
