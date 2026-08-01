@@ -51,7 +51,17 @@ pub fn serve(kernel: Kernel, path: &Path) -> io::Result<()> {
 /// would block a `--connect` client's blocking read **forever** (a synchronous
 /// read never yields, so no async `Timeout` overlay can save it). On elapse the
 /// call returns a `timeout` error — which the reliability overlays can then act on.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// FIVE MINUTES, not thirty seconds. What this bounds is SILENCE from the server, and the
+/// server says nothing until a resolution finishes — so for a long resolution the silence
+/// IS the work. A 70B model loads ~40GB before it emits its first token, and at 30s every
+/// such call failed with "no response from the kernel server (it may be hung or gone)"
+/// while the server was working perfectly. A deadline that cannot tell "hung" from "busy"
+/// reports the wrong thing confidently, which is worse than reporting late.
+///
+/// A genuinely gone server usually fails FAST anyway — connection refused, or EOF — so
+/// little detection is lost by being patient about silence.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Connect to a kernel server listening on `path`, with the default I/O timeout.
 pub fn connect(path: &Path) -> io::Result<IpcResolver> {
