@@ -978,6 +978,66 @@ fn build_engine(
 /// `--connect` does: `quic://host:port` for a remote kernel over mutually-pinned TLS
 /// (federation across machines), else a Unix socket path (a same-machine peer).
 #[cfg(feature = "embedded")]
+/// The machine's own topology, from `mount` lines in the host config.
+///
+/// Each line is `<mode> <prefix>=<target> [cert-dir]`, mirroring the CLI flags:
+///
+///     mount = "prefer urn:llm:=peer:plasma"
+///     mount = "alias urn:cal:=quic://bug.local:4433 ~/.config/ikigai/quic-bug"
+///
+/// In the CONFIG HOME rather than in a launchd plist, because topology is a property of the
+/// MACHINE: plasma is where inference lives, bug is where the calendar lives, and one copied
+/// plist cannot say both. A plist is deployed from the repo and `git pull` would overwrite a
+/// machine's identity with another's; a config file is that machine's own.
+fn config_mounts() -> Result<Vec<Mount>, String> {
+    ikigai_embedded::config::all("mount")
+        .into_iter()
+        .map(|line| {
+            let mut parts = line.split_whitespace();
+            let mode = parts
+                .next()
+                .ok_or_else(|| format!("mount `{line}`: expected <mode> <prefix>=<target>"))?;
+            let kind = match mode {
+                "alias" | "mount" => ikigai_embedded::MountKind::Alias,
+                "override" => ikigai_embedded::MountKind::Override,
+                "prefer" => ikigai_embedded::MountKind::Prefer,
+                other => {
+                    return Err(format!(
+                        "mount `{line}`: unknown mode `{other}` (alias | override | prefer)"
+                    ))
+                }
+            };
+            let spec = parts
+                .next()
+                .ok_or_else(|| format!("mount `{line}`: expected <prefix>=<target>"))?;
+            let (prefix, target) = spec.split_once('=').ok_or_else(|| {
+                format!("mount `{line}`: expected <prefix>=<target>, got `{spec}`")
+            })?;
+            let mut certs = Certs::default();
+            if let Some(dir) = parts.next() {
+                certs.cert_dir = Some(shellexpand_home(dir));
+            }
+            Ok(Mount {
+                prefix: prefix.to_string(),
+                target: target.to_string(),
+                certs,
+                kind,
+            })
+        })
+        .collect()
+}
+
+/// `~/x` → `$HOME/x`. A config file is hand-written, and `~` is what a person types.
+fn shellexpand_home(path: &str) -> String {
+    match path.strip_prefix("~/") {
+        Some(rest) => std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+            .join(rest)
+            .display()
+            .to_string(),
+        None => path.to_string(),
+    }
+}
+
 /// Turn a parsed [`Mount`] into a [`MountSpec`], connecting eagerly or lazily
 /// according to its kind.
 ///
@@ -1487,6 +1547,23 @@ fn connect_quic(_target: &str, _certs: &Certs) -> Result<Engine, String> {
 #[cfg(all(feature = "embedded", feature = "ipc", unix))]
 fn serve_ipc(path: Option<String>, mounts: Vec<Mount>) -> ! {
     let socket = ipc_socket(path);
+    // Flags are POSTURE and win wholesale when given; otherwise the machine's own topology
+    // from the config home. Wholesale rather than merged, because a half-and-half mount set
+    // is the kind of thing nobody can debug at 2am.
+    let mounts = if mounts.is_empty() {
+        match config_mounts() {
+            Ok(mounts) => mounts,
+            // A topology that does not parse must never look like no topology: this host
+            // would come up serving purely local resources and answer every federated
+            // request from the wrong machine, silently.
+            Err(e) => {
+                eprintln!("ikigai: {e}");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        mounts
+    };
     // Connect the mounts BEFORE announcing readiness: a host that says it is serving and
     // then cannot reach the peer it was told to compose is worse than one that refuses to
     // start. (A `--prefer` mount is exempt — its peer being absent is normal, and it dials

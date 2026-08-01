@@ -33,6 +33,28 @@ pub fn get(key: &str) -> Option<String> {
     value_for(&std::fs::read_to_string(config_path()).ok()?, key)
 }
 
+/// Every value for `key`, in file order — for settings that legitimately repeat.
+///
+/// A machine's TOPOLOGY is the motivating case: it has as many mounts as it has peers, and
+/// they belong in the config home rather than in a launchd plist, so `git pull` cannot
+/// overwrite one machine's identity with another's.
+pub fn all(key: &str) -> Vec<String> {
+    std::fs::read_to_string(config_path())
+        .map(|text| values_for(&text, key))
+        .unwrap_or_default()
+}
+
+/// Every `key = value` line for `key`. See [`value_for`] for the parsing rules.
+fn values_for(text: &str, key: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| line.split_once('='))
+        .filter(|(name, _)| name.trim() == key)
+        .map(|(_, value)| value.trim().trim_matches(['"', '\'']).trim().to_string())
+        .collect()
+}
+
 /// The first `key = value` line for `key`, trimmed and unquoted. Blank lines and `#` comments
 /// are skipped. Not a full TOML parser — the flat `key = "value"` shape the config uses today.
 fn value_for(text: &str, key: &str) -> Option<String> {
@@ -52,7 +74,25 @@ fn value_for(text: &str, key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::value_for;
+    use super::{value_for, values_for};
+
+    /// A machine has as many mounts as it has peers, so `mount` must be repeatable — the
+    /// single-value reader would silently take the first and drop the rest.
+    #[test]
+    fn repeated_keys_all_come_back_in_order() {
+        let text = "# topology\n\
+                    mount = \"prefer urn:llm:=peer:plasma\"\n\
+                    other = 1\n\
+                    mount = \"alias urn:cal:=quic://bug.local:4433\"\n";
+        assert_eq!(
+            values_for(text, "mount"),
+            vec![
+                "prefer urn:llm:=peer:plasma".to_string(),
+                "alias urn:cal:=quic://bug.local:4433".to_string()
+            ]
+        );
+        assert!(values_for(text, "absent").is_empty());
+    }
 
     #[test]
     fn reads_a_dotted_key_unquoted() {
