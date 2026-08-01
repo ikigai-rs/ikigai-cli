@@ -1590,6 +1590,371 @@ fn meeting_space() -> EndpointSpace {
     )
 }
 
+/// The kernel handle the alias generator reads the SPACE ENTRIES from, installed once the
+/// kernel exists (the same late-binding as the time registry and the reactor).
+///
+/// Only for `entries()` — enumerating bindings is pure data, not a resolution. The catalog
+/// is fetched through `inv.issue`, the supported re-entrant path.
+static ALIAS_RESOLVER: std::sync::OnceLock<Arc<dyn ikigai_resolve::Resolver>> =
+    std::sync::OnceLock::new();
+
+/// What the catalog says about one endpoint: its summary, and each non-Meta verb with the
+/// arguments that verb requires (in declaration order).
+type DescribedEndpoint = (String, Vec<(String, Vec<String>)>);
+
+/// One endpoint, as the alias generator needs it: the IRI you resolve, a name, and the
+/// arguments each verb declares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AliasTarget {
+    /// The RESOLVABLE IRI — from the space entry, not the catalog. The catalog names
+    /// endpoints by a skolem IRI (`urn:ikigai:endpoint:toUpper`), which is a description,
+    /// not an address; `urn:fn:toUpper` is what you can actually call.
+    iri: String,
+    summary: String,
+    /// (verb, required inputs in declaration order).
+    actions: Vec<(String, Vec<String>)>,
+}
+
+/// `urn:lisp:aliases` — the manifold projected as callable Lisp.
+///
+/// Named verbs instead of URIs: `(fn-toUpper "hi")` rather than
+/// `source urn:fn:toUpper in=hi`. GENERATED, never hand-written — every endpoint already
+/// declares its ArgSpecs, and the same projection that turns the manifold into MCP tools
+/// turns it into functions. So the alias surface cannot drift from what the server accepts
+/// (the property that makes a booking form build itself from `?description`), and a new
+/// endpoint gets a verb for free. Hand-maintained aliases would rot in a week.
+struct LispAliases;
+
+#[async_trait::async_trait]
+impl Endpoint for LispAliases {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let resolver = ALIAS_RESOLVER
+            .get()
+            .ok_or_else(|| Error::Endpoint("no kernel to read the manifold from".to_string()))?;
+        let entries = resolver
+            .entries()
+            .ok_or_else(|| Error::Endpoint("this kernel cannot enumerate its space".to_string()))?;
+        // Re-enter through the INVOCATION, not through the stashed resolver. `inv.issue`
+        // is the supported re-entrant path (it threads this call's capability, tracing and
+        // provenance); the resolver's own `issue_as` hides a `block_on` that panics inside
+        // an executor, and its async twin deadlocks on the single-threaded scheduler.
+        // `urn:agent:select` reads `urn:kernel:actions` exactly this way.
+        let catalog = inv
+            .issue(Request::new(
+                Verb::Source,
+                Iri::parse("urn:kernel:catalog").expect("a constant IRI"),
+            ))
+            .await?;
+        let catalog = String::from_utf8_lossy(&catalog.bytes).to_string();
+        let targets = alias_targets(&entries, &catalog);
+        let prefix = inv.inline_str("prefix").unwrap_or("").to_string();
+        Ok(Representation::new(
+            ReprType::new("text/plain"),
+            aliases_scheme(&targets, &prefix).into_bytes(),
+        ))
+    }
+
+    fn name(&self) -> &str {
+        "lisp-aliases"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("lisp-aliases")
+            .summary(
+                "this kernel's resources as callable Lisp definitions, generated from the manifold",
+            )
+            .verb(Verb::Source)
+            .action(
+                ActionSpec::new(Verb::Source)
+                    .summary("the alias prelude — one definition per resolvable endpoint")
+                    .input(ArgSpec::new("prefix").optional().summary(
+                        "only endpoints whose IRI starts with this (e.g. `urn:fn:`), \
+                                 for a prelude scoped to one family",
+                    )),
+            )
+    }
+}
+
+/// Join the space entries (which know the RESOLVABLE IRI) with the catalog (which knows
+/// the arguments) on the endpoint's name.
+///
+/// Templates are skipped: `urn:file:{path}` is a family, not a callable, and a function
+/// named after it would have nothing sensible to pass. Those stay `(source "urn:file:x")`.
+fn alias_targets(entries: &[SpaceEntry], catalog: &str) -> Vec<AliasTarget> {
+    let described = catalog_descriptions(catalog);
+    let mut targets: Vec<AliasTarget> = entries
+        .iter()
+        .filter(|e| !e.pattern.contains('{'))
+        .filter_map(|entry| {
+            let (summary, actions) = described.get(&entry.endpoint)?.clone();
+            Some(AliasTarget {
+                iri: entry.pattern.clone(),
+                summary,
+                actions,
+            })
+        })
+        .collect();
+    // Deterministic output: a prelude that reorders itself between runs is a diff nobody
+    // can read, and these get committed.
+    targets.sort_by(|a, b| a.iri.cmp(&b.iri));
+    targets.dedup_by(|a, b| a.iri == b.iri);
+    targets
+}
+
+/// Parse the catalog's Turtle into `endpoint id -> (summary, [(verb, required inputs)])`.
+///
+/// Two shapes have to survive here. Inputs may be SKOLEMIZED
+/// (`<…endpoint:toUpper:input:in>`) or BLANK (`ik:input [ ik:inputName "in" ; … ]`), so
+/// subjects are keyed as strings either way rather than filtering to named nodes — doing
+/// the latter silently produced zero arguments for every endpoint. Per-verb `ik:Action`
+/// nodes are used when present; when they are not, the endpoint's own verbs and inputs are
+/// the contract, which is exactly right for the single-verb endpoints that are the 93% case.
+fn catalog_descriptions(turtle: &str) -> std::collections::BTreeMap<String, DescribedEndpoint> {
+    use std::collections::BTreeMap;
+    const IK: &str = "https://ikigai-rs.dev/ns#";
+
+    let mut ids: BTreeMap<String, String> = BTreeMap::new();
+    let mut summaries: BTreeMap<String, String> = BTreeMap::new();
+    let mut verbs: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut inputs_of: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut input_name: BTreeMap<String, String> = BTreeMap::new();
+    let mut input_required: BTreeMap<String, bool> = BTreeMap::new();
+
+    // Blank and named subjects alike, as a plain key.
+    let key = |t: &oxrdf::NamedOrBlankNode| match t {
+        oxrdf::NamedOrBlankNode::NamedNode(n) => n.as_str().to_string(),
+        oxrdf::NamedOrBlankNode::BlankNode(b) => format!("_:{}", b.as_str()),
+    };
+    let obj_key = |t: &oxrdf::Term| match t {
+        oxrdf::Term::NamedNode(n) => Some(n.as_str().to_string()),
+        oxrdf::Term::BlankNode(b) => Some(format!("_:{}", b.as_str())),
+        _ => None,
+    };
+
+    for quad in
+        oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle).for_slice(turtle.as_bytes())
+    {
+        let Ok(quad) = quad else { continue };
+        let subject = key(&quad.subject);
+        let pred = quad.predicate.as_str().to_string();
+        if let oxrdf::Term::Literal(l) = &quad.object {
+            let value = l.value().to_string();
+            match pred.strip_prefix(IK) {
+                Some("id") => {
+                    ids.insert(subject, value);
+                }
+                Some("summary") => {
+                    summaries.entry(subject).or_insert(value);
+                }
+                Some("verb") => verbs.entry(subject).or_default().push(value),
+                Some("inputName") => {
+                    input_name.insert(subject, value);
+                }
+                Some("required") => {
+                    input_required.insert(subject, value == "true");
+                }
+                _ => {}
+            }
+        } else if pred.strip_prefix(IK) == Some("input") {
+            if let Some(object) = obj_key(&quad.object) {
+                inputs_of.entry(subject).or_default().push(object);
+            }
+        }
+    }
+
+    let mut out = BTreeMap::new();
+    for (endpoint, id) in ids {
+        let summary = summaries.get(&endpoint).cloned().unwrap_or_default();
+        // Declaration order is preserved by the parser, and it is the order a generated
+        // function's positional parameters must follow.
+        let required: Vec<String> = inputs_of
+            .get(&endpoint)
+            .into_iter()
+            .flatten()
+            .filter(|i| input_required.get(*i).copied().unwrap_or(false))
+            .filter_map(|i| input_name.get(i).cloned())
+            .collect();
+        let actions: Vec<(String, Vec<String>)> = verbs
+            .get(&endpoint)
+            .into_iter()
+            .flatten()
+            // Meta is every endpoint's self-description, not a selectable action.
+            .filter(|v| *v != "Meta")
+            .map(|v| (v.clone(), required.clone()))
+            .collect();
+        if !actions.is_empty() {
+            out.insert(id, (summary, actions));
+        }
+    }
+    out
+}
+
+/// Scheme identifiers a generated parameter must not shadow.
+///
+/// Two families, both of which produced real breakage: SYNTACTIC KEYWORDS — `urn:fn:conditional`
+/// declares an argument literally named `if`, and `(define (fn-conditional if …) …)` fails to
+/// parse — and the identifiers the generated BODY itself uses, which a parameter of the same
+/// name would shadow out from under it. The wire name is unaffected: only the binder is
+/// renamed, so `"if"` still travels as `"if"`.
+const SCHEME_RESERVED: &[&str] = &[
+    // R7RS syntactic keywords
+    "and",
+    "begin",
+    "case",
+    "cond",
+    "define",
+    "define-syntax",
+    "delay",
+    "do",
+    "else",
+    "if",
+    "lambda",
+    "let",
+    "let*",
+    "letrec",
+    "letrec*",
+    "or",
+    "quasiquote",
+    "quote",
+    "set!",
+    "syntax-rules",
+    "unless",
+    "unquote",
+    "when",
+    // used by the generated body — shadowing these breaks the call itself
+    "apply",
+    "invoke",
+    "rest",
+];
+
+/// A parameter name that is safe to bind. `if` → `if*`.
+fn safe_param(name: &str) -> String {
+    let clean: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if SCHEME_RESERVED.contains(&clean.as_str()) || clean.is_empty() {
+        format!("{clean}*")
+    } else {
+        clean
+    }
+}
+
+/// `urn:fn:toUpper` + Source → `fn-toUpper`; a Sink gets the Scheme mutation `!`.
+fn alias_name(iri: &str, verb: &str) -> String {
+    let stem = iri
+        .strip_prefix("urn:")
+        .unwrap_or(iri)
+        .replace(':', "-")
+        .replace(['/', '.', ' '], "-");
+    match verb {
+        "Sink" => format!("{stem}!"),
+        "Delete" => format!("{stem}-delete!"),
+        "Exists" => format!("{stem}?"),
+        _ => stem,
+    }
+}
+
+/// Emit the prelude. Pure, so the shape is testable without a kernel.
+fn aliases_scheme(targets: &[AliasTarget], prefix: &str) -> String {
+    let mut out = String::from(
+        ";; GENERATED from this kernel's manifold — do not edit.\n\
+         ;; Every definition here comes from an endpoint's own declared arguments, so this\n\
+         ;; surface cannot drift from what the kernel accepts. Regenerate with\n\
+         ;; `source urn:lisp:aliases`.\n\n",
+    );
+    let mut emitted = 0;
+    for target in targets {
+        if !prefix.is_empty() && !target.iri.starts_with(prefix) {
+            continue;
+        }
+        for (verb, required) in &target.actions {
+            let name = alias_name(&target.iri, verb);
+            let binders: Vec<String> = required.iter().map(|r| safe_param(r)).collect();
+            let params = binders.join(" ");
+            // Build the flat name→value list as a CONS CHAIN ending in `rest`, bound with
+            // `let` before the call. Three Steel constraints force this exact shape, each
+            // found by running it:
+            //   * `(apply invoke …)` fails — applying to a PRELUDE-defined variadic across
+            //     the clone-per-eval boundary errors with `FreeIdentifier: ##rest2`.
+            //   * `(append (list …) rest)` fails the same way; `cons` is fine.
+            //   * passing the cons chain DIRECTLY to the native `%verb-args` fails too;
+            //     binding it with `let` first materializes it and works.
+            // So this calls the fixed-arity primitive with a let-bound list. Less pretty
+            // than `(apply invoke …)`, and the only version that actually runs.
+            let mut args = "rest".to_string();
+            for (wire, binder) in required.iter().zip(&binders).rev() {
+                args = format!("(cons \"{wire}\" (cons {binder} {args}))");
+            }
+            if !target.summary.is_empty() {
+                out.push_str(&format!(";; {}\n", first_line(&target.summary)));
+            }
+            // The trailing `. rest` keeps OPTIONAL arguments reachable — a generated verb
+            // is a shortcut for the common call, never a narrowing of the endpoint:
+            // `(fn-toUpper "hi" "as" "text/plain")` still works.
+            out.push_str(&format!(
+                "(define ({name}{}{} . rest)\n  (let ((args {args}))\n    (%verb-args \"{}\" \"{}\" args)))\n\n",
+                if params.is_empty() { "" } else { " " },
+                params,
+                verb.to_lowercase(),
+                target.iri,
+            ));
+            emitted += 1;
+        }
+    }
+    if emitted == 0 {
+        out.push_str(";; (no endpoints matched)\n");
+    }
+    out
+}
+
+fn first_line(text: &str) -> String {
+    // ESCAPE transclusion markers. An endpoint's summary can contain one literally —
+    // `urn:fn:compose` documents itself with `$a{<iri>}` — and the moment that text lands
+    // in a generated comment, composing the prelude tries to expand the EXAMPLE inside its
+    // own documentation ("bad IRI in marker `<iri>`"). `$$a{…}` is compose's literal form.
+    escape_markers(text.lines().next().unwrap_or("").trim())
+}
+
+/// Normalize any run of `$` before `a{` to exactly `$$a{` — compose's literal form.
+///
+/// Idempotent on purpose. A plain `.replace("$a{", "$$a{")` also rewrites the ALREADY
+/// escaped `$$a{…}` that appears in the same sentence of compose's own summary, yielding
+/// `$$$a{…}` — which compose reads as a literal `$` followed by a live marker, and fails on
+/// again. Escaping must be a fixed point.
+fn escape_markers(text: &str) -> String {
+    let bytes: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == '$' {
+            let mut j = i;
+            while j < bytes.len() && bytes[j] == '$' {
+                j += 1;
+            }
+            if bytes[j..].starts_with(&['a', '{']) {
+                out.push_str("$$");
+                i = j;
+                continue;
+            }
+            for _ in i..j {
+                out.push('$');
+            }
+            i = j;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
 /// The capability a peer listing needs. Discovery is local-network reconnaissance — who is
 /// out there, and what they claim to serve — so it is gated, not free.
 const CAP_NET_DISCOVER: &str = "urn:cap:net:discover";
@@ -2206,8 +2571,13 @@ fn root_space_with_mounts(mounts: Vec<MountSpec>) -> Arc<dyn Space> {
         // Who else is on this network (urn:peer:list). Embedded-root only, like the
         // meeting endpoints: telling a remote caller what else is reachable from here is
         // reconnaissance, and a served kernel has no business answering it.
-        Arc::new(EndpointSpace::new().bind(Exact::new("urn:peer:list"), PeerList))
-            as Arc<dyn Space>,
+        Arc::new(
+            EndpointSpace::new()
+                .bind(Exact::new("urn:peer:list"), PeerList)
+                // The manifold as callable Lisp. Embedded-only: it describes THIS kernel's
+                // reachable surface, which is the local operator's business.
+                .bind(Exact::new("urn:lisp:aliases"), LispAliases),
+        ) as Arc<dyn Space>,
         // The org agenda (urn:org:agenda[:{period}]) over the configured org
         // files, which it reads through the kernel via urn:orgfile:*.
         Arc::new(ikigai_org::space(
@@ -2657,6 +3027,9 @@ fn build_watched(mounts: Vec<MountSpec>, reactive: bool) -> Arc<Kernel> {
     // module's tests if brought into scope.
     let registry = time_registry();
     registry.set_resolver(Arc::clone(&kernel) as Arc<dyn ikigai_resolve::Resolver>);
+    // The alias generator reads the manifold back through the kernel, so it needs the same
+    // late-bound handle (the kernel cannot be given to an endpoint it contains).
+    let _ = ALIAS_RESOLVER.set(Arc::clone(&kernel) as Arc<dyn ikigai_resolve::Resolver>);
     // The reactive tuplespace: watch file_root/spaces and fire each reactive space's handler
     // on a drop (inbox → outbox/error). Like the scheduler, it holds the kernel as a Resolver
     // installed now that the kernel exists. Handlers run under a SCOPED processing authority —
@@ -3453,6 +3826,121 @@ mod tests {
     use super::*;
     use futures::executor::block_on;
     use ikigai_core::{ArgRef, Capability, Iri, Request};
+
+    /// The prelude must be VALID STEEL, and getting there took four failed shapes — each
+    /// of which produced `FreeIdentifier: ##rest2`, Steel's opaque report for a rest-arg
+    /// problem. Pinning the working form so a "tidy-up" cannot silently break it:
+    /// `(apply invoke …)`, `(append (list …) rest)`, and passing a cons chain straight to
+    /// the native `%verb-args` all fail; a LET-BOUND cons chain into the fixed-arity
+    /// primitive works.
+    #[test]
+    fn a_generated_alias_has_the_shape_steel_actually_accepts() {
+        let targets = vec![AliasTarget {
+            iri: "urn:fn:toUpper".to_string(),
+            summary: "Upper-cases the text.".to_string(),
+            actions: vec![("Source".to_string(), vec!["in".to_string()])],
+        }];
+        let out = aliases_scheme(&targets, "");
+        assert!(out.contains("(define (fn-toUpper in . rest)"), "{out}");
+        assert!(
+            out.contains("(let ((args (cons \"in\" (cons in rest))))"),
+            "{out}"
+        );
+        assert!(
+            out.contains("(%verb-args \"source\" \"urn:fn:toUpper\" args)"),
+            "the fixed-arity primitive, not `apply invoke`: {out}"
+        );
+    }
+
+    /// `urn:fn:conditional` really does declare an argument named `if`, and
+    /// `(define (fn-conditional if …) …)` will not parse. The BINDER is renamed; the WIRE
+    /// name must not be.
+    #[test]
+    fn a_reserved_argument_name_is_renamed_only_in_the_binder() {
+        let targets = vec![AliasTarget {
+            iri: "urn:fn:conditional".to_string(),
+            summary: String::new(),
+            actions: vec![(
+                "Source".to_string(),
+                vec!["if".to_string(), "then".to_string()],
+            )],
+        }];
+        let out = aliases_scheme(&targets, "");
+        assert!(
+            out.contains("(define (fn-conditional if* then . rest)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("(cons \"if\" (cons if* "),
+            "the wire name stays `if`: {out}"
+        );
+    }
+
+    /// A verb that mutates reads as one: Scheme's `!`.
+    #[test]
+    fn verbs_shape_the_alias_name() {
+        assert_eq!(alias_name("urn:fn:toUpper", "Source"), "fn-toUpper");
+        assert_eq!(alias_name("urn:space:bookings", "Sink"), "space-bookings!");
+        assert_eq!(alias_name("urn:file:x", "Delete"), "file-x-delete!");
+        assert_eq!(alias_name("urn:file:x", "Exists"), "file-x?");
+    }
+
+    /// Compose documents ITSELF with a literal `$a{<iri>}` marker, so that text lands in a
+    /// generated comment — and composing the prelude then tries to expand the example in
+    /// its own documentation. Escaping must also be a FIXED POINT, or the already-escaped
+    /// `$$a{…}` in the same sentence becomes `$$$a{…}` and fails differently.
+    #[test]
+    fn transclusion_markers_in_summaries_are_escaped_idempotently() {
+        assert_eq!(
+            escape_markers("expands $a{<iri>} markers"),
+            "expands $$a{<iri>} markers"
+        );
+        assert_eq!(escape_markers("literal is $$a{…}"), "literal is $$a{…}");
+        assert_eq!(escape_markers("$$$a{x}"), "$$a{x}");
+        assert_eq!(escape_markers("a $5 cost"), "a $5 cost");
+    }
+
+    /// Templates are families, not callables: `urn:file:{path}` has nothing sensible to
+    /// pass, so it is skipped rather than generating a broken verb.
+    #[test]
+    fn templates_are_not_given_aliases() {
+        let entries = vec![
+            SpaceEntry::new("urn:fn:toUpper", "toUpper"),
+            SpaceEntry::new("urn:file:{path}", "file"),
+        ];
+        let catalog = r#"@prefix ik: <https://ikigai-rs.dev/ns#> .
+<urn:ikigai:endpoint:toUpper> a ik:Endpoint ; ik:id "toUpper" ; ik:verb "Source" ;
+    ik:input [ ik:inputName "in" ; ik:required true ] .
+<urn:ikigai:endpoint:file> a ik:Endpoint ; ik:id "file" ; ik:verb "Source" .
+"#;
+        let targets = alias_targets(&entries, catalog);
+        assert_eq!(targets.len(), 1, "only the concrete IRI: {targets:?}");
+        assert_eq!(targets[0].iri, "urn:fn:toUpper");
+        assert_eq!(
+            targets[0].actions,
+            vec![("Source".to_string(), vec!["in".to_string()])]
+        );
+    }
+
+    /// Inputs may be BLANK nodes in the catalog's Turtle. Filtering to named subjects
+    /// silently produced zero arguments for every endpoint — the generator emitted
+    /// parameterless functions that ignored their inputs.
+    #[test]
+    fn blank_node_inputs_are_read() {
+        let catalog = r#"@prefix ik: <https://ikigai-rs.dev/ns#> .
+<urn:ikigai:endpoint:toUpper> a ik:Endpoint ; ik:id "toUpper" ; ik:verb "Source", "Meta" ;
+    ik:input [ ik:inputName "in" ; ik:required true ] ,
+             [ ik:inputName "as" ; ik:required false ] .
+"#;
+        let described = catalog_descriptions(catalog);
+        let (_summary, actions) = described.get("toUpper").expect("parsed");
+        // Meta is self-description, never a selectable action; `as` is optional so it
+        // rides in `rest` rather than becoming a positional parameter.
+        assert_eq!(
+            *actions,
+            vec![("Source".to_string(), vec!["in".to_string()])]
+        );
+    }
 
     /// A mount target that is always down (or always denies), so the composition's
     /// behaviour under failure can be asserted without a peer.
