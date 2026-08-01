@@ -214,6 +214,38 @@ impl Endpoint for SpaceEndpoint {
                         "dropping into a space needs `{CAP_OUT}`"
                     )));
                 }
+                // `retry=<id>` moves a dead-lettered tuple back to the inbox for another
+                // pass, and drops its stale `.err` note. A failure is often ENVIRONMENTAL —
+                // the handler could not reach the calendar, the mailer was down, a grant had
+                // lapsed — which says "not now", not "this tuple is poison". Before this,
+                // recovery meant knowing the on-disk layout and doing it by hand with `mv`,
+                // which is not something a system should ask of the person it just failed.
+                if let Ok(id) = inv.inline_str("retry") {
+                    if id.is_empty() || id.contains(['/', '\\', '.']) {
+                        return Err(Error::InvalidArgument {
+                            name: "retry".to_string(),
+                            detail: "a tuple id is a content hash".to_string(),
+                        });
+                    }
+                    let from = self.root.join(name).join("error");
+                    std::fs::create_dir_all(&inbox).map_err(|e| {
+                        Error::Endpoint(format!("space `{name}`: create inbox: {e}"))
+                    })?;
+                    std::fs::rename(
+                        from.join(format!("{id}.tuple")),
+                        inbox.join(format!("{id}.tuple")),
+                    )
+                    .map_err(|_| {
+                        Error::NotFound(format!("no dead-lettered tuple `{id}` in space `{name}`"))
+                    })?;
+                    // Only after the tuple is safely back: a stale note beside no tuple
+                    // would read as a failure that never happened.
+                    let _ = std::fs::remove_file(from.join(format!("{id}.err")));
+                    return Ok(Representation::new(
+                        ReprType::new("text/plain"),
+                        format!("{id}\n").into_bytes(),
+                    ));
+                }
                 let content = inv
                     .inline_arg("content")
                     .map_err(|_| Error::MissingArgument("content".to_string()))?;
@@ -367,6 +399,14 @@ impl Endpoint for SpaceEndpoint {
             .action(
                 ActionSpec::new(Verb::Sink)
                     .summary("out — drop a tuple (the piped content) into the space")
+                    .input(
+                        ArgSpec::new("retry")
+                            .optional()
+                            .summary(
+                                "instead of dropping: move this dead-lettered tuple back to \
+                                 the inbox for another pass (and clear its .err note)",
+                            ),
+                    )
                     .requires(CAP_OUT),
             )
             .action(
@@ -521,7 +561,15 @@ impl SpaceReactor {
                     request,
                     &self.capability_for(name),
                 )
-                .map(|_| ())
+                // KEEP WHAT THE HANDLER SAID. Discarding it (`.map(|_| ())`) meant a
+                // handled tuple recorded NOTHING but its own existence in `outbox`: no
+                // record of what was decided, or whether the human it was supposed to
+                // reach was ever told. On 2026-07-31 a booking handler ran, decided, and
+                // failed to notify anyone — and there was no artifact anywhere saying so,
+                // because the answer died here. The `.err` note on the failure path was
+                // the only reason that outage was diagnosable at all; success deserves
+                // the same courtesy.
+                .map(|(repr, _status)| String::from_utf8_lossy(&repr.bytes).to_string())
                 .map_err(|e| e.to_string())
             }
             Err(e) => Err(format!("bad handler URI `{handler}`: {e}")),
@@ -536,10 +584,10 @@ impl SpaceReactor {
         name: &str,
         id: &str,
         claimed: &Path,
-        result: std::result::Result<(), String>,
+        result: std::result::Result<String, String>,
     ) -> Outcome {
         let (stage, outcome) = match &result {
-            Ok(()) => ("outbox", Outcome::Handled),
+            Ok(_) => ("outbox", Outcome::Handled),
             Err(e) => ("error", Outcome::Errored(e.clone())),
         };
         let dir = self.root.join(name).join(stage);
@@ -549,10 +597,19 @@ impl SpaceReactor {
         if let Err(e) = std::fs::rename(claimed, dir.join(format!("{id}.tuple"))) {
             return Outcome::Errored(format!("move to `{stage}`: {e}"));
         }
-        if let Err(msg) = &result {
+        match &result {
             // A dead-letter note alongside the tuple, so a failure is inspectable via
             // `rd state=error`.
-            let _ = std::fs::write(dir.join(format!("{id}.err")), msg);
+            Err(msg) => {
+                let _ = std::fs::write(dir.join(format!("{id}.err")), msg);
+            }
+            // The mirror image: what the handler ANSWERED, beside the handled tuple. This
+            // is the difference between "a booking was processed" and knowing what was
+            // decided and whether anyone was told. Empty answers write nothing.
+            Ok(said) if !said.trim().is_empty() => {
+                let _ = std::fs::write(dir.join(format!("{id}.out")), said);
+            }
+            Ok(_) => {}
         }
         outcome
     }
@@ -1000,6 +1057,97 @@ mod tests {
         std::fs::create_dir_all(root.join(space_name)).unwrap();
         std::fs::write(root.join(space_name).join("handler"), handler).unwrap();
         root
+    }
+
+    /// What the handler ANSWERED must survive, beside the handled tuple.
+    ///
+    /// The regression: `process` did `.map(|_| ())`, so a handled tuple recorded nothing
+    /// but its own existence. A booking handler could decide, fail to notify the human it
+    /// was supposed to reach, and leave no artifact saying so anywhere in the system — the
+    /// `.err` note on the failure path was the ONLY reason such an outage was diagnosable.
+    #[test]
+    fn a_handled_tuple_records_what_the_handler_said() {
+        let root = reactive_root("react-said", "jobs", "urn:test:handler");
+        let k = Kernel::new(Arc::new(space(root.clone())));
+        let cap = Capability::scoped(vec![CAP_OUT.to_string(), CAP_READ.to_string()]);
+        let id = out(&k, &cap, "urn:space:jobs", b"work");
+
+        let reactor = SpaceReactor::new(
+            root.clone(),
+            Arc::new(MockResolver::new(true)),
+            Capability::scoped(vec!["urn:cap:demo".to_string()]),
+        );
+        assert_eq!(reactor.drain("jobs"), vec![(id.clone(), Outcome::Handled)]);
+
+        let said =
+            std::fs::read_to_string(root.join("jobs").join("outbox").join(format!("{id}.out")))
+                .expect("a handled tuple carries the handler's answer beside it");
+        assert_eq!(said, "ok", "verbatim, not summarized: {said}");
+    }
+
+    /// A dead-lettered tuple can be put back for another pass — because a failure is
+    /// often ENVIRONMENTAL (no calendar, no mailer, a lapsed grant), which means "not
+    /// now", not "this tuple is poison". Recovery must not require knowing the on-disk
+    /// layout and running `mv` by hand.
+    #[test]
+    fn a_dead_lettered_tuple_can_be_retried() {
+        let root = reactive_root("react-retry", "jobs", "urn:test:handler");
+        let k = Kernel::new(Arc::new(space(root.clone())));
+        let cap = Capability::scoped(vec![CAP_OUT.to_string(), CAP_READ.to_string()]);
+        let id = out(&k, &cap, "urn:space:jobs", b"work");
+
+        // The environment is broken: the tuple dead-letters, with a note.
+        let failing = SpaceReactor::new(
+            root.clone(),
+            Arc::new(MockResolver::new(false)),
+            Capability::scoped(vec!["urn:cap:demo".to_string()]),
+        );
+        assert!(matches!(failing.drain("jobs")[0].1, Outcome::Errored(_)));
+        assert!(root
+            .join("jobs")
+            .join("error")
+            .join(format!("{id}.err"))
+            .exists());
+
+        // Put it back.
+        block_on(
+            k.issue(
+                Request::new(Verb::Sink, iri("urn:space:jobs"))
+                    .with_arg("retry", ArgRef::Inline(id.as_bytes().to_vec())),
+                &cap,
+            ),
+        )
+        .expect("retry moves it back to the inbox");
+        assert!(
+            !root.join("jobs").join("error").join(format!("{id}.err")).exists(),
+            "the stale note goes with it — a note beside no tuple reads as a failure that never happened"
+        );
+
+        // The environment is fixed: the same tuple now succeeds.
+        let working = SpaceReactor::new(
+            root.clone(),
+            Arc::new(MockResolver::new(true)),
+            Capability::scoped(vec!["urn:cap:demo".to_string()]),
+        );
+        assert_eq!(working.drain("jobs"), vec![(id.clone(), Outcome::Handled)]);
+    }
+
+    /// Retrying something that was never dead-lettered is a NotFound, not a silent no-op
+    /// that answers as if it worked.
+    #[test]
+    fn retrying_an_unknown_tuple_is_not_found() {
+        let root = reactive_root("react-retry-miss", "jobs", "urn:test:handler");
+        let k = Kernel::new(Arc::new(space(root.clone())));
+        let cap = Capability::scoped(vec![CAP_OUT.to_string(), CAP_READ.to_string()]);
+        let err = block_on(
+            k.issue(
+                Request::new(Verb::Sink, iri("urn:space:jobs"))
+                    .with_arg("retry", ArgRef::Inline(b"deadbeef".to_vec())),
+                &cap,
+            ),
+        )
+        .expect_err("nothing to retry");
+        assert!(matches!(err, Error::NotFound(_)), "{err:?}");
     }
 
     #[test]

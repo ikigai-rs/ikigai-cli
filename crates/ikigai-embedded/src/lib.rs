@@ -2428,12 +2428,30 @@ pub fn watched_kernel() -> Arc<Kernel> {
     watched_kernel_with_mounts(Vec::new())
 }
 
+/// A watched kernel that ALSO runs the space reactor — the writer's kernel.
+///
+/// Reacting is a privilege, not a side effect of building a kernel. A reactive process
+/// CLAIMS tuples from the shared workspace (atomic rename, exactly-once) and executes
+/// them, so every reactive process is a worker competing for the same production queue.
+/// That must be a deliberate role — `--daemon`, or `--react` for a session that means it —
+/// never the incidental consequence of starting a REPL.
+pub fn reactive_kernel_with_mounts(mounts: Vec<MountSpec>) -> Arc<Kernel> {
+    build_watched(mounts, true)
+}
+
 /// Like [`watched_kernel`], but composing one or more **remote kernels** into the
 /// local resolution graph. Each `(prefix, resolver)` mounts a `RemoteSpace` at
 /// `prefix` (rewriting `<prefix>rest` → `urn:rest` before forwarding), so a resource
 /// under the mount resolves on the remote kernel — and a `trace` stitches the
 /// remote execution under the mount node. Drives the `--mount` flag.
 pub fn watched_kernel_with_mounts(mounts: Vec<MountSpec>) -> Arc<Kernel> {
+    build_watched(mounts, false)
+}
+
+/// The shared constructor. `reactive` decides whether this process claims and runs the
+/// workspace's tuples; everything else (file/org/store watchers, scheduler, timed jobs)
+/// is the same either way.
+fn build_watched(mounts: Vec<MountSpec>, reactive: bool) -> Arc<Kernel> {
     // Inject the process scheduler so re-entrant fan-out (e.g. `compose`'s `$a{}`
     // markers) runs concurrently on it; single-threaded by default, a pool under
     // `IKIGAI_SCHEDULER=pool[:N]`. The same scheduler is injected as a read-only
@@ -2462,16 +2480,27 @@ pub fn watched_kernel_with_mounts(mounts: Vec<MountSpec>) -> Arc<Kernel> {
     // the tuplespace verbs only, so a handler can compose within the fabric (drop results,
     // read/take from spaces) but not touch fs/net/exec — NEVER root, NEVER the dropper's cap.
     // A space with no `handler` file is left alone, so this is safe over the whole tree.
-    let reactor = Arc::new(ikigai_intray::SpaceReactor::new(
-        file_root().join("spaces"),
-        Arc::clone(&kernel) as Arc<dyn ikigai_resolve::Resolver>,
-        ikigai_core::Capability::scoped(vec![
-            ikigai_intray::CAP_OUT.to_string(),
-            ikigai_intray::CAP_READ.to_string(),
-            ikigai_intray::CAP_TAKE.to_string(),
-        ]),
-    ));
-    reactor.watch();
+    //
+    // ONLY when this process is the designated worker. Before that was true, EVERY entry
+    // point that built a local kernel — a one-shot `ikigai -c`, an open REPL, an MCP
+    // server — silently enlisted as a worker on the writer's queue. On 2026-07-31 an idle
+    // REPL claimed a real booking out from under the daemon, ran the handler under the
+    // TERMINAL's TCC identity (where the calendar grant belongs to the terminal app, not
+    // the signed daemon), failed the freebusy read, and dead-lettered it. Exactly-once
+    // claiming meant the daemon — the one process that could have handled it — never saw
+    // it. A read-only query destroyed a booking.
+    if reactive {
+        let reactor = Arc::new(ikigai_intray::SpaceReactor::new(
+            file_root().join("spaces"),
+            Arc::clone(&kernel) as Arc<dyn ikigai_resolve::Resolver>,
+            ikigai_core::Capability::scoped(vec![
+                ikigai_intray::CAP_OUT.to_string(),
+                ikigai_intray::CAP_READ.to_string(),
+                ikigai_intray::CAP_TAKE.to_string(),
+            ]),
+        ));
+        reactor.watch();
+    }
     // Register the tab-bar clock's 1s timer as a PERSISTENT time-transport job, so it
     // shows on the Control tab's Time-jobs readout (the cache demo, live) and a demo
     // cancel-all leaves it running. Mirrors the browser nav clock.

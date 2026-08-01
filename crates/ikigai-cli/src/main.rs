@@ -52,6 +52,8 @@ usage:
                                rerouted; the most specific override wins
   ikigai --prefer <p>=<t>      like --override, but falls back to the LOCAL binding when the peer
                                is unreachable (transient failures only; denials still propagate)
+  ikigai --react               run the space reactor in this session — claims and executes tuples
+                               dropped in the workspace. OFF by default; the daemon is the worker
   ikigai cert generate         create the pinned QUIC certificates (--dir <d> for a dedicated set)
   ikigai cert add-client <n>   mint an extra client identity into clients/<n>.{crt,key}
   ikigai -c '<command>' ...    run command(s) non-interactively, then exit
@@ -159,6 +161,12 @@ struct ReplArgs {
     /// never share a cert set.
     mounts: Vec<Mount>,
     certs: Certs,
+    /// Run the space reactor in this session (`--react`), claiming and executing tuples
+    /// dropped into the workspace. OFF by default: reacting means competing with the
+    /// writer daemon for the same queue, under whatever identity and grants this process
+    /// happens to have. For demonstrating the tuplespace on a machine with no daemon —
+    /// never alongside one.
+    react: bool,
 }
 
 /// One `--mount`: where it binds, what it connects to, and the certificates for
@@ -480,6 +488,9 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                     kind: ikigai_embedded::MountKind::Override,
                 });
             }
+            "--react" => {
+                repl.react = true;
+            }
             "--prefer" => {
                 // `--prefer <prefix>=<target>`: an override that DEGRADES. The
                 // remote answers when it can; a transient failure (peer asleep,
@@ -607,10 +618,11 @@ fn main() {
             if args.demo {
                 ikigai_embedded::demo_flag().store(true, std::sync::atomic::Ordering::SeqCst);
             }
-            let engine = build_engine(args.connect, args.mounts, &args.certs).unwrap_or_else(|e| {
-                eprintln!("ikigai: {e}");
-                std::process::exit(1);
-            });
+            let engine = build_engine(args.connect, args.mounts, &args.certs, args.react)
+                .unwrap_or_else(|e| {
+                    eprintln!("ikigai: {e}");
+                    std::process::exit(1);
+                });
             run_repl(engine, args.plain, &args.commands);
         }
     }
@@ -630,8 +642,10 @@ fn daemon(mounts: Vec<Mount>) {
     // Compose any `--mount`s into that kernel, exactly as the REPL path does. This is what
     // the standing drain resolves `urn:edge:` through; a daemon that ignored its mounts
     // would schedule the drain and then pull nothing from a prefix it cannot resolve.
+    // The daemon IS the worker: it holds the reactive kernel, so the workspace's tuples
+    // are claimed and run here, under this signed job's identity and grants.
     let kernel = if mounts.is_empty() {
-        ikigai_embedded::watched_kernel()
+        ikigai_embedded::reactive_kernel_with_mounts(Vec::new())
     } else {
         let mut resolved = Vec::new();
         for mount in mounts {
@@ -649,7 +663,7 @@ fn daemon(mounts: Vec<Mount>) {
                 }
             }
         }
-        ikigai_embedded::watched_kernel_with_mounts(resolved)
+        ikigai_embedded::reactive_kernel_with_mounts(resolved)
     };
     let name = ikigai_embedded::instance_name();
     match ikigai_embedded::standing_sync_interval() {
@@ -861,6 +875,7 @@ fn build_engine(
     connect: Option<Option<String>>,
     mounts: Vec<Mount>,
     certs: &Certs,
+    react: bool,
 ) -> Result<Engine, String> {
     match connect {
         // The watched kernel: cached workspace reads also invalidate on an
@@ -870,7 +885,11 @@ fn build_engine(
         // governs all of it. Any `--mount`s compose remote kernels into it.
         None => {
             let kernel = if mounts.is_empty() {
-                ikigai_embedded::watched_kernel()
+                if react {
+                    ikigai_embedded::reactive_kernel_with_mounts(Vec::new())
+                } else {
+                    ikigai_embedded::watched_kernel()
+                }
             } else {
                 let mut resolved = Vec::new();
                 for mount in mounts {
@@ -878,7 +897,11 @@ fn build_engine(
                     // label, surfaced in the catalog; each mount pins its OWN peer.
                     resolved.push(resolve_mount(mount)?);
                 }
-                ikigai_embedded::watched_kernel_with_mounts(resolved)
+                if react {
+                    ikigai_embedded::reactive_kernel_with_mounts(resolved)
+                } else {
+                    ikigai_embedded::watched_kernel_with_mounts(resolved)
+                }
             };
             Ok(with_profiles(Engine::new(kernel).with_spawner(
                 std::sync::Arc::new(ikigai_embedded::scheduler()),
