@@ -1317,7 +1317,7 @@ pub fn calendar_server_kernel() -> Kernel {
 /// invocable at all. Together: cert-gated, cap-clamped, thread-bounded,
 /// time-boxed remote evaluation — the transport for portable code.
 fn with_wire_eval(base: Arc<dyn ikigai_core::Space>) -> Arc<dyn ikigai_core::Space> {
-    let budget = EVAL_TIMEOUT_SECS.load(Ordering::Relaxed).max(1);
+    let budget = eval_timeout_secs();
     let mut governed_space =
         EndpointSpace::new().bind(Exact::new("urn:lisp:eval"), ikigai_lisp::eval());
     let mut spaces: Vec<Arc<dyn ikigai_core::Space>> = Vec::new();
@@ -1381,7 +1381,32 @@ fn code_signers() -> Option<Vec<String>> {
 /// it. (Configuration arrives as flags — not environment variables.)
 static CODE_SIGNERS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 /// Wall-clock ceiling for a served eval, in seconds (`--eval-timeout`).
-static EVAL_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(10);
+/// 0 = UNSET, so the config can be consulted. A concrete value here means `--eval-timeout`
+/// was given, and an explicit flag beats a config file.
+static EVAL_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(0);
+
+/// The wall-clock budget for `urn:lisp:eval`, in seconds.
+///
+/// Precedence: `--eval-timeout` (posture, set per server) → `lisp.timeout` in the host
+/// config → 10s.
+///
+/// Ten seconds is right for its original purpose — bounding a program a STRANGER shipped
+/// over QUIC, where a runaway must not pin the server. It is wrong for the same-user IPC
+/// host, because every `ikigai-invoke` from Emacs wraps its call in Lisp: asking a 70B model
+/// a question is one `urn:lisp:eval`, and it was being cut off at 10s as though it were
+/// hostile. The threat differs by transport, so the budget has to be settable rather than
+/// fixed — and a wire-facing server should state its own with `--eval-timeout` (bug's peer
+/// plist already does).
+fn eval_timeout_secs() -> u64 {
+    let flag = EVAL_TIMEOUT_SECS.load(Ordering::Relaxed);
+    if flag > 0 {
+        return flag;
+    }
+    config::get("lisp.timeout")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(10)
+}
 static CODE_SIGNERS_DIR: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
 
 /// Declare the code-signing trust set: the public-key resource IRIs whose
