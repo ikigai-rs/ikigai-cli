@@ -1590,14 +1590,6 @@ fn meeting_space() -> EndpointSpace {
     )
 }
 
-/// The kernel handle the alias generator reads the SPACE ENTRIES from, installed once the
-/// kernel exists (the same late-binding as the time registry and the reactor).
-///
-/// Only for `entries()` — enumerating bindings is pure data, not a resolution. The catalog
-/// is fetched through `inv.issue`, the supported re-entrant path.
-static ALIAS_RESOLVER: std::sync::OnceLock<Arc<dyn ikigai_resolve::Resolver>> =
-    std::sync::OnceLock::new();
-
 /// What the catalog says about one endpoint: its summary, and each non-Meta verb with the
 /// arguments that verb requires (in declaration order).
 type DescribedEndpoint = (String, Vec<(String, Vec<String>)>);
@@ -1615,6 +1607,12 @@ struct AliasTarget {
     actions: Vec<(String, Vec<String>)>,
 }
 
+/// Reading the manifold IS inspection, so the alias generator needs the same grant
+/// `urn:kernel:actions` and `urn:kernel:catalog` do. DECLARED, not merely enforced by the
+/// inner resolutions: an action that enforces a cap it does not declare makes the manifold
+/// over-offer, and the denial then surfaces from a nested call instead of the door.
+const CAP_KERNEL_INSPECT: &str = "urn:cap:kernel:inspect";
+
 /// `urn:lisp:aliases` — the manifold projected as callable Lisp.
 ///
 /// Named verbs instead of URIs: `(fn-toUpper "hi")` rather than
@@ -1628,25 +1626,29 @@ struct LispAliases;
 #[async_trait::async_trait]
 impl Endpoint for LispAliases {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
-        let resolver = ALIAS_RESOLVER
-            .get()
-            .ok_or_else(|| Error::Endpoint("no kernel to read the manifold from".to_string()))?;
-        let entries = resolver
-            .entries()
-            .ok_or_else(|| Error::Endpoint("this kernel cannot enumerate its space".to_string()))?;
-        // Re-enter through the INVOCATION, not through the stashed resolver. `inv.issue`
-        // is the supported re-entrant path (it threads this call's capability, tracing and
-        // provenance); the resolver's own `issue_as` hides a `block_on` that panics inside
-        // an executor, and its async twin deadlocks on the single-threaded scheduler.
-        // `urn:agent:select` reads `urn:kernel:actions` exactly this way.
+        // THE MANIFOLD, not the raw catalog: `urn:kernel:actions` is already narrowed to
+        // what THIS capability may invoke, already carries the RESOLVABLE IRI
+        // (`ik:endpoint <urn:fn:toUpper>`, not the skolem description IRI), and already
+        // omits templates. So capability filtering is not a filter bolted on here — it is
+        // the surface the kernel says you have. A scoped session gets a smaller prelude,
+        // not a full one that fails at call time.
+        let mut request = Request::new(
+            Verb::Source,
+            Iri::parse("urn:kernel:actions").expect("a constant IRI"),
+        );
+        request = request.with_arg("as", ArgRef::Inline(b"text/turtle".to_vec()));
+        let manifold = inv.issue(request).await?;
+        let candidates = parse_action_matches(&String::from_utf8_lossy(&manifold.bytes));
+        // The catalog supplies what the manifold does not: summaries, and which inputs are
+        // REQUIRED (so they become positional parameters rather than riding in `rest`).
         let catalog = inv
             .issue(Request::new(
                 Verb::Source,
                 Iri::parse("urn:kernel:catalog").expect("a constant IRI"),
             ))
             .await?;
-        let catalog = String::from_utf8_lossy(&catalog.bytes).to_string();
-        let targets = alias_targets(&entries, &catalog);
+        let described = catalog_descriptions(&String::from_utf8_lossy(&catalog.bytes));
+        let targets = alias_targets(&candidates, &described);
         let prefix = inv.inline_str("prefix").unwrap_or("").to_string();
         Ok(Representation::new(
             ReprType::new("text/plain"),
@@ -1670,35 +1672,70 @@ impl Endpoint for LispAliases {
                     .input(ArgSpec::new("prefix").optional().summary(
                         "only endpoints whose IRI starts with this (e.g. `urn:fn:`), \
                                  for a prelude scoped to one family",
-                    )),
+                    ))
+                    .requires(CAP_KERNEL_INSPECT),
             )
     }
 }
 
-/// Join the space entries (which know the RESOLVABLE IRI) with the catalog (which knows
-/// the arguments) on the endpoint's name.
+/// Join the capability-scoped manifold (which knows WHAT MAY BE CALLED and its resolvable
+/// IRI) with the catalog (which knows the arguments), on the endpoint's id.
 ///
-/// Templates are skipped: `urn:file:{path}` is a family, not a callable, and a function
-/// named after it would have nothing sensible to pass. Those stay `(source "urn:file:x")`.
-fn alias_targets(entries: &[SpaceEntry], catalog: &str) -> Vec<AliasTarget> {
-    let described = catalog_descriptions(catalog);
-    let mut targets: Vec<AliasTarget> = entries
-        .iter()
-        .filter(|e| !e.pattern.contains('{'))
-        .filter_map(|entry| {
-            let (summary, actions) = described.get(&entry.endpoint)?.clone();
-            Some(AliasTarget {
-                iri: entry.pattern.clone(),
+/// The manifold's `ik:ActionMatch` subject encodes that id:
+/// `urn:ikigai:endpoint:{id}:action:{verb}`.
+fn alias_targets(
+    candidates: &[SelectCandidate],
+    described: &std::collections::BTreeMap<String, DescribedEndpoint>,
+) -> Vec<AliasTarget> {
+    use std::collections::BTreeMap;
+    let mut by_iri: BTreeMap<String, AliasTarget> = BTreeMap::new();
+    for candidate in candidates {
+        // A family is not a callable: a template IRI has nothing sensible to pass. The
+        // manifold does not currently surface them; belt and braces, since one appearing
+        // would otherwise emit a verb nobody can call.
+        if candidate.endpoint.contains('{') || candidate.endpoint.is_empty() {
+            continue;
+        }
+        let Some(id) = action_endpoint_id(&candidate.action) else {
+            continue;
+        };
+        let (summary, actions) = match described.get(&id) {
+            Some(described) => described.clone(),
+            // Described nowhere: still callable, just undocumented and with no declared
+            // inputs — emit it argument-less rather than dropping an authorized action.
+            None => (String::new(), Vec::new()),
+        };
+        let required = actions
+            .iter()
+            .find(|(verb, _)| *verb == candidate.verb)
+            .map(|(_, required)| required.clone())
+            .unwrap_or_default();
+        let entry = by_iri
+            .entry(candidate.endpoint.clone())
+            .or_insert_with(|| AliasTarget {
+                iri: candidate.endpoint.clone(),
                 summary,
-                actions,
-            })
-        })
-        .collect();
-    // Deterministic output: a prelude that reorders itself between runs is a diff nobody
-    // can read, and these get committed.
+                actions: Vec::new(),
+            });
+        entry.actions.push((candidate.verb.clone(), required));
+    }
+    let mut targets: Vec<AliasTarget> = by_iri.into_values().collect();
+    for target in &mut targets {
+        target.actions.sort();
+        target.actions.dedup();
+    }
+    // Deterministic output: a prelude that reorders itself between runs is an unreadable
+    // diff, and these get committed.
     targets.sort_by(|a, b| a.iri.cmp(&b.iri));
-    targets.dedup_by(|a, b| a.iri == b.iri);
     targets
+}
+
+/// `urn:ikigai:endpoint:agent-select:action:source` → `agent-select`.
+fn action_endpoint_id(action: &str) -> Option<String> {
+    action
+        .strip_prefix("urn:ikigai:endpoint:")?
+        .rsplit_once(":action:")
+        .map(|(id, _verb)| id.to_string())
 }
 
 /// Parse the catalog's Turtle into `endpoint id -> (summary, [(verb, required inputs)])`.
@@ -3027,9 +3064,6 @@ fn build_watched(mounts: Vec<MountSpec>, reactive: bool) -> Arc<Kernel> {
     // module's tests if brought into scope.
     let registry = time_registry();
     registry.set_resolver(Arc::clone(&kernel) as Arc<dyn ikigai_resolve::Resolver>);
-    // The alias generator reads the manifold back through the kernel, so it needs the same
-    // late-bound handle (the kernel cannot be given to an endpoint it contains).
-    let _ = ALIAS_RESOLVER.set(Arc::clone(&kernel) as Arc<dyn ikigai_resolve::Resolver>);
     // The reactive tuplespace: watch file_root/spaces and fire each reactive space's handler
     // on a drop (inbox → outbox/error). Like the scheduler, it holds the kernel as a Resolver
     // installed now that the kernel exists. Handlers run under a SCOPED processing authority —
@@ -3900,29 +3934,94 @@ mod tests {
         assert_eq!(escape_markers("a $5 cost"), "a $5 cost");
     }
 
-    /// Templates are families, not callables: `urn:file:{path}` has nothing sensible to
-    /// pass, so it is skipped rather than generating a broken verb.
+    fn candidate(id: &str, iri: &str, verb: &str) -> SelectCandidate {
+        SelectCandidate {
+            action: format!("urn:ikigai:endpoint:{id}:action:{}", verb.to_lowercase()),
+            endpoint: iri.to_string(),
+            verb: verb.to_string(),
+            requires: Vec::new(),
+            missing_optional: 0,
+        }
+    }
+
+    /// CAPABILITY FILTERING is not a filter bolted onto the generator — the prelude is
+    /// projected from `urn:kernel:actions`, which the kernel has already narrowed to what
+    /// this capability may invoke. An action absent from the manifold gets no verb, so a
+    /// scoped session gets a SMALLER prelude rather than a full one that fails at call time.
     #[test]
-    fn templates_are_not_given_aliases() {
-        let entries = vec![
-            SpaceEntry::new("urn:fn:toUpper", "toUpper"),
-            SpaceEntry::new("urn:file:{path}", "file"),
-        ];
-        let catalog = r#"@prefix ik: <https://ikigai-rs.dev/ns#> .
+    fn only_authorized_actions_get_a_verb() {
+        let described = catalog_descriptions(
+            r#"@prefix ik: <https://ikigai-rs.dev/ns#> .
 <urn:ikigai:endpoint:toUpper> a ik:Endpoint ; ik:id "toUpper" ; ik:verb "Source" ;
     ik:input [ ik:inputName "in" ; ik:required true ] .
-<urn:ikigai:endpoint:file> a ik:Endpoint ; ik:id "file" ; ik:verb "Source" .
-"#;
-        let targets = alias_targets(&entries, catalog);
-        assert_eq!(targets.len(), 1, "only the concrete IRI: {targets:?}");
+<urn:ikigai:endpoint:client-issue> a ik:Endpoint ; ik:id "client-issue" ; ik:verb "Sink" .
+"#,
+        );
+        // The catalog describes both; the manifold authorizes only one.
+        let authorized = vec![candidate("toUpper", "urn:fn:toUpper", "Source")];
+        let targets = alias_targets(&authorized, &described);
+        assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].iri, "urn:fn:toUpper");
-        assert_eq!(
-            targets[0].actions,
-            vec![("Source".to_string(), vec!["in".to_string()])]
+        let out = aliases_scheme(&targets, "");
+        assert!(out.contains("fn-toUpper"), "{out}");
+        assert!(
+            !out.contains("client-issue"),
+            "an unauthorized action must not appear at all: {out}"
         );
     }
 
-    /// Inputs may be BLANK nodes in the catalog's Turtle. Filtering to named subjects
+    /// The manifold carries the RESOLVABLE IRI; the catalog names endpoints by a skolem
+    /// description IRI. Joining on the id is what keeps the emitted call dialable.
+    #[test]
+    fn the_emitted_iri_is_the_resolvable_one() {
+        let described = catalog_descriptions(
+            r#"@prefix ik: <https://ikigai-rs.dev/ns#> .
+<urn:ikigai:endpoint:toUpper> a ik:Endpoint ; ik:id "toUpper" ; ik:verb "Source" ;
+    ik:input [ ik:inputName "in" ; ik:required true ] .
+"#,
+        );
+        let targets = alias_targets(
+            &[candidate("toUpper", "urn:fn:toUpper", "Source")],
+            &described,
+        );
+        let out = aliases_scheme(&targets, "");
+        assert!(out.contains("\"urn:fn:toUpper\""), "{out}");
+        assert!(
+            !out.contains("urn:ikigai:endpoint:toUpper\""),
+            "the skolem IRI is a description, not an address: {out}"
+        );
+    }
+
+    /// A family is not a callable.
+    #[test]
+    fn templates_are_not_given_aliases() {
+        let described = catalog_descriptions(
+            r#"@prefix ik: <https://ikigai-rs.dev/ns#> .
+<urn:ikigai:endpoint:file> a ik:Endpoint ; ik:id "file" ; ik:verb "Source" .
+"#,
+        );
+        let targets = alias_targets(
+            &[candidate("file", "urn:file:{path}", "Source")],
+            &described,
+        );
+        assert!(targets.is_empty(), "{targets:?}");
+    }
+
+    /// An authorized action the catalog says nothing about still gets a verb — undocumented
+    /// and argument-less — rather than being dropped. Silence in one source must not remove
+    /// an affordance the other one grants.
+    #[test]
+    fn an_undescribed_action_still_gets_a_verb() {
+        let described = std::collections::BTreeMap::new();
+        let targets = alias_targets(
+            &[candidate("mystery", "urn:mystery:go", "Source")],
+            &described,
+        );
+        let out = aliases_scheme(&targets, "");
+        assert!(out.contains("(define (mystery-go . rest)"), "{out}");
+    }
+
+    /// Inputs may be BLANK nodes in the catalog's Turtle.    /// Inputs may be BLANK nodes in the catalog's Turtle. Filtering to named subjects
     /// silently produced zero arguments for every endpoint — the generator emitted
     /// parameterless functions that ignored their inputs.
     #[test]
