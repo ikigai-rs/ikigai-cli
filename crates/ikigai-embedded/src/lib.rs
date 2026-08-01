@@ -69,6 +69,37 @@ fn page_impl(_inv: &Invocation<'_>) -> Result<Representation> {
     .cacheable())
 }
 
+/// `urn:data:alias-demo`: a Lisp program that PULLS ITS OWN PRELUDE.
+///
+/// The point of the transclusion marker here: each `urn:lisp:eval` is isolated, so
+/// definitions never survive from one evaluation to the next — a prelude has to be IN the
+/// program. `$a{urn:lisp:aliases}` splices in the generated alias definitions by REFERENCE,
+/// so what is stored is a pointer to the live manifold rather than a copy that goes stale
+/// the moment an endpoint changes.
+fn alias_demo_impl(_inv: &Invocation<'_>) -> Result<Representation> {
+    let body = "$a{urn:lisp:aliases}\n\n\
+        ;; The prelude above is generated from THIS kernel's manifold, under YOUR\n\
+        ;; capability. Everything below is an ordinary call to a named verb.\n\
+        (fn-toUpper \"named verbs, generated from the manifold\")\n";
+    Ok(Representation::new(
+        ReprType::new("text/plain").with_param("charset", "utf-8"),
+        body.as_bytes().to_vec(),
+    ))
+}
+
+fn alias_demo() -> FnEndpoint {
+    FnEndpoint::new("alias-demo", alias_demo_impl).with_description(
+        Description::new("alias-demo")
+            .title("Alias demo program")
+            .summary(
+                "a Lisp program that transcludes the generated alias prelude and then calls \
+                 one of its verbs — compose it, then pipe it to urn:lisp:eval",
+            )
+            .verb(Verb::Source)
+            .output("text/plain"),
+    )
+}
+
 fn page() -> FnEndpoint {
     FnEndpoint::new("page", page_impl).with_description(
         Description::new("page")
@@ -585,6 +616,7 @@ fn base_space(nature: &'static str) -> EndpointSpace {
         .bind(Exact::new("urn:data:page"), page())
         .bind(Exact::new("urn:data:control"), control())
         .bind(Exact::new("urn:data:about"), about())
+        .bind(Exact::new("urn:data:alias-demo"), alias_demo())
         .bind(Exact::new("urn:demo:greeter"), greeter())
         .bind(Exact::new("urn:time:now"), clock_now())
         .bind(Exact::new("urn:tz:convert"), ikigai_tz::convert())
