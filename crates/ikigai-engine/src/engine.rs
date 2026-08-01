@@ -203,6 +203,13 @@ pub enum Action {
 
 /// Holds the resolver (a local or remote kernel) and turns input lines into
 /// [`Action`]s.
+/// A one-shot piped-stdin payload: the bytes, or a way to obtain them when they are first
+/// needed. See [`Engine::set_piped_input_with`] for why the second variant exists.
+enum PipedInput {
+    Ready(Vec<u8>),
+    Deferred(Box<dyn FnOnce() -> Vec<u8>>),
+}
+
 pub struct Engine {
     resolver: Arc<dyn Resolver>,
     /// Cache outcomes recorded by [`run`](Self::run) during the current `eval`.
@@ -235,7 +242,7 @@ pub struct Engine {
     /// non-TTY stdin (`… | ikigai -c 'sink <iri>'`), the first content-less `sink` uses this as
     /// its `content` — so a secret can be piped in and never touch the command line (argv/`ps`)
     /// or the shell history. `take`n on use, so it feeds exactly one write.
-    piped_input: RefCell<Option<Vec<u8>>>,
+    piped_input: RefCell<Option<PipedInput>>,
 }
 
 impl Engine {
@@ -260,11 +267,24 @@ impl Engine {
         }
     }
 
+    /// Provide a one-shot piped-stdin payload LAZILY: `read` runs only if a content-less
+    /// `sink` actually asks for it.
+    ///
+    /// The eager version hung. Reading stdin to EOF before running the commands blocks
+    /// whenever stdin is a non-TTY that never closes — an inherited pipe from an editor, a
+    /// test harness, launchd — so `ikigai -c 'source …' > file` waited forever for input no
+    /// command wanted. `is_terminal()` does not distinguish "a pipe with data" from "a pipe
+    /// nobody will ever write to", and nothing can: the only safe moment to block on stdin
+    /// is when a command has asked for its content.
+    pub fn set_piped_input_with(&self, read: impl FnOnce() -> Vec<u8> + 'static) {
+        *self.piped_input.borrow_mut() = Some(PipedInput::Deferred(Box::new(read)));
+    }
+
     /// Provide a one-shot piped-stdin payload for a batch run: a content-less `sink <iri>` then
     /// reads it as `content`. The CLI sets this from a non-TTY stdin so a secret piped in
     /// (`printf %s "$v" | ikigai -c 'sink urn:secret:<name>'`) never lands on the command line.
     pub fn set_piped_input(&self, bytes: Vec<u8>) {
-        *self.piped_input.borrow_mut() = Some(bytes);
+        *self.piped_input.borrow_mut() = Some(PipedInput::Ready(bytes));
     }
 
     /// Inject the scheduler (as a [`Spawner`]) so `( a ; b )` forks and `..` maps
@@ -816,7 +836,14 @@ impl Engine {
         // stdin payload feeds it instead — so a value (e.g. a secret) can be piped in without
         // ever appearing on the command line. Empty otherwise (e.g. a no-body delete).
         let content = if tail.is_empty() && verb == Verb::Sink {
-            self.piped_input.borrow_mut().take().unwrap_or_default()
+            // Take FIRST, then read: a deferred reader may block, and holding the
+            // RefCell borrow across that is a deadlock waiting to happen.
+            let piped = self.piped_input.borrow_mut().take();
+            match piped {
+                Some(PipedInput::Ready(bytes)) => bytes,
+                Some(PipedInput::Deferred(read)) => read(),
+                None => Vec::new(),
+            }
         } else {
             tail.as_bytes().to_vec()
         };
@@ -2070,6 +2097,58 @@ mod tests {
             lisp_echo_engine().eval_lisp("   \n  "),
             Action::Noop
         ));
+    }
+
+    /// The deferred reader must not run unless a content-less `sink` asks.
+    ///
+    /// The regression: the CLI read stdin to EOF BEFORE running any command, which blocks
+    /// forever when stdin is a non-TTY that never closes (an inherited pipe from an editor,
+    /// a harness, launchd). `ikigai -c 'source …' > file` hung waiting for input no command
+    /// wanted.
+    #[test]
+    fn a_deferred_piped_input_is_not_read_unless_a_sink_needs_it() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let echo = FnEndpoint::new("echo", |inv: &Invocation<'_>| {
+            let body = inv.inline_str("content").unwrap_or("");
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("stored:{body}").into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("echo")
+                .verb(Verb::Sink)
+                .input(ArgSpec::new("content").summary("the body"))
+                .output("text/plain"),
+        );
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(EndpointSpace::new().bind(Exact::new("urn:echo"), echo)),
+            Arc::new(JsonRenderer),
+        ));
+        let run = |e: &Engine, cmd: &str| match e.eval(cmd) {
+            Action::Output(entry) => entry.result.unwrap(),
+            _ => panic!("expected Action::Output"),
+        };
+
+        let read = Rc::new(Cell::new(false));
+        let flag = Rc::clone(&read);
+        engine.set_piped_input_with(move || {
+            flag.set(true);
+            b"deferred".to_vec()
+        });
+
+        // A `sink` WITH content never touches the pipe...
+        assert_eq!(run(&engine, "sink urn:echo typed"), "stored:typed");
+        assert!(
+            !read.get(),
+            "nothing asked for stdin yet — reading it here is the hang"
+        );
+
+        // ...and only a content-less one does.
+        assert_eq!(run(&engine, "sink urn:echo"), "stored:deferred");
+        assert!(read.get(), "the sink asked, so the read happened");
     }
 
     #[test]

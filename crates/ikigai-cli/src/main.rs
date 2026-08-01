@@ -1121,10 +1121,17 @@ fn run_repl(engine: Engine, plain: bool, commands: &[String]) {
         {
             use std::io::{IsTerminal, Read};
             if !std::io::stdin().is_terminal() {
-                let mut buf = Vec::new();
-                if std::io::stdin().read_to_end(&mut buf).is_ok() && !buf.is_empty() {
-                    engine.set_piped_input(buf);
-                }
+                // LAZILY. Reading stdin to EOF here blocks whenever stdin is a non-TTY that
+                // never closes — an inherited pipe from an editor, a harness, launchd — so
+                // `ikigai -c 'source …' > file` hung waiting for input no command wanted.
+                // `is_terminal()` cannot tell "a pipe with data" from "a pipe nobody will
+                // write to"; the only safe moment to block is when a content-less `sink`
+                // has actually asked for the content.
+                engine.set_piped_input_with(|| {
+                    let mut buf = Vec::new();
+                    let _ = std::io::stdin().read_to_end(&mut buf);
+                    buf
+                });
             }
         }
         std::process::exit(repl::run_commands(engine, commands));
