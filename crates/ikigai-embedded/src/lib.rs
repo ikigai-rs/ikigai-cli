@@ -1650,10 +1650,18 @@ impl Endpoint for LispAliases {
         let described = catalog_descriptions(&String::from_utf8_lossy(&catalog.bytes));
         let targets = alias_targets(&candidates, &described);
         let prefix = inv.inline_str("prefix").unwrap_or("").to_string();
-        Ok(Representation::new(
-            ReprType::new("text/plain"),
-            aliases_scheme(&targets, &prefix).into_bytes(),
-        ))
+        // Two REPRESENTATIONS of one resource, not two endpoints: the same projection,
+        // emitted for whichever lisp is asking.
+        let elisp = inv
+            .inline_str("as")
+            .map(|v| v.contains("emacs"))
+            .unwrap_or(false);
+        let (body, repr) = if elisp {
+            (aliases_elisp(&targets, &prefix), "text/x-emacs-lisp")
+        } else {
+            (aliases_scheme(&targets, &prefix), "text/x-scheme")
+        };
+        Ok(Representation::new(ReprType::new(repr), body.into_bytes()))
     }
 
     fn name(&self) -> &str {
@@ -1669,6 +1677,12 @@ impl Endpoint for LispAliases {
             .action(
                 ActionSpec::new(Verb::Source)
                     .summary("the alias prelude — one definition per resolvable endpoint")
+                    .input(
+                        ArgSpec::new("as")
+                            .optional()
+                            .one_of(["text/x-scheme", "text/x-emacs-lisp"])
+                            .summary("which lisp to emit (default Scheme, for urn:lisp:eval)"),
+                    )
                     .input(ArgSpec::new("prefix").optional().summary(
                         "only endpoints whose IRI starts with this (e.g. `urn:fn:`), \
                                  for a prelude scoped to one family",
@@ -1949,6 +1963,79 @@ fn aliases_scheme(targets: &[AliasTarget], prefix: &str) -> String {
         out.push_str(";; (no endpoints matched)\n");
     }
     out
+}
+
+/// The fixed runtime every generated elisp file carries — the transport, not the surface.
+///
+/// Kept in a real `.el` file rather than a string literal here: it is the only hand-written
+/// part, and layering Rust escaping over elisp escaping over regexp escaping is how a
+/// mangled `ikigai--quote` reaches someone's Emacs.
+const ELISP_RUNTIME: &str = include_str!("aliases.el");
+
+/// Emit the elisp face. Same targets, same rules — a different lisp.
+fn aliases_elisp(targets: &[AliasTarget], prefix: &str) -> String {
+    let mut out = String::from(ELISP_RUNTIME);
+    let mut emitted = 0;
+    for target in targets {
+        if !prefix.is_empty() && !target.iri.starts_with(prefix) {
+            continue;
+        }
+        for (verb, required) in &target.actions {
+            // `ikigai-` namespaces the whole surface, so these can live in an ordinary
+            // load-path without colliding with anything.
+            let name = format!("ikigai-{}", alias_name(&target.iri, verb));
+            let binders: Vec<String> = required.iter().map(|r| safe_elisp_param(r)).collect();
+            let params = if binders.is_empty() {
+                "&rest args".to_string()
+            } else {
+                format!("{} &rest args", binders.join(" "))
+            };
+            let passed: String = required
+                .iter()
+                .zip(&binders)
+                .map(|(wire, binder)| format!(" \"{wire}\" {binder}"))
+                .collect();
+            let doc = if target.summary.is_empty() {
+                format!("Issue {} on `{}'.", verb.to_lowercase(), target.iri)
+            } else {
+                // Elisp docstrings are string literals: escape quotes and backslashes.
+                first_line(&target.summary)
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+            };
+            out.push_str(&format!(
+                "(defun {name} ({params})\n  \"{doc}\"\n  (ikigai--call \"{}\" \"{}\" (append (list{passed}) args)))\n\n",
+                verb.to_lowercase(),
+                target.iri,
+            ));
+            emitted += 1;
+        }
+    }
+    if emitted == 0 {
+        out.push_str(";; (no endpoints matched)\n");
+    }
+    out.push_str("(provide 'ikigai-aliases)\n");
+    out
+}
+
+/// A parameter name safe to bind in elisp. Unlike Scheme, elisp is a lisp-2, so `if` is a
+/// perfectly good VARIABLE name — only the constants cannot be rebound.
+fn safe_elisp_param(name: &str) -> String {
+    let clean: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if matches!(clean.as_str(), "nil" | "t" | "args") || clean.is_empty() {
+        format!("{clean}-value")
+    } else {
+        clean
+    }
 }
 
 fn first_line(text: &str) -> String {
@@ -3990,6 +4077,64 @@ mod tests {
             !out.contains("urn:ikigai:endpoint:toUpper\""),
             "the skolem IRI is a description, not an address: {out}"
         );
+    }
+
+    /// The elisp face is a REPRESENTATION of the same projection: same targets, same
+    /// required/optional split, a different lisp.
+    #[test]
+    fn the_elisp_face_emits_callable_defuns() {
+        let targets = vec![AliasTarget {
+            iri: "urn:fn:toUpper".to_string(),
+            summary: "Upper-cases the text.".to_string(),
+            actions: vec![("Source".to_string(), vec!["in".to_string()])],
+        }];
+        let out = aliases_elisp(&targets, "");
+        assert!(
+            out.contains("(defun ikigai-fn-toUpper (in &rest args)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("\"Upper-cases the text.\""),
+            "docstring: {out}"
+        );
+        assert!(
+            out.contains(
+                "(ikigai--call \"source\" \"urn:fn:toUpper\" (append (list \"in\" in) args))"
+            ),
+            "{out}"
+        );
+        // The hand-written transport rides along, and the file is loadable on its own.
+        assert!(
+            out.contains("(defun ikigai--call"),
+            "runtime included: {out}"
+        );
+        assert!(out.ends_with("(provide 'ikigai-aliases)\n"), "{out}");
+    }
+
+    /// Elisp is a lisp-2, so `if` is a perfectly good VARIABLE name — unlike Scheme, where
+    /// it must be renamed. Only the constants cannot be rebound.
+    #[test]
+    fn elisp_parameters_are_sanitized_only_where_elisp_requires_it() {
+        assert_eq!(safe_elisp_param("if"), "if");
+        assert_eq!(safe_elisp_param("in"), "in");
+        assert_eq!(safe_elisp_param("nil"), "nil-value");
+        assert_eq!(safe_elisp_param("t"), "t-value");
+        // `args` is the generated rest parameter; a declared argument of that name would
+        // shadow it and silently drop every optional argument.
+        assert_eq!(safe_elisp_param("args"), "args-value");
+    }
+
+    /// A docstring is a string literal: an embedded quote in a summary would end it early
+    /// and produce a file Emacs cannot load.
+    #[test]
+    fn elisp_docstrings_escape_quotes() {
+        let targets = vec![AliasTarget {
+            iri: "urn:x:y".to_string(),
+            summary: "says \"hello\" loudly".to_string(),
+            actions: vec![("Source".to_string(), vec![])],
+        }];
+        let out = aliases_elisp(&targets, "");
+        assert!(out.contains("says \\\"hello\\\" loudly"), "{out}");
     }
 
     /// A family is not a callable.
