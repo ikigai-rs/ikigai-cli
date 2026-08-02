@@ -2186,6 +2186,222 @@ fn escape_markers(text: &str) -> String {
     out
 }
 
+/// How many missed cadences before a recurring job is called STALE.
+///
+/// Three, not one: a single missed tick is noise (a slow resolution, a laptop that slept
+/// through one), three in a row is a pattern. The threshold is a MULTIPLE of the job's own
+/// declared interval, so nothing has to be configured — a 5-minute derive is stale at 15
+/// minutes, a 30-second drain at 90 seconds.
+const STALE_CADENCES: u32 = 3;
+
+/// `urn:host:health` — is this HOST doing what it said it would?
+///
+/// Named for the host, not the kernel, for two reasons. The facts are the host's — its timed
+/// jobs, its peers — and the kernel is a resolution engine that has no daemons. And
+/// `urn:kernel:*` is intercepted by core as intrinsics before any space sees it, so a
+/// binding there would never be reached.
+///
+/// SELF-STALENESS IS ALARMABLE; PEER ABSENCE IS NOT. "My derive has not run in 16 hours" is
+/// wrong wherever the machine is. "plasma is not here" is a laptop that went travelling, and
+/// a health check that pages about it is a health check nobody reads. So peers are REPORTED
+/// with their presence and never counted against the verdict.
+///
+/// The one peer condition that IS a fault — announcing but not answering — is distinguishable
+/// only because discovery separates Present from Withdrawn/Unknown, and is left to a caller
+/// that wants to dial.
+struct KernelHealth;
+
+#[async_trait::async_trait]
+impl Endpoint for KernelHealth {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        if !inv.capability.allows(CAP_KERNEL_INSPECT) {
+            return Err(Error::Denied(format!(
+                "reading kernel health requires `{CAP_KERNEL_INSPECT}`"
+            )));
+        }
+        let jobs = time_registry().health();
+        // Peers only if a browse is ALREADY running: health must not start a background
+        // multicast listener as a side effect, and on a machine whose peers are away the
+        // honest answer is "not watching" rather than a 1.2s wait for silence.
+        let peers = BROWSER
+            .get()
+            .and_then(|browser| browser.as_ref())
+            .map(|browser| browser.peers())
+            .unwrap_or_default();
+
+        let turtle = inv
+            .inline_str("as")
+            .map(|v| v.contains("turtle"))
+            .unwrap_or(false);
+        let (body, repr) = if turtle {
+            (health_turtle(&jobs, &peers), "text/turtle")
+        } else {
+            (health_text(&jobs, &peers), "text/plain")
+        };
+        Ok(Representation::new(ReprType::new(repr), body.into_bytes()))
+    }
+
+    fn name(&self) -> &str {
+        "kernel-health"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("kernel-health")
+            .summary(
+                "whether this kernel's own periodic work is running at the cadence it \
+                 declared, plus the peers it can currently hear",
+            )
+            .verb(Verb::Source)
+            .action(
+                ActionSpec::new(Verb::Source)
+                    .summary("ok | stale — judged against each job's OWN declared interval")
+                    .input(
+                        ArgSpec::new("as")
+                            .optional()
+                            .one_of(["text/plain", "text/turtle"])
+                            .summary("the representation to return (default text/plain)"),
+                    )
+                    .requires(CAP_KERNEL_INSPECT),
+            )
+    }
+}
+
+/// Is a recurring job overdue by more than [`STALE_CADENCES`] of its own interval?
+///
+/// A job that has NEVER run is not yet stale — it may simply be younger than its first
+/// tick; it becomes stale once more than that many intervals of process life have passed.
+/// Non-recurring jobs are never stale: they were meant to fire once.
+fn job_is_stale(job: &ikigai_time::JobHealth, uptime: std::time::Duration) -> bool {
+    if !job.recurring {
+        return false;
+    }
+    let limit = job.interval * STALE_CADENCES;
+    match job.since_last {
+        Some(age) => age > limit,
+        None => uptime > limit,
+    }
+}
+
+fn health_text(jobs: &[ikigai_time::JobHealth], peers: &[ikigai_discovery::Peer]) -> String {
+    let uptime = process_uptime();
+    let stale: Vec<&ikigai_time::JobHealth> =
+        jobs.iter().filter(|j| job_is_stale(j, uptime)).collect();
+    let mut out = format!(
+        "{}  ·  {} up  ·  {} job(s), {} stale\n\n",
+        if stale.is_empty() { "ok" } else { "STALE" },
+        fmt_secs(uptime),
+        jobs.len(),
+        stale.len()
+    );
+    for job in jobs {
+        let age = match job.since_last {
+            Some(age) => fmt_secs(age),
+            None => "never".to_string(),
+        };
+        out.push_str(&format!(
+            "  {:<7} {:<34} every {:<7} runs {:<5} last {}\n",
+            if job_is_stale(job, uptime) {
+                "STALE"
+            } else {
+                "ok"
+            },
+            job.target,
+            fmt_secs(job.interval),
+            job.runs,
+            age
+        ));
+        // The last thing it SAID, when it failed — a job can run on time and still be
+        // doing nothing useful, which is the failure that hid for sixteen hours.
+        if job.last_output.starts_with("error") {
+            out.push_str(&format!("          {}\n", job.last_output));
+        }
+    }
+    // Peers are INFORMATION. A travelling laptop is not a fault, so this section never
+    // affects the verdict above.
+    out.push_str("\npeers (not counted against health — an absent peer is normal):\n");
+    if peers.is_empty() {
+        out.push_str("  none heard (or no browse running here)\n");
+    } else {
+        for peer in peers {
+            out.push_str(&format!(
+                "  {:<12} {:<22} {}\n",
+                peer.name,
+                peer.socket_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "(no address)".to_string()),
+                peer.surface.as_deref().unwrap_or("")
+            ));
+        }
+    }
+    out
+}
+
+fn health_turtle(jobs: &[ikigai_time::JobHealth], peers: &[ikigai_discovery::Peer]) -> String {
+    let uptime = process_uptime();
+    let stale = jobs.iter().filter(|j| job_is_stale(j, uptime)).count();
+    let mut out = String::from(
+        "@prefix ik: <https://ikigai-rs.dev/ns#> .\n@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\n",
+    );
+    out.push_str(&format!(
+        "<urn:host:health> a ik:Health ;\n    ik:verdict \"{}\" ;\n    ik:uptimeSeconds {} ;\n    ik:staleJobs {stale} .\n\n",
+        if stale == 0 { "ok" } else { "stale" },
+        uptime.as_secs()
+    ));
+    for job in jobs {
+        out.push_str(&format!(
+            "<urn:host:health:job:{}> a ik:Job ;\n    ik:target <{}> ;\n    ik:intervalSeconds {} ;\n    ik:runs {} ;\n    ik:stale \"{}\"^^xsd:boolean",
+            job.id,
+            job.target,
+            job.interval.as_secs(),
+            job.runs,
+            job_is_stale(job, uptime)
+        ));
+        if let Some(age) = job.since_last {
+            out.push_str(&format!(" ;\n    ik:sinceLastSeconds {}", age.as_secs()));
+        }
+        out.push_str(" .\n\n");
+    }
+    for peer in peers {
+        out.push_str(&format!(
+            "<urn:peer:{}> a ik:Peer ;\n    ik:peerName \"{}\" ;\n    ik:heard \"true\"^^xsd:boolean .\n\n",
+            peer.name, peer.name
+        ));
+    }
+    out
+}
+
+/// How long this process has been up — the denominator for "has a job that never ran had
+/// time to run yet?".
+///
+/// The clock must be STARTED at kernel construction, not at first read: a `OnceLock`
+/// initialized lazily begins when health is first asked, which reported `0s up` on a host
+/// that had been running for hours, and would have called every never-run job healthy
+/// forever. [`start_uptime_clock`] is called while the kernel is being built.
+fn process_uptime() -> std::time::Duration {
+    uptime_start().elapsed()
+}
+
+fn uptime_start() -> std::time::Instant {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *START.get_or_init(std::time::Instant::now)
+}
+
+/// Start the uptime clock. Idempotent; called from every kernel constructor.
+fn start_uptime_clock() {
+    let _ = uptime_start();
+}
+
+fn fmt_secs(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    if s < 90 {
+        format!("{s}s")
+    } else if s < 5400 {
+        format!("{}m", s / 60)
+    } else {
+        format!("{}h{:02}m", s / 3600, (s % 3600) / 60)
+    }
+}
+
 /// The capability a peer listing needs. Discovery is local-network reconnaissance — who is
 /// out there, and what they claim to serve — so it is gated, not free.
 const CAP_NET_DISCOVER: &str = "urn:cap:net:discover";
@@ -2830,7 +3046,11 @@ fn root_space_with_mounts(mounts: Vec<MountSpec>) -> Arc<dyn Space> {
                 .bind(Exact::new("urn:peer:list"), PeerList)
                 // The manifold as callable Lisp. Embedded-only: it describes THIS kernel's
                 // reachable surface, which is the local operator's business.
-                .bind(Exact::new("urn:lisp:aliases"), LispAliases),
+                .bind(Exact::new("urn:lisp:aliases"), LispAliases)
+                // Is this kernel doing what it said it would? Embedded-only, like its
+                // neighbours: a served kernel reporting its own liveness to a remote
+                // caller is a different question, with a different answer.
+                .bind(Exact::new("urn:host:health"), KernelHealth),
         ) as Arc<dyn Space>,
         // The org agenda (urn:org:agenda[:{period}]) over the configured org
         // files, which it reads through the kernel via urn:orgfile:*.
@@ -3259,6 +3479,7 @@ pub fn watched_kernel_with_mounts(mounts: Vec<MountSpec>) -> Arc<Kernel> {
 /// workspace's tuples; everything else (file/org/store watchers, scheduler, timed jobs)
 /// is the same either way.
 fn build_watched(mounts: Vec<MountSpec>, reactive: bool) -> Arc<Kernel> {
+    start_uptime_clock();
     // Inject the process scheduler so re-entrant fan-out (e.g. `compose`'s `$a{}`
     // markers) runs concurrently on it; single-threaded by default, a pool under
     // `IKIGAI_SCHEDULER=pool[:N]`. The same scheduler is injected as a read-only
@@ -4075,6 +4296,7 @@ pub fn trusted_kernel_for(nature: &'static str) -> Kernel {
 /// mounts, so a machine's transport and topology are a property of that host" — which was
 /// unachievable while only the REPL and `--daemon` could take mount flags.
 pub fn trusted_kernel_with_mounts(nature: &'static str, mounts: Vec<MountSpec>) -> Kernel {
+    start_uptime_clock();
     let _ = nature;
     let space = if mounts.is_empty() {
         root_space()
@@ -4368,6 +4590,87 @@ mod tests {
         assert_eq!(
             *actions,
             vec![("Source".to_string(), vec!["in".to_string()])]
+        );
+    }
+
+    fn job(interval_secs: u64, since_last: Option<u64>, recurring: bool) -> ikigai_time::JobHealth {
+        ikigai_time::JobHealth {
+            id: 1,
+            target: "urn:view:derive:tick".to_string(),
+            interval: std::time::Duration::from_secs(interval_secs),
+            recurring,
+            persistent: true,
+            runs: since_last.map(|_| 5).unwrap_or(0),
+            since_last: since_last.map(std::time::Duration::from_secs),
+            last_output: String::new(),
+        }
+    }
+
+    /// Staleness is judged against the job's OWN declared cadence, so nothing has to be
+    /// configured: a 5-minute derive is stale at 15 minutes, a 30-second drain at 90s.
+    /// This is the check that would have caught a writer dead for sixteen hours within
+    /// fifteen minutes.
+    #[test]
+    fn a_job_is_stale_after_three_of_its_own_cadences() {
+        let up = std::time::Duration::from_secs(86_400);
+        // 300s derive: fine at 10 minutes, stale at 20.
+        assert!(!job_is_stale(&job(300, Some(600), true), up));
+        assert!(job_is_stale(&job(300, Some(1200), true), up));
+        // 30s drain: fine at 60s, stale at 120s.
+        assert!(!job_is_stale(&job(30, Some(60), true), up));
+        assert!(job_is_stale(&job(30, Some(120), true), up));
+    }
+
+    /// A job that has NEVER run is not automatically broken — it may simply be younger
+    /// than its first tick. It becomes stale once the PROCESS has been up long enough that
+    /// it should have fired.
+    #[test]
+    fn a_job_that_never_ran_is_judged_against_uptime() {
+        let young = std::time::Duration::from_secs(10);
+        let old = std::time::Duration::from_secs(3600);
+        assert!(
+            !job_is_stale(&job(300, None, true), young),
+            "a fresh process has not missed anything yet"
+        );
+        assert!(
+            job_is_stale(&job(300, None, true), old),
+            "an hour up and the 5-minute job has never fired: that is broken"
+        );
+    }
+
+    /// A one-shot job was meant to fire once. Calling it stale forever afterwards would
+    /// make the whole report cry wolf.
+    #[test]
+    fn a_one_shot_job_is_never_stale() {
+        let old = std::time::Duration::from_secs(86_400);
+        assert!(!job_is_stale(&job(30, Some(86_000), false), old));
+        assert!(!job_is_stale(&job(30, None, false), old));
+    }
+
+    /// PEER ABSENCE IS NOT A FAULT. Brian travels with plasma; a health check that pages
+    /// about a laptop being elsewhere is a health check nobody reads. The verdict line
+    /// must depend only on this host's own jobs.
+    #[test]
+    fn peers_do_not_affect_the_verdict() {
+        let jobs = vec![job(300, Some(60), true)];
+        let with_none = health_text(&jobs, &[]);
+        let with_peer = health_text(
+            &jobs,
+            &[ikigai_discovery::Peer {
+                name: "plasma".to_string(),
+                addrs: vec![],
+                port: 4433,
+                surface: None,
+                ceiling: None,
+                version: None,
+                trusted: true,
+            }],
+        );
+        assert!(with_none.starts_with("ok"), "{with_none}");
+        assert!(with_peer.starts_with("ok"), "{with_peer}");
+        assert!(
+            with_none.contains("none heard"),
+            "an absent peer is reported, not escalated: {with_none}"
         );
     }
 
