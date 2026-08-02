@@ -91,6 +91,18 @@ fn address_rank(ip: &IpAddr) -> u8 {
     }
 }
 
+/// How long a withdrawal is trusted before it decays back to [`Presence::Unknown`].
+///
+/// A negative must not be permanent. The browse socket is bound to an interface, and an
+/// interface goes away — sleep/wake, a VPN, changing networks — so a browse can outlive its
+/// ability to hear anything. If `Withdrawn` never expired, a caller that skips the dial on
+/// absence would skip it FOREVER, and a peer that came back would never be used again until
+/// something restarted. Absence expires; presence does not need to.
+///
+/// Two minutes: long enough that a peer which really left is not dialled repeatedly, short
+/// enough that its return costs at most one bounded dial to notice.
+pub const WITHDRAWN_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// What is known about a peer right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Presence {
@@ -234,11 +246,13 @@ impl Browser {
             return Presence::Unknown;
         };
         if state.present.contains_key(name) {
-            Presence::Present
-        } else if state.withdrawn.contains_key(name) {
-            Presence::Withdrawn
-        } else {
-            Presence::Unknown
+            return Presence::Present;
+        }
+        match state.withdrawn.get(name) {
+            // A FRESH withdrawal is knowledge; a stale one is just an old opinion, and
+            // acting on it forever is how a returning peer becomes invisible.
+            Some(since) if since.elapsed() < WITHDRAWN_TTL => Presence::Withdrawn,
+            _ => Presence::Unknown,
         }
     }
 
@@ -364,6 +378,36 @@ mod tests {
         // With nothing routable, still deterministic rather than arbitrary.
         p.addrs = vec!["fe80::2".parse().unwrap(), "fe80::1".parse().unwrap()];
         assert_eq!(p.socket_addr().unwrap().to_string(), "[fe80::1]:4433");
+    }
+
+    /// A withdrawal DECAYS. If it did not, a caller that skips the dial on absence would
+    /// skip it FOREVER — and a peer that came back after a network change the browse never
+    /// heard would never be used again. Absence is the claim that expires; presence needs
+    /// no such rule, because hearing an announcement is positive evidence.
+    #[test]
+    fn a_stale_withdrawal_decays_to_unknown() {
+        let state = Arc::new(Mutex::new(State::default()));
+        let browser = Browser {
+            daemon: ServiceDaemon::new().expect("a daemon for the test"),
+            state: Arc::clone(&state),
+        };
+        state.lock().unwrap().withdrawn.insert(
+            "plasma".to_string(),
+            Instant::now() - (WITHDRAWN_TTL + std::time::Duration::from_secs(1)),
+        );
+        assert_eq!(
+            browser.presence("plasma"),
+            Presence::Unknown,
+            "a stale negative must not keep a returning peer out"
+        );
+
+        // A recent withdrawal is still knowledge.
+        state
+            .lock()
+            .unwrap()
+            .withdrawn
+            .insert("plasma".to_string(), Instant::now());
+        assert_eq!(browser.presence("plasma"), Presence::Withdrawn);
     }
 
     #[test]

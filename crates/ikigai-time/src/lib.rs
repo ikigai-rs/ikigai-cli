@@ -192,6 +192,10 @@ struct JobRecord {
     persistent: bool,
     runs: u64,
     last_output: String,
+    /// When this job last COMPLETED a fire. The fact staleness is computed from: a
+    /// recurring job that declares its own cadence can be judged against it without
+    /// anyone configuring a threshold.
+    last_run: Option<std::time::Instant>,
     handle: TimerHandle,
 }
 
@@ -201,6 +205,22 @@ struct Inner {
     resolver: Option<Arc<dyn Resolver>>,
     capability: Capability,
     backend: Arc<dyn TimerBackend>,
+}
+
+/// One job's liveness, as [`JobRegistry::health`] reports it.
+#[derive(Clone, Debug)]
+pub struct JobHealth {
+    pub id: u64,
+    pub target: String,
+    /// The cadence the job DECLARED. Staleness is judged against this, so no threshold
+    /// has to be configured anywhere.
+    pub interval: std::time::Duration,
+    pub recurring: bool,
+    pub persistent: bool,
+    pub runs: u64,
+    /// `None` = it has never completed a run.
+    pub since_last: Option<std::time::Duration>,
+    pub last_output: String,
 }
 
 /// The registry of timed jobs — shared (cheaply cloneable) between the `urn:time:*`
@@ -314,6 +334,7 @@ impl JobRegistry {
                 persistent,
                 runs: 0,
                 last_output: String::new(),
+                last_run: None,
                 handle,
             },
         );
@@ -392,7 +413,31 @@ impl JobRegistry {
         if let Some(job) = inner.jobs.get_mut(&id) {
             job.runs += 1;
             job.last_output = outcome;
+            job.last_run = Some(std::time::Instant::now());
         }
+    }
+
+    /// A machine-readable snapshot of every job's liveness, for a health report.
+    ///
+    /// Deliberately reports FACTS, not a verdict: how often the job is meant to run, how
+    /// long since it did, and what it last said. Whether that is "stale" belongs to the
+    /// caller, because the answer depends on what the job is for.
+    pub fn health(&self) -> Vec<JobHealth> {
+        let inner = self.inner.lock().expect("time registry lock");
+        inner
+            .jobs
+            .values()
+            .map(|job| JobHealth {
+                id: job.id,
+                target: job.target.clone(),
+                interval: job.schedule.interval(),
+                recurring: job.recurring,
+                persistent: job.persistent,
+                runs: job.runs,
+                since_last: job.last_run.map(|at| at.elapsed()),
+                last_output: job.last_output.clone(),
+            })
+            .collect()
     }
 
     /// Render the job list as the `urn:time:jobs` readout.
