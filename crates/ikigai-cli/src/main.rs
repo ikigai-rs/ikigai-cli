@@ -688,6 +688,17 @@ fn main() {
 /// LaunchAgent runs: the desktop machine as a quiet, always-on resolver.
 #[cfg(feature = "embedded")]
 fn daemon(mounts: Vec<Mount>) {
+    // No mount flags -> the machine's own topology (config home), same rule as every
+    // kernel-building mode. The booking picker asking urn:llm:ask in THIS process is
+    // exactly who a `mount = "prefer urn:llm:=peer:plasma"` line is for.
+    let mounts = match mounts_or_config(mounts) {
+        Ok(mounts) => mounts,
+        // A topology that does not parse must never look like no topology.
+        Err(e) => {
+            eprintln!("ikigai: {e}");
+            std::process::exit(2);
+        }
+    };
     // watched_kernel(), NOT kernel_for(): the watchers, the time transport's
     // kernel handle, and the standing-sync registration all live in the
     // watched constructor — a bare served-space kernel would park with the
@@ -938,6 +949,10 @@ fn build_engine(
         // engine's `( a ; b )` / `..` parallelism, so `IKIGAI_SCHEDULER=pool:N`
         // governs all of it. Any `--mount`s compose remote kernels into it.
         None => {
+            // No mount flags -> the machine's own topology (config home). Only here in
+            // the EMBEDDED branch: a `--connect` client composes nothing — the host it
+            // connects to owns the topology.
+            let mounts = mounts_or_config(mounts)?;
             let kernel = if mounts.is_empty() {
                 if react {
                     ikigai_embedded::reactive_kernel_with_mounts(Vec::new())
@@ -973,10 +988,21 @@ fn build_engine(
     }
 }
 
-/// Connect a `--mount` target as a [`Resolver`](ikigai_resolve::Resolver) to compose
-/// a remote kernel into the local graph. The target picks the transport the same way
-/// `--connect` does: `quic://host:port` for a remote kernel over mutually-pinned TLS
-/// (federation across machines), else a Unix socket path (a same-machine peer).
+/// The mounts a kernel-building mode composes: flags are POSTURE and win WHOLESALE
+/// when given; otherwise the machine's own topology from the config home. Wholesale
+/// rather than merged, because a half-and-half mount set is the kind of thing nobody
+/// can debug at 2am. Every mode that builds a kernel from nothing routes through
+/// this — the REPL/one-shot, the daemon, the IPC host — so `mount =` lines mean the
+/// MACHINE composes that way, not one lucky process.
+#[cfg(feature = "embedded")]
+fn mounts_or_config(mounts: Vec<Mount>) -> Result<Vec<Mount>, String> {
+    if mounts.is_empty() {
+        config_mounts()
+    } else {
+        Ok(mounts)
+    }
+}
+
 #[cfg(feature = "embedded")]
 /// The machine's own topology, from `mount` lines in the host config.
 ///
@@ -1039,7 +1065,9 @@ fn shellexpand_home(path: &str) -> String {
 }
 
 /// Turn a parsed [`Mount`] into a [`MountSpec`], connecting eagerly or lazily
-/// according to its kind.
+/// according to its kind. The target picks the transport the same way `--connect`
+/// does: `quic://host:port` for a remote kernel over mutually-pinned TLS (federation
+/// across machines), else a Unix socket path (a same-machine peer).
 ///
 /// `--mount` and `--override` connect NOW: you named that peer because you want
 /// its namespace, and a silent no-op is the failure mode worth being loud about.
@@ -1569,19 +1597,15 @@ fn serve_ipc(path: Option<String>, mounts: Vec<Mount>) -> ! {
     // Flags are POSTURE and win wholesale when given; otherwise the machine's own topology
     // from the config home. Wholesale rather than merged, because a half-and-half mount set
     // is the kind of thing nobody can debug at 2am.
-    let mounts = if mounts.is_empty() {
-        match config_mounts() {
-            Ok(mounts) => mounts,
-            // A topology that does not parse must never look like no topology: this host
-            // would come up serving purely local resources and answer every federated
-            // request from the wrong machine, silently.
-            Err(e) => {
-                eprintln!("ikigai: {e}");
-                std::process::exit(2);
-            }
+    let mounts = match mounts_or_config(mounts) {
+        Ok(mounts) => mounts,
+        // A topology that does not parse must never look like no topology: this host
+        // would come up serving purely local resources and answer every federated
+        // request from the wrong machine, silently.
+        Err(e) => {
+            eprintln!("ikigai: {e}");
+            std::process::exit(2);
         }
-    } else {
-        mounts
     };
     // Connect the mounts BEFORE announcing readiness: a host that says it is serving and
     // then cannot reach the peer it was told to compose is worse than one that refuses to
