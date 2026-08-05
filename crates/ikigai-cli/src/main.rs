@@ -1247,6 +1247,17 @@ fn resolve_peer(name: &str, _certs: &Certs) -> Result<(String, Certs), String> {
     ))
 }
 
+/// The QUIC idle timeout: `quic.timeout` (seconds) in the host config, else the
+/// generous default. Like `ipc.timeout` (#259), what this bounds is SILENCE — and for
+/// a long resolution the silence is the work.
+#[cfg(all(feature = "embedded", feature = "quic"))]
+fn quic_idle_timeout() -> std::time::Duration {
+    ikigai_embedded::config::get("quic.timeout")
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(ikigai_quic::DEFAULT_IDLE_TIMEOUT)
+}
+
 #[cfg(all(feature = "embedded", feature = "quic"))]
 fn connect_mount_quic(
     target: &str,
@@ -1255,7 +1266,7 @@ fn connect_mount_quic(
     let addr = quic::parse_addr(target)?;
     let identity = quic::client_identity(certs)?;
     let trusted = quic::trusted_server_cert(certs)?;
-    let resolver = ikigai_quic::connect(addr, &identity, &trusted)
+    let resolver = ikigai_quic::connect_with(addr, &identity, &trusted, quic_idle_timeout())
         .map_err(|e| format!("--mount: connect {target}: {e}"))?;
     Ok(std::sync::Arc::new(resolver))
 }
@@ -1510,7 +1521,15 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool) -> !
         } else {
             None
         };
-        ikigai_quic::serve(kernel, addr, &identity, &trusted, minter).map_err(|e| e.to_string())
+        ikigai_quic::serve_with(
+            kernel,
+            addr,
+            &identity,
+            &trusted,
+            minter,
+            quic_idle_timeout(),
+        )
+        .map_err(|e| e.to_string())
     })();
     match result {
         Ok(()) => std::process::exit(0),
@@ -1526,7 +1545,7 @@ fn connect_quic(target: &str, certs: &Certs) -> Result<Engine, String> {
     let addr = quic::parse_addr(target)?;
     let identity = quic::client_identity(certs)?;
     let trusted = quic::trusted_server_cert(certs)?;
-    let resolver = ikigai_quic::connect(addr, &identity, &trusted)
+    let resolver = ikigai_quic::connect_with(addr, &identity, &trusted, quic_idle_timeout())
         .map_err(|e| format!("connect {target}: {e}"))?;
     Ok(with_profiles(Engine::new(resolver)))
 }

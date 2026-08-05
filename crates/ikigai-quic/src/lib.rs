@@ -63,6 +63,18 @@ pub struct Session {
     pub file_segment: String,
 }
 
+/// How long a connection may be SILENT before either side declares it dead.
+///
+/// Generous on purpose, mirroring `ipc.timeout` (cli #259): the server says nothing
+/// until a resolution finishes, so for a long resolution — a 70B loading ~40GB, a
+/// hard question generating for minutes — the silence IS the work. quinn's ~30s
+/// default killed exactly those calls mid-generation while the model kept computing.
+/// The cost is symmetric: a peer that dies MID-REQUEST now takes up to this long to
+/// notice (the 5s dial bound still catches a dead peer at connect time). A deadline
+/// that cannot tell "hung" from "busy" reports the wrong thing confidently, which is
+/// worse than reporting late. `quic.timeout` (seconds) in the host config overrides.
+pub const DEFAULT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 pub fn serve(
     kernel: Kernel,
     addr: SocketAddr,
@@ -70,7 +82,26 @@ pub fn serve(
     trusted_client_cert_pems: &[String],
     minter: Arc<dyn Fn(&str) -> Session + Send + Sync>,
 ) -> io::Result<()> {
-    let config = server_config(identity, trusted_client_cert_pems)?;
+    serve_with(
+        kernel,
+        addr,
+        identity,
+        trusted_client_cert_pems,
+        minter,
+        DEFAULT_IDLE_TIMEOUT,
+    )
+}
+
+/// [`serve`] with an explicit idle timeout (see [`DEFAULT_IDLE_TIMEOUT`]).
+pub fn serve_with(
+    kernel: Kernel,
+    addr: SocketAddr,
+    identity: &Identity,
+    trusted_client_cert_pems: &[String],
+    minter: Arc<dyn Fn(&str) -> Session + Send + Sync>,
+    idle: std::time::Duration,
+) -> io::Result<()> {
+    let config = server_config(identity, trusted_client_cert_pems, idle)?;
     let runtime = Runtime::new()?;
     runtime.block_on(async move {
         let endpoint = bind_endpoint(config, addr)?;
@@ -224,7 +255,22 @@ pub fn connect(
     identity: &Identity,
     trusted_server_cert_pem: &str,
 ) -> io::Result<QuicResolver> {
-    let config = client_config(identity, trusted_server_cert_pem)?;
+    connect_with(
+        addr,
+        identity,
+        trusted_server_cert_pem,
+        DEFAULT_IDLE_TIMEOUT,
+    )
+}
+
+/// [`connect`] with an explicit idle timeout (see [`DEFAULT_IDLE_TIMEOUT`]).
+pub fn connect_with(
+    addr: SocketAddr,
+    identity: &Identity,
+    trusted_server_cert_pem: &str,
+    idle: std::time::Duration,
+) -> io::Result<QuicResolver> {
+    let config = client_config(identity, trusted_server_cert_pem, idle)?;
     let runtime = Runtime::new()?;
     let (endpoint, connection) = runtime.block_on(async move {
         let bind: SocketAddr = if addr.is_ipv6() {
@@ -426,6 +472,7 @@ impl Resolver for QuicResolver {
 fn server_config(
     identity: &Identity,
     trusted_client_cert_pems: &[String],
+    idle: std::time::Duration,
 ) -> io::Result<quinn::ServerConfig> {
     let certs = trusted_client_cert_pems
         .iter()
@@ -443,7 +490,20 @@ fn server_config(
         .map_err(other)?;
     tls.alpn_protocols = vec![ALPN.to_vec()];
     let quic = quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(other)?;
-    Ok(quinn::ServerConfig::with_crypto(Arc::new(quic)))
+    let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic));
+    config.transport_config(Arc::new(transport(idle)?));
+    Ok(config)
+}
+
+/// A transport config carrying the idle timeout. Each side enforces its OWN, so both
+/// the server and the client builders apply it. Keep-alive stays deliberately absent:
+/// RFC 9000 restarts the idle timer on ack-eliciting SENDS too, so pinging would keep
+/// a dead peer's connection looking alive forever — patience bounded by `idle` beats
+/// liveness theater that never expires.
+fn transport(idle: std::time::Duration) -> io::Result<quinn::TransportConfig> {
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(quinn::IdleTimeout::try_from(idle).map_err(other)?));
+    Ok(transport)
 }
 
 /// How long a dial may run before the peer is declared unreachable.
@@ -475,6 +535,7 @@ async fn dial(endpoint: &quinn::Endpoint, addr: SocketAddr) -> io::Result<quinn:
 fn client_config(
     identity: &Identity,
     trusted_server_cert_pem: &str,
+    idle: std::time::Duration,
 ) -> io::Result<quinn::ClientConfig> {
     let verifier = Arc::new(PinnedPeer::new(load_cert(trusted_server_cert_pem)?));
     let mut tls = rustls::ClientConfig::builder_with_provider(provider())
@@ -489,12 +550,13 @@ fn client_config(
         .map_err(other)?;
     tls.alpn_protocols = vec![ALPN.to_vec()];
     let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(other)?;
-    // NOTE: transport timeouts are deliberately left at quinn's defaults. An earlier version
-    // of this change also set `max_idle_timeout` + `keep_alive_interval`; the keep-alive made
-    // a DEAD peer take LONGER to notice (the reconnect test went 30s → 60s+), because a
-    // connection being pinged looks active. quinn's default idle timeout already bounds a
-    // peer that dies mid-request. Only the dial needed bounding.
-    Ok(quinn::ClientConfig::new(Arc::new(quic)))
+    // The idle timeout is OURS to set (see [`DEFAULT_IDLE_TIMEOUT`]): quinn's ~30s
+    // default killed long-silent work (a 70B generating) mid-request. Keep-alive stays
+    // off — an earlier attempt showed pinging makes a DEAD peer take LONGER to notice
+    // (RFC 9000 restarts the idle timer on ack-eliciting sends); see [`transport`].
+    let mut config = quinn::ClientConfig::new(Arc::new(quic));
+    config.transport_config(Arc::new(transport(idle)?));
+    Ok(config)
 }
 
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
@@ -677,8 +739,12 @@ mod tests {
         let server_id = generate();
         let client_id = generate();
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let server_cfg =
-            server_config(&server_id, std::slice::from_ref(&client_id.cert_pem)).unwrap();
+        let server_cfg = server_config(
+            &server_id,
+            std::slice::from_ref(&client_id.cert_pem),
+            DEFAULT_IDLE_TIMEOUT,
+        )
+        .unwrap();
         let rt = Runtime::new().unwrap();
         let endpoint = rt
             .block_on(async { quinn::Endpoint::server(server_cfg, addr) })
@@ -728,8 +794,12 @@ mod tests {
         let server_id = generate();
         let client_id = generate();
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let server_cfg =
-            server_config(&server_id, std::slice::from_ref(&client_id.cert_pem)).unwrap();
+        let server_cfg = server_config(
+            &server_id,
+            std::slice::from_ref(&client_id.cert_pem),
+            DEFAULT_IDLE_TIMEOUT,
+        )
+        .unwrap();
         let rt = Runtime::new().unwrap();
         let endpoint = rt
             .block_on(async { quinn::Endpoint::server(server_cfg, addr) })
@@ -822,8 +892,12 @@ mod tests {
         let server_id = generate();
         let client_id = generate();
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let server_cfg =
-            server_config(&server_id, std::slice::from_ref(&client_id.cert_pem)).unwrap();
+        let server_cfg = server_config(
+            &server_id,
+            std::slice::from_ref(&client_id.cert_pem),
+            DEFAULT_IDLE_TIMEOUT,
+        )
+        .unwrap();
         let rt = Runtime::new().unwrap();
         let endpoint = rt
             .block_on(async { quinn::Endpoint::server(server_cfg, addr) })
@@ -878,6 +952,92 @@ mod tests {
             .with_arg("in", ArgRef::Inline(text.as_bytes().to_vec()))
     }
 
+    /// The idle timeout decides whether LONG-SILENT WORK survives: the server says
+    /// nothing while a resolution runs, and quinn's old ~30s default killed a hard
+    /// LLM question mid-generation (observed bug->plasma) while the model kept
+    /// computing. A client outliving the silence gets the reply; one with a shorter
+    /// idle than the work loses the connection.
+    #[test]
+    fn a_slow_resolution_survives_a_generous_idle_and_dies_under_a_short_one() {
+        let server_id = generate();
+        let client_id = generate();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server_cfg = server_config(
+            &server_id,
+            std::slice::from_ref(&client_id.cert_pem),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        let rt = Runtime::new().unwrap();
+        let endpoint = rt
+            .block_on(async { quinn::Endpoint::server(server_cfg, addr) })
+            .unwrap();
+        let server_addr = endpoint.local_addr().unwrap();
+        let slow = FnEndpoint::new("slow", |_inv: &Invocation<'_>| {
+            // Blocking sleep stands in for a model generating: the connection carries
+            // NOTHING until the work finishes. (Multi-thread runtime; one connection.)
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                b"eventually".to_vec(),
+            ))
+        });
+        let kernel = Arc::new(Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:demo:slow"), slow),
+        )));
+        let session = Session {
+            capability: Capability::root(),
+            file_segment: String::new(),
+        };
+        // A real accept loop: the impatient client's RETRY (round_trip reconnects once
+        // after a failure) dials a second connection while the first is still being
+        // served, so connections must be handled concurrently, as `serve` itself does.
+        drop(session);
+        let _server = thread::spawn(move || {
+            rt.block_on(async move {
+                while let Some(incoming) = endpoint.accept().await {
+                    let kernel = Arc::clone(&kernel);
+                    tokio::spawn(async move {
+                        let connection = match incoming.await {
+                            Ok(c) => c,
+                            Err(_) => return,
+                        };
+                        let session = Session {
+                            capability: Capability::root(),
+                            file_segment: String::new(),
+                        };
+                        serve_connection(&kernel, connection, &session).await;
+                    });
+                }
+            });
+        });
+
+        let req = || Request::new(Verb::Source, Iri::parse("urn:demo:slow").unwrap());
+        // 1s of patience for 3s of work: the connection idles out, the call fails.
+        let impatient = connect_with(
+            server_addr,
+            &client_id,
+            &server_id.cert_pem,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(
+            impatient.issue(req()).is_err(),
+            "a 1s idle must not survive 3s of silent work"
+        );
+        drop(impatient);
+        // 10s of patience: the same call completes.
+        let patient = connect_with(
+            server_addr,
+            &client_id,
+            &server_id.cert_pem,
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        let (repr, _) = patient.issue(req()).expect("slow work completes");
+        assert_eq!(repr.bytes, b"eventually");
+    }
+
     /// A dial to a peer that never answers must FAIL, not hang.
     ///
     /// The regression: quinn's defaults retry the handshake for a very long time, so a mount
@@ -913,8 +1073,12 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
         // Bind the server first so we can learn its actual (ephemeral) port.
-        let server_cfg =
-            server_config(&server_id, std::slice::from_ref(&client_id.cert_pem)).unwrap();
+        let server_cfg = server_config(
+            &server_id,
+            std::slice::from_ref(&client_id.cert_pem),
+            DEFAULT_IDLE_TIMEOUT,
+        )
+        .unwrap();
         let rt = Runtime::new().unwrap();
         let endpoint = rt
             .block_on(async { quinn::Endpoint::server(server_cfg, addr) })
@@ -961,8 +1125,12 @@ mod tests {
         let impostor = generate();
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-        let server_cfg =
-            server_config(&server_id, std::slice::from_ref(&client_id.cert_pem)).unwrap();
+        let server_cfg = server_config(
+            &server_id,
+            std::slice::from_ref(&client_id.cert_pem),
+            DEFAULT_IDLE_TIMEOUT,
+        )
+        .unwrap();
         let rt = Runtime::new().unwrap();
         let endpoint = rt
             .block_on(async { quinn::Endpoint::server(server_cfg, addr) })
@@ -1032,7 +1200,14 @@ mod reconnect_tests {
         // A FIXED port, so the second server instance is reachable at the same address the
         // resolver already knows — exactly the "same edge, restarted" case.
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let cfg = || server_config(&server_id, std::slice::from_ref(&client_id.cert_pem)).unwrap();
+        let cfg = || {
+            server_config(
+                &server_id,
+                std::slice::from_ref(&client_id.cert_pem),
+                DEFAULT_IDLE_TIMEOUT,
+            )
+            .unwrap()
+        };
         // Bind once to claim a concrete port, then hand that port to the servers.
         let probe = Runtime::new()
             .unwrap()
@@ -1040,9 +1215,17 @@ mod reconnect_tests {
         let port = probe.local_addr().unwrap();
         drop(probe);
 
-        // First server instance.
+        // First server instance. A SHORT idle timeout, explicitly: noticing the dead
+        // first connection costs up to the idle bound, and this test is about the
+        // reconnect, not about sitting out the generous production default.
         let first = serve_one(cfg(), port);
-        let client = connect(port, &client_id, &server_id.cert_pem).unwrap();
+        let client = connect_with(
+            port,
+            &client_id,
+            &server_id.cert_pem,
+            std::time::Duration::from_secs(2),
+        )
+        .unwrap();
         assert_eq!(client.issue(upper("one")).unwrap().0.bytes, b"ONE");
 
         // The server goes away — this is what leaves the resolver holding a dead connection.
@@ -1061,5 +1244,56 @@ mod reconnect_tests {
 
         drop(client);
         second.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod idle_timeout {
+    use super::*;
+    use std::net::SocketAddr;
+    use tokio::runtime::Runtime;
+
+    /// The configured idle timeout actually reaches the connection: a QUIET
+    /// connection (nothing sent either way) closes once it elapses. Guards the
+    /// regression where the transport config was built but never applied.
+    #[test]
+    fn a_quiet_connection_dies_at_the_configured_idle_timeout() {
+        let server_id = generate();
+        let client_id = generate();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server_cfg = server_config(
+            &server_id,
+            std::slice::from_ref(&client_id.cert_pem),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        let rt = Runtime::new().unwrap();
+        let endpoint = rt
+            .block_on(async { quinn::Endpoint::server(server_cfg, addr) })
+            .unwrap();
+        let server_addr = endpoint.local_addr().unwrap();
+        let _server = std::thread::spawn(move || {
+            rt.block_on(async move {
+                let incoming = endpoint.accept().await.unwrap();
+                let _connection = incoming.await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            });
+        });
+        let client = connect_with(
+            server_addr,
+            &client_id,
+            &server_id.cert_pem,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let reason = {
+            let conn = client.connection.lock().unwrap().clone();
+            conn.close_reason()
+        };
+        assert!(
+            reason.is_some(),
+            "a 1s idle must close a connection quiet for 3s"
+        );
     }
 }
