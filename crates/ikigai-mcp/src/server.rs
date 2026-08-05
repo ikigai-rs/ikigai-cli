@@ -69,6 +69,14 @@ fn tools_list(kernel: &Kernel, capability: &Capability, filter: &ToolFilter) -> 
         ..Default::default()
     };
     let mut tools = Vec::new();
+    // A federated kernel lists a mounted namespace TWICE — the fronted mount's
+    // catalog and the local space both carry `urn:llm:ask` under an `--override`/
+    // `--prefer` — but resolution serves exactly one (the mount, by precedence).
+    // The projection must offer exactly one tool per name: MCP clients key on the
+    // name, and a duplicate is at best confusing, at worst rejected. Keep the
+    // FIRST occurrence in `select_actions` order — `tools_call` re-selects the
+    // same way, so the tool shown is the action a call reaches.
+    let mut seen = std::collections::BTreeSet::new();
     for m in kernel.select_actions(&query) {
         let Ok(iri) = Iri::parse(&m.endpoint) else {
             continue;
@@ -85,7 +93,7 @@ fn tools_list(kernel: &Kernel, capability: &Capability, filter: &ToolFilter) -> 
             let shown = tool
                 .get("name")
                 .and_then(Value::as_str)
-                .is_some_and(|n| filter.allows(n));
+                .is_some_and(|n| filter.allows(n) && seen.insert(n.to_string()));
             if shown {
                 tools.push(tool);
             }
@@ -309,6 +317,70 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 0);
+    }
+
+    /// A federated kernel lists a mounted namespace twice: under `--override`/
+    /// `--prefer` the fronted mount's catalog AND the local space both carry the
+    /// same endpoint. Resolution serves exactly one (the mount, by precedence),
+    /// so the projection must offer exactly one tool — a duplicate name is at
+    /// best confusing to an MCP client, at worst rejected outright.
+    #[test]
+    fn a_federated_duplicate_projects_one_tool() {
+        let echo = |wrap: &'static str| {
+            FnEndpoint::new("echo", move |inv| {
+                let text = inv.inline_str("in").unwrap_or("");
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    format!("{wrap}{text}{wrap}").into_bytes(),
+                ))
+            })
+            .with_description(
+                Description::new("echo")
+                    .verb(Verb::Source)
+                    .input(ArgSpec::new("in").summary("the text")),
+            )
+        };
+        // The same IRI bound in two composed spaces — the shape an override/prefer
+        // mount produces (remote catalog fronted, local binding behind it).
+        let root = ikigai_core::Fallback::new(vec![
+            Arc::new(EndpointSpace::new().bind(Exact::new("urn:demo:echo"), echo("[")))
+                as Arc<dyn ikigai_core::Space>,
+            Arc::new(EndpointSpace::new().bind(Exact::new("urn:demo:echo"), echo("(")))
+                as Arc<dyn ikigai_core::Space>,
+        ]);
+        let k = Kernel::new(Arc::new(root));
+        let cap = Capability::root();
+        let resp = handle(
+            &k,
+            &cap,
+            &ToolFilter::default(),
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .unwrap();
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        let echoes: Vec<_> = tools
+            .iter()
+            .filter(|t| t["name"] == "echo__source")
+            .collect();
+        assert_eq!(
+            echoes.len(),
+            1,
+            "one tool per name, not one per catalog row"
+        );
+
+        // And the call reaches the endpoint resolution serves: the FIRST space,
+        // exactly as the fronted mount wins at resolution time.
+        let resp = handle(
+            &k,
+            &cap,
+            &ToolFilter::default(),
+            &json!({
+                "jsonrpc":"2.0","id":2,"method":"tools/call",
+                "params": { "name": "echo__source", "arguments": { "in": "hi" } }
+            }),
+        )
+        .unwrap();
+        assert_eq!(resp["result"]["content"][0]["text"], "[hi[");
     }
 
     #[test]

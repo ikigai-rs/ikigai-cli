@@ -140,6 +140,11 @@ enum Mode {
     Mcp {
         grants: Vec<String>,
         scopes: Vec<String>,
+        /// Remote kernels composed into the projected manifold (`--mount`/`--override`/
+        /// `--prefer`, same syntax as the REPL; no flags ⇒ the machine's own topology
+        /// from the config home). A federated mount is most useful HERE: the MCP
+        /// client gets tools that resolve on a peer without holding its certificates.
+        mounts: Vec<Mount>,
     },
     CertGenerate {
         force: bool,
@@ -454,7 +459,38 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
         argv.next();
         let mut grants = Vec::new();
         let mut scopes = Vec::new();
+        let mut certs = Certs::default();
+        let mut mounts: Vec<Mount> = Vec::new();
         while let Some(arg) = argv.next() {
+            // Cert flags AFTER a mount attach to it (the REPL's rule), so two peers
+            // with different identities never share a set. mcp never `--connect`s,
+            // so there is no default-set use for flags before any mount.
+            if cert_flag(&arg, &mut argv, &mut certs)? {
+                if let Some(mount) = mounts.last_mut() {
+                    mount.certs = certs.clone();
+                }
+                continue;
+            }
+            if let Some(kind) = match arg.as_str() {
+                "--mount" => Some(ikigai_embedded::MountKind::Alias),
+                "--override" => Some(ikigai_embedded::MountKind::Override),
+                "--prefer" => Some(ikigai_embedded::MountKind::Prefer),
+                _ => None,
+            } {
+                let spec = argv
+                    .next()
+                    .ok_or_else(|| format!("{arg} needs <prefix>=<target>"))?;
+                let (prefix, target) = spec
+                    .split_once('=')
+                    .ok_or_else(|| format!("{arg} expects <prefix>=<target>, got `{spec}`"))?;
+                mounts.push(Mount {
+                    prefix: prefix.to_string(),
+                    target: target.to_string(),
+                    certs: certs.clone(),
+                    kind,
+                });
+                continue;
+            }
             match arg.as_str() {
                 "--grant" => grants.push(
                     argv.next()
@@ -467,7 +503,11 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 other => return Err(format!("unknown argument after `mcp`: {other}")),
             }
         }
-        return Ok(Some(Mode::Mcp { grants, scopes }));
+        return Ok(Some(Mode::Mcp {
+            grants,
+            scopes,
+            mounts,
+        }));
     }
 
     let mut repl = ReplArgs::default();
@@ -631,7 +671,11 @@ fn main() {
 
     match mode {
         Mode::Daemon { mounts } => daemon(mounts),
-        Mode::Mcp { grants, scopes } => mcp(grants, scopes),
+        Mode::Mcp {
+            grants,
+            scopes,
+            mounts,
+        } => mcp(grants, scopes, mounts),
         Mode::CertGenerate { force, dir } => cert_generate(force, dir),
         Mode::CertAddClient {
             name,
@@ -795,7 +839,7 @@ fn mcp_filter(grants: &[String]) -> ikigai_mcp::ToolFilter {
 /// client's tool list morphs live — no restart. Broadening is safe here because
 /// it is the HUMAN editing the grant (root re-granting), never the client.
 #[cfg(feature = "embedded")]
-fn mcp(grants: Vec<String>, scopes: Vec<String>) {
+fn mcp(grants: Vec<String>, scopes: Vec<String>, mounts: Vec<Mount>) {
     use ikigai_mcp::server::handle;
     use std::io::{BufRead, Write};
     use std::sync::{Arc, Mutex, RwLock};
@@ -819,7 +863,40 @@ fn mcp(grants: Vec<String>, scopes: Vec<String>) {
             );
         }
     }
-    let kernel = ikigai_embedded::watched_kernel();
+    // No mount flags -> the machine's own topology (config home), the same rule as
+    // every kernel-building mode. This is where federation pays off for an agent:
+    // `mount = "prefer urn:llm:=peer:plasma"` puts the peer's models behind the
+    // SAME tool names the local kernel would project, no client-side config at all.
+    let mounts = match mounts_or_config(mounts) {
+        Ok(mounts) => mounts,
+        // A topology that does not parse must never look like no topology.
+        Err(e) => {
+            eprintln!("ikigai: {e}");
+            std::process::exit(2);
+        }
+    };
+    let kernel = if mounts.is_empty() {
+        ikigai_embedded::watched_kernel()
+    } else {
+        let mut resolved = Vec::new();
+        for mount in mounts {
+            let (target, prefix) = (mount.target.clone(), mount.prefix.clone());
+            match resolve_mount(mount) {
+                Ok(spec) => {
+                    eprintln!("ikigai mcp: composing {prefix} via {target}");
+                    resolved.push(spec);
+                }
+                // Fatal, like the daemon: an MCP server that silently dropped a mount
+                // would project a manifold missing the tools the topology promised.
+                // (A --prefer mount never lands here — it connects on demand.)
+                Err(e) => {
+                    eprintln!("ikigai: --mount {target}: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        ikigai_embedded::watched_kernel_with_mounts(resolved)
+    };
     let stdout = Arc::new(Mutex::new(std::io::stdout()));
 
     // The live grant-swap watcher (poll the grants file's mtime). Only meaningful
@@ -896,7 +973,7 @@ fn mcp(grants: Vec<String>, scopes: Vec<String>) {
 }
 
 #[cfg(not(feature = "embedded"))]
-fn mcp(_grants: Vec<String>, _scopes: Vec<String>) {
+fn mcp(_grants: Vec<String>, _scopes: Vec<String>, _mounts: Vec<Mount>) {
     eprintln!("ikigai: mcp requires the embedded feature");
     std::process::exit(2);
 }
@@ -1937,6 +2014,41 @@ mod mount_cert_tests {
         assert_eq!(mounts[2].prefix, "urn:llm:");
         assert_eq!(mounts[2].target, "quic://plasma.local:4433");
         assert_eq!(mounts[2].certs.cert_dir.as_deref(), Some("/certs/plasma"));
+    }
+
+    /// `ikigai mcp` composes mounts like every other kernel-building mode — a
+    /// federated manifold is where projection pays off (a peer's models and the
+    /// remote calendar behind natural tool names, no client-side topology). Cert
+    /// flags attach to the mount they follow, the REPL's rule.
+    #[test]
+    fn mcp_takes_mounts_with_their_own_certificates() {
+        let parsed = parse_argv(
+            argv(&[
+                "mcp",
+                "--grant",
+                "cal",
+                "--prefer",
+                "urn:llm:=peer:plasma",
+                "--mount",
+                "urn:cal:=quic://bug.local:4433",
+                "--cert-dir",
+                "/certs/bug",
+            ])
+            .into_iter(),
+        );
+        let Ok(Some(Mode::Mcp { grants, mounts, .. })) = parsed else {
+            panic!("expected mcp mode");
+        };
+        assert_eq!(grants, vec!["cal".to_string()]);
+        assert_eq!(mounts.len(), 2);
+        assert_eq!(mounts[0].kind, ikigai_embedded::MountKind::Prefer);
+        assert_eq!(mounts[0].target, "peer:plasma");
+        assert!(
+            mounts[0].certs.cert_dir.is_none(),
+            "a cert flag after the SECOND mount must not leak onto the first"
+        );
+        assert_eq!(mounts[1].kind, ikigai_embedded::MountKind::Alias);
+        assert_eq!(mounts[1].certs.cert_dir.as_deref(), Some("/certs/bug"));
     }
 
     /// A `--prefer` mount must NOT dial while the process starts: the peer being
