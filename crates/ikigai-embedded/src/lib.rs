@@ -2186,6 +2186,80 @@ fn escape_markers(text: &str) -> String {
     out
 }
 
+/// How often the daemon refreshes its heartbeat file.
+///
+/// A minute: frequent enough that a watcher checking every few minutes can call the file
+/// stale with confidence, cheap enough to be invisible.
+const HEARTBEAT_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Where a host leaves its heartbeat: `~/.ikigai/health/<instance>.txt`.
+///
+/// A file, because the watcher must not depend on the watched process being alive to
+/// answer. The writer daemon serves no socket — its jobs live inside it — so an external
+/// checker cannot ask it anything. It can, however, notice that a file stopped changing,
+/// which is the one signal a dead process still emits.
+fn heartbeat_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".ikigai/health")
+        .join(format!("{}.txt", instance_name()))
+}
+
+/// `urn:host:heartbeat` — write this host's health where a watcher can find it.
+///
+/// Sourcing it returns the same report as `urn:host:health` AND leaves it on disk. Made an
+/// endpoint rather than a background thread so the existing time transport can fire it on a
+/// schedule like anything else, and so it can be tested and inspected by hand.
+struct HostHeartbeat;
+
+#[async_trait::async_trait]
+impl Endpoint for HostHeartbeat {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        if !inv.capability.allows(CAP_KERNEL_INSPECT) {
+            return Err(Error::Denied(format!(
+                "writing a heartbeat requires `{CAP_KERNEL_INSPECT}`"
+            )));
+        }
+        let jobs = time_registry().health();
+        let peers = BROWSER
+            .get()
+            .and_then(|browser| browser.as_ref())
+            .map(|browser| browser.peers())
+            .unwrap_or_default();
+        let report = health_text(&jobs, &peers);
+        let path = heartbeat_path();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| Error::Endpoint(format!("heartbeat dir: {e}")))?;
+        }
+        // Write via a temp file + rename: a watcher reading mid-write must never see a
+        // half-written report and conclude something is wrong.
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, report.as_bytes())
+            .map_err(|e| Error::Endpoint(format!("heartbeat write: {e}")))?;
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| Error::Endpoint(format!("heartbeat rename: {e}")))?;
+        Ok(Representation::new(
+            ReprType::new("text/plain"),
+            report.into_bytes(),
+        ))
+    }
+
+    fn name(&self) -> &str {
+        "host-heartbeat"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("host-heartbeat")
+            .summary("write this host's health report to ~/.ikigai/health/<instance>.txt")
+            .verb(Verb::Source)
+            .action(
+                ActionSpec::new(Verb::Source)
+                    .summary("the health report, also left on disk for an external watcher")
+                    .requires(CAP_KERNEL_INSPECT),
+            )
+    }
+}
+
 /// How many missed cadences before a recurring job is called STALE.
 ///
 /// Three, not one: a single missed tick is noise (a slow resolution, a laptop that slept
@@ -3050,7 +3124,8 @@ fn root_space_with_mounts(mounts: Vec<MountSpec>) -> Arc<dyn Space> {
                 // Is this kernel doing what it said it would? Embedded-only, like its
                 // neighbours: a served kernel reporting its own liveness to a remote
                 // caller is a different question, with a different answer.
-                .bind(Exact::new("urn:host:health"), KernelHealth),
+                .bind(Exact::new("urn:host:health"), KernelHealth)
+                .bind(Exact::new("urn:host:heartbeat"), HostHeartbeat),
         ) as Arc<dyn Space>,
         // The org agenda (urn:org:agenda[:{period}]) over the configured org
         // files, which it reads through the kernel via urn:orgfile:*.
@@ -3559,6 +3634,19 @@ fn build_watched(mounts: Vec<MountSpec>, reactive: bool) -> Arc<Kernel> {
             "urn:booking:drain".to_string(),
             Verb::Source,
             ikigai_time::Schedule::Every(every),
+            true,
+        );
+    }
+    // The heartbeat: leave this host's health where a watcher can read it, whether or not
+    // this process is still alive to be asked. Only in a REACTIVE kernel — the daemon —
+    // because that is the process holding the derive and drain jobs whose staleness is
+    // worth noticing, and because a REPL writing the file would make a short-lived session
+    // look like the daemon.
+    if reactive {
+        let _ = registry.schedule_persistent(
+            "urn:host:heartbeat".to_string(),
+            Verb::Source,
+            ikigai_time::Schedule::Every(HEARTBEAT_EVERY),
             true,
         );
     }
