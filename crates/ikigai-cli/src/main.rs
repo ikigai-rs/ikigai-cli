@@ -895,6 +895,33 @@ fn mcp(grants: Vec<String>, scopes: Vec<String>, mounts: Vec<Mount>) {
                 }
             }
         }
+        // Warm each prefer mount ONCE before projecting. A prefer-mount's catalog
+        // only lists after its peer has been dialed (`entries()` deliberately never
+        // dials, so the REPL's `list` cannot block on a sleeping peer) — but here
+        // the manifold IS the interface: a tool that is not listed cannot be
+        // called, so a namespace the local kernel does not also bind would NEVER
+        // appear. One bounded probe (a UDS refusal is instant, QUIC has its dial
+        // budget); the connection is cached by the dial regardless of the probe's
+        // outcome, and an absent peer stays gracefully absent.
+        for spec in resolved
+            .iter()
+            .filter(|s| s.kind == ikigai_embedded::MountKind::Prefer)
+        {
+            let _ = spec.resolver.issue(ikigai_core::Request::new(
+                ikigai_core::Verb::Meta,
+                ikigai_core::Iri::parse("urn:kernel:catalog").expect("static IRI"),
+            ));
+            let up = spec.resolver.entries().is_some();
+            eprintln!(
+                "ikigai mcp: {} peer is {}",
+                spec.prefix,
+                if up {
+                    "up — its tools are projected"
+                } else {
+                    "absent — its tools are omitted (relaunch when it is up)"
+                }
+            );
+        }
         ikigai_embedded::watched_kernel_with_mounts(resolved)
     };
     let stdout = Arc::new(Mutex::new(std::io::stdout()));
