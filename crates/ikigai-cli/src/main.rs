@@ -1192,7 +1192,7 @@ fn resolve_mount(mount: Mount) -> Result<ikigai_embedded::MountSpec, String> {
                 inner: std::sync::Mutex::new(None),
             })
         } else {
-            connect_mount(&target, &certs)?
+            connect_mount(&target, &certs, kind)?
         };
     Ok(ikigai_embedded::MountSpec {
         prefix,
@@ -1234,8 +1234,13 @@ impl LazyResolver {
         if let Some(resolver) = self.inner.lock().unwrap().clone() {
             return Ok(resolver);
         }
-        let resolver = connect_mount(&self.target, &self.certs)
-            .map_err(|e| ikigai_core::Error::Unavailable(format!("{}: {e}", self.target)))?;
+        // A prefer mount forwards IRIs unchanged, so it speaks verbatim.
+        let resolver = connect_mount(
+            &self.target,
+            &self.certs,
+            ikigai_embedded::MountKind::Prefer,
+        )
+        .map_err(|e| ikigai_core::Error::Unavailable(format!("{}: {e}", self.target)))?;
         *self.inner.lock().unwrap() = Some(std::sync::Arc::clone(&resolver));
         Ok(resolver)
     }
@@ -1299,6 +1304,7 @@ impl ikigai_resolve::Resolver for LazyResolver {
 fn connect_mount(
     target: &str,
     certs: &Certs,
+    kind: ikigai_embedded::MountKind,
 ) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
     // `peer:<name>` — mount by NAME, letting mDNS supply the address. Addresses move
     // (bug's `ipconfig getifaddr en0` came back empty during the mail work, because it was
@@ -1310,7 +1316,7 @@ fn connect_mount(
     if is_quic(target) {
         connect_mount_quic(target, certs)
     } else {
-        connect_mount_ipc(target)
+        connect_mount_ipc(target, kind)
     }
 }
 
@@ -1412,8 +1418,19 @@ fn connect_mount_quic(
 }
 
 #[cfg(all(feature = "embedded", feature = "ipc"))]
-fn connect_mount_ipc(socket: &str) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
-    let resolver = ikigai_ipc::connect(std::path::Path::new(socket))
+fn connect_mount_ipc(
+    socket: &str,
+    kind: ikigai_embedded::MountKind,
+) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
+    // The hello declares how this mount will address the peer, so a
+    // prefix-canonical peer (ikigai-python) lists its entries in the form the
+    // mount expects — alias mounts strip and re-prefix, the others forward
+    // IRIs unchanged.
+    let mode = match kind {
+        ikigai_embedded::MountKind::Alias => ikigai_ipc::HelloMode::Alias,
+        _ => ikigai_ipc::HelloMode::Verbatim,
+    };
+    let resolver = ikigai_ipc::connect_as(std::path::Path::new(socket), mode)
         .map_err(|e| format!("--mount: connect {socket}: {e}"))?;
     Ok(std::sync::Arc::new(resolver))
 }
@@ -1421,6 +1438,7 @@ fn connect_mount_ipc(socket: &str) -> Result<std::sync::Arc<dyn ikigai_resolve::
 #[cfg(all(feature = "embedded", not(feature = "ipc")))]
 fn connect_mount_ipc(
     _socket: &str,
+    _kind: ikigai_embedded::MountKind,
 ) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
     Err("--mount of a Unix socket needs the `ipc` feature (Unix only)".to_string())
 }

@@ -28,8 +28,30 @@ use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use tokio::runtime::Runtime;
 
-/// The ALPN protocol id — both ends must agree on it.
-const ALPN: &[u8] = b"ikigai/0";
+/// The ALPN protocol ids, preference-ordered: the versioned id first
+/// (`ikigai/{PROTOCOL_VERSION}` — the TLS handshake IS the version gate on this
+/// transport), then the version-blind pre-v6 id, tolerated for one version so a
+/// mixed fleet degrades to a warning instead of a broken drain. v7 drops the
+/// legacy entry, and a version mismatch becomes a refused handshake at connect.
+fn alpn_protocols() -> Vec<Vec<u8>> {
+    vec![ikigai_wire::alpn(), ikigai_wire::ALPN_LEGACY.to_vec()]
+}
+
+/// Warn when a connection negotiated the LEGACY ALPN — the peer predates wire
+/// v6 (or is newer than us and kept the legacy id for our sake). Loud on both
+/// ends, because the warning is the pressure that retires the tolerance.
+fn warn_if_legacy_alpn(connection: &quinn::Connection, peer: &str) {
+    let negotiated = connection
+        .handshake_data()
+        .and_then(|d| d.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .and_then(|d| d.protocol);
+    if negotiated.as_deref() == Some(ikigai_wire::ALPN_LEGACY) {
+        eprintln!(
+            "ikigai: the QUIC connection with {peer} negotiated the pre-v6 ALPN \
+             (version-blind wire, tolerated until v7) — update the older side"
+        );
+    }
+}
 
 /// The largest message accepted off a stream (guards `read_to_end`).
 const MAX_MESSAGE: usize = 64 * 1024 * 1024;
@@ -111,6 +133,7 @@ pub fn serve_with(
             let minter = Arc::clone(&minter);
             tokio::spawn(async move {
                 if let Ok(connection) = incoming.await {
+                    warn_if_legacy_alpn(&connection, &connection.remote_address().to_string());
                     // mTLS verified the peer is one of the enrolled clients; mint that
                     // principal's session from *which* cert authenticated — multi-tenant
                     // capability-on-the-wire.
@@ -488,7 +511,7 @@ fn server_config(
             load_key(&identity.key_pem)?,
         )
         .map_err(other)?;
-    tls.alpn_protocols = vec![ALPN.to_vec()];
+    tls.alpn_protocols = alpn_protocols();
     let quic = quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(other)?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic));
     config.transport_config(Arc::new(transport(idle)?));
@@ -521,7 +544,12 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 async fn dial(endpoint: &quinn::Endpoint, addr: SocketAddr) -> io::Result<quinn::Connection> {
     let connecting = endpoint.connect(addr, "ikigai").map_err(other)?;
     match tokio::time::timeout(CONNECT_TIMEOUT, connecting).await {
-        Ok(result) => result.map_err(other),
+        Ok(result) => {
+            let connection = result.map_err(other)?;
+            // Covers first connect AND every transparent redial.
+            warn_if_legacy_alpn(&connection, &addr.to_string());
+            Ok(connection)
+        }
         Err(_) => Err(io::Error::new(
             io::ErrorKind::TimedOut,
             format!(
@@ -548,7 +576,7 @@ fn client_config(
             load_key(&identity.key_pem)?,
         )
         .map_err(other)?;
-    tls.alpn_protocols = vec![ALPN.to_vec()];
+    tls.alpn_protocols = alpn_protocols();
     let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(other)?;
     // The idle timeout is OURS to set (see [`DEFAULT_IDLE_TIMEOUT`]): quinn's ~30s
     // default killed long-silent work (a 70B generating) mid-request. Keep-alive stays
