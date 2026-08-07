@@ -1190,6 +1190,7 @@ fn resolve_mount(mount: Mount) -> Result<ikigai_embedded::MountSpec, String> {
                 target: target.clone(),
                 certs,
                 inner: std::sync::Mutex::new(None),
+                entries_failed: std::sync::Mutex::new(None),
             })
         } else {
             connect_mount(&target, &certs, kind)?
@@ -1225,7 +1226,15 @@ struct LazyResolver {
     target: String,
     certs: Certs,
     inner: std::sync::Mutex<Option<std::sync::Arc<dyn ikigai_resolve::Resolver>>>,
+    /// When the last `entries()` dial FAILED — the negative cache that keeps an
+    /// enumeration-happy session from paying the connect bound on every `list`
+    /// while the peer is asleep. Only `entries()` consults it: resolutions keep
+    /// their retry-on-every-use behavior, which is what picks a woken peer up.
+    entries_failed: std::sync::Mutex<Option<std::time::Instant>>,
 }
+
+/// How long `entries()` believes a failed dial before trying again.
+const ENTRIES_REDIAL_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl LazyResolver {
     /// The live resolver, dialing the peer if this is the first call (or the first
@@ -1288,9 +1297,34 @@ impl ikigai_resolve::Resolver for LazyResolver {
     }
 
     fn entries(&self) -> Option<Vec<ikigai_core::SpaceEntry>> {
-        // Only if already connected: `catalog` must not block on dialing a peer
-        // that may be asleep.
-        self.inner.lock().unwrap().clone()?.entries()
+        // An explicit enumeration deserves the truth: dial if we never have.
+        // Without this, a prefer-mounted namespace the local kernel does not
+        // also bind was INVISIBLE to `list` until something else used the peer
+        // (mcp works around it with a startup warm, cli #270 — the REPL had
+        // nothing). The cost is bounded (a UDS refusal is instant, QUIC by its
+        // dial budget) and paid at most once per ENTRIES_REDIAL_AFTER while
+        // the peer is asleep — resolutions keep their retry-on-every-use.
+        if let Some(resolver) = self.inner.lock().unwrap().clone() {
+            return resolver.entries();
+        }
+        {
+            let failed = self.entries_failed.lock().unwrap();
+            if let Some(at) = *failed {
+                if at.elapsed() < ENTRIES_REDIAL_AFTER {
+                    return None; // asleep a moment ago; don't stall every list
+                }
+            }
+        }
+        match self.get() {
+            Ok(resolver) => {
+                *self.entries_failed.lock().unwrap() = None;
+                resolver.entries()
+            }
+            Err(_) => {
+                *self.entries_failed.lock().unwrap() = Some(std::time::Instant::now());
+                None
+            }
+        }
     }
 
     fn transport(&self) -> String {
@@ -2061,6 +2095,50 @@ mod mount_cert_tests {
         assert_eq!(mounts[2].certs.cert_dir.as_deref(), Some("/certs/plasma"));
     }
 
+    /// The other half of prefer-mount catalog citizenship: `entries()` dials a
+    /// peer that has never been used, so `list` shows a prefer-mounted
+    /// namespace WITHOUT a prior resolution through it. (Before this, the
+    /// REPL's list was blind to an undialed prefer mount — the same
+    /// chicken-and-egg cli #270 fixed for mcp, which the ikigai-deno
+    /// satellite then hit interactively.)
+    #[test]
+    fn a_prefer_mounts_entries_dial_a_live_peer() {
+        use ikigai_core::{builtins, EndpointSpace, Exact, Kernel};
+        let path =
+            std::env::temp_dir().join(format!("ikigai-prefer-list-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let kernel = Kernel::new(std::sync::Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:fn:toUpper"), builtins::to_upper()),
+        ));
+        let served = path.clone();
+        std::thread::spawn(move || {
+            let _ = ikigai_ipc::serve(kernel, &served);
+        });
+        // Give the listener a beat to bind.
+        for _ in 0..50 {
+            if path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let mount = Mount {
+            prefix: "urn:fn:".to_string(),
+            target: path.display().to_string(),
+            certs: Certs::default(),
+            kind: ikigai_embedded::MountKind::Prefer,
+        };
+        let spec = resolve_mount(mount).expect("prefer resolves lazily");
+        let entries = spec
+            .resolver
+            .entries()
+            .expect("entries() dials the live peer");
+        assert!(
+            entries.iter().any(|e| e.endpoint == "toUpper"),
+            "the peer's catalog is visible without any prior resolution: {entries:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// `ikigai mcp` composes mounts like every other kernel-building mode — a
     /// federated manifold is where projection pays off (a peer's models and the
     /// remote calendar behind natural tool names, no client-side topology). Cert
@@ -2110,13 +2188,21 @@ mod mount_cert_tests {
         };
         let spec = resolve_mount(mount).expect("a prefer mount must not fail at startup");
         assert!(
-            spec.resolver.entries().is_none(),
-            "an unconnected prefer mount has no catalog to report"
-        );
-        assert!(
             spec.resolver.transport().contains("not connected"),
             "transport should say the peer is not connected, got: {}",
             spec.resolver.transport()
+        );
+        // `entries()` DOES attempt a bounded dial now (an explicit enumeration
+        // deserves the truth) — against a dead peer it yields no catalog, and
+        // the failure is negative-cached so the next list doesn't stall again.
+        let start = std::time::Instant::now();
+        assert!(
+            spec.resolver.entries().is_none(),
+            "a dead peer yields no catalog"
+        );
+        assert!(
+            spec.resolver.entries().is_none() && start.elapsed() < ENTRIES_REDIAL_AFTER,
+            "the second probe rides the negative cache"
         );
     }
 
