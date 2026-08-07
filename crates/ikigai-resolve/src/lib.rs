@@ -68,12 +68,28 @@ pub fn scoped_entries(kernel: &Kernel, capability: &Capability) -> Vec<SpaceEntr
         capability: Some(capability),
         ..Default::default()
     };
+    // Provenance comes from the space's own enumeration: `select_actions` walks the
+    // same entries but an `ActionMatch` carries no origin, so a mounted binding
+    // rebuilt from it alone would list indistinguishable from a local one — a
+    // federated client could no longer see WHERE `urn:py:*` resolves.
+    let origins: std::collections::HashMap<String, String> = kernel
+        .entries()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|e| e.origin.map(|origin| (e.pattern, origin)))
+        .collect();
     let mut seen = std::collections::BTreeSet::new();
     kernel
         .select_actions(&query)
         .into_iter()
         .filter(|m| seen.insert(m.endpoint.clone()))
-        .map(|m| SpaceEntry::new(m.endpoint, m.id))
+        .map(|m| {
+            let entry = SpaceEntry::new(&m.endpoint, m.id);
+            match origins.get(&m.endpoint) {
+                Some(origin) => entry.with_origin(origin),
+                None => entry,
+            }
+        })
         .collect()
 }
 
@@ -588,6 +604,58 @@ mod tests {
         assert!(
             !scoped.iter().any(|e| e.pattern == "urn:gated"),
             "the gated endpoint is hidden from a principal that can't invoke it"
+        );
+    }
+
+    /// A space whose entries carry an origin, the way a mounted remote's do.
+    struct MountedFace {
+        inner: Arc<dyn Space>,
+    }
+
+    impl Space for MountedFace {
+        fn resolve(&self, request: &Request, scope: &Scope) -> Resolution {
+            self.inner.resolve(request, scope)
+        }
+
+        fn entries(&self) -> Option<Vec<SpaceEntry>> {
+            Some(
+                self.inner
+                    .entries()?
+                    .into_iter()
+                    .map(|entry| entry.with_origin("test://peer"))
+                    .collect(),
+            )
+        }
+    }
+
+    /// The wire catalog is rebuilt from the action manifold, but a mounted
+    /// binding's PROVENANCE lives on the space entry — it must survive the
+    /// rebuild, or a federated client sees `urn:py:*` rows indistinguishable
+    /// from local bindings (the prefer-mount catalog bug, 2026-08-07).
+    #[test]
+    fn scoped_entries_preserve_a_mounted_bindings_origin() {
+        let inner: Arc<dyn Space> = Arc::new(
+            EndpointSpace::new().bind(
+                Exact::new("urn:open"),
+                FnEndpoint::new("open", |_inv| {
+                    Ok(Representation::new(
+                        ReprType::new("text/plain"),
+                        b"ok".to_vec(),
+                    ))
+                })
+                .with_description(Description::new("open").verb(Verb::Source)),
+            ),
+        );
+        let kernel = Kernel::new(Arc::new(MountedFace { inner }));
+        let entries = scoped_entries(&kernel, &Capability::root());
+        let row = entries
+            .iter()
+            .find(|e| e.pattern == "urn:open")
+            .expect("the mounted binding is listed");
+        assert_eq!(
+            row.origin.as_deref(),
+            Some("test://peer"),
+            "the wire catalog names where a mounted binding resolves"
         );
     }
 }
