@@ -24,7 +24,13 @@ use std::time::Duration;
 
 use ikigai_core::{Capability, Error, Kernel, Representation, Request, SpaceEntry, Tracer};
 use ikigai_resolve::{scoped_entries, CacheStatus, Resolver, SpanCollector};
-use ikigai_wire::{read_message, write_message, Call, Reply, TraceContext};
+use ikigai_wire::{
+    decode, decode_hello, read_frame, read_message, write_hello, write_message, Call, Hello, Reply,
+    TraceContext, PROTOCOL_VERSION,
+};
+// Re-exported so consumers (the CLI's mount plumbing) can pass a mode without
+// depending on ikigai-wire directly.
+pub use ikigai_wire::HelloMode;
 
 /// Run `kernel` as a server on `path` until an unrecoverable accept error: bind
 /// the socket (replacing a stale one), restrict it to `0600`, and serve each
@@ -65,18 +71,82 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Connect to a kernel server listening on `path`, with the default I/O timeout.
 pub fn connect(path: &Path) -> io::Result<IpcResolver> {
-    connect_with_timeout(path, Some(DEFAULT_TIMEOUT))
+    connect_as(path, HelloMode::Verbatim)
+}
+
+/// Connect declaring how this side will address the peer — an alias mount
+/// passes [`HelloMode::Alias`] so a prefix-canonical peer (ikigai-python) can
+/// list its entries in the form the mount expects.
+pub fn connect_as(path: &Path, mode: HelloMode) -> io::Result<IpcResolver> {
+    connect_with(path, Some(DEFAULT_TIMEOUT), mode)
 }
 
 /// Connect with an explicit socket I/O `timeout` (`None` blocks indefinitely).
 pub fn connect_with_timeout(path: &Path, timeout: Option<Duration>) -> io::Result<IpcResolver> {
+    connect_with(path, timeout, HelloMode::Verbatim)
+}
+
+/// The full connect: dial, then exchange the version [`Hello`].
+///
+/// A ≤v5 server cannot answer the hello — it postcard-decodes the frame as a
+/// `Call`, fails, and hangs up SILENTLY. That EOF is unmistakable (a real v6
+/// server always answers the hello, matching version or not), so the client
+/// reconnects WITHOUT the hello and warns — the one-version tolerance the
+/// design doc commits to removing at v7. A version MISMATCH from a v6+ server
+/// errors immediately, naming both versions: that is the whole point.
+pub fn connect_with(
+    path: &Path,
+    timeout: Option<Duration>,
+    mode: HelloMode,
+) -> io::Result<IpcResolver> {
+    let stream = dial(path, timeout)?;
+    let mut writer = &stream;
+    write_hello(
+        &mut writer,
+        &Hello {
+            version: PROTOCOL_VERSION,
+            mode,
+        },
+    )?;
+    match read_frame(&mut &stream) {
+        Ok(payload) => match decode_hello(&payload) {
+            Some(hello) if hello.version == PROTOCOL_VERSION => Ok(IpcResolver {
+                stream,
+                tracer: Mutex::new(None),
+            }),
+            Some(hello) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "the kernel server speaks wire v{}, this client speaks v{} — update the older side",
+                    hello.version, PROTOCOL_VERSION
+                ),
+            )),
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the kernel server answered the version hello with something else entirely",
+            )),
+        },
+        // Silence, then hang-up: a pre-v6 server. Reconnect legacy, loudly.
+        Err(_) => {
+            eprintln!(
+                "ikigai: the kernel server at {} hung up on the version hello — it likely \
+                 predates wire v6; reconnected WITHOUT the hello (tolerated until v7). \
+                 Update the server.",
+                path.display()
+            );
+            Ok(IpcResolver {
+                stream: dial(path, timeout)?,
+                tracer: Mutex::new(None),
+            })
+        }
+    }
+}
+
+fn dial(path: &Path, timeout: Option<Duration>) -> io::Result<UnixStream> {
     let stream = UnixStream::connect(path)?;
     stream.set_read_timeout(timeout)?;
     stream.set_write_timeout(timeout)?;
-    Ok(IpcResolver {
-        stream,
-        tracer: Mutex::new(None),
-    })
+    Ok(stream)
 }
 
 /// A [`Resolver`] backed by a kernel server over a Unix socket.
@@ -216,9 +286,49 @@ impl Resolver for IpcResolver {
     }
 }
 
-/// Serve one connection: answer calls until the peer hangs up (or a wire error).
+/// Serve one connection: the version hello first, then calls until the peer
+/// hangs up (or a wire error).
+///
+/// The FIRST frame decides the connection's era. A hello (magic-prefixed) is
+/// answered with our own hello — equal versions proceed, unequal versions get
+/// the answer (so the CLIENT can name both in its error) and a close. A frame
+/// WITHOUT the magic is a ≤v5 client's first `Call`: served, with a warning —
+/// the one-version tolerance the design doc removes at v7.
 fn handle_connection(kernel: &Kernel, stream: UnixStream) {
     let mut stream = &stream;
+    let first = match read_frame(&mut stream) {
+        Ok(payload) => payload,
+        Err(_) => return,
+    };
+    match decode_hello(&first) {
+        Some(hello) => {
+            // The mode is a hint for prefix-canonical peers; this server's
+            // kernel speaks canonical IRIs either way, so it is read and
+            // deliberately unused here.
+            let answer = Hello {
+                version: PROTOCOL_VERSION,
+                mode: HelloMode::Verbatim,
+            };
+            if write_hello(&mut stream, &answer).is_err() {
+                return;
+            }
+            if hello.version != PROTOCOL_VERSION {
+                return; // the client renders the mismatch; nothing more to say
+            }
+        }
+        None => {
+            eprintln!(
+                "ikigai: a client connected without the version hello (wire ≤v5) — served \
+                 in legacy mode (tolerated until v7). Update the client."
+            );
+            let Ok(call) = decode::<Call>(&first) else {
+                return; // neither a hello nor a call — hang up
+            };
+            if write_message(&mut stream, &dispatch(kernel, call)).is_err() {
+                return;
+            }
+        }
+    }
     loop {
         let call: Call = match read_message(&mut stream) {
             Ok(call) => call,
@@ -583,6 +693,136 @@ mod tests {
 
         drop(client);
         server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A ≤v5 client sends a Call first, no hello. The server serves it in
+    /// legacy mode — the one-version tolerance, so a mixed fleet degrades to
+    /// a warning instead of a broken drain.
+    #[test]
+    fn a_legacy_client_without_a_hello_is_still_served() {
+        let path = socket_path("legacy-client");
+        let server = serve_one(&path, kernel());
+
+        // Speak the ≤v5 sequence by hand: no hello, straight to a Call.
+        let stream = UnixStream::connect(&path).unwrap();
+        let mut s = &stream;
+        write_message(&mut s, &Call::Issue(upper("hi"))).unwrap();
+        let reply: Reply = read_message(&mut s).unwrap();
+        assert!(
+            matches!(&reply, Reply::Resolved(r, _) if r.bytes == b"HI"),
+            "{reply:?}"
+        );
+        // And the connection keeps serving after the legacy first frame.
+        write_message(&mut s, &Call::Entries).unwrap();
+        assert!(matches!(
+            read_message::<_, Reply>(&mut s).unwrap(),
+            Reply::Entries(Some(_))
+        ));
+
+        drop(stream);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A v6 client dialing a ≤v5 server: the old server drops the hello frame
+    /// silently, and the client reconnects WITHOUT the hello — so a new
+    /// binary keeps working against a not-yet-updated daemon.
+    #[test]
+    fn a_new_client_falls_back_against_a_pre_hello_server() {
+        let path = socket_path("legacy-server");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let kernel = kernel();
+        // A ≤v5 server: every frame is a Call; an undecodable one ends the
+        // session silently (the old handle_connection, replayed by hand).
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut s = &stream;
+                while let Ok(payload) = read_frame(&mut s) {
+                    let Ok(call) = decode::<Call>(&payload) else {
+                        break; // the hello, undecodable as a Call → hang up
+                    };
+                    if write_message(&mut s, &dispatch(&kernel, call)).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let client = connect(&path).unwrap(); // falls back internally
+        let (representation, _) = client.issue(upper("hi")).unwrap();
+        assert_eq!(representation.bytes, b"HI");
+
+        drop(client);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A version MISMATCH against a hello-speaking server errors immediately,
+    /// naming both versions — the failure mode this whole design buys.
+    #[test]
+    fn a_version_mismatch_names_both_versions() {
+        let path = socket_path("mismatch");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        // A future v9 server: answers the hello with its own version, closes.
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut s = &stream;
+            let _ = read_frame(&mut s).unwrap();
+            write_hello(
+                &mut s,
+                &Hello {
+                    version: 9,
+                    mode: HelloMode::Verbatim,
+                },
+            )
+            .unwrap();
+        });
+
+        let message = match connect(&path) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("a version mismatch must refuse the connection"),
+        };
+        assert!(message.contains("v9"), "{message}");
+        assert!(
+            message.contains(&format!("v{PROTOCOL_VERSION}")),
+            "{message}"
+        );
+
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The alias mode crosses in the client hello — the byte a
+    /// prefix-canonical peer (ikigai-python) reads to pick its entries form.
+    #[test]
+    fn the_client_hello_carries_the_mount_mode() {
+        let path = socket_path("mode");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut s = &stream;
+            let payload = read_frame(&mut s).unwrap();
+            let hello = decode_hello(&payload).expect("a hello");
+            write_hello(
+                &mut s,
+                &Hello {
+                    version: PROTOCOL_VERSION,
+                    mode: HelloMode::Verbatim,
+                },
+            )
+            .unwrap();
+            hello.mode
+        });
+
+        let _client = connect_as(&path, HelloMode::Alias).unwrap();
+        assert_eq!(server.join().unwrap(), HelloMode::Alias);
         let _ = std::fs::remove_file(&path);
     }
 
