@@ -29,12 +29,15 @@ use ikigai_core::{
 use ikigai_resolve::{CacheStatus, Resolver};
 use std::collections::BTreeSet;
 
-/// A pipe stage's output: its text plus the cache provenance (expiry + golden
+/// A pipe stage's output: its raw bytes plus the cache provenance (expiry + golden
 /// threads) to hand the next stage, so cacheability flows down the pipeline. The
 /// downstream stage resolves with this as its upstream [`Provenance`], and the
 /// kernel folds it into the result — a transform is no more cacheable than its input.
+/// The bytes stay bytes: a plain `|` passes any representation (a PDF, an image)
+/// through untouched; only the inherently textual surfaces — the `..` item split
+/// and the terminal display — decode, each with an error naming what needed text.
 struct Staged {
-    text: String,
+    bytes: Vec<u8>,
     expiry: Expiry,
     threads: BTreeSet<Thread>,
 }
@@ -43,6 +46,18 @@ impl Staged {
     /// The provenance this stage hands to the next.
     fn provenance(&self) -> Provenance {
         Provenance::new(self.expiry, self.threads.clone())
+    }
+
+    /// The output as owned text — the terminal display surface. A binary
+    /// representation flows *through* a pipe fine; what it can't do is be
+    /// printed, so the error points at the `sink` terminal that stores it.
+    fn into_text(self) -> Result<String, String> {
+        let len = self.bytes.len();
+        String::from_utf8(self.bytes).map_err(|_| {
+            format!(
+                "output is not UTF-8 text ({len} bytes) — pipe it into a `sink` to store the bytes"
+            )
+        })
     }
 }
 
@@ -59,14 +74,17 @@ fn root_provenance() -> Provenance {
 fn combine_outputs(parts: Vec<Staged>) -> Staged {
     let mut expiry = Expiry::Never;
     let mut threads = BTreeSet::new();
-    let mut texts = Vec::with_capacity(parts.len());
-    for part in parts {
+    let mut bytes = Vec::new();
+    for (index, part) in parts.into_iter().enumerate() {
         expiry = expiry.most_restrictive(part.expiry);
         threads.extend(part.threads);
-        texts.push(part.text);
+        if index > 0 {
+            bytes.push(b'\n');
+        }
+        bytes.extend_from_slice(&part.bytes);
     }
     Staged {
-        text: texts.join("\n"),
+        bytes,
         expiry,
         threads,
     }
@@ -453,10 +471,9 @@ impl Engine {
     /// [`run_source`](Self::run_source).
     async fn run_pipeline(&self, spec: &str) -> Result<String, String> {
         let pipeline = parse_spec(spec)?;
-        Ok(self
-            .run_pipeline_node(&pipeline, None, root_provenance())
+        self.run_pipeline_node(&pipeline, None, root_provenance())
             .await?
-            .text)
+            .into_text()
     }
 
     /// Evaluate an s-expression as Lisp: issue `source urn:lisp:eval` with the
@@ -571,7 +588,7 @@ impl Engine {
     fn run_pipeline_node<'a>(
         &'a self,
         pipeline: &'a Pipeline,
-        incoming: Option<&'a str>,
+        incoming: Option<&'a [u8]>,
         prov: Provenance,
     ) -> Pin<Box<dyn Future<Output = Result<Staged, String>> + 'a>> {
         Box::pin(async move {
@@ -582,7 +599,7 @@ impl Engine {
                 // mapped item.
                 staged = match step.connector {
                     Connector::Pipe => {
-                        self.run_node(&step.node, Some(&staged.text), staged.provenance())
+                        self.run_node(&step.node, Some(&staged.bytes), staged.provenance())
                             .await?
                     }
                     Connector::Map => self.run_map(&step.node, &staged).await?,
@@ -598,7 +615,7 @@ impl Engine {
     fn run_node<'a>(
         &'a self,
         node: &'a Node,
-        incoming: Option<&'a str>,
+        incoming: Option<&'a [u8]>,
         prov: Provenance,
     ) -> Pin<Box<dyn Future<Output = Result<Staged, String>> + 'a>> {
         Box::pin(async move {
@@ -651,6 +668,14 @@ impl Engine {
         value: &'a Staged,
     ) -> Pin<Box<dyn Future<Output = Result<Staged, String>> + 'a>> {
         Box::pin(async move {
+            // `..` is the one connector that must read the piped value: it splits on
+            // newlines, a textual convention. A binary upstream can't be item-mapped —
+            // say which operator demanded text (a plain `|` would have passed it through).
+            let text = std::str::from_utf8(&value.bytes).map_err(|_| {
+                "`..` maps over newline-separated text items, but the piped value is not \
+                 UTF-8 text — use a plain `|` to pass the bytes through whole"
+                    .to_string()
+            })?;
             // Every mapped item descends from the same upstream, so each inherits its
             // provenance; the joined result combines them (cacheable iff all are).
             let prov = value.provenance();
@@ -659,15 +684,21 @@ impl Engine {
             if let (Node::Source(words), Some(spawner)) = (node, &self.spawner) {
                 let (target, args) = words.split_first().ok_or("expected an IRI")?;
                 let mut requests = Vec::new();
-                for item in value.text.split('\n') {
-                    requests.push(self.source_request(target, args, Some(item)).await?);
+                for item in text.split('\n') {
+                    requests.push(
+                        self.source_request(target, args, Some(item.as_bytes()))
+                            .await?,
+                    );
                 }
                 let outputs = self.run_parallel(spawner, requests, prov).await?;
                 return Ok(combine_outputs(outputs));
             }
             let mut outputs = Vec::new();
-            for item in value.text.split('\n') {
-                outputs.push(self.run_node(node, Some(item), prov.clone()).await?);
+            for item in text.split('\n') {
+                outputs.push(
+                    self.run_node(node, Some(item.as_bytes()), prov.clone())
+                        .await?,
+                );
             }
             Ok(combine_outputs(outputs))
         })
@@ -723,9 +754,8 @@ impl Engine {
             stats.record(status);
             let expiry = representation.expiry;
             let threads = representation.threads().clone();
-            let text = String::from_utf8(representation.bytes).map_err(|e| e.to_string())?;
             outputs.push(Staged {
-                text,
+                bytes: representation.bytes,
                 expiry,
                 threads,
             });
@@ -735,12 +765,12 @@ impl Engine {
     }
 
     /// `SOURCE` a resource, folding the upstream pipe `prov` into its cacheability,
-    /// and return the stage's text + its own provenance for the next stage.
+    /// and return the stage's bytes + its own provenance for the next stage.
     async fn run_source(
         &self,
         target: &str,
         args: &[String],
-        incoming: Option<&str>,
+        incoming: Option<&[u8]>,
         prov: Provenance,
     ) -> Result<Staged, String> {
         let request = self.source_request(target, args, incoming).await?;
@@ -861,7 +891,7 @@ impl Engine {
         &self,
         target: &str,
         args: &[String],
-        incoming: Option<&str>,
+        incoming: Option<&[u8]>,
     ) -> Result<Request, String> {
         let iri = parse_target(target)?;
 
@@ -896,7 +926,7 @@ impl Engine {
         // The value to route comes from the pipe xor the positional text — never
         // both (a piped stage's input is the pipe, so a literal has nowhere else
         // to go).
-        let value = match (incoming, positional.is_empty()) {
+        let value: Option<&[u8]> = match (incoming, positional.is_empty()) {
             (Some(_), false) => {
                 return Err(format!(
                     "`{}` takes its input from the pipe — drop the literal input",
@@ -904,7 +934,7 @@ impl Engine {
                 ))
             }
             (Some(value), true) => Some(value),
-            (None, false) => Some(positional.as_str()),
+            (None, false) => Some(positional.as_bytes()),
             (None, true) => None,
         };
 
@@ -914,7 +944,7 @@ impl Engine {
         }
 
         if let Some(value) = value {
-            let value = ArgRef::Inline(value.as_bytes().to_vec());
+            let value = ArgRef::Inline(value.to_vec());
             match description {
                 // No contract: assume the conventional `in`, as before.
                 None => request = request.with_arg("in", value),
@@ -990,7 +1020,7 @@ impl Engine {
         &self,
         target: &str,
         args: &[String],
-        incoming: Option<&str>,
+        incoming: Option<&[u8]>,
     ) -> Result<Request, String> {
         let iri = parse_target(target)?;
 
@@ -1024,8 +1054,8 @@ impl Engine {
         }
 
         // The piped upstream value is the content (empty if nothing flows in).
-        let content = incoming.unwrap_or("");
-        Ok(request.with_arg("content", ArgRef::Inline(content.as_bytes().to_vec())))
+        let content = incoming.unwrap_or(&[]);
+        Ok(request.with_arg("content", ArgRef::Inline(content.to_vec())))
     }
 
     /// Report whether resolving `spec` would be served from the cache, without
@@ -1282,16 +1312,17 @@ impl Engine {
     }
 
     /// Issue a request, record how the resolver's cache served it, and decode the
-    /// representation as UTF-8 text. The resolver reports the [`CacheStatus`]
-    /// directly — for a remote kernel the server knows it without a probe.
+    /// representation as UTF-8 text for display. The resolver reports the
+    /// [`CacheStatus`] directly — for a remote kernel the server knows it without
+    /// a probe.
     async fn run(&self, request: Request) -> Result<String, String> {
         // No pipe upstream (sink / meta / a single source): resolve on its own merits.
-        Ok(self.run_staged(request, None).await?.text)
+        self.run_staged(request, None).await?.into_text()
     }
 
     /// Issue a request — optionally carrying the upstream pipe `incoming` provenance,
     /// which the kernel folds into the result's cacheability — record how the cache
-    /// served it, and return the stage's text plus its own provenance for the next
+    /// served it, and return the stage's bytes plus its own provenance for the next
     /// stage. The resolver reports the [`CacheStatus`] directly (a remote kernel knows
     /// it without a probe).
     async fn run_staged(
@@ -1317,9 +1348,8 @@ impl Engine {
         self.cache.set(stats);
         let expiry = representation.expiry;
         let threads = representation.threads().clone();
-        let text = String::from_utf8(representation.bytes).map_err(|e| e.to_string())?;
         Ok(Staged {
-            text,
+            bytes: representation.bytes,
             expiry,
             threads,
         })
@@ -2321,6 +2351,115 @@ mod tests {
         let err =
             output(engine.eval("source urn:fn:toUpper hi | sink urn:test:write junk")).unwrap_err();
         assert!(err.contains("takes its content from the pipe"), "{err}");
+    }
+
+    /// A representation that is not valid UTF-8 (a PDF-ish header with raw bytes).
+    const BINARY: &[u8] = b"%PDF-1.4\n\xff\xd8\x00\xfe binary body";
+
+    /// An engine for the binary-pipe regression: `urn:test:pdf` emits [`BINARY`],
+    /// `urn:test:digest` (source) and `urn:test:store` (sink) read their `content`
+    /// argument raw and report its length and whether it round-tripped byte-exact.
+    /// The regression: the engine decoded every stage's output as UTF-8, so piping
+    /// any binary representation died with "invalid utf-8 sequence". The spawner
+    /// routes single-source forks through the parallel path, covering it too.
+    fn binary_engine() -> Engine {
+        let pdf = FnEndpoint::new("pdf", |_: &Invocation<'_>| {
+            Ok(Representation::new(
+                ReprType::new("application/pdf"),
+                BINARY.to_vec(),
+            ))
+        });
+        let report = |bytes: &[u8]| format!("{} bytes, intact={}", bytes.len(), bytes == BINARY);
+        let digest = FnEndpoint::new("digest", move |inv: &Invocation<'_>| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                report(inv.inline_arg("content")?).into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("digest").input(ArgSpec::new("content").summary("raw bytes")),
+        );
+        let store = FnEndpoint::new("store", move |inv: &Invocation<'_>| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("stored {}", report(inv.inline_arg("content")?)).into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("store")
+                .verb(Verb::Sink)
+                .input(ArgSpec::new("content").summary("raw bytes")),
+        );
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:test:pdf"), pdf)
+            .bind(Exact::new("urn:test:digest"), digest)
+            .bind(Exact::new("urn:test:store"), store)
+            .bind(Exact::new("urn:fn:toUpper"), builtins::to_upper());
+        Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ))
+        .with_spawner(Arc::new(InlineSpawner))
+    }
+
+    #[test]
+    fn pipe_passes_binary_bytes_through_untouched() {
+        // The regression: `source <binary> | <stage>` — the piped representation
+        // must reach the next stage's `content` byte-for-byte, not via a UTF-8
+        // String.
+        let out = output(binary_engine().eval("source urn:test:pdf | urn:test:digest")).unwrap();
+        assert_eq!(out, format!("{} bytes, intact=true", BINARY.len()));
+    }
+
+    #[test]
+    fn pipeline_sink_terminal_passes_binary_content() {
+        // The write dual: a sink terminal stores the piped bytes exactly.
+        let out =
+            output(binary_engine().eval("source urn:test:pdf | sink urn:test:store")).unwrap();
+        assert_eq!(out, format!("stored {} bytes, intact=true", BINARY.len()));
+    }
+
+    #[test]
+    fn fork_fans_binary_input_to_each_branch() {
+        // Single-source branches under a spawner take the parallel path — the
+        // binary input must survive the fan-out to every branch.
+        let out = output(
+            binary_engine().eval("source urn:test:pdf | ( urn:test:digest ; urn:test:digest )"),
+        )
+        .unwrap();
+        let each = format!("{} bytes, intact=true", BINARY.len());
+        assert_eq!(out, format!("{each}\n{each}"));
+    }
+
+    #[test]
+    fn fork_branches_may_emit_binary_that_pipes_onward() {
+        // Branch *outputs* are binary here: the parallel join must carry bytes too
+        // (it used to decode each branch), newline-joining them for the next stage.
+        let out =
+            output(binary_engine().eval(
+                "source urn:fn:toUpper hi | ( urn:test:pdf ; urn:test:pdf ) | urn:test:digest",
+            ))
+            .unwrap();
+        assert_eq!(out, format!("{} bytes, intact=false", BINARY.len() * 2 + 1));
+    }
+
+    #[test]
+    fn map_rejects_a_binary_upstream_naming_the_operator() {
+        // `..` splits on newlines — inherently textual — so a binary upstream is a
+        // clear error naming the operator, not a bare utf-8 decode failure.
+        let err =
+            output(binary_engine().eval("source urn:test:pdf .. urn:fn:toUpper")).unwrap_err();
+        assert!(err.contains("`..`"), "{err}");
+        assert!(err.contains("not UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn displaying_binary_output_points_at_a_sink_terminal() {
+        // A binary value can flow through a pipe but not onto the screen: the
+        // terminal render says so and points at `sink` as the way to keep bytes.
+        let err = output(binary_engine().eval("source urn:test:pdf")).unwrap_err();
+        assert!(err.contains("not UTF-8 text"), "{err}");
+        assert!(err.contains("sink"), "{err}");
     }
 
     #[test]
