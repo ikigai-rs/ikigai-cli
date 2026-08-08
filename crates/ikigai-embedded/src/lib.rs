@@ -4888,6 +4888,82 @@ mod tests {
         assert!(override_calls.load(std::sync::atomic::Ordering::SeqCst) > 0);
     }
 
+    /// A mount target that is up and lists a catalog, so entry provenance can be
+    /// asserted without a peer.
+    struct ListingPeer;
+
+    #[async_trait::async_trait]
+    impl ikigai_resolve::Resolver for ListingPeer {
+        fn issue(
+            &self,
+            _request: Request,
+        ) -> std::result::Result<(Representation, ikigai_resolve::CacheStatus), ikigai_core::Error>
+        {
+            Err(ikigai_core::Error::Unavailable("peer".to_string()))
+        }
+
+        fn is_cached(&self, _request: &Request, _capability: &Capability) -> bool {
+            false
+        }
+
+        fn entries(&self) -> Option<Vec<SpaceEntry>> {
+            Some(vec![
+                SpaceEntry::new("urn:py:hello", "hello"),
+                SpaceEntry::new("urn:other:thing", "thing"),
+            ])
+        }
+    }
+
+    /// A prefer-mounted binding must be tagged with the mount's origin in the
+    /// catalog, exactly like an alias mount's — otherwise a federated `list`
+    /// cannot tell a peer's `urn:py:*` rows from local bindings.
+    #[test]
+    fn a_prefer_mounts_entries_carry_the_mounts_origin() {
+        let spec = MountSpec {
+            prefix: "urn:py:".to_string(),
+            origin: "test://peer".to_string(),
+            resolver: Arc::new(ListingPeer),
+            kind: MountKind::Prefer,
+        };
+        let space = root_space_with_mounts(vec![spec]);
+        let entries = space.entries().expect("the composed space enumerates");
+        let row = entries
+            .iter()
+            .find(|e| e.pattern == "urn:py:hello")
+            .expect("the peer's binding is listed");
+        assert_eq!(
+            row.origin.as_deref(),
+            Some("test://peer"),
+            "a prefer-mounted entry names where it resolves"
+        );
+        assert!(
+            !entries.iter().any(|e| e.pattern == "urn:other:thing"),
+            "a prefer mount lists only its own namespace"
+        );
+    }
+
+    /// The same provenance guarantee for an override mount.
+    #[test]
+    fn an_override_mounts_entries_carry_the_mounts_origin() {
+        let spec = MountSpec {
+            prefix: "urn:py:".to_string(),
+            origin: "test://peer".to_string(),
+            resolver: Arc::new(ListingPeer),
+            kind: MountKind::Override,
+        };
+        let space = root_space_with_mounts(vec![spec]);
+        let entries = space.entries().expect("the composed space enumerates");
+        let row = entries
+            .iter()
+            .find(|e| e.pattern == "urn:py:hello")
+            .expect("the peer's binding is listed");
+        assert_eq!(
+            row.origin.as_deref(),
+            Some("test://peer"),
+            "an override-mounted entry names where it resolves"
+        );
+    }
+
     /// A kernel with just the client endpoints, rooted at a scratch directory.
     fn client_kernel(root: std::path::PathBuf) -> Kernel {
         let space = EndpointSpace::new()
