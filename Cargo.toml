@@ -29,7 +29,7 @@ ikigai-http = "0.1.7" # 0.1.7 = endpoint-owned redirects (transport must not fol
 ikigai-runbook = "0.1.12" # Lisp page: + generated aliases (named verbs, cap-scoped, transcluded)
 # Linked Data toolkit (separate ikigai-linkeddata repo): RDF transreption + SPARQL.
 ikigai-rdf = "0.1.3" # + urn:rdf:union / urn:rdf:diff (graph set ops, with= carries ?k=v args)
-ikigai-sparql = "0.1.5" # 0.1.5 = unique id per query form (no 4× tool collision) + optional graph/as
+ikigai-sparql = "0.1.6" # 0.1.6 = space_with_store (shared-store seam for browse/annotations)
 # Content sniffing + sniff-and-dispatch (urn:sniff, urn:transrept:auto).
 ikigai-sniff = "0.1.1"
 # Neutral s-expr foundation: Sexpr datum + urn:sparql:from-sexpr transreptor (text/x-sexpr → SPARQL).
@@ -65,7 +65,7 @@ ikigai-cms = "0.1.1" # 0.1.1 = stitch wrapped bookmark titles (no dropped entrie
 ikigai-repo = "0.1.2" # 0.1.2 = typed Error::Denied for capability denials
 # Steel-backed Lisp evaluator (urn:lisp:eval): code is a resource, builtins ARE the
 # cap-scoped kernel verbs. Embedded-only (arbitrary code); gated by urn:cap:lisp.
-ikigai-lisp = "0.1.10" # 0.1.10 = a Steel panic reports its cause (isolation, not "thread panicked")
+ikigai-lisp = "0.1.12" # 0.1.12 = scope_sync migration (core-owned bridge; channels deleted)
 ikigai-throttle = "0.1.7" # Timeout governor + Failover (the --prefer mount degrades through it)
 # LLM inference (urn:llm:ask + urn:llm:<provider>:ask + urn:llm:config): a facade grammar
 # over pluggable backends. OpenAI-compatible REST backend (Ollama/vLLM/llama.cpp/mlx_lm).

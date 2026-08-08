@@ -2478,12 +2478,13 @@ dependencies = [
 
 [[package]]
 name = "ikigai-core"
-version = "0.1.49"
+version = "0.1.50"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cecb47bfe138536aa660247ca6cb865f8486ccab3020d85769b722602a41e214"
+checksum = "99c50e875f338a20ddbccec505a44e2f600c945b5eb3db279dfde3fb14309bbe"
 dependencies = [
  "async-trait",
  "blake3",
+ "futures-channel",
  "futures-util",
  "oxiri",
  "serde",
@@ -2665,13 +2666,11 @@ dependencies = [
 
 [[package]]
 name = "ikigai-lisp"
-version = "0.1.10"
+version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3fa2f5da4b186fb5eddd25b55e9137dd70abe4fa7ed232de373c785629581de"
+checksum = "a653637004bfa7e7fea4630d1f809820f4a7b997c74714c1f734f2162753070a"
 dependencies = [
  "async-trait",
- "crossbeam-channel",
- "futures",
  "ikigai-core",
  "ikigai-sexpr",
  "steel-core",
@@ -2891,9 +2890,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-sparql"
-version = "0.1.5"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8fa62c186dd03f132d84f84cc0e8c4a946c035ae02b45fa74b2b181697a452b"
+checksum = "653b80ee7f9c3725f023d7fb5664ccc9395dfdfa01c7d33bcc69d25ee4453157"
 dependencies = [
  "async-trait",
  "ikigai-core",
