@@ -25,8 +25,8 @@ use std::time::Duration;
 use ikigai_core::{Capability, Error, Kernel, Representation, Request, SpaceEntry, Tracer};
 use ikigai_resolve::{scoped_entries, CacheStatus, Resolver, SpanCollector};
 use ikigai_wire::{
-    decode, decode_hello, read_frame, read_message, write_hello, write_message, Call, Hello, Reply,
-    TraceContext, PROTOCOL_VERSION,
+    decode_hello, read_frame, read_message, write_hello, write_message, Call, Hello, Reply,
+    TraceContext, WireError, PROTOCOL_VERSION,
 };
 // Re-exported so consumers (the CLI's mount plumbing) can pass a mode without
 // depending on ikigai-wire directly.
@@ -86,14 +86,11 @@ pub fn connect_with_timeout(path: &Path, timeout: Option<Duration>) -> io::Resul
     connect_with(path, timeout, HelloMode::Verbatim)
 }
 
-/// The full connect: dial, then exchange the version [`Hello`].
-///
-/// A ≤v5 server cannot answer the hello — it postcard-decodes the frame as a
-/// `Call`, fails, and hangs up SILENTLY. That EOF is unmistakable (a real v6
-/// server always answers the hello, matching version or not), so the client
-/// reconnects WITHOUT the hello and warns — the one-version tolerance the
-/// design doc commits to removing at v7. A version MISMATCH from a v6+ server
-/// errors immediately, naming both versions: that is the whole point.
+/// The full connect: dial, then exchange the version [`Hello`] — REQUIRED
+/// since v7 (the v6 legacy-reconnect tolerance is gone). A version mismatch
+/// from any hello-speaking peer errors naming BOTH versions; a peer that
+/// hangs up on the hello predates v6 entirely and is refused with that
+/// diagnosis.
 pub fn connect_with(
     path: &Path,
     timeout: Option<Duration>,
@@ -126,19 +123,22 @@ pub fn connect_with(
                 "the kernel server answered the version hello with something else entirely",
             )),
         },
-        // Silence, then hang-up: a pre-v6 server. Reconnect legacy, loudly.
-        Err(_) => {
-            eprintln!(
-                "ikigai: the kernel server at {} hung up on the version hello — it likely \
-                 predates wire v6; reconnected WITHOUT the hello (tolerated until v7). \
-                 Update the server.",
-                path.display()
-            );
-            Ok(IpcResolver {
-                stream: dial(path, timeout)?,
-                tracer: Mutex::new(None),
-            })
+        // Silence is a HANG (the server may be overloaded — do not misdiagnose
+        // it as ancient); a hang-up (EOF/reset) is the pre-v6 signature.
+        Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "no answer to the version hello within the deadline (server hung or overloaded)",
+            ))
         }
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "the kernel server at {} hung up on the version hello — it predates wire v6 \
+                 and cannot speak v{PROTOCOL_VERSION}; update the server",
+                path.display()
+            ),
+        )),
     }
 }
 
@@ -192,8 +192,10 @@ impl Resolver for IpcResolver {
     fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), Error> {
         match self.round_trip(Call::Issue(request)).map_err(wire_error)? {
             Reply::Resolved(representation, status) => Ok((representation, status)),
-            // The server already rendered its error to a string; don't re-prefix an
-            // already-"endpoint error: …" message into a doubled one across the wire.
+            // v7: the taxonomy crosses intact — a remote Denied IS a Denied here.
+            Reply::ErrorTyped(wire_error) => Err(wire_error.into()),
+            // The flat string form is still decodable (append-only discriminants)
+            // though a v7 server never sends it.
             Reply::Error(message) => Err(Error::Endpoint(
                 message
                     .strip_prefix("endpoint error: ")
@@ -241,8 +243,9 @@ impl Resolver for IpcResolver {
                 }
                 Ok((representation, status))
             }
-            // The server already rendered its error to a string; don't re-prefix an
-            // already-"endpoint error: …" message into a doubled one across the wire.
+            // v7: the taxonomy crosses intact — a remote Denied IS a Denied here.
+            Reply::ErrorTyped(wire_error) => Err(wire_error.into()),
+            // The flat string form is still decodable though a v7 server never sends it.
             Reply::Error(message) => Err(Error::Endpoint(
                 message
                     .strip_prefix("endpoint error: ")
@@ -317,16 +320,14 @@ fn handle_connection(kernel: &Kernel, stream: UnixStream) {
             }
         }
         None => {
+            // v7: the hello is REQUIRED. A first frame without the magic is a
+            // pre-v6 client; refuse it (the v6 serve-it-anyway tolerance is
+            // over — this fleet updates together).
             eprintln!(
-                "ikigai: a client connected without the version hello (wire ≤v5) — served \
-                 in legacy mode (tolerated until v7). Update the client."
+                "ikigai: refused a client that connected without the version hello \
+                 (wire ≤v5; v{PROTOCOL_VERSION} requires it). Update the client."
             );
-            let Ok(call) = decode::<Call>(&first) else {
-                return; // neither a hello nor a call — hang up
-            };
-            if write_message(&mut stream, &dispatch(kernel, call)).is_err() {
-                return;
-            }
+            return;
         }
     }
     loop {
@@ -346,7 +347,7 @@ fn dispatch(kernel: &Kernel, call: Call) -> Reply {
     match call {
         Call::Issue(request) => match Resolver::issue(kernel, request) {
             Ok((representation, status)) => Reply::Resolved(representation, status),
-            Err(error) => Reply::Error(error.to_string()),
+            Err(error) => Reply::ErrorTyped(WireError::from(&error)),
         },
         // The peer is the owner (peercred-verified in `serve`), so the principal's
         // entitlement is root and the carried capability is already ≤ root —
@@ -355,7 +356,7 @@ fn dispatch(kernel: &Kernel, call: Call) -> Reply {
         Call::IssueAs(request, capability) => {
             match Resolver::issue_as(kernel, request, &capability) {
                 Ok((representation, status)) => Reply::Resolved(representation, status),
-                Err(error) => Reply::Error(error.to_string()),
+                Err(error) => Reply::ErrorTyped(WireError::from(&error)),
             }
         }
         Call::IsCached(request) => {
@@ -377,7 +378,7 @@ fn dispatch(kernel: &Kernel, call: Call) -> Reply {
                 Ok((representation, status)) => {
                     Reply::ResolvedTraced(representation, status, collector.take())
                 }
-                Err(error) => Reply::Error(error.to_string()),
+                Err(error) => Reply::ErrorTyped(WireError::from(&error)),
             }
         }
     }
@@ -603,6 +604,15 @@ mod tests {
         // A "server" that accepts the connection but never replies.
         let server = thread::spawn(move || {
             if let Ok((stream, _)) = listener.accept() {
+                let mut s = &stream;
+                let _ = read_frame(&mut s);
+                let _ = write_hello(
+                    &mut s,
+                    &Hello {
+                        version: PROTOCOL_VERSION,
+                        mode: HelloMode::Verbatim,
+                    },
+                );
                 std::thread::sleep(Duration::from_millis(400)); // hold it, write nothing
                 drop(stream);
             }
@@ -637,6 +647,15 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let server = thread::spawn(move || {
             if let Ok((stream, _)) = listener.accept() {
+                let mut s = &stream;
+                let _ = read_frame(&mut s);
+                let _ = write_hello(
+                    &mut s,
+                    &Hello {
+                        version: PROTOCOL_VERSION,
+                        mode: HelloMode::Verbatim,
+                    },
+                );
                 std::thread::sleep(Duration::from_millis(400));
                 drop(stream);
             }
@@ -696,68 +715,51 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A ≤v5 client sends a Call first, no hello. The server serves it in
-    /// legacy mode — the one-version tolerance, so a mixed fleet degrades to
-    /// a warning instead of a broken drain.
+    /// v7: a ≤v5 client (a Call first, no hello) is REFUSED — the tolerance
+    /// era is over. The connection closes without an answer.
     #[test]
-    fn a_legacy_client_without_a_hello_is_still_served() {
+    fn a_pre_hello_client_is_refused() {
         let path = socket_path("legacy-client");
         let server = serve_one(&path, kernel());
 
-        // Speak the ≤v5 sequence by hand: no hello, straight to a Call.
         let stream = UnixStream::connect(&path).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         let mut s = &stream;
         write_message(&mut s, &Call::Issue(upper("hi"))).unwrap();
-        let reply: Reply = read_message(&mut s).unwrap();
         assert!(
-            matches!(&reply, Reply::Resolved(r, _) if r.bytes == b"HI"),
-            "{reply:?}"
+            read_message::<_, Reply>(&mut s).is_err(),
+            "the server must hang up, not serve a pre-hello client"
         );
-        // And the connection keeps serving after the legacy first frame.
-        write_message(&mut s, &Call::Entries).unwrap();
-        assert!(matches!(
-            read_message::<_, Reply>(&mut s).unwrap(),
-            Reply::Entries(Some(_))
-        ));
 
         drop(stream);
         server.join().unwrap();
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A v6 client dialing a ≤v5 server: the old server drops the hello frame
-    /// silently, and the client reconnects WITHOUT the hello — so a new
-    /// binary keeps working against a not-yet-updated daemon.
+    /// v7: a client dialing a pre-hello server gets a CLEAR refusal naming the
+    /// diagnosis — no silent legacy reconnect.
     #[test]
-    fn a_new_client_falls_back_against_a_pre_hello_server() {
+    fn a_pre_hello_server_is_diagnosed_not_tolerated() {
         let path = socket_path("legacy-server");
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
-        let kernel = kernel();
-        // A ≤v5 server: every frame is a Call; an undecodable one ends the
-        // session silently (the old handle_connection, replayed by hand).
+        // A ≤v5 server: cannot decode the hello, hangs up silently.
         let server = thread::spawn(move || {
-            for _ in 0..2 {
-                let Ok((stream, _)) = listener.accept() else {
-                    return;
-                };
-                let mut s = &stream;
-                while let Ok(payload) = read_frame(&mut s) {
-                    let Ok(call) = decode::<Call>(&payload) else {
-                        break; // the hello, undecodable as a Call → hang up
-                    };
-                    if write_message(&mut s, &dispatch(&kernel, call)).is_err() {
-                        break;
-                    }
-                }
-            }
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut s = &stream;
+            let _ = read_frame(&mut s);
         });
 
-        let client = connect(&path).unwrap(); // falls back internally
-        let (representation, _) = client.issue(upper("hi")).unwrap();
-        assert_eq!(representation.bytes, b"HI");
+        let message = match connect(&path) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("a pre-hello server must be refused"),
+        };
+        assert!(message.contains("predates wire v6"), "{message}");
 
-        drop(client);
         server.join().unwrap();
         let _ = std::fs::remove_file(&path);
     }
@@ -824,6 +826,55 @@ mod tests {
         let _client = connect_as(&path, HelloMode::Alias).unwrap();
         assert_eq!(server.join().unwrap(), HelloMode::Alias);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_remote_denial_stays_a_permanent_denial() {
+        let space = EndpointSpace::new().bind(
+            Exact::new("urn:demo:gated"),
+            ikigai_core::FnEndpoint::new("gated", |_inv| {
+                Err(Error::Denied("needs urn:cap:x".to_string()))
+            }),
+        );
+        let path = socket_path("typed-denied");
+        let server = serve_one(&path, Kernel::new(Arc::new(space)));
+        let client = connect(&path).unwrap();
+        let err = client
+            .issue(Request::new(Verb::Source, iri_of("urn:demo:gated")))
+            .unwrap_err();
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
+        assert!(!err.is_transient());
+        drop(client);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_remote_timeout_stays_transient_across_the_wire() {
+        let space = EndpointSpace::new().bind(
+            Exact::new("urn:demo:slow"),
+            ikigai_core::FnEndpoint::new("slow", |_inv| {
+                Err(Error::Timeout("5s elapsed".to_string()))
+            }),
+        );
+        let path = socket_path("typed-timeout");
+        let server = serve_one(&path, Kernel::new(Arc::new(space)));
+        let client = connect(&path).unwrap();
+        let err = client
+            .issue(Request::new(Verb::Source, iri_of("urn:demo:slow")))
+            .unwrap_err();
+        assert!(matches!(err, Error::Timeout(_)), "{err:?}");
+        assert!(
+            err.is_transient(),
+            "a remote transient must remain actionable by Failover/Retry"
+        );
+        drop(client);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn iri_of(s: &str) -> Iri {
+        Iri::parse(s).unwrap()
     }
 
     #[test]

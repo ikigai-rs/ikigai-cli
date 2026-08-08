@@ -78,6 +78,28 @@ break overnight. So v6 negotiates DOWN, once, with warnings:
 v7 removes all three tolerances: hello required, single ALPN. The warnings
 are the pressure to get there.
 
+## v7 (2026-08-08): typed errors, tolerances removed
+
+- **`Reply::ErrorTyped(WireError)`** — the error taxonomy crosses the wire: a
+  wire-local, append-only mirror of `ikigai_core::Error` (Unresolved /
+  MissingArgument / InvalidArgument / Endpoint / Denied / NotFound / Timeout /
+  Unavailable). The client rebuilds the same core variant, so a remote Denied
+  stays a permanent denial (Failover must not paper over it), a remote
+  Timeout/Unavailable stays TRANSIENT (Failover/Retry may act — "graceful"
+  now reaches through the wire), and an HTTP face can answer 403/404/400
+  instead of a blanket 502. Wire-local on purpose: a taxonomy addition is a
+  WIRE VERSION event for a public ABI with independent implementations, not a
+  silent core cascade; core is non_exhaustive and unknown-future variants
+  degrade to Endpoint with the message preserved.
+- **Tolerances gone**: a UDS first frame without the hello magic is refused
+  (not served as v5); a server that hangs up on the hello is diagnosed as
+  pre-v6 (a server that is merely SILENT is reported as hung, not ancient);
+  QUIC offers and accepts exactly `ikigai/7`.
+- v6↔v7 still fails CLEANLY — the hello itself names both versions. Only
+  pre-v6 peers fail without explanation, and none remain in this fleet.
+- Deployment order: land Rust v7 on main → ship the Python and Deno v7
+  mirrors → THEN install binaries and update bug + the edge together.
+
 ## What this deliberately does not do
 
 - No capability negotiation, no feature flags — version + mode only. The

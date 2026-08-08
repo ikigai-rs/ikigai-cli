@@ -28,29 +28,12 @@ use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use tokio::runtime::Runtime;
 
-/// The ALPN protocol ids, preference-ordered: the versioned id first
-/// (`ikigai/{PROTOCOL_VERSION}` — the TLS handshake IS the version gate on this
-/// transport), then the version-blind pre-v6 id, tolerated for one version so a
-/// mixed fleet degrades to a warning instead of a broken drain. v7 drops the
-/// legacy entry, and a version mismatch becomes a refused handshake at connect.
+/// The ALPN protocol ids — since v7, exactly one: `ikigai/{PROTOCOL_VERSION}`.
+/// The TLS handshake IS the version gate on this transport; a version-mismatched
+/// peer fails the handshake at connect (mDNS TXT advertises the version
+/// pre-connect, which is where the human-readable hint lives).
 fn alpn_protocols() -> Vec<Vec<u8>> {
-    vec![ikigai_wire::alpn(), ikigai_wire::ALPN_LEGACY.to_vec()]
-}
-
-/// Warn when a connection negotiated the LEGACY ALPN — the peer predates wire
-/// v6 (or is newer than us and kept the legacy id for our sake). Loud on both
-/// ends, because the warning is the pressure that retires the tolerance.
-fn warn_if_legacy_alpn(connection: &quinn::Connection, peer: &str) {
-    let negotiated = connection
-        .handshake_data()
-        .and_then(|d| d.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
-        .and_then(|d| d.protocol);
-    if negotiated.as_deref() == Some(ikigai_wire::ALPN_LEGACY) {
-        eprintln!(
-            "ikigai: the QUIC connection with {peer} negotiated the pre-v6 ALPN \
-             (version-blind wire, tolerated until v7) — update the older side"
-        );
-    }
+    vec![ikigai_wire::alpn()]
 }
 
 /// The largest message accepted off a stream (guards `read_to_end`).
@@ -133,7 +116,6 @@ pub fn serve_with(
             let minter = Arc::clone(&minter);
             tokio::spawn(async move {
                 if let Ok(connection) = incoming.await {
-                    warn_if_legacy_alpn(&connection, &connection.remote_address().to_string());
                     // mTLS verified the peer is one of the enrolled clients; mint that
                     // principal's session from *which* cert authenticated — multi-tenant
                     // capability-on-the-wire.
@@ -200,7 +182,9 @@ async fn serve_connection(kernel: &Kernel, connection: quinn::Connection, sessio
         };
         let reply = match decode::<Call>(&bytes) {
             Ok(call) => dispatch(kernel, call, session),
-            Err(e) => Reply::Error(format!("malformed call: {e}")),
+            Err(e) => Reply::ErrorTyped(ikigai_wire::WireError::Endpoint(format!(
+                "malformed call: {e}"
+            ))),
         };
         if let Ok(out) = encode(&reply) {
             let _ = send.write_all(&out).await;
@@ -232,7 +216,7 @@ fn dispatch(kernel: &Kernel, call: Call, session: &Session) -> Reply {
         localize(&mut request, &session.file_segment);
         match Resolver::issue_as(kernel, request, capability) {
             Ok((representation, status)) => Reply::Resolved(representation, status),
-            Err(error) => Reply::Error(error.to_string()),
+            Err(error) => Reply::ErrorTyped(ikigai_wire::WireError::from(&error)),
         }
     };
     match call {
@@ -265,7 +249,7 @@ fn dispatch(kernel: &Kernel, call: Call, session: &Session) -> Reply {
                 Ok((representation, status)) => {
                     Reply::ResolvedTraced(representation, status, collector.take())
                 }
-                Err(error) => Reply::Error(error.to_string()),
+                Err(error) => Reply::ErrorTyped(ikigai_wire::WireError::from(&error)),
             }
         }
     }
@@ -402,6 +386,7 @@ impl Resolver for QuicResolver {
             Reply::Resolved(representation, status) => Ok((representation, status)),
             // The server already rendered its error to a string; don't re-prefix an
             // already-"endpoint error: …" message into a doubled one across the wire.
+            Reply::ErrorTyped(wire_error) => Err(wire_error.into()),
             Reply::Error(message) => Err(Error::Endpoint(
                 message
                     .strip_prefix("endpoint error: ")
@@ -448,6 +433,7 @@ impl Resolver for QuicResolver {
             }
             // The server already rendered its error to a string; don't re-prefix an
             // already-"endpoint error: …" message into a doubled one across the wire.
+            Reply::ErrorTyped(wire_error) => Err(wire_error.into()),
             Reply::Error(message) => Err(Error::Endpoint(
                 message
                     .strip_prefix("endpoint error: ")
@@ -544,12 +530,7 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 async fn dial(endpoint: &quinn::Endpoint, addr: SocketAddr) -> io::Result<quinn::Connection> {
     let connecting = endpoint.connect(addr, "ikigai").map_err(other)?;
     match tokio::time::timeout(CONNECT_TIMEOUT, connecting).await {
-        Ok(result) => {
-            let connection = result.map_err(other)?;
-            // Covers first connect AND every transparent redial.
-            warn_if_legacy_alpn(&connection, &addr.to_string());
-            Ok(connection)
-        }
+        Ok(result) => result.map_err(other),
         Err(_) => Err(io::Error::new(
             io::ErrorKind::TimedOut,
             format!(
