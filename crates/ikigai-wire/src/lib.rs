@@ -19,19 +19,21 @@ use serde::{Deserialize, Serialize};
 /// [`Reply::ResolvedTraced`] (trace-over-the-wire); v5 changes `TraceEvent`'s
 /// postcard layout (core 0.1.48 adds `notes` — endpoint span annotations);
 /// **v6 adds the [`Hello`] exchange**, so version (and mount mode) finally
-/// CROSS the wire instead of being assumed — see `docs/wire-hello-design.md`.
-pub const PROTOCOL_VERSION: u32 = 6;
+/// CROSS the wire instead of being assumed — see `docs/wire-hello-design.md`;
+/// **v7 adds [`Reply::ErrorTyped`]** (the error TAXONOMY crosses, not a flat
+/// string — a remote denial is a denial, a remote timeout is transient) and
+/// **removes the v6 tolerances**: the hello is REQUIRED and the legacy ALPN is
+/// gone. A v6 peer still fails CLEANLY (the hello exchange itself reports the
+/// mismatch naming both versions); only pre-v6 peers fail without explanation.
+pub const PROTOCOL_VERSION: u32 = 7;
 
-/// The ALPN protocol id for QUIC — `ikigai/{PROTOCOL_VERSION}`, so the TLS
-/// handshake itself is the version gate on that transport. [`ALPN_LEGACY`] is
-/// the pre-v6 id, still offered/accepted for one version so a mixed fleet
-/// degrades to a warning instead of a broken drain; v7 removes it.
+/// The ALPN protocol id for QUIC — `ikigai/{PROTOCOL_VERSION}`, the TLS
+/// handshake itself as the version gate. Since v7 it is the ONLY id offered
+/// and accepted: the v6 transition (offer/accept the version-blind `ikigai/0`
+/// beside it, warn on negotiation) is over.
 pub fn alpn() -> Vec<u8> {
     format!("ikigai/{PROTOCOL_VERSION}").into_bytes()
 }
-
-/// The version-blind pre-v6 ALPN id (tolerated through v6, removed at v7).
-pub const ALPN_LEGACY: &[u8] = b"ikigai/0";
 
 /// The magic prefix of a hello payload. A first frame that does NOT start with
 /// it is a legacy (≤v5) [`Call`] — that contrast is what makes the hello
@@ -159,8 +161,9 @@ pub enum Call {
     IssueTraced(Request, Capability, TraceContext),
 }
 
-/// A server → client reply. [`Error`](Reply::Error) can answer any call — a
-/// failed resolution, or a server/transport error.
+/// A server → client reply. [`ErrorTyped`](Reply::ErrorTyped) is how a v7+
+/// server answers failures; the flat [`Error`](Reply::Error) variant remains
+/// decodable (discriminants are append-only) but is no longer sent.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Reply {
     Resolved(Representation, CacheStatus),
@@ -171,6 +174,82 @@ pub enum Reply {
     /// the call — the answer to [`Call::IssueTraced`]. Appended so existing
     /// discriminants are unchanged.
     ResolvedTraced(Representation, CacheStatus, Vec<TraceEvent>),
+    /// A failure with its TAXONOMY intact (v7): the client rebuilds the same
+    /// `ikigai_core::Error` variant the server saw, so a remote denial stays a
+    /// permanent `Denied` (a Failover must NOT paper over it with a weaker
+    /// local answer), a remote timeout stays TRANSIENT (a Failover MAY act),
+    /// and an HTTP face can say 403/404/400 instead of a blanket 502.
+    ErrorTyped(WireError),
+}
+
+/// The error taxonomy on the wire — a field-for-field mirror of
+/// `ikigai_core::Error`, kept wire-local so a taxonomy addition is a WIRE
+/// version event (this codec is a public ABI with independent
+/// implementations), not a silent core cascade. Variant order is the postcard
+/// contract: append only.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum WireError {
+    /// Kernel found no binding for the target (the IRI, as text).
+    Unresolved(String),
+    MissingArgument(String),
+    InvalidArgument {
+        name: String,
+        detail: String,
+    },
+    Endpoint(String),
+    /// Permanent: the capability did not authorize it.
+    Denied(String),
+    /// Permanent: a bound endpoint reports the fronted thing absent.
+    NotFound(String),
+    /// Transient.
+    Timeout(String),
+    /// Transient.
+    Unavailable(String),
+}
+
+impl From<&ikigai_core::Error> for WireError {
+    fn from(error: &ikigai_core::Error) -> Self {
+        use ikigai_core::Error as E;
+        match error {
+            E::Unresolved(iri) => WireError::Unresolved(iri.as_str().to_string()),
+            E::MissingArgument(name) => WireError::MissingArgument(name.clone()),
+            E::InvalidArgument { name, detail } => WireError::InvalidArgument {
+                name: name.clone(),
+                detail: detail.clone(),
+            },
+            E::Endpoint(message) => WireError::Endpoint(message.clone()),
+            E::Denied(message) => WireError::Denied(message.clone()),
+            E::NotFound(message) => WireError::NotFound(message.clone()),
+            E::Timeout(message) => WireError::Timeout(message.clone()),
+            E::Unavailable(message) => WireError::Unavailable(message.clone()),
+            // Core's Error is non_exhaustive: a variant newer than this wire
+            // revision degrades to Endpoint (message preserved) until the wire
+            // catches up — a taxonomy addition is a wire-version event, and an
+            // old peer meanwhile sees a correct-if-untyped failure.
+            other => WireError::Endpoint(other.to_string()),
+        }
+    }
+}
+
+impl From<WireError> for ikigai_core::Error {
+    fn from(error: WireError) -> Self {
+        use ikigai_core::Error as E;
+        match error {
+            // An IRI that crossed the wire came FROM an Iri, so a parse failure
+            // here means corruption; degrade to Endpoint rather than panic.
+            WireError::Unresolved(iri) => match ikigai_core::Iri::parse(&iri) {
+                Ok(iri) => E::Unresolved(iri),
+                Err(_) => E::Endpoint(format!("no endpoint resolved for {iri}")),
+            },
+            WireError::MissingArgument(name) => E::MissingArgument(name),
+            WireError::InvalidArgument { name, detail } => E::InvalidArgument { name, detail },
+            WireError::Endpoint(message) => E::Endpoint(message),
+            WireError::Denied(message) => E::Denied(message),
+            WireError::NotFound(message) => E::NotFound(message),
+            WireError::Timeout(message) => E::Timeout(message),
+            WireError::Unavailable(message) => E::Unavailable(message),
+        }
+    }
 }
 
 /// Serialize `message` and write it length-prefixed (`u32` big-endian length,
@@ -360,7 +439,55 @@ mod tests {
     #[test]
     fn the_alpn_id_tracks_the_protocol_version() {
         assert_eq!(alpn(), format!("ikigai/{PROTOCOL_VERSION}").into_bytes());
-        assert_ne!(alpn(), ALPN_LEGACY.to_vec());
+    }
+
+    /// Every taxonomy variant crosses and comes back as the SAME core variant,
+    /// with transience preserved — the property the reliability overlays and
+    /// the HTTP faces depend on.
+    #[test]
+    fn typed_errors_round_trip_with_taxonomy_intact() {
+        use ikigai_core::Error as E;
+        let cases: Vec<ikigai_core::Error> = vec![
+            E::Unresolved(Iri::parse("urn:x:y").unwrap()),
+            E::MissingArgument("in".into()),
+            E::InvalidArgument {
+                name: "n".into(),
+                detail: "not a number".into(),
+            },
+            E::Endpoint("boom".into()),
+            E::Denied("needs urn:cap:x".into()),
+            E::NotFound("no such row".into()),
+            E::Timeout("5s elapsed".into()),
+            E::Unavailable("connection refused".into()),
+        ];
+        for original in cases {
+            let mut buf = Vec::new();
+            write_message(&mut buf, &Reply::ErrorTyped(WireError::from(&original))).unwrap();
+            let got: Reply = read_message(&mut std::io::Cursor::new(buf)).unwrap();
+            let Reply::ErrorTyped(wire_error) = got else {
+                panic!("expected ErrorTyped");
+            };
+            let rebuilt: ikigai_core::Error = wire_error.into();
+            assert_eq!(
+                rebuilt.is_transient(),
+                original.is_transient(),
+                "transience must survive the wire: {original:?}"
+            );
+            assert_eq!(
+                std::mem::discriminant(&rebuilt),
+                std::mem::discriminant(&original),
+                "variant must survive the wire: {original:?}"
+            );
+        }
+    }
+
+    /// ErrorTyped's postcard discriminant is part of the public ABI — lock it.
+    #[test]
+    fn error_typed_wire_discriminant_is_five() {
+        let bytes = encode(&Reply::ErrorTyped(WireError::Endpoint("x".into()))).unwrap();
+        assert_eq!(bytes[0], 5, "Reply::ErrorTyped is variant 5");
+        let inner = encode(&Reply::ErrorTyped(WireError::Denied("x".into()))).unwrap();
+        assert_eq!(inner[1], 4, "WireError::Denied is variant 4");
     }
 
     #[test]
