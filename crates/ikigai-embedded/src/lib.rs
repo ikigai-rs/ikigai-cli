@@ -1544,25 +1544,34 @@ pub struct ServedSurface {
 /// Build the served kernel for `surface`. One composer instead of a kernel
 /// function per combination.
 pub fn served_kernel(nature: &'static str, surface: ServedSurface) -> Kernel {
-    let base: Arc<dyn Space> = if surface.personal {
-        Arc::new(calendar_server_space(nature))
-    } else {
-        Arc::new(served_space(nature))
-    };
+    served_kernel_with_mounts(nature, surface, Vec::new())
+}
+
+/// [`served_kernel`], composing remote kernels into the served surface — the QUIC
+/// face of THE HOST OWNS THE TOPOLOGY ([`trusted_kernel_with_mounts`] is the IPC
+/// face). A mount widens REACH, never authority: a client resolves through it
+/// under its own clamped capability, which travels to the mounted peer.
+pub fn served_kernel_with_mounts(
+    nature: &'static str,
+    surface: ServedSurface,
+    mounts: Vec<MountSpec>,
+) -> Kernel {
+    let mut spaces: Vec<Arc<dyn Space>> = Vec::new();
     // The LLM face sits in front of the base surface (it binds its own namespace;
     // order only matters for a prefix collision, and there is none).
-    let base: Arc<dyn Space> = if surface.llm {
-        Arc::new(ikigai_core::Fallback::new(vec![
-            Arc::new(llm_space()) as Arc<dyn Space>,
-            base,
-        ]))
+    if surface.llm {
+        spaces.push(Arc::new(llm_space()) as Arc<dyn Space>);
+    }
+    spaces.push(if surface.personal {
+        Arc::new(calendar_server_space(nature)) as Arc<dyn Space>
     } else {
-        base
-    };
+        Arc::new(served_space(nature)) as Arc<dyn Space>
+    });
+    let composed = compose_mounts(spaces, mounts);
     let root = if surface.wire_eval {
-        with_wire_eval(base)
+        with_wire_eval(composed)
     } else {
-        base
+        composed
     };
     Kernel::with_meta_renderer(root, Arc::new(CliRenderer))
 }
@@ -3392,6 +3401,14 @@ fn root_space_with_mounts(mounts: Vec<MountSpec>) -> Arc<dyn Space> {
                 ClientRegistry::new(file_root()),
             ),
     ) as Arc<dyn Space>);
+    compose_mounts(spaces, mounts)
+}
+
+/// Compose remote mounts around a list of local spaces — the shared tail of every
+/// mounted kernel builder ([`root_space_with_mounts`] for the embedded root,
+/// [`served_kernel_with_mounts`] for the QUIC-served surface). Alias mounts join
+/// the local list; overrides and prefers front it, most specific prefix first.
+fn compose_mounts(mut spaces: Vec<Arc<dyn Space>>, mounts: Vec<MountSpec>) -> Arc<dyn Space> {
     // Guardrail for a real footgun: mounts are tried AFTER every local space, so a
     // mount prefix that a local space already serves is silently shadowed — requests
     // under it resolve locally and never reach the remote (e.g. `--mount urn:personal:=…`
@@ -4868,6 +4885,28 @@ mod tests {
         let space = root_space_with_mounts(vec![spec]);
         let answer = probe(&space, "urn:fn:toUpper").expect("local must answer for a dead peer");
         assert_eq!(answer, "HI");
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the peer must be TRIED first — preferring it is the whole point"
+        );
+    }
+
+    /// The QUIC-served surface composes mounts too ([`served_kernel_with_mounts`]):
+    /// the peer is TRIED, and the served binding answers when it is down — the
+    /// same contract the embedded root has.
+    #[test]
+    fn the_served_kernel_composes_mounts() {
+        let (spec, calls) = mount(
+            "urn:fn:",
+            MountKind::Prefer,
+            ikigai_core::Error::Unavailable,
+        );
+        let kernel = served_kernel_with_mounts("Test (QUIC)", ServedSurface::default(), vec![spec]);
+        let request = Request::new(Verb::Source, Iri::parse("urn:fn:toUpper").unwrap())
+            .with_arg("in", ArgRef::Inline(b"hi".to_vec()));
+        let representation = block_on(kernel.issue(request, &Capability::root()))
+            .expect("the served binding must answer for a dead peer");
+        assert_eq!(String::from_utf8_lossy(&representation.bytes), "HI");
         assert!(
             calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
             "the peer must be TRIED first — preferring it is the whole point"
