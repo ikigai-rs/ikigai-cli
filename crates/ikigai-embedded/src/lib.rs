@@ -20,6 +20,7 @@ use ikigai_core::{
 };
 use ikigai_scheduler::Scheduler;
 
+mod browse;
 pub mod config;
 pub mod contactblock;
 pub mod decide;
@@ -3105,6 +3106,33 @@ fn root_space() -> Arc<dyn Space> {
 /// `prefix` forwards to the remote, and the remote's catalog appears re-prefixed and
 /// tagged with `origin`.
 fn root_space_with_mounts(mounts: Vec<MountSpec>) -> Arc<dyn Space> {
+    // The browse family (urn:repo:{root}:tree/file/state/hash/explain/… +
+    // urn:annotation:*), opt-in via `browse.root` config lines — see the
+    // `browse` module for the grammar. Wired here, before the space list, so
+    // its persistent store handle can decide which sparql space binds below.
+    let browse = browse::setup();
+    // urn:sparql:*. Two regimes, decided by configuration — the shared store
+    // ACCOMPANIES the default space in the code, and configuration picks which
+    // one this host binds:
+    //
+    // - browse unconfigured: `space()` as always — private per-query store,
+    //   vocab pre-seeded, `graph=` loads kernel-resolved sources per query,
+    //   results cacheable under the sources' golden threads.
+    // - browse configured: `space_with_store` over the SAME `Arc<Store>` the
+    //   explanation archive and annotations write — one shared graph, so
+    //   `urn:sparql:select` joins ik:Explanation + oa:Annotation live. The
+    //   vocabulary is loaded into the shared store (browse::setup), so schema
+    //   joins keep working; what changes is `graph=` (not offered — loading
+    //   into a shared persistent store would mutate it for good) and
+    //   cacheability (live store, no golden thread — uncacheable).
+    //
+    // Both bind the same four IRIs, so they cannot coexist in one kernel; the
+    // per-query-federation regime is the default, the shared-graph regime is
+    // what you opted into by configuring a browse store.
+    let sparql_space: Arc<dyn Space> = match &browse {
+        Some(b) => Arc::new(ikigai_sparql::space_with_store(Arc::clone(&b.store))),
+        None => Arc::new(ikigai_sparql::space()),
+    };
     let mut spaces: Vec<Arc<dyn Space>> = vec![
         Arc::new(local_space("Embedded (Native)")) as Arc<dyn Space>,
         Arc::new(http_space()) as Arc<dyn Space>,
@@ -3147,7 +3175,7 @@ fn root_space_with_mounts(mounts: Vec<MountSpec>) -> Arc<dyn Space> {
         // as capability-gated resources. Native subprocess seam; ikigai using the
         // tools that build ikigai.
         Arc::new(ikigai_repo::space()) as Arc<dyn Space>,
-        Arc::new(ikigai_sparql::space()) as Arc<dyn Space>,
+        sparql_space,
         // The intray / tuplespace (urn:space:{name}: out=Sink, rd=Source) — a dir-backed
         // space under file_root/spaces/. The scheduling booking-inbox drops into it; the
         // reactive/sealed slices land on top. Cap-gated (urn:cap:space:out / :read).
@@ -3232,6 +3260,16 @@ fn root_space_with_mounts(mounts: Vec<MountSpec>) -> Arc<dyn Space> {
             on: demo_flag(),
         }) as Arc<dyn Space>,
     ];
+    // The browse family, when `browse.root` lines configured it (see above): repository
+    // browsing (urn:repo:{root}:tree/file/state/hash), the persistent explanation
+    // archive (…:explain[:{path}] — derived once per content version, then answered
+    // from the store forever), and Web Annotations (urn:annotation:* — Sink gated by
+    // urn:cap:annotate). Its grammar only ever matches configured root names — an
+    // unknown {root} is a clean miss — so it composes with ikigai-repo's urn:repo:*
+    // Exacts without shadowing (reserved names are refused at setup).
+    if let Some(b) = browse {
+        spaces.push(Arc::new(b.space) as Arc<dyn Space>);
+    }
     // The booking handler: `schedule.scm` bound as an endpoint (`ikigai_lisp::program` — the
     // program IS the endpoint), IF the workspace provides `booking-handler.scm`. The reactive
     // `bookings` space fires `urn:booking:handle` on each dropped request, under that space's

@@ -32,6 +32,15 @@ ikigai-http = { workspace = true }
 ikigai-runbook = { workspace = true }
 ikigai-rdf = { workspace = true }
 ikigai-sparql = { workspace = true }
+# Repository browsing + the persistent explanation/annotation archive, opt-in via
+# `browse.root` config lines (see src/browse.rs for the config grammar).
+ikigai-browse = { workspace = true }
+# The persistence switch for the browse/sparql shared store: ikigai-browse and
+# ikigai-sparql both keep oxigraph at default-features = false (wasm-clean, no
+# storage engine), and THIS host enables rocksdb — feature unification turns
+# `Store::open` on for the one shared Store type (re-exported as
+# ikigai_sparql::Store, which is what src/browse.rs names). Not imported directly.
+oxigraph = { version = "0.5", default-features = false, features = ["rocksdb"] }
 ikigai-sniff = { workspace = true }
 ikigai-sexpr = { workspace = true }
 ikigai-sign = { workspace = true }
