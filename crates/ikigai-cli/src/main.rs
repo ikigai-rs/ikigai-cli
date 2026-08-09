@@ -703,7 +703,7 @@ fn main() {
                 routes.as_deref(),
                 routes_only,
             ),
-            (None, Some(t)) if is_quic(t) => serve_quic(t, &certs, &caps, announce),
+            (None, Some(t)) if is_quic(t) => serve_quic(t, &certs, &caps, announce, mounts),
             (None, _) if !caps.is_empty() => {
                 eprintln!("ikigai: --cap sets a per-connection ceiling and needs a quic:// target");
                 std::process::exit(2);
@@ -759,7 +759,6 @@ fn daemon(mounts: Vec<Mount>) {
         let mut resolved = Vec::new();
         for mount in mounts {
             // Each mount connects with ITS OWN certificates.
-            let target = mount.target.clone();
             match resolve_mount(mount) {
                 Ok(spec) => resolved.push(spec),
                 // A mount that will not connect is fatal here: the daemon's whole reason to
@@ -767,7 +766,7 @@ fn daemon(mounts: Vec<Mount>) {
                 // fixing. Say so and exit rather than park looking healthy. (A --prefer
                 // mount never lands here — it connects on demand, by design.)
                 Err(e) => {
-                    eprintln!("ikigai: --mount {target}: {e}");
+                    eprintln!("ikigai: {e}");
                     std::process::exit(2);
                 }
             }
@@ -890,7 +889,7 @@ fn mcp(grants: Vec<String>, scopes: Vec<String>, mounts: Vec<Mount>) {
                 // would project a manifold missing the tools the topology promised.
                 // (A --prefer mount never lands here — it connects on demand.)
                 Err(e) => {
-                    eprintln!("ikigai: --mount {target}: {e}");
+                    eprintln!("ikigai: {e}");
                     std::process::exit(2);
                 }
             }
@@ -1340,17 +1339,32 @@ fn connect_mount(
     certs: &Certs,
     kind: ikigai_embedded::MountKind,
 ) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
+    // The connect error names the flag the operator actually wrote: a down
+    // prefer-mount peer surfacing at first use as `--mount: connect …` sent the
+    // reader hunting for a flag that was never typed.
+    let flag = mount_flag(kind);
     // `peer:<name>` — mount by NAME, letting mDNS supply the address. Addresses move
     // (bug's `ipconfig getifaddr en0` came back empty during the mail work, because it was
     // on another interface); a name does not.
     if let Some(name) = target.strip_prefix("peer:") {
         let (resolved, certs) = resolve_peer(name, certs)?;
-        return connect_mount_quic(&resolved, &certs);
+        return connect_mount_quic(&resolved, &certs, flag);
     }
     if is_quic(target) {
-        connect_mount_quic(target, certs)
+        connect_mount_quic(target, certs, flag)
     } else {
-        connect_mount_ipc(target, kind)
+        connect_mount_ipc(target, kind, flag)
+    }
+}
+
+/// The flag spelling of a mount kind (a `mount =` config line uses the same
+/// word without the dashes).
+#[cfg(feature = "embedded")]
+fn mount_flag(kind: ikigai_embedded::MountKind) -> &'static str {
+    match kind {
+        ikigai_embedded::MountKind::Alias => "--mount",
+        ikigai_embedded::MountKind::Override => "--override",
+        ikigai_embedded::MountKind::Prefer => "--prefer",
     }
 }
 
@@ -1434,12 +1448,13 @@ fn quic_idle_timeout() -> std::time::Duration {
 fn connect_mount_quic(
     target: &str,
     certs: &Certs,
+    flag: &'static str,
 ) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
     let addr = quic::parse_addr(target)?;
     let identity = quic::client_identity(certs)?;
     let trusted = quic::trusted_server_cert(certs)?;
     let resolver = ikigai_quic::connect_with(addr, &identity, &trusted, quic_idle_timeout())
-        .map_err(|e| format!("--mount: connect {target}: {e}"))?;
+        .map_err(|e| format!("{flag}: connect {target}: {e}"))?;
     Ok(std::sync::Arc::new(resolver))
 }
 
@@ -1447,14 +1462,18 @@ fn connect_mount_quic(
 fn connect_mount_quic(
     _target: &str,
     _certs: &Certs,
+    flag: &'static str,
 ) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
-    Err("--mount of a quic:// target needs the `quic` feature".to_string())
+    Err(format!(
+        "{flag} of a quic:// target needs the `quic` feature"
+    ))
 }
 
 #[cfg(all(feature = "embedded", feature = "ipc"))]
 fn connect_mount_ipc(
     socket: &str,
     kind: ikigai_embedded::MountKind,
+    flag: &'static str,
 ) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
     // The hello declares how this mount will address the peer, so a
     // prefix-canonical peer (ikigai-python) lists its entries in the form the
@@ -1465,7 +1484,7 @@ fn connect_mount_ipc(
         _ => ikigai_ipc::HelloMode::Verbatim,
     };
     let resolver = ikigai_ipc::connect_as(std::path::Path::new(socket), mode)
-        .map_err(|e| format!("--mount: connect {socket}: {e}"))?;
+        .map_err(|e| format!("{flag}: connect {socket}: {e}"))?;
     Ok(std::sync::Arc::new(resolver))
 }
 
@@ -1473,8 +1492,11 @@ fn connect_mount_ipc(
 fn connect_mount_ipc(
     _socket: &str,
     _kind: ikigai_embedded::MountKind,
+    flag: &'static str,
 ) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
-    Err("--mount of a Unix socket needs the `ipc` feature (Unix only)".to_string())
+    Err(format!(
+        "{flag} of a Unix socket needs the `ipc` feature (Unix only)"
+    ))
 }
 
 /// Drive the engine: one-shot `-c`, else the full-screen TUI on a terminal, else
@@ -1582,12 +1604,50 @@ fn cert_add_client(_name: &str, _cert_dir: Option<String>, _force: bool) -> ! {
 // --- QUIC serve / connect ---------------------------------------------------
 
 #[cfg(all(feature = "embedded", feature = "quic"))]
-fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool) -> ! {
+fn serve_quic(
+    target: &str,
+    certs: &Certs,
+    caps: &[String],
+    announce: bool,
+    mounts: Vec<Mount>,
+) -> ! {
     let caps = caps.to_vec();
     let result = (|| -> Result<(), String> {
         let addr = quic::parse_addr(target)?;
         let identity = quic::server_identity(certs)?;
         let trusted = quic::trusted_client_certs(certs)?;
+        // Flags are POSTURE and win wholesale when given; otherwise the machine's own
+        // topology from the config home — the same rule as every kernel-building mode.
+        let mounts = mounts_or_config(mounts)?;
+        // SELF-MOUNT GUARD, the QUIC face of serve_ipc's: the config home is shared by
+        // every process on the machine, so the very lines that point OTHER processes at
+        // this server (`mount = "prefer urn:repo:=quic://plasma:4433"`) are also read by
+        // the serving process itself. A mount that dials our own bind address would
+        // resolve through ourselves — skip it, one warning each, rather than dial.
+        let announced = announce.then(ikigai_embedded::instance_name);
+        let mounts: Vec<Mount> = mounts
+            .into_iter()
+            .filter(|mount| {
+                let own = is_own_quic_addr(&mount.target, addr, announced);
+                if own {
+                    eprintln!(
+                        "ikigai: mount `{}={}` targets this process's own serve address — \
+                         skipped (this instance IS the server; that line is for the other \
+                         processes on this machine)",
+                        mount.prefix, mount.target
+                    );
+                }
+                !own
+            })
+            .collect();
+        // Connect the mounts BEFORE announcing readiness, exactly as serve_ipc does: a
+        // host that says it is serving and then cannot reach the peer it was told to
+        // compose is worse than one that refuses to start. (`--prefer` is exempt — its
+        // peer being absent is normal, and it dials on demand.)
+        let mut resolved = Vec::new();
+        for mount in mounts {
+            resolved.push(resolve_mount(mount)?);
+        }
         // Capability-on-the-wire: every connection's ceiling is minted per-connection
         // from *which* certificate authenticated. The cert IS the credential — the
         // same identity→capability move as the browser passkey, over mTLS — and the
@@ -1642,7 +1702,12 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool) -> !
             // servable, still bounded by require_net to the granted provider hosts.
             llm: caps.iter().any(|c| c.starts_with("urn:cap:net:")),
         };
-        let kernel = ikigai_embedded::served_kernel("Remote (QUIC)", surface);
+        let mounted = if resolved.is_empty() {
+            String::new()
+        } else {
+            format!("; {} mount(s)", resolved.len())
+        };
+        let kernel = ikigai_embedded::served_kernel_with_mounts("Remote (QUIC)", surface, resolved);
         let signed_door = ikigai_embedded::code_signers_configured();
         let mut faces = vec![if surface.personal {
             "calendar-only"
@@ -1660,7 +1725,7 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool) -> !
         }
         let surface = faces.join(" + ");
         eprintln!(
-            "ikigai: serving on {target}  ({posture}; surface: {surface}; {} trusted client cert(s))  (Ctrl-C to stop)",
+            "ikigai: serving on {target}  ({posture}; surface: {surface}; {} trusted client cert(s){mounted})  (Ctrl-C to stop)",
             trusted.len()
         );
         // Announce on the local network, so a client can mount this kernel by NAME rather
@@ -1735,7 +1800,13 @@ fn connect_quic(target: &str, certs: &Certs) -> Result<Engine, String> {
 }
 
 #[cfg(all(feature = "embedded", not(feature = "quic")))]
-fn serve_quic(_target: &str, _certs: &Certs, _caps: &[String], _announce: bool) -> ! {
+fn serve_quic(
+    _target: &str,
+    _certs: &Certs,
+    _caps: &[String],
+    _announce: bool,
+    _mounts: Vec<Mount>,
+) -> ! {
     eprintln!("ikigai: `quic://` needs the `quic` feature");
     std::process::exit(1);
 }
@@ -1750,6 +1821,14 @@ fn connect_quic(_target: &str, _certs: &Certs) -> Result<Engine, String> {
 #[cfg(all(feature = "embedded", feature = "ipc", unix))]
 fn serve_ipc(path: Option<String>, mounts: Vec<Mount>) -> ! {
     let socket = ipc_socket(path);
+    // PRE-FLIGHT the sockaddr_un limit: the bind happens LAST — after the mounts
+    // dial and after the kernel opens the browse store, taking its exclusive
+    // lock — so without this check a too-long path surfaced the OS's
+    // "path must be shorter than SUN_LEN" only after all of that work.
+    if let Some(e) = socket_path_error(&socket) {
+        eprintln!("ikigai: {e}");
+        std::process::exit(2);
+    }
     // Flags are POSTURE and win wholesale when given; otherwise the machine's own topology
     // from the config home. Wholesale rather than merged, because a half-and-half mount set
     // is the kind of thing nobody can debug at 2am.
@@ -1791,11 +1870,10 @@ fn serve_ipc(path: Option<String>, mounts: Vec<Mount>) -> ! {
     // on demand.)
     let mut resolved = Vec::new();
     for mount in mounts {
-        let target = mount.target.clone();
         match resolve_mount(mount) {
             Ok(spec) => resolved.push(spec),
             Err(e) => {
-                eprintln!("ikigai: --mount {target}: {e}");
+                eprintln!("ikigai: {e}");
                 std::process::exit(2);
             }
         }
@@ -1835,6 +1913,34 @@ fn connect_ipc(path: Option<String>) -> Result<Engine, String> {
     Ok(with_profiles(Engine::new(resolver)))
 }
 
+/// True when a mount target dials this process's own QUIC bind address — the
+/// QUIC face of [`is_own_socket`].
+///
+/// Own means: a `quic://` target resolving to the bind address itself, or — when
+/// the bind is a wildcard (`0.0.0.0`/`::`), which holds every address this
+/// machine does — to a loopback or to an address this machine can BIND (the only
+/// local-address oracle std offers). A `peer:` target is own only when this
+/// server is itself announcing under that name. An unresolvable target is NOT
+/// own — err on the side of mounting; the dial will say what is wrong.
+#[cfg(all(feature = "embedded", feature = "quic"))]
+fn is_own_quic_addr(target: &str, bind: std::net::SocketAddr, announced: Option<&str>) -> bool {
+    if let Some(name) = target.strip_prefix("peer:") {
+        return announced == Some(name);
+    }
+    if !is_quic(target) {
+        return false; // a Unix-socket peer is never this QUIC server
+    }
+    let Ok(addr) = quic::parse_addr(target) else {
+        return false;
+    };
+    if addr.port() != bind.port() {
+        return false;
+    }
+    addr.ip() == bind.ip()
+        || (bind.ip().is_unspecified()
+            && (addr.ip().is_loopback() || std::net::UdpSocket::bind((addr.ip(), 0)).is_ok()))
+}
+
 /// True when an IPC mount target names this process's own serve socket.
 ///
 /// A QUIC or mDNS target is never "own" here — this guard runs in the IPC
@@ -1850,6 +1956,28 @@ fn is_own_socket(target: &str, socket: &std::path::Path) -> bool {
     }
     let absolute = |p: std::path::PathBuf| std::path::absolute(&p).unwrap_or(p);
     absolute(std::path::PathBuf::from(shellexpand_home(target))) == absolute(socket.to_path_buf())
+}
+
+/// What `sockaddr_un`'s `sun_path` holds on this platform: 104 bytes on
+/// macOS/the BSDs, 108 on Linux. The bind errors when the path's byte length
+/// reaches it (one byte is the terminating NUL).
+#[cfg(all(feature = "embedded", feature = "ipc", unix))]
+const SUN_PATH_CAPACITY: usize = if cfg!(target_os = "linux") { 108 } else { 104 };
+
+/// Why `socket` cannot be bound as a Unix socket, if it cannot be — the
+/// pre-flight for a limit the OS would otherwise report only at bind time.
+#[cfg(all(feature = "embedded", feature = "ipc", unix))]
+fn socket_path_error(socket: &std::path::Path) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
+    let len = socket.as_os_str().as_bytes().len();
+    (len >= SUN_PATH_CAPACITY).then(|| {
+        format!(
+            "socket path is {len} bytes, but a Unix socket path fits {} on this \
+             platform — serve at a shorter path: {}",
+            SUN_PATH_CAPACITY - 1,
+            socket.display()
+        )
+    })
 }
 
 /// Resolve an explicit Unix socket path, or the secure default, exiting if
@@ -2295,5 +2423,95 @@ mod own_socket_tests {
         let home = std::env::var("HOME").expect("HOME set in test env");
         let socket = std::path::PathBuf::from(home).join(".ikigai-test.sock");
         assert!(is_own_socket("~/.ikigai-test.sock", &socket));
+    }
+}
+
+#[cfg(all(test, feature = "embedded", feature = "quic"))]
+mod own_quic_addr_tests {
+    use super::is_own_quic_addr;
+
+    /// The QUIC face of the self-mount guard: the config home is machine-shared,
+    /// so a QUIC-serving process reads the very lines that point everyone else
+    /// at its own address — those must read as "own", while a different port, a
+    /// Unix-socket peer, or another machine must not.
+    #[test]
+    fn own_quic_address_is_detected() {
+        let wildcard: std::net::SocketAddr = "0.0.0.0:4433".parse().unwrap();
+        // A wildcard bind holds every address this machine does, loopback included.
+        assert!(is_own_quic_addr("quic://127.0.0.1:4433", wildcard, None));
+        // Another port is another server, even on this machine.
+        assert!(!is_own_quic_addr("quic://127.0.0.1:4434", wildcard, None));
+        // A Unix-socket peer is never this QUIC server.
+        assert!(!is_own_quic_addr("/tmp/ikigai.sock", wildcard, None));
+        // A specific bind matches exactly itself.
+        let specific: std::net::SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        assert!(is_own_quic_addr("quic://127.0.0.1:4433", specific, None));
+    }
+
+    /// A `peer:` target is own only when this server is itself announcing under
+    /// that name — a non-announcing server is not discoverable, so the name
+    /// cannot be it (err on the side of mounting).
+    #[test]
+    fn a_peer_target_is_own_only_under_our_announced_name() {
+        let bind: std::net::SocketAddr = "0.0.0.0:4433".parse().unwrap();
+        assert!(!is_own_quic_addr("peer:plasma", bind, None));
+        assert!(is_own_quic_addr("peer:plasma", bind, Some("plasma")));
+        assert!(!is_own_quic_addr("peer:bug", bind, Some("plasma")));
+    }
+}
+
+#[cfg(all(test, feature = "embedded", feature = "ipc", unix))]
+mod socket_preflight_tests {
+    use super::{socket_path_error, SUN_PATH_CAPACITY};
+
+    /// The bind used to be the LAST thing `serve_ipc` did — after the mounts
+    /// dialed and the browse store took its exclusive lock — so a too-long path
+    /// failed with the OS's "path must be shorter than SUN_LEN" only after all
+    /// that work. The pre-flight mirrors the bind's exact boundary: a path of
+    /// `sun_path`-capacity bytes fails (one byte is the NUL), one byte under fits.
+    #[test]
+    fn the_preflight_mirrors_the_binds_length_boundary() {
+        let of_len = |n: usize| std::path::PathBuf::from(format!("/{}", "x".repeat(n - 1)));
+        assert!(socket_path_error(&of_len(SUN_PATH_CAPACITY - 1)).is_none());
+        let e = socket_path_error(&of_len(SUN_PATH_CAPACITY)).expect("over the sun_path capacity");
+        assert!(e.contains("shorter path"), "{e}");
+        assert!(socket_path_error(std::path::Path::new("/tmp/ikigai.sock")).is_none());
+    }
+}
+
+#[cfg(all(test, feature = "embedded", feature = "ipc", unix))]
+mod mount_flag_tests {
+    use super::*;
+
+    /// A down prefer-mount peer used to surface at first use as `--mount:
+    /// connect …` — a flag the operator never typed. The connect error now names
+    /// the mount's own spelling, through the lazy resolver and eagerly alike.
+    #[test]
+    fn a_down_prefer_peer_says_prefer_not_mount() {
+        let absent = "/tmp/ikigai-test-absent-peer.sock";
+        let spec = resolve_mount(Mount {
+            prefix: "urn:repo:".to_string(),
+            target: absent.to_string(),
+            certs: Certs::default(),
+            kind: ikigai_embedded::MountKind::Prefer,
+        })
+        .expect("a prefer mount resolves lazily");
+        // First use dials — and the failure names --prefer.
+        let err = spec
+            .resolver
+            .issue(ikigai_core::Request::new(
+                ikigai_core::Verb::Source,
+                ikigai_core::Iri::parse("urn:repo:x").expect("static IRI"),
+            ))
+            .expect_err("nothing listens at the absent socket")
+            .to_string();
+        assert!(err.contains("--prefer: connect"), "{err}");
+        assert!(!err.contains("--mount:"), "{err}");
+        // The eager kinds keep their own spellings.
+        let Err(err) = connect_mount(absent, &Certs::default(), ikigai_embedded::MountKind::Alias)
+        else {
+            panic!("nothing listens at the absent socket");
+        };
+        assert!(err.contains("--mount: connect"), "{err}");
     }
 }
