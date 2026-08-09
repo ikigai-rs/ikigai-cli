@@ -17,9 +17,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use futures::executor::block_on;
 use ikigai_core::{
-    ArgRef, Bindings, Capability, Description, Endpoint, Error, Expiry, Invocation, Kernel,
-    Provenance, Representation, Request, Resolution, Resolved, Scope, Space, SpaceEntry,
-    TraceEvent, Tracer, Verb,
+    ArgRef, Bindings, Capability, Description, Endpoint, Error, Expiry, Grammar, Invocation, Iri,
+    Kernel, Provenance, Representation, Request, Resolution, Resolved, Scope, Space, SpaceEntry,
+    TraceEvent, Tracer, UriTemplate, Verb,
 };
 use serde::{Deserialize, Serialize};
 
@@ -93,6 +93,78 @@ pub fn scoped_entries(kernel: &Kernel, capability: &Capability) -> Vec<SpaceEntr
         .collect()
 }
 
+/// Maps an outgoing target to the *remote* endpoint's declared name, from the
+/// last-enumerated remote catalog.
+///
+/// The name matters to exactly one caller: the kernel's `entries → Meta → describe`
+/// walk probe-expands a template entry (`urn:file:{path}` → `urn:file:probe`) and
+/// keeps the hit only if the resolved endpoint's name matches the entry's — the
+/// shadow guard ("better invisible than misdescribed"). A forwarding endpoint
+/// flatly named `"remote"` failed that guard for EVERY remote template entry, so
+/// mounted template actions vanished from the local catalog, manifold, and MCP
+/// projection while exact remote entries projected fine.
+///
+/// The cache fills from `entries()` — every catalog/manifold walk enumerates
+/// before it probes — and is only ever *read* on the resolve path, so resolution
+/// never pays a wire round-trip for a name. An unmatched or never-enumerated
+/// target falls back to `"remote"`, which restores the old behavior (and the old
+/// invisibility) rather than guessing.
+struct RemoteNames {
+    patterns: Mutex<Vec<(NamePattern, String)>>,
+}
+
+/// One remote catalog row's pattern, pre-parsed for matching.
+enum NamePattern {
+    /// An exact IRI: matched by string equality.
+    Exact(String),
+    /// A URI-template pattern: matched by template expansion.
+    Template(UriTemplate),
+}
+
+impl RemoteNames {
+    fn new() -> Self {
+        RemoteNames {
+            patterns: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Rebuild from the remote's just-fetched catalog. Entries keep the remote's
+    /// own namespace (pre-aliasing): the lookup happens on the *forwarded* target,
+    /// which is in that namespace in every mount mode. Unparseable patterns
+    /// (display sugar like `urn:x[:{y}]`) are skipped — they can't match a probe
+    /// IRI anyway.
+    fn refresh(&self, entries: &[SpaceEntry]) {
+        let patterns = entries
+            .iter()
+            .filter_map(|entry| {
+                let pattern = if Iri::parse(&entry.pattern).is_ok() {
+                    NamePattern::Exact(entry.pattern.clone())
+                } else {
+                    NamePattern::Template(UriTemplate::parse(&entry.pattern).ok()?)
+                };
+                Some((pattern, entry.endpoint.clone()))
+            })
+            .collect();
+        *self.patterns.lock().expect("remote names") = patterns;
+    }
+
+    /// The remote endpoint name `target` would land on — first matching catalog
+    /// row wins, mirroring the remote's own first-match-wins resolution.
+    fn name_for(&self, target: &Iri) -> Option<String> {
+        self.patterns
+            .lock()
+            .ok()?
+            .iter()
+            .find_map(|(pattern, endpoint)| {
+                let matched = match pattern {
+                    NamePattern::Exact(iri) => iri == target.as_str(),
+                    NamePattern::Template(template) => template.match_iri(target).is_some(),
+                };
+                matched.then(|| endpoint.clone())
+            })
+    }
+}
+
 /// A [`Space`] that resolves every request under its mount into a *remote* kernel:
 /// it wraps a [`Resolver`] (an IPC or QUIC client) and, on resolve, yields a
 /// forwarding endpoint that round-trips the request over the wire on invoke. This
@@ -102,12 +174,16 @@ pub fn scoped_entries(kernel: &Kernel, capability: &Capability) -> Vec<SpaceEntr
 /// comes back as an error on invoke, not a resolution miss.
 pub struct RemoteSpace {
     resolver: Arc<dyn Resolver>,
+    names: RemoteNames,
 }
 
 impl RemoteSpace {
     /// Wrap a connected [`Resolver`] as a mountable space.
     pub fn new(resolver: Arc<dyn Resolver>) -> Self {
-        RemoteSpace { resolver }
+        RemoteSpace {
+            resolver,
+            names: RemoteNames::new(),
+        }
     }
 }
 
@@ -118,6 +194,7 @@ impl Space for RemoteSpace {
         Resolution::Hit(Resolved {
             endpoint: Arc::new(ForwardingEndpoint {
                 resolver: Arc::clone(&self.resolver),
+                name: self.names.name_for(&request.target),
                 request: request.clone(),
             }),
             bindings: Bindings::new(),
@@ -125,8 +202,11 @@ impl Space for RemoteSpace {
     }
 
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
-        // Forward the remote's catalog (a round-trip — off the hot path).
-        self.resolver.entries()
+        // Forward the remote's catalog (a round-trip — off the hot path), keeping
+        // the name map current so template probes resolve under the real names.
+        let entries = self.resolver.entries()?;
+        self.names.refresh(&entries);
+        Some(entries)
     }
 }
 
@@ -136,6 +216,12 @@ impl Space for RemoteSpace {
 struct ForwardingEndpoint {
     resolver: Arc<dyn Resolver>,
     request: Request,
+    /// The remote endpoint's declared name for this target, when the mount's
+    /// last-enumerated catalog names it (see [`RemoteNames`]) — the kernel's
+    /// template-probe guard compares this against the catalog entry, so it must
+    /// be the REMOTE's name, not a transport label. `None` falls back to
+    /// `"remote"`.
+    name: Option<String>,
 }
 
 #[async_trait]
@@ -165,7 +251,7 @@ impl Endpoint for ForwardingEndpoint {
     }
 
     fn name(&self) -> &str {
-        "remote"
+        self.name.as_deref().unwrap_or("remote")
     }
 
     fn describe(&self) -> Description {
@@ -194,6 +280,7 @@ pub struct MountedRemote {
     prefix: String,
     origin: String,
     mode: MountMode,
+    names: RemoteNames,
 }
 
 /// How a mount relates the local namespace to the remote one.
@@ -225,6 +312,7 @@ impl MountedRemote {
             prefix: prefix.into(),
             origin: origin.into(),
             mode: MountMode::Alias,
+            names: RemoteNames::new(),
         }
     }
 
@@ -241,6 +329,7 @@ impl MountedRemote {
             prefix: prefix.into(),
             origin: origin.into(),
             mode: MountMode::Override,
+            names: RemoteNames::new(),
         }
     }
 }
@@ -260,10 +349,12 @@ impl Space for MountedRemote {
             forwarded.target = target;
         }
         // An OVERRIDE forwards the IRI verbatim — the remote serves this very
-        // namespace, so there is nothing to rewrite.
+        // namespace, so there is nothing to rewrite. The name lookup happens on
+        // the FORWARDED target, which is in the remote's namespace either way.
         Resolution::Hit(Resolved {
             endpoint: Arc::new(ForwardingEndpoint {
                 resolver: Arc::clone(&self.resolver),
+                name: self.names.name_for(&forwarded.target),
                 request: forwarded,
             }),
             bindings: Bindings::new(),
@@ -272,6 +363,8 @@ impl Space for MountedRemote {
 
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
         let entries = self.resolver.entries()?;
+        // Keep the name map current so template probes resolve under real names.
+        self.names.refresh(&entries);
         match self.mode {
             // Surface the remote's catalog under the alias, tagged with its origin.
             MountMode::Alias => Some(
@@ -626,6 +719,141 @@ mod tests {
                     .collect(),
             )
         }
+    }
+
+    /// A remote kernel with one exact and one template binding, faked at the
+    /// resolver seam: `entries` is its (already capability-scoped) wire catalog,
+    /// and a Meta issue answers with the endpoint's JSON description — what the
+    /// real wire's Meta face returns.
+    struct FakeRemote {
+        entries: Vec<SpaceEntry>,
+        description: Description,
+    }
+
+    impl Resolver for FakeRemote {
+        fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), Error> {
+            let bytes = if request.verb == Verb::Meta {
+                serde_json::to_vec(&self.description).expect("description serializes")
+            } else {
+                b"ok".to_vec()
+            };
+            Ok((
+                Representation::new(ReprType::new("application/json"), bytes),
+                CacheStatus::Uncacheable,
+            ))
+        }
+
+        fn is_cached(&self, _request: &Request, _capability: &Capability) -> bool {
+            false
+        }
+
+        fn entries(&self) -> Option<Vec<SpaceEntry>> {
+            Some(self.entries.clone())
+        }
+    }
+
+    fn fake_remote() -> Arc<FakeRemote> {
+        Arc::new(FakeRemote {
+            entries: vec![
+                SpaceEntry::new("urn:status", "status"),
+                SpaceEntry::new("urn:file:{path}", "file"),
+            ],
+            description: Description::new("file")
+                .verb(Verb::Source)
+                .input(ikigai_core::ArgSpec::new("path").binding()),
+        })
+    }
+
+    /// The regression this crate owns: a REMOTE template entry must survive the
+    /// kernel's probe guard. `describe_entry` probe-expands `urn:remote:file:{path}`
+    /// to `urn:remote:file:probe` and discards the hit unless the resolved
+    /// endpoint's name matches the entry's — and the forwarding endpoint used to be
+    /// flatly named `"remote"`, so every mounted template action vanished from the
+    /// manifold/MCP projection while exact entries projected fine.
+    #[test]
+    fn a_mounted_template_entry_survives_the_probe_guard() {
+        let mounted = MountedRemote::new(fake_remote(), "urn:remote:", "test://peer");
+        let kernel = Kernel::new(Arc::new(mounted));
+        let entries = scoped_entries(&kernel, &Capability::root());
+        assert!(
+            entries.iter().any(|e| e.pattern == "urn:remote:status"),
+            "the exact remote entry is in the manifold"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.pattern == "urn:remote:file:{path}"),
+            "the TEMPLATE remote entry is in the manifold: the probe resolves to a \
+             forwarding endpoint named `file` (from the wire catalog), not `remote`; \
+             got {entries:?}"
+        );
+    }
+
+    /// Same through an OVERRIDE mount (the `--override`/`--prefer` shape): the IRI
+    /// is forwarded unchanged, and the name lookup matches the remote's own
+    /// namespace patterns.
+    #[test]
+    fn an_overriding_mounts_template_entry_survives_the_probe_guard() {
+        let mounted = MountedRemote::overriding(fake_remote(), "urn:file:", "test://peer");
+        let kernel = Kernel::new(Arc::new(mounted));
+        let entries = scoped_entries(&kernel, &Capability::root());
+        assert!(
+            entries.iter().any(|e| e.pattern == "urn:file:{path}"),
+            "the overridden template entry is in the manifold; got {entries:?}"
+        );
+    }
+
+    /// The guard's shadow-detection must stay intact: when a LOCAL binding wins the
+    /// probe IRI (alias mounts are tried after local), the probe resolves to the
+    /// local endpoint, its name mismatches the remote entry's, and the row is
+    /// discarded — better invisible than misdescribed.
+    #[test]
+    fn a_shadowed_remote_template_entry_is_still_discarded() {
+        let shadow = EndpointSpace::new().bind(
+            Exact::new("urn:remote:file:probe"),
+            FnEndpoint::new("shadow", |_inv| {
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    b"shadow".to_vec(),
+                ))
+            })
+            .with_description(Description::new("shadow").verb(Verb::Source)),
+        );
+        let mounted = MountedRemote::new(fake_remote(), "urn:remote:", "test://peer");
+        let root = ikigai_core::Fallback::new(vec![
+            Arc::new(shadow) as Arc<dyn Space>,
+            Arc::new(mounted) as Arc<dyn Space>,
+        ]);
+        let kernel = Kernel::new(Arc::new(root));
+        let entries = scoped_entries(&kernel, &Capability::root());
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.pattern == "urn:remote:file:{path}"),
+            "a locally-shadowed probe IRI still discards the remote template row"
+        );
+    }
+
+    /// Off the catalog walk (nothing enumerated yet), the forwarding endpoint keeps
+    /// its transport fallback name — the name map only fills from `entries()`, never
+    /// with a wire round-trip on the resolve path.
+    #[test]
+    fn an_unenumerated_target_falls_back_to_the_transport_name() {
+        let mounted = MountedRemote::new(fake_remote(), "urn:remote:", "test://peer");
+        let request = Request::new(
+            Verb::Source,
+            ikigai_core::Iri::parse("urn:remote:status").unwrap(),
+        );
+        let Resolution::Hit(resolved) = mounted.resolve(&request, &Scope::empty()) else {
+            panic!("a mounted remote always hits under its prefix");
+        };
+        assert_eq!(resolved.endpoint.name(), "remote");
+        // After one enumeration, the same resolve carries the remote's real name.
+        let _ = mounted.entries();
+        let Resolution::Hit(resolved) = mounted.resolve(&request, &Scope::empty()) else {
+            panic!("a mounted remote always hits under its prefix");
+        };
+        assert_eq!(resolved.endpoint.name(), "status");
     }
 
     /// The wire catalog is rebuilt from the action manifold, but a mounted
