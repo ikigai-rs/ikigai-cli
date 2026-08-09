@@ -68,36 +68,48 @@ fn tools_list(kernel: &Kernel, capability: &Capability, filter: &ToolFilter) -> 
         capability: Some(capability),
         ..Default::default()
     };
-    let mut tools = Vec::new();
-    // A federated kernel lists a mounted namespace TWICE — the fronted mount's
-    // catalog and the local space both carry `urn:llm:ask` under an `--override`/
-    // `--prefer` — but resolution serves exactly one (the mount, by precedence).
-    // The projection must offer exactly one tool per name: MCP clients key on the
-    // name, and a duplicate is at best confusing, at worst rejected. Keep the
-    // FIRST occurrence in `select_actions` order — `tools_call` re-selects the
-    // same way, so the tool shown is the action a call reaches.
-    let mut seen = std::collections::BTreeSet::new();
+    // Group the manifold rows by projected tool name: MCP clients key on the
+    // name, so same-named rows — a namespace listed by both a fronted mount and
+    // the local space (`--override`/`--prefer`), or one endpoint bound once per
+    // configured root (browse) — must collapse to ONE tool without losing
+    // reach. Identical patterns collapse by precedence (resolution serves the
+    // first); patterns that differ come back as synthesized selector arguments
+    // in the input schema (see [`crate::collapse`]), so every row stays
+    // addressable by call.
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: std::collections::BTreeMap<String, Vec<ikigai_core::ActionMatch>> =
+        std::collections::BTreeMap::new();
     for m in kernel.select_actions(&query) {
-        // `m.endpoint` may be an exact IRI or a URI-template pattern
+        let name = crate::tool_name(&m.id, m.verb);
+        if !groups.contains_key(&name) {
+            order.push(name.clone());
+        }
+        groups.entry(name).or_default().push(m);
+    }
+    let mut tools = Vec::new();
+    for name in order {
+        if !filter.allows(&name) {
+            continue;
+        }
+        let rows = &groups[&name];
+        // `endpoint` may be an exact IRI or a URI-template pattern
         // (`urn:demo:echo/{message}`) — `describe_pattern` covers both, so
         // template-bound endpoints project as tools too.
-        let Some(description) = kernel.describe_pattern(&m.endpoint) else {
+        let Some(description) = kernel.describe_pattern(&rows[0].endpoint) else {
             continue;
         };
-        if let Some(action) = description
+        let Some(action) = description
             .action_specs()
             .into_iter()
-            .find(|a| a.verb == m.verb)
-        {
-            let tool = action_to_tool(&description, &action);
-            let shown = tool
-                .get("name")
-                .and_then(Value::as_str)
-                .is_some_and(|n| filter.allows(n) && seen.insert(n.to_string()));
-            if shown {
-                tools.push(tool);
-            }
-        }
+            .find(|a| a.verb == rows[0].verb)
+        else {
+            continue;
+        };
+        let mut tool = action_to_tool(&description, &action);
+        let patterns: Vec<String> = rows.iter().map(|m| m.endpoint.clone()).collect();
+        let declared: Vec<String> = action.inputs.iter().map(|i| i.name.clone()).collect();
+        crate::add_synthesized(&mut tool, &crate::collapse(&patterns, &declared));
+        tools.push(tool);
     }
     json!({ "tools": tools })
 }
@@ -127,21 +139,26 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
     };
     // Match on the sanitized id: `id` from the tool name is already in
     // `sanitize_id` form, so sanitize each candidate the same way (a URI-shaped
-    // id like `urn:llm:config` projects to `urn_llm_config`).
-    let Some(m) = kernel
+    // id like `urn:llm:config` projects to `urn_llm_config`). ALL matching rows
+    // are kept — one tool may front many bound rows (see [`crate::collapse`]).
+    let rows: Vec<ikigai_core::ActionMatch> = kernel
         .select_actions(&query)
         .into_iter()
-        .find(|m| crate::sanitize_id(&m.id) == id && m.verb == verb)
-    else {
+        .filter(|m| crate::sanitize_id(&m.id) == id && m.verb == verb)
+        .collect();
+    if rows.is_empty() {
         return tool_error(format!(
             "tool `{name}` is not available under this capability"
         ));
-    };
+    }
 
     // Exact IRI or URI-template pattern alike — the contract comes back either
     // way; the substituted target is IRI-checked below, after binding args land.
-    let Some(description) = kernel.describe_pattern(&m.endpoint) else {
-        return tool_error(format!("endpoint `{}` no longer resolves", m.endpoint));
+    let Some(description) = kernel.describe_pattern(&rows[0].endpoint) else {
+        return tool_error(format!(
+            "endpoint `{}` no longer resolves",
+            rows[0].endpoint
+        ));
     };
     let Some(action) = description
         .action_specs()
@@ -151,13 +168,43 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
         return tool_error(format!("`{id}` declares no {verb:?} action"));
     };
 
+    // Collapse the same-named rows exactly as `tools/list` projected them, then
+    // route this call to the single row its arguments select — the supplied
+    // binding arguments pick the calling shape (path present → the templated
+    // row, absent → the concrete one) and a synthesized selector value (`repo`)
+    // picks the row within it. An argument no row can absorb, or a selector
+    // value naming no row, is a loud error — never a silent drop.
+    let patterns: Vec<String> = rows.iter().map(|m| m.endpoint.clone()).collect();
+    let declared: Vec<String> = action.inputs.iter().map(|i| i.name.clone()).collect();
+    let shape = crate::collapse(&patterns, &declared);
+    let empty = serde_json::Map::new();
+    let args_map = arguments.as_object().unwrap_or(&empty);
+    let supplied: std::collections::BTreeSet<String> = action
+        .inputs
+        .iter()
+        .filter(|i| i.source == ikigai_core::InputSource::Binding)
+        .filter(|i| args_map.get(&i.name).and_then(crate::scalar).is_some())
+        .map(|i| i.name.clone())
+        .collect();
+    let mut target = match shape.route(name, &supplied, args_map) {
+        Ok(pattern) => pattern.to_string(),
+        Err(reason) => return tool_error(reason),
+    };
+    // The synthesized selector arguments were consumed by routing; the action's
+    // declared contract knows nothing of them, so validate the remainder.
+    let mut endpoint_arguments = arguments.clone();
+    if let Some(map) = endpoint_arguments.as_object_mut() {
+        for arg in &shape.synthesized {
+            map.remove(&arg.name);
+        }
+    }
+
     // Route each supplied argument: a Binding-source input substitutes into the
     // endpoint IRI template ({name} → value); an Argument-source input becomes a
     // request argument.
-    let mut target = m.endpoint.clone();
     let mut req_args: Vec<(String, String)> = Vec::new();
     for input in &action.inputs {
-        let Some(value) = arguments.get(&input.name).and_then(json_scalar) else {
+        let Some(value) = arguments.get(&input.name).and_then(crate::scalar) else {
             continue;
         };
         if input.source == ikigai_core::InputSource::Binding {
@@ -170,7 +217,7 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
     // (structured, so a value with a newline/& validates correctly). A
     // non-conforming call comes back as the SHACL report — data the model reads
     // and repairs from — without touching the endpoint.
-    if let Some(report) = crate::validate_arguments(&description, &action, &arguments) {
+    if let Some(report) = crate::validate_arguments(&description, &action, &endpoint_arguments) {
         return tool_error(format!("arguments failed validation:\n{report}"));
     }
 
@@ -185,17 +232,6 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
     match block_on(kernel.issue(request, capability)) {
         Ok(repr) => tool_text(String::from_utf8_lossy(&repr.bytes).into_owned()),
         Err(e) => tool_error(format!("{e}")),
-    }
-}
-
-/// A JSON scalar as the string the kernel expects (numbers/bools stringified;
-/// objects/arrays/null skipped).
-fn json_scalar(value: &Value) -> Option<String> {
-    match value {
-        Value::String(s) => Some(s.clone()),
-        Value::Bool(b) => Some(b.to_string()),
-        Value::Number(n) => Some(n.to_string()),
-        _ => None,
     }
 }
 
@@ -440,6 +476,182 @@ mod tests {
         .unwrap();
         assert_eq!(resp["result"]["isError"], false);
         assert_eq!(resp["result"]["content"][0]["text"], "echo: hi");
+    }
+
+    /// One endpoint bound once per configured root — the shape ikigai-browse's
+    /// per-root manifold rows produce: `urn:repo:<root>:tree` (concrete) beside
+    /// `urn:repo:<root>:tree:{path}` (templated), one pair per root. One tool
+    /// must front all four rows and keep each reachable by call. The endpoint
+    /// echoes its resolved target so a test can see which row a call reached.
+    fn per_root_kernel() -> Kernel {
+        use ikigai_core::{Endpoint, UriTemplate};
+        let tree: Arc<dyn Endpoint> = Arc::new(
+            FnEndpoint::new("tree", |inv| {
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    inv.request.target.as_str().as_bytes().to_vec(),
+                ))
+            })
+            .with_description(
+                Description::new("tree").verb(Verb::Source).input(
+                    ArgSpec::new("path")
+                        .binding()
+                        .optional()
+                        .summary("path within the root"),
+                ),
+            ),
+        );
+        let space = EndpointSpace::new()
+            .bind_arc(Exact::new("urn:repo:alpha:tree"), Arc::clone(&tree))
+            .bind_arc(
+                UriTemplate::parse("urn:repo:alpha:tree:{path}").unwrap(),
+                Arc::clone(&tree),
+            )
+            .bind_arc(Exact::new("urn:repo:beta:tree"), Arc::clone(&tree))
+            .bind_arc(
+                UriTemplate::parse("urn:repo:beta:tree:{path}").unwrap(),
+                tree,
+            );
+        Kernel::new(Arc::new(space))
+    }
+
+    #[test]
+    fn per_root_rows_collapse_to_one_tool_with_a_repo_enum() {
+        let k = per_root_kernel();
+        let cap = Capability::root();
+        let resp = handle(
+            &k,
+            &cap,
+            &ToolFilter::default(),
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .unwrap();
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        let trees: Vec<_> = tools
+            .iter()
+            .filter(|t| t["name"] == "tree__source")
+            .collect();
+        assert_eq!(trees.len(), 1, "one tool fronts every per-root row");
+        let schema = &trees[0]["inputSchema"];
+        // The collapsed root dimension comes back as a required enum argument…
+        assert_eq!(
+            schema["properties"]["repo"]["enum"],
+            json!(["alpha", "beta"])
+        );
+        assert!(schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("repo")));
+        // …beside the untouched declared contract.
+        assert_eq!(schema["properties"]["path"]["type"], "string");
+    }
+
+    #[test]
+    fn a_call_routes_to_the_row_its_arguments_select() {
+        let k = per_root_kernel();
+        let cap = Capability::root();
+        let call = |args: Value| {
+            handle(
+                &k,
+                &cap,
+                &ToolFilter::default(),
+                &json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params": { "name": "tree__source", "arguments": args }
+                }),
+            )
+            .unwrap()["result"]
+                .clone()
+        };
+        // repo alone → that root's concrete row.
+        let resp = call(json!({ "repo": "beta" }));
+        assert_eq!(resp["isError"], false);
+        assert_eq!(resp["content"][0]["text"], "urn:repo:beta:tree");
+        // repo + path → that root's templated row, path substituted.
+        let resp = call(json!({ "repo": "alpha", "path": "src" }));
+        assert_eq!(resp["isError"], false);
+        assert_eq!(resp["content"][0]["text"], "urn:repo:alpha:tree:src");
+        // An unknown repo is a loud error naming the bound values.
+        let resp = call(json!({ "repo": "gamma", "path": "src" }));
+        assert_eq!(resp["isError"], true);
+        let text = resp["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("not a bound `repo`") && text.contains("alpha, beta"),
+            "{text}"
+        );
+        // Omitting repo is a loud error too: several rows, no arbitrary winner.
+        for args in [json!({}), json!({ "path": "src" })] {
+            let resp = call(args);
+            assert_eq!(resp["isError"], true);
+            let text = resp["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("`repo` is required"), "{text}");
+        }
+    }
+
+    /// A declared optional binding whose rows have no `{var}` for it (the
+    /// browse state-family shape: concrete rows only) must error loudly when
+    /// supplied — the pre-collapse projection silently dropped the argument
+    /// and answered the wrong resource.
+    #[test]
+    fn a_binding_arg_no_row_absorbs_is_a_loud_error() {
+        use ikigai_core::Endpoint;
+        let state: Arc<dyn Endpoint> = Arc::new(
+            FnEndpoint::new("state", |inv| {
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    inv.request.target.as_str().as_bytes().to_vec(),
+                ))
+            })
+            .with_description(
+                Description::new("state")
+                    .verb(Verb::Source)
+                    .input(ArgSpec::new("path").binding().optional()),
+            ),
+        );
+        let space = EndpointSpace::new()
+            .bind_arc(Exact::new("urn:repo:alpha:state"), Arc::clone(&state))
+            .bind_arc(Exact::new("urn:repo:beta:state"), state);
+        let k = Kernel::new(Arc::new(space));
+        let cap = Capability::root();
+        let resp = handle(
+            &k,
+            &cap,
+            &ToolFilter::default(),
+            &json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params": { "name": "state__source",
+                            "arguments": { "repo": "alpha", "path": "src" } }
+            }),
+        )
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("no bound row"), "{text}");
+        assert!(text.contains("path"), "{text}");
+    }
+
+    /// A tool fronting exactly one row projects byte-identically to the plain
+    /// per-action projection — the collapse machinery only shows where rows
+    /// actually collapsed.
+    #[test]
+    fn a_single_row_tool_projects_byte_identically() {
+        let k = kernel();
+        let cap = Capability::scoped(["urn:cap:demo:echo"]);
+        let resp = handle(
+            &k,
+            &cap,
+            &ToolFilter::default(),
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .unwrap();
+        let tool = &resp["result"]["tools"][0];
+        let description = k.describe_pattern("urn:demo:echo").unwrap();
+        let action = description
+            .action_specs()
+            .into_iter()
+            .find(|a| a.verb == Verb::Source)
+            .unwrap();
+        assert_eq!(tool, &action_to_tool(&description, &action));
     }
 
     #[test]
