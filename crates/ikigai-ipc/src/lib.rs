@@ -96,6 +96,22 @@ pub fn connect_with(
     timeout: Option<Duration>,
     mode: HelloMode,
 ) -> io::Result<IpcResolver> {
+    let stream = handshake(path, timeout, mode)?;
+    Ok(IpcResolver {
+        path: path.to_path_buf(),
+        timeout,
+        mode,
+        stream: Mutex::new(Some(stream)),
+        tracer: Mutex::new(None),
+    })
+}
+
+/// Dial `path` and run the version-hello exchange, returning the established
+/// stream. This is the whole cost of a (re)connect, so a resolver that redials
+/// a broken connection renegotiates the hello too — the peer may have been
+/// upgraded across its bounce, and a redial that now speaks a different wire
+/// version must surface the normal version error, not a desynced hang.
+fn handshake(path: &Path, timeout: Option<Duration>, mode: HelloMode) -> io::Result<UnixStream> {
     let stream = dial(path, timeout)?;
     let mut writer = &stream;
     write_hello(
@@ -107,10 +123,7 @@ pub fn connect_with(
     )?;
     match read_frame(&mut &stream) {
         Ok(payload) => match decode_hello(&payload) {
-            Some(hello) if hello.version == PROTOCOL_VERSION => Ok(IpcResolver {
-                stream,
-                tracer: Mutex::new(None),
-            }),
+            Some(hello) if hello.version == PROTOCOL_VERSION => Ok(stream),
             Some(hello) => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -150,29 +163,170 @@ fn dial(path: &Path, timeout: Option<Duration>) -> io::Result<UnixStream> {
 }
 
 /// A [`Resolver`] backed by a kernel server over a Unix socket.
+///
+/// The connection **heals on use**: an ESTABLISHED connection that breaks —
+/// the server bounced under a long-running client (a daemon's standing mount,
+/// an interactive `--connect` session) — is dropped and redialed instead of
+/// failing every subsequent call forever (the 2026-08-09 incident: one dev-server
+/// restart turned every `urn:repo:*` forward into "unavailable: Broken pipe"
+/// until the daemon itself was restarted). The redial runs the full
+/// [`handshake`], hello included. What may be *replayed* on the fresh
+/// connection follows the Retry/Failover discipline — see [`replay_may_follow`].
 pub struct IpcResolver {
-    stream: UnixStream,
+    /// The server's socket path, kept so a broken connection can be redialed.
+    path: PathBuf,
+    /// The I/O deadline every (re)dial installs on its stream.
+    timeout: Option<Duration>,
+    /// The hello mode every (re)dial declares — a redialed alias mount must
+    /// re-present itself as one.
+    mode: HelloMode,
+    /// The live connection, or `None` after a dead-connection failure (the next
+    /// call redials). The mutex also serializes whole round-trips: the protocol
+    /// is strict request/reply on one stream, so two concurrent calls
+    /// interleaving frames would desync it.
+    stream: Mutex<Option<UnixStream>>,
     /// The tracer the `trace` command installs. When set, a resolution is sent as
     /// [`Call::IssueTraced`] and the server's returned spans are forwarded here —
     /// so a `--connect` trace shows the *remote* kernel's execution tree.
     tracer: Mutex<Option<Arc<dyn Tracer>>>,
 }
 
+/// Which half of a request/reply exchange failed. The distinction carries replay
+/// safety: a WRITE failure means the length-framed request was never fully
+/// written — the server reads frames with `read_exact` and cannot dispatch a
+/// partial one — so the request provably never executed. A READ failure is
+/// ambiguous: the request was fully written, and the server may have executed
+/// it with the reply lost in the break.
+enum Phase {
+    Write,
+    Read,
+}
+
+/// An [`exchange`] failure: the error, tagged with the [`Phase`] it struck.
+struct ExchangeFailed {
+    phase: Phase,
+    error: io::Error,
+}
+
+/// One request/reply exchange on an established stream.
+fn exchange(mut stream: &UnixStream, call: &Call) -> Result<Reply, ExchangeFailed> {
+    write_message(&mut stream, call).map_err(|error| ExchangeFailed {
+        phase: Phase::Write,
+        error,
+    })?;
+    read_message(&mut stream).map_err(|error| ExchangeFailed {
+        phase: Phase::Read,
+        error,
+    })
+}
+
+/// Whether `error` means the established connection is DEAD (peer gone), as
+/// opposed to busy or misbehaving:
+///
+/// - `BrokenPipe` — a write on a socket whose peer closed (EPIPE; what the
+///   long-running daemon saw forever after the dev server bounced).
+/// - `ConnectionReset` — the peer died with data in flight (ECONNRESET).
+/// - `UnexpectedEof` — a `read_exact` hit end-of-stream mid-conversation (the
+///   peer closed cleanly between our write and its reply).
+/// - `NotConnected` / `ConnectionAborted` — platform spellings of the same death.
+///
+/// Deliberately NOT `TimedOut`/`WouldBlock`: silence is a busy server, not a
+/// dead one (see [`DEFAULT_TIMEOUT`]) — redialing would abandon a resolution
+/// that is still running, and replaying would double it.
+fn is_dead_connection(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::ConnectionAborted
+    )
+}
+
+/// Whether `call` may be REPLAYED on a fresh connection after `phase` failed on
+/// a dead one. This follows the documented Retry/Failover replay discipline
+/// (ikigai-throttle): a mutating verb is never blindly re-sent — a replayed
+/// `Sink` could double-write, and a replayed `Delete` that already ran would
+/// misreport a success as not-found — with one addition the transport can
+/// prove: a WRITE-phase failure means the frame never fully reached the server
+/// (see [`Phase`]), so nothing executed and replaying any verb is safe. After a
+/// READ-phase failure only the read-only calls replay — `Source`/`Exists`/`Meta`
+/// issues and the `IsCached`/`Entries` probes; `Sink`/`Delete` surface the typed
+/// transient for the CALLER to retry (the connection still heals for the next
+/// request).
+fn replay_may_follow(phase: &Phase, call: &Call) -> bool {
+    if matches!(phase, Phase::Write) {
+        return true;
+    }
+    match call {
+        Call::IsCached(_) | Call::Entries => true,
+        Call::Issue(request) | Call::IssueAs(request, _) | Call::IssueTraced(request, _, _) => {
+            matches!(
+                request.verb,
+                ikigai_core::Verb::Source | ikigai_core::Verb::Exists | ikigai_core::Verb::Meta
+            )
+        }
+    }
+}
+
 impl IpcResolver {
-    /// Send a call and read its reply. `&UnixStream` is `Read + Write`, so the
-    /// shared `&self` can drive the socket without interior mutability.
+    /// Send a call and read its reply, healing a dead connection on use.
+    ///
+    /// A broken established connection is dropped and redialed (full
+    /// [`handshake`], fresh hello) — at most ONE redial per call. Whether this
+    /// call is then replayed on the fresh connection is [`replay_may_follow`]'s
+    /// verdict; when it must not replay, the dead connection is still cleared so
+    /// the NEXT call redials, and this one surfaces its error (a typed transient
+    /// via [`wire_error`]) for the caller to retry.
     fn round_trip(&self, call: Call) -> io::Result<Reply> {
-        let mut stream = &self.stream;
-        write_message(&mut stream, &call)?;
-        read_message(&mut stream)
+        let mut guard = self.stream.lock().expect("ipc stream lock");
+        let dialed_this_call = guard.is_none();
+        if guard.is_none() {
+            // A previous call found the connection dead: heal on use.
+            *guard = Some(handshake(&self.path, self.timeout, self.mode)?);
+        }
+        let stream = guard.as_ref().expect("stream just ensured");
+        let failed = match exchange(stream, &call) {
+            Ok(reply) => return Ok(reply),
+            Err(failed) => failed,
+        };
+        if !is_dead_connection(&failed.error) {
+            return Err(failed.error);
+        }
+        // The established connection is dead. Drop it FIRST, unconditionally,
+        // so the next call redials even when this one must not replay.
+        *guard = None;
+        if dialed_this_call || !replay_may_follow(&failed.phase, &call) {
+            return Err(failed.error);
+        }
+        // One redial + one replay; a second failure surfaces as-is.
+        let fresh = handshake(&self.path, self.timeout, self.mode)?;
+        match exchange(&fresh, &call) {
+            Ok(reply) => {
+                *guard = Some(fresh);
+                Ok(reply)
+            }
+            Err(second) => {
+                // Keep the fresh connection unless it too is dead.
+                if !is_dead_connection(&second.error) {
+                    *guard = Some(fresh);
+                }
+                Err(second.error)
+            }
+        }
     }
 }
 
 /// Classify a socket I/O error as a typed [`Error`] so the reliability overlays can
 /// act on it: a read/write deadline is a **transient** [`Timeout`](Error::Timeout),
-/// a refused/reset/broken connection a **transient** [`Unavailable`](Error::Unavailable)
-/// (the server is hung or gone — a Retry or Failover should move on); anything else
-/// is a generic endpoint error.
+/// a refused/reset/broken/EOF-mid-conversation connection a **transient**
+/// [`Unavailable`](Error::Unavailable) (the server is hung or gone — a Retry or
+/// Failover should move on); anything else is a generic endpoint error.
+/// `UnexpectedEof` belongs in the unavailable set: a server that closes between
+/// our write and its reply IS gone, and surfacing it as a generic endpoint error
+/// ("failed to fill whole buffer") would hide the one retryable failure a
+/// non-replayable Sink needs its caller to see.
 fn wire_error(e: io::Error) -> Error {
     match e.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => Error::Timeout(
@@ -180,7 +334,9 @@ fn wire_error(e: io::Error) -> Error {
         ),
         io::ErrorKind::ConnectionRefused
         | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted
         | io::ErrorKind::BrokenPipe
+        | io::ErrorKind::UnexpectedEof
         | io::ErrorKind::NotConnected => {
             Error::Unavailable(format!("the kernel server is unreachable: {e}"))
         }
@@ -443,9 +599,12 @@ fn peer_uid(stream: &UnixStream) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
-    use ikigai_core::{builtins, ArgRef, Capability, EndpointSpace, Exact, Iri, Verb};
+    use ikigai_core::{
+        builtins, ArgRef, Capability, EndpointSpace, Exact, FnEndpoint, Iri, ReprType, Verb,
+    };
 
     fn kernel() -> Kernel {
         Kernel::new(Arc::new(
@@ -875,6 +1034,297 @@ mod tests {
 
     fn iri_of(s: &str) -> Iri {
         Iri::parse(s).unwrap()
+    }
+
+    // --- reconnect-on-broken-connection (heal on use) -----------------------
+
+    /// Accept one connection, verify + count its hello, then serve until
+    /// `resolutions` REAL resolutions (non-Meta Issue calls) are answered and
+    /// hang up — a server instance whose LIFETIME the test controls, so a
+    /// bounce (serve some, die) is deterministic. Meta probes (a mount's
+    /// `describe()` forwards one per resolve) and the IsCached/Entries
+    /// bookkeeping ride free, so the bounce lands between the first answered
+    /// resolution and the next regardless of how many probes surround them.
+    fn serve_counting_hellos(
+        path: &Path,
+        kernel: Kernel,
+        hellos: Arc<AtomicUsize>,
+        resolutions: usize,
+    ) -> thread::JoinHandle<()> {
+        let _ = std::fs::remove_file(path);
+        let listener = UnixListener::bind(path).unwrap();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut s = &stream;
+            let payload = read_frame(&mut s).unwrap();
+            assert!(
+                decode_hello(&payload).is_some(),
+                "every (re)dial must open with a version hello"
+            );
+            hellos.fetch_add(1, Ordering::SeqCst);
+            write_hello(
+                &mut s,
+                &Hello {
+                    version: PROTOCOL_VERSION,
+                    mode: HelloMode::Verbatim,
+                },
+            )
+            .unwrap();
+            let mut served = 0;
+            while served < resolutions {
+                let call: Call = match read_message(&mut s) {
+                    Ok(call) => call,
+                    Err(_) => return, // EOF: the client hung up
+                };
+                let real = match &call {
+                    Call::Issue(request)
+                    | Call::IssueAs(request, _)
+                    | Call::IssueTraced(request, _, _) => request.verb != Verb::Meta,
+                    Call::IsCached(_) | Call::Entries => false,
+                };
+                if write_message(&mut s, &dispatch(&kernel, call)).is_err() {
+                    return;
+                }
+                if real {
+                    served += 1;
+                }
+            }
+            // Served its budget — hang up mid-session (the bounce).
+        })
+    }
+
+    /// A kernel whose `urn:demo:box` Sink counts its executions — shared memory
+    /// with the test (server threads are in-process), so the test can assert
+    /// exactly how many times a mutation actually ran across a break.
+    fn counting_sink_kernel(executed: Arc<AtomicUsize>) -> Kernel {
+        let sink = FnEndpoint::new("box", move |_inv| {
+            executed.fetch_add(1, Ordering::SeqCst);
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                b"stored".to_vec(),
+            ))
+        });
+        Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:demo:box"), sink),
+        ))
+    }
+
+    fn sink_box() -> Request {
+        Request::new(Verb::Sink, Iri::parse("urn:demo:box").unwrap())
+            .with_arg("content", ArgRef::Inline(b"x".to_vec()))
+    }
+
+    /// The incident (2026-08-09): an ESTABLISHED connection breaks under a
+    /// long-running client — the server bounced — and before this fix every
+    /// subsequent call failed with "Broken pipe" forever; a process restart was
+    /// the only cure. A Source must transparently heal: one redial, correct
+    /// answer, and the redial renegotiates the version hello (the peer may have
+    /// been upgraded across the bounce).
+    #[test]
+    fn a_source_heals_across_a_server_bounce_with_a_fresh_hello() {
+        let path = socket_path("heal-source");
+        let first_hellos = Arc::new(AtomicUsize::new(0));
+        let first = serve_counting_hellos(&path, kernel(), Arc::clone(&first_hellos), 1);
+
+        let client = connect(&path).unwrap();
+        assert_eq!(client.issue(upper("one")).unwrap().0.bytes, b"ONE");
+        // The server bounces: its one-resolution budget is spent and it hangs
+        // up, leaving the client holding a dead established connection.
+        first.join().unwrap();
+
+        let second_hellos = Arc::new(AtomicUsize::new(0));
+        let second = serve_counting_hellos(&path, kernel(), Arc::clone(&second_hellos), usize::MAX);
+        let (representation, _) = client
+            .issue(upper("two"))
+            .expect("a broken established connection heals on use");
+        assert_eq!(representation.bytes, b"TWO");
+        assert_eq!(
+            second_hellos.load(Ordering::SeqCst),
+            1,
+            "the redial renegotiated the hello with the restarted server"
+        );
+        assert_eq!(first_hellos.load(Ordering::SeqCst), 1);
+
+        drop(client);
+        second.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The daemon's shape: a mounted remote (`MountedRemote` forwarding over
+    /// IPC) whose peer bounces. The next forwarded resolution must heal instead
+    /// of returning "unavailable: Broken pipe" forever.
+    #[test]
+    fn a_mounted_remote_heals_across_a_server_bounce() {
+        use ikigai_resolve::MountedRemote;
+
+        let path = socket_path("heal-mount");
+        let hellos = Arc::new(AtomicUsize::new(0));
+        let first = serve_counting_hellos(&path, kernel(), Arc::clone(&hellos), 1);
+
+        let client = connect(&path).unwrap();
+        // An override-style mount: IRIs forwarded unchanged (the prefer/override
+        // mount the personal daemon runs).
+        let mounted = MountedRemote::overriding(Arc::new(client), "urn:fn:", "test://dev.sock");
+        let local = Kernel::new(Arc::new(mounted));
+        let (representation, _) =
+            Resolver::issue_as(&local, upper("one"), &Capability::root()).unwrap();
+        assert_eq!(representation.bytes, b"ONE");
+        first.join().unwrap(); // the peer bounces
+
+        let second = serve_counting_hellos(&path, kernel(), Arc::clone(&hellos), usize::MAX);
+        let (representation, _) = Resolver::issue_as(&local, upper("two"), &Capability::root())
+            .expect("the standing mount heals on use after the peer bounced");
+        assert_eq!(representation.bytes, b"TWO");
+
+        drop(local);
+        second.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A Sink whose reply is lost is AMBIGUOUS — the server read the full
+    /// request and may have executed it — so it must NOT be silently replayed
+    /// (a replay could double-write): the caller gets a typed transient to
+    /// retry, and the connection still heals for the following request.
+    ///
+    /// The replacement server instance is listening BEFORE the break surfaces,
+    /// so a buggy silent replay would reach it and be caught — the assertion is
+    /// sharp, not saved by an accidental connect failure.
+    #[test]
+    fn a_sink_across_a_break_is_a_typed_transient_never_a_silent_replay() {
+        let path = socket_path("heal-sink");
+        let executed = Arc::new(AtomicUsize::new(0));
+        let kernel = counting_sink_kernel(Arc::clone(&executed));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = {
+            let path = path.clone();
+            thread::spawn(move || {
+                // First instance: hello, read ONE full call, die without replying.
+                let (stream, _) = listener.accept().unwrap();
+                let mut s = &stream;
+                let payload = read_frame(&mut s).unwrap();
+                assert!(decode_hello(&payload).is_some());
+                write_hello(
+                    &mut s,
+                    &Hello {
+                        version: PROTOCOL_VERSION,
+                        mode: HelloMode::Verbatim,
+                    },
+                )
+                .unwrap();
+                let _swallowed: Call = read_message(&mut s).unwrap();
+                // The restarted instance binds BEFORE the old connection drops,
+                // closing the window where a buggy replay would merely fail to
+                // connect and masquerade as discipline.
+                let _ = std::fs::remove_file(&path);
+                let reborn = UnixListener::bind(&path).unwrap();
+                drop(stream); // NOW the client sees the break
+                let (stream, _) = reborn.accept().unwrap();
+                handle_connection(&kernel, stream);
+            })
+        };
+
+        let client = connect(&path).unwrap();
+        let err = client
+            .issue(sink_box())
+            .expect_err("a Sink whose reply was lost must surface, not silently replay");
+        assert!(matches!(err, Error::Unavailable(_)), "{err:?}");
+        assert!(err.is_transient(), "typed transient: the caller may retry");
+        // The caller's EXPLICIT retry heals the connection and runs the Sink —
+        // once. (A silent replay would have made it two, or answered the failed
+        // call with Ok.)
+        let (representation, _) = client
+            .issue(sink_box())
+            .expect("the following request heals the connection");
+        assert_eq!(representation.bytes, b"stored");
+        assert_eq!(
+            executed.load(Ordering::SeqCst),
+            1,
+            "the mutation ran exactly once — the explicit retry, no silent replay"
+        );
+
+        drop(client);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The one case a mutation MAY replay: the request frame was never fully
+    /// written (the write itself failed), so the server provably never
+    /// dispatched it — replaying cannot double-apply. The client is held back
+    /// until the first instance's socket is fully closed, making the write-phase
+    /// failure deterministic.
+    #[test]
+    fn a_sink_whose_frame_never_left_replays_once_and_applies_once() {
+        let path = socket_path("heal-sink-unwritten");
+        let executed = Arc::new(AtomicUsize::new(0));
+        let kernel = counting_sink_kernel(Arc::clone(&executed));
+        let (dead, dead_signal) = std::sync::mpsc::channel::<()>();
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = {
+            let path = path.clone();
+            thread::spawn(move || {
+                // First instance: hello only, then die BEFORE reading any call.
+                let (stream, _) = listener.accept().unwrap();
+                let mut s = &stream;
+                let payload = read_frame(&mut s).unwrap();
+                assert!(decode_hello(&payload).is_some());
+                write_hello(
+                    &mut s,
+                    &Hello {
+                        version: PROTOCOL_VERSION,
+                        mode: HelloMode::Verbatim,
+                    },
+                )
+                .unwrap();
+                let _ = std::fs::remove_file(&path);
+                let reborn = UnixListener::bind(&path).unwrap();
+                drop(stream);
+                dead.send(()).unwrap(); // the client may now write — into EPIPE
+                let (stream, _) = reborn.accept().unwrap();
+                handle_connection(&kernel, stream);
+            })
+        };
+
+        let client = connect(&path).unwrap();
+        dead_signal.recv().unwrap();
+        let (representation, _) = client
+            .issue(sink_box())
+            .expect("a provably-unwritten Sink replays on the fresh connection");
+        assert_eq!(representation.bytes, b"stored");
+        assert_eq!(
+            executed.load(Ordering::SeqCst),
+            1,
+            "applied exactly once — the replay, with nothing before it"
+        );
+
+        drop(client);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A break whose server never returns: the healing attempt's redial fails,
+    /// and the call surfaces the same typed transient a connect failure always
+    /// was — promptly, with the next call retrying the dial (no wedged state).
+    #[test]
+    fn a_break_with_no_server_back_stays_a_typed_transient() {
+        let path = socket_path("heal-nobody");
+        let hellos = Arc::new(AtomicUsize::new(0));
+        let server = serve_counting_hellos(&path, kernel(), Arc::clone(&hellos), 1);
+        let client = connect(&path).unwrap();
+        assert_eq!(client.issue(upper("one")).unwrap().0.bytes, b"ONE");
+        server.join().unwrap(); // gone, and staying gone
+
+        for _ in 0..2 {
+            let err = client.issue(upper("two")).unwrap_err();
+            assert!(matches!(err, Error::Unavailable(_)), "{err:?}");
+            assert!(
+                err.is_transient(),
+                "an absent peer stays the transient a Failover falls through on"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
