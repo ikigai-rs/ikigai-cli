@@ -2,29 +2,50 @@
 //! store, and the explain tiers.
 //!
 //! Opt-in via the config home (`~/.config/ikigai/config.toml` — see
-//! [`crate::config`]; no env vars):
+//! [`crate::config`]; no env vars). The RECOMMENDED grammar scopes the family
+//! to ONE named instance (the topology decision of record: **the daemon
+//! serves, others mount**), because the persistent store below takes an
+//! exclusive lock — one process on a machine holds it, everyone else reaches
+//! the family through that process's socket:
 //!
 //! ```toml
-//! # One line per root; the URN repo name is the directory's basename
+//! # The SERVING instance (`ikigai serve <sock>`, instance name "serve" unless
+//! # --name says otherwise) is the one process that opens the store. One line
+//! # per root; the URN repo name is the directory's basename
 //! # (`urn:repo:ikigai-core:tree`, …). Repeatable, like `mount`.
-//! browse.root = "~/git-personal/ikigai-core"
-//! browse.root = "~/git-personal/ikigai-cli"
+//! serve.browse.root = "~/git-personal/ikigai-core"
+//! serve.browse.root = "~/git-personal/ikigai-cli"
 //!
-//! # Everything below is optional.
-//! browse.store = "~/.ikigai/browse-store"   # persistent archive (this IS the default)
-//! browse.file_model = "coder"               # explain file grain: urn:llm:{id}:ask, or a full IRI
-//! browse.dir_model = "ask"                  # explain dir rollup ("ask" = urn:llm:ask)
-//! browse.file_max_tokens = 400              # explain ceilings (S1 defaults shown)
+//! # Everything below is optional; scoped spellings win, unscoped are shared.
+//! serve.browse.store = "~/.ikigai/browse-store" # persistent archive (this IS the default)
+//! browse.file_model = "coder"        # explain file grain: urn:llm:{id}:ask, or a full IRI
+//! browse.dir_model = "ask"           # explain dir rollup ("ask" = urn:llm:ask)
+//! browse.file_max_tokens = 400       # explain ceilings (S1 defaults shown)
 //! browse.dir_max_tokens = 600
+//!
+//! # Every OTHER process on the machine mounts the family from the server.
+//! # Two lines because the family spans two URN prefixes (`urn:repo:…` and
+//! # `urn:annotation:…`). `prefer` = through the server when it is up, quiet
+//! # absence when it is down. The serving instance skips a mount that targets
+//! # its own socket (see `serve_ipc` in the CLI), so these lines are safe in
+//! # the one shared config file.
+//! mount = "prefer urn:repo:=/path/to/serve.sock"
+//! mount = "prefer urn:annotation:=/path/to/serve.sock"
 //! ```
 //!
-//! No `browse.root` lines ⇒ **no browse family at all** — absence, not error:
-//! the module is opt-in, and an unconfigured host must not even hint at it in
-//! the catalog. With roots configured, the store opens (or fails LOUD — a
-//! persistent archive that silently fell back to memory would "work" while
-//! quietly forgetting everything, the worst failure shape) and the host binds
-//! [`ikigai_browse::space_with_explain`]: tree/file/state/hash + the
-//! explanation archive + Web Annotations, all over ONE `Arc<Store>`.
+//! Unscoped `browse.root` lines keep working for SINGLE-PROCESS setups (every
+//! kernel-building process wires the family — fine when only one runs at a
+//! time). Mixing the spellings is refused loud: one scoped line plus one
+//! unscoped line would put two processes on the one store lock, which is
+//! exactly the collision scoping exists to prevent.
+//!
+//! No `browse.root` lines for this instance ⇒ **no browse family at all** —
+//! absence, not error: the module is opt-in, and an unconfigured host must not
+//! even hint at it in the catalog. With roots configured, the store opens (or
+//! fails LOUD — a persistent archive that silently fell back to memory would
+//! "work" while quietly forgetting everything, the worst failure shape) and
+//! the host binds [`ikigai_browse::space_with_explain`]: tree/file/state/hash
+//! + the explanation archive + Web Annotations, all over ONE `Arc<Store>`.
 //!
 //! That same handle is what [`super::root_space_with_mounts`] gives
 //! `ikigai_sparql::space_with_store`, so `urn:sparql:select` queries the
@@ -57,8 +78,10 @@ pub(crate) struct Browse {
     pub(crate) store: Arc<Store>,
 }
 
-/// Read the `browse.*` config and wire the family, or `None` when no
-/// `browse.root` lines exist (browse is opt-in; absence is not an error).
+/// Read the `browse.*` config and wire the family, or `None` when no root
+/// lines apply to THIS instance (browse is opt-in; absence is not an error —
+/// and under the scoped grammar, absence is precisely what every non-serving
+/// process is configured for).
 ///
 /// # Panics
 ///
@@ -72,7 +95,7 @@ pub(crate) fn setup() -> Option<Browse> {
         return None;
     }
 
-    let store_path = config::get("browse.store")
+    let store_path = scoped("browse.store")
         .map(|p| expand_home(&p))
         .unwrap_or_else(|| {
             let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
@@ -82,8 +105,12 @@ pub(crate) fn setup() -> Option<Browse> {
         panic!(
             "ikigai: browse.store `{}` cannot open: {e} — refusing to run with an \
              in-memory archive (explanations and annotations would be silently lost). \
-             Fix the path/permissions, or note that ONE process holds the store at a \
-             time (a running daemon with browse configured locks it).",
+             ONE process holds the store at a time; if another ikigai holds this lock, \
+             the fix is topology, not retry: scope the family to the SERVING instance \
+             (`serve.browse.root = …`) and point this process at it instead — \
+             mount = \"prefer urn:repo:=<serve socket>\" and \
+             mount = \"prefer urn:annotation:=<serve socket>\" in the config home. \
+             Otherwise fix the path/permissions.",
             store_path.display()
         )
     }));
@@ -96,10 +123,10 @@ pub(crate) fn setup() -> Option<Browse> {
 
     let mut explain = ikigai_browse::ExplainConfig::new(Arc::clone(&store))
         .file_provider(provider_iri(
-            &config::get("browse.file_model").unwrap_or_else(|| "coder".to_string()),
+            &scoped("browse.file_model").unwrap_or_else(|| "coder".to_string()),
         ))
         .dir_provider(provider_iri(
-            &config::get("browse.dir_model").unwrap_or_else(|| "ask".to_string()),
+            &scoped("browse.dir_model").unwrap_or_else(|| "ask".to_string()),
         ));
     if let Some(tokens) = ceiling("browse.file_max_tokens") {
         explain = explain.file_max_tokens(tokens);
@@ -114,34 +141,74 @@ pub(crate) fn setup() -> Option<Browse> {
     })
 }
 
-/// The configured roots: one `browse.root = "<dir>"` line per root, the URN
-/// name taken from the directory's basename. Missing dirs and reserved names
-/// fail loud here with the config line in hand; the emptiness/`:`/`/`/duplicate
-/// checks live in `ikigai_browse`'s own mount-time validation.
+/// The configured roots: one root line per `browse.root` (or scoped
+/// `<instance>.browse.root`) config line, the URN name taken from the
+/// directory's basename. Missing dirs and reserved names fail loud here with
+/// the config line in hand; the emptiness/`:`/`/`/duplicate checks live in
+/// `ikigai_browse`'s own mount-time validation.
 fn roots() -> Vec<(String, PathBuf)> {
-    config::all("browse.root")
-        .into_iter()
-        .map(|line| {
-            let dir = expand_home(&line);
-            assert!(
-                dir.is_dir(),
-                "ikigai: browse.root `{line}` is not a directory — fix the config \
+    root_lines(
+        config::all(&format!("{}.browse.root", crate::instance_name())),
+        config::all("browse.root"),
+        &config::scoping_instances("browse.root"),
+    )
+    .into_iter()
+    .map(|line| {
+        let dir = expand_home(&line);
+        assert!(
+            dir.is_dir(),
+            "ikigai: browse.root `{line}` is not a directory — fix the config \
                  (a root that resolves against nothing would answer every request \
                  with an error)"
-            );
-            let name = dir
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            assert!(
-                !RESERVED_ROOTS.contains(&name.as_str()),
-                "ikigai: browse.root `{line}`: the name `{name}` is reserved — \
+        );
+        let name = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        assert!(
+            !RESERVED_ROOTS.contains(&name.as_str()),
+            "ikigai: browse.root `{line}`: the name `{name}` is reserved — \
                  ikigai-repo binds urn:repo:{name} — rename the directory or \
                  browse it under a symlinked name"
-            );
-            (name, dir)
-        })
-        .collect()
+        );
+        (name, dir)
+    })
+    .collect()
+}
+
+/// Which `browse.root` spelling governs this instance: scoped lines when ANY
+/// instance scopes the key (and then unscoped lines are refused loud — a
+/// scoped line for instance A plus an unscoped line that instance B still
+/// honoured would put two processes on the one store lock), unscoped lines
+/// otherwise (the single-process setup, unchanged).
+fn root_lines(scoped: Vec<String>, unscoped: Vec<String>, scoping: &[String]) -> Vec<String> {
+    if scoping.is_empty() {
+        return unscoped;
+    }
+    assert!(
+        unscoped.is_empty(),
+        "ikigai: browse.root is scoped to {} but the config also has unscoped \
+         `browse.root` lines — every process honours an unscoped line, so this would \
+         put a second process on the store's exclusive lock. Scope ALL of them \
+         (`<instance>.browse.root`), designate ONE serving instance, and point every \
+         other process at it: mount = \"prefer urn:repo:=<serve socket>\" + \
+         mount = \"prefer urn:annotation:=<serve socket>\".",
+        scoping
+            .iter()
+            .map(|i| format!("`{i}.browse.root`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    scoped
+}
+
+/// A browse setting, instance-scoped spelling first (`<instance>.browse.store`
+/// wins over `browse.store`). Tunings — the store path, models, ceilings — may
+/// be shared unscoped: they only take effect in a process that has roots, so
+/// they cannot drag a second process onto the store lock the way a root line
+/// can.
+fn scoped(key: &str) -> Option<String> {
+    config::get(&format!("{}.{key}", crate::instance_name())).or_else(|| config::get(key))
 }
 
 /// A provider id from config as an IRI: a full `urn:` IRI passes through,
@@ -160,7 +227,7 @@ fn provider_iri(value: &str) -> String {
 /// A configured token ceiling, or `None` when unset. Set-but-garbage fails
 /// loud: a typo that silently fell back to the default would look configured.
 fn ceiling(key: &str) -> Option<u32> {
-    config::get(key).map(|v| {
+    scoped(key).map(|v| {
         v.parse()
             .unwrap_or_else(|_| panic!("ikigai: {key} `{v}` is not a number — fix the config"))
     })
@@ -178,7 +245,7 @@ fn expand_home(path: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::provider_iri;
+    use super::{provider_iri, root_lines};
 
     /// The three spellings a `browse.file_model` line can take: a backend id,
     /// the facade, and a full IRI.
@@ -187,5 +254,42 @@ mod tests {
         assert_eq!(provider_iri("coder"), "urn:llm:coder:ask");
         assert_eq!(provider_iri("ask"), "urn:llm:ask");
         assert_eq!(provider_iri("urn:llm:mlx:ask"), "urn:llm:mlx:ask");
+    }
+
+    /// Nobody scopes `browse.root` ⇒ the unscoped lines govern, unchanged —
+    /// the single-process setup keeps working.
+    #[test]
+    fn unscoped_roots_govern_when_nobody_scopes() {
+        assert_eq!(
+            root_lines(vec![], vec!["~/a".into(), "~/b".into()], &[]),
+            vec!["~/a".to_string(), "~/b".to_string()]
+        );
+    }
+
+    /// Someone scopes ⇒ only THIS instance's scoped lines govern. Another
+    /// instance's scoped lines are simply not ours — this process gets no
+    /// browse family, which is the (b) topology working: it mounts instead.
+    #[test]
+    fn scoped_roots_govern_only_their_instance() {
+        let scoping = ["serve".to_string()];
+        // This process IS the scoped instance.
+        assert_eq!(
+            root_lines(vec!["~/a".into()], vec![], &scoping),
+            vec!["~/a".to_string()]
+        );
+        // This process is some other instance: no roots, no store, no lock.
+        assert!(root_lines(vec![], vec![], &scoping).is_empty());
+    }
+
+    /// One scoped line plus one unscoped line would put two processes on the
+    /// store's exclusive lock — refused loud, not merged.
+    #[test]
+    #[should_panic(expected = "unscoped")]
+    fn mixing_scoped_and_unscoped_roots_is_refused() {
+        root_lines(
+            vec!["~/a".into()],
+            vec!["~/b".into()],
+            &["serve".to_string()],
+        );
     }
 }
