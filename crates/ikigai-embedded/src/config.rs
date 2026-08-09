@@ -44,6 +44,42 @@ pub fn all(key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The instance names that SCOPE `key` in the file — the `<instance>` of every
+/// `<instance>.<key> = …` line, in file order, deduped.
+///
+/// Instance-scoped properties (`serve.derive_every`, `serve.browse.root`) attach behavior to a
+/// NAMED process instead of to every process reading the shared config. A reader that falls
+/// back from `<instance>.<key>` to plain `<key>` needs to know whether ANYONE scopes the key:
+/// for a resource only one process may hold (the browse store), a scoped line for instance A
+/// plus an unscoped line that instance B still honours re-creates exactly the collision the
+/// scoping exists to prevent.
+pub fn scoping_instances(key: &str) -> Vec<String> {
+    std::fs::read_to_string(config_path())
+        .map(|text| scoping_instances_in(&text, key))
+        .unwrap_or_default()
+}
+
+/// The `<instance>` prefixes of every `<instance>.<key>` line in `text`. See
+/// [`scoping_instances`].
+fn scoping_instances_in(text: &str, key: &str) -> Vec<String> {
+    let suffix = format!(".{key}");
+    let mut instances: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((name, _)) = line.split_once('=') {
+            if let Some(instance) = name.trim().strip_suffix(&suffix) {
+                if !instance.is_empty() && !instances.iter().any(|i| i == instance) {
+                    instances.push(instance.to_string());
+                }
+            }
+        }
+    }
+    instances
+}
+
 /// Every `key = value` line for `key`. See [`value_for`] for the parsing rules.
 fn values_for(text: &str, key: &str) -> Vec<String> {
     text.lines()
@@ -74,7 +110,24 @@ fn value_for(text: &str, key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{value_for, values_for};
+    use super::{scoping_instances_in, value_for, values_for};
+
+    /// `serve.browse.root` scopes `browse.root` to the "serve" instance; the plain key, a
+    /// commented line, and an unrelated dotted key must not read as scoping instances.
+    #[test]
+    fn scoped_spellings_surface_their_instances() {
+        let text = "browse.root = \"~/a\"\n\
+                    serve.browse.root = \"~/b\"\n\
+                    serve.browse.root = \"~/c\"\n\
+                    daemon.browse.root = \"~/d\"\n\
+                    # repl.browse.root = \"~/e\"\n\
+                    mail.from = \"x@y.example\"\n";
+        assert_eq!(
+            scoping_instances_in(text, "browse.root"),
+            vec!["serve".to_string(), "daemon".to_string()]
+        );
+        assert!(scoping_instances_in(text, "browse.store").is_empty());
+    }
 
     /// A machine has as many mounts as it has peers, so `mount` must be repeatable — the
     /// single-value reader would silently take the first and drop the rest.

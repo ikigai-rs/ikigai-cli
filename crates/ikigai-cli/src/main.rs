@@ -1763,6 +1763,28 @@ fn serve_ipc(path: Option<String>, mounts: Vec<Mount>) -> ! {
             std::process::exit(2);
         }
     };
+    // SELF-MOUNT GUARD: the config home is shared by every process on the machine, so
+    // under the "the daemon serves, others mount" topology the very lines that point
+    // OTHER processes at this socket (`mount = "prefer urn:repo:=<this socket>"`) are
+    // also read by the serving process itself. A mount whose target is our own serve
+    // socket would resolve through ourselves — at best a pointless hop, at worst a
+    // recursive loop on every miss under the prefix — so it is skipped, with one
+    // warning each, rather than dialed.
+    let mounts: Vec<Mount> = mounts
+        .into_iter()
+        .filter(|mount| {
+            let own = is_own_socket(&mount.target, &socket);
+            if own {
+                eprintln!(
+                    "ikigai: mount `{}={}` targets this process's own serve socket — \
+                     skipped (this instance IS the server; that line is for the other \
+                     processes on this machine)",
+                    mount.prefix, mount.target
+                );
+            }
+            !own
+        })
+        .collect();
     // Connect the mounts BEFORE announcing readiness: a host that says it is serving and
     // then cannot reach the peer it was told to compose is worse than one that refuses to
     // start. (A `--prefer` mount is exempt — its peer being absent is normal, and it dials
@@ -1811,6 +1833,23 @@ fn connect_ipc(path: Option<String>) -> Result<Engine, String> {
     let resolver = ikigai_ipc::connect_with_timeout(&socket, Some(timeout))
         .map_err(|e| format!("connect {}: {e}", socket.display()))?;
     Ok(with_profiles(Engine::new(resolver)))
+}
+
+/// True when an IPC mount target names this process's own serve socket.
+///
+/// A QUIC or mDNS target is never "own" here — this guard runs in the IPC
+/// server, whose identity is exactly one Unix socket path. Comparison is on
+/// `~`-expanded, lexically-absolute paths (the socket usually does not exist
+/// yet — it is bound after the mounts compose — so canonicalizing would fail);
+/// a symlinked spelling of the same socket is not caught, which errs on the
+/// side of mounting.
+#[cfg(all(feature = "embedded", feature = "ipc", unix))]
+fn is_own_socket(target: &str, socket: &std::path::Path) -> bool {
+    if is_quic(target) || target.starts_with("peer:") {
+        return false;
+    }
+    let absolute = |p: std::path::PathBuf| std::path::absolute(&p).unwrap_or(p);
+    absolute(std::path::PathBuf::from(shellexpand_home(target))) == absolute(socket.to_path_buf())
 }
 
 /// Resolve an explicit Unix socket path, or the secure default, exiting if
@@ -2227,5 +2266,34 @@ mod mount_cert_tests {
             mounts[1].certs.server_cert.as_deref(),
             Some("/certs/b-server.crt")
         );
+    }
+}
+
+#[cfg(all(test, feature = "embedded", feature = "ipc", unix))]
+mod own_socket_tests {
+    use super::is_own_socket;
+    use std::path::Path;
+
+    /// The config home is shared machine-wide, so the serving process reads the very
+    /// mount lines that point everyone ELSE at its socket — those must read as "own"
+    /// however the path is spelled, while genuinely-remote targets must not.
+    #[test]
+    fn own_socket_is_detected_across_spellings() {
+        let socket = Path::new("/tmp/ikigai-test/serve.sock");
+        assert!(is_own_socket("/tmp/ikigai-test/serve.sock", socket));
+        // A lexically-different spelling of the same path.
+        assert!(is_own_socket("/tmp/ikigai-test/./serve.sock", socket));
+        assert!(!is_own_socket("/tmp/ikigai-test/other.sock", socket));
+        // Remote targets are never "own" — the IPC server's identity is a Unix path.
+        assert!(!is_own_socket("quic://plasma.local:4433", socket));
+        assert!(!is_own_socket("peer:plasma", socket));
+    }
+
+    /// `~` in a config line expands against $HOME before comparing.
+    #[test]
+    fn tilde_spelling_matches_the_expanded_socket() {
+        let home = std::env::var("HOME").expect("HOME set in test env");
+        let socket = std::path::PathBuf::from(home).join(".ikigai-test.sock");
+        assert!(is_own_socket("~/.ikigai-test.sock", &socket));
     }
 }
