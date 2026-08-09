@@ -1216,7 +1216,8 @@ fn resolve_mount(mount: Mount) -> Result<ikigai_embedded::MountSpec, String> {
 ///
 /// Once connected, the resolver is KEPT even across failures — the transports
 /// re-establish their own connections (`QuicResolver::round_trip` redials on any
-/// transport error), so a peer that goes and returns is handled a layer down.
+/// transport error; `IpcResolver::round_trip` heals a dead connection on use),
+/// so a peer that goes and returns is handled a layer down.
 /// Dropping it here instead looks tempting and wedges the REPL: `QuicResolver`'s
 /// `Drop` blocks on its runtime to flush the close frame, and doing that from
 /// inside a resolution — which is already running under a runtime — is exactly
