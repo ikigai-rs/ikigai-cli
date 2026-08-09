@@ -78,10 +78,10 @@ fn tools_list(kernel: &Kernel, capability: &Capability, filter: &ToolFilter) -> 
     // same way, so the tool shown is the action a call reaches.
     let mut seen = std::collections::BTreeSet::new();
     for m in kernel.select_actions(&query) {
-        let Ok(iri) = Iri::parse(&m.endpoint) else {
-            continue;
-        };
-        let Some(description) = kernel.describe(&iri) else {
+        // `m.endpoint` may be an exact IRI or a URI-template pattern
+        // (`urn:demo:echo/{message}`) — `describe_pattern` covers both, so
+        // template-bound endpoints project as tools too.
+        let Some(description) = kernel.describe_pattern(&m.endpoint) else {
             continue;
         };
         if let Some(action) = description
@@ -138,10 +138,9 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
         ));
     };
 
-    let Ok(endpoint_iri) = Iri::parse(&m.endpoint) else {
-        return tool_error(format!("endpoint `{}` is not a valid IRI", m.endpoint));
-    };
-    let Some(description) = kernel.describe(&endpoint_iri) else {
+    // Exact IRI or URI-template pattern alike — the contract comes back either
+    // way; the substituted target is IRI-checked below, after binding args land.
+    let Some(description) = kernel.describe_pattern(&m.endpoint) else {
         return tool_error(format!("endpoint `{}` no longer resolves", m.endpoint));
     };
     let Some(action) = description
@@ -381,6 +380,66 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resp["result"]["content"][0]["text"], "[hi[");
+    }
+
+    /// A template-bound endpoint (`urn:demo:echo/{message}`) has no exact IRI —
+    /// its manifold row carries the pattern. `describe_pattern` still yields the
+    /// contract, so it projects as a tool whose binding arg sits in the input
+    /// schema; a call substitutes the arg into the IRI and resolves.
+    #[test]
+    fn a_template_bound_endpoint_projects_and_invokes() {
+        use ikigai_core::{ActionSpec, UriTemplate};
+        let echo = FnEndpoint::new("demo-echo", |inv| {
+            let message = inv.bindings.get("message").unwrap_or("").to_string();
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("echo: {message}").into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("demo-echo").action(
+                ActionSpec::new(Verb::Source)
+                    .summary("echo the path segment back")
+                    .input(ArgSpec::new("message").binding().summary("what to echo")),
+            ),
+        );
+        let space =
+            EndpointSpace::new().bind(UriTemplate::parse("urn:demo:echo/{message}").unwrap(), echo);
+        let k = Kernel::new(Arc::new(space));
+        let cap = Capability::root();
+
+        // tools/list: the template action projects, binding arg in the schema.
+        let resp = handle(
+            &k,
+            &cap,
+            &ToolFilter::default(),
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .unwrap();
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == "demo-echo__source")
+            .expect("a template-bound endpoint projects a tool");
+        assert_eq!(
+            tool["inputSchema"]["properties"]["message"]["type"],
+            "string"
+        );
+        assert_eq!(tool["inputSchema"]["required"], json!(["message"]));
+
+        // tools/call: the binding arg substitutes into the IRI and resolves.
+        let resp = handle(
+            &k,
+            &cap,
+            &ToolFilter::default(),
+            &json!({
+                "jsonrpc":"2.0","id":2,"method":"tools/call",
+                "params": { "name": "demo-echo__source", "arguments": { "message": "hi" } }
+            }),
+        )
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], false);
+        assert_eq!(resp["result"]["content"][0]["text"], "echo: hi");
     }
 
     #[test]
