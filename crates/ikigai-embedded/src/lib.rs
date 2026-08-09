@@ -839,7 +839,11 @@ fn stamp() -> String {
 #[derive(Debug, Clone)]
 struct SelectCandidate {
     action: String,
+    /// The exact endpoint IRI (`ik:endpoint`) or, when `template` is set, the
+    /// URI-template pattern (`ik:template`, e.g. `urn:demo:echo/{message}`) —
+    /// a pattern is not a legal IRI, so the two travel as different predicates.
     endpoint: String,
+    template: bool,
     verb: String,
     requires: Vec<String>,
     missing_optional: u32,
@@ -862,6 +866,7 @@ fn parse_action_matches(turtle: &str) -> Vec<SelectCandidate> {
             .or_insert_with(|| SelectCandidate {
                 action: subject.as_str().to_string(),
                 endpoint: String::new(),
+                template: false,
                 verb: String::new(),
                 requires: Vec::new(),
                 missing_optional: 0,
@@ -870,6 +875,12 @@ fn parse_action_matches(turtle: &str) -> Vec<SelectCandidate> {
         match &quad.object {
             oxrdf::Term::NamedNode(n) if pred == format!("{IK}endpoint") => {
                 entry.endpoint = n.as_str().to_string();
+            }
+            // A template-bound action: the pattern is a LITERAL (`{path}` makes
+            // it no legal IRI), under ik:template instead of ik:endpoint.
+            oxrdf::Term::Literal(l) if pred == format!("{IK}template") => {
+                entry.endpoint = l.value().to_string();
+                entry.template = true;
             }
             oxrdf::Term::NamedNode(n) if pred == format!("{IK}requires") => {
                 entry.requires.push(n.as_str().to_string());
@@ -920,9 +931,16 @@ fn selection_turtle(
     };
     for (rank, i) in order.iter().enumerate() {
         let c = &candidates[*i];
+        // A template pattern is not a legal IRI — round-trip it as the
+        // ik:template literal it arrived as, never as `ik:endpoint <…>`.
+        let named = if c.template {
+            format!("ik:template \"{}\"", escape(&c.endpoint))
+        } else {
+            format!("ik:endpoint <{}>", c.endpoint)
+        };
         ttl.push_str(&format!(
-            "\n<{}> a ik:ActionMatch ;\n    ik:endpoint <{}> ;\n    ik:verb \"{}\"",
-            c.action, c.endpoint, c.verb
+            "\n<{}> a ik:ActionMatch ;\n    {named} ;\n    ik:verb \"{}\"",
+            c.action, c.verb
         ));
         for r in &c.requires {
             ttl.push_str(&format!(" ;\n    ik:requires <{r}>"));
@@ -4542,6 +4560,7 @@ mod tests {
         SelectCandidate {
             action: format!("urn:ikigai:endpoint:{id}:action:{}", verb.to_lowercase()),
             endpoint: iri.to_string(),
+            template: false,
             verb: verb.to_string(),
             requires: Vec::new(),
             missing_optional: 0,
@@ -5306,12 +5325,54 @@ mod tests {
         assert!(ttl.contains("give goal= to disambiguate"), "{ttl}");
     }
 
+    /// A template-bound action arrives from `urn:kernel:actions` with its
+    /// pattern as the `ik:template` LITERAL (a `{var}` pattern is not a legal
+    /// IRI). The parse must capture it, and the selection graph must emit it
+    /// back as `ik:template "…"` — never an invalid `ik:endpoint <>` — so the
+    /// whole round trip stays parseable RDF.
+    #[test]
+    fn parse_action_matches_round_trips_a_template_candidate() {
+        let manifold = r#"@prefix ik: <https://ikigai-rs.dev/ns#> .
+<urn:ikigai:endpoint:demo-echo:action:source> a ik:ActionMatch ;
+    ik:template "urn:demo:echo/{message}" ;
+    ik:verb "Source" .
+<urn:ikigai:endpoint:toUpper:action:source> a ik:ActionMatch ;
+    ik:endpoint <urn:fn:toUpper> ;
+    ik:verb "Source" .
+"#;
+        let cands = parse_action_matches(manifold);
+        assert_eq!(cands.len(), 2);
+        let echo = cands
+            .iter()
+            .find(|c| c.action.contains("demo-echo"))
+            .unwrap();
+        assert!(echo.template);
+        assert_eq!(echo.endpoint, "urn:demo:echo/{message}");
+        let upper = cands.iter().find(|c| c.action.contains("toUpper")).unwrap();
+        assert!(!upper.template, "an exact IRI stays an ik:endpoint");
+        assert_eq!(upper.endpoint, "urn:fn:toUpper");
+
+        let ttl = selection_turtle(&cands, None, None);
+        assert!(
+            ttl.contains("ik:template \"urn:demo:echo/{message}\""),
+            "{ttl}"
+        );
+        assert!(ttl.contains("ik:endpoint <urn:fn:toUpper>"), "{ttl}");
+        assert!(!ttl.contains("ik:endpoint <>"), "{ttl}");
+        let reparsed = parse_action_matches(&ttl);
+        assert_eq!(reparsed.len(), 2, "the emitted graph re-parses whole");
+        assert!(reparsed
+            .iter()
+            .any(|c| c.template && c.endpoint == "urn:demo:echo/{message}"));
+    }
+
     #[test]
     fn selection_turtle_distinguishes_no_goal_from_a_failed_residual() {
         let cands = vec![
             SelectCandidate {
                 action: "urn:ikigai:endpoint:a:action:source".to_string(),
                 endpoint: "urn:a".to_string(),
+                template: false,
                 verb: "Source".to_string(),
                 requires: vec![],
                 missing_optional: 0,
@@ -5319,6 +5380,7 @@ mod tests {
             SelectCandidate {
                 action: "urn:ikigai:endpoint:b:action:source".to_string(),
                 endpoint: "urn:b".to_string(),
+                template: false,
                 verb: "Source".to_string(),
                 requires: vec![],
                 missing_optional: 0,
