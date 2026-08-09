@@ -99,8 +99,8 @@ ikigai-passkey = { path = "crates/ikigai-passkey" }
 # require its siblings at this version too, so the lockstep release publishes in
 # dependency order (resolve → wire → engine → …) and a crate can never build against
 # an older, incompatible sibling on crates.io.
-ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.1.9" }
-ikigai-wire = { path = "crates/ikigai-wire", version = "0.1.9" }
+ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.1.10" } # typed Resolver errors + scoped_entries/SpanCollector (ipc/quic use them)
+ikigai-wire = { path = "crates/ikigai-wire", version = "0.1.10" } # v6 hello + ErrorTyped/WireError
 ikigai-scheduler = { path = "crates/ikigai-scheduler", version = "0.1.9" }
 ikigai-time = { path = "crates/ikigai-time", version = "0.1.11" } # JobHealth: last_run for staleness
 # Inbound HTTP transport (method↔verb, path↔iri, cap-per-request). A published
