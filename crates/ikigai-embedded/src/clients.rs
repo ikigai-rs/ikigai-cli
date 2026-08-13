@@ -37,6 +37,13 @@
 //!   operator writes `"default"` explicitly; absence never implies one. (The MCP grant
 //!   path has the opposite footgun — an empty grant there yields root — which is
 //!   exactly what is not reproduced here.)
+//!
+//! A grant's **file** scopes are the one kind that is not simply carried through: a
+//! served client addresses files inside its own workspace, not by absolute host path,
+//! so `urn:cap:fs:read:notes` is written the way the client names it and is resolved
+//! against that workspace when the session is minted. See [`crate::tenant`] — which
+//! also says why an absolute path outside the served jail stops `serve` at startup
+//! instead of becoming a grant that quietly authorizes nothing.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
