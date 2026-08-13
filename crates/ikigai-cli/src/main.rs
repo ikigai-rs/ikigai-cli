@@ -34,6 +34,12 @@ usage:
   ikigai --mount <pfx>=<tgt>   compose a remote kernel at prefix <pfx> (<tgt> = Unix path or quic://host:port)
   ikigai serve [<target>]      run a kernel server (a Unix socket path, or quic://addr to bind)
   ikigai serve <q> --cap <s>   serve under a fixed capability ceiling <s> every client is clamped to
+                               (with clients.json below, the OUTER bound each grant narrows within)
+  ikigai serve <q>             per-identity authority when ~/.config/ikigai/clients.json enrols
+                               certificates — it maps a client's SHA-256 fingerprint to a grant
+                               named in grants.json, so each gets its own scopes, an unenrolled
+                               one is REFUSED, and editing the file revokes on the next
+                               connection. `cert add-client` prints the fingerprint to enrol.
   ikigai serve <q> --announce  also advertise this kernel on the local network (mDNS), so clients
                                can mount it by name; `source urn:peer:list` shows who is out there
   ikigai serve <s> --prefer …  a served host may take --mount/--override/--prefer too, so IT owns
@@ -107,6 +113,9 @@ enum Mode {
         /// filesystem workspace. This is how a server shares exactly one narrow
         /// affordance — e.g. `--cap urn:cap:personal:calendar:read:freebusy` serves
         /// free/busy and nothing else, the clamp forbidding any client from widening.
+        /// Alongside a `clients.json` enrolment it is the OUTER bound instead: each
+        /// client's own grant narrows within it and can never widen past it
+        /// (see the `ikigai_embedded::clients` module).
         caps: Vec<String>,
         /// `--http <port|addr>`: serve the inbound HTTP face instead of IPC/QUIC.
         /// A bare port binds `127.0.0.1:<port>` (loopback — TLS terminates at the
@@ -1581,6 +1590,20 @@ fn cert_add_client(name: &str, cert_dir: Option<String>, force: bool) -> ! {
                 "the server trusts it on next start (it reads clients/*.crt); to use it, copy \
                  {name}.crt, {name}.key, and server.crt to the client machine."
             );
+            // The id this cert will be KNOWN BY in clients.json. Printed here because
+            // this is the moment the operator has the certificate in hand; otherwise
+            // enrolling means going back for `openssl x509 -noout -fingerprint -sha256`.
+            if let Ok(pem) = std::fs::read_to_string(&path) {
+                if let Ok(fingerprint) = ikigai_quic::fingerprint_of_pem(&pem) {
+                    println!(
+                        "fingerprint: {fingerprint}\n  \
+                         to give it its own authority, add it to the `clients` map in \
+                         {}: \"{fingerprint}\": {{\"grant\": \"<grant>\", \"label\": \"{name}\"}}",
+                        ikigai_embedded::clients::clients_path()
+                            .map_or_else(|| "clients.json".into(), |p| p.display().to_string())
+                    );
+                }
+            }
             std::process::exit(0);
         }
         Err(e) => {
@@ -1654,38 +1677,104 @@ fn serve_quic(
         // same identity→capability move as the browser passkey, over mTLS — and the
         // server clamps any carried capability down to it (never widens).
         //
-        // Two modes: with `--cap`, a FIXED ceiling shared by every authenticated
-        // client (`--cap urn:cap:personal:calendar:read:freebusy` = a free/busy share
-        // and nothing else). Without it, the default per-tenant filesystem workspace,
-        // where each client transparently roots at its own segment (`urn:file:x`).
-        let minter: std::sync::Arc<dyn Fn(&str) -> ikigai_quic::Session + Send + Sync> =
-            if caps.is_empty() {
-                let root = ikigai_embedded::file_root();
-                std::sync::Arc::new(move |id: &str| {
-                    let segment = root.join(id);
-                    let _ = std::fs::create_dir_all(&segment); // the tenant's private dir
-                    let seg = segment.display();
-                    ikigai_quic::Session {
-                        capability: ikigai_core::Capability::root().attenuate([
-                            format!("urn:cap:fs:read:{seg}"),
-                            format!("urn:cap:fs:write:{seg}"),
-                            format!("urn:cap:fs:delete:{seg}"),
-                        ]),
-                        file_segment: id.to_string(),
-                    }
-                })
+        // THREE postures, most specific first.
+        //
+        // 1. PER-IDENTITY GRANTS, when a `clients.json` enrols certificates: the
+        //    session capability is a function of *which* certificate authenticated,
+        //    fingerprint → grant name → scopes, re-read per connection so editing the
+        //    file revokes a client on its next call. Unenrolled ⇒ REFUSED, never the
+        //    shared ceiling and never root.
+        // 2. `--cap`: a FIXED ceiling shared by every authenticated client
+        //    (`--cap urn:cap:personal:calendar:read:freebusy` = a free/busy share and
+        //    nothing else). It also remains the OUTER bound under posture 1.
+        // 3. Neither: the default per-tenant filesystem workspace, where each client
+        //    transparently roots at its own segment (`urn:file:x`).
+        //
+        // A `clients.json` that exists but does not parse stops the server here: a
+        // broken authority config must not degrade into serving everyone under 2 or 3.
+        let enrolment = ikigai_embedded::clients::enrolment()?;
+        // The enrolment is re-read per connection inside the minter (that is what makes
+        // an edit a revocation), so the startup read is used only to CHOOSE the posture
+        // and to report it.
+        let minter: ikigai_quic::Minter = if enrolment.is_some() {
+            // `--cap` still bounds every grant; with no `--cap` the grant IS the authority.
+            let ceiling = if caps.is_empty() {
+                ikigai_core::Capability::root()
             } else {
-                let ceiling = ikigai_core::Capability::scoped(caps.clone());
-                std::sync::Arc::new(move |id: &str| ikigai_quic::Session {
-                    capability: ceiling.clone(),
-                    file_segment: id.to_string(),
-                })
+                ikigai_core::Capability::scoped(caps.clone())
             };
-        let posture = if caps.is_empty() {
-            "per-client workspaces".to_string()
+            let path = ikigai_embedded::clients::clients_path()
+                .map_or_else(|| "clients.json".into(), |p| p.display().to_string());
+            std::sync::Arc::new(move |peer: &ikigai_quic::PeerIdentity| {
+                match ikigai_embedded::clients::authority(&peer.fingerprint, &ceiling) {
+                    Ok((grant, capability)) => {
+                        eprintln!(
+                            "ikigai: client {} → grant \"{grant}\" ({})",
+                            &peer.fingerprint[..peer.fingerprint.len().min(16)],
+                            match capability.scopes() {
+                                None => "unrestricted".to_string(),
+                                Some(s) => format!("{} scope(s)", s.len()),
+                            }
+                        );
+                        Some(ikigai_quic::Session {
+                            capability,
+                            file_segment: peer.segment_id.clone(),
+                        })
+                    }
+                    // The FULL fingerprint, so debugging a denied client is a copy-paste
+                    // rather than a packet capture.
+                    Err(why) => {
+                        eprintln!(
+                            "ikigai: REFUSED a trusted client certificate — {why}\n  \
+                             fingerprint: {}\n  \
+                             to enrol it, add it to the `clients` map in {path}",
+                            peer.fingerprint
+                        );
+                        None
+                    }
+                }
+            })
+        } else if caps.is_empty() {
+            let root = ikigai_embedded::file_root();
+            std::sync::Arc::new(move |peer: &ikigai_quic::PeerIdentity| {
+                let segment = root.join(&peer.segment_id);
+                let _ = std::fs::create_dir_all(&segment); // the tenant's private dir
+                let seg = segment.display();
+                Some(ikigai_quic::Session {
+                    capability: ikigai_core::Capability::root().attenuate([
+                        format!("urn:cap:fs:read:{seg}"),
+                        format!("urn:cap:fs:write:{seg}"),
+                        format!("urn:cap:fs:delete:{seg}"),
+                    ]),
+                    file_segment: peer.segment_id.clone(),
+                })
+            })
         } else {
-            format!("fixed ceiling: {}", caps.join(", "))
+            let ceiling = ikigai_core::Capability::scoped(caps.clone());
+            std::sync::Arc::new(move |peer: &ikigai_quic::PeerIdentity| {
+                Some(ikigai_quic::Session {
+                    capability: ceiling.clone(),
+                    file_segment: peer.segment_id.clone(),
+                })
+            })
         };
+        let posture = match (&enrolment, caps.is_empty()) {
+            (Some(e), true) => format!("per-identity grants: {} enrolled", e.len()),
+            (Some(e), false) => format!(
+                "per-identity grants: {} enrolled, under ceiling: {}",
+                e.len(),
+                caps.join(", ")
+            ),
+            (None, true) => "per-client workspaces".to_string(),
+            (None, false) => format!("fixed ceiling: {}", caps.join(", ")),
+        };
+        if let Some(default_grant) = enrolment.as_ref().and_then(|e| e.default_grant()) {
+            eprintln!(
+                "ikigai: warning: clients.json sets an explicit shared default grant \
+                 \"{default_grant}\" — every trusted certificate that is not enrolled \
+                 individually gets it"
+            );
+        }
         // A personal ceiling means this is a personal-resource server (the calendar
         // federation): serve the minimal calendar-only kernel — availability + calendar
         // and nothing else — instead of the default served kernel (host + fs). The clamp
@@ -1694,14 +1783,32 @@ fn serve_quic(
         // THE GRANT DECIDES THE SURFACE. Each optional face is switched on by the
         // ceiling the operator set, so a capability that could never be exercised
         // never puts its endpoints on the wire.
+        //
+        // Under per-identity grants the operator's declared intent is `--cap` PLUS
+        // every enrolled grant — otherwise `serve` with no `--cap` could only ever
+        // offer the default surface, whatever the grants named. The surface is still
+        // one startup-time decision (per-session surfaces are a much larger change),
+        // so enrolling a grant that needs a new face takes a restart; the per-call
+        // clamp is what makes serving one surface to differently-scoped clients safe.
+        let surface_caps: Vec<String> = {
+            let mut union = caps.clone();
+            for grant in enrolment.iter().flat_map(|e| e.grant_names()) {
+                union.extend(ikigai_embedded::grant_scopes(&grant));
+            }
+            union.sort();
+            union.dedup();
+            union
+        };
         let surface = ikigai_embedded::ServedSurface {
-            personal: caps.iter().any(|c| c.starts_with("urn:cap:personal:")),
-            wire_eval: caps
+            personal: surface_caps
+                .iter()
+                .any(|c| c.starts_with("urn:cap:personal:")),
+            wire_eval: surface_caps
                 .iter()
                 .any(|c| c == "urn:cap:lisp" || c == "urn:cap:lisp:run"),
             // A net grant means "you may spend my inference": urn:llm:* becomes
             // servable, still bounded by require_net to the granted provider hosts.
-            llm: caps.iter().any(|c| c.starts_with("urn:cap:net:")),
+            llm: surface_caps.iter().any(|c| c.starts_with("urn:cap:net:")),
         };
         let mounted = if resolved.is_empty() {
             String::new()

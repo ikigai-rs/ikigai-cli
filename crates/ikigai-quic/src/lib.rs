@@ -9,7 +9,9 @@
 //! Trust is **mutual certificate pinning**, no CA: each side is configured with
 //! its own self-signed identity ([`generate`]) and the *exact* peer certificate
 //! it will accept. The client pins the server's cert; the server requires and
-//! pins the client's. A capability bound to that identity can layer on later.
+//! pins the client's. The authenticated certificate is then the CREDENTIAL: a
+//! [`Minter`] turns the peer's [`PeerIdentity`] into the [`Session`] whose
+//! capability bounds every call on that connection — or refuses it outright.
 //!
 //! quinn is async; the sync [`Resolver`] hides a `tokio` runtime, just as the
 //! embedded kernel hides its executor.
@@ -68,6 +70,46 @@ pub struct Session {
     pub file_segment: String,
 }
 
+/// Who the mTLS handshake authenticated, in the two spellings a host needs.
+///
+/// Passed as a struct rather than as widening positional arguments because the two
+/// ids are NOT interchangeable and a call site should have to say which it means:
+/// `segment_id` is a *namespace* (it names on-disk tenant directories, so it can
+/// never be recomputed differently without orphaning data), `fingerprint` is an
+/// *identity* (it is what an operator writes in a config file, so it must be stable
+/// across toolchains and match what certificate tooling prints). A third derived
+/// attribute later adds a field instead of rewriting every minter signature.
+pub struct PeerIdentity {
+    /// The legacy namespace id — see [`peer_cert_id`].
+    pub segment_id: String,
+    /// Lowercase hex SHA-256 of the leaf certificate DER — see [`fingerprint`].
+    pub fingerprint: String,
+}
+
+impl PeerIdentity {
+    /// Derive both ids from a post-handshake connection.
+    fn of(connection: &quinn::Connection) -> Self {
+        PeerIdentity {
+            segment_id: peer_cert_id(connection),
+            fingerprint: cert_fingerprint(connection),
+        }
+    }
+}
+
+/// Mints the authority for one connection from the identity that authenticated it,
+/// or **refuses** the connection by returning `None`.
+///
+/// Refusal is the fail-closed path: a host that cannot decide what a certificate may
+/// do must not fall back to a shared ceiling or to root. The minter is also where the
+/// refusal is *logged* — it holds the operator context (config paths, grant names)
+/// that makes a log line actionable; this crate only closes the connection.
+pub type Minter = Arc<dyn Fn(&PeerIdentity) -> Option<Session> + Send + Sync>;
+
+/// The QUIC application close code for a peer whose certificate authenticated but
+/// carries no authority. Distinct from a handshake failure: the cert IS trusted, the
+/// *authorization* is missing.
+const UNAUTHORIZED: u32 = 1;
+
 /// How long a connection may be SILENT before either side declares it dead.
 ///
 /// Generous on purpose, mirroring `ipc.timeout` (cli #259): the server says nothing
@@ -85,7 +127,7 @@ pub fn serve(
     addr: SocketAddr,
     identity: &Identity,
     trusted_client_cert_pems: &[String],
-    minter: Arc<dyn Fn(&str) -> Session + Send + Sync>,
+    minter: Minter,
 ) -> io::Result<()> {
     serve_with(
         kernel,
@@ -103,7 +145,7 @@ pub fn serve_with(
     addr: SocketAddr,
     identity: &Identity,
     trusted_client_cert_pems: &[String],
-    minter: Arc<dyn Fn(&str) -> Session + Send + Sync>,
+    minter: Minter,
     idle: std::time::Duration,
 ) -> io::Result<()> {
     let config = server_config(identity, trusted_client_cert_pems, idle)?;
@@ -118,9 +160,19 @@ pub fn serve_with(
                 if let Ok(connection) = incoming.await {
                     // mTLS verified the peer is one of the enrolled clients; mint that
                     // principal's session from *which* cert authenticated — multi-tenant
-                    // capability-on-the-wire.
-                    let session = minter(&peer_cert_id(&connection));
-                    serve_connection(&kernel, connection, &session).await;
+                    // capability-on-the-wire. Minted PER CONNECTION and never cached, so
+                    // an operator editing the authority config revokes a client's rights
+                    // on its next connection rather than at the end of some TTL.
+                    match minter(&PeerIdentity::of(&connection)) {
+                        Some(session) => serve_connection(&kernel, connection, &session).await,
+                        // Authenticated but not authorized: close rather than serve. The
+                        // alternative — falling back to a shared ceiling — is how a
+                        // forgotten config entry silently becomes an over-grant.
+                        None => connection.close(
+                            UNAUTHORIZED.into(),
+                            b"no authority is configured for this client certificate",
+                        ),
+                    }
                 }
             });
         }
@@ -153,16 +205,57 @@ fn bind_endpoint(config: quinn::ServerConfig, addr: SocketAddr) -> io::Result<qu
     )
 }
 
-/// A stable id for the connection's authenticated client — a hash of its leaf
-/// certificate (exposed by quinn post-handshake). `anonymous` if the peer presented
-/// no cert (shouldn't happen with the client-cert verifier in force).
-fn peer_cert_id(connection: &quinn::Connection) -> String {
-    use std::hash::{Hash, Hasher};
-    let leaf = connection
+/// The leaf certificate DER the peer presented, if any (quinn exposes it
+/// post-handshake).
+fn peer_leaf_der(connection: &quinn::Connection) -> Option<Vec<u8>> {
+    connection
         .peer_identity()
         .and_then(|any| any.downcast::<Vec<CertificateDer<'static>>>().ok())
-        .and_then(|chain| chain.first().map(|c| c.as_ref().to_vec()));
-    match leaf {
+        .and_then(|chain| chain.first().map(|c| c.as_ref().to_vec()))
+}
+
+/// The **stable** fingerprint of the connection's authenticated client: lowercase
+/// hex SHA-256 of its leaf certificate DER. `anonymous` if the peer presented no
+/// cert (unreachable with the client-cert verifier in force).
+///
+/// This is the id an operator writes in a config file, so it has two hard
+/// requirements [`peer_cert_id`] cannot meet. It must be stable *forever* —
+/// `DefaultHasher` is explicitly not guaranteed stable across Rust releases, so
+/// keying a config on it would silently re-map every enrolled client on some
+/// future toolchain upgrade. And it must be *obtainable*: this is byte-for-byte
+/// what `openssl x509 -noout -fingerprint -sha256` prints (minus the colons and
+/// the case), so a client is enrolled by pasting what the tooling already gives.
+pub fn cert_fingerprint(connection: &quinn::Connection) -> String {
+    match peer_leaf_der(connection) {
+        Some(der) => fingerprint(&der),
+        None => "anonymous".to_string(),
+    }
+}
+
+/// Lowercase hex SHA-256 of a certificate's DER bytes. See [`cert_fingerprint`].
+pub fn fingerprint(der: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(der);
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// [`fingerprint`] of the first certificate in a PEM — so the tool that MINTS a
+/// client identity can print the id the operator must enrol, instead of sending
+/// them to `openssl`.
+pub fn fingerprint_of_pem(pem: &str) -> io::Result<String> {
+    Ok(fingerprint(load_cert(pem)?.as_ref()))
+}
+
+/// A per-tenant namespace id for the connection's authenticated client — a hash of
+/// its leaf certificate. `anonymous` if the peer presented no cert.
+///
+/// **Deliberately unchanged**, `DefaultHasher` and all: `file_segment` is derived
+/// from it and existing tenant workspace directories on disk are NAMED by it, so
+/// recomputing it differently would orphan every tenant's files. It is a namespace,
+/// not an identity — use [`cert_fingerprint`] for anything an operator configures.
+fn peer_cert_id(connection: &quinn::Connection) -> String {
+    use std::hash::{Hash, Hasher};
+    match peer_leaf_der(connection) {
         Some(der) => {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             der.hash(&mut hasher);
@@ -1072,6 +1165,142 @@ mod tests {
             "must give up near the {}s bound, took {:?}",
             CONNECT_TIMEOUT.as_secs(),
             elapsed
+        );
+    }
+
+    /// The fingerprint is a CONFIG KEY, so it must be reproducible outside this
+    /// process: fixed bytes in, fixed hex out, forever. Vectors are the published
+    /// SHA-256 of the empty string and of `abc` — the same digest
+    /// `openssl x509 -noout -fingerprint -sha256` prints over a certificate's DER
+    /// (minus its colons and case), which is how a client is enrolled by paste.
+    ///
+    /// Deliberately NOT a property of `peer_cert_id`: that one hashes with
+    /// `DefaultHasher`, whose output is explicitly not stable across Rust releases.
+    #[test]
+    fn the_fingerprint_is_the_sha256_of_the_der_and_never_moves() {
+        assert_eq!(
+            fingerprint(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            fingerprint(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // A real certificate: the PEM path and the DER path agree, and the id is a
+        // 64-character lowercase hex digest.
+        let identity = generate();
+        let der = load_cert(&identity.cert_pem).unwrap();
+        let from_pem = fingerprint_of_pem(&identity.cert_pem).unwrap();
+        assert_eq!(from_pem, fingerprint(der.as_ref()));
+        assert_eq!(from_pem.len(), 64);
+        assert!(from_pem
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
+        // Distinct certificates are distinct identities.
+        assert_ne!(from_pem, fingerprint_of_pem(&generate().cert_pem).unwrap());
+    }
+
+    /// Run the real accept loop (minter and all) against `minter`, dialing `dials`
+    /// times with the same client cert, and return what `urn:demo:cal` resolved to on
+    /// each dial — `Err` when the connection was refused.
+    fn dials_under(minter: Minter, dials: usize) -> Vec<Result<String, ()>> {
+        let server_id = generate();
+        let client_id = generate();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server_cfg = server_config(
+            &server_id,
+            std::slice::from_ref(&client_id.cert_pem),
+            DEFAULT_IDLE_TIMEOUT,
+        )
+        .unwrap();
+        let rt = Runtime::new().unwrap();
+        let endpoint = rt
+            .block_on(async { quinn::Endpoint::server(server_cfg, addr) })
+            .unwrap();
+        let server_addr = endpoint.local_addr().unwrap();
+        let kernel = Arc::new(gated_kernel());
+        // The accept loop as `serve_with` runs it: mint per connection, refuse on None.
+        let _server = thread::spawn(move || {
+            rt.block_on(async move {
+                while let Some(incoming) = endpoint.accept().await {
+                    let kernel = Arc::clone(&kernel);
+                    let minter = Arc::clone(&minter);
+                    tokio::spawn(async move {
+                        let Ok(connection) = incoming.await else {
+                            return;
+                        };
+                        match minter(&PeerIdentity::of(&connection)) {
+                            Some(session) => serve_connection(&kernel, connection, &session).await,
+                            None => connection.close(UNAUTHORIZED.into(), b"unauthorized"),
+                        }
+                    });
+                }
+            });
+        });
+        let cal = || Request::new(Verb::Source, Iri::parse("urn:demo:cal").unwrap());
+        (0..dials)
+            .map(|_| {
+                let client = connect(server_addr, &client_id, &server_id.cert_pem).unwrap();
+                let result = client
+                    .issue(cal())
+                    .map(|(r, _)| String::from_utf8(r.bytes).unwrap())
+                    .map_err(|_| ());
+                drop(client);
+                result
+            })
+            .collect()
+    }
+
+    /// FAIL CLOSED on the wire. A certificate the mTLS layer TRUSTS — the handshake
+    /// succeeds — still gets nothing when the host mints no authority for it. The
+    /// dangerous alternative is falling back to a shared ceiling, which is how a
+    /// forgotten config entry becomes a silent over-grant.
+    #[test]
+    fn a_trusted_certificate_with_no_authority_is_refused_not_served() {
+        let refuse: Minter = Arc::new(|_| None);
+        assert_eq!(dials_under(refuse, 1), vec![Err(())]);
+        // Control: the same handshake, with authority minted, resolves.
+        let grant: Minter = Arc::new(|peer: &PeerIdentity| {
+            assert_eq!(peer.fingerprint.len(), 64, "the minter sees the stable id");
+            Some(Session {
+                capability: Capability::root(),
+                file_segment: peer.segment_id.clone(),
+            })
+        });
+        assert_eq!(dials_under(grant, 1), vec![Ok("DETAIL".to_string())]);
+    }
+
+    /// REVOCATION BY EDITING A FILE. Authority is minted per connection and never
+    /// cached, so a change made between two connections governs the second one —
+    /// including all the way down to refusal. (Here an atomic counter stands in for
+    /// the operator editing `clients.json`; the host's minter re-reads it per call.)
+    #[test]
+    fn each_connection_mints_afresh_so_an_edit_governs_the_next_one() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let nth = Arc::new(AtomicUsize::new(0));
+        let minter: Minter = Arc::new(move |peer: &PeerIdentity| {
+            let session = |capability| {
+                Some(Session {
+                    capability,
+                    file_segment: peer.segment_id.clone(),
+                })
+            };
+            match nth.fetch_add(1, Ordering::SeqCst) {
+                // First: full authority.
+                0 => session(Capability::root()),
+                // The operator narrows the grant — same client, same certificate.
+                1 => session(Capability::scoped(["urn:cap:demo:other".to_string()])),
+                // The operator deletes the entry: revoked.
+                _ => None,
+            }
+        });
+        assert_eq!(
+            dials_under(minter, 3),
+            vec![
+                Ok("DETAIL".to_string()),
+                Ok("freebusy".to_string()),
+                Err(())
+            ]
         );
     }
 

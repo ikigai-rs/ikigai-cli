@@ -17,6 +17,10 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 rustls-pemfile = "2"
+# The STABLE certificate fingerprint (SHA-256 of the leaf DER) that an operator
+# keys per-identity authority on — `DefaultHasher` cannot promise stability across
+# toolchains, and a config key must outlive a Rust upgrade.
+sha2 = "0.10"
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "io-util", "time", "sync"] }
 # For a dual-stack server socket (IPV6_V6ONLY off) — std can't set it. Already in
 # the tree via quinn; declared directly so `serve` can build the socket itself.

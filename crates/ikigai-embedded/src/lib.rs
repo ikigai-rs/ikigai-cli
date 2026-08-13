@@ -21,6 +21,7 @@ use ikigai_core::{
 use ikigai_scheduler::Scheduler;
 
 mod browse;
+pub mod clients;
 pub mod config;
 pub mod contactblock;
 pub mod decide;
