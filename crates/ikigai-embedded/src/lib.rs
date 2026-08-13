@@ -29,6 +29,7 @@ pub mod decisions;
 pub mod jsonl;
 pub mod passkey;
 pub mod people;
+pub mod tenant;
 use ikigai_time::JobRegistry;
 use ikigai_vocab::TurtleRenderer;
 use notify::{RecursiveMode, Watcher};

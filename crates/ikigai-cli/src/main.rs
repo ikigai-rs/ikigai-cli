@@ -1693,6 +1693,39 @@ fn serve_quic(
         // A `clients.json` that exists but does not parse stops the server here: a
         // broken authority config must not degrade into serving everyone under 2 or 3.
         let enrolment = ikigai_embedded::clients::enrolment()?;
+        // A served connection addresses files only inside `file_root/<segment>` — the
+        // file module's jail refuses absolute IRI paths and anything outside its root
+        // whatever the capability says, and the transport roots each tenant at its own
+        // segment. So an fs scope naming an ABSOLUTE path outside the jail authorizes a
+        // path no client can name: it looks like a narrow grant and grants nothing.
+        // Refuse to start rather than run it — a silently inert authority config is the
+        // failure this whole posture exists to avoid. (Relative fs scopes are the other
+        // half, and are given a reachable meaning at mint time below.)
+        let file_root = ikigai_embedded::file_root();
+        let declared: Vec<String> = caps
+            .iter()
+            .cloned()
+            .chain(
+                enrolment
+                    .iter()
+                    .flat_map(|e| e.grant_names())
+                    .flat_map(|name| ikigai_embedded::grant_scopes(&name)),
+            )
+            .collect();
+        let unaddressable = ikigai_embedded::tenant::unaddressable_fs_scopes(&declared, &file_root);
+        if !unaddressable.is_empty() {
+            return Err(format!(
+                "these file scopes name paths no client of this server can address:\n  \
+                 {}\n  \
+                 a served connection reaches only {}/<its segment>/… — the file module is \
+                 jailed there and refuses everything outside it, capability or not.\n  \
+                 write the path RELATIVE to the client's own workspace (`urn:cap:fs:read:notes` \
+                 grants the `notes` it addresses as `urn:file:notes/…`), or point IKIGAI_FILES \
+                 at the tree you meant to serve.",
+                unaddressable.join("\n  "),
+                file_root.display()
+            ));
+        }
         // The enrolment is re-read per connection inside the minter (that is what makes
         // an edit a revocation), so the startup read is used only to CHOOSE the posture
         // and to report it.
@@ -1705,9 +1738,17 @@ fn serve_quic(
             };
             let path = ikigai_embedded::clients::clients_path()
                 .map_or_else(|| "clients.json".into(), |p| p.display().to_string());
+            let root = file_root.clone();
             std::sync::Arc::new(move |peer: &ikigai_quic::PeerIdentity| {
                 match ikigai_embedded::clients::authority(&peer.fingerprint, &ceiling) {
                     Ok((grant, capability)) => {
+                        // A grant's fs scopes are written the way the CLIENT addresses
+                        // files (`urn:file:notes/…`), so resolve them against this
+                        // connection's own workspace — the namespace its IRIs land in.
+                        let capability = ikigai_embedded::tenant::root_fs_scopes(
+                            &capability,
+                            &ikigai_embedded::tenant::tenant_root(&root, &peer.segment_id),
+                        );
                         eprintln!(
                             "ikigai: client {} → grant \"{grant}\" ({})",
                             &peer.fingerprint[..peer.fingerprint.len().min(16)],
@@ -1735,9 +1776,9 @@ fn serve_quic(
                 }
             })
         } else if caps.is_empty() {
-            let root = ikigai_embedded::file_root();
+            let root = file_root.clone();
             std::sync::Arc::new(move |peer: &ikigai_quic::PeerIdentity| {
-                let segment = root.join(&peer.segment_id);
+                let segment = ikigai_embedded::tenant::tenant_root(&root, &peer.segment_id);
                 let _ = std::fs::create_dir_all(&segment); // the tenant's private dir
                 let seg = segment.display();
                 Some(ikigai_quic::Session {
@@ -1751,9 +1792,16 @@ fn serve_quic(
             })
         } else {
             let ceiling = ikigai_core::Capability::scoped(caps.clone());
+            let root = file_root.clone();
             std::sync::Arc::new(move |peer: &ikigai_quic::PeerIdentity| {
                 Some(ikigai_quic::Session {
-                    capability: ceiling.clone(),
+                    // The shared ceiling is shared, but each connection's file namespace
+                    // is its own: a relative `--cap` fs scope means "this client's own
+                    // `notes`", resolved per connection like a grant's.
+                    capability: ikigai_embedded::tenant::root_fs_scopes(
+                        &ceiling,
+                        &ikigai_embedded::tenant::tenant_root(&root, &peer.segment_id),
+                    ),
                     file_segment: peer.segment_id.clone(),
                 })
             })
