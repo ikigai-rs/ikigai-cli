@@ -655,17 +655,10 @@ pub fn file_root() -> PathBuf {
 /// [`file_root`]. Omitted from [`base_space`] (the QUIC-served space) until remote
 /// auth + capability-on-the-wire land.
 /// The consolidated-view calendar config: `IKIGAI_CALENDAR_CONFIG`, else
-/// `~/.config/ikigai/calendar.json`. An absent file is normal (the config
+/// `calendar.json` in the config home. An absent file is normal (the config
 /// resource then guides you to create it); a bad file warns and is ignored.
 fn calendar_config() -> Option<ikigai_personal::CalendarConfig> {
-    let path = std::env::var("IKIGAI_CALENDAR_CONFIG")
-        .map(PathBuf::from)
-        .ok()
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|home| Path::new(&home).join(".config/ikigai/calendar.json"))
-        })?;
+    let path = calendar_config_path()?;
     let json = std::fs::read_to_string(&path).ok()?;
     match ikigai_personal::CalendarConfig::from_json(&json) {
         Ok(config) => Some(config),
@@ -679,19 +672,25 @@ fn calendar_config() -> Option<ikigai_personal::CalendarConfig> {
     }
 }
 
+/// Where `calendar.json` is read from: `$IKIGAI_CALENDAR_CONFIG` else the
+/// [config home](crate::config::config_home).
+///
+/// FOUR readers want this one file — the calendar sources, the org agenda, the
+/// per-source projection, and the derive interval — and each used to spell the
+/// lookup out for itself. Four copies of a rule is four chances to fix three of
+/// them: they are one function now, and the file stays ONE hand-editable config.
+fn calendar_config_path() -> Option<PathBuf> {
+    std::env::var_os("IKIGAI_CALENDAR_CONFIG")
+        .map(PathBuf::from)
+        .or_else(|| crate::config::config_home().map(|dir| dir.join("calendar.json")))
+}
+
 /// The org agenda config from the same calendar.json: `org_dir` (the jail root
 /// for the org-file space) and `org_files` (which files carry date-fixed
 /// events). Parsed independently of CalendarConfig so the file stays ONE
 /// hand-editable config.
 fn org_config() -> Option<(PathBuf, Vec<String>)> {
-    let path = std::env::var("IKIGAI_CALENDAR_CONFIG")
-        .map(PathBuf::from)
-        .ok()
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|home| Path::new(&home).join(".config/ikigai/calendar.json"))
-        })?;
+    let path = calendar_config_path()?;
     let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     let dir = v["org_dir"].as_str()?;
     let dir = if let Some(rest) = dir.strip_prefix("~/") {
@@ -712,18 +711,17 @@ fn org_config() -> Option<(PathBuf, Vec<String>)> {
 /// `Busy (Bosatsu)` with the location withheld — the freebusy capability idea
 /// applied at derivation time. UIDs are untouched, so flipping a source's mode
 /// UPDATES its events in place (the diff sees changed titles, not new events).
-/// Where MCP grants are read from: `$IKIGAI_GRANTS` else
-/// `~/.config/ikigai/grants.json`. Exposed so a host can WATCH it (the live
-/// grant-swap: edit the file, the connected client's tool list morphs).
+/// Where MCP grants are read from: `$IKIGAI_GRANTS` else `grants.json` in the
+/// [config home](crate::config::config_home). Exposed so a host can WATCH it (the
+/// live grant-swap: edit the file, the connected client's tool list morphs).
+///
+/// A watcher makes the config home's ONE spelling load-bearing: watch the path a
+/// second spelling produced and the edit that should have re-scoped a live session
+/// lands in a directory nobody is reading.
 pub fn grants_path() -> Option<PathBuf> {
-    std::env::var("IKIGAI_GRANTS")
+    std::env::var_os("IKIGAI_GRANTS")
         .map(PathBuf::from)
-        .ok()
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|home| Path::new(&home).join(".config/ikigai/grants.json"))
-        })
+        .or_else(|| crate::config::config_home().map(|dir| dir.join("grants.json")))
 }
 
 /// The scopes of a named MCP grant, from `~/.config/ikigai/grants.json`
@@ -786,15 +784,7 @@ fn string_array(v: &serde_json::Value) -> Vec<String> {
 }
 
 fn projection_config() -> std::collections::BTreeMap<String, String> {
-    let Some(path) = std::env::var("IKIGAI_CALENDAR_CONFIG")
-        .map(PathBuf::from)
-        .ok()
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|home| Path::new(&home).join(".config/ikigai/calendar.json"))
-        })
-    else {
+    let Some(path) = calendar_config_path() else {
         return Default::default();
     };
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -1457,7 +1447,11 @@ pub fn set_eval_timeout_secs(secs: u64) {
 }
 
 /// Where the code-signing public keys live (`urn:codekey:{file}` resolves here):
-/// `--code-signers-dir` if given, else `~/.config/ikigai/code-signers`.
+/// `--code-signers-dir` if given, else `code-signers` in the
+/// [config home](crate::config::config_home).
+///
+/// With no config home at all this stays RELATIVE, as it always has — the trust root
+/// for portable code should fail to find keys, not silently resolve to `/code-signers`.
 fn code_signers_dir() -> std::path::PathBuf {
     if let Some(dir) = CODE_SIGNERS_DIR
         .lock()
@@ -1466,10 +1460,9 @@ fn code_signers_dir() -> std::path::PathBuf {
     {
         return dir;
     }
-    std::env::var("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default()
-        .join(".config/ikigai/code-signers")
+    crate::config::config_home()
+        .unwrap_or_else(|| std::path::PathBuf::from(".config/ikigai"))
+        .join("code-signers")
 }
 
 /// `urn:codekey:{file}` — a code-signing PUBLIC key, served openly from the
@@ -2531,19 +2524,18 @@ struct PeerList;
 
 /// Does this machine hold a pinned server certificate for `name`?
 ///
-/// The deployed convention is one directory per peer — `<config>/ikigai/quic-<name>/` holds
+/// The deployed convention is one directory per peer — `<config home>/quic-<name>/` holds
 /// that peer's `server.crt` plus our client identity (plasma has `quic-bug`, bug has
 /// `quic-plasma`). Holding one means "I could try": the peer must ALSO trust our client
 /// cert, and only a dial proves that. The narrower claim is the one worth reporting.
+///
+/// This ORACLE and the writer must agree on where the directory is. They did not: the
+/// CLI's `quic::dir` resolved the config home through the XDG-honouring spelling while
+/// this one hardcoded `$HOME/.config/ikigai`, so on a machine setting `XDG_CONFIG_HOME`
+/// a peer whose certificate had just been written still reported as unheld.
 fn holds_cert_for(name: &str) -> bool {
-    let Ok(home) = std::env::var("HOME") else {
-        return false;
-    };
-    std::path::PathBuf::from(home)
-        .join(".config/ikigai")
-        .join(format!("quic-{name}"))
-        .join("server.crt")
-        .exists()
+    crate::config::config_home()
+        .is_some_and(|dir| dir.join(format!("quic-{name}")).join("server.crt").exists())
 }
 
 #[async_trait::async_trait]
@@ -2725,8 +2717,8 @@ fn llm_config_candidates() -> Vec<(String, &'static str)> {
     if let Ok(path) = std::env::var("IKIGAI_LLM_CONFIG") {
         candidates.push((path, "IKIGAI_LLM_CONFIG"));
     }
-    if let Ok(home) = std::env::var("HOME") {
-        let path = std::path::PathBuf::from(home).join(".config/ikigai/llm.json");
+    if let Some(dir) = crate::config::config_home() {
+        let path = dir.join("llm.json");
         candidates.push((path.display().to_string(), "llm.json"));
     }
     candidates
@@ -4197,14 +4189,7 @@ static INSTANCE_NAME: OnceLock<String> = OnceLock::new();
 /// (a server without `serve.derive_every` never touches the calendar); an
 /// unscoped `derive_every` is deliberately ignored.
 fn derive_every() -> Option<std::time::Duration> {
-    let path = std::env::var("IKIGAI_CALENDAR_CONFIG")
-        .map(PathBuf::from)
-        .ok()
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|home| Path::new(&home).join(".config/ikigai/calendar.json"))
-        })?;
+    let path = calendar_config_path()?;
     let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     let spec = v[format!("{}.derive_every", instance_name())].as_str()?;
     let (digits, unit) = spec.split_at(spec.len().saturating_sub(1));

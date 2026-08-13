@@ -46,21 +46,19 @@
 //! instead of becoming a grant that quietly authorizes nothing.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use ikigai_core::Capability;
 
 /// Where the per-identity client map is read from: `$IKIGAI_CLIENTS` else
-/// `~/.config/ikigai/clients.json` — beside `grants.json`, which it references by name.
+/// `clients.json` in the [config home](crate::config::config_home) — beside `grants.json`,
+/// which it references by name. "Beside" is the whole point, so both resolve the config
+/// home the same way; this file once spelled it `$HOME/.config/ikigai` directly, which put
+/// it in a different directory than `config.toml` wherever `XDG_CONFIG_HOME` was set.
 pub fn clients_path() -> Option<PathBuf> {
-    std::env::var("IKIGAI_CLIENTS")
+    std::env::var_os("IKIGAI_CLIENTS")
         .map(PathBuf::from)
-        .ok()
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|home| Path::new(&home).join(".config/ikigai/clients.json"))
-        })
+        .or_else(|| crate::config::config_home().map(|dir| dir.join("clients.json")))
 }
 
 /// The parsed enrolment: fingerprint → grant name, plus the operator's *explicit*
