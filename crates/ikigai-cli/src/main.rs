@@ -1426,12 +1426,17 @@ fn resolve_peer(name: &str, certs: &Certs) -> Result<(String, Certs), String> {
     Ok((format!("quic://{addr}"), certs))
 }
 
-/// The conventional per-peer certificate directory: `<config>/ikigai/quic-<name>/`.
+/// The conventional per-peer certificate directory: `<config home>/quic-<name>/`.
 /// plasma holds `quic-bug`, bug holds `quic-plasma`.
+///
+/// Resolved through the SAME config home as [`quic::dir`](crate::quic) and as
+/// `holds_cert_for`'s oracle in the embedded host — this used to hardcode
+/// `$HOME/.config/ikigai` while `quic::dir` honoured `XDG_CONFIG_HOME`, so setting that
+/// variable pointed the dialer at one directory and the certificate writer at another.
 #[cfg(all(feature = "embedded", feature = "quic"))]
 fn peer_cert_dir(name: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join(".config/ikigai")
+    ikigai_embedded::config::config_home()
+        .unwrap_or_default()
         .join(format!("quic-{name}"))
 }
 
