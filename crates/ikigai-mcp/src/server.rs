@@ -147,9 +147,36 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
         .filter(|m| crate::sanitize_id(&m.id) == id && m.verb == verb)
         .collect();
     if rows.is_empty() {
-        return tool_error(format!(
-            "tool `{name}` is not available under this capability"
-        ));
+        // Absence has two causes and the distinction IS the diagnosis: re-select
+        // without the capability filter to tell them apart. Rows that exist
+        // unrestricted were withheld by the grant; rows gone even unrestricted
+        // have left the manifold — an unbound endpoint or an unreachable mounted
+        // peer — and blaming the capability there sends the caller debugging
+        // grants while a peer is down (the 2026-08-09 incident: a dev-server
+        // bounce read as a grant problem for a whole session).
+        //
+        // TRADE, MADE KNOWINGLY: a truthful message is necessarily an informative
+        // one, so "denied" now confirms the tool EXISTS above the caller's grant —
+        // an existence oracle the old always-blame-the-capability wording did not
+        // give. Acceptable HERE because this face is the local stdio projection and
+        // the caller already holds a named grant. It stops being acceptable the
+        // moment this manifold is projected to a peer we would not tell what we
+        // hold: then the denied branch must fall back to the absent wording, so
+        // both answers reveal the same thing. Affordance = authorization means a
+        // denial should ideally be unreachable; this is a diagnosis for a caller we
+        // trust, not a hint for one we don't.
+        let offered = kernel
+            .select_actions(&ikigai_core::ActionQuery::default())
+            .into_iter()
+            .any(|m| crate::sanitize_id(&m.id) == id && m.verb == verb);
+        return tool_error(if offered {
+            format!("tool `{name}` is not available under this capability")
+        } else {
+            format!(
+                "tool `{name}` is not in the manifold — no bound endpoint answers to it \
+                 (a mounted peer may be unreachable, or the tool list is stale)"
+            )
+        });
     }
 
     // Exact IRI or URI-template pattern alike — the contract comes back either
@@ -728,5 +755,24 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("not available under this capability"));
+    }
+
+    /// A tool no manifold row backs at ALL — the shape a dead mounted peer
+    /// leaves behind (its catalog vanishes, the client's tool roster doesn't) —
+    /// must NOT be blamed on the capability: the caller holding the right grant
+    /// would go debug grants while the peer is down. The message names absence.
+    #[test]
+    fn an_absent_tool_is_reported_as_absent_not_denied() {
+        let k = kernel();
+        let held = Capability::scoped(["urn:cap:demo:echo"]);
+        let call = json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params": { "name": "ghost__source", "arguments": {} }
+        });
+        let resp = handle(&k, &held, &ToolFilter::default(), &call).unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("not in the manifold"), "{text}");
+        assert!(!text.contains("capability"), "{text}");
     }
 }
