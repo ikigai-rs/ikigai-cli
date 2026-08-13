@@ -457,11 +457,6 @@ fn host_identity() -> FnEndpoint {
     )
 }
 
-/// The base demo space: the linked [`ikigai_fn`] function library plus this host's
-/// own resources (the `page`/`about` shapes, `urn:host:info`, the `urn:host:demo` /
-/// `urn:host:history` toggles, and `urn:host:identity`). Used as-is for a *served*
-/// kernel — it deliberately omits the personal space, which must not be exposed over the
-/// wire until capability-on-the-wire lands.
 /// `urn:style:catalog` — a **text-output** XSLT (a resource) that renders the catalog
 /// RDF/XML into terminal-friendly text "cards", one per endpoint. The TUI Docs tab pipes
 /// `urn:kernel:catalog | urn:rdf:transrept as=application/rdf+xml | urn:xslt:transform
@@ -614,6 +609,11 @@ fn runbook_timer_demo() -> FnEndpoint {
     )
 }
 
+/// The base demo space: the linked [`ikigai_fn`] function library plus this host's
+/// own resources (the `page`/`about` shapes, `urn:host:info`, the `urn:host:demo` /
+/// `urn:host:history` toggles, and `urn:host:identity`). Used as-is for a *served*
+/// kernel — it deliberately omits the personal space, which must not be exposed over the
+/// wire until capability-on-the-wire lands.
 fn base_space(nature: &'static str) -> EndpointSpace {
     ikigai_fn::space()
         .bind(Exact::new("urn:data:page"), page())
@@ -649,11 +649,6 @@ pub fn file_root() -> PathBuf {
     root
 }
 
-/// The base space plus the spaces a *trusted* principal drives (the local owner,
-/// or an IPC peer the OS verified is the same user): the personal space
-/// (`urn:personal:*`) and the local file module (`urn:file:{path}`), jailed to
-/// [`file_root`]. Omitted from [`base_space`] (the QUIC-served space) until remote
-/// auth + capability-on-the-wire land.
 /// The consolidated-view calendar config: `IKIGAI_CALENDAR_CONFIG`, else
 /// `calendar.json` in the config home. An absent file is normal (the config
 /// resource then guides you to create it); a bad file warns and is ignored.
@@ -706,11 +701,6 @@ fn org_config() -> Option<(PathBuf, Vec<String>)> {
     Some((dir, files))
 }
 
-/// The per-source detail projection from calendar.json: `"project":
-/// {"Bosatsu": "busy"}` renders that source's events into the view as
-/// `Busy (Bosatsu)` with the location withheld — the freebusy capability idea
-/// applied at derivation time. UIDs are untouched, so flipping a source's mode
-/// UPDATES its events in place (the diff sees changed titles, not new events).
 /// Where MCP grants are read from: `$IKIGAI_GRANTS` else `grants.json` in the
 /// [config home](crate::config::config_home). Exposed so a host can WATCH it (the
 /// live grant-swap: edit the file, the connected client's tool list morphs).
@@ -783,6 +773,11 @@ fn string_array(v: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The per-source detail projection from calendar.json: `"project":
+/// {"Bosatsu": "busy"}` renders that source's events into the view as
+/// `Busy (Bosatsu)` with the location withheld — the freebusy capability idea
+/// applied at derivation time. UIDs are untouched, so flipping a source's mode
+/// UPDATES its events in place (the diff sees changed titles, not new events).
 fn projection_config() -> std::collections::BTreeMap<String, String> {
     let Some(path) = calendar_config_path() else {
         return Default::default();
@@ -1112,6 +1107,11 @@ Authorized candidate actions:
     }
 }
 
+/// The base space plus the spaces a *trusted* principal drives (the local owner,
+/// or an IPC peer the OS verified is the same user): the personal space
+/// (`urn:personal:*`) and the local file module (`urn:file:{path}`), jailed to
+/// [`file_root`]. Omitted from [`base_space`] (the QUIC-served space) until remote
+/// auth + capability-on-the-wire land.
 fn local_space(nature: &'static str) -> EndpointSpace {
     base_space(nature)
         .bind(
@@ -3105,15 +3105,6 @@ fn runbook_jury_demo() -> FnEndpoint {
     )
 }
 
-/// Build the **local** embedded kernel (nature `Embedded (Native)`), including
-/// the personal space and the HTTP-client module. The running user *is* the owner,
-/// so it resolves under their identity — the engine's default root capability — and
-/// the REPL's `cap` command lets them voluntarily attenuate it before handing work
-/// to an agent.
-///
-/// A [`SystemClock`] is injected so the HTTP module's `Cache-Control: max-age`
-/// deadlines (`Expiry::At`) are honoured; without a clock those reads would stay
-/// uncacheable. The root is a [`Fallback`] over the local space then the HTTP space.
 /// The embedded kernel's root space: the local space, the HTTP module, and the
 /// interactive runbook (`urn:runbook:*`) — the last **gated** by [`demo_flag`], so it
 /// only resolves while the demo is on (OFF by default; `--demo` or `demo on` turns it
@@ -3578,6 +3569,16 @@ fn subclass_axioms() -> Vec<(String, String)> {
 }
 
 /// The embedded kernel.
+///
+/// Build the **local** embedded kernel (nature `Embedded (Native)`), including
+/// the personal space and the HTTP-client module. The running user *is* the owner,
+/// so it resolves under their identity — the engine's default root capability — and
+/// the REPL's `cap` command lets them voluntarily attenuate it before handing work
+/// to an agent.
+///
+/// A [`SystemClock`] is injected so the HTTP module's `Cache-Control: max-age`
+/// deadlines (`Expiry::At`) are honoured; without a clock those reads would stay
+/// uncacheable. The root is a [`Fallback`] over the local space then the HTTP space.
 pub fn kernel() -> Kernel {
     Kernel::with_meta_renderer(root_space(), Arc::new(CliRenderer))
         .with_clock(Arc::new(SystemClock))
