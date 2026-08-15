@@ -54,7 +54,7 @@ ikigai-shacl = "0.1.0"
 # The org-mode agenda (urn:org:agenda:{period}) — reads org files through the
 # kernel (urn:orgfile:*) and speaks the same skolemized event graph as the
 # calendar, so the two union/diff as graphs.
-ikigai-org = "0.1.5" # :LOCATION:/:URL: drawers -> ical:location + join link as ical:description
+ikigai-org = "0.1.6" # 0.1.6 = drawer properties are read wherever the drawer sits (:ID:/:URL: below SCHEDULED:) + :ZOOM_PASSCODE:
 # Unix-like text endpoints (urn:text:wc/head/tail/grep/sort/uniq/nl/rev) — the
 # first satellite-built module; pure text, wasm-clean, ArgSpec showcase.
 ikigai-text = "0.1.0"
