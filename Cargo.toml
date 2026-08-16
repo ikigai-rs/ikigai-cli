@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.13"
+version = "0.1.14"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -99,7 +99,7 @@ ikigai-passkey = { path = "crates/ikigai-passkey" }
 # require its siblings at this version too, so the lockstep release publishes in
 # dependency order (resolve → wire → engine → …) and a crate can never build against
 # an older, incompatible sibling on crates.io.
-ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.1.11" } # remote template entries carry real endpoint names (probe-guard fix)
+ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.1.14" } # naming_entry: the most specific catalog row names a target (the engine's trace labels use it)
 ikigai-wire = { path = "crates/ikigai-wire", version = "0.1.11" } # v6 hello + ErrorTyped/WireError
 ikigai-scheduler = { path = "crates/ikigai-scheduler", version = "0.1.9" }
 ikigai-time = { path = "crates/ikigai-time", version = "0.1.12" } # JobHealth: last_run for staleness

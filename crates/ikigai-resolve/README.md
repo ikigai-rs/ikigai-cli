@@ -47,6 +47,20 @@ recomputes every time).
   cuts golden threads on the very same kernel and cache. Every method delegates, so
   the inner resolver's overrides are preserved.
 
+## Naming a target from a catalog
+
+`naming_entry(&[SpaceEntry], &Iri)` answers "which catalog row names this IRI" —
+the **most specific** matching pattern (the most literal, non-variable characters),
+ties broken by catalog order. Mounts use it to label a forwarded target with the
+remote's own endpoint name, and the REPL's `trace` uses it to label a span.
+
+Specificity, not first-match, because routes NEST: `urn:repo:{repo}:pr:{n}` matches
+`urn:repo:acme:pr:12:explain` too (its trailing variable swallows the rest), so a
+first match names the parent route for every child. It remains a heuristic — a
+remote's grammar can apply predicates no pattern string carries — and the shapes
+that would let the wire carry the resolved name instead are written up in
+`docs/resolved-name-on-the-wire-design.md`.
+
 The wire protocol that remote resolvers speak lives in the companion
 [ikigai-wire](https://crates.io/crates/ikigai-wire) crate.
 

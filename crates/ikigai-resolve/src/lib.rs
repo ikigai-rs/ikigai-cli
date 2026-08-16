@@ -110,21 +110,25 @@ pub fn scoped_entries(kernel: &Kernel, capability: &Capability) -> Vec<SpaceEntr
 /// target falls back to `"remote"`, which restores the old behavior (and the old
 /// invisibility) rather than guessing.
 struct RemoteNames {
-    patterns: Mutex<Vec<(NamePattern, String)>>,
+    rows: Mutex<Vec<NameRow>>,
 }
 
-/// One remote catalog row's pattern, pre-parsed for matching.
-enum NamePattern {
-    /// An exact IRI: matched by string equality.
-    Exact(String),
-    /// A URI-template pattern: matched by template expansion.
-    Template(UriTemplate),
+/// One remote catalog row, pre-parsed for matching and pre-scored for
+/// specificity — parsing on the resolve path would be paid per resolution.
+struct NameRow {
+    /// The row's pattern. An exact IRI parses as a template with no variables,
+    /// so one matcher covers both: its literals must equal the whole target.
+    pattern: UriTemplate,
+    /// The remote's declared endpoint name for that pattern.
+    endpoint: String,
+    /// How specifically the pattern pins an IRI — see [`literal_len`].
+    specificity: usize,
 }
 
 impl RemoteNames {
     fn new() -> Self {
         RemoteNames {
-            patterns: Mutex::new(Vec::new()),
+            rows: Mutex::new(Vec::new()),
         }
     }
 
@@ -134,35 +138,90 @@ impl RemoteNames {
     /// (display sugar like `urn:x[:{y}]`) are skipped — they can't match a probe
     /// IRI anyway.
     fn refresh(&self, entries: &[SpaceEntry]) {
-        let patterns = entries
+        let rows = entries
             .iter()
             .filter_map(|entry| {
-                let pattern = if Iri::parse(&entry.pattern).is_ok() {
-                    NamePattern::Exact(entry.pattern.clone())
-                } else {
-                    NamePattern::Template(UriTemplate::parse(&entry.pattern).ok()?)
-                };
-                Some((pattern, entry.endpoint.clone()))
+                let pattern = UriTemplate::parse(&entry.pattern).ok()?;
+                Some(NameRow {
+                    specificity: literal_len(&pattern),
+                    pattern,
+                    endpoint: entry.endpoint.clone(),
+                })
             })
             .collect();
-        *self.patterns.lock().expect("remote names") = patterns;
+        *self.rows.lock().expect("remote names") = rows;
     }
 
-    /// The remote endpoint name `target` would land on — first matching catalog
-    /// row wins, mirroring the remote's own first-match-wins resolution.
+    /// The remote endpoint name `target` would land on: the MOST SPECIFIC matching
+    /// catalog row (see [`literal_len`]), ties broken by catalog order.
+    ///
+    /// Deliberately *not* first-match-wins, even though the remote's own resolution
+    /// is. What crosses the wire are pattern STRINGS, and grammar semantics do not
+    /// survive that trip: ikigai-browse's PR row binds `urn:repo:{repo}:pr:{n}` and
+    /// then REJECTS an `n` containing a `:` — Rust logic no pattern string can
+    /// express — so replaying the strings in catalog order let the shorter row
+    /// swallow `…:pr:{n}:explain` and `…:pr:{n}:review` and label them `browse-pr`.
+    /// Most-specific-wins is still a heuristic, but a well-founded one: a nested
+    /// route is spelled by ADDING literals to its parent's pattern, so the row with
+    /// more literals is the one the remote meant. It stays a guess until the wire
+    /// carries the resolved name itself — the shapes that would, and which consumer
+    /// each one serves, are written up in `docs/resolved-name-on-the-wire-design.md`.
     fn name_for(&self, target: &Iri) -> Option<String> {
-        self.patterns
-            .lock()
-            .ok()?
-            .iter()
-            .find_map(|(pattern, endpoint)| {
-                let matched = match pattern {
-                    NamePattern::Exact(iri) => iri == target.as_str(),
-                    NamePattern::Template(template) => template.match_iri(target).is_some(),
-                };
-                matched.then(|| endpoint.clone())
-            })
+        let rows = self.rows.lock().ok()?;
+        let mut best: Option<&NameRow> = None;
+        for row in rows.iter() {
+            if row.pattern.match_iri(target).is_none() {
+                continue;
+            }
+            // Strictly greater, so an equally specific row LATER in the catalog
+            // does not displace the earlier one (first-wins on a true tie).
+            if best.is_none_or(|top| row.specificity > top.specificity) {
+                best = Some(row);
+            }
+        }
+        best.map(|row| row.endpoint.clone())
     }
+}
+
+/// How specifically a pattern pins an IRI: the count of LITERAL (non-variable)
+/// characters in it. A `{var}` matches an unbounded run, so it contributes
+/// nothing; everything the pattern actually spells out counts. An exact IRI
+/// therefore scores its own length, which no template matching the same string
+/// can reach (a template's captures are non-empty), so exact rows outrank
+/// template rows for free.
+fn literal_len(pattern: &UriTemplate) -> usize {
+    // `variables()` yields every occurrence in order, so a repeated variable is
+    // subtracted once per appearance — `{var}` costs its name plus both braces.
+    pattern.source().len() - pattern.variables().map(|var| var.len() + 2).sum::<usize>()
+}
+
+/// The catalog row that names `target`: the most specific matching pattern, ties
+/// broken by catalog order — the same rule [`RemoteNames`] applies to a mount's
+/// forwarded targets, over a plain slice of entries.
+///
+/// This is what a *renderer* wants (the REPL's `trace` labels each span's target
+/// with the endpoint that served it), and the reason it can't just take the first
+/// matching row is the same one: nested routes. `urn:repo:{repo}:pr:{n}` matches
+/// `urn:repo:x:pr:12:explain` too, so a first-match (or, worse, a match on the
+/// literal prefix before the first `{`) names the parent route for every child.
+///
+/// `None` when nothing matches, and for patterns that are neither IRIs nor
+/// parseable templates — a caller with a looser fallback can still apply it.
+pub fn naming_entry<'a>(entries: &'a [SpaceEntry], target: &Iri) -> Option<&'a SpaceEntry> {
+    let mut best: Option<(usize, &SpaceEntry)> = None;
+    for entry in entries {
+        let Ok(pattern) = UriTemplate::parse(&entry.pattern) else {
+            continue;
+        };
+        if pattern.match_iri(target).is_none() {
+            continue;
+        }
+        let specificity = literal_len(&pattern);
+        if best.is_none_or(|(top, _)| specificity > top) {
+            best = Some((specificity, entry));
+        }
+    }
+    best.map(|(_, entry)| entry)
 }
 
 /// A [`Space`] that resolves every request under its mount into a *remote* kernel:
@@ -854,6 +913,136 @@ mod tests {
             panic!("a mounted remote always hits under its prefix");
         };
         assert_eq!(resolved.endpoint.name(), "status");
+    }
+
+    /// A remote whose catalog NESTS one route inside another — ikigai-browse's PR
+    /// rows, with the shorter pattern listed first (the order that broke).
+    struct NestedRemote;
+
+    impl Resolver for NestedRemote {
+        fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), Error> {
+            // Meta answers for the target asked about, the way the real wire does —
+            // so the description is right even where the client's label is wrong.
+            let bytes = if request.verb == Verb::Meta {
+                let description = Description::new(name_of(request.target.as_str()))
+                    .verb(Verb::Source)
+                    .input(ikigai_core::ArgSpec::new("repo").binding())
+                    .input(ikigai_core::ArgSpec::new("n").binding());
+                serde_json::to_vec(&description).expect("description serializes")
+            } else {
+                b"ok".to_vec()
+            };
+            Ok((
+                Representation::new(ReprType::new("application/json"), bytes),
+                CacheStatus::Uncacheable,
+            ))
+        }
+
+        fn is_cached(&self, _request: &Request, _capability: &Capability) -> bool {
+            false
+        }
+
+        fn entries(&self) -> Option<Vec<SpaceEntry>> {
+            Some(vec![
+                SpaceEntry::new("urn:repo:{repo}:pr:{n}", "browse-pr"),
+                SpaceEntry::new("urn:repo:{repo}:pr:{n}:explain", "browse-explain"),
+                SpaceEntry::new("urn:repo:{repo}:pr:{n}:review", "browse-review"),
+            ])
+        }
+    }
+
+    /// The remote's own routing — the Rust logic no pattern string can express:
+    /// the PR row rejects an `n` that spans a `:`, so the nested routes win.
+    fn name_of(target: &str) -> &'static str {
+        if target.ends_with(":explain") {
+            "browse-explain"
+        } else if target.ends_with(":review") {
+            "browse-review"
+        } else {
+            "browse-pr"
+        }
+    }
+
+    fn nested_name_for(target: &str) -> String {
+        let mounted = MountedRemote::overriding(Arc::new(NestedRemote), "urn:repo:", "test://peer");
+        let _ = mounted.entries(); // the catalog walk that fills the name map
+        let request = Request::new(Verb::Source, ikigai_core::Iri::parse(target).unwrap());
+        let Resolution::Hit(resolved) = mounted.resolve(&request, &Scope::empty()) else {
+            panic!("a mounted remote always hits under its prefix");
+        };
+        resolved.endpoint.name().to_string()
+    }
+
+    /// A NESTED remote route must be named by its own catalog row. The parent
+    /// pattern `urn:repo:{repo}:pr:{n}` matches `…:pr:12:explain` too (`{n}`
+    /// captures `12:explain`), so replaying the catalog in order labelled every
+    /// child route `browse-pr` — the client can't see the remote's rejection of an
+    /// `n` spanning a `:`, only its pattern string. Most-specific-wins reads the
+    /// nesting straight off the literals.
+    #[test]
+    fn a_nested_remote_route_is_named_by_its_own_row() {
+        assert_eq!(
+            nested_name_for("urn:repo:acme:pr:12:explain"),
+            "browse-explain",
+            "the longer row names the nested route, though the shorter one matches \
+             and is listed first"
+        );
+        assert_eq!(
+            nested_name_for("urn:repo:acme:pr:12:review"),
+            "browse-review"
+        );
+        // …and the parent route still names itself: specificity narrows, it doesn't
+        // just prefer the longest row in the catalog.
+        assert_eq!(nested_name_for("urn:repo:acme:pr:12"), "browse-pr");
+    }
+
+    /// The nesting reaches the manifold: every PR-grain row survives the kernel's
+    /// probe guard under its own name, so all three project as tools rather than
+    /// two of them being swallowed by the shorter sibling's label.
+    #[test]
+    fn every_nested_row_reaches_the_mounted_manifold() {
+        let mounted = MountedRemote::overriding(Arc::new(NestedRemote), "urn:repo:", "test://peer");
+        let kernel = Kernel::new(Arc::new(mounted));
+        let entries = scoped_entries(&kernel, &Capability::root());
+        for pattern in [
+            "urn:repo:{repo}:pr:{n}",
+            "urn:repo:{repo}:pr:{n}:explain",
+            "urn:repo:{repo}:pr:{n}:review",
+        ] {
+            assert!(
+                entries.iter().any(|e| e.pattern == pattern),
+                "`{pattern}` is in the mounted manifold; got {entries:?}"
+            );
+        }
+    }
+
+    /// The same rule, over a plain catalog slice — what the REPL's `trace` renderer
+    /// applies to label a span with the endpoint that served it.
+    #[test]
+    fn naming_entry_picks_the_most_specific_row() {
+        let entries = NestedRemote.entries().expect("catalog");
+        let name = |target: &str| {
+            naming_entry(&entries, &ikigai_core::Iri::parse(target).unwrap())
+                .map(|entry| entry.endpoint.as_str())
+        };
+        assert_eq!(name("urn:repo:acme:pr:12:explain"), Some("browse-explain"));
+        assert_eq!(name("urn:repo:acme:pr:12"), Some("browse-pr"));
+        assert_eq!(name("urn:other:thing"), None);
+    }
+
+    /// An exact row outranks a template that also matches — its literals span the
+    /// whole IRI, which a template's non-empty captures never leave room for.
+    #[test]
+    fn naming_entry_prefers_an_exact_row_over_a_template() {
+        let entries = vec![
+            SpaceEntry::new("urn:file:{path}", "file"),
+            SpaceEntry::new("urn:file:special", "special"),
+        ];
+        let target = ikigai_core::Iri::parse("urn:file:special").unwrap();
+        assert_eq!(
+            naming_entry(&entries, &target).map(|e| e.endpoint.as_str()),
+            Some("special")
+        );
     }
 
     /// The wire catalog is rebuilt from the action manifold, but a mounted
