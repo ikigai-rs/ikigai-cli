@@ -638,7 +638,26 @@ fn base_space(nature: &'static str) -> EndpointSpace {
 /// documents — so the owner's root capability grants files only within this tree.
 /// The CLI mints `read-only`/`write`/`delete` `cap` profiles against this root,
 /// and the file endpoint's jail makes it the hard floor regardless of capability.
+///
+/// **A test must never land on the real workspace**, and two mechanisms keep it off:
+/// [`set_file_root`] for callers outside this crate, and — for this crate's own unit
+/// tests, which cannot call a setter before the harness starts — a throwaway per-thread
+/// directory substituted under `cfg(test)`.
+///
+/// Twelve of the bindings in [`root_space`] reach this function, so a test that merely
+/// builds a kernel — the case that looks like nothing at the call site — would otherwise
+/// create the developer's real `~/.ikigai/workspace`, bind the file module to it, and load
+/// whatever `*.scm` handlers happen to sit there. Nothing fails when it does: the test
+/// passes, and what it exercised depends on the machine it ran on. The substitution lives
+/// here rather than in each test because the call sites are what make it invisible.
 pub fn file_root() -> PathBuf {
+    if let Some(root) = FILE_ROOT_OVERRIDE.lock().expect("file root lock").clone() {
+        let _ = std::fs::create_dir_all(&root);
+        return root;
+    }
+    #[cfg(test)]
+    let root = tests::thread_file_root();
+    #[cfg(not(test))]
     let root = std::env::var_os("IKIGAI_FILES")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -647,6 +666,23 @@ pub fn file_root() -> PathBuf {
         });
     let _ = std::fs::create_dir_all(&root);
     root
+}
+
+static FILE_ROOT_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Point [`file_root`] somewhere other than `$IKIGAI_FILES` / `~/.ikigai/workspace`.
+///
+/// The channel an **integration test** uses to stay hermetic. `cfg(test)` does not reach
+/// them: a `tests/` binary links this crate compiled without it, so `calendar_server_kernel*`
+/// and `trusted_kernel_for` resolve the developer's real data home from a call that reads as
+/// ordinary setup — which is precisely how this class of bug hides. A typed setter rather
+/// than another environment variable, matching [`set_code_signers_dir`] and the rule that
+/// configuration arrives by flag or config home, not by ambient env.
+///
+/// Process-global, so one test binary's tests must not each set a different root — the same
+/// constraint `set_code_signers_dir` and [`set_eval_timeout_secs`] already carry.
+pub fn set_file_root(dir: PathBuf) {
+    *FILE_ROOT_OVERRIDE.lock().expect("file root lock") = Some(dir);
 }
 
 /// The consolidated-view calendar config: `IKIGAI_CALENDAR_CONFIG`, else
@@ -4470,6 +4506,59 @@ mod tests {
     use super::*;
     use futures::executor::block_on;
     use ikigai_core::{ArgRef, Capability, Iri, Request};
+
+    thread_local! {
+        static FILE_ROOT: std::cell::OnceCell<PathBuf> = const { std::cell::OnceCell::new() };
+    }
+
+    /// The workspace root [`file_root`] resolves to while testing: a throwaway directory,
+    /// one per thread, stable for that thread's life.
+    ///
+    /// Per-THREAD because the tests run in parallel and each gets its own thread — two
+    /// sharing a workspace would race on the same files. STABLE within a thread because a
+    /// test that sinks through one endpoint must read it back through another. This is the
+    /// same reasoning `passkey::store_root` already spells out for its own files, and the
+    /// reason neither uses the process-global `IKIGAI_FILES`: an env var is one value for
+    /// the whole process, so parallel tests would overwrite each other's setting.
+    pub(super) fn thread_file_root() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        FILE_ROOT.with(|cell| {
+            cell.get_or_init(|| {
+                std::env::temp_dir().join(format!(
+                    "ikigai-embedded-test-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ))
+            })
+            .clone()
+        })
+    }
+
+    /// The guard for the whole class of bug this file's `cfg(test)` branch exists to stop:
+    /// a test must never resolve the developer's real workspace.
+    ///
+    /// Asserted here rather than trusted to review because the damage is silent — the
+    /// offending call is a plain `root_space()` or `kernel()`, which reads as setup, and a
+    /// test that inherits `~/.ikigai/workspace` still passes. An earlier comment in this
+    /// workspace already asked for hermetic tests and did not reach the call sites; a
+    /// failing test reaches them.
+    #[test]
+    fn the_test_workspace_is_never_the_developers_real_one() {
+        let root = file_root();
+        if let Some(home) = std::env::var_os("HOME") {
+            let real = PathBuf::from(home).join(".ikigai");
+            assert!(
+                !root.starts_with(&real),
+                "file_root() is {root:?}, inside the real data home {real:?}"
+            );
+        }
+        assert!(root.starts_with(std::env::temp_dir()), "{root:?}");
+        // Stable within the thread: a sink and a later source must agree on the path.
+        assert_eq!(root, file_root());
+        // And building the whole local space — the innocuous-looking call — stays inside it.
+        let _ = root_space();
+        assert!(root.is_dir(), "{root:?}");
+    }
 
     /// The prelude must be VALID STEEL, and getting there took four failed shapes — each
     /// of which produced `FreeIdentifier: ##rest2`, Steel's opaque report for a rest-arg
