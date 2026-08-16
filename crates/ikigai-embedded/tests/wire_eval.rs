@@ -22,6 +22,16 @@ fn the_served_eval_is_governed_clamped_and_absent_without_optin() {
     // ALL process-global config — including the signed-run door's — before any
     // kernel exists; this single test fn owns it (see signed_run_door).
     ikigai_embedded::set_eval_timeout_secs(2);
+
+    // The workspace root FIRST, before any kernel: the served kernels below bind the file
+    // module, the intray spaces and the client registry to `file_root()`, so without this
+    // they would create and bind the developer's real `~/.ikigai/workspace`. `cfg(test)`
+    // does not reach an integration test — it links the crate compiled without it — so the
+    // hermetic root has to be asked for here.
+    let workspace = std::env::temp_dir().join("ikigai-wire-eval-workspace");
+    let _ = std::fs::remove_dir_all(&workspace);
+    std::fs::create_dir_all(&workspace).expect("workspace root");
+    ikigai_embedded::set_file_root(workspace);
     let dir = std::env::temp_dir().join("ikigai-code-signers-test");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("signers dir");
