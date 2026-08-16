@@ -1850,12 +1850,20 @@ fn render_trace_event(
     }
 }
 
-/// The endpoint name bound to `iri` in `entries` (exact, then template prefix).
+/// The endpoint name bound to `iri` in `entries` — the most specific matching
+/// pattern ([`naming_entry`](ikigai_resolve::naming_entry)), falling back to the
+/// old literal-prefix scan for patterns that don't parse as templates (display
+/// sugar like `urn:x[:{y}]`, which nothing can properly match).
+///
+/// Specificity is what makes NESTED routes come out right: `urn:repo:{repo}:pr:{n}`
+/// matches `urn:repo:x:pr:12:explain` as surely as `urn:repo:{repo}:pr:{n}:explain`
+/// does, and the prefix scan couldn't tell them apart at all (both start
+/// `urn:repo:`), so a trace through a mount named the parent route for every child.
 fn endpoint_name(entries: &[ikigai_core::SpaceEntry], iri: &Iri) -> String {
-    let target = iri.as_str();
-    if let Some(entry) = entries.iter().find(|entry| entry.pattern == target) {
+    if let Some(entry) = ikigai_resolve::naming_entry(entries, iri) {
         return entry.endpoint.clone();
     }
+    let target = iri.as_str();
     if let Some(entry) = entries.iter().find(|entry| {
         entry.pattern.contains('{')
             && target.starts_with(entry.pattern.split('{').next().unwrap_or(""))
@@ -3527,6 +3535,41 @@ mod tests {
         assert_eq!(
             declared_arguments(Some(&description)),
             vec!["tuple", "match"]
+        );
+    }
+
+    /// A trace labels each span with the endpoint bound to its target, and NESTED
+    /// routes share a prefix all the way down: `urn:repo:{repo}:pr:{n}` matches
+    /// `urn:repo:acme:pr:12:explain` (its trailing `{n}` swallows `12:explain`), and
+    /// the old scan compared only the literal head before the first `{`, so both
+    /// children were labelled with the parent's endpoint. Most-specific-wins names
+    /// each route for itself.
+    #[test]
+    fn endpoint_name_labels_a_nested_route_with_its_own_endpoint() {
+        use ikigai_core::SpaceEntry;
+        let entries = vec![
+            SpaceEntry::new("urn:repo:{repo}:pr:{n}", "browse-pr"),
+            SpaceEntry::new("urn:repo:{repo}:pr:{n}:explain", "browse-explain"),
+            SpaceEntry::new("urn:status", "status"),
+        ];
+        let name = |target: &str| endpoint_name(&entries, &Iri::parse(target).unwrap());
+        assert_eq!(name("urn:repo:acme:pr:12:explain"), "browse-explain");
+        assert_eq!(name("urn:repo:acme:pr:12"), "browse-pr");
+        assert_eq!(name("urn:status"), "status");
+        assert_eq!(name("urn:nothing:here"), "?");
+    }
+
+    /// A pattern that doesn't parse as a template (here, ambiguous adjacent
+    /// variables) can't be matched properly by anyone — it still labels by its
+    /// literal head, the pre-existing scan kept as the fallback so no trace line
+    /// regresses to `?`.
+    #[test]
+    fn endpoint_name_falls_back_to_the_literal_prefix_for_unparseable_patterns() {
+        use ikigai_core::SpaceEntry;
+        let entries = vec![SpaceEntry::new("urn:org:agenda:{a}{b}", "org-agenda")];
+        assert_eq!(
+            endpoint_name(&entries, &Iri::parse("urn:org:agenda:week").unwrap()),
+            "org-agenda"
         );
     }
 }
