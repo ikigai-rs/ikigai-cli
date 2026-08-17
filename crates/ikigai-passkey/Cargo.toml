@@ -7,9 +7,13 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-# Held back from crates.io until the verifier has been exercised against a live device and the
-# challenge/session endpoints that consume it have settled.
-publish = false
+# Published from 0.1.14 despite the caution this line used to carry — the verifier had not been
+# exercised against a live device, and the challenge/session endpoints had not settled. Neither
+# is resolved; what changed is that holding it back stopped being free. ikigai-embedded depends
+# on this crate, and a path-only dependency with no version makes EVERY crate above it in the
+# workspace unpublishable — including the ikigai binary itself, which had been silently
+# unreleasable since July because of it. A 0.x version already promises nothing about stability,
+# which is the honest place for something still settling.
 
 [dependencies]
 # ES256 (ECDSA over NIST P-256) is what Apple, Android and Windows platform authenticators
