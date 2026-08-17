@@ -2457,17 +2457,33 @@ dependencies = [
 ]
 
 [[package]]
-name = "ikigai-browse"
-version = "0.2.0"
+name = "ikigai-a11y"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2914367c0420456d785f86b41be54ed6bd9f6dbd842f8b2b0e91e158e645733b"
+checksum = "6cbbb4ad11f41d5e37ef7a223ff8ae3334a4ae389d3fdaddf6dc44461fec5ed3"
+dependencies = [
+ "ikigai-core",
+ "serde",
+ "serde_json",
+ "syntect",
+ "toml 0.8.23",
+ "two-face",
+]
+
+[[package]]
+name = "ikigai-browse"
+version = "0.2.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18cc4e2859d2f91d691afc8e45e3a6c3c5b06f2271c70ee4227104c4dc35f1bb"
 dependencies = [
  "async-trait",
+ "ikigai-a11y",
  "ikigai-core",
  "oxigraph",
  "serde_json",
  "sha2 0.10.9",
  "syntect",
+ "two-face",
  "uuid",
 ]
 
@@ -2504,9 +2520,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-core"
-version = "0.1.54"
+version = "0.1.59"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "602e28bfc94e929dcb9931bf0f772d2193231f13494f516cdd4003191f2fb8af"
+checksum = "330e3d2dfd896c988232eb4f3620214f66029b8d2808b5c4ed6b608e640fc281"
 dependencies = [
  "async-trait",
  "blake3",
@@ -7002,6 +7018,7 @@ dependencies = [
  "serde",
  "serde_spanned 0.6.9",
  "toml_datetime 0.6.11",
+ "toml_write",
  "winnow 0.7.15",
 ]
 
@@ -7025,6 +7042,12 @@ checksum = "a2abe9b86193656635d2411dc43050282ca48aa31c2451210f4202550afb7526"
 dependencies = [
  "winnow 1.0.3",
 ]
+
+[[package]]
+name = "toml_write"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "toml_writer"
@@ -7114,6 +7137,17 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
+name = "two-face"
+version = "0.5.2+bat-0.26.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "915be7adc2ff6f4338acbf71f3eda0a146f46003b992a1669c674308610efdac"
+dependencies = [
+ "serde",
+ "serde_derive",
+ "syntect",
+]
 
 [[package]]
 name = "type-map"
