@@ -390,7 +390,7 @@ mod tests {
         let config = EmailConfig {
             host: "localhost".to_string(),
             port: 25,
-            from: "site@bosatsu.net".to_string(),
+            from: "site@example.com".to_string(),
         };
         Kernel::new(Arc::new(space(config, transport)))
     }
@@ -414,8 +414,8 @@ mod tests {
         let k = kernel(mail.clone());
         let rep = block_on(k.issue(
             send_request(&[
-                ("to", "brian@bosatsu.net"),
-                ("subject", "Enquiry from bosatsu.net"),
+                ("to", "owner@example.com"),
+                ("subject", "Enquiry from example.com"),
                 ("reply_to", "someone@example.com"),
                 ("content", "Hello, I would like to talk."),
             ]),
@@ -424,10 +424,10 @@ mod tests {
         .unwrap();
         assert!(String::from_utf8(rep.bytes)
             .unwrap()
-            .contains("sent to brian@bosatsu.net"));
+            .contains("sent to owner@example.com"));
         let sent = mail.sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].from, "site@bosatsu.net", "the configured From");
+        assert_eq!(sent[0].from, "site@example.com", "the configured From");
         assert_eq!(sent[0].reply_to.as_deref(), Some("someone@example.com"));
         assert_eq!(sent[0].body, "Hello, I would like to talk.");
     }
@@ -445,7 +445,7 @@ mod tests {
         let k = Kernel::new(Arc::new(space(config, mail.clone())));
         let err = block_on(k.issue(
             send_request(&[
-                ("to", "brian@bosatsu.net"),
+                ("to", "owner@example.com"),
                 ("subject", "x"),
                 ("content", "y"),
             ]),
@@ -468,7 +468,7 @@ mod tests {
         // public contact form becomes an open relay.
         let err = block_on(k.issue(
             send_request(&[
-                ("to", "brian@bosatsu.net"),
+                ("to", "owner@example.com"),
                 ("subject", "Hi\nBcc: victim@example.com"),
                 ("content", "body"),
             ]),
@@ -482,7 +482,7 @@ mod tests {
         // Same for the recipient itself.
         let err = block_on(k.issue(
             send_request(&[
-                ("to", "brian@bosatsu.net\nBcc: victim@example.com"),
+                ("to", "owner@example.com\nBcc: victim@example.com"),
                 ("subject", "Hi"),
                 ("content", "body"),
             ]),
@@ -521,7 +521,7 @@ mod tests {
         let k = kernel(mail);
         let err = block_on(k.issue(
             send_request(&[
-                ("to", "brian@bosatsu.net"),
+                ("to", "owner@example.com"),
                 ("subject", "Hi"),
                 ("content", "b"),
             ]),
@@ -540,7 +540,7 @@ mod tests {
         });
         let err = block_on(kernel(permanent).issue(
             send_request(&[
-                ("to", "brian@bosatsu.net"),
+                ("to", "owner@example.com"),
                 ("subject", "Hi"),
                 ("content", "b"),
             ]),
@@ -556,7 +556,7 @@ mod tests {
         let k = kernel(mail.clone());
         let err = block_on(k.issue(
             send_request(&[
-                ("to", "brian@bosatsu.net"),
+                ("to", "owner@example.com"),
                 ("subject", "Hi"),
                 ("content", "b"),
             ]),
@@ -574,7 +574,7 @@ mod ics_tests {
 
     fn msg(ics: Option<&str>) -> Outgoing {
         Outgoing {
-            from: "brian@bosatsu.net".to_string(),
+            from: "owner@example.com".to_string(),
             to: "nigel@ukclient.example".to_string(),
             reply_to: None,
             subject: "Your meeting is confirmed".to_string(),
@@ -584,7 +584,7 @@ mod ics_tests {
     }
 
     const INVITE: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\n\
-                          UID:abc@bosatsu.net\r\nSUMMARY:Call with Brian Sletten\r\n\
+                          UID:abc@example.com\r\nSUMMARY:Call with Ada Lovelace\r\n\
                           END:VEVENT\r\nEND:VCALENDAR\r\n";
 
     /// A wire-bytes rendering of the built message, for structural assertions.
@@ -612,7 +612,7 @@ mod ics_tests {
         // The plain body survives as the fallback alternative.
         assert!(w.contains("We're on for tomorrow."), "{w}");
         // And the invite itself is in there.
-        assert!(w.contains("SUMMARY:Call with Brian Sletten"), "{w}");
+        assert!(w.contains("SUMMARY:Call with Ada Lovelace"), "{w}");
     }
 
     #[test]
