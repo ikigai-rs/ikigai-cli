@@ -20,6 +20,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -45,6 +46,64 @@ pub enum Scheduler {
     },
 }
 
+/// A scheduler configuration — `single`, `pool`, or `pool:N` — parsed but not yet built.
+///
+/// Parsing is deliberately separate from construction: [`Scheduler::pool`] SPAWNS WORKER
+/// THREADS, while a `--scheduler` flag has to be validated as argv is read, before the
+/// process has decided anything at all. Without the split, "is this spec valid?" could
+/// only be answered by building a threadpool and throwing it away — so a host would be
+/// pushed toward accepting a typo and falling back silently, which is exactly the failure
+/// a flag must not have.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchedulerSpec {
+    /// `single` — [`Scheduler::single`].
+    Single,
+    /// `pool:N`, and bare `pool` as `Pool(0)` — one worker per available core, resolved
+    /// at build time (the core count is a property of the machine, not of the spec).
+    Pool(usize),
+}
+
+impl SchedulerSpec {
+    /// Build the scheduler this spec names. `Pool(0)` resolves to one worker per core.
+    pub fn build(self) -> Scheduler {
+        match self {
+            SchedulerSpec::Single => Scheduler::single(),
+            SchedulerSpec::Pool(size) => Scheduler::pool(size),
+        }
+    }
+}
+
+impl FromStr for SchedulerSpec {
+    type Err = String;
+
+    fn from_str(spec: &str) -> Result<Self, String> {
+        match spec.trim() {
+            "single" => Ok(SchedulerSpec::Single),
+            "pool" => Ok(SchedulerSpec::Pool(0)),
+            s => match s.strip_prefix("pool:") {
+                Some(n) => n
+                    .parse::<usize>()
+                    .map(SchedulerSpec::Pool)
+                    .map_err(|_| format!("invalid pool size in `{spec}` (expected `pool:N`)")),
+                None => Err(format!(
+                    "unknown scheduler `{spec}` (single | pool | pool:N)"
+                )),
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for SchedulerSpec {
+    /// The canonical spelling of the spec — round-trips through [`FromStr`].
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SchedulerSpec::Single => f.write_str("single"),
+            SchedulerSpec::Pool(0) => f.write_str("pool"),
+            SchedulerSpec::Pool(size) => write!(f, "pool:{size}"),
+        }
+    }
+}
+
 impl Scheduler {
     /// A single-threaded scheduler (`block_on`).
     pub fn single() -> Self {
@@ -66,21 +125,12 @@ impl Scheduler {
         }
     }
 
-    /// Parse a scheduler from a config string: `single`, `pool` (cores), or `pool:N`.
+    /// Parse a scheduler from a config string (`single`, `pool` (cores), or `pool:N`)
+    /// and build it. Sugar over [`SchedulerSpec`]: parse and construction are separate
+    /// steps because a *flag* must be rejected while argv is being read, long before
+    /// anything decides to spawn threads.
     pub fn from_config(spec: &str) -> Result<Self, String> {
-        match spec.trim() {
-            "single" => Ok(Self::single()),
-            "pool" => Ok(Self::pool(0)),
-            s => match s.strip_prefix("pool:") {
-                Some(n) => n
-                    .parse::<usize>()
-                    .map(Self::pool)
-                    .map_err(|_| format!("invalid pool size in `{spec}` (expected `pool:N`)")),
-                None => Err(format!(
-                    "unknown scheduler `{spec}` (single | pool | pool:N)"
-                )),
-            },
-        }
+        spec.parse::<SchedulerSpec>().map(SchedulerSpec::build)
     }
 
     /// Run `task` to completion, blocking the calling thread (the top-level submit)
@@ -318,6 +368,44 @@ mod tests {
             3,
             "all children ran on the 1-worker pool — the parent parked rather than blocked"
         );
+    }
+
+    /// A spec is validated WITHOUT building: this is what lets `--scheduler pool:xyz`
+    /// be rejected at argv time instead of quietly becoming `single`.
+    #[test]
+    fn a_spec_parses_and_round_trips_without_building_anything() {
+        assert_eq!(
+            "single".parse::<SchedulerSpec>().unwrap(),
+            SchedulerSpec::Single
+        );
+        assert_eq!(
+            "pool".parse::<SchedulerSpec>().unwrap(),
+            SchedulerSpec::Pool(0)
+        );
+        assert_eq!(
+            " pool:4 ".parse::<SchedulerSpec>().unwrap(),
+            SchedulerSpec::Pool(4)
+        );
+        assert!("pool:xyz".parse::<SchedulerSpec>().is_err());
+        assert!("nonsense".parse::<SchedulerSpec>().is_err());
+        // The canonical spelling round-trips, so a host can report the spec it resolved
+        // and have that report be re-readable as configuration.
+        for spec in [
+            SchedulerSpec::Single,
+            SchedulerSpec::Pool(0),
+            SchedulerSpec::Pool(4),
+        ] {
+            assert_eq!(spec.to_string().parse::<SchedulerSpec>().unwrap(), spec);
+        }
+    }
+
+    /// `pool:N` gives the fan-out N workers — the width the whole point of configuring
+    /// this is to obtain.
+    #[test]
+    fn a_pool_spec_builds_the_width_it_names() {
+        assert_eq!(SchedulerSpec::Pool(4).build().threads(), 4);
+        assert_eq!(SchedulerSpec::Single.build().threads(), 1);
+        assert!(SchedulerSpec::Pool(0).build().threads() >= 1);
     }
 
     #[test]

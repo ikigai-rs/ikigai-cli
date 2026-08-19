@@ -56,6 +56,11 @@ usage:
   ikigai --daemon              headless: timers, the watcher, and the standing sync — for launchd
   ikigai --name <instance>     name this instance (scopes <name>.* config properties; defaults
                                repl / daemon / serve by mode)
+  ikigai --scheduler <spec>    fan-out width: single | pool | pool:N (any mode). Also
+                               `scheduler = \"pool:N\"` in the config home (instance-scoped as
+                               <name>.scheduler); IKIGAI_SCHEDULER still works, deprecated.
+                               `source urn:kernel:scheduler` reports the width AND the channel
+                               that set it — the DEFAULT `single` runs every fan-out serially
   ikigai --mount <p>=<t>       graft a remote namespace at prefix <p> (ALIAS: <p>rest → urn:rest
                                on the remote, tried after local; --cert-dir after it is ITS cert set)
   ikigai --override <p>=<t>    the SAME namespace, served remotely: IRIs forward unchanged and win
@@ -238,6 +243,29 @@ fn cert_flag(
     Ok(true)
 }
 
+/// If `arg` is `--scheduler`, consume its spec (`single` | `pool` | `pool:N`) and declare
+/// it for this process. Accepted by every mode — a served kernel, the daemon, `mcp` and
+/// the REPL all fan out on the same process scheduler.
+///
+/// **An invalid spec is an error here, not a fallback.** A typo'd `--scheduler pool:xyz`
+/// quietly becoming `single` would leave the operator believing the host is N-wide while
+/// it is one-wide — and a serialized fan-out is indistinguishable from a slow server from
+/// outside the process. The deprecated `IKIGAI_SCHEDULER` keeps its lenient
+/// warn-and-fall-back behaviour, because services in the field already set it.
+fn scheduler_flag(arg: &str, argv: &mut impl Iterator<Item = String>) -> Result<bool, String> {
+    if arg != "--scheduler" {
+        return Ok(false);
+    }
+    let spec = argv
+        .next()
+        .ok_or_else(|| "--scheduler needs <single|pool|pool:N>".to_string())?;
+    #[cfg(feature = "embedded")]
+    ikigai_embedded::set_scheduler_spec(spec.as_str()).map_err(|e| format!("--scheduler: {e}"))?;
+    #[cfg(not(feature = "embedded"))]
+    let _ = spec;
+    Ok(true)
+}
+
 /// Parse argv. `Ok(None)` means a usage request was handled and we should exit 0.
 fn parse_args() -> Result<Option<Mode>, String> {
     parse_argv(std::env::args().skip(1))
@@ -332,6 +360,9 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 if let Some(mount) = mounts.last_mut() {
                     mount.certs = certs.clone();
                 }
+                continue;
+            }
+            if scheduler_flag(&arg, &mut argv)? {
                 continue;
             }
             if arg == "--announce" {
@@ -500,6 +531,9 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 });
                 continue;
             }
+            if scheduler_flag(&arg, &mut argv)? {
+                continue;
+            }
             match arg.as_str() {
                 "--grant" => grants.push(
                     argv.next()
@@ -531,6 +565,9 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
             None => &mut repl.certs,
         };
         if cert_flag(&arg, &mut argv, cert_target)? {
+            continue;
+        }
+        if scheduler_flag(&arg, &mut argv)? {
             continue;
         }
         match arg.as_str() {
@@ -1058,8 +1095,11 @@ fn build_engine(
         // The watched kernel: cached workspace reads also invalidate on an
         // out-of-band file change (an editor), not just a `sink` through the REPL.
         // The same process scheduler drives both the kernel's fan-out and the
-        // engine's `( a ; b )` / `..` parallelism, so `IKIGAI_SCHEDULER=pool:N`
-        // governs all of it. Any `--mount`s compose remote kernels into it.
+        // engine's `( a ; b )` / `..` parallelism, so `--scheduler pool:N` (or the
+        // config home's `scheduler` key) governs all of it — and at the default
+        // `single` all of it runs SEQUENTIALLY, because a Single scheduler polls its
+        // tasks cooperatively on one thread and the HTTP transport blocks that thread.
+        // Any `--mount`s compose remote kernels into it.
         None => {
             // No mount flags -> the machine's own topology (config home). Only here in
             // the EMBEDDED branch: a `--connect` client composes nothing — the host it
@@ -2674,5 +2714,74 @@ mod mount_flag_tests {
             panic!("nothing listens at the absent socket");
         };
         assert!(err.contains("--mount: connect"), "{err}");
+    }
+}
+
+/// `--scheduler`, the flag half of the fan-out width. The precedence ladder itself
+/// (flag > config > env > `single`) is pinned in `ikigai_embedded::scheduling`, which can
+/// test it as a pure function; what belongs here is that argv reaches that ladder from
+/// every mode, and that a bad spec stops the process instead of silently narrowing it.
+#[cfg(test)]
+mod scheduler_flag_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Option<Mode>, String> {
+        parse_argv(args.iter().map(|s| s.to_string()))
+    }
+
+    /// The failure this exists to prevent: a typo'd width that becomes `single` and is
+    /// invisible from outside the process — a serialized fan-out looks exactly like a
+    /// slow server. Every mode fans out on the process scheduler, so every mode rejects.
+    #[cfg(feature = "embedded")]
+    #[test]
+    fn an_invalid_scheduler_spec_stops_the_process_in_every_mode() {
+        for args in [
+            vec!["--scheduler", "pool:xyz"],
+            vec!["--daemon", "--scheduler", "pool:xyz"],
+            vec!["serve", "--scheduler", "pool:xyz"],
+            vec!["mcp", "--scheduler", "pool:xyz"],
+        ] {
+            let Err(e) = parse(&args) else {
+                panic!("a typo'd spec must not fall back to single: {args:?}")
+            };
+            assert!(
+                e.contains("--scheduler") && e.contains("pool:xyz"),
+                "the error must name the flag and the bad value, got: {e}"
+            );
+        }
+        assert!(parse(&["--scheduler", "nonsense"]).is_err());
+    }
+
+    /// A flag that eats the next argument must say so when there is none, rather than
+    /// treating the following flag as its value.
+    #[test]
+    fn the_scheduler_flag_requires_a_spec() {
+        let Err(e) = parse(&["--scheduler"]) else {
+            panic!("a flag with no value is an error")
+        };
+        assert!(e.contains("--scheduler"), "{e}");
+    }
+
+    /// Accepted in every mode: a served kernel, the daemon, `mcp` and the REPL all drive
+    /// the same process scheduler. (This arms the process-global setting for the rest of
+    /// this test binary — nothing else here builds a kernel.)
+    #[test]
+    fn a_valid_scheduler_spec_parses_in_every_mode() {
+        assert!(matches!(
+            parse(&["--scheduler", "pool:2"]),
+            Ok(Some(Mode::Repl(_)))
+        ));
+        assert!(matches!(
+            parse(&["--daemon", "--scheduler", "pool"]),
+            Ok(Some(Mode::Daemon { .. }))
+        ));
+        assert!(matches!(
+            parse(&["serve", "--scheduler", "single"]),
+            Ok(Some(Mode::Serve { .. }))
+        ));
+        assert!(matches!(
+            parse(&["mcp", "--scheduler", "single"]),
+            Ok(Some(Mode::Mcp { .. }))
+        ));
     }
 }
