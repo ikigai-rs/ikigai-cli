@@ -21,6 +21,14 @@
 //! `urn:kernel:scheduler` naming the channel that decided it.
 //!
 //! Precedence: **flag > config > env > `single`**.
+//!
+//! The width the scheduler permits is also what a fan-out may *route* on: at two or more
+//! effectively-concurrent requests, the engine can append `needs=batchAt<=W` so a backend
+//! is chosen by the load shape rather than by a caller's guess (see
+//! `ikigai_engine::fanout`). That is a second setting, [`width_routing`], and it lives
+//! here because it is the same question — how wide is this host, really — read for a
+//! different purpose. It is **off by default and has no environment channel**: it is new,
+//! so nothing in the field sets it, and the env var was only ever kept for compatibility.
 
 use std::sync::OnceLock;
 
@@ -122,6 +130,122 @@ fn config_spec() -> Option<String> {
         .or_else(|| crate::config::get(CONFIG_KEY))
 }
 
+/// The config-home key: `width-routing = "on"` in `config.toml`, instance-scoped as
+/// `<instance>.width-routing`.
+pub const WIDTH_ROUTING_CONFIG_KEY: &str = "width-routing";
+
+/// Which channel set automatic width routing.
+///
+/// Deliberately *not* [`SchedulerSource`]: there is no environment channel here. The
+/// scheduler keeps one only because services in the field already set `IKIGAI_SCHEDULER`;
+/// a setting introduced today has no such debt, and an env var is the third channel this
+/// ecosystem rules out — visible only inside an already-running process, so it can be
+/// neither diffed nor version-controlled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoutingSource {
+    /// `--width-routing <on|off>` on the command line.
+    Flag,
+    /// `width-routing` (or `<instance>.width-routing`) in the config home.
+    Config,
+    /// Nothing said anything: off.
+    Default,
+}
+
+impl RoutingSource {
+    /// The row value: `flag` / `config` / `default`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RoutingSource::Flag => "flag",
+            RoutingSource::Config => "config",
+            RoutingSource::Default => "default",
+        }
+    }
+}
+
+/// The `--width-routing` value, declared while argv is being read (first write wins).
+static WIDTH_ROUTING_FLAG: OnceLock<bool> = OnceLock::new();
+
+/// Declare `--width-routing <on|off>` for this process.
+///
+/// Rejects anything else, for the same reason `--scheduler` does: a typo silently
+/// meaning "off" leaves the operator believing the host routes by load shape when it does
+/// not, and nothing in the process contradicts them.
+pub fn set_width_routing(value: &str) -> Result<(), String> {
+    let on = parse_switch(value)?;
+    let _ = WIDTH_ROUTING_FLAG.set(on);
+    Ok(())
+}
+
+/// Whether this process routes fan-outs by their measured width. **Off unless something
+/// says otherwise** — it changes which backend answers, and `ikigai-browse` keys its
+/// durable explanation archive on model identity, so turning it on without meaning to
+/// would write "which backend answered depends on how many siblings the request happened
+/// to have" permanently into a store.
+pub fn width_routing() -> bool {
+    resolved_routing().0
+}
+
+/// The channel that decided [`width_routing`].
+pub fn width_routing_source() -> RoutingSource {
+    resolved_routing().1
+}
+
+fn resolved_routing() -> &'static (bool, RoutingSource) {
+    static RESOLVED: OnceLock<(bool, RoutingSource)> = OnceLock::new();
+    RESOLVED.get_or_init(|| {
+        let (on, source, warnings) = decide_routing(
+            WIDTH_ROUTING_FLAG.get().copied(),
+            routing_config_spec().as_deref(),
+        );
+        for warning in &warnings {
+            eprintln!("ikigai: {warning}");
+        }
+        (on, source)
+    })
+}
+
+/// The width-routing setting from the config home, instance-scoped spelling first — the
+/// same rule the scheduler key uses, because a served kernel and a REPL read one file and
+/// want different answers.
+fn routing_config_spec() -> Option<String> {
+    crate::config::get(&format!(
+        "{}.{WIDTH_ROUTING_CONFIG_KEY}",
+        crate::instance_name()
+    ))
+    .or_else(|| crate::config::get(WIDTH_ROUTING_CONFIG_KEY))
+}
+
+/// `on`/`off` (and the `true`/`false` spelling a TOML-minded operator will try).
+fn parse_switch(value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" => Ok(true),
+        "off" | "false" => Ok(false),
+        other => Err(format!("`{other}` is not a width-routing setting (on|off)")),
+    }
+}
+
+/// The width-routing ladder as a PURE function of its two channels — flag > config > off
+/// — so the precedence is testable without a process or a config file.
+///
+/// A broken config line warns and leaves the switch OFF rather than bricking a supervised
+/// daemon, and off is the safe direction: it declines an optimization instead of silently
+/// changing which backend answers.
+fn decide_routing(flag: Option<bool>, config: Option<&str>) -> (bool, RoutingSource, Vec<String>) {
+    let mut warnings = Vec::new();
+    if let Some(on) = flag {
+        return (on, RoutingSource::Flag, warnings);
+    }
+    if let Some(value) = config {
+        match parse_switch(value) {
+            Ok(on) => return (on, RoutingSource::Config, warnings),
+            Err(e) => warnings.push(format!(
+                "{e} (from {WIDTH_ROUTING_CONFIG_KEY}); ignoring it"
+            )),
+        }
+    }
+    (false, RoutingSource::Default, warnings)
+}
+
 /// What the ladder decided, plus anything the operator should be told about it.
 struct Decision {
     spec: SchedulerSpec,
@@ -181,12 +305,36 @@ fn decide(flag: Option<&str>, config: Option<&str>, env: Option<&str>) -> Decisi
 pub struct ConfiguredScheduler {
     scheduler: Scheduler,
     source: SchedulerSource,
+    width_routing: bool,
+    routing_source: RoutingSource,
 }
 
 impl ikigai_core::SchedulerReporter for ConfiguredScheduler {
     fn rows(&self) -> Vec<(String, String)> {
         let mut rows = ikigai_core::SchedulerReporter::rows(&self.scheduler);
         rows.push(("source".to_string(), self.source.as_str().to_string()));
+        // Whether fan-outs route on their measured width, and who said so. A routing
+        // decision nobody can observe is one nobody can debug — and the answer an
+        // operator needs first is "is this even on?", which lives beside the width it
+        // routes on rather than in a second resource.
+        //
+        // The labels are short on purpose: the kernel renders these rows as
+        // `{label:<10} {value}`, so anything longer breaks the column for every row
+        // beside it. The VALUE carries the meaning instead — `routing by-width` says what
+        // `routing on` would have left the reader to guess.
+        rows.push((
+            "routing".to_string(),
+            if self.width_routing {
+                "by-width"
+            } else {
+                "off"
+            }
+            .to_string(),
+        ));
+        rows.push((
+            "routing.by".to_string(),
+            self.routing_source.as_str().to_string(),
+        ));
         rows
     }
 }
@@ -197,6 +345,8 @@ pub fn reporter() -> ConfiguredScheduler {
     ConfiguredScheduler {
         scheduler: scheduler.clone(),
         source: *source,
+        width_routing: width_routing(),
+        routing_source: width_routing_source(),
     }
 }
 
@@ -298,13 +448,93 @@ mod tests {
         let reporter = ConfiguredScheduler {
             scheduler: SchedulerSpec::Pool(3).build(),
             source: SchedulerSource::Config,
+            width_routing: false,
+            routing_source: RoutingSource::Default,
         };
         let rows = reporter.rows();
         assert!(rows.contains(&("backend".to_string(), "pool:3".to_string())));
         assert!(rows.contains(&("threads".to_string(), "3".to_string())));
-        assert_eq!(
-            rows.last(),
-            Some(&("source".to_string(), "config".to_string()))
+        assert!(rows.contains(&("source".to_string(), "config".to_string())));
+    }
+
+    /// The fan-out routing switch is readable from the same resource as the width it
+    /// routes on, and it says which channel set it — so "why did this host pick that
+    /// backend?" is a question the host answers about itself.
+    #[test]
+    fn the_reporter_states_whether_width_routing_is_on_and_who_said_so() {
+        let off = ConfiguredScheduler {
+            scheduler: SchedulerSpec::Single.build(),
+            source: SchedulerSource::Default,
+            width_routing: false,
+            routing_source: RoutingSource::Default,
+        };
+        assert!(off
+            .rows()
+            .contains(&("routing".to_string(), "off".to_string())));
+        assert!(off
+            .rows()
+            .contains(&("routing.by".to_string(), "default".to_string())));
+
+        let on = ConfiguredScheduler {
+            scheduler: SchedulerSpec::Pool(8).build(),
+            source: SchedulerSource::Flag,
+            width_routing: true,
+            routing_source: RoutingSource::Config,
+        };
+        assert!(on
+            .rows()
+            .contains(&("routing".to_string(), "by-width".to_string())));
+        assert!(on
+            .rows()
+            .contains(&("routing.by".to_string(), "config".to_string())));
+        // The kernel renders `{label:<10} {value}`: a longer label breaks the column.
+        for (label, _) in on.rows() {
+            assert!(label.len() <= 10, "`{label}` overflows the row column");
+        }
+    }
+
+    /// Width routing is OFF unless something says otherwise, the flag beats the config,
+    /// and each channel names itself. Off is the default because turning it on changes
+    /// which backend answers, and browse keys a durable archive on that.
+    #[test]
+    fn width_routing_is_off_by_default_and_the_flag_beats_the_config() {
+        assert!(
+            !decide_routing(None, None).0,
+            "off unless something says so"
         );
+        assert_eq!(decide_routing(None, None).1, RoutingSource::Default);
+
+        let from_config = decide_routing(None, Some("on"));
+        assert!(from_config.0);
+        assert_eq!(from_config.1, RoutingSource::Config);
+
+        let flag_wins = decide_routing(Some(false), Some("on"));
+        assert!(!flag_wins.0);
+        assert_eq!(flag_wins.1, RoutingSource::Flag);
+    }
+
+    /// A typo in a shared config file degrades to OFF and says so, rather than bricking a
+    /// launchd-supervised daemon — and off is the direction that declines an optimization
+    /// instead of silently rerouting work.
+    #[test]
+    fn an_invalid_width_routing_config_value_warns_and_stays_off() {
+        let (on, source, warnings) = decide_routing(None, Some("maybe"));
+        assert!(!on);
+        assert_eq!(source, RoutingSource::Default);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("maybe"), "{warnings:?}");
+    }
+
+    /// Both spellings an operator will reach for, and nothing else. `--width-routing yes`
+    /// is a typo, not a synonym: silently reading it as "off" is the failure this rejects.
+    #[test]
+    fn the_switch_accepts_on_off_and_the_toml_booleans() {
+        assert_eq!(parse_switch("on"), Ok(true));
+        assert_eq!(parse_switch("ON"), Ok(true));
+        assert_eq!(parse_switch("true"), Ok(true));
+        assert_eq!(parse_switch("off"), Ok(false));
+        assert_eq!(parse_switch("false"), Ok(false));
+        assert!(parse_switch("yes").is_err());
+        assert!(set_width_routing("yes").is_err());
     }
 }

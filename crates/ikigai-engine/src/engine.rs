@@ -27,6 +27,8 @@ use ikigai_core::{
     Representation, Request, Spawner, Thread, TraceEvent, Tracer, Verb,
 };
 use ikigai_resolve::{CacheStatus, Resolver};
+
+use crate::fanout::{self, FanOut};
 use std::collections::BTreeSet;
 
 /// A pipe stage's output: its raw bytes plus the cache provenance (expiry + golden
@@ -256,6 +258,18 @@ pub struct Engine {
     /// (cancel). `None` in the normal verb-grammar mode. Interior-mutable so the
     /// `&self` eval path can toggle and accumulate; the REPL is single-threaded.
     lisp_buffer: RefCell<Option<Vec<String>>>,
+    /// Whether an automatic fan-out width hint may be appended to the requests of a
+    /// fork/map whose target declares it reads `needs=` (see [`crate::fanout`]).
+    /// **Off unless a host turns it on**: routing by width changes *which backend*
+    /// answers, and `ikigai-browse` folds model identity into a durable archive key —
+    /// so silent width-based routing would write "which backend answered depends on how
+    /// many siblings the request happened to have" permanently into a store.
+    width_routing: bool,
+    /// The widest fan-out this line performed, for [`last_fan_out`](Self::last_fan_out).
+    /// Recorded whether or not anything was routed, and on the sequential path too: "you
+    /// asked for ten and got one" is the fact an operator most needs, and from outside
+    /// the process a serialized fan-out and a slow server look identical.
+    fan_out: RefCell<Option<FanOut>>,
     /// A one-shot piped-stdin payload for a batch (`-c`) run. When the CLI is fed content on a
     /// non-TTY stdin (`… | ikigai -c 'sink <iri>'`), the first content-less `sink` uses this as
     /// its `content` — so a secret can be piped in and never touch the command line (argv/`ps`)
@@ -280,6 +294,8 @@ impl Engine {
             identity: RefCell::new(identity),
             profiles: RefCell::new(HashMap::new()),
             spawner: None,
+            width_routing: false,
+            fan_out: RefCell::new(None),
             lisp_buffer: RefCell::new(None),
             piped_input: RefCell::new(None),
         }
@@ -311,6 +327,63 @@ impl Engine {
     pub fn with_spawner(mut self, spawner: Arc<dyn Spawner>) -> Self {
         self.spawner = Some(spawner);
         self
+    }
+
+    /// Enable automatic fan-out width routing: a fork/map wide enough to matter appends
+    /// `needs=batchAt<=W` to the requests of targets that declare they read `needs=`, so
+    /// a backend can be chosen by the load shape the runtime already knows.
+    ///
+    /// **Opt-in, and deliberately so** — see the field docs on `width_routing`. The host
+    /// decides (`--width-routing on`, or `width-routing = "on"` in the config home);
+    /// with it off, the requests this engine issues are byte-identical to the ones it
+    /// issued before the feature existed.
+    pub fn with_width_routing(mut self, enabled: bool) -> Self {
+        self.width_routing = enabled;
+        self
+    }
+
+    /// The widest fan-out the last evaluated line performed — its nominal width, the
+    /// width it actually achieved, and any width hint it applied. `None` when the line
+    /// fanned out nowhere.
+    ///
+    /// This is the observable half of width routing. A routing decision nobody can see
+    /// is one nobody can debug, and the *unrouted* number is worth as much: a ten-branch
+    /// fork on the default `single` scheduler is one-wide, which is invisible from
+    /// outside the process.
+    pub fn last_fan_out(&self) -> Option<FanOut> {
+        self.fan_out.borrow().clone()
+    }
+
+    /// Start a fresh per-line tally: the cache outcomes and the fan-out note both
+    /// describe *this* line, so both are cleared together.
+    fn reset_line_stats(&self) {
+        self.cache.set(CacheStats::default());
+        *self.fan_out.borrow_mut() = None;
+    }
+
+    /// Record a fan-out, keeping the widest of the line (ties to the first). A line can
+    /// fan out more than once — a map inside a fork — and the widest is the one whose
+    /// shape explains the line's cost.
+    fn record_fan_out(&self, fan_out: FanOut) {
+        let mut slot = self.fan_out.borrow_mut();
+        if slot
+            .as_ref()
+            .is_none_or(|prev| fan_out.nominal > prev.nominal)
+        {
+            *slot = Some(fan_out);
+        }
+    }
+
+    /// A construct that fans out but resolves its parts one after another: no spawner,
+    /// or a multi-stage branch (which must run in sequence, so a spawned branch is
+    /// always a single resolve). Its achievable width is 1 **by definition** — reporting
+    /// the branch count here would name a concurrency the run never reaches.
+    fn record_sequential_fan_out(&self, nominal: usize) {
+        self.record_fan_out(FanOut {
+            nominal,
+            effective: 1,
+            hint: None,
+        });
     }
 
     /// The session's current capability.
@@ -382,7 +455,7 @@ impl Engine {
         // Each eval starts a fresh cache tally (like `eval_async`), read back into the
         // entry once resolved. Runs under the session capability, so a session lacking
         // `urn:cap:lisp` is denied cleanly by the endpoint.
-        self.cache.set(CacheStats::default());
+        self.reset_line_stats();
         let result = self.run_lisp(src).await;
         Action::Output(Entry {
             input: src.to_string(),
@@ -416,7 +489,7 @@ impl Engine {
         }
         // Each `run` during this line accumulates into `self.cache`; reset it
         // first, then read it back into the entry once the command has resolved.
-        self.cache.set(CacheStats::default());
+        self.reset_line_stats();
         let output = |this: &Self, result| {
             Action::Output(Entry {
                 input: line.to_string(),
@@ -503,7 +576,7 @@ impl Engine {
     async fn eval_lisp_mode(&self, line: &str) -> Action {
         if line == ":lisp" {
             *self.lisp_buffer.borrow_mut() = None;
-            self.cache.set(CacheStats::default());
+            self.reset_line_stats();
             return Action::Output(Entry {
                 input: line.to_string(),
                 result: Ok("lisp mode cancelled".to_string()),
@@ -522,7 +595,7 @@ impl Engine {
             return Action::Noop;
         }
         let src = program.join("\n");
-        self.cache.set(CacheStats::default());
+        self.reset_line_stats();
         let result = self.run_lisp(&src).await;
         Action::Output(Entry {
             input: src,
@@ -645,6 +718,9 @@ impl Engine {
                             return Ok(combine_outputs(outputs));
                         }
                     }
+                    // No spawner, or a multi-stage branch: the branches run one after
+                    // another, so this fork is one-wide however many branches it has.
+                    self.record_sequential_fan_out(branches.len());
                     let mut outputs = Vec::with_capacity(branches.len());
                     for branch in branches {
                         outputs.push(
@@ -693,6 +769,9 @@ impl Engine {
                 let outputs = self.run_parallel(spawner, requests, prov).await?;
                 return Ok(combine_outputs(outputs));
             }
+            // Sequential per-item mapping (no spawner, or a stage that isn't a lone
+            // `source`): one item at a time, so the achieved width is 1.
+            self.record_sequential_fan_out(text.split('\n').count());
             let mut outputs = Vec::new();
             for item in text.split('\n') {
                 outputs.push(
@@ -719,24 +798,61 @@ impl Engine {
     ) -> Result<Vec<Staged>, String> {
         type Slot = Arc<Mutex<Option<Result<(Representation, CacheStatus), String>>>>;
         let capability = self.capability.borrow().clone();
+        // The width this fan-out will actually reach: the request count bounded by how
+        // many tasks the spawner carries at once, with an unknown width read as 1. The
+        // default `single` scheduler answers 1 however many branches there are, and that
+        // is the number worth acting on — routing a serialized run to a batching backend
+        // is measurably ~1.8x SLOWER, so widening on ignorance is the one unsafe guess.
+        let nominal = requests.len();
+        let effective = fanout::effective_width(nominal, spawner.width());
+        let hints = self.width_hints(effective, &requests).await;
+        self.record_fan_out(FanOut {
+            nominal,
+            effective,
+            // One note per fan-out: the term applied, if any request took one. A fork
+            // whose branches hit different targets can in principle have some hinted and
+            // some not; the note names the term, not the branch list.
+            hint: hints.iter().find_map(Clone::clone),
+        });
         let slots: Vec<Slot> = requests
             .iter()
             .map(|_| Arc::new(Mutex::new(None)))
             .collect();
         let joins: Vec<BoxFuture<()>> = requests
             .into_iter()
+            .zip(hints)
             .zip(&slots)
-            .map(|(request, slot)| {
+            .map(|((request, hint), slot)| {
                 let resolver = Arc::clone(&self.resolver);
                 let capability = capability.clone();
                 let prov = prov.clone();
                 let slot = Arc::clone(slot);
+                // `needs=` is a HARD filter and a no-match is a LOUD error, so an
+                // automatic term nothing satisfies must not break a pipeline that would
+                // have worked. Keep the un-hinted request to retry with.
+                let fallback = hint.as_ref().map(|_| request.clone());
+                let request = match &hint {
+                    Some(term) => {
+                        request.with_arg("needs", ArgRef::Inline(term.as_bytes().to_vec()))
+                    }
+                    None => request,
+                };
                 spawner.spawn(Box::pin(async move {
                     // Each fanned-out branch/item inherits the same upstream provenance.
-                    let result = resolver
-                        .issue_as_async_with_incoming(request, &capability, prov)
+                    let mut result = resolver
+                        .issue_as_async_with_incoming(request, &capability, prov.clone())
                         .await
                         .map_err(|e| e.to_string());
+                    if let (Err(error), Some(term), Some(fallback)) = (&result, &hint, fallback) {
+                        if fanout::is_hint_no_match(error, term) {
+                            // Nothing declares a crossover at or below this width. Ask
+                            // for what the caller actually asked for.
+                            result = resolver
+                                .issue_as_async_with_incoming(fallback, &capability, prov)
+                                .await
+                                .map_err(|e| e.to_string());
+                        }
+                    }
                     *slot.lock().expect("branch slot") = Some(result);
                 }))
             })
@@ -762,6 +878,46 @@ impl Engine {
         }
         self.cache.set(stats);
         Ok(outputs)
+    }
+
+    /// The width hint each request of a fan-out should carry, in request order.
+    ///
+    /// ★ **This is where the cache is protected.** A width argument added to every
+    /// fanned-out request would enter request identity — the kernel caches on request id
+    /// plus capability fingerprint — and the same resource resolved inside a 3-wide map
+    /// and a 10-wide map would become two entries: a miss manufactured out of nothing,
+    /// on every cacheable endpoint reached through `..` or a fork. So the hint is offered
+    /// only where it is *read*, which the target's own self-description says: an
+    /// **optional** `needs` argument. Everything else is left exactly as it was.
+    ///
+    /// The contract lookup is a `Meta` request, so it costs something — which is why it
+    /// happens only when the switch is on, only above width 1, only for a request that
+    /// isn't already explicitly routed, and only once per distinct target of the fan-out
+    /// (a `..` map has one target for all its items).
+    async fn width_hints(&self, effective: usize, requests: &[Request]) -> Vec<Option<String>> {
+        if !self.width_routing || effective < 2 {
+            return vec![None; requests.len()];
+        }
+        let mut contracts: HashMap<String, Option<Description>> = HashMap::new();
+        let mut hints = Vec::with_capacity(requests.len());
+        for request in requests {
+            if fanout::explicitly_routed(request) {
+                hints.push(None);
+                continue;
+            }
+            let target = request.target.as_str().to_string();
+            if !contracts.contains_key(&target) {
+                let description = self.describe_struct(&request.target).await;
+                contracts.insert(target.clone(), description);
+            }
+            hints.push(fanout::hint_for(
+                true,
+                effective,
+                request,
+                contracts[&target].as_ref(),
+            ));
+        }
+        hints
     }
 
     /// `SOURCE` a resource, folding the upstream pipe `prov` into its cacheability,
@@ -2041,8 +2197,39 @@ mod tests {
     /// A cooperative spawner: returns each task as its own completion future so the
     /// join drives them on the current thread — exercises the parallel fork/map path
     /// without real threads (the threaded version is verified live + in ikigai-scheduler).
+    ///
+    /// It answers `width() == Some(1)`, which is the honest number for this shape:
+    /// nothing interleaves when the work inside blocks. (Core's `kernel.rs` has the same
+    /// struct answering `None` — left that way deliberately, as the witness that an
+    /// existing implementor compiles untouched. This one has no reason to lie.)
     struct InlineSpawner;
     impl ikigai_core::Spawner for InlineSpawner {
+        fn spawn(&self, task: ikigai_core::BoxFuture<()>) -> ikigai_core::BoxFuture<()> {
+            task
+        }
+        fn width(&self) -> Option<usize> {
+            Some(1)
+        }
+    }
+
+    /// A spawner that *declares* it carries `n` tasks at once while still running them
+    /// inline, so a test can drive the width the engine reads without real threads.
+    /// `width()` is a declaration by design — the kernel never drives the scheduler — so
+    /// declaring it is exactly what a real pool does.
+    struct WideSpawner(usize);
+    impl ikigai_core::Spawner for WideSpawner {
+        fn spawn(&self, task: ikigai_core::BoxFuture<()>) -> ikigai_core::BoxFuture<()> {
+            task
+        }
+        fn width(&self) -> Option<usize> {
+            Some(self.0)
+        }
+    }
+
+    /// A spawner that cannot say how wide it is — an elastic or remote pool. Read as
+    /// width 1, never as wide.
+    struct UnknownSpawner;
+    impl ikigai_core::Spawner for UnknownSpawner {
         fn spawn(&self, task: ikigai_core::BoxFuture<()>) -> ikigai_core::BoxFuture<()> {
             task
         }
@@ -2081,6 +2268,289 @@ mod tests {
         // `.. toUpper` over the items a, b → A, B.
         let out = output(parallel_engine().eval("source urn:test:list .. urn:fn:toUpper")).unwrap();
         assert_eq!(out, "A\nB");
+    }
+
+    // --- fan-out width routing ------------------------------------------------
+    //
+    // The engine knows how wide a fork/map is *before* it dispatches any of it, and how
+    // wide the scheduler will let that run. These pin the three properties that make
+    // acting on that number a win rather than a regression: it reaches the endpoints that
+    // route on it, it stays off the cache key of the ones that don't, and it never
+    // reports a concurrency the run will not achieve.
+
+    /// A stand-in for `urn:llm:ask`: it routes on requirements, so it declares an
+    /// **optional** `needs` (and `provider`) — the declaration the engine looks for — and
+    /// echoes back whatever `needs` it was handed.
+    fn ask_endpoint() -> FnEndpoint {
+        FnEndpoint::new("ask", |inv: &Invocation<'_>| {
+            let needs = inv.inline_str("needs").unwrap_or("none");
+            let prompt = inv.inline_str("in").unwrap_or("");
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("{prompt}:{needs}").into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("ask")
+                .verb(Verb::Source)
+                .verb(Verb::Meta)
+                .input(ArgSpec::new("provider").optional())
+                .input(ArgSpec::new("needs").optional())
+                .input(ArgSpec::new("in")),
+        )
+    }
+
+    /// An ordinary cacheable endpoint — no requirements vocabulary at all, which is the
+    /// overwhelming majority of the catalog. Its request identity must not move with the
+    /// width of the construct it happens to be resolved inside.
+    fn echo_endpoint() -> FnEndpoint {
+        FnEndpoint::new("echo", |inv: &Invocation<'_>| {
+            let value = inv.inline_str("in").unwrap_or("");
+            Ok(
+                Representation::new(ReprType::new("text/plain"), value.as_bytes().to_vec())
+                    .cacheable(),
+            )
+        })
+        .with_description(
+            Description::new("echo")
+                .verb(Verb::Source)
+                .verb(Verb::Meta)
+                .input(ArgSpec::new("in")),
+        )
+    }
+
+    fn fixed_list(items: &'static str) -> FnEndpoint {
+        FnEndpoint::new("items", move |_: &Invocation<'_>| {
+            Ok(
+                Representation::new(ReprType::new("text/plain"), items.as_bytes().to_vec())
+                    .cacheable(),
+            )
+        })
+    }
+
+    /// An engine over the fan-out fixtures, on a spawner of the caller's choosing.
+    fn fanout_engine(spawner: Arc<dyn Spawner>, width_routing: bool) -> Engine {
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:test:ask"), ask_endpoint())
+            .bind(Exact::new("urn:test:echo"), echo_endpoint())
+            .bind(Exact::new("urn:test:two"), fixed_list("a\nb"))
+            .bind(Exact::new("urn:test:three"), fixed_list("a\nb\nc"))
+            .bind(
+                Exact::new("urn:test:ten"),
+                fixed_list("a\nb\nc\nd\ne\nf\ng\nh\ni\nj"),
+            );
+        Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ))
+        .with_spawner(spawner)
+        .with_width_routing(width_routing)
+    }
+
+    /// The width reaches a routing target through `..` — the map builds its whole request
+    /// vector first, so the item count is known before anything is dispatched.
+    #[test]
+    fn the_width_reaches_a_routing_target_from_a_map() {
+        let engine = fanout_engine(Arc::new(WideSpawner(8)), true);
+        let out = output(engine.eval("source urn:test:three .. urn:test:ask")).unwrap();
+        assert_eq!(out, "a:batchAt<=3\nb:batchAt<=3\nc:batchAt<=3");
+    }
+
+    /// ...and through a fork, the other construct that reaches `run_parallel`.
+    #[test]
+    fn the_width_reaches_a_routing_target_from_a_fork() {
+        let engine = fanout_engine(Arc::new(WideSpawner(8)), true);
+        let out =
+            output(engine.eval("source urn:test:two | ( urn:test:ask ; urn:test:ask )")).unwrap();
+        assert_eq!(out.matches("batchAt<=2").count(), 2, "{out}");
+    }
+
+    /// ★ The property the whole design turns on: **the width never enters request
+    /// identity for an endpoint that does not route on it.**
+    ///
+    /// The kernel caches on request id ⊕ capability fingerprint. Had the hint ridden on
+    /// every fanned-out request, the same resource resolved inside a 3-wide map and a
+    /// 10-wide map would be two cache entries — a miss manufactured out of nothing, on
+    /// every cacheable endpoint reached through `..` or a fork. So: resolve `urn:test:echo`
+    /// over three items, then over ten whose first three are the same, **with width
+    /// routing ON**, and the repeated three must come back cached.
+    #[test]
+    fn a_cacheable_resource_hits_cache_across_two_fan_out_widths() {
+        let engine = fanout_engine(Arc::new(WideSpawner(16)), true);
+
+        let first = entry(engine.eval("source urn:test:three .. urn:test:echo"));
+        assert_eq!(
+            first.cache.label().as_deref(),
+            Some("4 computed"),
+            "cold: the list plus its three items"
+        );
+        assert_eq!(engine.last_fan_out().unwrap().effective, 3);
+
+        let second = entry(engine.eval("source urn:test:ten .. urn:test:echo"));
+        assert_eq!(engine.last_fan_out().unwrap().effective, 10, "a wider run");
+        assert_eq!(
+            second.cache.label().as_deref(),
+            Some("3 cached · 8 computed"),
+            "a, b and c are the SAME requests at width 10 as at width 3"
+        );
+    }
+
+    /// The default host is `single`, which does not spawn: it hands back an inline future
+    /// polled on one thread, and the native HTTP transport blocks that thread. Ten
+    /// branches there are one wide, and saying otherwise would route a serialized run to a
+    /// batching backend — measured ~1.8x SLOWER.
+    #[test]
+    fn an_inline_scheduler_is_one_wide_however_many_branches() {
+        let engine = fanout_engine(Arc::new(InlineSpawner), true);
+        let out = output(engine.eval("source urn:test:ten .. urn:test:ask")).unwrap();
+        let fan_out = engine.last_fan_out().unwrap();
+        assert_eq!((fan_out.nominal, fan_out.effective), (10, 1));
+        assert_eq!(fan_out.hint, None, "width 1 asks for nothing");
+        assert!(out.starts_with("a:none"), "{out}");
+    }
+
+    /// An executor that cannot say how wide it is reads as ONE, never as wide. Unknown is
+    /// not a shorthand for small, but the two guesses are not symmetric: guessing wide
+    /// runs a serialized workload on the batching backend, and guessing narrow only
+    /// declines an optimization.
+    #[test]
+    fn an_unknown_scheduler_width_is_treated_as_one() {
+        let engine = fanout_engine(Arc::new(UnknownSpawner), true);
+        let out = output(engine.eval("source urn:test:ten .. urn:test:ask")).unwrap();
+        assert_eq!(engine.last_fan_out().unwrap().effective, 1);
+        assert!(out.starts_with("a:none"), "{out}");
+    }
+
+    /// A pool bounds the fan-out and the fan-out bounds the pool — the width reported is
+    /// the one the run reaches, not the one either side would allow alone.
+    #[test]
+    fn a_pool_width_and_the_branch_count_bound_each_other() {
+        let narrow = fanout_engine(Arc::new(WideSpawner(4)), true);
+        output(narrow.eval("source urn:test:ten .. urn:test:ask")).unwrap();
+        assert_eq!(narrow.last_fan_out().unwrap().effective, 4, "pool-bound");
+
+        let wide = fanout_engine(Arc::new(WideSpawner(16)), true);
+        let out = output(wide.eval("source urn:test:ten .. urn:test:ask")).unwrap();
+        assert_eq!(wide.last_fan_out().unwrap().effective, 10, "fan-out-bound");
+        assert!(out.starts_with("a:batchAt<=10"), "{out}");
+    }
+
+    /// A multi-stage branch cannot be spawned — `single_source_branches` sends the whole
+    /// fork down the sequential loop — so its width is 1 by definition, and it is reported
+    /// as 1. Naming the branch count here would promise a concurrency the run never has.
+    #[test]
+    fn a_multi_stage_branch_reports_width_one() {
+        let engine = fanout_engine(Arc::new(WideSpawner(16)), true);
+        let out = output(
+            engine.eval("source urn:test:two | ( urn:test:echo | urn:test:echo ; urn:test:ask )"),
+        )
+        .unwrap();
+        let fan_out = engine.last_fan_out().unwrap();
+        assert_eq!((fan_out.nominal, fan_out.effective), (2, 1));
+        assert_eq!(fan_out.hint, None);
+        assert!(out.ends_with("a\nb:none"), "no hint reached the ask: {out}");
+    }
+
+    /// With the switch off — the default — the requests that reach the kernel are the
+    /// requests that reached it before this existed.
+    #[test]
+    fn with_the_switch_off_nothing_is_appended() {
+        let engine = fanout_engine(Arc::new(WideSpawner(8)), false);
+        let out = output(engine.eval("source urn:test:three .. urn:test:ask")).unwrap();
+        assert_eq!(out, "a:none\nb:none\nc:none");
+        // The fan-out is still *reported* — observability is not the opt-in half.
+        let fan_out = engine.last_fan_out().unwrap();
+        assert_eq!(
+            (fan_out.nominal, fan_out.effective, fan_out.hint),
+            (3, 3, None)
+        );
+    }
+
+    /// Explicit routing outranks the automatic kind, both spellings. `ikigai-browse` keys
+    /// a durable explanation archive on model identity, so an automatic override of a
+    /// caller's own choice would write width-dependent nondeterminism into a store.
+    #[test]
+    fn an_explicit_provider_or_needs_outranks_the_automatic_hint() {
+        let engine = fanout_engine(Arc::new(WideSpawner(8)), true);
+
+        let their_needs =
+            output(engine.eval("source urn:test:three .. urn:test:ask needs=vision")).unwrap();
+        assert_eq!(their_needs, "a:vision\nb:vision\nc:vision");
+
+        let their_provider =
+            output(engine.eval("source urn:test:three .. urn:test:ask provider=ollama")).unwrap();
+        assert_eq!(their_provider, "a:none\nb:none\nc:none");
+    }
+
+    /// `needs=` is a HARD filter and a no-match is a LOUD error, so a hint nothing
+    /// satisfies must not break a pipeline that would otherwise have worked: the request
+    /// is re-issued without the term.
+    #[test]
+    fn a_no_match_on_the_automatic_hint_retries_without_it() {
+        let picky = FnEndpoint::new("picky", |inv: &Invocation<'_>| {
+            match inv.inline_str("needs") {
+                Ok(needs) => Err(ikigai_core::Error::Endpoint(format!(
+                    "urn:test:picky: no configured backend satisfies `{needs}` (providers: solo)"
+                ))),
+                Err(_) => Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    b"served".to_vec(),
+                )),
+            }
+        })
+        .with_description(
+            Description::new("picky")
+                .verb(Verb::Source)
+                .verb(Verb::Meta)
+                .input(ArgSpec::new("needs").optional())
+                .input(ArgSpec::new("in")),
+        );
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:test:picky"), picky)
+            .bind(Exact::new("urn:test:three"), fixed_list("a\nb\nc"));
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ))
+        .with_spawner(Arc::new(WideSpawner(8)))
+        .with_width_routing(true);
+
+        let out = output(engine.eval("source urn:test:three .. urn:test:picky")).unwrap();
+        assert_eq!(out, "served\nserved\nserved");
+    }
+
+    /// ...but a failure that is not the hint's fault is NOT retried. Re-issuing on any
+    /// error would double the cost of every genuine failure, and an LLM call is the
+    /// expensive kind.
+    #[test]
+    fn an_unrelated_failure_is_not_retried() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        CALLS.store(0, Ordering::SeqCst);
+        let broken = FnEndpoint::new("broken", |_: &Invocation<'_>| {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            Err(ikigai_core::Error::Endpoint("boom".to_string()))
+        })
+        .with_description(
+            Description::new("broken")
+                .verb(Verb::Source)
+                .verb(Verb::Meta)
+                .input(ArgSpec::new("needs").optional())
+                .input(ArgSpec::new("in")),
+        );
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:test:broken"), broken)
+            .bind(Exact::new("urn:test:three"), fixed_list("a\nb\nc"));
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ))
+        .with_spawner(Arc::new(WideSpawner(8)))
+        .with_width_routing(true);
+
+        let err = output(engine.eval("source urn:test:three .. urn:test:broken")).unwrap_err();
+        assert!(err.contains("boom"), "{err}");
+        assert_eq!(CALLS.load(Ordering::SeqCst), 3, "one attempt per item");
     }
 
     fn output(action: Action) -> Result<String, String> {

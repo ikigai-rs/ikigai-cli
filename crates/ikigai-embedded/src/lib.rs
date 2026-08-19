@@ -21,7 +21,10 @@ use ikigai_core::{
 /// The process scheduler and how it was configured — `--scheduler`, the config home's
 /// `scheduler` key, then the deprecated `IKIGAI_SCHEDULER`. Re-exported at the crate
 /// root because every host in the workspace already calls `ikigai_embedded::scheduler()`.
-pub use scheduling::{scheduler, set_scheduler_spec, SchedulerSource};
+pub use scheduling::{
+    scheduler, set_scheduler_spec, set_width_routing, width_routing, width_routing_source,
+    RoutingSource, SchedulerSource,
+};
 
 mod browse;
 pub mod clients;

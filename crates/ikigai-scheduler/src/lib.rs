@@ -253,6 +253,21 @@ impl ikigai_core::Spawner for Scheduler {
     fn spawn(&self, task: ikigai_core::BoxFuture<()>) -> ikigai_core::BoxFuture<()> {
         Box::pin(Scheduler::spawn(self, task))
     }
+
+    /// How many spawned tasks make progress **at once** — the worker count, which for
+    /// `Single` is honestly 1.
+    ///
+    /// `Single` does not spawn: it hands the task back as an inline future polled
+    /// cooperatively on the calling thread, and the native HTTP transport is blocking
+    /// `ureq`, so a call inside such a future holds that thread to completion. Nothing
+    /// interleaves, whatever the caller hands over. The default `width()` is `None` —
+    /// *unknown* — and a caller that reads unknown as "wide" routes a serialized run to a
+    /// backend that only wins under real concurrency, measured ~1.8x slower. Answering is
+    /// therefore not a nicety: it is the difference between the fan-out router seeing this
+    /// host's real width and guessing.
+    fn width(&self) -> Option<usize> {
+        Some(self.threads())
+    }
 }
 
 /// Reports the scheduler's live state for `urn:kernel:scheduler`, so the kernel can
@@ -320,6 +335,19 @@ mod tests {
             .collect();
         let ids: HashSet<ThreadId> = sched.run(join_all(handles)).into_iter().collect();
         assert_eq!(ids.len(), 1, "single is one thread");
+    }
+
+    /// The width a caller reads to SIZE a fan-out. `single` answers 1 rather than
+    /// `None`: it runs one task to completion before the next, and the damaging guess
+    /// about an unknown width is "wide" — which sends a serialized workload to a batching
+    /// backend and runs it slower than sequencing it would have.
+    #[test]
+    fn a_scheduler_reports_its_achievable_width_and_single_says_one() {
+        use ikigai_core::Spawner;
+        assert_eq!(Spawner::width(&SchedulerSpec::Single.build()), Some(1));
+        assert_eq!(Spawner::width(&SchedulerSpec::Pool(4).build()), Some(4));
+        // Never `None`: this host always knows its own worker count.
+        assert!(Spawner::width(&SchedulerSpec::Pool(0).build()).is_some_and(|w| w >= 1));
     }
 
     #[test]

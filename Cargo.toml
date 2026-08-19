@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.15"
+version = "0.1.16"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -13,10 +13,14 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 [workspace.dependencies]
 # The released kernel, consumed from crates.io. For local cross-repo development
 # against a sibling checkout, use .cargo/config.toml (see .cargo/config.toml.example).
-ikigai-core = "0.1.55" # 0.1.55 = the probe guard takes either witness. A BEHAVIOURAL floor,
-# not an API one: below it a MOUNTED template row whose local name-guess collides with a
+ikigai-core = "0.1.60" # 0.1.60 = `Spawner::width()`, the read the engine's fan-out routing
+# is built on: how many spawned tasks make progress AT ONCE, so a ten-branch fork on the
+# default `single` scheduler is known to be one-wide. An API floor — the method is defaulted,
+# so an older core compiles and silently answers `None` (= width 1) for every scheduler,
+# turning width routing off wherever it would have mattered. 0.1.55's behavioural floor still
+# holds beneath it: below that a MOUNTED template row whose local name-guess collides with a
 # shorter sibling is dropped from the manifold, so `ikigai mcp` silently stops projecting
-# browse-pr-explain and browse-pr-review. Nothing fails to compile; tools just go missing.
+# browse-pr-explain and browse-pr-review.
 ikigai-vocab = "0.1.33" # + event terms (ik:calendar/allDay/alert) + LLM trait terms
 # The reusable function library, linked in as a published module crate.
 ikigai-fn = "0.1.2" # + urn:fn:conditional (the lazy branch: if/then/else are URIs)
@@ -78,7 +82,11 @@ ikigai-lisp = "0.1.12" # 0.1.12 = scope_sync migration (core-owned bridge; chann
 ikigai-throttle = "0.1.7" # Timeout governor + Failover (the --prefer mount degrades through it)
 # LLM inference (urn:llm:ask + urn:llm:<provider>:ask + urn:llm:config): a facade grammar
 # over pluggable backends. OpenAI-compatible REST backend (Ollama/vLLM/llama.cpp/mlx_lm).
-ikigai-llm = "0.10" # 0.10 = urn:llm:{provider}:model — browse's explain archive keys version tags on it
+ikigai-llm = "0.12" # 0.12 = `caps.batchAt` + the `batchAt<=W` need term: the declared
+# concurrency at or above which a backend is the throughput winner, which is what the engine's
+# automatic fan-out hint resolves against. An API floor AND a breaking one — `Caps` gained a
+# public field, so a caret pin on 0.11 does not reach it. Carries 0.10's
+# urn:llm:{provider}:model, which browse's explain archive keys its version tags on.
 # Video-conference scheduling (urn:meeting:schedule + urn:meeting:<provider>:schedule): a facade
 # over provider backends, Zoom first. Now on crates.io — the git-rev bridge retired at first publish.
 ikigai-meeting = "0.1.0"
@@ -107,9 +115,13 @@ ikigai-passkey = { path = "crates/ikigai-passkey", version = "0.1.14" }
 # an older, incompatible sibling on crates.io.
 ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.1.14" } # naming_entry: the most specific catalog row names a target (the engine's trace labels use it)
 ikigai-wire = { path = "crates/ikigai-wire", version = "0.1.11" } # v6 hello + ErrorTyped/WireError
+# 0.1.16 = `Spawner::width()`: the scheduler answers how many tasks make progress AT ONCE
+# (1 for `single`), which is what the engine's fan-out routing sizes itself by. Core
+# defaults that method to `None` = unknown, and a caller reading unknown as "wide" is the
+# ~1.8x-slower case — so below this floor the routing is silently inert, not merely older.
 # 0.1.15 = SchedulerSpec: a spec parsed WITHOUT building, so `--scheduler pool:xyz` is
 # rejected while argv is read instead of by spawning a threadpool to find out.
-ikigai-scheduler = { path = "crates/ikigai-scheduler", version = "0.1.15" }
+ikigai-scheduler = { path = "crates/ikigai-scheduler", version = "0.1.16" }
 ikigai-time = { path = "crates/ikigai-time", version = "0.1.12" } # JobHealth: last_run for staleness
 # Inbound HTTP transport (method↔verb, path↔iri, cap-per-request). A published
 # transport like ipc/quic/mcp; only the `web`-featured CLI pulls it (and Tokio).
