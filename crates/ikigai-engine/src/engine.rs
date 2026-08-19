@@ -1375,13 +1375,19 @@ fn run_config(rest: &str) -> Result<String, String> {
 }
 
 /// Show the config file path and the current value of each known property.
+///
+/// `scheduler` is listed even though the host, not the engine, acts on it: it is the
+/// setting that decides whether `( a ; b )` and `..` actually fan out, and at the default
+/// `single` they run one after another. A width nobody can see is a width nobody sets —
+/// `urn:kernel:scheduler` reports the LIVE one, this reports the CONFIGURED one.
 fn config_summary() -> String {
     let location = config::path().map_or_else(
         || "(no config directory — set $XDG_CONFIG_HOME or $HOME)".to_string(),
         |path| path.display().to_string(),
     );
     let keybindings = config::get("keybindings").unwrap_or_else(|| "emacs (default)".to_string());
-    format!("config file: {location}\nkeybindings = {keybindings}")
+    let scheduler = config::get("scheduler").unwrap_or_else(|| "single (default)".to_string());
+    format!("config file: {location}\nkeybindings = {keybindings}\nscheduler = {scheduler}")
 }
 
 /// Parse and validate a `config` assignment into a `(property, value)`. Pure —

@@ -18,7 +18,10 @@ use ikigai_core::{
     FnEndpoint, Invocation, Iri, Kernel, MetaRenderer, ReprType, Representation, Request,
     Resolution, Result, Scope, Space, SpaceEntry, SystemClock, Time, UriTemplate, Verb,
 };
-use ikigai_scheduler::Scheduler;
+/// The process scheduler and how it was configured — `--scheduler`, the config home's
+/// `scheduler` key, then the deprecated `IKIGAI_SCHEDULER`. Re-exported at the crate
+/// root because every host in the workspace already calls `ikigai_embedded::scheduler()`.
+pub use scheduling::{scheduler, set_scheduler_spec, SchedulerSource};
 
 mod browse;
 pub mod clients;
@@ -29,6 +32,7 @@ pub mod decisions;
 pub mod jsonl;
 pub mod passkey;
 pub mod people;
+pub mod scheduling;
 pub mod tenant;
 use ikigai_time::JobRegistry;
 use ikigai_vocab::TurtleRenderer;
@@ -201,23 +205,6 @@ fn host_info(nature: &'static str) -> FnEndpoint {
             .verb(Verb::Meta)
             .output("text/plain;charset=utf-8"),
     )
-}
-
-/// The process scheduler that drives kernel work. Single-threaded by default; set
-/// `IKIGAI_SCHEDULER` (`single` | `pool` | `pool:N`) to run on a threadpool. Built
-/// once and shared (a clone shares the pool), so the kernel's injected spawner and
-/// its `urn:kernel:scheduler` reporter reflect the same scheduler.
-pub fn scheduler() -> Scheduler {
-    static SCHEDULER: OnceLock<Scheduler> = OnceLock::new();
-    SCHEDULER
-        .get_or_init(|| match std::env::var("IKIGAI_SCHEDULER") {
-            Ok(spec) => Scheduler::from_config(&spec).unwrap_or_else(|e| {
-                eprintln!("ikigai: {e}; falling back to a single-threaded scheduler");
-                Scheduler::single()
-            }),
-            Err(_) => Scheduler::single(),
-        })
-        .clone()
 }
 
 /// Process-global registry of time-transport jobs — the `urn:time:schedule` /
@@ -3661,14 +3648,17 @@ fn build_watched(mounts: Vec<MountSpec>, reactive: bool) -> Arc<Kernel> {
     start_uptime_clock();
     // Inject the process scheduler so re-entrant fan-out (e.g. `compose`'s `$a{}`
     // markers) runs concurrently on it; single-threaded by default, a pool under
-    // `IKIGAI_SCHEDULER=pool[:N]`. The same scheduler is injected as a read-only
-    // reporter so `urn:kernel:scheduler` surfaces its live state intrinsically. The
-    // runbook is mounted but gated by `demo_flag()` (off by default).
+    // `--scheduler pool[:N]` or `scheduler = "pool:N"` in the config home (see
+    // [`scheduling`]). The reporter injected alongside it surfaces the same scheduler's
+    // live state through `urn:kernel:scheduler`, PLUS the channel that set it — without
+    // that row the fan-out width is invisible from outside the process, and a serialized
+    // run is indistinguishable from a slow server. The runbook is mounted but gated by
+    // `demo_flag()` (off by default).
     let sched = Arc::new(scheduler());
     let kernel = Kernel::with_meta_renderer(root_space_with_mounts(mounts), Arc::new(CliRenderer))
         .with_clock(Arc::new(SystemClock))
         .with_subclass_axioms(subclass_axioms())
-        .with_scheduler_reporter(sched.clone())
+        .with_scheduler_reporter(Arc::new(scheduling::reporter()))
         .into_scheduled(sched);
     watch_root(Arc::clone(&kernel), file_root());
     watch_org(Arc::clone(&kernel));

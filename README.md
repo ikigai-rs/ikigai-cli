@@ -228,8 +228,9 @@ end like `ce`), `yw`/`yy` yank — and the title shows the pending operator. A f
 line starts in Insert (like `set -o vi`). (Counts like `3w` aren't in yet.)
 
 The scheme is configurable — set `keybindings` from inside the REPL with
-`config keybindings=vi`, or edit `$XDG_CONFIG_HOME/ikigai-cli/config.toml`
-(falling back to `~/.config/ikigai-cli/config.toml`):
+`config keybindings=vi`, or edit `$XDG_CONFIG_HOME/ikigai/config.toml`
+(falling back to `~/.config/ikigai/config.toml` — the one shared config home, the
+same file the host reads `mail.*`, `mount` and `scheduler` from):
 
 ```toml
 keybindings = "emacs"   # "emacs" (default) · "vi" · "native"
@@ -292,6 +293,52 @@ else never starts a background job just because a config file exists.
 `ikigai --daemon` runs the embedded kernel headless — persistent timers and
 filesystem watchers stay live, nothing is printed but their output — which is
 the shape a LaunchAgent/systemd unit wants.
+
+## The scheduler (how wide the fan-out actually is)
+
+Every host in this workspace — REPL, `serve`, `mcp`, `--daemon` — drives one process
+**scheduler**, and it is what makes `( a ; b )` forks and `..` maps run *concurrently*.
+The default is `single`, which does not spawn: tasks are polled cooperatively on one
+thread, and the native HTTP transport blocks that thread for the length of a call. So at
+the default **a ten-branch fan-out is ten sequential calls**, and from outside the process
+that is indistinguishable from a slow server (ten concurrent 27B LLM calls measured 17.9s
+against one local backend and 49.3s against another).
+
+Set it on the command line, in the config home, or — deprecated — in the environment:
+
+```bash
+ikigai --scheduler pool:8            # any mode: repl, serve, mcp, --daemon
+ikigai serve --scheduler pool        # `pool` = one worker per available core
+```
+
+```toml
+# ~/.config/ikigai/config.toml  ($XDG_CONFIG_HOME/ikigai/config.toml when set)
+scheduler = "pool:8"
+serve.scheduler = "pool:16"   # instance-scoped: this applies to `serve` alone
+```
+
+**Precedence: flag > config > env > `single`.** `IKIGAI_SCHEDULER` still works so
+already-running services keep their width, but it warns when it is the channel that
+decided the value. An invalid *flag* is a hard error — a typo'd `--scheduler pool:xyz`
+must not quietly become one-wide — while an invalid config or environment value warns and
+falls through to the next channel, so a bad line cannot brick a supervised daemon.
+
+Read it back from the running host, which is the point: `urn:kernel:scheduler` reports the
+backend, the worker count, live task counters, **and the channel that set it**.
+
+```
+source urn:kernel:scheduler
+scheduler
+  backend    pool:8
+  threads    8
+  active     0
+  spawned    31
+  completed  31
+  source     config
+```
+
+The TUI's Control tab composes the same rows. `config` inside the REPL shows the
+*configured* value (`config scheduler=pool:8` persists it to the same file).
 
 ## The consolidated calendar (the embedded host's standing job)
 
