@@ -60,6 +60,12 @@ usage:
                                `scheduler = \"pool:N\"` in the config home (instance-scoped as
                                <name>.scheduler); IKIGAI_SCHEDULER still works, deprecated.
                                `source urn:kernel:scheduler` reports the width AND the channel
+  ikigai --width-routing <on|off>
+                               route a fan-out by the width it ACHIEVES: at 2+ concurrent
+                               requests, append needs=batchAt<=W for targets that read it
+                               (urn:llm:ask). OFF by default; also `width-routing = \"on\"`
+                               in the config home (instance-scoped as <name>.width-routing).
+                               An explicit provider= or needs= always wins
                                that set it — the DEFAULT `single` runs every fan-out serially
   ikigai --mount <p>=<t>       graft a remote namespace at prefix <p> (ALIAS: <p>rest → urn:rest
                                on the remote, tried after local; --cert-dir after it is ITS cert set)
@@ -266,6 +272,30 @@ fn scheduler_flag(arg: &str, argv: &mut impl Iterator<Item = String>) -> Result<
     Ok(true)
 }
 
+/// If `arg` is `--width-routing`, consume its `on`/`off` value and declare it for this
+/// process. Accepted by every mode, like `--scheduler` — the setting belongs to the host,
+/// not to one command.
+///
+/// Off is the default, and deliberately: routing by width changes *which backend* answers,
+/// and `ikigai-browse` folds model identity into a durable archive key — so the same file
+/// explained twice would land under different entries depending on how many siblings its
+/// request happened to have. An invalid value is an error rather than a fallback, for the
+/// reason `--scheduler` gives: silently meaning "off" leaves nothing in the process to
+/// contradict an operator who believes it is on.
+fn width_routing_flag(arg: &str, argv: &mut impl Iterator<Item = String>) -> Result<bool, String> {
+    if arg != "--width-routing" {
+        return Ok(false);
+    }
+    let value = argv
+        .next()
+        .ok_or_else(|| "--width-routing needs <on|off>".to_string())?;
+    #[cfg(feature = "embedded")]
+    ikigai_embedded::set_width_routing(&value).map_err(|e| format!("--width-routing: {e}"))?;
+    #[cfg(not(feature = "embedded"))]
+    let _ = value;
+    Ok(true)
+}
+
 /// Parse argv. `Ok(None)` means a usage request was handled and we should exit 0.
 fn parse_args() -> Result<Option<Mode>, String> {
     parse_argv(std::env::args().skip(1))
@@ -362,7 +392,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 }
                 continue;
             }
-            if scheduler_flag(&arg, &mut argv)? {
+            if scheduler_flag(&arg, &mut argv)? || width_routing_flag(&arg, &mut argv)? {
                 continue;
             }
             if arg == "--announce" {
@@ -531,7 +561,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 });
                 continue;
             }
-            if scheduler_flag(&arg, &mut argv)? {
+            if scheduler_flag(&arg, &mut argv)? || width_routing_flag(&arg, &mut argv)? {
                 continue;
             }
             match arg.as_str() {
@@ -567,7 +597,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
         if cert_flag(&arg, &mut argv, cert_target)? {
             continue;
         }
-        if scheduler_flag(&arg, &mut argv)? {
+        if scheduler_flag(&arg, &mut argv)? || width_routing_flag(&arg, &mut argv)? {
             continue;
         }
         match arg.as_str() {
@@ -1124,9 +1154,14 @@ fn build_engine(
                     ikigai_embedded::watched_kernel_with_mounts(resolved)
                 }
             };
-            Ok(with_profiles(Engine::new(kernel).with_spawner(
-                std::sync::Arc::new(ikigai_embedded::scheduler()),
-            )))
+            // The same process scheduler that decides how wide a fan-out RUNS also
+            // decides what it may route on — so the engine reads its achievable width
+            // from this spawner, and routes on it only if the host turned that on.
+            Ok(with_profiles(
+                Engine::new(kernel)
+                    .with_spawner(std::sync::Arc::new(ikigai_embedded::scheduler()))
+                    .with_width_routing(ikigai_embedded::width_routing()),
+            ))
         }
         Some(target) => {
             if !mounts.is_empty() {
@@ -2783,5 +2818,44 @@ mod scheduler_flag_tests {
             parse(&["mcp", "--scheduler", "single"]),
             Ok(Some(Mode::Mcp { .. }))
         ));
+    }
+
+    /// `--width-routing` rides the same three argv sites as `--scheduler`, so every mode
+    /// that fans out can also say whether it routes on the width it reaches.
+    #[test]
+    fn the_width_routing_flag_parses_in_every_mode() {
+        assert!(matches!(
+            parse(&["--width-routing", "off"]),
+            Ok(Some(Mode::Repl(_)))
+        ));
+        assert!(matches!(
+            parse(&["--daemon", "--width-routing", "off"]),
+            Ok(Some(Mode::Daemon { .. }))
+        ));
+        assert!(matches!(
+            parse(&["serve", "--width-routing", "off"]),
+            Ok(Some(Mode::Serve { .. }))
+        ));
+        assert!(matches!(
+            parse(&["mcp", "--width-routing", "off"]),
+            Ok(Some(Mode::Mcp { .. }))
+        ));
+    }
+
+    /// A typo'd switch stops the process rather than silently meaning "off": the operator
+    /// would otherwise believe the host routes by load shape when nothing in the process
+    /// contradicts them. And a flag that eats its value must say so when there is none.
+    #[cfg(feature = "embedded")]
+    #[test]
+    fn an_invalid_width_routing_value_stops_the_process() {
+        let Err(e) = parse(&["--width-routing", "yes"]) else {
+            panic!("`yes` is a typo, not a synonym for on")
+        };
+        assert!(e.contains("--width-routing") && e.contains("yes"), "{e}");
+
+        let Err(e) = parse(&["--width-routing"]) else {
+            panic!("a flag with no value is an error")
+        };
+        assert!(e.contains("--width-routing"), "{e}");
     }
 }

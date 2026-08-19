@@ -340,6 +340,48 @@ scheduler
 The TUI's Control tab composes the same rows. `config` inside the REPL shows the
 *configured* value (`config scheduler=pool:8` persists it to the same file).
 
+### Routing a fan-out by the width it actually reaches (opt-in)
+
+Backend choice follows load shape. On one machine, against one model, a *single* request
+ran ~1.8× better on the serializing backend (53.0 vs 28.9 tok/s) while *ten concurrent*
+ones finished in 17.9s against the batching backend and 49.3s against the other. A caller
+can declare that with [`ikigai-llm`](https://github.com/ikigai-rs/ikigai-llm)'s
+`needs=batchAt<=10` — but the runtime already knows the number: a `..` map or a `( a ; b )`
+fork builds its whole request vector before dispatching any of it.
+
+With `--width-routing on` (or `width-routing = "on"` in the config home, instance-scoped as
+`<name>.width-routing`), a fan-out appends `needs=batchAt<=W` to its requests, where **W is
+the width the run will actually reach** — the request count bounded by the scheduler's
+worker count. On the default `single` scheduler that is **1** however many branches there
+are, and a width of 1 appends nothing: routing a serialized run to a batching backend is
+the ~1.8×-slower direction, so the hint is never emitted on a guess.
+
+It is off by default and it stays out of everyone else's way:
+
+- **Only targets that declare an optional `needs` argument ever see it.** Every other
+  request is byte-identical, so its cache key — request id ⊕ capability fingerprint — does
+  not move with the width of the construct it happened to be resolved inside. The same
+  resource resolved inside a 3-wide map and a 10-wide map is *one* cache entry.
+- **Explicit routing wins.** `provider=` first, then `needs=`, then the automatic width
+  hint, then the endpoint's configured default. (`ikigai-browse` keys its durable
+  explanation archive on model identity; an automatic override of a caller's own choice
+  would write width-dependent nondeterminism into a store.)
+- **A no-match falls back rather than failing.** `needs=` is a hard filter and a no-match
+  is a loud error, so when nothing declares a crossover at or below W the request is
+  re-issued without the term. An unrelated failure is *not* retried.
+
+Every fan-out reports itself on stderr, routed or not — the unrouted number is the useful
+one, since a ten-branch fork that ran one-wide is invisible from outside the process:
+
+```
+$ ikigai -c 'source urn:test:items .. urn:llm:ask'
+[10 uncacheable]
+[fan-out 10 → 8 wide · needs=batchAt<=8]
+```
+
+and `urn:kernel:scheduler` carries `routing` (`by-width`/`off`) and `routing.by`
+(`flag`/`config`/`default`) beside the width itself.
+
 ## The consolidated calendar (the embedded host's standing job)
 
 The embedded host wires the [`ikigai-personal`](https://github.com/ikigai-rs/ikigai-personal)

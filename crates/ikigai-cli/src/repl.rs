@@ -32,6 +32,7 @@ pub fn run_commands(engine: Engine, commands: &[String]) -> i32 {
                 if let Some(label) = entry.cache.label() {
                     eprintln!("[{label}]");
                 }
+                report_fan_out(&engine);
                 total.merge(entry.cache);
                 ran += 1;
             }
@@ -85,8 +86,23 @@ pub fn run(engine: Engine) {
                 if let Some(label) = entry.cache.label() {
                     eprintln!("[{label}]");
                 }
+                report_fan_out(&engine);
             }
             Action::Noop => {}
         }
+    }
+}
+
+/// Report what a fan-out actually did — `[fan-out 10 → 1 wide]` — beside the cache
+/// outcome, on stderr like it.
+///
+/// Printed for every line that fanned out, routed or not. The unrouted number is the
+/// valuable one: a ten-branch fork on the default `single` scheduler is ONE wide, and
+/// from outside the process that is indistinguishable from a slow server. When a width
+/// hint was applied the note names the term, so the routing decision is visible rather
+/// than inferred from which backend happened to answer.
+fn report_fan_out(engine: &Engine) {
+    if let Some(fan_out) = engine.last_fan_out() {
+        eprintln!("[{fan_out}]");
     }
 }
