@@ -42,7 +42,7 @@ ikigai-sniff = "0.1.1"
 # Neutral s-expr foundation: Sexpr datum + urn:sparql:from-sexpr transreptor (text/x-sexpr → SPARQL).
 ikigai-sexpr = "0.1.0"
 # Signing + verification: urn:sign:sign (cap-gated) / urn:sign:verify (open), Ed25519.
-ikigai-sign = "0.1.0"
+ikigai-sign = "0.2.0"
 # Public-key encryption (urn:encrypt:encrypt/decrypt, age/X25519) — the dual of sign.
 # Keys resolved through the kernel (urn:secret:<id>.enc). Embedded-only (off the wire).
 ikigai-encrypt = "0.1.0"
