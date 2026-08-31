@@ -765,7 +765,16 @@ fn merge_json(target: &mut serde_json::Value, patch: &serde_json::Value) {
         let tmap = target.as_object_mut().expect("just set to object");
         for (k, v) in patch_map {
             if v.is_null() {
-                tmap.remove(k);
+                // `shift_remove`, not `remove`: under `preserve_order` (which this workspace
+                // enables) `Map::remove` is `swap_remove`, so deleting a key would drag the
+                // document's LAST key into the hole. A merge patch that removes one field
+                // must not reshuffle the ones it left alone.
+                //
+                // It doubles as a canary, which is why it is worth the extra word here:
+                // `shift_remove` does not EXIST on a BTreeMap-backed `Map`, so dropping
+                // `preserve_order` from the workspace fails to compile right here instead of
+                // silently re-alphabetizing every projection this crate serves.
+                tmap.shift_remove(k);
             } else {
                 merge_json(tmap.entry(k.clone()).or_insert(Value::Null), v);
             }
@@ -1240,6 +1249,14 @@ fn operation_id(method: &str, path: &str) -> String {
 }
 
 /// The JSON-Schema object properties + required list for a set of inputs (a write's body).
+///
+/// **Order is part of the contract.** `properties` comes out in the order the endpoint's
+/// author declared the inputs, because that order is the intended reading order of a form
+/// generated from it — adjacent fields were meant to be adjacent. This holds only because
+/// the workspace enables serde_json's `preserve_order`; without it `Map` is a `BTreeMap`
+/// and the keys silently alphabetize on the way out while `required` (a `Vec`) does not,
+/// which is exactly the asymmetry that gave this away. Pinned by
+/// `description_projects_properties_in_declaration_order`.
 fn schema_properties(inputs: &[ikigai_core::ArgSpec]) -> (serde_json::Value, Vec<String>) {
     use serde_json::{Map, Value};
     let mut props = Map::new();
@@ -2279,6 +2296,64 @@ mod tests {
         let required = schema["required"].as_array().unwrap();
         assert!(required.iter().any(|r| r == "slot") && required.iter().any(|r| r == "email"));
         assert!(!required.iter().any(|r| r == "preference"));
+    }
+
+    #[tokio::test]
+    async fn description_projects_properties_in_declaration_order() {
+        // The endpoint author's declaration order IS the intended reading order of a form
+        // generated from `?description`: fields declared adjacently were meant to render
+        // adjacently. `serde_json::Map` is a BTreeMap unless `preserve_order` is enabled, so
+        // for a long time this came back alphabetized while `required` — a Vec — did not,
+        // and a form generator had no way to recover what the author wrote.
+        let addr = start().await;
+        let resp = roundtrip(
+            addr,
+            "GET /test/booking?description HTTP/1.1\r\nHost: x\r\n\r\n",
+        )
+        .await;
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        let v: serde_json::Value = serde_json::from_str(body).expect("openapi json");
+        let properties = v["paths"]["/test/booking"]["post"]["requestBody"]["content"]
+            ["application/json"]["schema"]["properties"]
+            .as_object()
+            .expect("an object of properties");
+        let projected: Vec<&str> = properties.keys().map(String::as_str).collect();
+
+        // The order `urn:test:booking` declares its inputs in, above. Asserted whole, not as
+        // a set and not as a pairwise "x before y": a future re-alphabetization has to fail
+        // this, and a pairwise check would let one through whenever the pair happens to sort
+        // the way it was written.
+        let declared = ["slot", "timezone", "email", "preference"];
+        assert_eq!(projected, declared, "got: {body}");
+
+        // …and this declaration is deliberately not in alphabetical order, so the assertion
+        // above cannot be satisfied by a sorted map. Without this, the test would quietly
+        // stop testing anything the day someone reorders the fixture.
+        let mut sorted = declared;
+        sorted.sort_unstable();
+        assert_ne!(
+            declared, sorted,
+            "the fixture must declare its inputs out of alphabetical order, or this test \
+             passes under a BTreeMap and proves nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_merge_patch_that_deletes_a_field_leaves_the_others_in_place() {
+        // Under `preserve_order`, `Map::remove` is `swap_remove` — it fills the hole with the
+        // map's LAST entry. A patch removing one field would then reorder the fields it did
+        // not mention, which for a document whose key order now carries meaning is a silent
+        // edit nobody asked for.
+        let mut target: serde_json::Value =
+            serde_json::from_str(r#"{"a":1,"b":2,"c":3,"d":4}"#).unwrap();
+        merge_json(&mut target, &serde_json::json!({ "b": null }));
+        let keys: Vec<&str> = target
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["a", "c", "d"], "swap_remove would give a, d, c");
     }
 
     #[tokio::test]

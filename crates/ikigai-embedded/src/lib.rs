@@ -5651,6 +5651,32 @@ mod tests {
     }
 
     #[test]
+    fn the_booking_form_offers_its_fields_in_declaration_order() {
+        // The projection (ikigai-web's `?description` → OpenAPI) now renders `properties` in
+        // this order rather than alphabetically, so this list is the order a generated form
+        // lays out — which makes it a statement about the READER, not just about the struct.
+        // Two consequences worth naming: `from` and `until` are adjacent, which is what the
+        // "put it in both boxes" label promises; and `preference` — the four-row "Anything to
+        // note?" textarea that used to land between them, purely because `p` sorts between
+        // `f` and `u` — is last, where its author put it.
+        assert_eq!(
+            offered_fields(),
+            [
+                "name",
+                "email",
+                "period",
+                "date",
+                "from",
+                "until",
+                "zone",
+                "preference"
+            ],
+            "the declared order is the rendered order; reordering this list reorders the \
+             public booking form"
+        );
+    }
+
+    #[test]
     fn the_booking_form_no_longer_offers_the_prose_hours_box() {
         // The ambiguity is removed at the SOURCE: nobody is shown the box that lost two
         // prospects. (It is still accepted — see the next test.)
