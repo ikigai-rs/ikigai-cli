@@ -4113,16 +4113,45 @@ fn booking_intake() -> ikigai_intake::IntakeConfig {
             // The handler validates the shape and the availability endpoint the substance —
             // this is the convenience half. A generated form renders it as an HTML5 date input
             // (keyed on the field name, the same way the zone field becomes a picker).
-            F::optional("date", "Or pick a specific date"),
-            // Optional: absence is "I'm flexible," not a malformed request. Blank defaults to
-            // business hours (the handler's `visitor-hours-for`); a preference still only ranks
-            // within them, never widens them. A non-blank value that isn't clock-hours is still
-            // rejected by the handler. The generated form drops the required marker from the
-            // ?description automatically — bosatsu-www needs no change.
+            F::optional("date", "Or pick a specific date").max_len(40),
+            // ★ TWO TIMES, NOT ONE BOX OF PROSE. Both optional: leaving them blank is "I'm
+            // flexible", which defaults to business hours in the handler's `visitor-hours-for`.
+            //
+            // These replaced a single free-text `hours` because two real prospects were lost
+            // typing the natural answer into it — one wanted a RANGE ("any time between 10:00
+            // and 16:00"), the other a POINT ("1630 hrs BST"), and a field validated as
+            // clock-hours could express neither. Two boxes hold both exactly: the pair is a
+            // range, the same time in both is that exact minute (the handler never rounds it),
+            // and one of the two alone is open-ended in that direction. Nothing has to guess.
+            //
+            // Bounded tightly on purpose: a clock time is a handful of characters, so the door
+            // has no reason to accept more, and the reactor behind it never sees more.
+            F::optional(
+                "from",
+                "Earliest time that suits you, in YOUR timezone (e.g. 10:00)",
+            )
+            .max_len(40),
+            F::optional(
+                "until",
+                "Latest time that suits you (e.g. 16:00). For one specific time, put it in \
+                 both boxes; leave both blank for any business hour",
+            )
+            .max_len(40),
+            // ★ SUPERSEDED BY `from`/`until`, AND STILL DECLARED ON PURPOSE. `legacy()` stops
+            // the generated form offering it while links, email templates and API callers that
+            // already send it keep working. Deleting the declaration was the tempting move and
+            // is the wrong one: an UNDECLARED field is dropped, not refused (see ikigai-intake's
+            // `invoke`), so an old caller's stated hours would vanish in silence — a request
+            // losing its constraint with nobody told, which is the exact failure this whole
+            // change exists to end. Refusing loudly would at least be honest; carrying it is
+            // better still, and the handler demotes it to `preference` when `from`/`until` also
+            // arrive, so the two statements never fight.
             F::optional(
                 "hours",
-                "Hours that suit you, in YOUR timezone (24-hour, space separated — e.g. 9 10 14); leave blank for any business hour",
-            ),
+                "Hours that suit you, in YOUR timezone (24-hour, space separated — e.g. 9 10 14)",
+            )
+            .legacy()
+            .max_len(500),
             // No "e.g. Europe/London" hint: a generated form offers a zone picker, and the
             // label is what it renders. The server still checks the name against tzdata.
             F::required("zone", "Your timezone").iana_zone(),
@@ -5543,5 +5572,151 @@ mod tests {
         // A fresh read now sees v2.
         assert_eq!(block_on(kernel.issue(source(), &cap)).unwrap().bytes, b"v2");
         std::fs::remove_dir_all(&root).ok();
+    }
+    // ---------- the public booking door: what it offers and what it accepts ----------
+
+    /// A stand-in booking space that records the tuples dropped into it.
+    struct RecordingSpace {
+        dropped: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl Endpoint for RecordingSpace {
+        async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+            let body = inv.inline_str("content").unwrap_or_default().to_string();
+            self.dropped.lock().unwrap().push(body);
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                b"ok".to_vec(),
+            ))
+        }
+    }
+
+    /// The real `booking_intake()` in front of a recording space — the production field set,
+    /// so these tests fail if the declaration changes underneath them.
+    fn booking_kernel() -> (Kernel, Arc<std::sync::Mutex<Vec<String>>>) {
+        let dropped = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let space = EndpointSpace::new()
+            .bind(
+                Exact::new("urn:booking:submit"),
+                ikigai_intake::submit(booking_intake()),
+            )
+            .bind(
+                Exact::new("urn:space:bookings"),
+                RecordingSpace {
+                    dropped: dropped.clone(),
+                },
+            );
+        (Kernel::new(Arc::new(space)), dropped)
+    }
+
+    fn book(body: &str) -> Request {
+        Request::new(Verb::Sink, Iri::parse("urn:booking:submit").unwrap())
+            .with_arg("content", ArgRef::Inline(body.as_bytes().to_vec()))
+    }
+
+    fn booking_cap() -> Capability {
+        Capability::scoped(["urn:cap:booking:submit"])
+    }
+
+    /// The names `?description` offers, which ARE the fields a generated form renders.
+    fn offered_fields() -> Vec<String> {
+        ikigai_intake::submit(booking_intake())
+            .describe()
+            .action_specs()[0]
+            .inputs
+            .iter()
+            .map(|i| i.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_booking_form_offers_from_and_until() {
+        let offered = offered_fields();
+        for name in ["from", "until"] {
+            assert!(
+                offered.contains(&name.to_string()),
+                "`{name}` must reach the generated form: {offered:?}"
+            );
+        }
+        // Both optional — blank is "I'm flexible", not a malformed request.
+        let described = ikigai_intake::submit(booking_intake()).describe();
+        for spec in described.action_specs()[0]
+            .inputs
+            .iter()
+            .filter(|i| i.name == "from" || i.name == "until")
+        {
+            assert!(!spec.required, "`{}` must be optional", spec.name);
+            assert!(!spec.summary.is_empty(), "`{}` needs a label", spec.name);
+        }
+    }
+
+    #[test]
+    fn the_booking_form_no_longer_offers_the_prose_hours_box() {
+        // The ambiguity is removed at the SOURCE: nobody is shown the box that lost two
+        // prospects. (It is still accepted — see the next test.)
+        let offered = offered_fields();
+        assert!(
+            !offered.contains(&"hours".to_string()),
+            "`hours` is superseded and must not be offered: {offered:?}"
+        );
+    }
+
+    #[test]
+    fn a_stated_from_and_until_lands_in_the_tuple() {
+        let (k, dropped) = booking_kernel();
+        block_on(k.issue(
+            book(
+                "name=Ada&email=ada%40example.com&period=week\
+                 &zone=Europe%2FLondon&from=10%3A00&until=16%3A00",
+            ),
+            &booking_cap(),
+        ))
+        .unwrap();
+        let tuple = dropped.lock().unwrap()[0].clone();
+        assert!(tuple.contains(r#"(from "10:00")"#), "{tuple}");
+        assert!(tuple.contains(r#"(until "16:00")"#), "{tuple}");
+    }
+
+    #[test]
+    fn a_legacy_hours_submission_still_lands() {
+        // A link, an email template or an API caller that predates `from`/`until` keeps
+        // working — the field is unoffered, not undeclared, so its value is CARRIED rather
+        // than silently dropped on the way to the handler.
+        let (k, dropped) = booking_kernel();
+        block_on(k.issue(
+            book("name=Ada&email=ada%40example.com&period=week&zone=Europe%2FLondon&hours=9+10+14"),
+            &booking_cap(),
+        ))
+        .unwrap();
+        let tuple = dropped.lock().unwrap()[0].clone();
+        assert!(
+            tuple.contains(r#"(hours "9 10 14")"#),
+            "an old caller's hours must still reach the handler: {tuple}"
+        );
+    }
+
+    #[test]
+    fn an_over_long_time_is_refused_at_the_booking_door() {
+        // The door-side half of a measured denial of service: 100 KB in this field once
+        // stalled the serial reactor behind it for 356 seconds. A clock time is short.
+        let (k, dropped) = booking_kernel();
+        let huge = "9".repeat(100_000);
+        let err = block_on(k.issue(
+            book(&format!(
+                "name=Ada&email=ada%40example.com&period=week&zone=Europe%2FLondon&from={huge}"
+            )),
+            &booking_cap(),
+        ))
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("at most 40 characters"), "{text}");
+        assert!(
+            text.len() < 200,
+            "the error must not carry the value: {text}"
+        );
+        assert!(
+            dropped.lock().unwrap().is_empty(),
+            "nothing reached the reactor"
+        );
     }
 }
