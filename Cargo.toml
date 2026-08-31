@@ -128,7 +128,18 @@ ikigai-time = { path = "crates/ikigai-time", version = "0.1.12" } # JobHealth: l
 ikigai-web = { path = "crates/ikigai-web", version = "0.1.9" }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order` makes `serde_json::Map` an IndexMap instead of a BTreeMap, so a JSON
+# object serializes in the order its keys were INSERTED rather than alphabetically. Every
+# crate here that projects a declared contract into JSON — ikigai-web's OpenAPI
+# `?description`, ikigai-mcp's tool `inputSchema` — builds `properties` by iterating the
+# endpoint's `inputs` in declaration order, and without this feature that order was thrown
+# away at serialization. The visible cost was a booking form that rendered a textarea
+# between the two time boxes its author had declared adjacently, while one of their labels
+# said "put it in both boxes". The author's order IS the intended reading order; nothing
+# downstream can recover it once it is sorted, and no naming discipline should be needed to
+# keep it. Note for anyone reading a diff of JSON this workspace emits: `Map::remove` is
+# `swap_remove` under this feature — reach for `shift_remove` where order is meant to hold.
+serde_json = { version = "1", features = ["preserve_order"] }
 postcard = { version = "1", features = ["use-std"] }
 libc = "0.2"
 # Native HTTP client for the embedded host's ikigai-http transport. Blocking and
