@@ -14,6 +14,10 @@
 //!   character, which is a real defect found in a sibling decoder.
 //! - **Fields are declared.** Anything not declared is DROPPED rather than carried
 //!   through, so a submitter cannot smuggle an extra key into the tuple the handler reads.
+//! - **Every field is BOUNDED.** A value longer than the field allows is refused here, in
+//!   front of someone who can still shorten it — never passed on to be clipped or to stall
+//!   the serial reactor behind this door. There is no unbounded setting; see
+//!   [`DEFAULT_MAX_LEN`] for what that cost in seconds when there was.
 //! - **Values are escaped for the s-expression.** A quote or backslash in a message would
 //!   otherwise break out of the datum and reshape the tuple the handler parses. Escaping
 //!   here is what lets the handler's `read` stay a pure data parse.
@@ -31,6 +35,21 @@ use ikigai_core::{
 };
 
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+
+/// How long a submitted value may be, in characters, unless the field says otherwise.
+///
+/// ★ There is deliberately no "unbounded" setting. An unbounded public text field is not a
+/// theoretical risk: a 100 KB value in the booking form's `hours` stalled the SERIAL reactor
+/// behind this door for **356 seconds** (measured, `ikigai-programs` PR #27) — every other
+/// submission waiting behind it. The handler grew an 8000-character refusal in response, but
+/// a handler cap is a BACKSTOP: by then the tuple has dropped and the submitter is long gone.
+/// This is the door, and a door that has to be remembered is not a door — so the bound is the
+/// default and widening it is the explicit act ([`IntakeField::max_len`]).
+///
+/// 4000 characters is a long enquiry (~650 words) and sits deliberately BELOW the handler's
+/// own 8000-character backstop, so the refusal happens here — in front of someone who can
+/// still read it and shorten what they wrote — rather than silently downstream.
+pub const DEFAULT_MAX_LEN: usize = 4_000;
 
 /// One accepted field. The `summary` is human-facing on purpose: it becomes the
 /// `ArgSpec` summary, which is what `?description` projects and a generated form renders
@@ -50,6 +69,18 @@ pub struct IntakeField {
     /// form is free to build its own picker from whatever tzdata it has (a browser ships
     /// its own) while the server stays the authority on what it will accept.
     pub iana_zone: bool,
+    /// The longest value this field will accept, in characters. See [`DEFAULT_MAX_LEN`] —
+    /// there is no unbounded setting, only a bigger number stated on purpose.
+    pub max_len: usize,
+    /// Is this field OFFERED, as well as accepted? `true` for every ordinary field.
+    ///
+    /// `false` marks a field that is still ACCEPTED on submission but no longer projected
+    /// into `?description`, so a generated form stops showing it — the shape a superseded
+    /// field needs while links, saved bookmarks, email templates and API callers still send
+    /// it. It exists because an undeclared field is **dropped, not refused** (see `invoke`):
+    /// deleting the declaration outright would make an old caller's stated constraint vanish
+    /// in silence, which is a worse failure than either keeping or refusing it.
+    pub advertised: bool,
 }
 
 impl IntakeField {
@@ -61,6 +92,8 @@ impl IntakeField {
             summary: summary.into(),
             one_of: Vec::new(),
             iana_zone: false,
+            max_len: DEFAULT_MAX_LEN,
+            advertised: true,
         }
     }
     /// An optional free-text field.
@@ -71,7 +104,26 @@ impl IntakeField {
             summary: summary.into(),
             one_of: Vec::new(),
             iana_zone: false,
+            max_len: DEFAULT_MAX_LEN,
+            advertised: true,
         }
+    }
+    /// Bound this field at `max` characters instead of [`DEFAULT_MAX_LEN`].
+    ///
+    /// Worth stating for any field whose shape is genuinely small — a clock time is never
+    /// 4000 characters — because the tighter the door, the less a hostile submission can
+    /// cost the reactor behind it.
+    pub fn max_len(mut self, max: usize) -> Self {
+        self.max_len = max;
+        self
+    }
+    /// Keep accepting this field, but stop offering it: it vanishes from `?description`
+    /// and therefore from any generated form, while an existing caller that still sends it
+    /// is unaffected. See [`IntakeField::advertised`] for why deleting it instead would be
+    /// worse than either alternative.
+    pub fn legacy(mut self) -> Self {
+        self.advertised = false;
+        self
     }
     /// Constrain this field to `values` (rendered as a select).
     pub fn one_of<I, S>(mut self, values: I) -> Self
@@ -416,6 +468,24 @@ impl Endpoint for IntakeEndpoint {
             let value = get(&field.name).filter(|v| !v.is_empty());
             match value {
                 Some(value) => {
+                    // LENGTH FIRST, before anything looks at the value: this is the bound
+                    // that keeps a hostile submission from costing the serial reactor behind
+                    // this door minutes of wall clock (see `DEFAULT_MAX_LEN`). Counted in
+                    // CHARACTERS because that is the unit the message quotes back at someone
+                    // who has to shorten what they typed; it bounds bytes at 4x either way.
+                    //
+                    // The oversized value is deliberately NOT echoed — the whole complaint is
+                    // that it is enormous, and an error carrying it lands in logs and emails.
+                    let len = value.chars().count();
+                    if len > field.max_len {
+                        return Err(Error::InvalidArgument {
+                            name: field.name.clone(),
+                            detail: format!(
+                                "`{}` is at most {} characters (this one was {len})",
+                                field.name, field.max_len
+                            ),
+                        });
+                    }
                     // A constrained field must hold one of its declared values — the same
                     // list a generated form renders as a select, enforced server-side
                     // because the form is only a suggestion to a submitter.
@@ -549,7 +619,11 @@ impl Endpoint for IntakeEndpoint {
         // These ArgSpecs ARE the form: `?description` projects them, and a generated UI
         // renders each summary as a label and each `one_of` as a select. One declaration,
         // validated here and rendered there — they cannot drift.
-        for field in &self.config.fields {
+        //
+        // A `legacy()` field is the one asymmetry, and it is the point of that method: still
+        // accepted above, no longer offered here, so a superseded field stops appearing on
+        // the form without breaking the callers that still send it.
+        for field in self.config.fields.iter().filter(|f| f.advertised) {
             let mut spec = ArgSpec::new(field.name.clone())
                 .summary(field.summary.clone())
                 .class(XSD_STRING);
@@ -1135,6 +1209,144 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, Error::Denied(_)), "got: {err:?}");
         assert!(dropped.lock().unwrap().is_empty());
+    }
+
+    /// An intake with one tightly bounded field, to exercise the door's length check.
+    fn bounded_kernel() -> (Kernel, Arc<Mutex<Vec<String>>>) {
+        let mut cfg = config();
+        cfg.fields
+            .push(IntakeField::optional("when", "When suits you").max_len(8));
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:contact:submit"), submit(cfg))
+            .bind(
+                Exact::new("urn:space:contact"),
+                RecordingSpace {
+                    dropped: dropped.clone(),
+                },
+            );
+        (Kernel::new(Arc::new(space)), dropped)
+    }
+
+    #[test]
+    fn an_over_long_field_is_refused_at_the_door() {
+        let (k, dropped) = bounded_kernel();
+        let err = block_on(k.issue(
+            post("name=X&email=x%40y.com&message=hi&when=aaaaaaaaaaaaaaaa"),
+            &cap(),
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument { ref name, .. } if name == "when"),
+            "got: {err:?}"
+        );
+        // The message says the limit and the actual size, so the submitter knows what to do…
+        let text = err.to_string();
+        assert!(text.contains("at most 8 characters"), "{text}");
+        assert!(text.contains("was 16"), "{text}");
+        // …and does NOT echo the value back: the complaint is that it is enormous, and this
+        // string reaches logs and a host's email.
+        assert!(!text.contains("aaaaaaaaaaaaaaaa"), "{text}");
+        // Nothing reached the space, so nothing reached the serial reactor behind it.
+        assert!(dropped.lock().unwrap().is_empty(), "nothing dropped");
+    }
+
+    #[test]
+    fn a_value_at_the_limit_is_accepted() {
+        // An off-by-one here would refuse a perfectly good submission, which is the failure
+        // mode a length check is most likely to introduce.
+        let (k, dropped) = bounded_kernel();
+        block_on(k.issue(
+            post("name=X&email=x%40y.com&message=hi&when=aaaaaaaa"),
+            &cap(),
+        ))
+        .unwrap();
+        assert!(dropped.lock().unwrap()[0].contains(r#"(when "aaaaaaaa")"#));
+    }
+
+    #[test]
+    fn the_bound_counts_characters_not_bytes() {
+        // Eight multibyte characters are 24 bytes. The limit is stated to a person in the
+        // unit they typed in, so this must pass — and a byte count would refuse it.
+        let (k, dropped) = bounded_kernel();
+        block_on(k.issue(
+            post("name=X&email=x%40y.com&message=hi&when=八八八八八八八八"),
+            &cap(),
+        ))
+        .unwrap();
+        assert!(dropped.lock().unwrap()[0].contains("八八八八八八八八"));
+    }
+
+    #[test]
+    fn every_field_is_bounded_by_default() {
+        // The point of the default: a field nobody thought about is still a bounded field.
+        let (k, dropped) = kernel();
+        let huge = "x".repeat(DEFAULT_MAX_LEN + 1);
+        let err = block_on(k.issue(
+            post(&format!("name=X&email=x%40y.com&message={huge}")),
+            &cap(),
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument { ref name, .. } if name == "message"),
+            "got: {err:?}"
+        );
+        assert!(dropped.lock().unwrap().is_empty());
+    }
+
+    /// An intake whose `message` has been superseded but is still accepted.
+    fn legacy_kernel() -> (Kernel, Arc<Mutex<Vec<String>>>) {
+        let mut cfg = config();
+        for field in &mut cfg.fields {
+            if field.name == "organisation" {
+                *field = IntakeField::optional("organisation", "Organisation").legacy();
+            }
+        }
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:contact:submit"), submit(cfg))
+            .bind(
+                Exact::new("urn:space:contact"),
+                RecordingSpace {
+                    dropped: dropped.clone(),
+                },
+            );
+        (Kernel::new(Arc::new(space)), dropped)
+    }
+
+    #[test]
+    fn a_legacy_field_is_still_accepted_but_no_longer_offered() {
+        let (k, dropped) = legacy_kernel();
+        block_on(k.issue(
+            post("name=X&email=x%40y.com&message=hi&organisation=Analytical"),
+            &cap(),
+        ))
+        .unwrap();
+        // Still CARRIED — an existing caller's value is not silently discarded…
+        assert!(
+            dropped.lock().unwrap()[0].contains(r#"(organisation "Analytical")"#),
+            "{:?}",
+            dropped.lock().unwrap()[0]
+        );
+    }
+
+    #[test]
+    fn a_legacy_field_is_absent_from_the_description() {
+        // …but a generated form stops showing it, because `?description` no longer names it.
+        let mut cfg = config();
+        cfg.fields
+            .push(IntakeField::optional("hours", "Hours that suit you").legacy());
+        let described = submit(cfg).describe();
+        let inputs: Vec<String> = described.action_specs()[0]
+            .inputs
+            .iter()
+            .map(|i| i.name.clone())
+            .collect();
+        assert!(inputs.contains(&"message".to_string()), "{inputs:?}");
+        assert!(
+            !inputs.contains(&"hours".to_string()),
+            "a legacy field must not be offered: {inputs:?}"
+        );
     }
 
     #[test]
