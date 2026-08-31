@@ -52,7 +52,8 @@ usage:
   ikigai serve --http <port>   serve the inbound HTTP face (loopback; front with TLS at your proxy)
                                [--trust-proxy: honor X-Forwarded-*; --cors-origin <o>: allow a CORS origin;
                                 --routes <iri>: load routes from an RDF or plain-JSON resource
-                                (a urn:file: route hot-reloads); --routes-only: un-routed → 404]
+                                (a urn:file: route hot-reloads); --routes-only: un-routed → 404;
+                                --max-body <bytes>: largest accepted request body, default 1048576]
   ikigai --daemon              headless: timers, the watcher, and the standing sync — for launchd
   ikigai --name <instance>     name this instance (scopes <name>.* config properties; defaults
                                repl / daemon / serve by mode)
@@ -144,6 +145,11 @@ enum Mode {
         /// `--routes-only`: an un-routed path 404s instead of falling through to the mechanical
         /// default — the route table becomes an exhaustive allow-list (the public-edge posture).
         routes_only: bool,
+        /// `--max-body <bytes>`: the largest request body this door accepts; a bigger one is
+        /// refused with `413` before it is read. `None` → the transport's own default. Lower
+        /// it for a door that only takes forms — the public intake edge has no use for a
+        /// megabyte.
+        max_body: Option<usize>,
         /// `--announce`: advertise this kernel on the local network over mDNS, so clients
         /// can mount it by name instead of by an address that moves. Opt-in — broadcasting
         /// what a machine serves is a disclosure.
@@ -380,6 +386,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
         let mut cors_origins = Vec::new();
         let mut routes = None;
         let mut routes_only = false;
+        let mut max_body = None;
         let mut announce = false;
         let mut mounts: Vec<Mount> = Vec::new();
         while let Some(arg) = argv.next() {
@@ -496,6 +503,16 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 routes_only = true;
                 continue;
             }
+            if arg == "--max-body" {
+                let raw = argv
+                    .next()
+                    .ok_or_else(|| "--max-body needs a size in bytes".to_string())?;
+                max_body = Some(
+                    raw.parse::<usize>()
+                        .map_err(|_| format!("--max-body wants a size in bytes ({raw})"))?,
+                );
+                continue;
+            }
             if arg.starts_with('-') {
                 return Err(format!("unknown argument: {arg}"));
             } else if target.is_none() {
@@ -520,6 +537,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
             cors_origins,
             routes,
             routes_only,
+            max_body,
             announce,
             mounts,
         }));
@@ -769,6 +787,7 @@ fn main() {
             cors_origins,
             routes,
             routes_only,
+            max_body,
         } => match (http, target.as_deref()) {
             // The inbound HTTP face takes precedence over IPC/QUIC when `--http` is given.
             (Some(bind), _) => serve_http(
@@ -778,6 +797,7 @@ fn main() {
                 &cors_origins,
                 routes.as_deref(),
                 routes_only,
+                max_body,
             ),
             (None, Some(t)) if is_quic(t) => serve_quic(t, &certs, &caps, announce, mounts),
             (None, _) if !caps.is_empty() => {
@@ -2248,6 +2268,7 @@ fn serve_http(
     cors_origins: &[String],
     routes: Option<&str>,
     routes_only: bool,
+    max_body: Option<usize>,
 ) -> ! {
     use std::net::SocketAddr;
     let addr: SocketAddr = if let Ok(port) = bind.parse::<u16>() {
@@ -2281,6 +2302,10 @@ fn serve_http(
         routes_only,
         ..Default::default()
     };
+    // `--max-body` narrows the door; unset keeps the transport's own default.
+    if let Some(max) = max_body {
+        config.max_body_bytes = max;
+    }
     config.cors.allowed_origins = cors_origins.to_vec();
     // Build the async runtime up front — route loading (a kernel SPARQL query) is async too.
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -2391,6 +2416,7 @@ fn serve_http(
     _cors_origins: &[String],
     _routes: Option<&str>,
     _routes_only: bool,
+    _max_body: Option<usize>,
 ) -> ! {
     eprintln!("ikigai: the inbound HTTP face needs the `web` feature (build with --features web)");
     std::process::exit(1);

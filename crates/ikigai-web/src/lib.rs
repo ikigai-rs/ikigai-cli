@@ -78,6 +78,20 @@ pub fn fixed_cap(scopes: Vec<String>) -> CapFn {
     Arc::new(move |_req| Capability::scoped(scopes.clone()))
 }
 
+/// The largest request body accepted from a client, in bytes.
+///
+/// This is a TRANSPORT bound, not a form bound: the same door carries `PUT`/`PATCH` of
+/// documents as well as the intake forms, so it is sized for the widest legitimate write
+/// rather than for the widest legitimate submission. One mebibyte is what this server has
+/// in fact enforced since it was written (as a silent truncation — see `handle`), so
+/// naming it changes no request that succeeds today; it only makes the number arguable and
+/// [overridable](EdgeConfig::max_body_bytes) instead of magic.
+///
+/// For scale on the intake side of the door: `ikigai-intake` bounds each declared field at
+/// 4000 characters by default and booking's widest field at 500, so a form with twenty
+/// generous fields cannot honestly approach this even fully percent-encoded.
+pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
+
 /// Edge response policy: security headers, CORS, and whether to trust a fronting proxy's
 /// `X-Forwarded-*`. [`Default`] is a safe public-edge posture — strict security headers,
 /// CORS **closed**, proxy **not** trusted. (Per-route policy is a later slice; this is the
@@ -98,6 +112,10 @@ pub struct EdgeConfig {
     /// the host may swap it (e.g. when a watched route file changes) without a restart; each
     /// request reads whatever the handle currently holds. `None` → the static `routes`.
     pub live_routes: Option<LiveRoutes>,
+    /// The largest request body accepted, in bytes; a larger one is refused with `413`
+    /// before it is read. Default [`DEFAULT_MAX_BODY_BYTES`]. Raise it for a door that
+    /// takes genuinely large writes, lower it for one that only takes forms.
+    pub max_body_bytes: usize,
     /// Routes-only: an un-routed path is **not** part of the public surface — it 404s instead
     /// of falling through to the mechanical `/noun/partition/key` → `urn:` default. This turns
     /// the route table into an exhaustive allow-list (no accidental export), the right posture
@@ -132,6 +150,7 @@ impl Default for EdgeConfig {
             routes: RouteTable::default(),
             live_routes: None,
             routes_only: false,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
         }
     }
 }
@@ -413,22 +432,86 @@ async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::
             .await
         }
     };
-    // Read the body up to Content-Length (bounded).
-    let cl: usize = req
-        .header("content-length")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    // THE FRAMING IS SETTLED BEFORE A BODY BYTE IS READ. Everything here decides how much
+    // an anonymous client may make this process hold and hand onward, and this door is
+    // public — bosatsu's contact and booking forms front it — so the decision cannot come
+    // after the read it is meant to bound.
+    //
+    // A transfer-coding this server does not implement is REFUSED rather than ignored.
+    // `chunked` carries its length inside the body, so falling through to "no
+    // Content-Length" would both skip the bound below and hand the endpoint the raw chunk
+    // framing as if it were the submission.
+    if req.header("transfer-encoding").is_some() {
+        return write(
+            &mut sock,
+            Resp::text(501, "Not Implemented", "unsupported transfer-encoding"),
+        )
+        .await;
+    }
+    let max = shared.config.max_body_bytes;
+    // A `Content-Length` that is present but unreadable is a disagreement about framing,
+    // not a zero-length body: treating it as 0 would silently deliver whatever trailed the
+    // headers in the read buffer as the body.
+    let cl: usize = match req.header("content-length") {
+        None => 0,
+        Some(raw) => match raw.parse() {
+            Ok(n) => n,
+            Err(_) => {
+                return write(
+                    &mut sock,
+                    Resp::text(400, "Bad Request", "malformed Content-Length"),
+                )
+                .await
+            }
+        },
+    };
+    // REFUSE, DO NOT TRUNCATE — the whole point of this block. The declared length is the
+    // cheapest check there is (it costs no read at all) and 413 is the honest answer to a
+    // client whose submission this server will not take.
+    //
+    // What stood here stopped READING at the same threshold and then went on to parse and
+    // dispatch what it had. An oversize POST therefore became a silently truncated one that
+    // the endpoint had no way to tell from a complete submission, and the submitter was
+    // told nothing — mangled input accepted, rather than large input refused.
+    if cl > max {
+        return write(
+            &mut sock,
+            Resp::text(413, "Payload Too Large", "request body too large"),
+        )
+        .await;
+    }
+    // Whatever already arrived behind the headers. Bounded by the 64 KiB header cap above,
+    // but checked against `max` too so a deliberately small `max_body_bytes` still holds.
     let mut body = buf[header_end + 4..].to_vec();
+    if body.len() > max {
+        return write(
+            &mut sock,
+            Resp::text(413, "Payload Too Large", "request body too large"),
+        )
+        .await;
+    }
+    // No second size check is needed in the loop: it stops at `cl`, and `cl <= max`. The
+    // read may overshoot by one buffer, which is why the body is cut to the length the
+    // client declared — those trailing bytes are the next pipelined request, not this body.
     while body.len() < cl {
         let n = sock.read(&mut tmp).await?;
         if n == 0 {
             break;
         }
         body.extend_from_slice(&tmp[..n]);
-        if body.len() > 1024 * 1024 {
-            break;
-        }
     }
+    // The other end of the same principle. A client that declares more than it sends and
+    // then hangs up has produced a PARTIAL submission, and delivering it would put the
+    // endpoint back in the position this whole block exists to get it out of: unable to
+    // tell an incomplete body from a complete one.
+    if body.len() < cl {
+        return write(
+            &mut sock,
+            Resp::text(400, "Bad Request", "incomplete request body"),
+        )
+        .await;
+    }
+    body.truncate(cl);
     req.body = body;
     req.peer = Some(peer);
 
@@ -2240,6 +2323,156 @@ mod tests {
         assert!(
             !closed.contains("Access-Control-Allow-Origin"),
             "server default stays closed off-route, got: {closed}"
+        );
+    }
+
+    // ---- The body bound. -------------------------------------------------------------
+    //
+    // The door these guard is public (bosatsu's contact and booking forms sit behind it),
+    // and the reactor behind it is serial, so what a stranger can make this server read and
+    // hand onward is a security property rather than a nicety.
+
+    /// The defect these tests exist for: the bound used to `break` out of the read and then
+    /// parse what it had, so an oversize body arrived at the endpoint as a SHORTER one that
+    /// looked complete. Refusing is the only answer that cannot be mistaken for a
+    /// submission.
+    #[tokio::test]
+    async fn an_oversize_body_is_refused_rather_than_quietly_cut_down_to_the_bound() {
+        let addr = start_with(EdgeConfig {
+            max_body_bytes: 64,
+            ..Default::default()
+        })
+        .await;
+        let body = "x".repeat(100);
+        let out = roundtrip(
+            addr,
+            &format!(
+                "PUT /test/writable HTTP/1.1\r\nHost: x\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert!(out.starts_with("HTTP/1.1 413 "), "got: {out}");
+        // The endpoint echoes what it was handed. Nothing was handed to it.
+        assert!(
+            !out.contains("xxxx"),
+            "a refused body must not reach the endpoint at all, got: {out}"
+        );
+    }
+
+    /// `Content-Length` is checked BEFORE the body is read, which is what makes the bound
+    /// worth having: the refusal has to cost nothing.
+    ///
+    /// This test proves the ordering rather than asserting it. It declares 50 MB and then
+    /// sends two bytes, holding the connection open. A server that read up to the declared
+    /// length before deciding would block here until the test timed out; a prompt 413 is
+    /// only reachable by deciding on the header alone.
+    #[tokio::test]
+    async fn a_declared_length_over_the_bound_is_refused_without_reading_the_body() {
+        let addr = start().await;
+        let out = roundtrip(
+            addr,
+            "PUT /test/writable HTTP/1.1\r\nHost: x\r\nContent-Type: text/plain\r\nContent-Length: 50000000\r\n\r\nhi",
+        )
+        .await;
+        assert!(out.starts_with("HTTP/1.1 413 "), "got: {out}");
+    }
+
+    /// The bound is a ceiling, not a target: a body that exactly reaches it is ordinary.
+    #[tokio::test]
+    async fn a_body_at_the_bound_is_delivered_whole() {
+        let addr = start_with(EdgeConfig {
+            max_body_bytes: 64,
+            ..Default::default()
+        })
+        .await;
+        let body = "y".repeat(64);
+        let out = roundtrip(
+            addr,
+            &format!(
+                "PUT /test/writable HTTP/1.1\r\nHost: x\r\nContent-Type: text/plain\r\nContent-Length: 64\r\n\r\n{body}"
+            ),
+        )
+        .await;
+        assert!(out.starts_with("HTTP/1.1 200 "), "got: {out}");
+        assert!(
+            out.ends_with(&body),
+            "all 64 bytes should reach the endpoint, got: {out}"
+        );
+    }
+
+    /// `chunked` carries its length in the body. Ignoring it meant `Content-Length` was
+    /// absent, so the bound never applied AND the endpoint was handed the chunk framing as
+    /// if a person had typed it.
+    #[tokio::test]
+    async fn a_chunked_body_is_refused_rather_than_delivered_as_its_own_framing() {
+        let addr = start().await;
+        let out = roundtrip(
+            addr,
+            "PUT /test/writable HTTP/1.1\r\nHost: x\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        )
+        .await;
+        assert!(out.starts_with("HTTP/1.1 501 "), "got: {out}");
+        assert!(
+            !out.contains("hello"),
+            "the chunk framing must not reach the endpoint as content, got: {out}"
+        );
+    }
+
+    /// A `Content-Length` that will not parse is a disagreement about framing. Reading it as
+    /// zero delivered whatever trailed the headers in the read buffer instead.
+    #[tokio::test]
+    async fn a_malformed_content_length_is_a_framing_error_not_an_empty_body() {
+        let addr = start().await;
+        let out = roundtrip(
+            addr,
+            "PUT /test/writable HTTP/1.1\r\nHost: x\r\nContent-Type: text/plain\r\nContent-Length: eleven\r\n\r\nhello",
+        )
+        .await;
+        assert!(out.starts_with("HTTP/1.1 400 "), "got: {out}");
+        assert!(!out.contains("hello"), "got: {out}");
+    }
+
+    /// A body SHORTER than declared is the same defect from the other side: the client
+    /// hung up mid-submission, and handing the endpoint what arrived would let a partial
+    /// form read as a complete one.
+    #[tokio::test]
+    async fn a_body_shorter_than_declared_is_refused_rather_than_delivered_partial() {
+        let addr = start().await;
+        let mut c = connect(addr).await;
+        // Declares twenty bytes, sends five, then closes the write half — the shape of a
+        // submission cut off in flight.
+        c.write_all(
+            b"PUT /test/writable HTTP/1.1\r\nHost: x\r\nContent-Type: text/plain\r\nContent-Length: 20\r\n\r\nhello",
+        )
+        .await
+        .unwrap();
+        c.shutdown().await.unwrap();
+        let mut out = Vec::new();
+        c.read_to_end(&mut out).await.unwrap();
+        let out = String::from_utf8_lossy(&out).into_owned();
+        assert!(out.starts_with("HTTP/1.1 400 "), "got: {out}");
+        assert!(
+            !out.ends_with("hello"),
+            "a partial body must not reach the endpoint, got: {out}"
+        );
+    }
+
+    /// The body is exactly what the client declared. Bytes past `Content-Length` are the
+    /// next pipelined request, and appending them to this one let a client add content the
+    /// framing said was not part of it.
+    #[tokio::test]
+    async fn the_body_is_cut_to_the_length_the_client_declared() {
+        let addr = start().await;
+        let out = roundtrip(
+            addr,
+            "PUT /test/writable HTTP/1.1\r\nHost: x\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhelloAND MORE",
+        )
+        .await;
+        assert!(out.starts_with("HTTP/1.1 200 "), "got: {out}");
+        assert!(
+            out.ends_with("hello"),
+            "only the declared five bytes are the body, got: {out}"
         );
     }
 }

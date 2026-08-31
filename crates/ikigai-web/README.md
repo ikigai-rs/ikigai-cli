@@ -80,6 +80,25 @@ CORS closed, proxy not trusted**:
   `Access-Control-Request-Method`) advertises methods from the resource's own
   `describe()` Allow.
 
+### Request bounds
+
+What an anonymous client can make the server hold is bounded before it is read, and
+an over-bound request is **refused rather than trimmed to fit**:
+
+- **Headers** cap at 64 KiB → `431 Request Header Fields Too Large`.
+- **Bodies** cap at `max_body_bytes` (default 1 MiB, `--max-body <bytes>`). A
+  `Content-Length` above the cap is refused with `413` *without reading the body*,
+  so the refusal costs nothing.
+- **Framing must agree.** A `Content-Length` that will not parse is a `400`, not a
+  zero-length body; a body shorter than declared is a `400`, not a partial
+  submission; bytes past `Content-Length` are the next pipelined request and never
+  join this one; and a `Transfer-Encoding` this server does not implement is a
+  `501`, not an absent length.
+
+The point of refusing rather than trimming is that an endpoint cannot tell a
+truncated submission from a complete one — so a bound that silently shortens input
+turns a rejected request into an accepted, wrong one.
+
 ### TLS terminates at the proxy
 
 `ikigai serve --http <port>` binds `127.0.0.1` and speaks **plain HTTP** — TLS is
