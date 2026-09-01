@@ -220,7 +220,12 @@ fn host_info(nature: &'static str) -> FnEndpoint {
 pub fn time_registry() -> JobRegistry {
     static REGISTRY: OnceLock<JobRegistry> = OnceLock::new();
     REGISTRY
-        .get_or_init(|| JobRegistry::new(Arc::new(ikigai_time::ThreadTimer)))
+        .get_or_init(|| {
+            // The registry stamps `last_run` from this clock — the SAME seam the kernel
+            // uses. A native host passes the system clock; the browser host passes its
+            // `Date.now()`-backed one.
+            JobRegistry::new(Arc::new(ikigai_time::ThreadTimer), Arc::new(SystemClock))
+        })
         .clone()
 }
 

@@ -31,8 +31,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ikigai_core::{
-    ArgSpec, Capability, Description, EndpointSpace, Error, Exact, FnEndpoint, Invocation, Iri,
-    ReprType, Representation, Request, Verb,
+    ArgSpec, Capability, Clock, Description, EndpointSpace, Error, Exact, FnEndpoint, Invocation,
+    Iri, ReprType, Representation, Request, Time, Verb,
 };
 use ikigai_resolve::Resolver;
 
@@ -192,10 +192,18 @@ struct JobRecord {
     persistent: bool,
     runs: u64,
     last_output: String,
-    /// When this job last COMPLETED a fire. The fact staleness is computed from: a
-    /// recurring job that declares its own cadence can be judged against it without
-    /// anyone configuring a threshold.
-    last_run: Option<std::time::Instant>,
+    /// When this job last COMPLETED a fire, stamped from the kernel's injected
+    /// [`Clock`]. The fact staleness is computed from: a recurring job that declares
+    /// its own cadence can be judged against it without anyone configuring a threshold.
+    ///
+    /// **This is WALL-CLOCK time, not monotonic.** `std::time::Instant` — the obvious
+    /// monotonic choice — is unimplemented on `wasm32-unknown-unknown`: it compiles and
+    /// panics at runtime, and this line is where it did. Wall-clock is what the kernel's
+    /// clock seam offers and it is good enough for staleness reporting, but the trade is
+    /// real: a backwards clock adjustment between a fire and a [`JobRegistry::health`]
+    /// read makes `now` earlier than this stamp. That case clamps to zero rather than
+    /// underflowing — see `since_last` on [`JobHealth`].
+    last_run: Option<Time>,
     handle: TimerHandle,
 }
 
@@ -218,7 +226,11 @@ pub struct JobHealth {
     pub recurring: bool,
     pub persistent: bool,
     pub runs: u64,
-    /// `None` = it has never completed a run.
+    /// How long since the job last completed, measured on the injected wall clock.
+    /// `None` means exactly one thing: **it has never completed a run** — so a
+    /// backwards clock adjustment reports `Some(0)` ("just now"), never `None`.
+    /// Conflating the two would tell a health report that a job which has run 400
+    /// times has never run at all.
     pub since_last: Option<std::time::Duration>,
     pub last_output: String,
 }
@@ -229,14 +241,30 @@ pub struct JobHealth {
 #[derive(Clone)]
 pub struct JobRegistry {
     inner: Arc<Mutex<Inner>>,
+    /// The kernel's injected clock, held deliberately OUTSIDE the mutex. Reading it
+    /// runs host code (a browser clock calls into JS), and host code must not run
+    /// inside this critical section: a panic there is not a lost tick but a dead
+    /// registry — native poisons the mutex, and wasm's `no_threads` mutex fails every
+    /// later acquisition, so every `urn:time:*` read afterwards panics too. Keeping
+    /// the clock outside the lock makes "stamp before you lock" structural instead of
+    /// a rule someone has to remember.
+    clock: Arc<dyn Clock>,
 }
 
 impl JobRegistry {
-    /// A registry driven by `backend`, firing under full authority until
-    /// [`with_capability`](Self::with_capability) narrows it. The [`Resolver`] must be
-    /// installed with [`set_resolver`](Self::set_resolver) before any job is scheduled
-    /// (the host does this once the kernel is built).
-    pub fn new(backend: Arc<dyn TimerBackend>) -> Self {
+    /// A registry driven by `backend` and stamped by `clock`, firing under full
+    /// authority until [`with_capability`](Self::with_capability) narrows it. The
+    /// [`Resolver`] must be installed with [`set_resolver`](Self::set_resolver) before
+    /// any job is scheduled (the host does this once the kernel is built).
+    ///
+    /// `clock` is the same [`Clock`] the host injects into its kernel: a native host
+    /// passes [`ikigai_core::SystemClock`], a browser host passes its `Date.now()`-backed
+    /// one. It is a **required** argument rather than a defaulted one on purpose —
+    /// the obvious default, `SystemClock`, reads `std::time::SystemTime`, which panics
+    /// on `wasm32-unknown-unknown` exactly like the `Instant` it replaced. A default
+    /// would move the wasm landmine rather than remove it; a required argument makes a
+    /// clockless registry a compile error in the host that forgot.
+    pub fn new(backend: Arc<dyn TimerBackend>, clock: Arc<dyn Clock>) -> Self {
         JobRegistry {
             inner: Arc::new(Mutex::new(Inner {
                 next_id: 1,
@@ -245,6 +273,7 @@ impl JobRegistry {
                 capability: Capability::root(),
                 backend,
             })),
+            clock,
         }
     }
 
@@ -342,13 +371,26 @@ impl JobRegistry {
     }
 
     /// Stop and remove a job. Returns whether it existed.
+    ///
+    /// The record is dropped from the map under the lock; the timer is cancelled with
+    /// the lock RELEASED. [`TimerHandle::cancel`] runs injected host code (the
+    /// browser's `clearInterval`), and injected code may panic or re-enter the
+    /// registry — either of which, under the lock, kills the registry permanently.
+    /// This is the same hazard `schedule_inner` already avoids around `start()`; it
+    /// applies just as much on the way out.
     pub fn cancel(&self, id: u64) -> bool {
-        let mut inner = self.inner.lock().expect("time registry lock");
-        if let Some(job) = inner.jobs.remove(&id) {
-            job.handle.cancel();
-            true
-        } else {
-            false
+        let removed = self
+            .inner
+            .lock()
+            .expect("time registry lock")
+            .jobs
+            .remove(&id);
+        match removed {
+            Some(job) => {
+                job.handle.cancel();
+                true
+            }
+            None => false,
         }
     }
 
@@ -356,37 +398,36 @@ impl JobRegistry {
     /// persistent jobs are left running (cancel those explicitly by id or target). Ids
     /// keep incrementing — a later schedule still gets a fresh id.
     pub fn cancel_all(&self) -> usize {
-        let mut inner = self.inner.lock().expect("time registry lock");
-        let ids: Vec<u64> = inner
-            .jobs
-            .iter()
-            .filter(|(_, job)| !job.persistent)
-            .map(|(id, _)| *id)
-            .collect();
-        for id in &ids {
-            if let Some(job) = inner.jobs.remove(id) {
-                job.handle.cancel();
-            }
-        }
-        ids.len()
+        self.remove_and_cancel(|job| !job.persistent)
     }
 
     /// Stop and remove every job whose target IRI is `target` (persistent or not — an
     /// explicit target is deliberate). Returns how many were cancelled.
     pub fn cancel_target(&self, target: &str) -> usize {
-        let mut inner = self.inner.lock().expect("time registry lock");
-        let ids: Vec<u64> = inner
-            .jobs
-            .iter()
-            .filter(|(_, job)| job.target == target)
-            .map(|(id, _)| *id)
-            .collect();
-        for id in &ids {
-            if let Some(job) = inner.jobs.remove(id) {
-                job.handle.cancel();
-            }
+        self.remove_and_cancel(|job| job.target == target)
+    }
+
+    /// Drop every job matching `predicate` from the map under the lock, then cancel
+    /// their timers with the lock RELEASED — see [`cancel`](Self::cancel) for why the
+    /// second half must not happen inside the critical section. Returns how many.
+    fn remove_and_cancel(&self, predicate: impl Fn(&JobRecord) -> bool) -> usize {
+        let handles: Vec<TimerHandle> = {
+            let mut inner = self.inner.lock().expect("time registry lock");
+            let ids: Vec<u64> = inner
+                .jobs
+                .iter()
+                .filter(|(_, job)| predicate(job))
+                .map(|(id, _)| *id)
+                .collect();
+            ids.iter()
+                .filter_map(|id| inner.jobs.remove(id))
+                .map(|job| job.handle)
+                .collect()
+        };
+        for handle in &handles {
+            handle.cancel();
         }
-        ids.len()
+        handles.len()
     }
 
     /// Fire one tick of a job: resolve its request and fold the outcome into the
@@ -409,11 +450,14 @@ impl JobRegistry {
             },
             Err(e) => format!("error: bad target: {e}"),
         };
+        // Stamp BEFORE locking. The clock is host-injected code; reading it inside the
+        // critical section is what turned one panic into a permanently dead registry.
+        let at = self.clock.now();
         let mut inner = self.inner.lock().expect("time registry lock");
         if let Some(job) = inner.jobs.get_mut(&id) {
             job.runs += 1;
             job.last_output = outcome;
-            job.last_run = Some(std::time::Instant::now());
+            job.last_run = Some(at);
         }
     }
 
@@ -423,6 +467,8 @@ impl JobRegistry {
     /// long since it did, and what it last said. Whether that is "stale" belongs to the
     /// caller, because the answer depends on what the job is for.
     pub fn health(&self) -> Vec<JobHealth> {
+        // Read the clock before locking, for the same reason `fire` does.
+        let now = self.clock.now().as_millis();
         let inner = self.inner.lock().expect("time registry lock");
         inner
             .jobs
@@ -434,7 +480,13 @@ impl JobRegistry {
                 recurring: job.recurring,
                 persistent: job.persistent,
                 runs: job.runs,
-                since_last: job.last_run.map(|at| at.elapsed()),
+                // `saturating_sub`: a wall clock can step BACKWARDS between the fire
+                // and this read, and an age of zero ("just now") is the honest answer
+                // there. Underflowing would report ~584 million years, and reporting
+                // `None` would claim a job that has run has never run.
+                since_last: job
+                    .last_run
+                    .map(|at| Duration::from_millis(now.saturating_sub(at.as_millis()))),
                 last_output: job.last_output.clone(),
             })
             .collect()
@@ -631,7 +683,7 @@ pub fn space(registry: JobRegistry) -> EndpointSpace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ikigai_core::SpaceEntry;
+    use ikigai_core::{SpaceEntry, SystemClock};
     use ikigai_resolve::CacheStatus;
     use std::sync::atomic::AtomicU64;
 
@@ -713,7 +765,7 @@ mod tests {
     fn schedules_fires_and_renders() {
         let issued = Arc::new(AtomicU64::new(0));
         let backend = Arc::new(ManualBackend::default());
-        let reg = JobRegistry::new(backend.clone());
+        let reg = JobRegistry::new(backend.clone(), Arc::new(SystemClock));
         reg.set_resolver(Arc::new(StubResolver {
             issued: Arc::clone(&issued),
         }));
@@ -746,7 +798,7 @@ mod tests {
 
     #[test]
     fn schedule_without_resolver_errors() {
-        let reg = JobRegistry::new(Arc::new(ManualBackend::default()));
+        let reg = JobRegistry::new(Arc::new(ManualBackend::default()), Arc::new(SystemClock));
         let err = reg
             .schedule(
                 "urn:demo:greeter".to_string(),
@@ -761,7 +813,7 @@ mod tests {
     #[test]
     fn cancel_all_clears_every_job() {
         let issued = Arc::new(AtomicU64::new(0));
-        let reg = JobRegistry::new(Arc::new(ManualBackend::default()));
+        let reg = JobRegistry::new(Arc::new(ManualBackend::default()), Arc::new(SystemClock));
         reg.set_resolver(Arc::new(StubResolver {
             issued: Arc::clone(&issued),
         }));
@@ -787,7 +839,7 @@ mod tests {
     #[test]
     fn cancel_all_skips_persistent_but_target_and_id_still_remove_it() {
         let issued = Arc::new(AtomicU64::new(0));
-        let reg = JobRegistry::new(Arc::new(ManualBackend::default()));
+        let reg = JobRegistry::new(Arc::new(ManualBackend::default()), Arc::new(SystemClock));
         reg.set_resolver(Arc::new(StubResolver {
             issued: Arc::clone(&issued),
         }));
@@ -822,7 +874,7 @@ mod tests {
     #[test]
     fn cancel_target_removes_only_matching_jobs() {
         let issued = Arc::new(AtomicU64::new(0));
-        let reg = JobRegistry::new(Arc::new(ManualBackend::default()));
+        let reg = JobRegistry::new(Arc::new(ManualBackend::default()), Arc::new(SystemClock));
         reg.set_resolver(Arc::new(StubResolver {
             issued: Arc::clone(&issued),
         }));
@@ -838,5 +890,146 @@ mod tests {
         assert!(rendered.contains("urn:time:now"));
         assert!(!rendered.contains("urn:demo:greeter"));
         assert_eq!(reg.cancel_target("urn:nope:missing"), 0);
+    }
+
+    /// A clock the test drives by hand, standing in for the host's injected one.
+    struct FixedClock(Arc<AtomicU64>);
+    impl Clock for FixedClock {
+        fn now(&self) -> Time {
+            Time::from_millis(self.0.load(Ordering::SeqCst))
+        }
+    }
+
+    #[test]
+    fn since_last_is_measured_on_the_injected_clock() {
+        let millis = Arc::new(AtomicU64::new(1_000_000));
+        let backend = Arc::new(ManualBackend::default());
+        let reg = JobRegistry::new(
+            backend.clone(),
+            Arc::new(FixedClock(Arc::clone(&millis))) as Arc<dyn Clock>,
+        );
+        reg.set_resolver(Arc::new(StubResolver {
+            issued: Arc::new(AtomicU64::new(0)),
+        }));
+        reg.schedule(
+            "urn:demo:greeter".to_string(),
+            Verb::Source,
+            Schedule::Every(Duration::from_secs(1)),
+            true,
+        )
+        .expect("scheduled");
+
+        // Never fired: `None` means never, and nothing else ever means it.
+        let health = reg.health();
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].runs, 0);
+        assert_eq!(health[0].since_last, None);
+
+        backend.fire_all(1);
+        millis.store(1_005_000, Ordering::SeqCst); // five seconds later
+        let health = reg.health();
+        assert_eq!(health[0].runs, 1);
+        assert_eq!(health[0].since_last, Some(Duration::from_secs(5)));
+
+        // A backwards clock adjustment (NTP step, a laptop waking in another timezone)
+        // must clamp to zero — not underflow into ~584 million years, and not report
+        // `None`, which would claim a job that has run has never run.
+        millis.store(1, Ordering::SeqCst);
+        let health = reg.health();
+        assert_eq!(health[0].runs, 1);
+        assert_eq!(health[0].since_last, Some(Duration::ZERO));
+    }
+
+    /// A backend whose cancel closure re-enters the registry — the shape of real
+    /// injected host code (`clearInterval` calling back into the page).
+    struct ReentrantBackend {
+        reg: Arc<std::sync::OnceLock<JobRegistry>>,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+    impl TimerBackend for ReentrantBackend {
+        fn start(
+            &self,
+            _interval: Duration,
+            _recurring: bool,
+            _on_tick: Arc<dyn Fn() + Send + Sync>,
+        ) -> TimerHandle {
+            let reg = Arc::clone(&self.reg);
+            let seen = Arc::clone(&self.seen);
+            TimerHandle::new(move || {
+                if let Some(reg) = reg.get() {
+                    seen.lock().expect("seen lock").push(reg.render());
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn cancel_runs_host_code_with_the_registry_lock_released() {
+        // `TimerHandle::cancel` runs INJECTED host code. Running it inside the critical
+        // section is a latent brick: a panic there poisons the mutex natively and makes
+        // wasm's `no_threads` mutex fail every later acquisition, so every `urn:time:*`
+        // read afterwards dies too — which is exactly how one bad tick took out the
+        // browser demo's whole Control panel. Re-entry is the observable half of the
+        // same property, so test that.
+        //
+        // Run it on a worker with a deadline: a regression DEADLOCKS, and a test that
+        // hangs until CI's six-hour timeout is not a signal.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let cell = Arc::new(std::sync::OnceLock::new());
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let backend = Arc::new(ReentrantBackend {
+                reg: Arc::clone(&cell),
+                seen: Arc::clone(&seen),
+            });
+            let reg = JobRegistry::new(backend, Arc::new(SystemClock));
+            let _ = cell.set(reg.clone());
+            reg.set_resolver(Arc::new(StubResolver {
+                issued: Arc::new(AtomicU64::new(0)),
+            }));
+            reg.schedule(
+                "urn:demo:greeter".to_string(),
+                Verb::Source,
+                Schedule::Every(Duration::from_secs(1)),
+                true,
+            )
+            .expect("scheduled");
+            assert!(reg.cancel(1));
+            // cancel_all and cancel_target take the same path.
+            reg.schedule(
+                "urn:demo:greeter".to_string(),
+                Verb::Source,
+                Schedule::Every(Duration::from_secs(1)),
+                true,
+            )
+            .expect("scheduled");
+            assert_eq!(reg.cancel_all(), 1);
+            reg.schedule(
+                "urn:demo:greeter".to_string(),
+                Verb::Source,
+                Schedule::Every(Duration::from_secs(1)),
+                true,
+            )
+            .expect("scheduled");
+            assert_eq!(reg.cancel_target("urn:demo:greeter"), 1);
+            let seen = seen.lock().expect("seen lock").clone();
+            let _ = tx.send(seen);
+        });
+
+        let seen = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("cancel re-entered the registry without deadlocking");
+        assert_eq!(
+            seen.len(),
+            3,
+            "all three cancel paths ran host code: {seen:?}"
+        );
+        for rendered in &seen {
+            // The record is gone before the host code runs, and the lock is free.
+            assert!(
+                rendered.contains("(none scheduled)"),
+                "cancel removed the job before calling host code: {rendered}"
+            );
+        }
     }
 }

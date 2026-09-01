@@ -8,7 +8,17 @@ description = "The time transport: originates kernel resource-requests on a time
 # for a fresh consumer: it predates the structured-Error migration, so once cargo
 # resolves a current ikigai-core, `one_line(&e)` is a type error. Found installing
 # cms-server, which pins this crate.
-version = "0.1.12"
+# 0.2.0 — a MAJOR bump under 0.x, not the 0.1.13 the fix alone would need. `JobRegistry::new`
+# now takes the host's `Arc<dyn Clock>`, because 0.1.12 stamped `last_run` with
+# `std::time::Instant::now()`, which is unimplemented on wasm32-unknown-unknown: it compiled
+# and panicked on the first completed job, under the registry lock, killing every later
+# `urn:time:*` read in the browser demo. The argument is required so a host that forgets a
+# clock is a compile error, not a runtime panic — and that makes the signature source-breaking.
+# Shipping it as 0.1.13 would land inside `^0.1.11`, and ikigai-cms-web's server calls
+# `JobRegistry::new(Arc::new(ThreadTimer))` at exactly that pin: a caret bump must never break
+# a build, so the break gets a version that says so. Consumers add one argument
+# (`Arc::new(SystemClock)` natively, the `Date.now()`-backed clock in a browser).
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true

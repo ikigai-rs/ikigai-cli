@@ -1,0 +1,19 @@
+# This crate is compiled to `wasm32-unknown-unknown` (the browser demo links it for
+# `urn:time:*`), and on that target `std::time::Instant` and `std::time::SystemTime`
+# are UNIMPLEMENTED: they compile and then panic at runtime. A compile-only wasm gate
+# — `cargo clippy --target wasm32-unknown-unknown` — is structurally incapable of
+# catching that, which is why one such call sat in `fire()` for three weeks and
+# bricked the demo's whole Control panel the first time a job completed.
+#
+# The clock is INJECTED here: `JobRegistry::new` takes an `Arc<dyn Clock>`, and the
+# host supplies `SystemClock` natively or a `Date.now()`-backed one in the browser.
+# Reach for that, not for `std::time`.
+#
+# Scope note: clippy resolves this file from the crate manifest directory upward, so
+# it governs `ikigai-time` alone — deliberately. Native-only members of this
+# workspace (ikigai-cli, ikigai-embedded, ikigai-discovery, ikigai-ipc, ikigai-quic,
+# ikigai-web) use `Instant` legitimately and must not inherit the ban.
+disallowed-methods = [
+  { path = "std::time::Instant::now", reason = "panics on wasm32-unknown-unknown; take the timestamp from the injected ikigai_core::Clock instead" },
+  { path = "std::time::SystemTime::now", reason = "panics on wasm32-unknown-unknown just like Instant::now; take the timestamp from the injected ikigai_core::Clock instead" },
+]
