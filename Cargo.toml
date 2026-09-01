@@ -106,7 +106,14 @@ ikigai-intray = { path = "crates/ikigai-intray", version = "0.1.14" }
 ikigai-email = { path = "crates/ikigai-email", version = "0.1.14" }
 # Public form intake (urn:*:submit): parse an untrusted urlencoded/JSON body, validate
 # declared fields, drop an escaped s-expr tuple into a space. Contact + booking share it.
-ikigai-intake = { path = "crates/ikigai-intake", version = "0.1.14" }
+# 0.1.17 = `IntakeField::max_len` and `IntakeField::legacy` (#300, the bounded booking
+# door). A HARD floor, and one the workspace build cannot see: inside this tree the path
+# dep always wins, so `cargo test` is green against a pin that no published version
+# satisfies. It surfaces only when a member is PACKAGED, where the path is stripped and
+# the caret resolves against the registry — `^0.1.14` picked the live 0.1.16, which
+# predates both methods, and ikigai-embedded failed to verify with four E0599s. Nothing
+# else catches this: the gates pass, CI passes, and the break waits for release day.
+ikigai-intake = { path = "crates/ikigai-intake", version = "0.1.17" }
 # WebAuthn (ES256) assertion verifier: the second factor gating the edge decision links.
 ikigai-passkey = { path = "crates/ikigai-passkey", version = "0.1.14" }
 # Sibling workspace crates pinned to the current release: a published crate must
