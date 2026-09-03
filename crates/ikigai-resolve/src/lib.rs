@@ -257,6 +257,10 @@ impl Space for RemoteSpace {
                 request: request.clone(),
             }),
             bindings: Bindings::new(),
+            // Nothing is rewritten here — the request goes over the wire under the
+            // name it arrived with. (Even if it were, it would not be a canonical:
+            // see `MountedRemote::resolve` below for why a mount never reports one.)
+            canonical: None,
         })
     }
 
@@ -417,6 +421,22 @@ impl Space for MountedRemote {
                 request: forwarded,
             }),
             bindings: Bindings::new(),
+            // ★ A MOUNT REWRITES AND STILL REPORTS NO CANONICAL. `Alias` mode just
+            // rewrote the target above (`urn:edge:foo` → `urn:foo`), so a mechanical
+            // sweep would forward that as `canonical` — and it would be wrong.
+            // `Resolved::canonical` means "the same resource under another name IN
+            // THIS KERNEL'S NAMESPACE": the kernel adopts it as the cache id and the
+            // golden-thread key. A mount's rewrite crosses a namespace boundary —
+            // `urn:foo` is meaningful in the REMOTE, and this kernel may serve an
+            // entirely unrelated local `urn:foo`. Reporting it would fuse two
+            // different resources into one cache entry and one thread. The stripped
+            // name is a wire address, not a local name, so it stays inside the
+            // forwarded request and never reaches the kernel's identity computation.
+            //
+            // If a mounted name and a local name should ever share identity, that
+            // needs a concept that carries ORIGIN alongside the name; `canonical`,
+            // which is a bare `Iri`, cannot express it.
+            canonical: None,
         })
     }
 

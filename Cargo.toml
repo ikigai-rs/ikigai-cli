@@ -13,7 +13,13 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 [workspace.dependencies]
 # The released kernel, consumed from crates.io. For local cross-repo development
 # against a sibling checkout, use .cargo/config.toml (see .cargo/config.toml.example).
-ikigai-core = "0.1.60" # 0.1.60 = `Spawner::width()`, the read the engine's fan-out routing
+ikigai-core = "0.1.64" # 0.1.64 = `Resolved.canonical`, the field a `Space` sets when its
+# resolution REWROTE the request's target; the kernel adopts that name before it computes the
+# cache id and fires the golden-thread cut, so a logical name and its backing name stay ONE
+# resource. A hard floor, not a soft one: the field has no default in a struct literal, so an
+# older core is a compile error rather than a silent `None`. `ikigai-resolve` reports `None`
+# at both of its sites on purpose — see the comment on `MountedRemote::resolve`.
+# 0.1.60 = `Spawner::width()`, the read the engine's fan-out routing
 # is built on: how many spawned tasks make progress AT ONCE, so a ten-branch fork on the
 # default `single` scheduler is known to be one-wide. An API floor — the method is defaulted,
 # so an older core compiles and silently answers `None` (= width 1) for every scheduler,
