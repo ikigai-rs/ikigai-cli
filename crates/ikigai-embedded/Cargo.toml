@@ -26,7 +26,10 @@ ikigai-lisp = { workspace = true }
 # The Timeout interception overlay fronting urn:lisp:eval on every SERVED surface
 # (wire-eval L1's wall-clock compute governor).
 ikigai-throttle = { workspace = true }
-ikigai-discovery = { path = "../ikigai-discovery", version = "0.1.9" }
+# mDNS announce/browse. The one sibling this host names by path rather than through
+# `[workspace.dependencies]`; the version is the LOCKSTEP version, not a floor (see the root
+# manifest for why, and `crates/ikigai-cli/tests/lockstep_pins.rs` for the check).
+ikigai-discovery = { path = "../ikigai-discovery", version = "0.1.17" }
 ikigai-fs = { workspace = true }
 ikigai-http = { workspace = true }
 ikigai-runbook = { workspace = true }

@@ -117,25 +117,54 @@ ikigai-llm = "0.12" # 0.12 = `caps.batchAt` + the `batchAt<=W` need term: the de
 # Video-conference scheduling (urn:meeting:schedule + urn:meeting:<provider>:schedule): a facade
 # over provider backends, Zoom first. Now on crates.io — the git-rev bridge retired at first publish.
 ikigai-meeting = "0.1.0"
+# ── Intra-workspace siblings: LOCKSTEP pins, not floors ───────────────────────
+# The seventeen members that take `version.workspace = true` are released TOGETHER, at one
+# version, always. So every sibling pin below states the CURRENT workspace version rather
+# than the oldest published sibling whose API is actually called.
+#
+# This does not break "a pin states the true minimum API you use" (constitution rule 5) —
+# it is that rule applied to a set that ships as a unit, so please do not "fix" it back.
+# A floor lets cargo resolve `ikigai-cli 0.1.17` against `ikigai-ipc 0.1.16`: a combination
+# NOTHING HAS EVER BUILT. In-tree the path dependency always wins, so the version half is
+# never exercised here; off-tree, same-version-across-the-set is the only combination that
+# has ever been packaged, published or tested. For a lockstep set the lockstep version IS
+# the true minimum — the floor is not a weaker claim than it, it is a DIFFERENT and untested
+# one. And it was reachable, not theoretical: `just release ikigai-cli` reported READY while
+# ipc, quic, wire and embedded were still at 0.1.16, with nothing to stop a cli 0.1.17
+# shipping against 0.1.16 siblings.
+#
+# The per-pin notes are kept as API HISTORY: they record which release first carried the API
+# named, which is what a reader needs when asking whether an older sibling would compile at
+# all. They no longer set the number.
+#
+# ⚠ Consequence for the release ritual: a lockstep bump now edits SEVENTEEN sibling pins
+# across three manifests (this one, crates/ikigai-cli, crates/ikigai-embedded) on top of
+# `workspace.package.version`. `crates/ikigai-cli/tests/lockstep_pins.rs` is what makes those
+# seventeen non-optional rather than remembered — the drift that produced this defect ran for
+# eight releases and the only thing that ever noticed was a comment.
+#
+# `ikigai-time` is the ONE exception; its own note below says why.
+
 # The org⊕calendar consolidated-view (Brian-Busy) derivation — a composition crate
 # that reconciles personal/org/rdf THROUGH the kernel. Published since 0.1.14 (#296):
 # ikigai-embedded depends on it, and a path-only dependency makes every crate above it
 # in this workspace unpublishable, the `ikigai` binary included.
-ikigai-view = { path = "crates/ikigai-view", version = "0.1.14" }
+ikigai-view = { path = "crates/ikigai-view", version = "0.1.17" }
 # Timezone conversion (urn:tz:convert, IANA/DST-correct) + a zoned clock (urn:tz:now).
 # Published since 0.1.14 (#296); keeps the tzdata dependency out of the lean modules.
-ikigai-tz = { path = "crates/ikigai-tz", version = "0.1.14" }
+ikigai-tz = { path = "crates/ikigai-tz", version = "0.1.17" }
 # The intray / tuplespace (urn:space:{name}: out/rd). Published since 0.1.14 (#296);
 # a dir-backed space under file_root. The scheduling booking-inbox drops into it.
-ikigai-intray = { path = "crates/ikigai-intray", version = "0.1.14" }
+ikigai-intray = { path = "crates/ikigai-intray", version = "0.1.17" }
 # Outbound email (urn:email:send): a cap-gated Sink submitting over SMTP to a local MTA
 # that relays onward. Published since 0.1.14 (#296); the contact service and the
 # scheduling confirm-link both need it.
-ikigai-email = { path = "crates/ikigai-email", version = "0.1.14" }
+ikigai-email = { path = "crates/ikigai-email", version = "0.1.17" }
 # Public form intake (urn:*:submit): parse an untrusted urlencoded/JSON body, validate
 # declared fields, drop an escaped s-expr tuple into a space. Contact + booking share it.
-# 0.1.17 = `IntakeField::max_len` and `IntakeField::legacy` (#300, the bounded booking
-# door). A HARD floor, and one the workspace build cannot see: inside this tree the path
+# API history — 0.1.17 = `IntakeField::max_len` and `IntakeField::legacy` (#300, the bounded
+# booking door), which is where the API floor and the lockstep version happen to coincide.
+# A HARD floor, and one the workspace build cannot see: inside this tree the path
 # dep always wins, so `cargo test` is green against a pin that no published version
 # satisfies. It surfaces only when a member is PACKAGED, where the path is stripped and
 # the caret resolves against the registry — `^0.1.14` picked the live 0.1.16, which
@@ -143,20 +172,34 @@ ikigai-email = { path = "crates/ikigai-email", version = "0.1.14" }
 # else catches this: the gates pass, CI passes, and the break waits for release day.
 ikigai-intake = { path = "crates/ikigai-intake", version = "0.1.17" }
 # WebAuthn (ES256) assertion verifier: the second factor gating the edge decision links.
-ikigai-passkey = { path = "crates/ikigai-passkey", version = "0.1.14" }
+ikigai-passkey = { path = "crates/ikigai-passkey", version = "0.1.17" }
 # Sibling workspace crates pinned to the current release: a published crate must
 # require its siblings at this version too, so the lockstep release publishes in
 # dependency order (resolve → wire → engine → …) and a crate can never build against
 # an older, incompatible sibling on crates.io.
-ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.1.14" } # naming_entry: the most specific catalog row names a target (the engine's trace labels use it)
-ikigai-wire = { path = "crates/ikigai-wire", version = "0.1.11" } # v6 hello + ErrorTyped/WireError
-# 0.1.16 = `Spawner::width()`: the scheduler answers how many tasks make progress AT ONCE
+ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.1.17" } # naming_entry: the most specific catalog row names a target (the engine's trace labels use it)
+ikigai-wire = { path = "crates/ikigai-wire", version = "0.1.17" } # v6 hello + ErrorTyped/WireError
+# API history — 0.1.16 = `Spawner::width()`: the scheduler answers how many tasks make progress AT ONCE
 # (1 for `single`), which is what the engine's fan-out routing sizes itself by. Core
 # defaults that method to `None` = unknown, and a caller reading unknown as "wide" is the
 # ~1.8x-slower case — so below this floor the routing is silently inert, not merely older.
-# 0.1.15 = SchedulerSpec: a spec parsed WITHOUT building, so `--scheduler pool:xyz` is
+# API history — 0.1.15 = SchedulerSpec: a spec parsed WITHOUT building, so `--scheduler pool:xyz` is
 # rejected while argv is read instead of by spawning a threadpool to find out.
-ikigai-scheduler = { path = "crates/ikigai-scheduler", version = "0.1.16" }
+ikigai-scheduler = { path = "crates/ikigai-scheduler", version = "0.1.17" }
+# ⚠⚠ EXEMPT from the lockstep above — deliberately, and this pin must NOT be raised to the
+# workspace version. ikigai-time is the eighteenth member and the only one that does not take
+# `version.workspace = true`: it declares `version = "0.2.0"` in its own manifest and is
+# published on its own line, because the Clock change below was a BREAKING API change that
+# earned a major bump the other seventeen had no reason to take. 0.2.0 is therefore its
+# current release; `0.1.17` would name a version of ikigai-time that does not exist on
+# crates.io and never will. That one, unlike a stale floor, is loud: cargo checks a path
+# dependency's declared version against the requirement, so `0.1.17` here stops the whole
+# workspace resolving ("candidate versions found which didn't match: 0.2.0") before anything
+# compiles. It is exactly the asymmetry that let the floors rot unseen — a requirement too
+# HIGH fails immediately, a requirement too LOW is satisfied by the path dep and says nothing.
+# The exemption is encoded BY NAME in `crates/ikigai-cli/tests/lockstep_pins.rs`, which
+# checks this pin against ikigai-time's own declared version — so the two cannot drift, and
+# if ikigai-time ever rejoins the lockstep the test says to delete the exemption.
 # 0.2.0 = `JobRegistry::new` takes the host's `Arc<dyn Clock>`. A hard floor, not a
 # preference: 0.1.x stamps `last_run` with `std::time::Instant::now()`, which panics on
 # wasm32-unknown-unknown under the registry lock and bricks the registry for the life of
@@ -164,7 +207,7 @@ ikigai-scheduler = { path = "crates/ikigai-scheduler", version = "0.1.16" }
 ikigai-time = { path = "crates/ikigai-time", version = "0.2.0" }
 # Inbound HTTP transport (method↔verb, path↔iri, cap-per-request). A published
 # transport like ipc/quic/mcp; only the `web`-featured CLI pulls it (and Tokio).
-ikigai-web = { path = "crates/ikigai-web", version = "0.1.9" }
+ikigai-web = { path = "crates/ikigai-web", version = "0.1.17" }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 # `preserve_order` makes `serde_json::Map` an IndexMap instead of a BTreeMap, so a JSON
