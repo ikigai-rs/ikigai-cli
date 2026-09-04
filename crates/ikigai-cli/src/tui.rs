@@ -278,7 +278,14 @@ fn event_loop(
                     state.control = out.result.unwrap_or_else(|e| format!("error: {e}"));
                 }
             }
-            last_refresh = Some(std::time::Instant::now());
+            // Native-only: the TUI draws to a real terminal through ratatui/crossterm and
+            // cannot exist on wasm. This is the redraw throttle's last-refresh mark.
+            // Bound to a `let` only so the attribute has a statement to sit on — an
+            // attribute on an assignment expression is not stable (E0658) — which keeps
+            // the opt-out on this one call instead of the whole event loop.
+            #[allow(clippy::disallowed_methods)]
+            let refreshed_at = std::time::Instant::now();
+            last_refresh = Some(refreshed_at);
         }
 
         terminal.draw(|frame| draw(frame, &state))?;
@@ -1152,6 +1159,9 @@ fn clock_spans(clock: &str) -> Vec<Span<'static>> {
     let Some((h, m)) = clock.split_once(':') else {
         return vec![clock.to_string().into()];
     };
+    // Native-only: same terminal TUI. The blinking colon's phase has to come from
+    // the wall clock rather than the redraw tick, and this renderer takes no kernel.
+    #[allow(clippy::disallowed_methods)]
     let colon_on = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_millis() < 500)

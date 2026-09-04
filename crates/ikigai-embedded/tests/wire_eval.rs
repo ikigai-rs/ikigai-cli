@@ -18,6 +18,10 @@ fn eval(src: &str) -> Request {
 }
 
 #[test]
+// Native-only integration test: it builds an embedded kernel with threads and a
+// real Lisp worker, none of which exists on wasm, and times a runaway loop to
+// prove the eval governor's timeout fires.
+#[allow(clippy::disallowed_methods)]
 fn the_served_eval_is_governed_clamped_and_absent_without_optin() {
     // ALL process-global config — including the signed-run door's — before any
     // kernel exists; this single test fn owns it (see signed_run_door).

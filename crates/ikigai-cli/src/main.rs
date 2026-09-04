@@ -1425,7 +1425,15 @@ impl ikigai_resolve::Resolver for LazyResolver {
                 resolver.entries()
             }
             Err(_) => {
-                *self.entries_failed.lock().unwrap() = Some(std::time::Instant::now());
+                // Native-only: `ikigai-cli` is the host BINARY — clap, the QUIC/IPC transports,
+                // a terminal. It is never built for wasm. This stamps the negative cache for a
+                // peer dial that failed, and the kernel Clock is not in scope on this path.
+                // Bound to a `let` only so the attribute has a statement to sit on — an
+                // attribute on an assignment expression is not stable (E0658) — which keeps
+                // the opt-out on this one call instead of the whole method.
+                #[allow(clippy::disallowed_methods)]
+                let failed_at = std::time::Instant::now();
+                *self.entries_failed.lock().unwrap() = Some(failed_at);
                 None
             }
         }
@@ -2607,6 +2615,10 @@ mod mount_cert_tests {
     /// absent is its normal case, and an eager connect would both fail at boot and
     /// never pick the peer up when it woke.
     #[test]
+    // Native-only test in the host binary's own suite: it measures wall-clock elapsed
+    // to assert a dead peer's `entries()` returns instead of stalling. Nothing here
+    // is ever compiled for wasm.
+    #[allow(clippy::disallowed_methods)]
     fn a_prefer_mount_does_not_connect_at_startup() {
         let mount = Mount {
             prefix: "urn:llm:".to_string(),

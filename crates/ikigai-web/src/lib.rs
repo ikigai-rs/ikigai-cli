@@ -841,6 +841,10 @@ fn etag_list_contains(header: &str, etag: &str) -> bool {
 /// Record that we deleted `iri`, so a repeat DELETE is idempotent for a bounded window.
 fn record_tombstone(shared: &Shared, iri: &str) {
     if let Ok(mut t) = shared.tombstones.lock() {
+        // Native-only: `ikigai-web` is the INBOUND HTTP transport — a tokio TcpListener
+        // bound to a port — so it has no wasm build. This is the DELETE tombstone's
+        // monotonic expiry mark, which must not move when the wall clock does.
+        #[allow(clippy::disallowed_methods)]
         t.insert(iri.to_string(), std::time::Instant::now());
     }
 }
@@ -924,6 +928,10 @@ fn cache_control_of(expiry: ikigai_core::Expiry) -> Option<String> {
         Expiry::Always => Some("no-store".to_string()),
         Expiry::Never => Some("public, max-age=31536000, immutable".to_string()),
         Expiry::At(deadline) => {
+            // Native-only: same inbound HTTP server. Turning an `Expiry::At` deadline into a
+            // `Cache-Control: max-age` needs wall-clock now, and this is a free function with
+            // no kernel handle to take an injected Clock from.
+            #[allow(clippy::disallowed_methods)]
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)

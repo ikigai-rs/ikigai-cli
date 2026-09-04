@@ -756,6 +756,9 @@ mod tests {
     }
 
     #[test]
+    // Native-only test: the IPC transport is Unix-domain sockets, unavailable on
+    // wasm. The test measures elapsed time to prove the read timeout fires.
+    #[allow(clippy::disallowed_methods)]
     fn a_hung_server_times_out_instead_of_hanging() {
         let path = socket_path("hang");
         let _ = std::fs::remove_file(&path);
