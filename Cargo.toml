@@ -85,7 +85,18 @@ ikigai-browse = "0.2.12" # 0.2.0 = explain archive + annotations over a host-inj
 # Steel-backed Lisp evaluator (urn:lisp:eval): code is a resource, builtins ARE the
 # cap-scoped kernel verbs. Embedded-only (arbitrary code); gated by urn:cap:lisp.
 ikigai-lisp = "0.1.12" # 0.1.12 = scope_sync migration (core-owned bridge; channels deleted)
-ikigai-throttle = "0.1.8" # 0.1.8 = the overlays answer `Resolved.canonical` (core 0.1.64). A HARD
+ikigai-throttle = "0.1.9" # 0.1.9 = each `Failover` candidate is invoked on its OWN grammar's
+# captures. A behavioural floor with a named site right here: `--prefer` composes
+# `Failover::new([MountedRemote, local])` (see `crates/ikigai-embedded`), and `MountedRemote`
+# hits with `Bindings::new()`. Under 0.1.8, which invoked EVERY candidate with the first hit's
+# bindings, the local fallback therefore lost its own captures on exactly the degradation path
+# the mount exists for — `urn:codekey:{path}` reads `inv.bindings.get("path")` and would answer
+# MissingArgument instead of the key. Nothing catches it: the types are identical, and the
+# branch only runs when the peer is down. The caret alone would not have delivered the fix
+# either — `Cargo.lock` was frozen on 0.1.8. This floor raises `ikigai-core` to 0.1.65
+# transitively (0.1.9 needs `Invocation::with_bindings`); the core pin above stays at 0.1.64
+# because no source in THIS workspace calls a 0.1.65 API, and a pin states the minimum you use.
+# 0.1.8 = the overlays answer `Resolved.canonical` (core 0.1.64). A HARD
 # floor, and the reason is the registry rather than this workspace: 0.1.7's six `Resolved`
 # literals predate the field, so with core resolved at 0.1.64 the published 0.1.7 source does not
 # compile at all. A caret pin cannot save it — cargo unifies core to one version across the
@@ -106,18 +117,19 @@ ikigai-llm = "0.12" # 0.12 = `caps.batchAt` + the `batchAt<=W` need term: the de
 # Video-conference scheduling (urn:meeting:schedule + urn:meeting:<provider>:schedule): a facade
 # over provider backends, Zoom first. Now on crates.io — the git-rev bridge retired at first publish.
 ikigai-meeting = "0.1.0"
-# The org⊕calendar consolidated-view (Brian-Busy) derivation — a workspace-local
-# composition crate that reconciles personal/org/rdf THROUGH the kernel. Not
-# published (no version pin); the CLI installs it from this path only.
+# The org⊕calendar consolidated-view (Brian-Busy) derivation — a composition crate
+# that reconciles personal/org/rdf THROUGH the kernel. Published since 0.1.14 (#296):
+# ikigai-embedded depends on it, and a path-only dependency makes every crate above it
+# in this workspace unpublishable, the `ikigai` binary included.
 ikigai-view = { path = "crates/ikigai-view", version = "0.1.14" }
 # Timezone conversion (urn:tz:convert, IANA/DST-correct) + a zoned clock (urn:tz:now).
-# Workspace-local, not published; keeps the tzdata dependency out of the lean modules.
+# Published since 0.1.14 (#296); keeps the tzdata dependency out of the lean modules.
 ikigai-tz = { path = "crates/ikigai-tz", version = "0.1.14" }
-# The intray / tuplespace (urn:space:{name}: out/rd). Workspace-local, not published;
+# The intray / tuplespace (urn:space:{name}: out/rd). Published since 0.1.14 (#296);
 # a dir-backed space under file_root. The scheduling booking-inbox drops into it.
 ikigai-intray = { path = "crates/ikigai-intray", version = "0.1.14" }
 # Outbound email (urn:email:send): a cap-gated Sink submitting over SMTP to a local MTA
-# that relays onward. Workspace-local, not published; the contact service and the
+# that relays onward. Published since 0.1.14 (#296); the contact service and the
 # scheduling confirm-link both need it.
 ikigai-email = { path = "crates/ikigai-email", version = "0.1.14" }
 # Public form intake (urn:*:submit): parse an untrusted urlencoded/JSON body, validate

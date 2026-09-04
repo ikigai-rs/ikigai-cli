@@ -21,20 +21,30 @@ web = ["dep:ikigai-web", "dep:tokio", "dep:serde_yaml"] # opt-in inbound HTTP fa
 [dependencies]
 async-trait = "0.1"
 ikigai-core = { workspace = true }
-# Sibling crates carry an explicit version (required to publish) pinned to this
-# release, so the binary always resolves them at the matching lockstep version.
+# Sibling crates carry an explicit version — a path-only dependency is unpublishable.
+# The number is a FLOOR, not this release: the oldest PUBLISHED sibling whose API this
+# binary actually calls. Cargo takes the newest match, so a completed lockstep cascade
+# resolves them at the current version anyway, and the floor is what a consumer building
+# against an older sibling is promised. Whatever it says must therefore be true — and only
+# a PACKAGED build can contradict it, because in-tree the path dependency always wins.
 ikigai-engine = { path = "../ikigai-engine", version = "0.1.16" } # with_width_routing + last_fan_out: the fan-out switch and the note the REPL prints
 ikigai-resolve = { workspace = true }
 serde_json = { workspace = true }
 ikigai-embedded = { path = "../ikigai-embedded", version = "0.1.16", optional = true } # set_width_routing/width_routing: the --width-routing channel, beside set_scheduler_spec
 ikigai-mcp = { path = "../ikigai-mcp", version = "0.1.12" } # row collapse: every same-named manifold row stays reachable
 ikigai-ipc = { path = "../ikigai-ipc", version = "0.1.13", optional = true } # heal-on-use: a broken established connection redials
-ikigai-quic = { path = "../ikigai-quic", version = "0.1.6", optional = true }
+ikigai-quic = { path = "../ikigai-quic", version = "0.1.14", optional = true } # 0.1.14 = the
+# first published quic carrying `Minter`, `PeerIdentity` and `fingerprint_of_pem` (#286,
+# per-identity grants), all three named in main.rs. The pin read 0.1.6 — a version that
+# EXISTS on crates.io and does not have them, so the claim was false in the one direction a
+# resolver can actually take. No local build could ever have contradicted it.
 # mDNS announce/browse. Rides the `quic` feature: the only thing worth finding on the
 # network is a QUIC-served kernel.
 ikigai-discovery = { path = "../ikigai-discovery", version = "0.1.9", optional = true }
 ikigai-wire = { workspace = true, optional = true }
-# Inbound HTTP face — workspace-local (path only, not published), gated behind `web`.
+# Inbound HTTP face — published as `ikigai-web`; this workspace owns that crates.io name
+# (the standalone server repo of the same directory name publishes as `ikigai-web-server`).
+# Gated behind `web`.
 ikigai-web = { workspace = true, optional = true }
 # A runtime for the `web` serve loop (ikigai-web is async). Feature-gated so the
 # default/wasm binary never pulls Tokio; matches the `quic` transport's posture.
