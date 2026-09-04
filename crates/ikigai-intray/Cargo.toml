@@ -21,8 +21,9 @@ async-trait = "0.1"
 # Content-addressed tuple ids (same hash family core uses for content addressing).
 blake3 = "1"
 # Associative match: a tuple's graph is loaded and tested against a SPARQL ASK. Already
-# in the build graph via ikigai-sparql; the space is embedded-only (publish=false) so the
-# heavy Oxigraph dependency is acceptable here.
+# in the build graph via ikigai-sparql; the space is embedded-only — nothing serves it over
+# the wire — so the heavy Oxigraph dependency is acceptable here. (The crate itself has been
+# published since 0.1.14; it was `publish = false` until #296.)
 oxigraph = "0.5"
 
 [dev-dependencies]
