@@ -85,7 +85,17 @@ ikigai-browse = "0.2.12" # 0.2.0 = explain archive + annotations over a host-inj
 # Steel-backed Lisp evaluator (urn:lisp:eval): code is a resource, builtins ARE the
 # cap-scoped kernel verbs. Embedded-only (arbitrary code); gated by urn:cap:lisp.
 ikigai-lisp = "0.1.12" # 0.1.12 = scope_sync migration (core-owned bridge; channels deleted)
-ikigai-throttle = "0.1.7" # Timeout governor + Failover (the --prefer mount degrades through it)
+ikigai-throttle = "0.1.8" # 0.1.8 = the overlays answer `Resolved.canonical` (core 0.1.64). A HARD
+# floor, and the reason is the registry rather than this workspace: 0.1.7's six `Resolved`
+# literals predate the field, so with core resolved at 0.1.64 the published 0.1.7 source does not
+# compile at all. A caret pin cannot save it — cargo unifies core to one version across the
+# graph, so the throttle floor and the core floor move together. Semantically the overlays are
+# transparent to identity — each FORWARDS the canonical its inner resolution reported, so an
+# `Alias` composed beneath a governor keeps the logical and the backing name on one cache entry
+# and one golden thread. `Failover` is the stated exception: it holds every hit and defers the
+# choice past the point the cache key is derived, so it reports a canonical only when all its
+# targets agree on one and `None` when they disagree.
+# Timeout governor + Failover (the --prefer mount degrades through it)
 # LLM inference (urn:llm:ask + urn:llm:<provider>:ask + urn:llm:config): a facade grammar
 # over pluggable backends. OpenAI-compatible REST backend (Ollama/vLLM/llama.cpp/mlx_lm).
 ikigai-llm = "0.12" # 0.12 = `caps.batchAt` + the `batchAt<=W` need term: the declared

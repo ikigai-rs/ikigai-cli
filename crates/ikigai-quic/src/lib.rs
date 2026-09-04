@@ -1148,6 +1148,10 @@ mod tests {
     /// never speaks QUIC on it, which is what a silent LAN peer looks like. Measured on
     /// bug↔plasma before the fix: ~60s of dead air before `--prefer` fell back to local.
     #[test]
+    // Native-only test: the QUIC transport is built on real UDP sockets and has no
+    // wasm target at all. The test times a dial to a silent peer to prove it gives
+    // up rather than hanging, which needs a genuine monotonic clock.
+    #[allow(clippy::disallowed_methods)]
     fn a_dial_to_a_silent_peer_times_out_rather_than_hanging() {
         // Bound to a real socket, so packets are accepted and dropped rather than refused.
         let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();

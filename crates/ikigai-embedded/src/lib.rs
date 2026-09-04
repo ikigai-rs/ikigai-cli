@@ -2509,6 +2509,12 @@ fn process_uptime() -> std::time::Duration {
     uptime_start().elapsed()
 }
 
+// Native-only: the embedded host is a threaded, filesystem-backed process; it is
+// the thing a wasm build replaces rather than something wasm compiles. Process
+// uptime is measured from a monotonic baseline the injected Clock does not offer.
+// The attribute is on the fn because the call is a trailing expression, and an
+// attribute on an expression is not stable.
+#[allow(clippy::disallowed_methods)]
 fn uptime_start() -> std::time::Instant {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     *START.get_or_init(std::time::Instant::now)
@@ -4308,6 +4314,13 @@ fn watch_root(kernel: Arc<Kernel>, root: PathBuf) {
 /// the standing sync is: only instances with a scoped `derive_every` react
 /// (an unsynced instance has no business deriving). The derive itself is
 /// idempotent, so a spurious extra trigger costs one no-op pass.
+// Native-only, whole function: `notify` is watching the real filesystem
+// (FSEvents/inotify), which a wasm build has none of. Both `Instant::now()` calls
+// below are the debounce window's baseline (backdated so the first change passes
+// straight through) and its reset after a run. Scoped to the fn rather than to the
+// two statements because an attribute on an assignment expression is not stable
+// (E0658).
+#[allow(clippy::disallowed_methods)]
 fn watch_org(kernel: Arc<Kernel>) {
     if derive_every().is_none() {
         return; // not a syncing instance
@@ -4377,6 +4390,14 @@ fn watch_org(kernel: Arc<Kernel>) {
 /// writes cause (the loop would self-terminate anyway — a re-derive is a
 /// no-op — but suppression skips even that pass). Gated like the standing
 /// sync: only instances with a scoped derive_every react.
+// Native-only, whole function: this watcher exists only because EventKit is
+// watching the macOS calendar store — not merely native but macOS-gated, and a
+// wasm build has neither the store nor the thread it runs on. Both
+// `Instant::now()` calls below are the debounce window's baseline and its reset;
+// a monotonic mark is exactly right there and the injected Clock offers none.
+// Scoped to the fn rather than to the two statements because an attribute on an
+// assignment expression is not stable (E0658).
+#[allow(clippy::disallowed_methods)]
 fn watch_store(kernel: Arc<Kernel>) {
     if derive_every().is_none() {
         return;

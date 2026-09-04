@@ -1,0 +1,38 @@
+# ★ WORKSPACE-WIDE: `std::time::Instant::now` and `SystemTime::now` are BANNED by default.
+#
+# On `wasm32-unknown-unknown` both COMPILE and then panic at runtime. That is the whole
+# problem: `cargo clippy --target wasm32-unknown-unknown` is a compile-only gate and is
+# structurally incapable of catching it, so the failure surfaces only when the code actually
+# runs in a browser. One such call sat in `ikigai-time`'s `fire()` for three weeks and
+# bricked the web demo's entire Control panel the first time a job completed — three green
+# CI runs said nothing, because there was nothing at compile time to say.
+#
+# The kernel's answer is an INJECTED clock: `ikigai_core::Clock`, supplied as `SystemClock`
+# natively and as a `Date.now()`-backed implementation in the browser. Reach for that.
+#
+# ★ WHY THIS FILE LIVES AT THE WORKSPACE ROOT AND NOT PER-CRATE.
+# It began as `crates/ikigai-time/clippy.toml`, governing the one crate that had been bitten.
+# But four members are wasm-facing — `ikigai-time`, `ikigai-engine`, `ikigai-resolve`,
+# `ikigai-wire` — and the other three were ungated with nothing anywhere saying so. Copying
+# the file into each fails the same way one more time: the FIFTH wasm-facing crate arrives
+# gated by nothing, and its absence is invisible. So the ban is the default for every member
+# and each native-only use opts out explicitly at the call site.
+#
+# ⚠ Clippy resolves this file by walking up from the crate's manifest directory and takes the
+# FIRST one it finds. A crate-level `clippy.toml` therefore SHADOWS this file entirely — it
+# does not merge with it, and a rule added here would silently stop applying to that crate.
+# `crates/ikigai-time/clippy.toml` was deleted rather than kept for exactly that reason: its
+# content is folded in above, and keeping it would have excluded the one crate that proved
+# the rule was needed. Do not reintroduce a crate-level config; add to this file instead.
+#
+# ★ OPTING OUT. Native-only members (`ikigai-cli`, `ikigai-embedded`, `ikigai-discovery`,
+# `ikigai-ipc`, `ikigai-quic`, `ikigai-web`) use these legitimately — elapsed-time
+# measurement, TTL bookkeeping, HTTP date headers. Each site carries
+# `#[allow(clippy::disallowed_methods)]` above a comment naming why it can never run on wasm.
+# The reason comment is not optional: an `#[allow]` with no stated reason is how a
+# deny-by-default rule decays into cargo-culted noise, and this one exists to stop a class of
+# bug that already cost three weeks.
+disallowed-methods = [
+  { path = "std::time::Instant::now", reason = "compiles on wasm32-unknown-unknown and panics at runtime; take the timestamp from the injected ikigai_core::Clock instead, or #[allow] with a reason if the site is native-only" },
+  { path = "std::time::SystemTime::now", reason = "compiles on wasm32-unknown-unknown and panics at runtime just like Instant::now; take the timestamp from the injected ikigai_core::Clock instead, or #[allow] with a reason if the site is native-only" },
+]

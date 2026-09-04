@@ -214,6 +214,11 @@ impl Browser {
                         state.present.remove(&name);
                         // POSITIVE evidence of absence — the whole point of tracking this
                         // separately from "never heard of".
+                        // Native-only: mDNS discovery is multicast UDP through `mdns-sd`, which a browser
+                        // sandbox does not expose, so this crate has no wasm build. The withdrawal mark
+                        // is monotonic on purpose — a positive record of absence must not be aged out or
+                        // revived by a wall-clock adjustment.
+                        #[allow(clippy::disallowed_methods)]
                         state.withdrawn.insert(name, Instant::now());
                     }
                     _ => {}
@@ -317,6 +322,9 @@ mod tests {
     /// not absent. Skipping a dial on `Unknown` would refuse a peer that is right there —
     /// worse than the wait it saves, because mDNS loses packets routinely.
     #[test]
+    // Native-only test in that same multicast crate: it forges withdrawal timestamps
+    // to check presence classification.
+    #[allow(clippy::disallowed_methods)]
     fn never_heard_of_is_unknown_but_heard_leaving_is_withdrawn() {
         let state = Arc::new(Mutex::new(State::default()));
         let browser = Browser {
@@ -385,6 +393,9 @@ mod tests {
     /// heard would never be used again. Absence is the claim that expires; presence needs
     /// no such rule, because hearing an announcement is positive evidence.
     #[test]
+    // Native-only test in that same multicast crate: it forges both a stale and a
+    // fresh withdrawal timestamp to check the TTL boundary.
+    #[allow(clippy::disallowed_methods)]
     fn a_stale_withdrawal_decays_to_unknown() {
         let state = Arc::new(Mutex::new(State::default()));
         let browser = Browser {
@@ -434,6 +445,9 @@ mod tests {
     ///     cargo test -p ikigai-discovery -- --ignored --nocapture
     #[test]
     #[ignore]
+    // Native-only test in that same multicast crate: it announces on the real network
+    // and polls against a monotonic deadline rather than sleeping a fixed guess.
+    #[allow(clippy::disallowed_methods)]
     fn announce_and_browse_round_trip() {
         let _announced = announce(
             "discovery-selftest",
