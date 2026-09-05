@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use ikigai_core::{
-    ActionSpec, ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, Fallback,
-    FnEndpoint, Invocation, Iri, Kernel, MetaRenderer, ReprType, Representation, Request,
+    ActionSpec, AliasTable, ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact,
+    Fallback, FnEndpoint, Invocation, Iri, Kernel, MetaRenderer, ReprType, Representation, Request,
     Resolution, Result, Scope, Space, SpaceEntry, SystemClock, Time, UriTemplate, Verb,
 };
 /// The process scheduler and how it was configured — `--scheduler`, the config home's
@@ -3142,6 +3142,67 @@ fn runbook_jury_demo() -> FnEndpoint {
     )
 }
 
+/// The host's URN **rewrite table** — the transition window for the `urn:iki:`
+/// namespace consolidation, installed on every kernel this crate builds over
+/// [`root_space_with_mounts`] and readable at `urn:kernel:aliases`.
+///
+/// One namespace has moved so far. `ikigai-browse` 0.3.0 renamed its Web Annotation
+/// family `urn:annotation:*` → `urn:iki:annotation:*`; the library moved atomically and
+/// the HOST carries the old spelling, which is what makes the migration incremental —
+/// the catalog advertises only the new name (so catalog-driven consumers migrate
+/// themselves), while anything still holding the old name keeps resolving, against one
+/// cache entry and one golden thread.
+///
+/// ## ★ TWO rules for one namespace, and the second is not redundant
+///
+/// ```text
+/// prefix  urn:annotation:  urn:iki:annotation:
+/// exact   urn:annotation   urn:iki:annotation
+/// ```
+///
+/// A prefix rule matches on the literal prefix **including its trailing colon**, so
+/// `prefix urn:annotation:` does not match the bare `urn:annotation` — and the bare IRI
+/// is not a spare synonym here: it is the **minting** form (`Sink urn:annotation` with no
+/// id mints a uuid), and minting is the only write path the annotation family has. Drop
+/// the `exact` rule as duplicated-looking noise and reads keep working perfectly while
+/// every *new* annotation fails — an `Unresolved` on the bare name, from a table whose
+/// counters show it never fired. A test below ablates exactly that rule.
+///
+/// The general shape, for the 96 namespaces still to move: **a namespace with a
+/// resolvable bare root needs both rules.** Check for one before writing the prefix line.
+///
+/// ## Where it is NOT installed, deliberately
+///
+/// Not on the served surfaces ([`kernel_for`], [`served_kernel_with_mounts`],
+/// [`calendar_server_kernel`]): [`served_space`] binds no browse family, so a table there
+/// could only rewrite a name nothing binds — and it would rewrite it *before* mount
+/// matching, since `with_aliases` wraps the ROOT and mounts sit inside it. No upside, one
+/// downside.
+///
+/// ## ⚠ The consequence operators must sequence by hand
+///
+/// Because the alias wraps the root, a `mount = "prefer urn:annotation=…"` line in the
+/// config home sits INSIDE it and sees the **canonical** name: it stops matching the
+/// instant this table ships, and no alias can save it — the rewrite happens first. Route
+/// gates outside the kernel move the opposite way and must accept both spellings. The
+/// mount lines are live routing state on the hosts, owned by nothing in this repo; adding
+/// `mount = "prefer urn:iki:annotation=<same socket>"` beside the existing line is a step
+/// in the deploy window, not a code change.
+fn alias_table() -> Arc<AliasTable> {
+    static TABLE: std::sync::OnceLock<Arc<AliasTable>> = std::sync::OnceLock::new();
+    Arc::clone(TABLE.get_or_init(|| {
+        Arc::new(
+            AliasTable::new()
+                // ikigai-browse 0.3.0: the Web Annotation family.
+                .prefix("urn:annotation:", "urn:iki:annotation:")
+                // ★ NOT redundant with the line above — see the module note. This is the
+                // bare mint IRI (`Sink urn:annotation` with no id), which the prefix rule
+                // cannot match because it carries no trailing colon.
+                .exact("urn:annotation", "urn:iki:annotation"),
+        )
+    }))
+}
+
 /// The embedded kernel's root space: the local space, the HTTP module, and the
 /// interactive runbook (`urn:runbook:*`) — the last **gated** by [`demo_flag`], so it
 /// only resolves while the demo is on (OFF by default; `--demo` or `demo on` turns it
@@ -3156,7 +3217,7 @@ fn root_space() -> Arc<dyn Space> {
 /// tagged with `origin`.
 fn root_space_with_mounts(mounts: Vec<MountSpec>) -> Arc<dyn Space> {
     // The browse family (urn:repo:{root}:tree/file/state/hash/explain/… +
-    // urn:annotation:*), opt-in via `browse.root` config lines — see the
+    // urn:iki:annotation:*), opt-in via `browse.root` config lines — see the
     // `browse` module for the grammar. Wired here, before the space list, so
     // its persistent store handle can decide which sparql space binds below.
     let browse = browse::setup();
@@ -3312,8 +3373,9 @@ fn root_space_with_mounts(mounts: Vec<MountSpec>) -> Arc<dyn Space> {
     // The browse family, when `browse.root` lines configured it (see above): repository
     // browsing (urn:repo:{root}:tree/file/state/hash), the persistent explanation
     // archive (…:explain[:{path}] — derived once per content version, then answered
-    // from the store forever), and Web Annotations (urn:annotation:* — Sink gated by
-    // urn:cap:annotate). Its grammar only ever matches configured root names — an
+    // from the store forever), and Web Annotations (urn:iki:annotation:* — Sink gated
+    // by urn:cap:annotate; the old `urn:annotation:*` spelling keeps resolving through
+    // `alias_table`). Its grammar only ever matches configured root names — an
     // unknown {root} is a clean miss — so it composes with ikigai-repo's urn:repo:*
     // Exacts without shadowing (reserved names are refused at setup).
     if let Some(b) = browse {
@@ -3620,6 +3682,7 @@ pub fn kernel() -> Kernel {
     Kernel::with_meta_renderer(root_space(), Arc::new(CliRenderer))
         .with_clock(Arc::new(SystemClock))
         .with_subclass_axioms(subclass_axioms())
+        .with_aliases(alias_table())
 }
 
 /// The local embedded kernel as a shared `Arc`, with a filesystem **watcher** over
@@ -3672,6 +3735,12 @@ fn build_watched(mounts: Vec<MountSpec>, reactive: bool) -> Arc<Kernel> {
     let kernel = Kernel::with_meta_renderer(root_space_with_mounts(mounts), Arc::new(CliRenderer))
         .with_clock(Arc::new(SystemClock))
         .with_subclass_axioms(subclass_axioms())
+        // ⚠ Order of composition, not of calls: `with_aliases` wraps the ROOT, and
+        // `mounts` were composed into that root above — so the mounts sit INSIDE the
+        // alias and match against the CANONICAL name. A `mount = "prefer
+        // urn:annotation=…"` line stops matching the moment this table ships. See
+        // [`alias_table`].
+        .with_aliases(alias_table())
         .with_scheduler_reporter(Arc::new(scheduling::reporter()))
         .into_scheduled(sched);
     watch_root(Arc::clone(&kernel), file_root());
@@ -4539,6 +4608,9 @@ pub fn trusted_kernel_with_mounts(nature: &'static str, mounts: Vec<MountSpec>) 
     Kernel::with_meta_renderer(with_wire_eval(space), Arc::new(CliRenderer))
         .with_clock(Arc::new(SystemClock))
         .with_subclass_axioms(subclass_axioms())
+        // Same caveat as `build_watched`: `mounts` are inside this wrap and see the
+        // canonical name. See [`alias_table`].
+        .with_aliases(alias_table())
 }
 
 /// Build a **served** kernel for an *unauthenticated* transport (QUIC), labelled
@@ -4606,6 +4678,228 @@ mod tests {
         // And building the whole local space — the innocuous-looking call — stays inside it.
         let _ = root_space();
         assert!(root.is_dir(), "{root:?}");
+    }
+
+    // --- the `urn:iki:` rename window (ikigai-browse 0.3.0) -----------------
+    //
+    // ★ A library's own green suite is NOT evidence about this class of change.
+    // ikigai-browse renamed its bindings and its tests moved with them, so both
+    // halves agreed by construction. The failure lives at the boundary — here,
+    // where a HOST that still says `urn:annotation` meets a library that no
+    // longer binds it. So these tests resolve against the real published 0.3.0
+    // bindings, not a stand-in space.
+
+    /// A browse annotation space over an in-memory store, rooted at a throwaway repo
+    /// with one file in it. `table` is the rewrite table under test — `None` builds the
+    /// un-aliased kernel, which is the pre-window behaviour.
+    fn annotation_kernel(table: Option<Arc<AliasTable>>) -> Kernel {
+        let root = thread_file_root().join("annotation-repo");
+        std::fs::create_dir_all(&root).expect("test repo root");
+        std::fs::write(root.join("a.rs"), "fn one() {}\nfn two() {}\n").expect("test file");
+        let store = Arc::new(ikigai_sparql::Store::new().expect("in-memory store"));
+        let space = ikigai_browse::space_with_annotations(vec![("demo".to_string(), root)], store);
+        let kernel = Kernel::new(Arc::new(space));
+        match table {
+            Some(t) => kernel.with_aliases(t),
+            None => kernel,
+        }
+    }
+
+    fn annotate_cap() -> Capability {
+        Capability::scoped(["urn:cap:browse:read:demo", ikigai_browse::CAP_ANNOTATE])
+    }
+
+    fn annotation_issue(
+        kernel: &Kernel,
+        verb: Verb,
+        iri: &str,
+        args: &[(&str, &str)],
+    ) -> Result<Representation> {
+        let mut request = Request::new(verb, Iri::parse(iri).expect("valid IRI"));
+        for (k, v) in args {
+            request = request.with_arg(*k, ArgRef::Inline(v.as_bytes().to_vec()));
+        }
+        block_on(kernel.issue(request, &annotate_cap()))
+    }
+
+    /// The window, proved end to end: a caller that never heard of the rename sinks and
+    /// sources under `urn:annotation:*`, and the SAME record answers under the canonical
+    /// name — one resource, two spellings.
+    #[test]
+    fn both_spellings_reach_one_annotation() {
+        let k = annotation_kernel(Some(alias_table()));
+
+        // Written under the OLD name...
+        let created = annotation_issue(
+            &k,
+            Verb::Sink,
+            "urn:annotation:note-1",
+            &[
+                ("target", "urn:repo:demo:file:a.rs"),
+                ("exact", "fn two()"),
+                ("body", "the second function"),
+                ("as", "application/json"),
+            ],
+        )
+        .expect("an old-spelling sink resolves through the alias");
+        let json: serde_json::Value =
+            serde_json::from_slice(&created.bytes).expect("json annotation record");
+        // ★ The record reports the BACKING name, not the one the caller wrote: the kernel
+        // adopts the canonical target before dispatch, so the endpoint never sees the
+        // alias. That is what makes the two spellings one cache entry and one thread.
+        assert_eq!(json["iri"], "urn:iki:annotation:note-1");
+
+        // ...read back under BOTH.
+        let old = annotation_issue(&k, Verb::Source, "urn:annotation:note-1", &[])
+            .expect("old spelling sources");
+        let new = annotation_issue(&k, Verb::Source, "urn:iki:annotation:note-1", &[])
+            .expect("canonical spelling sources");
+        assert_eq!(old.bytes, b"the second function");
+        assert_eq!(old.bytes, new.bytes);
+    }
+
+    /// ★ The `exact` rule earns its place, and this is the ablation that proves it.
+    ///
+    /// With only `prefix urn:annotation: → urn:iki:annotation:` installed, every READ
+    /// under the old spelling still works perfectly — and the bare mint IRI, the family's
+    /// only write path for a caller with no id, is not rewritten at all and dies
+    /// `Unresolved`. Nothing in the reads hints at it. Deleting the `exact` rule as
+    /// duplicated-looking noise is a change no read test can catch, so the ablation is
+    /// pinned here instead.
+    #[test]
+    fn the_prefix_rule_alone_would_break_minting_and_nothing_else() {
+        let prefix_only =
+            Arc::new(AliasTable::new().prefix("urn:annotation:", "urn:iki:annotation:"));
+
+        // The half that keeps working, which is exactly what makes the gap invisible.
+        let ablated = annotation_kernel(Some(Arc::clone(&prefix_only)));
+        annotation_issue(
+            &ablated,
+            Verb::Sink,
+            "urn:annotation:note-1",
+            &[
+                ("target", "urn:repo:demo:file:a.rs"),
+                ("exact", "fn two()"),
+                ("body", "still fine"),
+            ],
+        )
+        .expect("a slugged old-spelling write is covered by the prefix rule");
+
+        // The half that does not. A bare `Sink urn:annotation` MINTS a uuid id; under the
+        // prefix rule alone the name stands as written and nothing binds it.
+        let err = annotation_issue(
+            &ablated,
+            Verb::Sink,
+            "urn:annotation",
+            &[
+                ("target", "urn:repo:demo:file:a.rs"),
+                ("exact", "fn one()"),
+                ("body", "minted"),
+            ],
+        )
+        .expect_err("the prefix rule cannot match a name with no trailing colon");
+        assert!(
+            matches!(err, Error::Unresolved(_)),
+            "minting fails by not resolving at all, which is why it is silent: {err:?}"
+        );
+
+        // And the same request against the shipped table mints.
+        let whole = annotation_kernel(Some(alias_table()));
+        let minted = annotation_issue(
+            &whole,
+            Verb::Sink,
+            "urn:annotation",
+            &[
+                ("target", "urn:repo:demo:file:a.rs"),
+                ("exact", "fn one()"),
+                ("body", "minted"),
+                ("as", "application/json"),
+            ],
+        )
+        .expect("the exact rule carries the bare mint IRI");
+        let json: serde_json::Value =
+            serde_json::from_slice(&minted.bytes).expect("json annotation record");
+        assert_eq!(json["minted"], true);
+        let iri = json["iri"].as_str().expect("a minted iri");
+        assert!(
+            iri.starts_with("urn:iki:annotation:"),
+            "a minted id lands in the canonical namespace: {iri}"
+        );
+    }
+
+    /// The mechanical statement of the same fact, one layer down: a prefix rule matches
+    /// its prefix INCLUDING the trailing colon, so a namespace with a resolvable bare
+    /// root needs two rules. This is the check to run against each of the 96 namespaces
+    /// still to move.
+    #[test]
+    fn a_prefix_rule_does_not_match_the_bare_root() {
+        let prefix_only = AliasTable::new().prefix("urn:annotation:", "urn:iki:annotation:");
+        let bare = Iri::parse("urn:annotation").expect("valid IRI");
+        assert!(
+            prefix_only.canonicalize(&bare).canonical().is_none(),
+            "the prefix rule must not be credited with covering the bare root"
+        );
+        assert_eq!(
+            alias_table()
+                .canonicalize(&bare)
+                .canonical()
+                .map(|i| i.as_str().to_string())
+                .as_deref(),
+            Some("urn:iki:annotation"),
+        );
+        assert_eq!(
+            alias_table()
+                .canonicalize(&Iri::parse("urn:annotation:x").expect("valid IRI"))
+                .canonical()
+                .map(|i| i.as_str().to_string())
+                .as_deref(),
+            Some("urn:iki:annotation:x"),
+        );
+    }
+
+    /// Every kernel that carries the browse family carries the table, and the served
+    /// surfaces — which bind no browse family — deliberately do not.
+    ///
+    /// Named individually rather than looped because the install is one chained call per
+    /// constructor: a new constructor over `root_space*` that forgets it would resolve
+    /// annotations under the canonical name only, and the omission is invisible until an
+    /// old-name caller arrives.
+    #[test]
+    fn the_root_space_kernels_install_the_table_and_the_served_ones_do_not() {
+        for (label, kernel) in [
+            ("kernel", kernel()),
+            ("trusted_kernel_for", trusted_kernel_for("Test (IPC)")),
+        ] {
+            let rules = kernel
+                .aliases()
+                .unwrap_or_else(|| panic!("{label} installs no rewrite table"))
+                .rules()
+                .iter()
+                .map(|r| (r.from().to_string(), r.to().to_string()))
+                .collect::<Vec<_>>();
+            assert!(
+                rules.contains(&(
+                    "urn:annotation:".to_string(),
+                    "urn:iki:annotation:".to_string()
+                )),
+                "{label}: {rules:?}"
+            );
+            assert!(
+                rules.contains(&(
+                    "urn:annotation".to_string(),
+                    "urn:iki:annotation".to_string()
+                )),
+                "{label}: {rules:?}"
+            );
+        }
+        // `watched_kernel*` / `reactive_kernel_with_mounts` share `build_watched`, which is
+        // not constructed here: it starts watchers, the scheduler and the tuplespace
+        // reactor, none of which a naming assertion needs.
+        assert!(
+            kernel_for("Test (QUIC)").aliases().is_none(),
+            "a served kernel binds no browse family; a table there could only rewrite \
+             names ahead of mount matching"
+        );
     }
 
     /// The prelude must be VALID STEEL, and getting there took four failed shapes — each

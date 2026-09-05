@@ -25,12 +25,23 @@
 //!
 //! # Every OTHER process on the machine mounts the family from the server.
 //! # Two lines because the family spans two URN prefixes (`urn:repo:…` and
-//! # `urn:annotation:…`). `prefer` = through the server when it is up, quiet
+//! # `urn:iki:annotation:…`). `prefer` = through the server when it is up, quiet
 //! # absence when it is down. The serving instance skips a mount that targets
 //! # its own socket (see `serve_ipc` in the CLI), so these lines are safe in
 //! # the one shared config file.
+//! #
+//! # ⚠ Note the MISSING trailing colon on the annotation line, and keep it: a
+//! # mount prefix is matched with `starts_with`, and the family's resolvable
+//! # BARE root `urn:iki:annotation` (Sink mints an id) is the only write path
+//! # it has. `urn:iki:annotation:=` would route every read and no mint.
+//! #
+//! # ⚠ Write the mount in the CANONICAL spelling. This host aliases
+//! # `urn:annotation` → `urn:iki:annotation` (`ikigai_embedded::alias_table`),
+//! # and the alias wraps the ROOT while mounts sit inside it — so a mount
+//! # matches the name AFTER the rewrite. An old-spelling mount line never
+//! # matches again.
 //! mount = "prefer urn:repo:=/path/to/serve.sock"
-//! mount = "prefer urn:annotation:=/path/to/serve.sock"
+//! mount = "prefer urn:iki:annotation=/path/to/serve.sock"
 //! ```
 //!
 //! Unscoped `browse.root` lines keep working for SINGLE-PROCESS setups (every
@@ -109,7 +120,7 @@ pub(crate) fn setup() -> Option<Browse> {
              the fix is topology, not retry: scope the family to the SERVING instance \
              (`serve.browse.root = …`) and point this process at it instead — \
              mount = \"prefer urn:repo:=<serve socket>\" and \
-             mount = \"prefer urn:annotation:=<serve socket>\" in the config home. \
+             mount = \"prefer urn:iki:annotation=<serve socket>\" in the config home. \
              Otherwise fix the path/permissions.",
             store_path.display()
         )
@@ -192,7 +203,7 @@ fn root_lines(scoped: Vec<String>, unscoped: Vec<String>, scoping: &[String]) ->
          put a second process on the store's exclusive lock. Scope ALL of them \
          (`<instance>.browse.root`), designate ONE serving instance, and point every \
          other process at it: mount = \"prefer urn:repo:=<serve socket>\" + \
-         mount = \"prefer urn:annotation:=<serve socket>\".",
+         mount = \"prefer urn:iki:annotation=<serve socket>\".",
         scoping
             .iter()
             .map(|i| format!("`{i}.browse.root`"))

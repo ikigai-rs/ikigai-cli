@@ -76,10 +76,16 @@ ikigai-text = "0.1.0"
 ikigai-cms = "0.1.1" # 0.1.1 = stitch wrapped bookmark titles (no dropped entries)
 # Dev-tooling seam: git/gh/cargo as resources (urn:system:exec, urn:repo:*).
 ikigai-repo = "0.1.2" # 0.1.2 = typed Error::Denied for capability denials
-# Repository browsing (urn:repo:{root}:tree/file/state/hash/explain + urn:annotation:*)
-# over configured roots — opt-in via `browse.root` config lines (embedded host).
-ikigai-browse = "0.2.12" # 0.2.0 = explain archive + annotations over a host-injected store.
-# 0.2.12 is a RENDERING floor: urn:repo:style reads its themes and contrast floor from the
+# Repository browsing (urn:repo:{root}:tree/file/state/hash/explain +
+# urn:iki:annotation:*) over configured roots — opt-in via `browse.root` config lines
+# (embedded host).
+ikigai-browse = "0.3.0" # 0.3.0 is a NAMING floor, and the reason it is hard rather than
+# cosmetic: the annotation family moved from `urn:annotation:*` to `urn:iki:annotation:*`,
+# and this host answers the OLD spelling through the alias table installed in
+# `ikigai_embedded::alias_table` (see the two rules there). Pinned below 0.3.0 the host
+# would alias `urn:annotation` onto a name nothing binds — every annotation read and every
+# mint Unresolved, with the table reporting a clean rewrite. Bump and alias travel together.
+# 0.2.12 was a RENDERING floor: urn:repo:style reads its themes and contrast floor from the
 # layered a11y.toml and lifts every sub-floor colour to the theme's own foreground. Below
 # 0.2.11 it also leaked the light theme into dark mode, rendering parameters at 1.03:1.
 # Steel-backed Lisp evaluator (urn:lisp:eval): code is a resource, builtins ARE the

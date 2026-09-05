@@ -799,14 +799,21 @@ mod tests {
 
     #[test]
     fn a_single_partially_answerable_row_still_routes() {
-        // The annotation-Sink shape: one row `urn:annotation:{id}` whose `id`
+        // The annotation-Sink shape: one row `urn:iki:annotation:{id}` whose `id`
         // is optional (the endpoint mints one). Omitting it must keep routing
         // to the row — partial substitution stands, as before the collapse.
-        let patterns = vec!["urn:annotation:{id}".to_string()];
+        //
+        // The IRI is written in the CANONICAL spelling on purpose: this fixture
+        // mirrors what the browse catalog advertises, and the catalog lists the
+        // BACKING name (an alias is never listed — ikigai-core's alias decision 4).
+        // A projection tested against a spelling the catalog no longer emits is
+        // testing a shape nothing produces. The tool NAME is unaffected: it comes
+        // from `Description::id` ("annotation"), not from the IRI.
+        let patterns = vec!["urn:iki:annotation:{id}".to_string()];
         let shape = collapse(&patterns, &["id".to_string()]);
         assert_eq!(
             shape.route("annotation__sink", &BTreeSet::new(), &Map::new()),
-            Ok("urn:annotation:{id}")
+            Ok("urn:iki:annotation:{id}")
         );
     }
 
