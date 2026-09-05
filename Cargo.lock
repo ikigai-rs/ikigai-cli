@@ -2458,9 +2458,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-a11y"
-version = "0.1.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cbbb4ad11f41d5e37ef7a223ff8ae3334a4ae389d3fdaddf6dc44461fec5ed3"
+checksum = "fe0308f7493826570fce95a6f718ddde940e36cadcbea32e395bcb72b1fe3a70"
 dependencies = [
  "ikigai-core",
  "serde",
@@ -2472,9 +2472,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-browse"
-version = "0.2.12"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18cc4e2859d2f91d691afc8e45e3a6c3c5b06f2271c70ee4227104c4dc35f1bb"
+checksum = "d9559bd1591bf3f4e71c56dc25a8cf5117f603df8299c416fd178df5bcb6819d"
 dependencies = [
  "async-trait",
  "ikigai-a11y",
