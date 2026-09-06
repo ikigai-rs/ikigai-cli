@@ -1978,7 +1978,7 @@ fn catalog_descriptions(turtle: &str) -> std::collections::BTreeMap<String, Desc
     out
 }
 
-/// Scheme identifiers a generated parameter must not shadow.
+/// Scheme identifiers a generated binder OR definition must not shadow.
 ///
 /// Two families, both of which produced real breakage: SYNTACTIC KEYWORDS — `urn:iki:fn:conditional`
 /// declares an argument literally named `if`, and `(define (fn-conditional if …) …)` fails to
@@ -2012,22 +2012,100 @@ const SCHEME_RESERVED: &[&str] = &[
     "when",
     // used by the generated body — shadowing these breaks the call itself
     "apply",
+    "cons",
     "invoke",
     "rest",
 ];
 
-/// A parameter name that is safe to bind. `if` → `if*`.
-fn safe_param(name: &str) -> String {
-    let clean: String = name
-        .chars()
+/// Names the Steel PRELUDE defines that a generated *definition* must not take over.
+///
+/// Kept apart from [`SCHEME_RESERVED`] because the two hazards live in different scopes,
+/// and collapsing them would be wrong in both directions. A binder is lexical to one
+/// body — and that body calls `%verb-args`, not `source` — so an argument named `source`
+/// shadows nothing that matters and is left alone. A `define` is global and permanent:
+/// `urn:source` would REPLACE the prelude's `(source iri . rest)` for every later
+/// expression in the session, including hand-written ones. Same mechanism, two sets.
+const SCHEME_PRELUDE: &[&str] = &["source", "sink", "exists", "delete"];
+
+/// The one charset every generated lisp identifier passes through — a WHITELIST, because
+/// a blacklist can only exclude the characters whoever wrote it thought of, and this
+/// function's output is `load`ed by the user's Emacs.
+///
+/// ASCII, deliberately: an R7RS `<identifier>` is ASCII-only (anything else needs
+/// `|vertical bars|`), and elisp symbols are a superset — so the ASCII intersection is
+/// legal in both target lisps and needs no per-face charset.
+fn ident_chars(raw: &str) -> String {
+    raw.chars()
         .map(|c| {
-            if c.is_alphanumeric() || c == '-' {
+            if c.is_ascii_alphanumeric() || c == '-' {
                 c
             } else {
                 '-'
             }
         })
-        .collect();
+        .collect()
+}
+
+/// Whether `s` is a legal R7RS `<identifier>` — the grammar Steel READS this back in.
+///
+/// ★ Filtering the INPUT does not prove the OUTPUT parses. That is the lesson core #99
+/// paid for in the RDF projection (percent-encoding produced a legal `IRIREF` that was
+/// not a legal IRI, and `oxttl` then rejected the whole document); the same shape applies
+/// here, because one unreadable `define` fails the whole prelude, not one alias. So the
+/// generator checks its result against the target grammar and emits nothing it cannot
+/// certify — see [`aliases_scheme`].
+///
+/// The cases that actually bite after [`ident_chars`]: a leading digit (`urn:3d:render`
+/// → `3d-render`, which reads as a NUMBER), and the peculiar-identifier rule that makes
+/// `-foo` legal but `-3d` not.
+fn is_scheme_identifier(s: &str) -> bool {
+    fn initial(c: char) -> bool {
+        c.is_ascii_alphabetic() || "!$%&*/:<=>?^_~".contains(c)
+    }
+    fn subsequent(c: char) -> bool {
+        initial(c) || c.is_ascii_digit() || matches!(c, '+' | '-' | '.' | '@')
+    }
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if initial(first) {
+        return chars.all(subsequent);
+    }
+    // <peculiar identifier>: an explicit sign alone, or followed by a <sign subsequent>.
+    // The leading-dot forms are legal Scheme and never generated here, so they are not
+    // accepted — a generator may be stricter than its reader, never looser.
+    if matches!(first, '+' | '-') {
+        let Some(second) = chars.next() else {
+            return true;
+        };
+        return (initial(second) || matches!(second, '+' | '-' | '@')) && chars.all(subsequent);
+    }
+    false
+}
+
+/// Whether `s` reads back as a plain elisp SYMBOL, with no escaping required.
+///
+/// Conservative on purpose: it accepts a strict subset of what elisp's reader would take.
+/// The asymmetry is the point — a false reject costs one shortcut (the resource is still
+/// reachable through `ikigai-invoke`), a false accept writes a broken form into a file
+/// `ikigai-refresh-aliases` hands to `load`, which breaks the user's whole Emacs session.
+fn is_elisp_symbol(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let constituent = |c: char| c.is_ascii_alphanumeric() || "-+*/_~!@$%^&=:<>?".contains(c);
+    if !constituent(first) || !chars.all(constituent) {
+        return false;
+    }
+    // A token the reader would take for a number or a character literal is not a symbol.
+    !first.is_ascii_digit() && first != '?'
+}
+
+/// A parameter name that is safe to bind. `if` → `if*`.
+fn safe_param(name: &str) -> String {
+    let clean = ident_chars(name);
     if SCHEME_RESERVED.contains(&clean.as_str()) || clean.is_empty() {
         format!("{clean}*")
     } else {
@@ -2059,19 +2137,112 @@ fn safe_param(name: &str) -> String {
 /// advertises only the CANONICAL name (core's alias decision 4), so a migrated namespace
 /// appears exactly once. That is a property of the catalog, not of this function, which is
 /// why it is written down.
+/// ## ★ Why this is a whitelist, and why the guard runs on the DECORATED name
+///
+/// It used to replace exactly `:`, `/`, `.` and space and pass everything else through
+/// raw — a blacklist, thirty lines below [`safe_param`], which is a whitelist. One file,
+/// one purpose, opposite strategies, and the unsafe one names the function. An IRI
+/// carrying `(`, `"` or `;` produced a syntactically broken `defun`, and
+/// `ikigai-refresh-aliases` `load`s that file: the blast radius was the user's Emacs
+/// session, not one call. It shares [`ident_chars`] with [`safe_param`] now.
+///
+/// The reserved check runs AFTER the verb decoration, because the decoration is what
+/// decides: `urn:if` + Source is the bare `if` and must become `if*`, while `urn:if` +
+/// Sink is `if!`, which shadows nothing and is left exactly as it reads.
 fn alias_name(iri: &str, verb: &str) -> String {
-    let stem = iri
-        .strip_prefix("urn:iki:")
-        .or_else(|| iri.strip_prefix("urn:"))
-        .unwrap_or(iri)
-        .replace(':', "-")
-        .replace(['/', '.', ' '], "-");
-    match verb {
+    let stem = ident_chars(
+        iri.strip_prefix("urn:iki:")
+            .or_else(|| iri.strip_prefix("urn:"))
+            .unwrap_or(iri),
+    );
+    let name = match verb {
         "Sink" => format!("{stem}!"),
         "Delete" => format!("{stem}-delete!"),
         "Exists" => format!("{stem}?"),
         _ => stem,
+    };
+    if SCHEME_RESERVED.contains(&name.as_str()) || SCHEME_PRELUDE.contains(&name.as_str()) {
+        format!("{name}*")
+    } else {
+        name
     }
+}
+
+/// The verbs an alias may be generated for. `Meta` is every endpoint's self-description
+/// and is filtered upstream; anything else is not a kernel verb at all.
+///
+/// This is a check on a different axis from the name projections, and it is here because
+/// the verb is not only interpolated into a string — the elisp face emits it as a quoted
+/// SYMBOL (`(apply #'ikigai-invoke 'source …)`), where escaping is not even the right
+/// tool. The value arrives as an `ik:verb` literal from the manifold, which for a mounted
+/// peer means it arrives over the wire, so an unrecognized one is refused rather than
+/// written into a file Emacs will `load`.
+const ALIAS_VERBS: &[&str] = &["Source", "Sink", "Exists", "Delete"];
+
+/// Escape a value for a lisp STRING LITERAL. Scheme and elisp agree on both escapes.
+///
+/// ★ THE FIFTH PROJECTION, and it was invisible until Steel itself read the output back.
+/// The four everyone counted are all NAMES; this one is the IRI and the wire argument
+/// names, which are interpolated verbatim into the generated body — `(%verb-args "sink"
+/// "urn:demo:a"b" args)`. A name projection sanitizes because a name has a grammar; a
+/// string literal has a grammar too, and nothing was enforcing it. A quote in the value
+/// closes the string and everything after it is read as code.
+///
+/// It is also the reason the whitelist alone was never going to be enough: the name
+/// carried a hostile IRI safely and the SAME IRI, three tokens later, ended the string.
+/// Only reading the emitted file back in the target grammar finds that.
+fn lisp_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Flatten a value into something that cannot escape a `;;` COMMENT. A newline would put
+/// the remainder of the text on a live code line.
+fn lisp_comment(value: &str) -> String {
+    value.replace(['\n', '\r'], " ")
+}
+
+/// Why a generated definition must not be emitted, or `None` if it is safe to write.
+///
+/// `legal` is the target grammar's own reader test — [`is_scheme_identifier`] or
+/// [`is_elisp_symbol`]. Three refusals, and the third is not a syntax problem at all:
+/// two DIFFERENT IRIs projecting to one name is a silent last-wins redefinition, the
+/// same non-injectivity the MCP tool-name projection carries. A name is an identity, so
+/// two of them under one spelling is a defect that must surface rather than merge.
+fn unemittable(
+    name: &str,
+    binders: &[String],
+    defined: &[String],
+    legal: fn(&str) -> bool,
+) -> Option<String> {
+    if !legal(name) {
+        return Some(format!("`{name}` does not read back as an identifier"));
+    }
+    if let Some(bad) = binders.iter().find(|b| !legal(b)) {
+        return Some(format!(
+            "argument binder `{bad}` does not read back as an identifier"
+        ));
+    }
+    if defined.contains(&name.to_string()) {
+        return Some(format!(
+            "`{name}` is already defined above — two IRIs, one name"
+        ));
+    }
+    None
+}
+
+/// A refused alias is a COMMENT, never a gap.
+///
+/// The shortcut is all that is lost: `reach` names the generic call that still resolves
+/// the resource, so the manifold stays whole. The trade is the whole point — one form
+/// that does not read takes the ENTIRE generated file down with it (`load` in Emacs,
+/// one prelude eval in Steel), exactly as one bad IRIREF took down a whole Turtle
+/// document in core #99.
+fn skip_note(iri: &str, verb: &str, reason: &str, reach: &str) -> String {
+    format!(
+        ";; SKIPPED {} ({verb}): {reason}.\n;; Still reachable as {}.\n\n",
+        lisp_comment(iri),
+        lisp_comment(reach)
+    )
 }
 
 /// Emit the prelude. Pure, so the shape is testable without a kernel.
@@ -2083,6 +2254,8 @@ fn aliases_scheme(targets: &[AliasTarget], prefix: &str) -> String {
          ;; `source urn:lisp:aliases`.\n\n",
     );
     let mut emitted = 0;
+    let mut skipped = 0;
+    let mut defined: Vec<String> = Vec::new();
     for target in targets {
         if !prefix.is_empty() && !target.iri.starts_with(prefix) {
             continue;
@@ -2090,6 +2263,20 @@ fn aliases_scheme(targets: &[AliasTarget], prefix: &str) -> String {
         for (verb, required) in &target.actions {
             let name = alias_name(&target.iri, verb);
             let binders: Vec<String> = required.iter().map(|r| safe_param(r)).collect();
+            // ★ CERTIFY THE OUTPUT, not the input. `alias_name` filters characters, which
+            // proves nothing about whether the result reads as an identifier — a stem
+            // beginning with a digit passes every charset test and is a NUMBER to the
+            // reader. Nothing legal is emitted on faith.
+            if let Some(reason) = (!ALIAS_VERBS.contains(&verb.as_str()))
+                .then(|| format!("`{verb}` is not a kernel verb"))
+                .or_else(|| unemittable(&name, &binders, &defined, is_scheme_identifier))
+            {
+                let reach = format!("({} \"{}\" …)", verb.to_lowercase(), target.iri);
+                out.push_str(&skip_note(&target.iri, verb, &reason, &reach));
+                skipped += 1;
+                continue;
+            }
+            defined.push(name.clone());
             let params = binders.join(" ");
             // Build the flat name→value list as a CONS CHAIN ending in `rest`, bound with
             // `let` before the call. Three Steel constraints force this exact shape, each
@@ -2103,10 +2290,13 @@ fn aliases_scheme(targets: &[AliasTarget], prefix: &str) -> String {
             // than `(apply invoke …)`, and the only version that actually runs.
             let mut args = "rest".to_string();
             for (wire, binder) in required.iter().zip(&binders).rev() {
-                args = format!("(cons \"{wire}\" (cons {binder} {args}))");
+                args = format!("(cons \"{}\" (cons {binder} {args}))", lisp_string(wire));
             }
             if !target.summary.is_empty() {
-                out.push_str(&format!(";; {}\n", first_line(&target.summary)));
+                out.push_str(&format!(
+                    ";; {}\n",
+                    lisp_comment(&first_line(&target.summary))
+                ));
             }
             // The trailing `. rest` keeps OPTIONAL arguments reachable — a generated verb
             // is a shortcut for the common call, never a narrowing of the endpoint:
@@ -2116,12 +2306,12 @@ fn aliases_scheme(targets: &[AliasTarget], prefix: &str) -> String {
                 if params.is_empty() { "" } else { " " },
                 params,
                 verb.to_lowercase(),
-                target.iri,
+                lisp_string(&target.iri),
             ));
             emitted += 1;
         }
     }
-    if emitted == 0 {
+    if emitted == 0 && skipped == 0 {
         out.push_str(";; (no endpoints matched)\n");
     }
     out
@@ -2148,6 +2338,8 @@ const ELISP_HEADER: &str = ";;; -*- lexical-binding: t -*-\n\
 fn aliases_elisp(targets: &[AliasTarget], prefix: &str) -> String {
     let mut out = String::from(ELISP_HEADER);
     let mut emitted = 0;
+    let mut skipped = 0;
+    let mut defined: Vec<String> = Vec::new();
     for target in targets {
         if !prefix.is_empty() && !target.iri.starts_with(prefix) {
             continue;
@@ -2156,8 +2348,32 @@ fn aliases_elisp(targets: &[AliasTarget], prefix: &str) -> String {
             // `ikigai-` namespaces the whole surface. Guarded against the handful of names
             // ikigai.el already owns — `urn:eval:*` would otherwise generate `ikigai-eval`
             // and redefine the function everything else here calls through.
-            let name = elisp_defun_name(&alias_name(&target.iri, verb));
+            let stem = alias_name(&target.iri, verb);
+            let name = elisp_defun_name(&stem);
             let binders: Vec<String> = required.iter().map(|r| safe_elisp_param(r)).collect();
+            // Same certification as the Scheme face, in elisp's grammar — and this is the
+            // face with the blast radius: `ikigai-refresh-aliases` writes this file and
+            // `load`s it, so an unreadable form breaks the user's Emacs, not one call.
+            // The extra empty-stem clause is the one thing the grammar cannot catch here:
+            // `ikigai-` alone READS fine, so only the projection knows it names nothing.
+            if let Some(reason) = (!ALIAS_VERBS.contains(&verb.as_str()))
+                .then(|| format!("`{verb}` is not a kernel verb"))
+                .or_else(|| unemittable(&name, &binders, &defined, is_elisp_symbol))
+                .or_else(|| {
+                    stem.is_empty()
+                        .then(|| "the IRI projects to an empty name".to_string())
+                })
+            {
+                let reach = format!(
+                    "(ikigai-invoke '{} \"{}\")",
+                    verb.to_lowercase(),
+                    target.iri
+                );
+                out.push_str(&skip_note(&target.iri, verb, &reason, &reach));
+                skipped += 1;
+                continue;
+            }
+            defined.push(name.clone());
             let params = if binders.is_empty() {
                 "&rest args".to_string()
             } else {
@@ -2166,25 +2382,27 @@ fn aliases_elisp(targets: &[AliasTarget], prefix: &str) -> String {
             let passed: String = required
                 .iter()
                 .zip(&binders)
-                .map(|(wire, binder)| format!(" \"{wire}\" {binder}"))
+                .map(|(wire, binder)| format!(" \"{}\" {binder}", lisp_string(wire)))
                 .collect();
             let doc = if target.summary.is_empty() {
-                format!("Issue {} on `{}'.", verb.to_lowercase(), target.iri)
+                format!(
+                    "Issue {} on `{}'.",
+                    verb.to_lowercase(),
+                    lisp_string(&target.iri)
+                )
             } else {
-                // Elisp docstrings are string literals: escape quotes and backslashes.
-                first_line(&target.summary)
-                    .replace('\\', "\\\\")
-                    .replace('"', "\\\"")
+                // Elisp docstrings are string literals, like every other interpolation here.
+                lisp_string(&first_line(&target.summary))
             };
             out.push_str(&format!(
                 "(defun {name} ({params})\n  \"{doc}\"\n  (apply #'ikigai-invoke '{} \"{}\"{passed} args))\n\n",
                 verb.to_lowercase(),
-                target.iri,
+                lisp_string(&target.iri),
             ));
             emitted += 1;
         }
     }
-    if emitted == 0 {
+    if emitted == 0 && skipped == 0 {
         out.push_str(";; (no endpoints matched)\n");
     }
     out.push_str("(provide 'ikigai-aliases)\n");
@@ -2216,16 +2434,7 @@ fn elisp_defun_name(stem: &str) -> String {
 /// A parameter name safe to bind in elisp. Unlike Scheme, elisp is a lisp-2, so `if` is a
 /// perfectly good VARIABLE name — only the constants cannot be rebound.
 fn safe_elisp_param(name: &str) -> String {
-    let clean: String = name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
+    let clean = ident_chars(name);
     if matches!(clean.as_str(), "nil" | "t" | "args") || clean.is_empty() {
         format!("{clean}-value")
     } else {
@@ -5146,6 +5355,335 @@ mod tests {
         assert_eq!(alias_name("urn:space:bookings", "Sink"), "space-bookings!");
         assert_eq!(alias_name("urn:file:x", "Delete"), "file-x-delete!");
         assert_eq!(alias_name("urn:file:x", "Exists"), "file-x?");
+    }
+
+    /// ★ `alias_name` used to be a BLACKLIST — it replaced `:`, `/`, `.` and space and
+    /// passed everything else through untouched — thirty lines below `safe_param`, which
+    /// is a whitelist. A blacklist can only exclude the characters its author thought of,
+    /// and this one's output is written to a file `ikigai-refresh-aliases` hands to
+    /// `load`: the blast radius of a stray `(` or `"` was the user's whole Emacs session.
+    #[test]
+    fn a_hostile_iri_cannot_reach_the_generated_source() {
+        // Parentheses, quotes and semicolons all used to survive verbatim.
+        assert_eq!(alias_name("urn:demo:ev(il)", "Source"), "demo-ev-il-");
+        assert_eq!(alias_name("urn:demo:a\"b;c", "Source"), "demo-a-b-c");
+        assert_eq!(alias_name("urn:demo:x y", "Source"), "demo-x-y");
+        // And the old four-character list still maps the way it did, so no live name moves.
+        assert_eq!(alias_name("urn:iki:fn:toUpper", "Source"), "fn-toUpper");
+        assert_eq!(alias_name("urn:browse:a/b.c", "Source"), "browse-a-b-c");
+    }
+
+    /// A definition and a binder are guarded by DIFFERENT sets, because their scopes
+    /// differ. `if` breaks both (it will not parse as a binder, and it redefines a
+    /// syntactic keyword as a definition). `source` breaks only the definition: a `define`
+    /// is global and would replace the prelude's own `(source iri . rest)`, while a binder
+    /// is lexical to a body that calls `%verb-args` and never `source`.
+    #[test]
+    fn a_definition_name_is_guarded_where_a_binder_need_not_be() {
+        assert_eq!(alias_name("urn:if", "Source"), "if*");
+        assert_eq!(safe_param("if"), "if*");
+        assert_eq!(alias_name("urn:source", "Source"), "source*");
+        assert_eq!(
+            safe_param("source"),
+            "source",
+            "shadows nothing in the body"
+        );
+        // The guard runs on the DECORATED name: `urn:if` + Sink is `if!`, which shadows
+        // nothing at all and must be left exactly as it reads.
+        assert_eq!(alias_name("urn:if", "Sink"), "if!");
+        assert_eq!(alias_name("urn:source", "Exists"), "source?");
+        // `cons` is what every generated body is built from — a binder of that name
+        // breaks its own call.
+        assert_eq!(safe_param("cons"), "cons*");
+    }
+
+    /// ★★★ Filtering the INPUT does not prove the OUTPUT parses. Core #99 learned it in
+    /// the RDF projection (a legal `IRIREF` that was not a legal IRI, and the parser threw
+    /// out the whole document); the same shape holds here, because one unreadable `define`
+    /// fails the whole prelude. So the grammar itself is a test.
+    #[test]
+    fn the_scheme_identifier_grammar_is_the_check_the_charset_cannot_make() {
+        assert!(is_scheme_identifier("fn-toUpper"));
+        assert!(is_scheme_identifier("if*"));
+        assert!(is_scheme_identifier("space-bookings!"));
+        assert!(is_scheme_identifier("file-x?"));
+        // Every character here is in the whitelist and the result is still a NUMBER.
+        assert!(!is_scheme_identifier("3d-render"));
+        // R7RS peculiar identifiers: a leading sign needs a sign-subsequent after it.
+        assert!(is_scheme_identifier("-foo"));
+        assert!(is_scheme_identifier("-"));
+        assert!(!is_scheme_identifier("-3d"));
+        assert!(!is_scheme_identifier(""));
+        assert!(!is_scheme_identifier("has space"));
+        assert!(!is_scheme_identifier("bad(paren"));
+
+        assert!(is_elisp_symbol("ikigai-fn-toUpper"));
+        assert!(is_elisp_symbol("ikigai-3d-render"), "the prefix saves it");
+        assert!(!is_elisp_symbol("3d-render"));
+        assert!(!is_elisp_symbol(""));
+        assert!(!is_elisp_symbol("ikigai-ev(il)"));
+        assert!(!is_elisp_symbol("?char-literal"));
+    }
+
+    /// A name the target grammar refuses is SKIPPED, with the reason and the call that
+    /// still reaches the resource — never emitted, never silently dropped. And the two
+    /// faces do not agree, which is the point of certifying each in its own grammar:
+    /// `3d-render` is a number to Steel and `ikigai-3d-render` is a perfectly good elisp
+    /// symbol, so the same endpoint is refused by one face and served by the other.
+    #[test]
+    fn a_name_its_grammar_refuses_is_skipped_with_a_note() {
+        let targets = vec![
+            AliasTarget {
+                iri: "urn:3d:render".to_string(),
+                summary: String::new(),
+                actions: vec![("Source".to_string(), vec![])],
+            },
+            AliasTarget {
+                iri: "urn:iki:fn:toUpper".to_string(),
+                summary: String::new(),
+                actions: vec![("Source".to_string(), vec!["in".to_string()])],
+            },
+        ];
+        let scheme = aliases_scheme(&targets, "");
+        assert!(
+            scheme.contains(";; SKIPPED urn:3d:render (Source)"),
+            "{scheme}"
+        );
+        assert!(
+            scheme.contains("Still reachable as (source \"urn:3d:render\" …)"),
+            "the shortcut is lost, the resource is not: {scheme}"
+        );
+        assert!(!scheme.contains("(define (3d-render"), "{scheme}");
+        // The healthy alias beside it is unaffected — one refusal is not a cliff.
+        assert!(
+            scheme.contains("(define (fn-toUpper in . rest)"),
+            "{scheme}"
+        );
+
+        let elisp = aliases_elisp(&targets, "");
+        assert!(
+            elisp.contains("(defun ikigai-3d-render "),
+            "elisp's grammar accepts what Steel's refuses: {elisp}"
+        );
+    }
+
+    /// The same non-injectivity the MCP tool-name projection carries: two DIFFERENT IRIs
+    /// arriving at one Scheme name is a silent last-wins `define`. The module note already
+    /// argued it cannot happen because the catalog advertises only canonical names — an
+    /// argument about a different component, which is exactly the kind that stops being
+    /// true without anyone editing this file. So it is checked here instead of asserted.
+    #[test]
+    fn two_iris_projecting_to_one_name_do_not_silently_redefine() {
+        let targets = vec![
+            AliasTarget {
+                iri: "urn:demo:a:b".to_string(),
+                summary: String::new(),
+                actions: vec![("Source".to_string(), vec![])],
+            },
+            AliasTarget {
+                iri: "urn:demo:a.b".to_string(),
+                summary: String::new(),
+                actions: vec![("Source".to_string(), vec![])],
+            },
+        ];
+        for out in [aliases_scheme(&targets, ""), aliases_elisp(&targets, "")] {
+            assert!(out.contains("already defined above"), "{out}");
+            assert_eq!(
+                out.matches("(define (demo-a-b").count()
+                    + out.matches("(defun ikigai-demo-a-b ").count(),
+                1,
+                "exactly one definition survives, and the loss is STATED: {out}"
+            );
+        }
+    }
+
+    /// The standing guarantee, checked over the whole emitted file rather than one name:
+    /// every definition and every binder the generator writes reads back as an identifier
+    /// in the grammar of the face that will read it.
+    #[test]
+    fn every_name_in_a_generated_file_reads_back() {
+        let targets = vec![
+            AliasTarget {
+                iri: "urn:iki:fn:toUpper".to_string(),
+                summary: "Upper-cases.".to_string(),
+                actions: vec![("Source".to_string(), vec!["in".to_string()])],
+            },
+            AliasTarget {
+                iri: "urn:iki:fn:conditional".to_string(),
+                summary: String::new(),
+                actions: vec![("Source".to_string(), vec!["if".to_string()])],
+            },
+            AliasTarget {
+                iri: "urn:demo:ev(il) \"x\";".to_string(),
+                summary: String::new(),
+                actions: vec![("Sink".to_string(), vec!["a b(c)".to_string()])],
+            },
+            AliasTarget {
+                iri: "urn:3d:render".to_string(),
+                summary: String::new(),
+                actions: vec![("Source".to_string(), vec![])],
+            },
+            AliasTarget {
+                iri: "urn:".to_string(),
+                summary: String::new(),
+                actions: vec![("Source".to_string(), vec![])],
+            },
+        ];
+        for name in defined_names(&aliases_scheme(&targets, ""), "(define (") {
+            assert!(
+                is_scheme_identifier(&name),
+                "{name:?} is not readable Steel"
+            );
+        }
+        for name in defined_names(&aliases_elisp(&targets, ""), "(defun ") {
+            assert!(
+                is_elisp_symbol(&name),
+                "{name:?} is not a readable elisp symbol"
+            );
+        }
+    }
+
+    /// ★ THE FIFTH PROJECTION — found by the Steel test below, not by design, and not
+    /// listed in the brief at all.
+    ///
+    /// The four projections everyone counted are NAMES. But the IRI and the wire argument
+    /// names are also interpolated into the generated body, as STRING LITERALS, and
+    /// nothing escaped them: a `"` in the IRI closed the string and everything after it
+    /// was read as code — with a correctly sanitized function name three tokens earlier.
+    /// That is precisely why a whitelist over names could never have been the whole fix.
+    ///
+    /// The elisp face has no reader available here (Emacs is not a CI dependency), so it
+    /// is pinned by assertion where Scheme is pinned by Steel — stated plainly because it
+    /// is the weaker half.
+    #[test]
+    fn an_iri_reaching_a_string_literal_is_escaped_in_both_faces() {
+        let targets = vec![AliasTarget {
+            iri: "urn:demo:a\"b\\c".to_string(),
+            summary: "Says \"hi\".".to_string(),
+            actions: vec![("Source".to_string(), vec!["a\"b".to_string()])],
+        }];
+        for out in [aliases_scheme(&targets, ""), aliases_elisp(&targets, "")] {
+            assert!(
+                out.contains(r#""urn:demo:a\"b\\c""#),
+                "the IRI must survive as data, not as a terminator: {out}"
+            );
+            assert!(
+                out.contains(r#""a\"b""#),
+                "the wire argument name too: {out}"
+            );
+            // The wire names are unchanged as VALUES — escaping is presentation, not a
+            // rename; the endpoint still receives `a"b`.
+            assert!(!out.contains(r#""a-b""#), "{out}");
+        }
+        assert!(aliases_elisp(&targets, "").contains(r#""Says \"hi\".""#));
+    }
+
+    /// A verb is not a name projection at all, and the elisp face emits it as a quoted
+    /// SYMBOL, where escaping would not even be the right tool. It arrives as an `ik:verb`
+    /// literal from the manifold — over the wire, for a mounted peer — so it is checked
+    /// against the kernel's verbs rather than sanitized.
+    #[test]
+    fn a_verb_the_kernel_does_not_have_is_refused_not_escaped() {
+        let targets = vec![AliasTarget {
+            iri: "urn:demo:x".to_string(),
+            summary: String::new(),
+            actions: vec![("Source\") (evil".to_string(), vec![])],
+        }];
+        for out in [aliases_scheme(&targets, ""), aliases_elisp(&targets, "")] {
+            assert!(out.contains("is not a kernel verb"), "{out}");
+            // Nothing executable is written. The refused verb does appear in the skip
+            // note, where it is inert: `lisp_comment` guarantees it cannot leave the
+            // `;;` line, which is the whole reason a comment is a safe place to name it.
+            assert!(!out.contains("(define ("), "{out}");
+            assert!(!out.contains("(defun "), "{out}");
+        }
+    }
+
+    /// ★★★ The check that is not circular: hand the generated prelude to STEEL and let
+    /// its reader be the judge. Every other test here asks our own validator whether our
+    /// own generator was right, which is one opinion stated twice.
+    ///
+    /// The negative control is the load-bearing half — without it this test would pass
+    /// just as happily against a generator that emitted nothing at all, or against a
+    /// Steel that accepted anything. So it also proves the name the OLD blacklist would
+    /// have produced really does fail to parse.
+    #[test]
+    fn steel_itself_reads_back_a_prelude_generated_from_hostile_iris() {
+        let eval = |src: String| {
+            let kernel = Kernel::new(Arc::new(ikigai_lisp::space()));
+            let request = Request::new(
+                Verb::Source,
+                Iri::parse("urn:lisp:eval").expect("valid IRI"),
+            )
+            .with_arg("in", ArgRef::Inline(src.into_bytes()));
+            block_on(kernel.issue(request, &Capability::root()))
+        };
+
+        // NEGATIVE CONTROL: exactly what the blacklist used to emit for an IRI carrying
+        // parentheses — the reader must reject it, or this test proves nothing.
+        assert!(
+            eval("(define (demo-ev(il) . rest) 1)".to_string()).is_err(),
+            "Steel accepted a broken defun; the positive case below means nothing"
+        );
+
+        let targets = vec![
+            AliasTarget {
+                iri: "urn:demo:ev(il) \"x\";".to_string(),
+                summary: "Hostile.".to_string(),
+                actions: vec![("Sink".to_string(), vec!["a b(c)".to_string()])],
+            },
+            AliasTarget {
+                iri: "urn:iki:fn:conditional".to_string(),
+                summary: String::new(),
+                actions: vec![("Source".to_string(), vec!["if".to_string()])],
+            },
+            AliasTarget {
+                iri: "urn:3d:render".to_string(),
+                summary: String::new(),
+                actions: vec![("Source".to_string(), vec![])],
+            },
+            AliasTarget {
+                iri: "urn:if".to_string(),
+                summary: String::new(),
+                actions: vec![("Source".to_string(), vec![])],
+            },
+            AliasTarget {
+                iri: "urn:source".to_string(),
+                summary: String::new(),
+                actions: vec![("Source".to_string(), vec![])],
+            },
+        ];
+        let prelude = aliases_scheme(&targets, "");
+        eval(prelude.clone())
+            .unwrap_or_else(|e| panic!("Steel refused the prelude: {e:?}\n{prelude}"));
+        // And what it read is not an empty file: the one name Steel could not have taken
+        // was skipped, the other four — hostile IRI, reserved binder, reserved definition,
+        // prelude-shadowing definition — were defined and read back fine.
+        assert_eq!(prelude.matches("(define (").count(), 4, "{prelude}");
+        assert_eq!(prelude.matches(";; SKIPPED").count(), 1, "{prelude}");
+        // The escaping is real and not an artifact of the assertion: the quote inside the
+        // IRI survives as data, inside the string, not as a terminator.
+        assert!(prelude.contains(r#""urn:demo:ev(il) \"x\";""#), "{prelude}");
+    }
+
+    /// Pull every defined name and binder out of a generated file — the definition head is
+    /// scanned, not the generator's intent.
+    fn defined_names(source: &str, opener: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        for line in source.lines() {
+            let Some(head) = line.strip_prefix(opener) else {
+                continue;
+            };
+            for token in head
+                .split_whitespace()
+                .map(|t| t.trim_matches(|c| c == '(' || c == ')'))
+                .take_while(|t| *t != "." && *t != "&rest")
+            {
+                names.push(token.to_string());
+            }
+        }
+        assert!(!names.is_empty(), "nothing was scanned");
+        names
     }
 
     /// ★ The `urn:iki:` consolidation must be INVISIBLE to the prelude.

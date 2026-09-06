@@ -80,7 +80,17 @@ fn tools_list(kernel: &Kernel, capability: &Capability, filter: &ToolFilter) -> 
     let mut groups: std::collections::BTreeMap<String, Vec<ikigai_core::ActionMatch>> =
         std::collections::BTreeMap::new();
     for m in kernel.select_actions(&query) {
-        let name = crate::tool_name(&m.id, m.verb);
+        // A name this projection cannot certify is not offered. Silence would be the
+        // wrong answer twice over — the tool would be missing with no reason given, and
+        // an over-long name reaching a client rejects the ENTIRE list, not the one tool
+        // — so the reason goes to stderr, which is the stdio server's log channel.
+        let name = match crate::checked_tool_name(&m.id, m.verb) {
+            Ok(name) => name,
+            Err(reason) => {
+                eprintln!("ikigai-mcp: not projected as a tool — {reason}");
+                continue;
+            }
+        };
         if !groups.contains_key(&name) {
             order.push(name.clone());
         }
@@ -92,6 +102,22 @@ fn tools_list(kernel: &Kernel, capability: &Capability, filter: &ToolFilter) -> 
             continue;
         }
         let rows = &groups[&name];
+        // ★ The collapse above is a collapse of ONE endpoint bound many ways. Two
+        // DIFFERENT ids landing on one name is a different thing entirely: the name is
+        // the identity an MCP client calls by, so serving it would route by selection
+        // precedence rather than by what the caller asked for. Refuse instead — an
+        // ambiguous name is not a usable tool, and a silent merge is the one outcome a
+        // caller cannot detect. See [`crate::distinct_ids`].
+        let ids = crate::distinct_ids(rows.iter().map(|m| m.id.as_str()));
+        if ids.len() > 1 {
+            eprintln!(
+                "ikigai-mcp: `{name}` is claimed by {} endpoint ids that differ only in \
+                 punctuation ({}) — not projected; rename one of them",
+                ids.len(),
+                ids.join(", ")
+            );
+            continue;
+        }
         // `endpoint` may be an exact IRI or a URI-template pattern
         // (`urn:demo:echo/{message}`) — `describe_pattern` covers both, so
         // template-bound endpoints project as tools too.
@@ -130,6 +156,15 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
     let Some((id, verb)) = parse_tool_name(name) else {
         return tool_error(format!("not a tool name: {name:?}"));
     };
+    // Callable and listable must be the same set: `tools/list` refuses to project a name
+    // it cannot certify, so `tools/call` refuses to route one. Without this, an over-long
+    // name would fall through to the "not in the manifold" branch below and blame a
+    // missing endpoint for what is a projection limit.
+    if !crate::is_tool_name(name) {
+        return tool_error(format!(
+            "`{name}` is not a projectable tool name — it is never listed, so it cannot be called"
+        ));
+    }
 
     // Re-select under the grant: the tool must still be an allowed action, and
     // this yields its resolvable endpoint IRI + catalog action IRI.
@@ -177,6 +212,20 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
                  (a mounted peer may be unreachable, or the tool list is stale)"
             )
         });
+    }
+
+    // The same ambiguity `tools/list` refuses to project, refused again on the way in —
+    // both sides compute it from the rows, so a name that is not offered is not routed
+    // either. A loud error here is strictly better than a silent pick by precedence: the
+    // caller named a tool, and two endpoints answer to that name.
+    let ids = crate::distinct_ids(rows.iter().map(|m| m.id.as_str()));
+    if ids.len() > 1 {
+        return tool_error(format!(
+            "`{name}` is ambiguous — {} endpoint ids project to it ({}); it is not offered \
+             in tools/list and cannot be routed. Rename one of them.",
+            ids.len(),
+            ids.join(", ")
+        ));
     }
 
     // Exact IRI or URI-template pattern alike — the contract comes back either
@@ -379,6 +428,61 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 0);
+    }
+
+    /// ★★ The tool name is an IDENTITY KEY and `sanitize_id` is LOSSY. One endpoint bound
+    /// many ways collapses to one tool on purpose; two DIFFERENT endpoints whose ids
+    /// differ only in punctuation collapse the same way and must not — the caller named a
+    /// tool and selection precedence would decide which endpoint it reached.
+    ///
+    /// Refusing costs both endpoints their MCP face, which is the right side to fail on:
+    /// an ambiguous name is not a usable tool, the operator is told exactly which two ids
+    /// to rename, and every other face of the kernel still reaches them. A silent merge is
+    /// the one outcome the caller cannot detect.
+    #[test]
+    fn two_endpoints_colliding_on_one_tool_name_are_refused_by_both_sides() {
+        let ep = |id: &'static str| {
+            FnEndpoint::new(id, |_inv| {
+                Ok(Representation::new(ReprType::new("text/plain"), Vec::new()))
+            })
+            .with_description(Description::new(id).verb(Verb::Source))
+        };
+        // `llm:config` and `llm.config` both sanitize to `llm_config`.
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:demo:one"), ep("llm:config"))
+            .bind(Exact::new("urn:demo:two"), ep("llm.config"));
+        let k = Kernel::new(Arc::new(space));
+        let cap = Capability::root();
+
+        let resp = handle(
+            &k,
+            &cap,
+            &ToolFilter::default(),
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .unwrap();
+        assert!(
+            resp["result"]["tools"].as_array().unwrap().is_empty(),
+            "an ambiguous name is not offered: {resp}"
+        );
+
+        // And the two sides agree: what is not listed is not routed either, with the
+        // reason and both ids — never a pick by precedence.
+        let resp = handle(
+            &k,
+            &cap,
+            &ToolFilter::default(),
+            &json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+                    "params":{"name":"llm_config__source","arguments":{}}}),
+        )
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true, "{resp}");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("ambiguous"), "{text}");
+        assert!(
+            text.contains("llm.config") && text.contains("llm:config"),
+            "{text}"
+        );
     }
 
     /// A federated kernel lists a mounted namespace twice: under `--override`/
