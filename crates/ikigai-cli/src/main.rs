@@ -2545,7 +2545,7 @@ mod mount_cert_tests {
             std::env::temp_dir().join(format!("ikigai-prefer-list-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let kernel = Kernel::new(std::sync::Arc::new(
-            EndpointSpace::new().bind(Exact::new("urn:fn:toUpper"), builtins::to_upper()),
+            EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),
         ));
         let served = path.clone();
         std::thread::spawn(move || {
@@ -2559,7 +2559,7 @@ mod mount_cert_tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         let mount = Mount {
-            prefix: "urn:fn:".to_string(),
+            prefix: "urn:test:".to_string(),
             target: path.display().to_string(),
             certs: Certs::default(),
             kind: ikigai_embedded::MountKind::Prefer,

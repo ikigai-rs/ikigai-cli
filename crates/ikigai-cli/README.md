@@ -15,7 +15,7 @@ cargo install ikigai-cli            # installs the `ikigai` binary
 
 ikigai                              # full-screen TUI REPL on a terminal
 ikigai --plain                      # line REPL (also used automatically when piped)
-ikigai -c 'source urn:fn:toUpper hi'  # run a command and exit (repeatable; composes in a shell)
+ikigai -c 'source urn:iki:fn:toUpper hi'  # run a command and exit (repeatable; composes in a shell)
 ```
 
 ## Transports

@@ -133,21 +133,21 @@ quoting:
   IRI or input; \\\" is a literal quote and \\\\ a literal backslash.
 
 try:
-  source urn:fn:toUpper resource-oriented computing
+  source urn:iki:fn:toUpper resource-oriented computing
   source urn:demo:echo/hello
   source urn:demo:greet greeting=Hello name=World
   source urn:demo:greet Hello name=World
-  source urn:fn:toUpper hello | urn:fn:toUpper
-  source urn:fn:toUpper \"a | b\"
-  source urn:demo:split \"a,b,c\" .. urn:fn:toUpper
-  source urn:demo:split \"a,b,c\" | ( urn:fn:toUpper ; urn:fn:reverseList )
+  source urn:iki:fn:toUpper hello | urn:iki:fn:toUpper
+  source urn:iki:fn:toUpper \"a | b\"
+  source urn:demo:split \"a,b,c\" .. urn:iki:fn:toUpper
+  source urn:demo:split \"a,b,c\" | ( urn:iki:fn:toUpper ; urn:iki:fn:reverseList )
   sink urn:file:notes.txt remember the milk
-  source urn:fn:toUpper hello | sink urn:file:shout.txt
+  source urn:iki:fn:toUpper hello | sink urn:file:shout.txt
   source urn:file:notes.txt
   (+ 1 2)
-  (source \"urn:fn:toUpper\" \"hi\")
+  (source \"urn:iki:fn:toUpper\" \"hi\")
   cap read-only ; sink urn:file:notes.txt nope   (write now refused)
-  describe urn:fn:toUpper text/turtle";
+  describe urn:iki:fn:toUpper text/turtle";
 
 /// One evaluated request: the line the user typed, what came back, and how the
 /// kernel's cache served it.
@@ -1294,7 +1294,7 @@ impl Engine {
     /// tree reflects what truly happened: a plain resource is a single node, while a
     /// `compose` shows its `$a{…}` markers as the branches it fanned out — on
     /// distinct workers under `pool:N`, the same thread under the single-threaded
-    /// default. Trace `urn:fn:compose src=<shape>` to see the fan-out, not the bare
+    /// default. Trace `urn:iki:fn:compose src=<shape>` to see the fan-out, not the bare
     /// shape (sourcing the shape itself really is one resolution).
     async fn run_trace(&self, spec: &str) -> Result<String, String> {
         let pipeline = parse_spec(spec)?;
@@ -2158,10 +2158,19 @@ mod tests {
         }
     }
 
+    /// ★ The fixture names here are `urn:test:*`, deliberately, and should stay that way.
+    ///
+    /// They used to be `urn:fn:toUpper` / `urn:fn:reverseList`, which was a borrowed name:
+    /// this crate has no `ikigai-fn` dependency (not even a dev-dependency) and never
+    /// resolves fn's endpoints — every one of these binds `ikigai_core::builtins` and
+    /// exists to exercise the GRAMMAR (pipes, forks, maps, quoting, cache identity), for
+    /// which any name does. Wearing another namespace's name made them look like a
+    /// contract with `ikigai-fn`, so they had to be re-read one by one when that namespace
+    /// moved to `urn:iki:fn:`. Under `urn:test:` a rename over there cannot reach them.
     fn builtin_engine() -> Engine {
         let echo = UriTemplate::parse("urn:demo:echo/{message}").expect("valid template");
         let space = EndpointSpace::new()
-            .bind(Exact::new("urn:fn:toUpper"), builtins::to_upper())
+            .bind(Exact::new("urn:test:upper"), builtins::to_upper())
             .bind(echo, builtins::echo());
         Engine::new(Kernel::with_meta_renderer(
             Arc::new(space),
@@ -2242,8 +2251,8 @@ mod tests {
             Ok(Representation::new(ReprType::new("text/plain"), b"a\nb".to_vec()).cacheable())
         });
         let space = EndpointSpace::new()
-            .bind(Exact::new("urn:fn:toUpper"), builtins::to_upper())
-            .bind(Exact::new("urn:fn:reverseList"), builtins::reverse_list())
+            .bind(Exact::new("urn:test:upper"), builtins::to_upper())
+            .bind(Exact::new("urn:test:reverse"), builtins::reverse_list())
             .bind(Exact::new("urn:test:list"), list);
         Engine::new(Kernel::with_meta_renderer(
             Arc::new(space),
@@ -2256,8 +2265,7 @@ mod tests {
     fn fork_over_a_spawner_resolves_each_branch() {
         // `( toUpper ; reverseList )` fed "a\nb" → "A\nB" then "b\na", joined.
         let out = output(
-            parallel_engine()
-                .eval("source urn:test:list | ( urn:fn:toUpper ; urn:fn:reverseList )"),
+            parallel_engine().eval("source urn:test:list | ( urn:test:upper ; urn:test:reverse )"),
         )
         .unwrap();
         assert_eq!(out, "A\nB\nb\na");
@@ -2266,7 +2274,7 @@ mod tests {
     #[test]
     fn map_over_a_spawner_resolves_each_item() {
         // `.. toUpper` over the items a, b → A, B.
-        let out = output(parallel_engine().eval("source urn:test:list .. urn:fn:toUpper")).unwrap();
+        let out = output(parallel_engine().eval("source urn:test:list .. urn:test:upper")).unwrap();
         assert_eq!(out, "A\nB");
     }
 
@@ -2704,13 +2712,13 @@ mod tests {
     #[test]
     fn cache_reports_computed_then_cached() {
         let engine = builtin_engine();
-        let first = entry(engine.eval("source urn:fn:toUpper hi"));
+        let first = entry(engine.eval("source urn:test:upper hi"));
         assert_eq!(first.cache.label().as_deref(), Some("computed"));
         // Same request again: served from the cache without recomputing.
-        let second = entry(engine.eval("source urn:fn:toUpper hi"));
+        let second = entry(engine.eval("source urn:test:upper hi"));
         assert_eq!(second.cache.label().as_deref(), Some("cached"));
         // A different input is a fresh computation.
-        let other = entry(engine.eval("source urn:fn:toUpper bye"));
+        let other = entry(engine.eval("source urn:test:upper bye"));
         assert_eq!(other.cache.label().as_deref(), Some("computed"));
     }
 
@@ -2796,7 +2804,7 @@ mod tests {
                 .input(ArgSpec::new("content").summary("the body")),
         );
         let space = EndpointSpace::new()
-            .bind(Exact::new("urn:fn:toUpper"), builtins::to_upper())
+            .bind(Exact::new("urn:test:upper"), builtins::to_upper())
             .bind(Exact::new("urn:test:write"), endpoint);
         Engine::new(Kernel::with_meta_renderer(
             Arc::new(space),
@@ -2811,7 +2819,7 @@ mod tests {
         // a `source` of the bare IRI `sink` → "No scheme found").
         let engine = pipe_sink_engine();
         assert_eq!(
-            output(engine.eval("source urn:fn:toUpper hello | sink urn:test:write")).unwrap(),
+            output(engine.eval("source urn:test:upper hello | sink urn:test:write")).unwrap(),
             "Sink url= content=HELLO"
         );
     }
@@ -2821,7 +2829,7 @@ mod tests {
         // Leading `key=value` for a declared arg is named; the pipe still fills content.
         let engine = pipe_sink_engine();
         assert_eq!(
-            output(engine.eval("source urn:fn:toUpper hi | sink urn:test:write url=https://h/p"))
+            output(engine.eval("source urn:test:upper hi | sink urn:test:write url=https://h/p"))
                 .unwrap(),
             "Sink url=https://h/p content=HI"
         );
@@ -2833,7 +2841,7 @@ mod tests {
         // nowhere to go — that's a usage error, not silent content.
         let engine = pipe_sink_engine();
         let err =
-            output(engine.eval("source urn:fn:toUpper hi | sink urn:test:write junk")).unwrap_err();
+            output(engine.eval("source urn:test:upper hi | sink urn:test:write junk")).unwrap_err();
         assert!(err.contains("takes its content from the pipe"), "{err}");
     }
 
@@ -2878,7 +2886,7 @@ mod tests {
             .bind(Exact::new("urn:test:pdf"), pdf)
             .bind(Exact::new("urn:test:digest"), digest)
             .bind(Exact::new("urn:test:store"), store)
-            .bind(Exact::new("urn:fn:toUpper"), builtins::to_upper());
+            .bind(Exact::new("urn:test:upper"), builtins::to_upper());
         Engine::new(Kernel::with_meta_renderer(
             Arc::new(space),
             Arc::new(JsonRenderer),
@@ -2921,7 +2929,7 @@ mod tests {
         // (it used to decode each branch), newline-joining them for the next stage.
         let out =
             output(binary_engine().eval(
-                "source urn:fn:toUpper hi | ( urn:test:pdf ; urn:test:pdf ) | urn:test:digest",
+                "source urn:test:upper hi | ( urn:test:pdf ; urn:test:pdf ) | urn:test:digest",
             ))
             .unwrap();
         assert_eq!(out, format!("{} bytes, intact=false", BINARY.len() * 2 + 1));
@@ -2932,7 +2940,7 @@ mod tests {
         // `..` splits on newlines — inherently textual — so a binary upstream is a
         // clear error naming the operator, not a bare utf-8 decode failure.
         let err =
-            output(binary_engine().eval("source urn:test:pdf .. urn:fn:toUpper")).unwrap_err();
+            output(binary_engine().eval("source urn:test:pdf .. urn:test:upper")).unwrap_err();
         assert!(err.contains("`..`"), "{err}");
         assert!(err.contains("not UTF-8"), "{err}");
     }
@@ -3059,8 +3067,8 @@ mod tests {
                 notes: Vec::new(),
             };
         let events = vec![
-            ev("urn:fn:toUpper", "ikigai-sched-0", 4, Some(3), true), // grandchild, out of order
-            ev("urn:fn:compose", "main", 0, None, false),
+            ev("urn:test:upper", "ikigai-sched-0", 4, Some(3), true), // grandchild, out of order
+            ev("urn:test:compose", "main", 0, None, false),
             ev("urn:demo:wrap", "ikigai-sched-1", 1, Some(0), false),
             ev("urn:demo:greet", "ikigai-sched-2", 2, Some(0), false),
             ev("urn:data:about", "ikigai-sched-0", 3, Some(0), false),
@@ -3070,7 +3078,7 @@ mod tests {
         render_trace_tree(&events, &[], false, &repr, &mut out);
 
         // Root first, carrying the assembled result and its worker/timing.
-        assert!(out[0].contains("urn:fn:compose"), "{out:#?}");
+        assert!(out[0].contains("urn:test:compose"), "{out:#?}");
         assert!(
             out[0].contains("· main ·") && out[0].contains("→ 9b"),
             "{out:#?}"
@@ -3083,7 +3091,7 @@ mod tests {
         );
         // The grandchild nests one level deeper under `about` and shows as a cache hit.
         assert!(
-            out[4].starts_with("   └─ urn:fn:toUpper") && out[4].contains("cached"),
+            out[4].starts_with("   └─ urn:test:upper") && out[4].contains("cached"),
             "grandchild indented under about: {out:#?}"
         );
     }
@@ -3270,22 +3278,22 @@ mod tests {
         let engine = builtin_engine();
         // Not cached — and probing must not resolve/cache the target itself.
         assert_eq!(
-            output(engine.eval("cache urn:fn:toUpper hi")).unwrap(),
+            output(engine.eval("cache urn:test:upper hi")).unwrap(),
             "not cached"
         );
         assert_eq!(
-            output(engine.eval("cache urn:fn:toUpper hi")).unwrap(),
+            output(engine.eval("cache urn:test:upper hi")).unwrap(),
             "not cached"
         );
         // After resolving, the same request is a hit.
-        output(engine.eval("source urn:fn:toUpper hi")).unwrap();
+        output(engine.eval("source urn:test:upper hi")).unwrap();
         assert_eq!(
-            output(engine.eval("cache urn:fn:toUpper hi")).unwrap(),
+            output(engine.eval("cache urn:test:upper hi")).unwrap(),
             "cached"
         );
         // A different argument identity is still a miss.
         assert_eq!(
-            output(engine.eval("cache urn:fn:toUpper bye")).unwrap(),
+            output(engine.eval("cache urn:test:upper bye")).unwrap(),
             "not cached"
         );
     }
@@ -3293,7 +3301,7 @@ mod tests {
     #[test]
     fn cache_command_rejects_a_pipeline() {
         let err =
-            output(builtin_engine().eval("cache urn:fn:toUpper hi | urn:fn:toUpper")).unwrap_err();
+            output(builtin_engine().eval("cache urn:test:upper hi | urn:test:upper")).unwrap_err();
         assert!(err.contains("single resource"), "got: {err}");
     }
 
@@ -3301,7 +3309,7 @@ mod tests {
     fn cache_command_carries_no_cache_tag() {
         // The probe is not a resolution, so it reports no cache outcome of its own.
         assert_eq!(
-            entry(builtin_engine().eval("cache urn:fn:toUpper hi"))
+            entry(builtin_engine().eval("cache urn:test:upper hi"))
                 .cache
                 .label(),
             None
@@ -3317,20 +3325,20 @@ mod tests {
                 b"tick".to_vec(),
             ))
         });
-        let space = EndpointSpace::new().bind(Exact::new("urn:fn:now"), now);
+        let space = EndpointSpace::new().bind(Exact::new("urn:test:now"), now);
         let engine = Engine::new(Kernel::with_meta_renderer(
             Arc::new(space),
             Arc::new(JsonRenderer),
         ));
         assert_eq!(
-            entry(engine.eval("source urn:fn:now"))
+            entry(engine.eval("source urn:test:now"))
                 .cache
                 .label()
                 .as_deref(),
             Some("uncacheable")
         );
         assert_eq!(
-            entry(engine.eval("source urn:fn:now"))
+            entry(engine.eval("source urn:test:now"))
                 .cache
                 .label()
                 .as_deref(),
@@ -3341,9 +3349,9 @@ mod tests {
     #[test]
     fn cache_summarises_a_multi_stage_pipeline() {
         let engine = list_engine();
-        let first = entry(engine.eval("source urn:fn:toUpper hi | urn:fn:reverseList"));
+        let first = entry(engine.eval("source urn:test:upper hi | urn:test:reverse"));
         assert_eq!(first.cache.label().as_deref(), Some("2 computed"));
-        let second = entry(engine.eval("source urn:fn:toUpper hi | urn:fn:reverseList"));
+        let second = entry(engine.eval("source urn:test:upper hi | urn:test:reverse"));
         assert_eq!(second.cache.label().as_deref(), Some("2 cached"));
     }
 
@@ -3370,7 +3378,7 @@ mod tests {
         let space = EndpointSpace::new()
             .bind(Exact::new("urn:test:volatile"), volatile)
             .bind(Exact::new("urn:test:stable"), stable)
-            .bind(Exact::new("urn:fn:toUpper"), builtins::to_upper());
+            .bind(Exact::new("urn:test:upper"), builtins::to_upper());
         Engine::new(Kernel::with_meta_renderer(
             Arc::new(space),
             Arc::new(JsonRenderer),
@@ -3382,16 +3390,16 @@ mod tests {
         let engine = inheritance_engine();
         // Volatile upstream: the transform can't be cached either — both stages
         // recompute every run (the live-fetch case).
-        let v1 = entry(engine.eval("source urn:test:volatile | urn:fn:toUpper"));
+        let v1 = entry(engine.eval("source urn:test:volatile | urn:test:upper"));
         assert_eq!(v1.cache.label().as_deref(), Some("2 uncacheable"));
-        let v2 = entry(engine.eval("source urn:test:volatile | urn:fn:toUpper"));
+        let v2 = entry(engine.eval("source urn:test:volatile | urn:test:upper"));
         assert_eq!(v2.cache.label().as_deref(), Some("2 uncacheable"));
 
         // Stable upstream: the whole pipeline caches — computed once, then served
         // (the catalog case).
-        let s1 = entry(engine.eval("source urn:test:stable | urn:fn:toUpper"));
+        let s1 = entry(engine.eval("source urn:test:stable | urn:test:upper"));
         assert_eq!(s1.cache.label().as_deref(), Some("2 computed"));
-        let s2 = entry(engine.eval("source urn:test:stable | urn:fn:toUpper"));
+        let s2 = entry(engine.eval("source urn:test:stable | urn:test:upper"));
         assert_eq!(s2.cache.label().as_deref(), Some("2 cached"));
     }
 
@@ -3412,7 +3420,7 @@ mod tests {
     #[test]
     fn sources_an_inline_arg() {
         assert_eq!(
-            output(builtin_engine().eval("source urn:fn:toUpper hi")).unwrap(),
+            output(builtin_engine().eval("source urn:test:upper hi")).unwrap(),
             "HI"
         );
     }
@@ -3429,14 +3437,14 @@ mod tests {
             )
         });
         let space = EndpointSpace::new()
-            .bind(Exact::new("urn:fn:toUpper"), builtins::to_upper())
+            .bind(Exact::new("urn:test:upper"), builtins::to_upper())
             .bind(Exact::new("urn:test:wrap"), wrap);
         let engine = Engine::new(Kernel::with_meta_renderer(
             Arc::new(space),
             Arc::new(JsonRenderer),
         ));
         assert_eq!(
-            output(engine.eval("source urn:fn:toUpper hi | urn:test:wrap")).unwrap(),
+            output(engine.eval("source urn:test:upper hi | urn:test:wrap")).unwrap(),
             "[HI]"
         );
     }
@@ -3446,7 +3454,7 @@ mod tests {
         // Without quoting this would split into two stages; the quotes make
         // `a | b` a single literal input to toUpper.
         assert_eq!(
-            output(builtin_engine().eval("source urn:fn:toUpper \"a | b\"")).unwrap(),
+            output(builtin_engine().eval("source urn:test:upper \"a | b\"")).unwrap(),
             "A | B"
         );
     }
@@ -3455,14 +3463,14 @@ mod tests {
     fn quoted_input_preserves_internal_spacing() {
         // Bare words rejoin with single spaces; a quoted word keeps its own.
         assert_eq!(
-            output(builtin_engine().eval("source urn:fn:toUpper \"a   b\"")).unwrap(),
+            output(builtin_engine().eval("source urn:test:upper \"a   b\"")).unwrap(),
             "A   B"
         );
     }
 
     #[test]
     fn piped_stage_with_a_literal_input_is_an_error() {
-        let err = output(builtin_engine().eval("source urn:fn:toUpper hi | urn:fn:toUpper x"))
+        let err = output(builtin_engine().eval("source urn:test:upper hi | urn:test:upper x"))
             .unwrap_err();
         assert!(err.contains("from the pipe"), "got: {err}");
     }
@@ -3474,7 +3482,7 @@ mod tests {
         // collides with it (which used to raise "takes its input from the pipe").
         assert_eq!(
             output(
-                builtin_engine().eval("source urn:fn:toUpper hi | urn:fn:toUpper as=text/plain")
+                builtin_engine().eval("source urn:test:upper hi | urn:test:upper as=text/plain")
             )
             .unwrap(),
             "HI"
@@ -3483,7 +3491,7 @@ mod tests {
 
     #[test]
     fn a_stray_pipe_is_an_error() {
-        let err = output(builtin_engine().eval("source urn:fn:toUpper hi | | urn:fn:toUpper"))
+        let err = output(builtin_engine().eval("source urn:test:upper hi | | urn:test:upper"))
             .unwrap_err();
         assert!(err.contains("empty pipeline stage"), "got: {err}");
     }
@@ -3520,9 +3528,9 @@ mod tests {
     fn tokenize_splits_and_unquotes() {
         // The quoted span holds a literal pipe and collapses to one word.
         assert_eq!(
-            tokenize("urn:fn:toUpper \"a | b\" | urn:demo:wrap").unwrap(),
+            tokenize("urn:test:upper \"a | b\" | urn:demo:wrap").unwrap(),
             vec![
-                w("urn:fn:toUpper"),
+                w("urn:test:upper"),
                 w("a | b"),
                 Token::Pipe,
                 w("urn:demo:wrap"),
@@ -3546,14 +3554,14 @@ mod tests {
     #[test]
     fn tokenize_recognises_a_standalone_map_operator() {
         assert_eq!(
-            tokenize("urn:demo:split a | b .. urn:fn:toUpper").unwrap(),
+            tokenize("urn:demo:split a | b .. urn:test:upper").unwrap(),
             vec![
                 w("urn:demo:split"),
                 w("a"),
                 Token::Pipe,
                 w("b"),
                 Token::Map,
-                w("urn:fn:toUpper"),
+                w("urn:test:upper"),
             ]
         );
     }
@@ -3642,8 +3650,8 @@ mod tests {
     /// and `toUpper`, for exercising `..` map.
     fn list_engine() -> Engine {
         let space = EndpointSpace::new()
-            .bind(Exact::new("urn:fn:reverseList"), builtins::reverse_list())
-            .bind(Exact::new("urn:fn:toUpper"), builtins::to_upper());
+            .bind(Exact::new("urn:test:reverse"), builtins::reverse_list())
+            .bind(Exact::new("urn:test:upper"), builtins::to_upper());
         Engine::new(Kernel::with_meta_renderer(
             Arc::new(space),
             Arc::new(JsonRenderer),
@@ -3672,8 +3680,8 @@ mod tests {
         );
         let space = EndpointSpace::new()
             .bind(Exact::new("urn:demo:greet"), greet)
-            .bind(Exact::new("urn:fn:toUpper"), builtins::to_upper())
-            .bind(Exact::new("urn:fn:reverseList"), builtins::reverse_list());
+            .bind(Exact::new("urn:test:upper"), builtins::to_upper())
+            .bind(Exact::new("urn:test:reverse"), builtins::reverse_list());
         Engine::new(Kernel::with_meta_renderer(
             Arc::new(space),
             Arc::new(JsonRenderer),
@@ -3709,7 +3717,7 @@ mod tests {
     fn a_pipe_fills_the_one_unnamed_argument() {
         // `greeting` is named; the piped value lands in the remaining `name`.
         assert_eq!(
-            output(greet_engine().eval("source urn:fn:toUpper world | urn:demo:greet greeting=Hi"))
+            output(greet_engine().eval("source urn:test:upper world | urn:demo:greet greeting=Hi"))
                 .unwrap(),
             "Hi, WORLD"
         );
@@ -3719,7 +3727,7 @@ mod tests {
     fn map_threads_items_through_a_fixed_named_argument() {
         // `greeting` is pinned; `..` feeds each list item into the remaining `name`.
         let out = output(
-            greet_engine().eval("source urn:fn:reverseList \"a\nb\" .. urn:demo:greet greeting=Hi"),
+            greet_engine().eval("source urn:test:reverse \"a\nb\" .. urn:demo:greet greeting=Hi"),
         )
         .unwrap();
         assert_eq!(out, "Hi, b\nHi, a");
@@ -3729,7 +3737,7 @@ mod tests {
     fn equals_in_a_value_is_positional_when_the_key_is_not_declared() {
         // `a` is not a declared argument of toUpper, so `a=b` is positional input.
         assert_eq!(
-            output(greet_engine().eval("source urn:fn:toUpper a=b")).unwrap(),
+            output(greet_engine().eval("source urn:test:upper a=b")).unwrap(),
             "A=B"
         );
     }
@@ -3790,7 +3798,7 @@ mod tests {
     fn map_applies_the_next_stage_per_item() {
         // reverseList flips the three lines; `..` then uppercases each independently.
         let out =
-            output(list_engine().eval("source urn:fn:reverseList \"a\nb\nc\" .. urn:fn:toUpper"))
+            output(list_engine().eval("source urn:test:reverse \"a\nb\nc\" .. urn:test:upper"))
                 .unwrap();
         assert_eq!(out, "C\nB\nA");
     }
@@ -3800,7 +3808,7 @@ mod tests {
         // Whole-value pipe into reverseList, then map toUpper over its items.
         let out = output(
             list_engine()
-                .eval("source urn:fn:toUpper \"x\ny\" | urn:fn:reverseList .. urn:fn:toUpper"),
+                .eval("source urn:test:upper \"x\ny\" | urn:test:reverse .. urn:test:upper"),
         )
         .unwrap();
         assert_eq!(out, "Y\nX");
@@ -3811,21 +3819,21 @@ mod tests {
         // A blank line in the list (here the reversed middle of `a\n\nb`) must
         // reach the stage as an empty input, not be dropped into a no-argument
         // request that errors with "missing required argument".
-        let out = output(list_engine().eval("source urn:fn:toUpper \"a\n\nb\" .. urn:fn:toUpper"))
+        let out = output(list_engine().eval("source urn:test:upper \"a\n\nb\" .. urn:test:upper"))
             .unwrap();
         assert_eq!(out, "A\n\nB");
     }
 
     #[test]
     fn map_propagates_a_stage_error() {
-        let out = output(list_engine().eval("source urn:fn:toUpper \"a\nb\" .. urn:fn:nope"));
+        let out = output(list_engine().eval("source urn:test:upper \"a\nb\" .. urn:test:nope"));
         assert!(out.is_err());
     }
 
     #[test]
     fn map_stage_with_a_literal_input_is_an_error() {
         let err =
-            output(list_engine().eval("source urn:fn:toUpper hi .. urn:fn:toUpper x")).unwrap_err();
+            output(list_engine().eval("source urn:test:upper hi .. urn:test:upper x")).unwrap_err();
         assert!(err.contains("from the pipe"), "got: {err}");
     }
 
@@ -3835,7 +3843,7 @@ mod tests {
         // through; outputs join with a newline.
         let out = output(
             list_engine()
-                .eval("source urn:fn:toUpper \"x\ny\" | ( urn:fn:reverseList ; urn:fn:toUpper )"),
+                .eval("source urn:test:upper \"x\ny\" | ( urn:test:reverse ; urn:test:upper )"),
         )
         .unwrap();
         assert_eq!(out, "Y\nX\nX\nY");
@@ -3845,7 +3853,7 @@ mod tests {
     fn fork_branches_can_be_multi_stage_pipelines() {
         // First branch is a two-stage pipeline; second is a single stage.
         let out = output(list_engine().eval(
-            "source urn:fn:reverseList \"x\ny\nz\" | ( urn:fn:toUpper | urn:fn:reverseList ; urn:fn:toUpper )",
+            "source urn:test:reverse \"x\ny\nz\" | ( urn:test:upper | urn:test:reverse ; urn:test:upper )",
         ))
         .unwrap();
         assert_eq!(out, "X\nY\nZ\nZ\nY\nX");
@@ -3855,7 +3863,7 @@ mod tests {
     fn fork_at_the_top_level_runs_each_branch_with_its_own_literal() {
         // No incoming value, so each branch's first stage takes its own literal.
         let out =
-            output(list_engine().eval("source ( urn:fn:toUpper a ; urn:fn:toUpper b )")).unwrap();
+            output(list_engine().eval("source ( urn:test:upper a ; urn:test:upper b )")).unwrap();
         assert_eq!(out, "A\nB");
     }
 
@@ -3864,7 +3872,7 @@ mod tests {
         // reverseList → `b\na`; `..` runs the fork per item, each fanned to both.
         let out = output(
             list_engine()
-                .eval("source urn:fn:reverseList \"a\nb\" .. ( urn:fn:toUpper ; urn:fn:toUpper )"),
+                .eval("source urn:test:reverse \"a\nb\" .. ( urn:test:upper ; urn:test:upper )"),
         )
         .unwrap();
         assert_eq!(out, "B\nB\nA\nA");
@@ -3872,15 +3880,15 @@ mod tests {
 
     #[test]
     fn fork_propagates_a_branch_error() {
-        let out =
-            list_engine().eval("source urn:fn:toUpper \"a\nb\" | ( urn:fn:toUpper ; urn:fn:nope )");
+        let out = list_engine()
+            .eval("source urn:test:upper \"a\nb\" | ( urn:test:upper ; urn:test:nope )");
         assert!(output(out).is_err());
     }
 
     #[test]
     fn piped_fork_branch_with_a_literal_input_is_an_error() {
         let err = output(
-            list_engine().eval("source urn:fn:toUpper hi | ( urn:fn:toUpper x ; urn:fn:toUpper )"),
+            list_engine().eval("source urn:test:upper hi | ( urn:test:upper x ; urn:test:upper )"),
         )
         .unwrap_err();
         assert!(err.contains("from the pipe"), "got: {err}");
@@ -3888,12 +3896,12 @@ mod tests {
 
     #[test]
     fn pipeline_propagates_a_stage_error() {
-        assert!(output(builtin_engine().eval("source urn:fn:toUpper hi | urn:fn:nope")).is_err());
+        assert!(output(builtin_engine().eval("source urn:test:upper hi | urn:test:nope")).is_err());
     }
 
     #[test]
     fn pipeline_into_binding_only_endpoint_errors() {
-        let err = output(builtin_engine().eval("source urn:fn:toUpper hi | urn:demo:echo/x"))
+        let err = output(builtin_engine().eval("source urn:test:upper hi | urn:demo:echo/x"))
             .unwrap_err();
         assert!(err.contains("identifier"), "got: {err}");
     }
@@ -3901,7 +3909,7 @@ mod tests {
     #[test]
     fn lists_the_bound_resources() {
         let listing = output(builtin_engine().eval("list")).unwrap();
-        assert!(listing.contains("urn:fn:toUpper"));
+        assert!(listing.contains("urn:test:upper"));
         assert!(listing.contains("toUpper"));
         assert!(listing.contains("urn:demo:echo/{message}"));
         assert!(listing.contains("echo"));
@@ -3947,12 +3955,15 @@ mod tests {
                 .input(ArgSpec::new("text").summary("the text to shout"))
                 .output("text/plain"),
         );
-        let space = EndpointSpace::new().bind(Exact::new("urn:fn:shout"), shout);
+        let space = EndpointSpace::new().bind(Exact::new("urn:test:shout"), shout);
         let engine = Engine::new(Kernel::with_meta_renderer(
             Arc::new(space),
             Arc::new(JsonRenderer),
         ));
-        assert_eq!(output(engine.eval("source urn:fn:shout hi")).unwrap(), "HI");
+        assert_eq!(
+            output(engine.eval("source urn:test:shout hi")).unwrap(),
+            "HI"
+        );
     }
 
     #[test]
@@ -3962,7 +3973,7 @@ mod tests {
 
     #[test]
     fn unresolved_iri_is_an_error() {
-        assert!(output(builtin_engine().eval("source urn:fn:nope x")).is_err());
+        assert!(output(builtin_engine().eval("source urn:test:nope x")).is_err());
     }
 
     #[test]

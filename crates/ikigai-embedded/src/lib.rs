@@ -63,15 +63,15 @@ impl MetaRenderer for CliRenderer {
 
 /// `urn:data:page`: a demo *shape* for `compose`. A text template whose
 /// `$a{<iri>}` markers transclude other resources in this space; resolving
-/// `source urn:fn:compose src=urn:data:page` assembles the whole thing in one
+/// `source urn:iki:fn:compose src=urn:data:page` assembles the whole thing in one
 /// pull. The escaped `$$a{…}` shows a literal marker surviving expansion.
 fn page_impl(_inv: &Invocation<'_>) -> Result<Representation> {
     let body = "ikigai compose demo — one pull, recursively assembled\n\n  \
-        toUpper : $a{urn:fn:toUpper?in=\"resource oriented computing\"}\n  \
+        toUpper : $a{urn:iki:fn:toUpper?in=\"resource oriented computing\"}\n  \
         wrap    : $a{urn:demo:wrap?text=hello}\n  \
         greet   : $a{urn:demo:greet?greeting=Hi&name=World}\n  \
         nested  : $a{urn:data:about}\n\n\
-        literal marker (escaped, not expanded): $$a{urn:fn:toUpper?in=x}\n";
+        literal marker (escaped, not expanded): $$a{urn:iki:fn:toUpper?in=x}\n";
     Ok(Representation::new(
         ReprType::new("text/plain").with_param("charset", "utf-8"),
         body.as_bytes().to_vec(),
@@ -125,7 +125,7 @@ fn page() -> FnEndpoint {
 /// `$a{}` markers are sub-requests `compose` resolves and inlines —
 /// `urn:kernel:scheduler` (the host work backend + live task counts),
 /// `urn:kernel:cache` (what's cached), and `urn:time:jobs` (the time transport's
-/// timed jobs). So `source urn:fn:compose src=urn:data:control` is "a composite
+/// timed jobs). So `source urn:iki:fn:compose src=urn:data:control` is "a composite
 /// resource pulling three sub-requests," its cache validity folding all three — the
 /// text analog of the browser demo's Control page.
 fn control_impl(_inv: &Invocation<'_>) -> Result<Representation> {
@@ -156,7 +156,7 @@ fn control() -> FnEndpoint {
 /// transcludes another resource, so `compose` (and the `trace` tree) recurses.
 fn about_impl(_inv: &Invocation<'_>) -> Result<Representation> {
     let body = "a shape within a shape: \
-        $a{urn:fn:toUpper?in=\"composed within a composed shape\"}";
+        $a{urn:iki:fn:toUpper?in=\"composed within a composed shape\"}";
     Ok(Representation::new(
         ReprType::new("text/plain").with_param("charset", "utf-8"),
         body.as_bytes().to_vec(),
@@ -1346,6 +1346,9 @@ pub fn calendar_server_kernel() -> Kernel {
         Arc::new(calendar_server_space("Calendar (QUIC)")),
         Arc::new(CliRenderer),
     )
+    // Built over `base_space`, so it binds `urn:iki:fn:*` and a remote caller holding the
+    // old spelling needs the rewrite. See [`base_alias_table`].
+    .with_aliases(base_alias_table())
 }
 
 /// The wire-eval L1 posture: `urn:lisp:eval` behind the wall-clock [`Timeout`]
@@ -1554,6 +1557,7 @@ pub fn calendar_server_kernel_with_eval() -> Kernel {
         with_wire_eval(Arc::new(calendar_server_space("Calendar (QUIC)"))),
         Arc::new(CliRenderer),
     )
+    .with_aliases(base_alias_table())
 }
 
 /// [`kernel_for`] plus the governed wire-eval binding — the default served
@@ -1563,6 +1567,7 @@ pub fn kernel_for_with_eval(nature: &'static str) -> Kernel {
         with_wire_eval(Arc::new(served_space(nature))),
         Arc::new(CliRenderer),
     )
+    .with_aliases(base_alias_table())
 }
 
 /// Which optional faces a served kernel carries. Each is decided by the
@@ -1618,6 +1623,11 @@ pub fn served_kernel_with_mounts(
         composed
     };
     Kernel::with_meta_renderer(root, Arc::new(CliRenderer))
+        // ⚠ Same ordering caveat as `build_watched`: `with_aliases` wraps the ROOT and the
+        // mounts were composed into it above, so a `--prefer urn:fn:=…` mount sits INSIDE
+        // the alias and never sees a `urn:fn:` request again — the rewrite happens first.
+        // A served mount over this family must name `urn:iki:fn:`.
+        .with_aliases(base_alias_table())
 }
 
 /// The native HTTP transport backing the `urn:http*` endpoints: a blocking `ureq`
@@ -1711,7 +1721,7 @@ type DescribedEndpoint = (String, Vec<(String, Vec<String>)>);
 struct AliasTarget {
     /// The RESOLVABLE IRI — from the space entry, not the catalog. The catalog names
     /// endpoints by a skolem IRI (`urn:ikigai:endpoint:toUpper`), which is a description,
-    /// not an address; `urn:fn:toUpper` is what you can actually call.
+    /// not an address; `urn:iki:fn:toUpper` is what you can actually call.
     iri: String,
     summary: String,
     /// (verb, required inputs in declaration order).
@@ -1727,7 +1737,7 @@ const CAP_KERNEL_INSPECT: &str = "urn:cap:kernel:inspect";
 /// `urn:lisp:aliases` — the manifold projected as callable Lisp.
 ///
 /// Named verbs instead of URIs: `(fn-toUpper "hi")` rather than
-/// `source urn:fn:toUpper in=hi`. GENERATED, never hand-written — every endpoint already
+/// `source urn:iki:fn:toUpper in=hi`. GENERATED, never hand-written — every endpoint already
 /// declares its ArgSpecs, and the same projection that turns the manifold into MCP tools
 /// turns it into functions. So the alias surface cannot drift from what the server accepts
 /// (the property that makes a booking form build itself from `?description`), and a new
@@ -1739,7 +1749,7 @@ impl Endpoint for LispAliases {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         // THE MANIFOLD, not the raw catalog: `urn:kernel:actions` is already narrowed to
         // what THIS capability may invoke, already carries the RESOLVABLE IRI
-        // (`ik:endpoint <urn:fn:toUpper>`, not the skolem description IRI), and already
+        // (`ik:endpoint <urn:iki:fn:toUpper>`, not the skolem description IRI), and already
         // omits templates. So capability filtering is not a filter bolted on here — it is
         // the surface the kernel says you have. A scoped session gets a smaller prelude,
         // not a full one that fails at call time.
@@ -1795,7 +1805,7 @@ impl Endpoint for LispAliases {
                             .summary("which lisp to emit (default Scheme, for urn:lisp:eval)"),
                     )
                     .input(ArgSpec::new("prefix").optional().summary(
-                        "only endpoints whose IRI starts with this (e.g. `urn:fn:`), \
+                        "only endpoints whose IRI starts with this (e.g. `urn:iki:fn:`), \
                                  for a prelude scoped to one family",
                     ))
                     .requires(CAP_KERNEL_INSPECT),
@@ -1970,7 +1980,7 @@ fn catalog_descriptions(turtle: &str) -> std::collections::BTreeMap<String, Desc
 
 /// Scheme identifiers a generated parameter must not shadow.
 ///
-/// Two families, both of which produced real breakage: SYNTACTIC KEYWORDS — `urn:fn:conditional`
+/// Two families, both of which produced real breakage: SYNTACTIC KEYWORDS — `urn:iki:fn:conditional`
 /// declares an argument literally named `if`, and `(define (fn-conditional if …) …)` fails to
 /// parse — and the identifiers the generated BODY itself uses, which a parameter of the same
 /// name would shadow out from under it. The wire name is unaffected: only the binder is
@@ -2025,10 +2035,34 @@ fn safe_param(name: &str) -> String {
     }
 }
 
-/// `urn:fn:toUpper` + Source → `fn-toUpper`; a Sink gets the Scheme mutation `!`.
+/// `urn:iki:fn:toUpper` + Source → `fn-toUpper`; a Sink gets the Scheme mutation `!`.
+///
+/// ## ★ Why `urn:iki:` is stripped as well as `urn:`
+///
+/// The mechanical derivation would give `iki-fn-toUpper`. It does not, and the reason is
+/// not ergonomics (though `(fn-toUpper "hi")` is plainly better than
+/// `(iki-fn-toUpper "hi")`): it is that **`iki` is the new `urn`**. The consolidation moves
+/// all 98 namespaces under one prefix, so once it finishes `iki-` is on the front of every
+/// alias in the prelude and distinguishes nothing — the same reason `urn:` was already
+/// stripped.
+///
+/// The load-bearing half is what happens DURING the consolidation. A resource keeps its old
+/// IRI working through [`alias_table`]; a Scheme identifier has no such table. Deriving the
+/// alias from the un-stripped IRI would rename every verb in the prelude on the day its
+/// namespace migrates — `llm-ask` → `iki-llm-ask`, `repo-list` → `iki-repo-list` — 96 times,
+/// each one silently breaking every `.scm` that named it, with nothing to alias it back.
+/// Stripping makes the whole migration invisible to the prelude.
+///
+/// ⚠ The cost, stated: `urn:fn:toUpper` and `urn:iki:fn:toUpper` now collide on
+/// `fn-toUpper`, and two `define`s of one name means the last silently wins. They cannot
+/// meet here — the prelude is projected from `urn:kernel:actions`, and the catalog
+/// advertises only the CANONICAL name (core's alias decision 4), so a migrated namespace
+/// appears exactly once. That is a property of the catalog, not of this function, which is
+/// why it is written down.
 fn alias_name(iri: &str, verb: &str) -> String {
     let stem = iri
-        .strip_prefix("urn:")
+        .strip_prefix("urn:iki:")
+        .or_else(|| iri.strip_prefix("urn:"))
         .unwrap_or(iri)
         .replace(':', "-")
         .replace(['/', '.', ' '], "-");
@@ -2201,7 +2235,7 @@ fn safe_elisp_param(name: &str) -> String {
 
 fn first_line(text: &str) -> String {
     // ESCAPE transclusion markers. An endpoint's summary can contain one literally —
-    // `urn:fn:compose` documents itself with `$a{<iri>}` — and the moment that text lands
+    // `urn:iki:fn:compose` documents itself with `$a{<iri>}` — and the moment that text lands
     // in a generated comment, composing the prelude tries to expand the EXAMPLE inside its
     // own documentation ("bad IRI in marker `<iri>`"). `$$a{…}` is compose's literal form.
     escape_markers(text.lines().next().unwrap_or("").trim())
@@ -2832,7 +2866,7 @@ fn llm_annotation_facts() -> Vec<(String, String, String)> {
     facts
 }
 
-/// The `urn:fn:compose` shape behind the Jury runbook tab: one question, two
+/// The `urn:iki:fn:compose` shape behind the Jury runbook tab: one question, two
 /// `urn:llm:ask` markers — built against what's ACTUALLY installed. Sources
 /// `urn:llm:ollama:installed` with `supports=completion` (an embedder is often
 /// the smallest model installed, and a juror must be able to chat) and forks to
@@ -3029,7 +3063,7 @@ fn jury_shape() -> JuryShape {
     JuryShape
 }
 
-/// The friendly degraded branch for LLM demos: what `urn:fn:conditional` returns
+/// The friendly degraded branch for LLM demos: what `urn:iki:fn:conditional` returns
 /// when `urn:llm:ollama:up` says the model server is down.
 fn ollama_offline() -> FnEndpoint {
     const NOTE: &str = "\
@@ -3051,14 +3085,14 @@ then re-run this step — no restart needed, liveness is a live fact.
     })
 }
 
-/// The gracefully-degrading Jury: ONE compose marker invoking `urn:fn:conditional`
+/// The gracefully-degrading Jury: ONE compose marker invoking `urn:iki:fn:conditional`
 /// on the liveness resource. When Ollama is up the conditional returns the jury
 /// shape and compose recursively expands its two `urn:llm:ask` markers (the fork);
 /// when it's down the offline note is spliced in instead — the LLM branch is never
 /// invoked, so nothing errors. compose + conditional + up + ask, zero glue code.
 fn jury_gated_shape() -> FnEndpoint {
     const GATED: &str = "\
-$a{urn:fn:conditional?if=urn:llm:ollama:up&then=urn:demo:jury&else=urn:data:ollama-offline}";
+$a{urn:iki:fn:conditional?if=urn:llm:ollama:up&then=urn:demo:jury&else=urn:data:ollama-offline}";
     FnEndpoint::new("jury-gated-shape", |_inv: &Invocation<'_>| {
         Ok(Representation::new(
             ReprType::new("text/plain").with_param("charset", "utf-8"),
@@ -3069,20 +3103,20 @@ $a{urn:fn:conditional?if=urn:llm:ollama:up&then=urn:demo:jury&else=urn:data:olla
 
 /// A native-only runbook tab (like [`runbook_timer_demo`]): best-of-two-models as
 /// pure composition. Forks one question to two `urn:llm:ask` personas concurrently
-/// via `urn:fn:compose` fan-out, then pipes both candidates into a third `urn:llm:ask`
+/// via `urn:iki:fn:compose` fan-out, then pipes both candidates into a third `urn:llm:ask`
 /// that judges. Needs a local Ollama (LLM is mounted natively). Cross-frontend
 /// promotion into the shared runbook awaits the browser LLM face.
 fn runbook_jury_demo() -> FnEndpoint {
     FnEndpoint::new("runbook-jury", |_inv: &Invocation<'_>| {
         let json = serde_json::json!({
             "label": "Jury",
-            "intro": "Best-of-two, as pure composition. urn:demo:jury is a urn:fn:compose shape \
+            "intro": "Best-of-two, as pure composition. urn:demo:jury is a urn:iki:fn:compose shape \
                       with two urn:llm:ask markers — two personas of your local model. Sourcing \
                       it forks both concurrently (fan-out) and inlines both answers; pipe that \
                       into a third urn:llm:ask and it judges which is better. Watch the \
                       [N uncacheable] tag: the verdict depends on both upstream generations, so \
                       the cache-dependency graph propagates across compose AND the pipe. The \
-                      gated form degrades gracefully: urn:fn:conditional branches on the \
+                      gated form degrades gracefully: urn:iki:fn:conditional branches on the \
                       urn:llm:ollama:up liveness resource, so if Ollama is down you get a \
                       friendly note instead of an error.",
             "steps": [
@@ -3100,14 +3134,14 @@ fn runbook_jury_demo() -> FnEndpoint {
                 },
                 {
                     "label": "fork the question to two jurors (gracefully)",
-                    "cmd": "source urn:fn:compose src=urn:demo:jury-gated",
+                    "cmd": "source urn:iki:fn:compose src=urn:demo:jury-gated",
                     "note": "ONE marker: conditional branches on :up — Ollama up = the jury shape \
                              (built against the installed list, whose markers then fork), down = a \
                              friendly note. The LLM branch is never touched when down."
                 },
                 {
                     "label": "let a third model pick the winner",
-                    "cmd": "source urn:fn:compose src=urn:demo:jury | urn:llm:ask system=\"You are judging two candidate answers, A and B, to the question shown. Reply with the winner (A or B) and one short sentence why.\"",
+                    "cmd": "source urn:iki:fn:compose src=urn:demo:jury | urn:llm:ask system=\"You are judging two candidate answers, A and B, to the question shown. Reply with the winner (A or B) and one short sentence why.\"",
                     "note": "pipes both candidates into a judge; [2 uncacheable] = the verdict's two upstream deps (needs Ollama up)"
                 },
                 {
@@ -3142,16 +3176,67 @@ fn runbook_jury_demo() -> FnEndpoint {
     )
 }
 
+/// The rewrite rules for the namespaces **[`base_space`]** binds — so: every kernel this
+/// crate builds, served or embedded, because every space graph here is built over
+/// `base_space`. Readable at `urn:kernel:aliases`.
+///
+/// `ikigai-fn` 0.2.0 renamed the namespace it owns, `urn:fn:*` → `urn:iki:fn:*`
+/// (`toUpper`, `reverseList`, `compose`, `conditional`). The library moved atomically and
+/// the HOST carries the old spelling, which is what makes the migration incremental — the
+/// catalog advertises only the new name (so catalog-driven consumers migrate themselves),
+/// while anything still holding the old name keeps resolving, against one cache entry and
+/// one golden thread.
+///
+/// `urn:fn:` has **no resolvable bare root**, so unlike the annotation family below it
+/// needs only the prefix rule. That was checked, not assumed: `grep 'urn:fn\([^:]\|$\)'`
+/// over the whole repo is empty, and `ikigai_fn::space()` binds four exact IRIs, all with
+/// a segment after the prefix.
+///
+/// ## ★ Why this is a SEPARATE table from [`alias_table`]
+///
+/// The recipe's rule is *install the table only on kernels that bind under the prefix* —
+/// elsewhere a rule can only rewrite a name ahead of mount matching (aliases wrap the
+/// ROOT, mounts sit inside), which is no upside and one downside. For `urn:annotation:`
+/// that split the constructors cleanly in two: only `root_space*` carries the browse
+/// family, so the served surfaces got no table at all.
+///
+/// **`urn:fn:` does not split the same way.** `ikigai_fn::space()` is the first thing
+/// `base_space` composes, and `served_space` and `calendar_server_space` are both built
+/// over `base_space` — so `ikigai serve quic://…` binds `urn:iki:fn:toUpper` just as the
+/// REPL does, and a QUIC client that still says `urn:fn:toUpper` needs the rewrite exactly
+/// as much as a local one. Withholding the table there would have made the bump a silent
+/// flag day on the wire.
+///
+/// So the tables are per-SPACE-GRAPH, not per-repo: this one carries what `base_space`
+/// binds and goes everywhere; [`alias_table`] adds what only `root_space*` binds. The
+/// alternative — one global table installed everywhere — would put the annotation rules on
+/// a served kernel that binds no annotation, which is the case the recipe warns about.
+fn base_alias_table() -> Arc<AliasTable> {
+    static TABLE: std::sync::OnceLock<Arc<AliasTable>> = std::sync::OnceLock::new();
+    Arc::clone(TABLE.get_or_init(|| Arc::new(base_rules(AliasTable::new()))))
+}
+
+/// The base rules as a FUNCTION over a partially-built table, so [`alias_table`] extends
+/// this set rather than restating it. Two tables listing the same rule by hand is how one
+/// of them silently stops carrying a namespace the other does; a test below pins that the
+/// root table is a superset.
+fn base_rules(table: AliasTable) -> AliasTable {
+    // ikigai-fn 0.2.0: the function library's own namespace.
+    table.prefix("urn:fn:", "urn:iki:fn:")
+}
+
 /// The host's URN **rewrite table** — the transition window for the `urn:iki:`
 /// namespace consolidation, installed on every kernel this crate builds over
 /// [`root_space_with_mounts`] and readable at `urn:kernel:aliases`.
 ///
-/// One namespace has moved so far. `ikigai-browse` 0.3.0 renamed its Web Annotation
-/// family `urn:annotation:*` → `urn:iki:annotation:*`; the library moved atomically and
-/// the HOST carries the old spelling, which is what makes the migration incremental —
-/// the catalog advertises only the new name (so catalog-driven consumers migrate
-/// themselves), while anything still holding the old name keeps resolving, against one
-/// cache entry and one golden thread.
+/// [`base_alias_table`]'s rules PLUS the ones only the embedded root binds. Two namespaces
+/// have moved so far; the `urn:fn:` half is documented there.
+///
+/// `ikigai-browse` 0.3.0 renamed its Web Annotation family `urn:annotation:*` →
+/// `urn:iki:annotation:*`; the library moved atomically and the HOST carries the old
+/// spelling, which is what makes the migration incremental — the catalog advertises only
+/// the new name (so catalog-driven consumers migrate themselves), while anything still
+/// holding the old name keeps resolving, against one cache entry and one golden thread.
 ///
 /// ## ★ TWO rules for one namespace, and the second is not redundant
 ///
@@ -3171,13 +3256,15 @@ fn runbook_jury_demo() -> FnEndpoint {
 /// The general shape, for the 96 namespaces still to move: **a namespace with a
 /// resolvable bare root needs both rules.** Check for one before writing the prefix line.
 ///
-/// ## Where it is NOT installed, deliberately
+/// ## Where the ANNOTATION rules are not installed, deliberately
 ///
-/// Not on the served surfaces ([`kernel_for`], [`served_kernel_with_mounts`],
-/// [`calendar_server_kernel`]): [`served_space`] binds no browse family, so a table there
-/// could only rewrite a name nothing binds — and it would rewrite it *before* mount
-/// matching, since `with_aliases` wraps the ROOT and mounts sit inside it. No upside, one
-/// downside.
+/// The served surfaces ([`kernel_for`], [`served_kernel_with_mounts`],
+/// [`calendar_server_kernel`]) get [`base_alias_table`] instead of this one:
+/// [`served_space`] binds no browse family, so the annotation rules there could only
+/// rewrite a name nothing binds — and they would rewrite it *before* mount matching, since
+/// `with_aliases` wraps the ROOT and mounts sit inside it. No upside, one downside. The
+/// `urn:fn:` rule does not have that problem there, which is exactly why it lives in the
+/// other table.
 ///
 /// ## ⚠ The consequence operators must sequence by hand
 ///
@@ -3192,7 +3279,7 @@ fn alias_table() -> Arc<AliasTable> {
     static TABLE: std::sync::OnceLock<Arc<AliasTable>> = std::sync::OnceLock::new();
     Arc::clone(TABLE.get_or_init(|| {
         Arc::new(
-            AliasTable::new()
+            base_rules(AliasTable::new())
                 // ikigai-browse 0.3.0: the Web Annotation family.
                 .prefix("urn:annotation:", "urn:iki:annotation:")
                 // ★ NOT redundant with the line above — see the module note. This is the
@@ -4619,6 +4706,7 @@ pub fn trusted_kernel_with_mounts(nature: &'static str, mounts: Vec<MountSpec>) 
 /// `urn:personal:*` would leak it — gated on remote auth + capability-on-the-wire.
 pub fn kernel_for(nature: &'static str) -> Kernel {
     Kernel::with_meta_renderer(Arc::new(served_space(nature)), Arc::new(CliRenderer))
+        .with_aliases(base_alias_table())
 }
 
 #[cfg(test)]
@@ -4857,49 +4945,149 @@ mod tests {
         );
     }
 
-    /// Every kernel that carries the browse family carries the table, and the served
-    /// surfaces — which bind no browse family — deliberately do not.
+    /// The rules a kernel installs, as `(from, to)` pairs.
+    fn rules_of(label: &str, kernel: &Kernel) -> Vec<(String, String)> {
+        kernel
+            .aliases()
+            .unwrap_or_else(|| panic!("{label} installs no rewrite table"))
+            .rules()
+            .iter()
+            .map(|r| (r.from().to_string(), r.to().to_string()))
+            .collect()
+    }
+
+    /// EVERY kernel this crate builds carries the `urn:fn:` rule, and only the ones that
+    /// bind the browse family carry the annotation rules.
+    ///
+    /// The split is the whole point of having two tables. `ikigai_fn::space()` is the first
+    /// thing `base_space` composes, and every space graph here is built over `base_space` —
+    /// so a served QUIC surface binds `urn:iki:fn:toUpper` exactly as the REPL does and a
+    /// remote caller holding the old name needs the same rewrite. The browse family is not
+    /// like that: only `root_space*` binds it, so putting its rules on a served kernel
+    /// could only rewrite a name nothing binds, ahead of mount matching.
     ///
     /// Named individually rather than looped because the install is one chained call per
-    /// constructor: a new constructor over `root_space*` that forgets it would resolve
-    /// annotations under the canonical name only, and the omission is invisible until an
-    /// old-name caller arrives.
+    /// constructor: a new constructor that forgets it resolves under the canonical name
+    /// only, and the omission is invisible until an old-name caller arrives.
     #[test]
-    fn the_root_space_kernels_install_the_table_and_the_served_ones_do_not() {
+    fn every_kernel_carries_the_fn_rule_and_only_root_kernels_carry_annotation() {
+        let fn_rule = ("urn:fn:".to_string(), "urn:iki:fn:".to_string());
+        let annotation_prefix = (
+            "urn:annotation:".to_string(),
+            "urn:iki:annotation:".to_string(),
+        );
+        let annotation_exact = (
+            "urn:annotation".to_string(),
+            "urn:iki:annotation".to_string(),
+        );
+
         for (label, kernel) in [
             ("kernel", kernel()),
             ("trusted_kernel_for", trusted_kernel_for("Test (IPC)")),
         ] {
-            let rules = kernel
-                .aliases()
-                .unwrap_or_else(|| panic!("{label} installs no rewrite table"))
-                .rules()
-                .iter()
-                .map(|r| (r.from().to_string(), r.to().to_string()))
-                .collect::<Vec<_>>();
-            assert!(
-                rules.contains(&(
-                    "urn:annotation:".to_string(),
-                    "urn:iki:annotation:".to_string()
-                )),
-                "{label}: {rules:?}"
-            );
-            assert!(
-                rules.contains(&(
-                    "urn:annotation".to_string(),
-                    "urn:iki:annotation".to_string()
-                )),
-                "{label}: {rules:?}"
-            );
+            let rules = rules_of(label, &kernel);
+            assert!(rules.contains(&fn_rule), "{label}: {rules:?}");
+            assert!(rules.contains(&annotation_prefix), "{label}: {rules:?}");
+            assert!(rules.contains(&annotation_exact), "{label}: {rules:?}");
         }
         // `watched_kernel*` / `reactive_kernel_with_mounts` share `build_watched`, which is
         // not constructed here: it starts watchers, the scheduler and the tuplespace
         // reactor, none of which a naming assertion needs.
+
+        for (label, kernel) in [
+            ("kernel_for", kernel_for("Test (QUIC)")),
+            (
+                "served_kernel",
+                served_kernel("Test (QUIC)", ServedSurface::default()),
+            ),
+            ("calendar_server_kernel", calendar_server_kernel()),
+        ] {
+            let rules = rules_of(label, &kernel);
+            assert!(
+                rules.contains(&fn_rule),
+                "{label} binds urn:iki:fn:* through base_space, so it owes the rewrite: \
+                 {rules:?}"
+            );
+            assert!(
+                !rules.contains(&annotation_prefix) && !rules.contains(&annotation_exact),
+                "{label} binds no browse family; those rules could only rewrite a name \
+                 nothing binds, ahead of mount matching: {rules:?}"
+            );
+        }
+    }
+
+    /// The root table EXTENDS the base one — it does not restate it. Two hand-written lists
+    /// of the same rule is how one of them silently stops carrying a namespace.
+    #[test]
+    fn the_root_table_is_a_superset_of_the_base_table() {
+        let base: Vec<_> = base_alias_table()
+            .rules()
+            .iter()
+            .map(|r| (r.from().to_string(), r.to().to_string()))
+            .collect();
+        let root: Vec<_> = alias_table()
+            .rules()
+            .iter()
+            .map(|r| (r.from().to_string(), r.to().to_string()))
+            .collect();
+        assert!(!base.is_empty());
+        for rule in &base {
+            assert!(root.contains(rule), "the root table dropped {rule:?}");
+        }
         assert!(
-            kernel_for("Test (QUIC)").aliases().is_none(),
-            "a served kernel binds no browse family; a table there could only rewrite \
-             names ahead of mount matching"
+            root.len() > base.len(),
+            "the root table adds browse's rules"
         );
+    }
+
+    /// The whole point of the transition window, proven against the real published
+    /// `ikigai-fn` 0.2.0 bindings rather than a stand-in space: the OLD name still
+    /// resolves, the NEW name resolves, and they are ONE resource — same cache entry,
+    /// because the overlay reports the rewrite on `Resolved.canonical` and the kernel
+    /// adopts it before it computes the id.
+    #[test]
+    fn both_spellings_resolve_to_one_resource() {
+        let kernel = kernel();
+        let ask = |iri: &str| {
+            let request = Request::new(Verb::Source, Iri::parse(iri).expect("valid IRI"))
+                .with_arg("in", ArgRef::Inline(b"hi".to_vec()));
+            block_on(kernel.issue(request, &Capability::root()))
+        };
+        assert_eq!(
+            String::from_utf8_lossy(&ask("urn:iki:fn:toUpper").expect("canonical").bytes),
+            "HI"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&ask("urn:fn:toUpper").expect("through the alias").bytes),
+            "HI"
+        );
+        // One cache entry: the second spelling reads what the first computed.
+        let cached = Request::new(
+            Verb::Source,
+            Iri::parse("urn:fn:toUpper").expect("valid IRI"),
+        )
+        .with_arg("in", ArgRef::Inline(b"hi".to_vec()));
+        assert!(
+            kernel.is_cached(&cached, &Capability::root()),
+            "the old spelling must hit the entry the canonical name populated"
+        );
+    }
+
+    /// Ablate the `urn:fn:` rule and the old spelling dies — the check that this rule is
+    /// load-bearing rather than decorative, run rather than reasoned. `ikigai-fn` 0.2.0
+    /// does not bind the old names at all, so without the rewrite there is nothing behind
+    /// them.
+    #[test]
+    fn without_the_fn_rule_the_old_spelling_is_unresolved() {
+        let bare = Kernel::with_meta_renderer(root_space(), Arc::new(CliRenderer));
+        let request = Request::new(
+            Verb::Source,
+            Iri::parse("urn:fn:toUpper").expect("valid IRI"),
+        )
+        .with_arg("in", ArgRef::Inline(b"hi".to_vec()));
+        let err = block_on(bare.issue(request, &Capability::root()))
+            .expect_err("0.2.0 binds only the canonical name");
+        assert!(matches!(err, ikigai_core::Error::Unresolved(_)), "{err:?}");
     }
 
     /// The prelude must be VALID STEEL, and getting there took four failed shapes — each
@@ -4911,7 +5099,7 @@ mod tests {
     #[test]
     fn a_generated_alias_has_the_shape_steel_actually_accepts() {
         let targets = vec![AliasTarget {
-            iri: "urn:fn:toUpper".to_string(),
+            iri: "urn:iki:fn:toUpper".to_string(),
             summary: "Upper-cases the text.".to_string(),
             actions: vec![("Source".to_string(), vec!["in".to_string()])],
         }];
@@ -4922,18 +5110,18 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("(%verb-args \"source\" \"urn:fn:toUpper\" args)"),
+            out.contains("(%verb-args \"source\" \"urn:iki:fn:toUpper\" args)"),
             "the fixed-arity primitive, not `apply invoke`: {out}"
         );
     }
 
-    /// `urn:fn:conditional` really does declare an argument named `if`, and
+    /// `urn:iki:fn:conditional` really does declare an argument named `if`, and
     /// `(define (fn-conditional if …) …)` will not parse. The BINDER is renamed; the WIRE
     /// name must not be.
     #[test]
     fn a_reserved_argument_name_is_renamed_only_in_the_binder() {
         let targets = vec![AliasTarget {
-            iri: "urn:fn:conditional".to_string(),
+            iri: "urn:iki:fn:conditional".to_string(),
             summary: String::new(),
             actions: vec![(
                 "Source".to_string(),
@@ -4954,10 +5142,40 @@ mod tests {
     /// A verb that mutates reads as one: Scheme's `!`.
     #[test]
     fn verbs_shape_the_alias_name() {
-        assert_eq!(alias_name("urn:fn:toUpper", "Source"), "fn-toUpper");
+        assert_eq!(alias_name("urn:iki:fn:toUpper", "Source"), "fn-toUpper");
         assert_eq!(alias_name("urn:space:bookings", "Sink"), "space-bookings!");
         assert_eq!(alias_name("urn:file:x", "Delete"), "file-x-delete!");
         assert_eq!(alias_name("urn:file:x", "Exists"), "file-x?");
+    }
+
+    /// ★ The `urn:iki:` consolidation must be INVISIBLE to the prelude.
+    ///
+    /// An IRI keeps working under its old spelling through [`alias_table`]; a Scheme
+    /// identifier has no such table. If the alias were derived from the un-stripped IRI,
+    /// every verb in the prelude would be renamed on the day its namespace migrated — 96
+    /// times, each one silently breaking every `.scm` that named it. So `iki` is stripped
+    /// exactly as `urn` is, and a namespace's migration produces the SAME verb before and
+    /// after. That equality is the property; the individual names are not.
+    #[test]
+    fn migrating_a_namespace_does_not_rename_its_lisp_verb() {
+        for (old, new) in [
+            ("urn:fn:toUpper", "urn:iki:fn:toUpper"),
+            ("urn:llm:ask", "urn:iki:llm:ask"),
+            ("urn:repo:list", "urn:iki:repo:list"),
+        ] {
+            assert_eq!(
+                alias_name(old, "Source"),
+                alias_name(new, "Source"),
+                "{old} and {new} must project to one verb"
+            );
+        }
+        // Which is also the collision the module note records: the two spellings CANNOT
+        // both appear in one prelude, because the catalog advertises only the canonical
+        // name. Pinned here so the constraint is visible where the code is.
+        assert_eq!(alias_name("urn:fn:toUpper", "Source"), "fn-toUpper");
+        // A namespace that merely BEGINS with the letters is untouched — the strip is on
+        // the `urn:iki:` segment, not a substring.
+        assert_eq!(alias_name("urn:ikigai:thing", "Source"), "ikigai-thing");
     }
 
     /// Compose documents ITSELF with a literal `$a{<iri>}` marker, so that text lands in a
@@ -5000,10 +5218,10 @@ mod tests {
 "#,
         );
         // The catalog describes both; the manifold authorizes only one.
-        let authorized = vec![candidate("toUpper", "urn:fn:toUpper", "Source")];
+        let authorized = vec![candidate("toUpper", "urn:iki:fn:toUpper", "Source")];
         let targets = alias_targets(&authorized, &described);
         assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].iri, "urn:fn:toUpper");
+        assert_eq!(targets[0].iri, "urn:iki:fn:toUpper");
         let out = aliases_scheme(&targets, "");
         assert!(out.contains("fn-toUpper"), "{out}");
         assert!(
@@ -5023,11 +5241,11 @@ mod tests {
 "#,
         );
         let targets = alias_targets(
-            &[candidate("toUpper", "urn:fn:toUpper", "Source")],
+            &[candidate("toUpper", "urn:iki:fn:toUpper", "Source")],
             &described,
         );
         let out = aliases_scheme(&targets, "");
-        assert!(out.contains("\"urn:fn:toUpper\""), "{out}");
+        assert!(out.contains("\"urn:iki:fn:toUpper\""), "{out}");
         assert!(
             !out.contains("urn:ikigai:endpoint:toUpper\""),
             "the skolem IRI is a description, not an address: {out}"
@@ -5039,7 +5257,7 @@ mod tests {
     #[test]
     fn the_elisp_face_emits_callable_defuns() {
         let targets = vec![AliasTarget {
-            iri: "urn:fn:toUpper".to_string(),
+            iri: "urn:iki:fn:toUpper".to_string(),
             summary: "Upper-cases the text.".to_string(),
             actions: vec![("Source".to_string(), vec!["in".to_string()])],
         }];
@@ -5053,7 +5271,7 @@ mod tests {
             "docstring: {out}"
         );
         assert!(
-            out.contains("(apply #'ikigai-invoke 'source \"urn:fn:toUpper\" \"in\" in args)"),
+            out.contains("(apply #'ikigai-invoke 'source \"urn:iki:fn:toUpper\" \"in\" in args)"),
             "{out}"
         );
         // NO bundled runtime: ikigai.el owns transport, mounts and quoting, and defines
@@ -5302,8 +5520,14 @@ mod tests {
         )
     }
 
-    /// `urn:fn:toUpper` is bound locally, so it is a good probe for "did the local
+    /// `urn:iki:fn:toUpper` is bound locally, so it is a good probe for "did the local
     /// binding get a chance to answer".
+    ///
+    /// ★ Note the CANONICAL spelling throughout this suite. `with_aliases` wraps the ROOT
+    /// and `compose_mounts` composes into it, so a mount sits INSIDE the alias and matches
+    /// against the rewritten name — a `urn:fn:` mount prefix would stop matching the instant
+    /// the table ships, and no alias can save it. Mounts move one way, route gates outside
+    /// the kernel move the other.
     fn probe(space: &Arc<dyn Space>, iri: &str) -> std::result::Result<String, ikigai_core::Error> {
         let kernel = Kernel::new(Arc::clone(space));
         let request = Request::new(Verb::Source, Iri::parse(iri).unwrap())
@@ -5316,12 +5540,13 @@ mod tests {
     #[test]
     fn a_prefer_mount_falls_back_to_the_local_binding_when_the_peer_is_down() {
         let (spec, calls) = mount(
-            "urn:fn:",
+            "urn:iki:fn:",
             MountKind::Prefer,
             ikigai_core::Error::Unavailable,
         );
         let space = root_space_with_mounts(vec![spec]);
-        let answer = probe(&space, "urn:fn:toUpper").expect("local must answer for a dead peer");
+        let answer =
+            probe(&space, "urn:iki:fn:toUpper").expect("local must answer for a dead peer");
         assert_eq!(answer, "HI");
         assert!(
             calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
@@ -5335,12 +5560,12 @@ mod tests {
     #[test]
     fn the_served_kernel_composes_mounts() {
         let (spec, calls) = mount(
-            "urn:fn:",
+            "urn:iki:fn:",
             MountKind::Prefer,
             ikigai_core::Error::Unavailable,
         );
         let kernel = served_kernel_with_mounts("Test (QUIC)", ServedSurface::default(), vec![spec]);
-        let request = Request::new(Verb::Source, Iri::parse("urn:fn:toUpper").unwrap())
+        let request = Request::new(Verb::Source, Iri::parse("urn:iki:fn:toUpper").unwrap())
             .with_arg("in", ArgRef::Inline(b"hi".to_vec()));
         let representation = block_on(kernel.issue(request, &Capability::root()))
             .expect("the served binding must answer for a dead peer");
@@ -5356,12 +5581,12 @@ mod tests {
     #[test]
     fn an_override_mount_fails_when_the_peer_is_down() {
         let (spec, _) = mount(
-            "urn:fn:",
+            "urn:iki:fn:",
             MountKind::Override,
             ikigai_core::Error::Unavailable,
         );
         let space = root_space_with_mounts(vec![spec]);
-        let err = probe(&space, "urn:fn:toUpper").expect_err("an override must not fall back");
+        let err = probe(&space, "urn:iki:fn:toUpper").expect_err("an override must not fall back");
         assert!(matches!(err, ikigai_core::Error::Unavailable(_)), "{err:?}");
     }
 
@@ -5370,9 +5595,9 @@ mod tests {
     /// boundary into a suggestion.
     #[test]
     fn a_prefer_mount_does_not_swallow_a_denial() {
-        let (spec, _) = mount("urn:fn:", MountKind::Prefer, ikigai_core::Error::Denied);
+        let (spec, _) = mount("urn:iki:fn:", MountKind::Prefer, ikigai_core::Error::Denied);
         let space = root_space_with_mounts(vec![spec]);
-        let err = probe(&space, "urn:fn:toUpper").expect_err("a denial must propagate");
+        let err = probe(&space, "urn:iki:fn:toUpper").expect_err("a denial must propagate");
         assert!(matches!(err, ikigai_core::Error::Denied(_)), "{err:?}");
     }
 
@@ -5387,18 +5612,18 @@ mod tests {
             ikigai_core::Error::Unavailable,
         );
         let (override_mount, override_calls) = mount(
-            "urn:fn:",
+            "urn:iki:fn:",
             MountKind::Override,
             ikigai_core::Error::Unavailable,
         );
         let space = root_space_with_mounts(vec![prefer, override_mount]);
-        let err = probe(&space, "urn:fn:toUpper")
-            .expect_err("the override still owns urn:fn:, despite the longer prefer prefix");
+        let err = probe(&space, "urn:iki:fn:toUpper")
+            .expect_err("the override still owns urn:iki:fn:, despite the longer prefer prefix");
         assert!(matches!(err, ikigai_core::Error::Unavailable(_)), "{err:?}");
         assert_eq!(
             prefer_calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "the urn:llm: mount must not see a urn:fn: request"
+            "the urn:llm: mount must not see a urn:iki:fn: request"
         );
         assert!(override_calls.load(std::sync::atomic::Ordering::SeqCst) > 0);
     }
@@ -5655,12 +5880,15 @@ mod tests {
         let _ = std::fs::remove_file(history_file(&dir));
 
         assert!(read_history(&dir).is_empty(), "absent file → no history");
-        write_history(&dir, "source urn:fn:toUpper hi");
+        write_history(&dir, "source urn:iki:fn:toUpper hi");
         write_history(&dir, "   "); // blank → skipped
         write_history(&dir, "list");
         assert_eq!(
             read_history(&dir),
-            vec!["source urn:fn:toUpper hi".to_string(), "list".to_string()],
+            vec![
+                "source urn:iki:fn:toUpper hi".to_string(),
+                "list".to_string()
+            ],
             "appends in order, blanks dropped"
         );
 
@@ -5698,7 +5926,7 @@ mod tests {
     #[test]
     fn page_composes_through_the_linked_module() {
         let kernel = kernel();
-        let request = Request::new(Verb::Source, Iri::parse("urn:fn:compose").unwrap())
+        let request = Request::new(Verb::Source, Iri::parse("urn:iki:fn:compose").unwrap())
             .with_arg("src", ArgRef::Inline(b"urn:data:page".to_vec()));
         let representation = block_on(kernel.issue(request, &Capability::root())).unwrap();
         let text = String::from_utf8(representation.bytes).unwrap();
@@ -5706,7 +5934,7 @@ mod tests {
         assert!(text.contains("[hello]"));
         assert!(text.contains("Hi, World"));
         // the escaped marker survives unexpanded
-        assert!(text.contains("$a{urn:fn:toUpper?in=x}"));
+        assert!(text.contains("$a{urn:iki:fn:toUpper?in=x}"));
     }
 
     #[test]
@@ -5755,8 +5983,8 @@ mod tests {
 <urn:ikigai:endpoint:demo-echo:action:source> a ik:ActionMatch ;
     ik:template "urn:demo:echo/{message}" ;
     ik:verb "Source" .
-<urn:ikigai:endpoint:toUpper:action:source> a ik:ActionMatch ;
-    ik:endpoint <urn:fn:toUpper> ;
+<urn:ikigai:endpoint:upper:action:source> a ik:ActionMatch ;
+    ik:endpoint <urn:test:upper> ;
     ik:verb "Source" .
 "#;
         let cands = parse_action_matches(manifold);
@@ -5767,16 +5995,16 @@ mod tests {
             .unwrap();
         assert!(echo.template);
         assert_eq!(echo.endpoint, "urn:demo:echo/{message}");
-        let upper = cands.iter().find(|c| c.action.contains("toUpper")).unwrap();
+        let upper = cands.iter().find(|c| c.action.contains("upper")).unwrap();
         assert!(!upper.template, "an exact IRI stays an ik:endpoint");
-        assert_eq!(upper.endpoint, "urn:fn:toUpper");
+        assert_eq!(upper.endpoint, "urn:test:upper");
 
         let ttl = selection_turtle(&cands, None, None);
         assert!(
             ttl.contains("ik:template \"urn:demo:echo/{message}\""),
             "{ttl}"
         );
-        assert!(ttl.contains("ik:endpoint <urn:fn:toUpper>"), "{ttl}");
+        assert!(ttl.contains("ik:endpoint <urn:test:upper>"), "{ttl}");
         assert!(!ttl.contains("ik:endpoint <>"), "{ttl}");
         let reparsed = parse_action_matches(&ttl);
         assert_eq!(reparsed.len(), 2, "the emitted graph re-parses whole");

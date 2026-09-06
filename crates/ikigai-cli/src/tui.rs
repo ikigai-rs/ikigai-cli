@@ -273,7 +273,7 @@ fn event_loop(
             state.clock = clock_text(engine);
             if state.tab == TAB_CONTROL {
                 if let Action::Output(out) =
-                    engine.eval("source urn:fn:compose src=urn:data:control")
+                    engine.eval("source urn:iki:fn:compose src=urn:data:control")
                 {
                     state.control = out.result.unwrap_or_else(|e| format!("error: {e}"));
                 }
@@ -430,7 +430,7 @@ fn load_demos(state: &mut State, engine: &Engine) {
     // The Control tab: the kernel control plane (scheduler + cache) as one composed
     // resource — `urn:data:control` is a compose shape whose two `$a{}` markers are the
     // sub-requests. The same resource the browser demo's Control page composes.
-    state.control = match engine.eval("source urn:fn:compose src=urn:data:control") {
+    state.control = match engine.eval("source urn:iki:fn:compose src=urn:data:control") {
         Action::Output(out) => out.result.unwrap_or_else(|e| format!("error: {e}")),
         _ => String::new(),
     };
@@ -1402,7 +1402,7 @@ fn control_lines(control: &str) -> Vec<Line<'static>> {
         Line::from(
             "the control plane · scheduler + cache + time jobs, one composed resource".bold(),
         ),
-        Line::from("source urn:fn:compose src=urn:data:control".cyan()),
+        Line::from("source urn:iki:fn:compose src=urn:data:control".cyan()),
         Line::from(""),
     ];
     if control.trim().is_empty() {
@@ -1518,15 +1518,15 @@ mod tests {
         render(80, 24, &state); // empty, normal size
         render(1, 1, &state); // degenerate: smaller than the layout wants
 
-        state.input = "source urn:fn:toUpper hi".into();
+        state.input = "source urn:iki:fn:toUpper hi".into();
         state.cursor = 7; // cursor mid-line — exercises the cursor-column math
         state.transcript.push(Entry {
-            input: "source urn:fn:toUpper hi".into(),
+            input: "source urn:iki:fn:toUpper hi".into(),
             result: Ok("line one\nline two".into()),
             cache: CacheStats::default(),
         });
         state.transcript.push(Entry {
-            input: "source urn:fn:nope".into(),
+            input: "source urn:iki:fn:nope".into(),
             result: Err("no endpoint resolved".into()),
             cache: CacheStats::default(),
         });
@@ -1551,18 +1551,18 @@ mod tests {
             steps: vec![
                 StepData {
                     label: "uppercase".into(),
-                    cmd: "source urn:fn:toUpper hello".into(),
+                    cmd: "source urn:iki:fn:toUpper hello".into(),
                     note: "a function resource".into(),
                 },
                 StepData {
                     label: "pipe".into(),
-                    cmd: "source urn:fn:toUpper hi | urn:demo:wrap".into(),
+                    cmd: "source urn:iki:fn:toUpper hi | urn:demo:wrap".into(),
                     note: "pipe output into the next stage".into(),
                 },
             ],
         });
 
-        state.docs = "│ urn:fn:toUpper\n│   a function resource".into();
+        state.docs = "│ urn:iki:fn:toUpper\n│   a function resource".into();
         state.control =
             "scheduler\n  backend    single\n  threads    1\ncache\n  entries  3".into();
 
@@ -1582,7 +1582,7 @@ mod tests {
         state.tab = TAB_DEMO_BASE; // the demo page (demos start at index 4), no step run yet
         render(80, 24, &state);
 
-        state.demo_out = "$ source urn:fn:toUpper hello\nHELLO".into();
+        state.demo_out = "$ source urn:iki:fn:toUpper hello\nHELLO".into();
         render(80, 24, &state); // demo page with output
         render(20, 6, &state); // narrow → intro wraps, output scrolls
     }

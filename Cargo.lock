@@ -2631,9 +2631,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-fn"
-version = "0.1.2"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66cab3913390b281889d38bd0d47d733e548e444fc440dc852da161a6cca56e4"
+checksum = "40832a7e380d5949eba4b5654d3f340ff135a67a54883948544b050cb448b750"
 dependencies = [
  "async-trait",
  "futures-util",

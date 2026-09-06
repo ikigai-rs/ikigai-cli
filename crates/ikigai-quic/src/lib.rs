@@ -810,7 +810,7 @@ mod tests {
 
     fn kernel() -> Kernel {
         Kernel::new(Arc::new(
-            EndpointSpace::new().bind(Exact::new("urn:fn:toUpper"), builtins::to_upper()),
+            EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),
         ))
     }
 
@@ -1050,7 +1050,7 @@ mod tests {
     }
 
     fn upper(text: &str) -> Request {
-        Request::new(Verb::Source, Iri::parse("urn:fn:toUpper").unwrap())
+        Request::new(Verb::Source, Iri::parse("urn:test:upper").unwrap())
             .with_arg("in", ArgRef::Inline(text.as_bytes().to_vec()))
     }
 
@@ -1402,7 +1402,7 @@ mod reconnect_tests {
     use std::thread;
 
     fn upper(text: &str) -> Request {
-        Request::new(Verb::Source, Iri::parse("urn:fn:toUpper").unwrap())
+        Request::new(Verb::Source, Iri::parse("urn:test:upper").unwrap())
             .with_arg("in", ArgRef::Inline(text.as_bytes().to_vec()))
     }
 
@@ -1419,7 +1419,7 @@ mod reconnect_tests {
                 };
                 let kernel = Arc::new(Kernel::new(Arc::new(
                     ikigai_core::EndpointSpace::new().bind(
-                        ikigai_core::Exact::new("urn:fn:toUpper"),
+                        ikigai_core::Exact::new("urn:test:upper"),
                         ikigai_core::builtins::to_upper(),
                     ),
                 )));

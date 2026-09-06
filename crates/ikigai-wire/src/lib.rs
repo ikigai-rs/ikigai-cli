@@ -302,7 +302,7 @@ mod tests {
     use ikigai_core::{ArgRef, Iri, ReprType, Verb};
 
     fn request() -> Request {
-        Request::new(Verb::Source, Iri::parse("urn:fn:toUpper").unwrap())
+        Request::new(Verb::Source, Iri::parse("urn:test:upper").unwrap())
             .with_arg("in", ArgRef::Inline(b"hi".to_vec()))
     }
 
@@ -321,7 +321,7 @@ mod tests {
                 Representation::new(ReprType::new("text/plain"), b"HI".to_vec()),
                 CacheStatus::Miss,
                 vec![TraceEvent {
-                    target: "urn:fn:toUpper".to_string(),
+                    target: "urn:test:upper".to_string(),
                     thread: "ikigai-sched-0".to_string(),
                     started: None,
                     ended: None,
