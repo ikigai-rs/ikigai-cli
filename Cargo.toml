@@ -68,7 +68,7 @@ ikigai-xslt = "0.1.0"
 ikigai-jsonld = "0.1.1"
 # SHACL validation (urn:shacl:validate) — rudof's validator is native-only (gated off wasm),
 # so it's linked natively here; the browser serves the same resource via shacl-engine (JS).
-ikigai-shacl = "0.1.0"
+ikigai-shacl = "0.1.1" # 0.1.1 = compiles against shacl 0.3.17+ (validate() grew a 3rd arg in a PATCH release) + real upper bounds
 # The org-mode agenda (urn:org:agenda:{period}) — reads org files through the
 # kernel (urn:orgfile:*) and speaks the same skolemized event graph as the
 # calendar, so the two union/diff as graphs.
