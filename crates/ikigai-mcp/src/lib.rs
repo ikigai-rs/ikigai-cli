@@ -24,12 +24,27 @@ use std::collections::BTreeSet;
 /// (`personal-calendar`, Sink).
 const SEP: &str = "__";
 
+/// The longest tool name this projection will emit.
+///
+/// Not an MCP rule — MCP itself does not bound the length — but the strictest bound
+/// among the clients that consume it (the OpenAI-style function-name limit). It is
+/// enforced anyway, and deliberately at the tighter end, because the failure is not
+/// local: a client that rejects one over-long name rejects the whole `tools/list`
+/// response, so an over-strict cap costs one shortcut and an over-loose one costs every
+/// tool on the server. The live maximum across the ecosystem is about half of this.
+pub const MAX_TOOL_NAME: usize = 64;
+
 /// Collapse an endpoint id into the MCP tool-name charset `[A-Za-z0-9_-]`.
 /// Endpoint ids are conventionally kebab/lowerCamel, but an id may be a full URI
 /// (`urn:llm:config`), and MCP names forbid `:` — so any character outside the
 /// set becomes `_`. The map is lossy, but it is never inverted: [`tool_name`]
 /// sanitizes when building a name and `tools/call` sanitizes each candidate id
 /// the same way before matching, so both sides agree on the canonical form.
+///
+/// ⚠ This is a filter over the INPUT and proves nothing on its own. It cannot see the
+/// length of what it produced, and — being lossy — it cannot see that two DIFFERENT ids
+/// arrived at one name. [`is_tool_name`] and [`distinct_ids`] are the two checks that
+/// close those, and the projection runs both; see [`checked_tool_name`].
 pub fn sanitize_id(id: &str) -> String {
     id.chars()
         .map(|c| {
@@ -49,6 +64,73 @@ pub fn sanitize_id(id: &str) -> String {
 /// *sanitized* id, the form `tools/call` matches on.
 pub fn tool_name(id: &str, verb: Verb) -> String {
     format!("{}{SEP}{}", sanitize_id(id), verb_token(verb))
+}
+
+/// Whether `name` is a usable MCP tool name: `[A-Za-z0-9_-]`, non-empty, and within
+/// [`MAX_TOOL_NAME`].
+///
+/// ★ This is the check that filtering characters does not give you. Escaping the input
+/// makes a value *look* legal; only reading the result back in the target grammar proves
+/// it. Core #99 paid for that lesson in the RDF projection — percent-encoding produced a
+/// legal Turtle `IRIREF` that was not a legal IRI, and the parser then rejected the whole
+/// document rather than the one triple. Same shape here: the unit of rejection is the
+/// response, not the tool.
+pub fn is_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_TOOL_NAME
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// The MCP tool name for an action, or the reason it cannot be projected.
+///
+/// The failure is a *skip*, never a fallback name: a synthesized replacement would be a
+/// name no `tools/call` could predict, and the endpoint stays reachable through every
+/// other face of the kernel. What is not acceptable is emitting a name that takes the
+/// whole tool list down with it.
+pub fn checked_tool_name(id: &str, verb: Verb) -> Result<String, String> {
+    let name = tool_name(id, verb);
+    if name.len() > MAX_TOOL_NAME {
+        return Err(format!(
+            "`{id}` projects to a {}-character tool name, over the {MAX_TOOL_NAME}-character limit",
+            name.len()
+        ));
+    }
+    if !is_tool_name(&name) {
+        return Err(format!("`{id}` projects to no usable tool name (`{name}`)"));
+    }
+    // ★ And then READ IT BACK with the parser `tools/call` routes by. The charset check
+    // above is satisfied by `__source` — the projection of an EMPTY id — which
+    // [`parse_tool_name`] refuses, so listing it would offer a tool that can never be
+    // called. Nothing but the round trip catches that; a character-class test never can.
+    if parse_tool_name(&name).map(|(parsed, v)| parsed == sanitize_id(id) && v == verb)
+        != Some(true)
+    {
+        return Err(format!(
+            "`{id}` projects to `{name}`, which does not read back as the action it names"
+        ));
+    }
+    Ok(name)
+}
+
+/// The distinct endpoint ids behind one projected tool name, in sorted order.
+///
+/// ★★ [`sanitize_id`] is LOSSY, and its result is used as an IDENTITY KEY: `tools/list`
+/// groups rows by tool name and `tools/call` keeps every row whose sanitized id matches.
+/// Collapsing many rows of ONE endpoint is deliberate and correct — a federated mount
+/// lists a namespace twice, browse binds one endpoint per configured root. Collapsing two
+/// DIFFERENT endpoints is not: `urn:llm:config` and `urn.llm.config` both sanitize to
+/// `urn_llm_config`, and the caller's request would then be routed by selection
+/// precedence rather than by what it asked for.
+///
+/// So the collapse is only allowed to be a collapse of *one* id. More than one is a
+/// defect that must surface. Surveyed 2026-09-06: 285 endpoint ids across the ecosystem,
+/// zero collisions — this costs nothing today and is a guard for the day someone adds an
+/// id that differs from another only in punctuation.
+pub fn distinct_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let set: BTreeSet<&str> = ids.into_iter().collect();
+    set.into_iter().map(str::to_string).collect()
 }
 
 /// Recover the `(sanitized endpoint id, verb)` an MCP tool name was built from.
@@ -729,6 +811,75 @@ mod tests {
             shape.route("echo__source", &BTreeSet::new(), &Map::new()),
             Ok("urn:demo:echo")
         );
+    }
+
+    /// ★ Filtering the input characters does not prove the output is a legal name.
+    ///
+    /// `sanitize_id` cannot see length, and length is exactly where the analogue of core
+    /// #99 bites: a client that rejects one over-long name rejects the WHOLE `tools/list`
+    /// response, so the failure escalates from one tool to every tool. The projection has
+    /// to read its own result back in MCP's grammar.
+    #[test]
+    fn a_projected_tool_name_is_certified_in_mcps_own_grammar() {
+        // The grammar, stated as a test rather than as a comment.
+        assert!(is_tool_name("urn_llm_config__source"));
+        assert!(is_tool_name("a"));
+        assert!(!is_tool_name(""));
+        assert!(
+            !is_tool_name("urn:llm:config__source"),
+            "`:` is not in the charset"
+        );
+        assert!(!is_tool_name("has space__source"));
+        assert!(!is_tool_name(&"x".repeat(MAX_TOOL_NAME + 1)));
+        assert!(is_tool_name(&"x".repeat(MAX_TOOL_NAME)));
+
+        // Every id in the live shapes projects to a certified name that parses back.
+        for id in [
+            "echo",
+            "urn:llm:config",
+            "urn:meeting:zoom:schedule",
+            "browse-explain-versions",
+        ] {
+            let name = checked_tool_name(id, Verb::Source).expect(id);
+            assert!(is_tool_name(&name), "{name}");
+            assert_eq!(parse_tool_name(&name).unwrap().0, sanitize_id(id));
+        }
+
+        // An id too long to project is REFUSED, with the reason — never emitted, and
+        // never replaced by a synthesized name no `tools/call` could predict.
+        let long = "urn:".to_string() + &"segment:".repeat(12);
+        let err = checked_tool_name(&long, Verb::Source).unwrap_err();
+        assert!(err.contains("over the"), "{err}");
+        // An empty id would project to `__source`, which `parse_tool_name` already
+        // refuses — so listing it would offer a tool that can never be called.
+        assert!(checked_tool_name("", Verb::Source).is_err());
+    }
+
+    /// ★★ `sanitize_id` is lossy AND it is the identity key. Two ids differing only in
+    /// punctuation become one tool name, and a call then lands wherever selection
+    /// precedence puts it. Zero collisions exist today across 285 ecosystem ids, which is
+    /// precisely why the guard is worth having now: it costs nothing and it will not be
+    /// added on the day it is needed.
+    #[test]
+    fn two_ids_differing_only_in_punctuation_collide_on_one_tool_name() {
+        assert_eq!(sanitize_id("urn:llm:config"), sanitize_id("urn.llm.config"));
+        assert_eq!(
+            tool_name("urn:llm:config", Verb::Source),
+            tool_name("urn.llm.config", Verb::Source)
+        );
+        // Which is the defect the projection must SURFACE rather than merge.
+        assert_eq!(
+            distinct_ids(["urn:llm:config", "urn.llm.config"]).len(),
+            2,
+            "two endpoints, one name — an ambiguous tool"
+        );
+        // Many rows of ONE endpoint is the deliberate, correct collapse: a federated
+        // mount lists a namespace twice, browse binds one endpoint per configured root.
+        assert_eq!(
+            distinct_ids(["browse-tree", "browse-tree", "browse-tree"]),
+            vec!["browse-tree".to_string()]
+        );
+        assert!(distinct_ids(std::iter::empty()).is_empty());
     }
 
     #[test]
