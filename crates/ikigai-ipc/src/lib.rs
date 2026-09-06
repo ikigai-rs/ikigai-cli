@@ -608,7 +608,7 @@ mod tests {
 
     fn kernel() -> Kernel {
         Kernel::new(Arc::new(
-            EndpointSpace::new().bind(Exact::new("urn:fn:toUpper"), builtins::to_upper()),
+            EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),
         ))
     }
 
@@ -617,7 +617,7 @@ mod tests {
     }
 
     fn upper(text: &str) -> Request {
-        Request::new(Verb::Source, Iri::parse("urn:fn:toUpper").unwrap())
+        Request::new(Verb::Source, Iri::parse("urn:test:upper").unwrap())
             .with_arg("in", ArgRef::Inline(text.as_bytes().to_vec()))
     }
 
@@ -668,7 +668,7 @@ mod tests {
 
         let events = collector.take();
         assert!(
-            events.iter().any(|e| e.target == "urn:fn:toUpper"),
+            events.iter().any(|e| e.target == "urn:test:upper"),
             "the remote span crossed the wire: {events:?}"
         );
 
@@ -682,7 +682,7 @@ mod tests {
         use ikigai_core::{Fallback, Space};
         use ikigai_resolve::RemoteSpace;
 
-        // Remote server: has urn:fn:toUpper.
+        // Remote server: has urn:test:upper.
         let path = socket_path("remote-mount");
         let server = serve_one(&path, kernel());
 
@@ -746,7 +746,7 @@ mod tests {
             .find(|e| e.parent == Some(root.span))
             .expect("a node stitched under the mount");
         assert_eq!(
-            child.target, "urn:fn:toUpper",
+            child.target, "urn:test:upper",
             "the remote node under the mount"
         );
 
@@ -869,7 +869,7 @@ mod tests {
         let server = serve_one(&path, kernel());
 
         let client = connect(&path).unwrap();
-        let request = Request::new(Verb::Source, Iri::parse("urn:fn:nope").unwrap());
+        let request = Request::new(Verb::Source, Iri::parse("urn:test:nope").unwrap());
         assert!(client.issue(request).is_err());
 
         drop(client);
@@ -1167,7 +1167,7 @@ mod tests {
         let client = connect(&path).unwrap();
         // An override-style mount: IRIs forwarded unchanged (the prefer/override
         // mount the personal daemon runs).
-        let mounted = MountedRemote::overriding(Arc::new(client), "urn:fn:", "test://dev.sock");
+        let mounted = MountedRemote::overriding(Arc::new(client), "urn:test:", "test://dev.sock");
         let local = Kernel::new(Arc::new(mounted));
         let (representation, _) =
             Resolver::issue_as(&local, upper("one"), &Capability::root()).unwrap();

@@ -12,7 +12,7 @@ This repository carries the transport dependencies, keeping
 ```bash
 cargo run --bin ikigai          # full-screen TUI on a terminal
 cargo run --bin ikigai -- --plain   # line REPL (also used automatically when piped)
-cargo run --bin ikigai -- -c 'source urn:fn:toUpper hello'   # run and exit (one-shot)
+cargo run --bin ikigai -- -c 'source urn:iki:fn:toUpper hello'   # run and exit (one-shot)
 cargo run --bin ikigai -- --daemon  # headless kernel: timers + watchers, no REPL
 ```
 
@@ -27,7 +27,7 @@ running in **another process** over IPC — same REPL, same commands:
 ikigai serve                    # run a kernel server on the default per-user socket
 ikigai --connect                # attach the REPL to it
 ikigai serve /tmp/k.sock        # …or an explicit socket path, on both sides
-ikigai --connect /tmp/k.sock -c 'source urn:fn:toUpper hi'
+ikigai --connect /tmp/k.sock -c 'source urn:iki:fn:toUpper hi'
 ```
 
 The cache indicator then reflects the *server's* cache, so two clients sharing a
@@ -57,11 +57,11 @@ falls back to a line-oriented REPL (handy for scripting). All drive the same
 engine, whether the kernel is in-process or across a socket.
 
 ```
-ikigai> source urn:fn:toUpper resource-oriented computing
+ikigai> source urn:iki:fn:toUpper resource-oriented computing
 RESOURCE-ORIENTED COMPUTING
 ikigai> source urn:demo:echo/hello          # {message} captured during resolution
 hello
-ikigai> describe urn:fn:toUpper             # META → text/turtle self-description
+ikigai> describe urn:iki:fn:toUpper         # META → text/turtle self-description
 @prefix ik: <https://ikigai-rs.dev/ns#> .
 <urn:ikigai:endpoint:toUpper> a ik:Endpoint ;
     ik:id "toUpper" .
@@ -99,7 +99,7 @@ Hi, c
 ```
 
 Because the split is contract-driven, an `=` in ordinary input is harmless when
-the key isn't a declared argument (`source urn:fn:toUpper a=b` → `A=B`). If a
+the key isn't a declared argument (`source urn:iki:fn:toUpper a=b` → `A=B`). If a
 positional value is left over with no unnamed argument to take it — or two
 arguments are unnamed and only one value is given — `source` says so. A named
 value can be quoted to carry whitespace — `title="Dinner with the Hendersons"`
@@ -110,7 +110,7 @@ or an unterminated quote falls back to ordinary positional input.
 as its input (the first stage may take a literal input; later stages get the pipe):
 
 ```
-ikigai> source urn:fn:toUpper hi | urn:demo:wrap
+ikigai> source urn:iki:fn:toUpper hi | urn:demo:wrap
 [HI]
 ```
 
@@ -123,13 +123,13 @@ rejoining with newlines. That newline-list is the convention `reverseList` and
 `split` already speak, so `..` threads a list endpoint through a per-item transform:
 
 ```
-ikigai> source urn:demo:split "a,b,c" .. urn:fn:toUpper
+ikigai> source urn:demo:split "a,b,c" .. urn:iki:fn:toUpper
 A
 B
 C
 ```
 
-`|` and `..` compose freely — `split "c,b,a" | urn:fn:reverseList .. urn:demo:wrap`
+`|` and `..` compose freely — `split "c,b,a" | urn:iki:fn:reverseList .. urn:demo:wrap`
 reverses the list as one value, then wraps each item: `[a]` / `[b]` / `[c]`.
 
 **Fork/join.** A stage can be a `( a | b ; c )` fork: each `;`-separated branch is
@@ -137,7 +137,7 @@ itself a pipeline, the same input is fanned to all of them, and their outputs ar
 joined (newline-concatenated, the same list convention):
 
 ```
-ikigai> source urn:demo:split "a,b,c" | ( urn:fn:toUpper ; urn:fn:reverseList )
+ikigai> source urn:demo:split "a,b,c" | ( urn:iki:fn:toUpper ; urn:iki:fn:reverseList )
 A
 B
 C
@@ -147,15 +147,15 @@ a
 ```
 
 Forks nest and compose with the connectors: a branch can be multi-stage
-(`( urn:fn:reverseList | urn:demo:wrap ; … )`), and `..` can map a whole fork over
+(`( urn:iki:fn:reverseList | urn:demo:wrap ; … )`), and `..` can map a whole fork over
 each item. At the top level a fork has no incoming value, so each branch takes its
-own literal input (`source ( urn:fn:toUpper hi ; urn:demo:wrap there )`).
+own literal input (`source ( urn:iki:fn:toUpper hi ; urn:demo:wrap there )`).
 
 **Quoting.** Wrap a word in `"…"` to keep an operator — `|`, `..`, `(`, `)`, `;` —
 or whitespace literal inside an IRI or input, so it's data rather than structure:
 
 ```
-ikigai> source urn:fn:toUpper "a | (b ; c)"
+ikigai> source urn:iki:fn:toUpper "a | (b ; c)"
 A | (B ; C)
 ```
 
@@ -171,11 +171,11 @@ of caching and recomputes each time. A pipeline summarises its stages, so you ca
 see partial reuse:
 
 ```
-ikigai> source urn:fn:toUpper hi        (computed)
+ikigai> source urn:iki:fn:toUpper hi        (computed)
 HI
-ikigai> source urn:fn:toUpper hi        (cached)
+ikigai> source urn:iki:fn:toUpper hi        (cached)
 HI
-ikigai> source urn:fn:toUpper hi | urn:demo:wrap   (1 cached · 1 computed)
+ikigai> source urn:iki:fn:toUpper hi | urn:demo:wrap   (1 cached · 1 computed)
 [HI]
 ```
 
@@ -187,11 +187,11 @@ already in the cache — a read-only probe (it takes the same `<iri> [key=value 
 [input]` as one `source` stage, but no pipelines):
 
 ```
-ikigai> cache urn:fn:toUpper hi
+ikigai> cache urn:iki:fn:toUpper hi
 not cached
-ikigai> source urn:fn:toUpper hi
+ikigai> source urn:iki:fn:toUpper hi
 HI
-ikigai> cache urn:fn:toUpper hi
+ikigai> cache urn:iki:fn:toUpper hi
 cached
 ```
 
@@ -254,7 +254,7 @@ starting with `(` evaluates as Lisp; from the command line `-e` evaluates an
 expression and `--load <uri>` runs a script:
 
 ```bash
-ikigai -e '(source "urn:fn:toUpper" "hi")'      # -> HI
+ikigai -e '(source "urn:iki:fn:toUpper" "hi")'      # -> HI
 ikigai -e '(cacheable (+ 1 2))'                 # opt-in cacheable eval
 ```
 

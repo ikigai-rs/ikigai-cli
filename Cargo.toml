@@ -29,7 +29,12 @@ ikigai-core = "0.1.64" # 0.1.64 = `Resolved.canonical`, the field a `Space` sets
 # browse-pr-explain and browse-pr-review.
 ikigai-vocab = "0.1.33" # + event terms (ik:calendar/allDay/alert) + LLM trait terms
 # The reusable function library, linked in as a published module crate.
-ikigai-fn = "0.1.2" # + urn:fn:conditional (the lazy branch: if/then/else are URIs)
+ikigai-fn = "0.2.0" # 0.2.0 = the namespace this library owns moved to `urn:iki:fn:*`
+# (toUpper/reverseList/compose/conditional). A HARD floor: the old names are not bound at all
+# by 0.2.0, so a lower pin resolving here would leave this host's alias rule rewriting every
+# `urn:fn:` request to a name nothing binds — the reverse trap, and it fails at runtime, not
+# at compile time. `urn:demo:*`, `urn:data:page` and `urn:host:info` deliberately did NOT move:
+# they are bound in several repos and a shared prefix cannot migrate one binder at a time.
 # Personal contexts (urn:personal:*), macOS-backed, linked as a published module.
 ikigai-personal = "0.7.1" # 0.7.1 = multi-day events block every spanned day (free/busy + booking); notes/URL/attendees on the graph face + description= Sink (detail preservation)
 # Capability-gated file/store module, linked as a published module crate.
