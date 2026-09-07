@@ -29,6 +29,7 @@ use ikigai_core::{
 use ikigai_resolve::{CacheStatus, Resolver};
 
 use crate::fanout::{self, FanOut};
+use crate::suggest;
 use std::collections::BTreeSet;
 
 /// A pipe stage's output: its raw bytes plus the cache provenance (expiry + golden
@@ -796,7 +797,10 @@ impl Engine {
         requests: Vec<Request>,
         prov: Provenance,
     ) -> Result<Vec<Staged>, String> {
-        type Slot = Arc<Mutex<Option<Result<(Representation, CacheStatus), String>>>>;
+        // The branch error stays TYPED across the join: the near-name suggestion needs the
+        // catalog, and reading it can be a blocking round-trip on a remote resolver — which
+        // must not happen on a spawned worker. Stringify on this thread, after the join.
+        type Slot = Arc<Mutex<Option<Result<(Representation, CacheStatus), ikigai_core::Error>>>>;
         let capability = self.capability.borrow().clone();
         // The width this fan-out will actually reach: the request count bounded by how
         // many tasks the spawner carries at once, with an unknown width read as 1. The
@@ -841,16 +845,14 @@ impl Engine {
                     // Each fanned-out branch/item inherits the same upstream provenance.
                     let mut result = resolver
                         .issue_as_async_with_incoming(request, &capability, prov.clone())
-                        .await
-                        .map_err(|e| e.to_string());
+                        .await;
                     if let (Err(error), Some(term), Some(fallback)) = (&result, &hint, fallback) {
-                        if fanout::is_hint_no_match(error, term) {
+                        if fanout::is_hint_no_match(&error.to_string(), term) {
                             // Nothing declares a crossover at or below this width. Ask
                             // for what the caller actually asked for.
                             result = resolver
                                 .issue_as_async_with_incoming(fallback, &capability, prov)
-                                .await
-                                .map_err(|e| e.to_string());
+                                .await;
                         }
                     }
                     *slot.lock().expect("branch slot") = Some(result);
@@ -866,7 +868,8 @@ impl Engine {
                 .lock()
                 .expect("branch slot")
                 .take()
-                .expect("spawned branch completed")?;
+                .expect("spawned branch completed")
+                .map_err(|e| describe(&*self.resolver, &e))?;
             stats.record(status);
             let expiry = representation.expiry;
             let threads = representation.threads().clone();
@@ -1367,6 +1370,15 @@ impl Engine {
                     "error"
                 };
                 out.push(format!("{}   {tag}: {error}", short_iri(iri.as_str())));
+                // `trace` already holds the catalog, so the near-name hint costs nothing
+                // extra here — and this is exactly where someone is hunting a name.
+                if let ikigai_core::Error::Unresolved(missed) = &error {
+                    let patterns: Vec<String> =
+                        entries.iter().map(|entry| entry.pattern.clone()).collect();
+                    if let Some(note) = suggest::note(missed.as_str(), &patterns) {
+                        out.push(format!("{SUGGESTION_INDENT}{note}"));
+                    }
+                }
             }
         }
         Ok(out.join("\n"))
@@ -1492,12 +1504,12 @@ impl Engine {
                 .resolver
                 .issue_as_async_with_incoming(request, &capability, prov)
                 .await
-                .map_err(|e| e.to_string())?,
+                .map_err(|e| describe(&*self.resolver, &e))?,
             None => self
                 .resolver
                 .issue_as_async(request, &capability)
                 .await
-                .map_err(|e| e.to_string())?,
+                .map_err(|e| describe(&*self.resolver, &e))?,
         };
         let mut stats = self.cache.get();
         stats.record(status);
@@ -1509,6 +1521,41 @@ impl Engine {
             expiry,
             threads,
         })
+    }
+}
+
+/// Lines a continuation up under the `error: ` prefix that the REPL, the `-c` batch
+/// and the TUI each write in front of a message. Presentation, not protocol: the
+/// prefix is the faces', so the indent that clears it belongs beside them.
+const SUGGESTION_INDENT: &str = "       ";
+
+/// A resolution failure as a **face** should say it: the typed error's own words,
+/// plus a near-name suggestion when — and only when — the catalog actually binds one.
+///
+/// ```text
+/// error: no endpoint resolved for urn:iki:fn:toUpper
+///        did you mean `urn:fn:toUpper`? (bound here)
+/// ```
+///
+/// [`ikigai_core::Error::Unresolved`] is deliberately untouched — it carries the fact
+/// and nothing else, and its `Display` has no kernel to consult. Enrichment happens
+/// here, where the resolver (and so the catalog) is in hand. With no candidate the
+/// returned string is byte-identical to `error.to_string()`, which is the property
+/// that keeps this from making every error noisier.
+fn describe(resolver: &dyn Resolver, error: &ikigai_core::Error) -> String {
+    let text = error.to_string();
+    let ikigai_core::Error::Unresolved(iri) = error else {
+        return text;
+    };
+    // Only reached once a resolve has already failed, so the catalog read — a blocking
+    // round-trip on a remote resolver — is off every hot path.
+    let Some(entries) = resolver.entries() else {
+        return text;
+    };
+    let patterns: Vec<String> = entries.into_iter().map(|entry| entry.pattern).collect();
+    match suggest::note(iri.as_str(), &patterns) {
+        Some(note) => format!("{text}\n{SUGGESTION_INDENT}{note}"),
+        None => text,
     }
 }
 
@@ -2559,6 +2606,112 @@ mod tests {
         let err = output(engine.eval("source urn:test:three .. urn:test:broken")).unwrap_err();
         assert!(err.contains("boom"), "{err}");
         assert_eq!(CALLS.load(Ordering::SeqCst), 3, "one attempt per item");
+    }
+
+    // --- unresolved-name suggestions (see `crate::suggest`) --------------------
+
+    /// The wiring, not the rule: an unresolved name whose leaf IS bound elsewhere
+    /// comes back with the suggestion hung under the message, indented to clear the
+    /// `error: ` prefix each face writes.
+    #[test]
+    fn an_unresolved_name_names_the_near_binding_that_is_bound() {
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:fn:toUpper"), echo_endpoint())
+            .bind(Exact::new("urn:test:three"), fixed_list("a\nb\nc"));
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ));
+        let err = output(engine.eval("source urn:iki:fn:toUpper hi")).unwrap_err();
+        assert_eq!(
+            err,
+            "no endpoint resolved for urn:iki:fn:toUpper\n       \
+             did you mean `urn:fn:toUpper`? (bound here)"
+        );
+    }
+
+    /// The regression that matters more: with nothing near, the message must be
+    /// BYTE-IDENTICAL to the typed error's own words. A suggestion that fires on
+    /// everything is noise, and noise on an error path teaches people to stop
+    /// reading errors.
+    #[test]
+    fn an_unresolved_name_with_nothing_near_is_unchanged() {
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:fn:toUpper"), echo_endpoint())
+            .bind(Exact::new("urn:test:three"), fixed_list("a\nb\nc"));
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ));
+        let err = output(engine.eval("source urn:iki:fn:sideways hi")).unwrap_err();
+        let bare =
+            ikigai_core::Error::Unresolved(Iri::parse("urn:iki:fn:sideways").unwrap()).to_string();
+        assert_eq!(err, bare);
+        assert!(
+            !err.contains('\n'),
+            "the bare message stays one line: {err:?}"
+        );
+    }
+
+    /// A resolver that cannot enumerate (a remote space, a rewrite) has no catalog to
+    /// consult, and must degrade to the bare message rather than to a panic or a guess.
+    #[test]
+    fn a_space_that_cannot_enumerate_still_prints_the_bare_message() {
+        struct Opaque;
+        impl ikigai_core::Space for Opaque {
+            fn resolve(
+                &self,
+                _request: &Request,
+                _scope: &ikigai_core::Scope,
+            ) -> ikigai_core::Resolution {
+                ikigai_core::Resolution::Miss
+            }
+        }
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(Opaque),
+            Arc::new(JsonRenderer),
+        ));
+        let err = output(engine.eval("source urn:iki:fn:toUpper hi")).unwrap_err();
+        assert_eq!(err, "no endpoint resolved for urn:iki:fn:toUpper");
+    }
+
+    /// The fan-out path stringifies its branch errors on the REPL thread, after the
+    /// join — so a mapped stage gets the same suggestion the single-request path does.
+    #[test]
+    fn a_fanned_out_branch_gets_the_suggestion_too() {
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:fn:toUpper"), echo_endpoint())
+            .bind(Exact::new("urn:test:three"), fixed_list("a\nb\nc"));
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ))
+        .with_spawner(Arc::new(InlineSpawner));
+        let err = output(engine.eval("source urn:test:three .. urn:iki:fn:toUpper")).unwrap_err();
+        assert_eq!(
+            err,
+            "no endpoint resolved for urn:iki:fn:toUpper\n       \
+             did you mean `urn:fn:toUpper`? (bound here)"
+        );
+    }
+
+    /// `trace` is the other place a person hunts for a name, and it already holds the
+    /// catalog — so the hint costs it nothing.
+    #[test]
+    fn trace_hangs_the_suggestion_under_the_failing_row() {
+        let space = EndpointSpace::new().bind(Exact::new("urn:fn:toUpper"), echo_endpoint());
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ));
+        let out = output(engine.eval("trace urn:iki:fn:toUpper")).unwrap();
+        assert!(
+            out.contains("did you mean `urn:fn:toUpper`? (bound here)"),
+            "{out}"
+        );
+        // …and stays quiet when nothing is near.
+        let out = output(engine.eval("trace urn:iki:fn:sideways")).unwrap();
+        assert!(!out.contains("did you mean"), "{out}");
     }
 
     fn output(action: Action) -> Result<String, String> {

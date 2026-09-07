@@ -1364,9 +1364,34 @@ fn scratch_result_lines(result: &Result<String, String>) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from("─ result ─".dim())];
     match result {
         Ok(out) => lines.extend(out.lines().map(|l| Line::from(l.to_string().green()))),
-        Err(err) => lines.push(Line::from(format!("error: {err}").red())),
+        Err(err) => lines.extend(error_lines(err)),
     }
     lines
+}
+
+/// An error message as red `Line`s — one per `\n`, because a `Line` is one line and a
+/// newline inside it renders as a stray glyph, not a break. Errors gained a second line
+/// when the engine started hanging a near-name suggestion under an unresolved IRI; the
+/// `error: ` prefix goes on the first line only, and the engine has already indented the
+/// continuation to clear it.
+///
+/// An empty message still renders the bare `error: ` — `"".lines()` yields nothing, and
+/// an error that draws zero lines is indistinguishable from no error at all.
+fn error_lines(err: &str) -> Vec<Line<'static>> {
+    if err.is_empty() {
+        return vec![Line::from("error: ".red())];
+    }
+    err.lines()
+        .enumerate()
+        .map(|(i, l)| {
+            let text = if i == 0 {
+                format!("error: {l}")
+            } else {
+                l.to_string()
+            };
+            Line::from(text.red())
+        })
+        .collect()
 }
 
 /// Render the Docs page: a header naming the resource, then the catalog text (Turtle).
@@ -1480,7 +1505,7 @@ fn transcript_lines(transcript: &[Entry]) -> Vec<Line<'static>> {
         lines.push(Line::from(prompt));
         match &entry.result {
             Ok(out) => lines.extend(out.lines().map(|l| Line::from(l.to_string().green()))),
-            Err(err) => lines.push(Line::from(format!("error: {err}").red())),
+            Err(err) => lines.extend(error_lines(err)),
         }
     }
     lines
@@ -1508,6 +1533,29 @@ mod tests {
         assert_eq!(demo_index(TAB_CONTROL), None);
         assert_eq!(demo_index(TAB_DEMO_BASE), Some(0));
         assert_eq!(demo_index(TAB_DEMO_BASE + 1), Some(1));
+    }
+
+    /// A multi-line error (the engine hangs a near-name suggestion under an unresolved
+    /// IRI) becomes one `Line` per line, with the `error: ` prefix on the first only —
+    /// a `\n` inside a single `Line` renders as a stray glyph, not a break.
+    #[test]
+    fn a_multi_line_error_becomes_one_line_each() {
+        let lines = error_lines(
+            "no endpoint resolved for urn:iki:fn:toUpper\n       \
+             did you mean `urn:fn:toUpper`? (bound here)",
+        );
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0].spans[0].content,
+            "error: no endpoint resolved for urn:iki:fn:toUpper"
+        );
+        assert_eq!(
+            lines[1].spans[0].content,
+            "       did you mean `urn:fn:toUpper`? (bound here)"
+        );
+        // The single-line case is unchanged, and an empty one still says something.
+        assert_eq!(error_lines("boom").len(), 1);
+        assert_eq!(error_lines("").len(), 1);
     }
 
     // The interactive loop can't run headless, but `draw` can — exercise it at

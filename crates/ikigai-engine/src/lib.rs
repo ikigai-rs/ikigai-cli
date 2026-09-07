@@ -14,6 +14,7 @@
 pub mod config;
 pub mod engine;
 pub mod fanout;
+pub mod suggest;
 
 pub use engine::{Action, CacheStats, Engine, Entry, HELP};
 pub use fanout::FanOut;
