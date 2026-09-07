@@ -85,9 +85,20 @@ usage:
   ikigai -e '<sexpr>' ...       evaluate a Lisp s-expression (urn:lisp:eval), then exit
   ikigai --load <uri> [--cap <s>]  read a script resource and evaluate it as Lisp (--cap narrows first)
   ikigai -h | --help           show this help
+  ikigai -V | --version        print `ikigai <x.y.z>` on one line and exit — answered in
+                               every mode, before anything is built or connected
 
 QUIC: --server-cert/--server-key name the server's identity, --client-cert/--client-key the client's
 inside the REPL: source, describe, help, quit (type `help` for details)";
+
+/// The single line `-V`/`--version` prints. ONE version string for the whole binary:
+/// the same spelling as the REPL banner (`repl.rs`), the no-transport message below,
+/// and the MCP server's `version` field — so a script comparing a host against a
+/// release does not have to know which face produced the number.
+///
+/// Deliberately undecorated. The caller is usually a script, not a human: `ikigai
+/// 0.1.18`, nothing else on the line, exit 0.
+const VERSION_LINE: &str = concat!("ikigai ", env!("CARGO_PKG_VERSION"));
 
 use ikigai_engine::Engine;
 
@@ -107,6 +118,10 @@ struct Certs {
 
 /// What the CLI was asked to do.
 enum Mode {
+    /// `-V` / `--version`: print `VERSION_LINE` to stdout and exit 0. A mode rather
+    /// than an early `Ok(None)` because `Ok(None)` means "print the usage block",
+    /// and burying a version behind a screen of help is the failure this fixes.
+    Version,
     Repl(ReplArgs),
     /// Headless: build the watched kernel (timers, watcher, the standing sync)
     /// and park — the launchd-agent face of the desktop machine. Carries any
@@ -302,6 +317,17 @@ fn width_routing_flag(arg: &str, argv: &mut impl Iterator<Item = String>) -> Res
     Ok(true)
 }
 
+/// `-V` / `--version` appearing anywhere in argv.
+///
+/// The scan is exact-token and unconditional — it does not know which flags take a
+/// value, so a literal `--version` handed to one of them (`--name --version`) reads
+/// as a version request. That is the deliberate price of not keeping a list of
+/// value-taking flags here: such a list would rot silently the next time a flag is
+/// added, and the failure would be a version flag that stops working in one arm.
+fn version_requested<'a>(mut args: impl Iterator<Item = &'a str>) -> bool {
+    args.any(|arg| arg == "-V" || arg == "--version")
+}
+
 /// Parse argv. `Ok(None)` means a usage request was handled and we should exit 0.
 fn parse_args() -> Result<Option<Mode>, String> {
     parse_argv(std::env::args().skip(1))
@@ -310,7 +336,15 @@ fn parse_args() -> Result<Option<Mode>, String> {
 /// The argument parser proper, over any argv — so it can be tested without a
 /// process (which is how the per-mount certificate behaviour below is pinned).
 fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String> {
-    let mut argv = args.peekable();
+    let args: Vec<String> = args.collect();
+    // BEFORE any subcommand or mode parsing can consume it: `ikigai --version`,
+    // `ikigai serve --version` and `ikigai --plain --version` must all answer the
+    // same way. A version flag that works in only one arm is worse than none,
+    // because it gets trusted.
+    if version_requested(args.iter().map(String::as_str)) {
+        return Ok(Some(Mode::Version));
+    }
+    let mut argv = args.into_iter().peekable();
 
     if argv.peek().map(String::as_str) == Some("cert") {
         argv.next();
@@ -764,6 +798,10 @@ fn main() {
     });
 
     match mode {
+        // One line, stdout, exit 0. Nothing is built, nothing is connected: the
+        // question "which build am I on?" is asked precisely when the host is
+        // suspect, so answering it must not depend on the host working.
+        Mode::Version => println!("{VERSION_LINE}"),
         Mode::Daemon { mounts } => daemon(mounts),
         Mode::Mcp {
             grants,
@@ -2437,6 +2475,13 @@ fn connect_ipc(_path: Option<String>) -> Result<Engine, String> {
 
 #[cfg(not(feature = "embedded"))]
 fn main() {
+    // A build with no transport still has to say what it is — that is exactly the
+    // host someone is interrogating. Same parser, same line, exit 0; everything
+    // else on this build is still the message below.
+    if matches!(parse_args(), Ok(Some(Mode::Version))) {
+        println!("{VERSION_LINE}");
+        return;
+    }
     eprintln!(
         "ikigai {}: built without a transport. Rebuild with a transport feature, e.g. `--features embedded`.",
         env!("CARGO_PKG_VERSION")
@@ -2895,5 +2940,92 @@ mod scheduler_flag_tests {
             panic!("a flag with no value is an error")
         };
         assert!(e.contains("--width-routing"), "{e}");
+    }
+}
+
+/// `-V` / `--version`. This is the flag anyone debugging a client-library
+/// integration reaches for first — three repos in one day worked around its absence
+/// by resolving a known name and interpreting the failure — and it is exactly the
+/// kind of flag that works the day it is written and breaks silently the next time
+/// the argument parser is restructured. Nothing else in this suite would notice.
+#[cfg(test)]
+mod version_flag_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Option<Mode>, String> {
+        parse_argv(args.iter().map(|s| s.to_string()))
+    }
+
+    /// The OUTPUT contract, which is what a script actually depends on: `ikigai
+    /// <version>` — one line, two tokens, no decoration — carrying the same number
+    /// the REPL banner and the MCP server report.
+    #[test]
+    fn the_version_line_is_one_undecorated_line() {
+        assert_eq!(
+            VERSION_LINE,
+            format!("ikigai {}", env!("CARGO_PKG_VERSION")),
+            "one version string for the whole binary"
+        );
+        assert!(
+            !VERSION_LINE.contains('\n'),
+            "a script reads one line: {VERSION_LINE:?}"
+        );
+        assert_eq!(
+            VERSION_LINE.split(' ').count(),
+            2,
+            "`ikigai <x.y.z>` and nothing else: {VERSION_LINE:?}"
+        );
+    }
+
+    /// Every argument path answers it. The flag is consumed before any subcommand or
+    /// mode parsing, so it cannot depend on which mode the REST of argv would have
+    /// selected, and it never falls through to the usage printer (`Ok(None)`) — a
+    /// version buried in a screen of help is the failure this replaces.
+    #[test]
+    fn every_argument_path_answers_the_version_flag() {
+        for args in [
+            vec!["--version"],
+            vec!["-V"],
+            vec!["serve", "--version"],
+            vec!["serve", "-V"],
+            vec!["serve", "quic://127.0.0.1:4433", "--version"],
+            vec!["mcp", "--version"],
+            vec!["cert", "--version"],
+            vec!["cert", "generate", "--version"],
+            vec!["--daemon", "--version"],
+            vec!["--plain", "--version"],
+            vec!["--demo", "--plain", "-V"],
+            vec!["-c", "source urn:host:info", "--version"],
+            vec!["--version", "-c", "source urn:host:info"],
+            vec!["--connect", "--version"],
+        ] {
+            assert!(
+                matches!(parse(&args), Ok(Some(Mode::Version))),
+                "the version flag must be answered in every arm, not just one: {args:?}"
+            );
+        }
+    }
+
+    /// …and the scan changes nothing else: argv without the flag still parses to the
+    /// mode it always did, including the arms whose own parsers would reject an
+    /// unknown flag.
+    #[test]
+    fn argv_without_the_flag_is_untouched() {
+        assert!(matches!(parse(&[]), Ok(Some(Mode::Repl(_)))));
+        assert!(matches!(parse(&["--plain"]), Ok(Some(Mode::Repl(_)))));
+        assert!(matches!(
+            parse(&["--daemon"]),
+            Ok(Some(Mode::Daemon { .. }))
+        ));
+        assert!(matches!(parse(&["serve"]), Ok(Some(Mode::Serve { .. }))));
+        assert!(matches!(parse(&["mcp"]), Ok(Some(Mode::Mcp { .. }))));
+        assert!(
+            matches!(parse(&["-h"]), Ok(None)),
+            "help still prints usage"
+        );
+        assert!(
+            parse(&["--versionn"]).is_err(),
+            "a near-miss is still an unknown argument, not a version request"
+        );
     }
 }
