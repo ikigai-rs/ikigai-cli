@@ -29,7 +29,7 @@ ikigai-throttle = { workspace = true }
 # mDNS announce/browse. The one sibling this host names by path rather than through
 # `[workspace.dependencies]`; the version is the LOCKSTEP version, not a floor (see the root
 # manifest for why, and `crates/ikigai-cli/tests/lockstep_pins.rs` for the check).
-ikigai-discovery = { path = "../ikigai-discovery", version = "0.1.17" }
+ikigai-discovery = { path = "../ikigai-discovery", version = "0.1.18" }
 ikigai-fs = { workspace = true }
 ikigai-http = { workspace = true }
 ikigai-runbook = { workspace = true }
