@@ -1364,9 +1364,28 @@ fn scratch_result_lines(result: &Result<String, String>) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from("─ result ─".dim())];
     match result {
         Ok(out) => lines.extend(out.lines().map(|l| Line::from(l.to_string().green()))),
-        Err(err) => lines.push(Line::from(format!("error: {err}").red())),
+        Err(err) => lines.extend(error_lines(err)),
     }
     lines
+}
+
+/// An error message as red `Line`s — one per `\n`, because a `Line` is one line and a
+/// newline inside it renders as a stray glyph, not a break. Errors gained a second line
+/// when the engine started hanging a near-name suggestion under an unresolved IRI; the
+/// `error: ` prefix goes on the first line only, and the engine has already indented the
+/// continuation to clear it.
+fn error_lines(err: &str) -> Vec<Line<'static>> {
+    err.lines()
+        .enumerate()
+        .map(|(i, l)| {
+            let text = if i == 0 {
+                format!("error: {l}")
+            } else {
+                l.to_string()
+            };
+            Line::from(text.red())
+        })
+        .collect()
 }
 
 /// Render the Docs page: a header naming the resource, then the catalog text (Turtle).
@@ -1480,7 +1499,7 @@ fn transcript_lines(transcript: &[Entry]) -> Vec<Line<'static>> {
         lines.push(Line::from(prompt));
         match &entry.result {
             Ok(out) => lines.extend(out.lines().map(|l| Line::from(l.to_string().green()))),
-            Err(err) => lines.push(Line::from(format!("error: {err}").red())),
+            Err(err) => lines.extend(error_lines(err)),
         }
     }
     lines
