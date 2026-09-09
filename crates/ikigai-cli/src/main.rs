@@ -54,6 +54,8 @@ usage:
                                 --routes <iri>: load routes from an RDF or plain-JSON resource
                                 (a urn:file: route hot-reloads); --routes-only: un-routed → 404;
                                 --max-body <bytes>: largest accepted request body, default 1048576]
+                               workspace files are LIVE: an on-disk edit under ~/.ikigai/workspace
+                               (a stylesheet, a context) is served on the next request, no restart
   ikigai --daemon              headless: timers, the watcher, and the standing sync — for launchd
   ikigai --name <instance>     name this instance (scopes <name>.* config properties; defaults
                                repl / daemon / serve by mode)
@@ -147,6 +149,8 @@ enum Mode {
         /// `--http <port|addr>`: serve the inbound HTTP face instead of IPC/QUIC.
         /// A bare port binds `127.0.0.1:<port>` (loopback — TLS terminates at the
         /// fronting proxy, e.g. Apache); a full `host:port` overrides the bind.
+        /// Workspace files are live: the served kernel watches `~/.ikigai/workspace`,
+        /// so an on-disk edit is served on the next request.
         http: Option<String>,
         /// `--trust-proxy`: honor `X-Forwarded-Proto`/`-For` from the upstream (enable
         /// ONLY behind a proxy you control, e.g. Apache). Drives HTTPS detection for HSTS.
@@ -2328,7 +2332,9 @@ fn serve_http(
             }
         }
     };
-    let kernel = std::sync::Arc::new(ikigai_embedded::kernel_for("Remote (HTTP)"));
+    // Already shared: the door's kernel arrives holding a workspace watcher, so a file
+    // replaced on disk is served fresh on the next request (no restart).
+    let kernel = ikigai_embedded::kernel_for("Remote (HTTP)");
     // `--cap` clamps every request to a fixed ceiling — how the public HTTP face is
     // narrowed for the edge (a request can reach only what the ceiling grants). Without
     // it, the public (empty-scope) capability: only cap-free resources resolve.

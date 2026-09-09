@@ -1562,13 +1562,16 @@ pub fn calendar_server_kernel_with_eval() -> Kernel {
 }
 
 /// [`kernel_for`] plus the governed wire-eval binding — the default served
-/// surface for an operator whose `--cap` ceiling grants `urn:cap:lisp`.
-pub fn kernel_for_with_eval(nature: &'static str) -> Kernel {
-    Kernel::with_meta_renderer(
-        with_wire_eval(Arc::new(served_space(nature))),
-        Arc::new(CliRenderer),
+/// surface for an operator whose `--cap` ceiling grants `urn:cap:lisp`. Watched over
+/// the workspace like [`kernel_for`].
+pub fn kernel_for_with_eval(nature: &'static str) -> Arc<Kernel> {
+    watched_workspace(
+        Kernel::with_meta_renderer(
+            with_wire_eval(Arc::new(served_space(nature))),
+            Arc::new(CliRenderer),
+        )
+        .with_aliases(base_alias_table()),
     )
-    .with_aliases(base_alias_table())
 }
 
 /// Which optional faces a served kernel carries. Each is decided by the
@@ -1593,7 +1596,7 @@ pub struct ServedSurface {
 
 /// Build the served kernel for `surface`. One composer instead of a kernel
 /// function per combination.
-pub fn served_kernel(nature: &'static str, surface: ServedSurface) -> Kernel {
+pub fn served_kernel(nature: &'static str, surface: ServedSurface) -> Arc<Kernel> {
     served_kernel_with_mounts(nature, surface, Vec::new())
 }
 
@@ -1601,11 +1604,17 @@ pub fn served_kernel(nature: &'static str, surface: ServedSurface) -> Kernel {
 /// face of THE HOST OWNS THE TOPOLOGY ([`trusted_kernel_with_mounts`] is the IPC
 /// face). A mount widens REACH, never authority: a client resolves through it
 /// under its own clamped capability, which travels to the mounted peer.
+///
+/// Shared with a workspace watcher, as [`kernel_for`] is and for the same reason: the
+/// general surface binds the cacheable `urn:file:*`, and a QUIC peer reading a workspace
+/// file would otherwise be served the first version it ever saw until the process
+/// restarted. The calendar-only surface (`personal`) binds no file module, so the
+/// watcher is simply idle there.
 pub fn served_kernel_with_mounts(
     nature: &'static str,
     surface: ServedSurface,
     mounts: Vec<MountSpec>,
-) -> Kernel {
+) -> Arc<Kernel> {
     let mut spaces: Vec<Arc<dyn Space>> = Vec::new();
     // The LLM face sits in front of the base surface (it binds its own namespace;
     // order only matters for a prefix collision, and there is none).
@@ -1623,12 +1632,14 @@ pub fn served_kernel_with_mounts(
     } else {
         composed
     };
-    Kernel::with_meta_renderer(root, Arc::new(CliRenderer))
-        // ⚠ Same ordering caveat as `build_watched`: `with_aliases` wraps the ROOT and the
-        // mounts were composed into it above, so a `--prefer urn:fn:=…` mount sits INSIDE
-        // the alias and never sees a `urn:fn:` request again — the rewrite happens first.
-        // A served mount over this family must name `urn:iki:fn:`.
-        .with_aliases(base_alias_table())
+    watched_workspace(
+        Kernel::with_meta_renderer(root, Arc::new(CliRenderer))
+            // ⚠ Same ordering caveat as `build_watched`: `with_aliases` wraps the ROOT and
+            // the mounts were composed into it above, so a `--prefer urn:fn:=…` mount sits
+            // INSIDE the alias and never sees a `urn:fn:` request again — the rewrite
+            // happens first. A served mount over this family must name `urn:iki:fn:`.
+            .with_aliases(base_alias_table()),
+    )
 }
 
 /// The native HTTP transport backing the `urn:http*` endpoints: a blocking `ureq`
@@ -4644,34 +4655,99 @@ fn derive_every() -> Option<std::time::Duration> {
 /// watch error disables it silently (caching then invalidates only on
 /// kernel-mediated writes — still correct for files written through ikigai).
 fn watch_root(kernel: Arc<Kernel>, root: PathBuf) {
-    // Canonicalize so the prefix matches the paths `notify` reports — it resolves
-    // symlinks (notably macOS maps `/var` → `/private/var`), and the relative path
-    // is what becomes the `urn:file:<rel>` thread.
-    let root = root.canonicalize().unwrap_or(root);
     std::thread::spawn(move || {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut watcher = match notify::recommended_watcher(move |res| {
-            let _ = tx.send(res);
-        }) {
-            Ok(watcher) => watcher,
-            Err(_) => return,
-        };
-        if watcher.watch(&root, RecursiveMode::Recursive).is_err() {
-            return;
-        }
-        // `watcher` is held to the end of this scope, keeping the watch (and the
-        // channel) alive; the loop blocks until the process exits.
-        for event in rx.iter().flatten() {
-            if event.kind.is_access() {
-                continue; // a read doesn't change content
-            }
-            for path in &event.paths {
-                if let Some(thread) = file_thread(&root, path) {
-                    kernel.cut(thread);
-                }
-            }
+        if let Some(watch) = WorkspaceWatch::start(kernel, root) {
+            watch.run();
         }
     });
+}
+
+/// Share `kernel` with a watcher over the workspace ([`file_root`]) and hand back the
+/// shared handle. Every served constructor whose space binds the cacheable `urn:file:*`
+/// module goes through here — it is the one line that decides whether a served kernel
+/// notices an on-disk edit, so it is a function rather than four copies of two lines.
+fn watched_workspace(kernel: Kernel) -> Arc<Kernel> {
+    let kernel = Arc::new(kernel);
+    watch_root(Arc::clone(&kernel), file_root());
+    kernel
+}
+
+/// A live watch over a workspace root: the platform watcher (FSEvents / inotify), the
+/// channel it reports on, and the kernel whose `urn:file:<rel>` threads it cuts.
+///
+/// Split from the thread that drives it ([`watch_root`]) so a test can drive it INSTEAD:
+/// [`Self::apply_next`] blocks on the watcher's own notification and applies the cut,
+/// which is the only way to assert "the read recomputes after the change" without a
+/// sleep that passes by luck on a fast machine and fails by luck on a slow one.
+struct WorkspaceWatch {
+    kernel: Arc<Kernel>,
+    /// Canonical, so it prefixes the paths `notify` reports (see [`Self::start`]).
+    root: PathBuf,
+    events: std::sync::mpsc::Receiver<notify::Result<notify::Event>>,
+    /// Held for the watch's lifetime: dropping it ends the platform watch and closes
+    /// `events`.
+    _watcher: notify::RecommendedWatcher,
+}
+
+impl WorkspaceWatch {
+    /// Start watching `root` on `kernel`'s behalf. `None` when the platform watcher cannot
+    /// be created or pointed at `root`.
+    fn start(kernel: Arc<Kernel>, root: PathBuf) -> Option<Self> {
+        // Canonicalize so the prefix matches the paths `notify` reports — it resolves
+        // symlinks (notably macOS maps `/var` → `/private/var`), and the relative path
+        // is what becomes the `urn:file:<rel>` thread.
+        let root = root.canonicalize().unwrap_or(root);
+        let (tx, events) = std::sync::mpsc::channel();
+        let mut watcher = notify::recommended_watcher(move |res| {
+            let _ = tx.send(res);
+        })
+        .ok()?;
+        watcher.watch(&root, RecursiveMode::Recursive).ok()?;
+        Some(Self {
+            kernel,
+            root,
+            events,
+            _watcher: watcher,
+        })
+    }
+
+    /// Cut the thread of every path a change names. Returns the threads cut — empty for
+    /// an access (a read changes no content), a path outside the root, or a watcher error
+    /// (which names no path).
+    fn apply(&self, event: notify::Result<notify::Event>) -> Vec<String> {
+        let Ok(event) = event else {
+            return Vec::new();
+        };
+        if event.kind.is_access() {
+            return Vec::new();
+        }
+        let cut: Vec<String> = event
+            .paths
+            .iter()
+            .filter_map(|path| file_thread(&self.root, path))
+            .collect();
+        for thread in &cut {
+            self.kernel.cut(thread.as_str());
+        }
+        cut
+    }
+
+    /// Wait up to `timeout` for the watcher's next notification and apply it. `None` when
+    /// nothing arrived in time or the watch has ended; otherwise what [`Self::apply`] cut.
+    #[cfg(test)]
+    fn apply_next(&self, timeout: std::time::Duration) -> Option<Vec<String>> {
+        self.events
+            .recv_timeout(timeout)
+            .ok()
+            .map(|event| self.apply(event))
+    }
+
+    /// Drive the watch until its channel closes — in practice, for the process's lifetime.
+    fn run(self) {
+        for event in self.events.iter() {
+            self.apply(event);
+        }
+    }
 }
 
 /// Watch the org directory and trigger a consolidated-view derivation when an
@@ -4867,7 +4943,7 @@ fn file_thread(root: &Path, path: &Path) -> Option<String> {
 /// carries its (possibly attenuated) capability, which the server clamps to that
 /// principal. Distinct from [`kernel_for`], the QUIC kernel, which omits personal
 /// because a QUIC peer isn't authenticated yet.
-pub fn trusted_kernel_for(nature: &'static str) -> Kernel {
+pub fn trusted_kernel_for(nature: &'static str) -> Arc<Kernel> {
     // The same-user IPC surface is the FULL embedded root — llm, rdf, meeting,
     // the demo-gated runbook, everything the terminal REPL gets. Peercred means
     // the peer IS this user: the socket is a process boundary, not a trust
@@ -4894,7 +4970,11 @@ pub fn trusted_kernel_for(nature: &'static str) -> Kernel {
 /// It is also what `ikigai.el`'s own docs already promised — "a connected host owns its own
 /// mounts, so a machine's transport and topology are a property of that host" — which was
 /// unachievable while only the REPL and `--daemon` could take mount flags.
-pub fn trusted_kernel_with_mounts(nature: &'static str, mounts: Vec<MountSpec>) -> Kernel {
+///
+/// Shared with a workspace watcher (see [`kernel_for`]): the root binds the cacheable
+/// `urn:file:*`, and an IPC client is the same principal as the terminal, whose REPL
+/// already sees an on-disk edit through [`watched_kernel`]'s watcher.
+pub fn trusted_kernel_with_mounts(nature: &'static str, mounts: Vec<MountSpec>) -> Arc<Kernel> {
     start_uptime_clock();
     let _ = nature;
     let space = if mounts.is_empty() {
@@ -4902,12 +4982,14 @@ pub fn trusted_kernel_with_mounts(nature: &'static str, mounts: Vec<MountSpec>) 
     } else {
         root_space_with_mounts(mounts)
     };
-    Kernel::with_meta_renderer(with_wire_eval(space), Arc::new(CliRenderer))
-        .with_clock(Arc::new(SystemClock))
-        .with_subclass_axioms(subclass_axioms())
-        // Same caveat as `build_watched`: `mounts` are inside this wrap and see the
-        // canonical name. See [`alias_table`].
-        .with_aliases(alias_table())
+    watched_workspace(
+        Kernel::with_meta_renderer(with_wire_eval(space), Arc::new(CliRenderer))
+            .with_clock(Arc::new(SystemClock))
+            .with_subclass_axioms(subclass_axioms())
+            // Same caveat as `build_watched`: `mounts` are inside this wrap and see the
+            // canonical name. See [`alias_table`].
+            .with_aliases(alias_table()),
+    )
 }
 
 /// Build the **HTTP door's** kernel (`ikigai serve --http`), labelled `nature`: the
@@ -4924,7 +5006,22 @@ pub fn trusted_kernel_with_mounts(nature: &'static str, mounts: Vec<MountSpec>) 
 /// (the edge's posture) an un-routed path never reaches any of them: the route table is
 /// the surface allowlist, the capability the authority ceiling, and this list is what
 /// those two gate. The QUIC face ([`served_kernel`]) is unchanged.
-pub fn kernel_for(nature: &'static str) -> Kernel {
+///
+/// **Workspace files are live.** The kernel is shared with a watcher over [`file_root`]
+/// (the same one [`watched_kernel`] runs), so an on-disk edit cuts its `urn:file:<rel>`
+/// thread and the next request recomputes. Until 2026-09-09 this kernel ran no watcher:
+/// `urn:file:*` is `.cacheable().depends_on(target)`, so the edge kept rendering a
+/// replaced `foaf.xsl` until the unit was restarted — the cache was correct about every
+/// write it could see, and nothing told it about the one it could not. Reach only: the
+/// watcher holds no capability and the door's ceiling is unchanged.
+pub fn kernel_for(nature: &'static str) -> Arc<Kernel> {
+    watched_workspace(door_kernel(nature))
+}
+
+/// [`kernel_for`] before it is shared with its watcher. Separate so the watch test can
+/// drive the door's exact space through a hand-held [`WorkspaceWatch`]; production never
+/// holds an unwatched one.
+fn door_kernel(nature: &'static str) -> Kernel {
     let spaces: Vec<Arc<dyn Space>> = vec![
         Arc::new(served_space(nature)) as Arc<dyn Space>,
         // `urn:foaf`, the negotiated FOAF face (see [`foaf`]), routed as `/foaf` on the
@@ -5212,11 +5309,12 @@ mod tests {
             "urn:iki:annotation".to_string(),
         );
 
-        for (label, kernel) in [
-            ("kernel", kernel()),
-            ("trusted_kernel_for", trusted_kernel_for("Test (IPC)")),
-        ] {
-            let rules = rules_of(label, &kernel);
+        // The served constructors return the `Arc` their workspace watcher shares; borrow
+        // through it so both shapes sit in one list.
+        let local = kernel();
+        let trusted = trusted_kernel_for("Test (IPC)");
+        for (label, kernel) in [("kernel", &local), ("trusted_kernel_for", &*trusted)] {
+            let rules = rules_of(label, kernel);
             assert!(rules.contains(&fn_rule), "{label}: {rules:?}");
             assert!(rules.contains(&annotation_prefix), "{label}: {rules:?}");
             assert!(rules.contains(&annotation_exact), "{label}: {rules:?}");
@@ -5225,15 +5323,15 @@ mod tests {
         // not constructed here: it starts watchers, the scheduler and the tuplespace
         // reactor, none of which a naming assertion needs.
 
+        let door = kernel_for("Test (HTTP)");
+        let served = served_kernel("Test (QUIC)", ServedSurface::default());
+        let calendar = calendar_server_kernel();
         for (label, kernel) in [
-            ("kernel_for", kernel_for("Test (QUIC)")),
-            (
-                "served_kernel",
-                served_kernel("Test (QUIC)", ServedSurface::default()),
-            ),
-            ("calendar_server_kernel", calendar_server_kernel()),
+            ("kernel_for", &*door),
+            ("served_kernel", &*served),
+            ("calendar_server_kernel", &calendar),
         ] {
-            let rules = rules_of(label, &kernel);
+            let rules = rules_of(label, kernel);
             assert!(
                 rules.contains(&fn_rule),
                 "{label} binds urn:iki:fn:* through base_space, so it owes the rewrite: \
@@ -6495,6 +6593,69 @@ mod tests {
         assert!(text.contains("Hi, World"));
         // the escaped marker survives unexpanded
         assert!(text.contains("$a{urn:iki:fn:toUpper?in=x}"));
+    }
+
+    /// The door must see a workspace file change WITHOUT a restart.
+    ///
+    /// Seen live on the edge, 2026-09-09: `foaf.xsl` was replaced on disk and `urn:foaf`
+    /// kept rendering the old stylesheet until the unit restarted, because `urn:file:*`
+    /// is `.cacheable().depends_on(target)` and nothing on that kernel cut the thread —
+    /// only `build_watched` ran a watcher. This drives the door's exact space through
+    /// the watcher's OWN notification path (`apply_next`) rather than a sleep: the
+    /// deadline is an upper bound on FSEvents / inotify latency, so a slow platform
+    /// fails loudly instead of passing by luck. The stale read in the middle is the
+    /// premise, not a wish — it proves the recompute at the end is the watcher's doing
+    /// and not an uncached endpoint's.
+    #[test]
+    fn the_doors_file_read_recomputes_after_the_file_changes_on_disk() {
+        use std::time::Duration;
+        let root = file_root();
+        let path = root.join("live.txt");
+        // std::fs on purpose: this IS the out-of-band edit (a deploy replacing a
+        // stylesheet), the write the kernel cannot see.
+        std::fs::write(&path, "one").unwrap();
+        let kernel = Arc::new(door_kernel("Test (HTTP)"));
+        let watch = WorkspaceWatch::start(Arc::clone(&kernel), root)
+            .expect("the platform watcher must start on the test workspace");
+        let read = || {
+            let request = Request::new(Verb::Source, Iri::parse("urn:file:live.txt").unwrap());
+            let repr = block_on(kernel.issue(request, &Capability::root())).unwrap();
+            String::from_utf8_lossy(&repr.bytes).into_owned()
+        };
+        assert_eq!(read(), "one");
+
+        std::fs::write(&path, "two").unwrap();
+        // Nothing has cut the thread yet, so the cache still answers — the bug, pinned.
+        assert_eq!(
+            read(),
+            "one",
+            "the cached read must hold until its thread is cut"
+        );
+
+        // Drain the watcher's notifications until ours arrives; a burst may name other
+        // paths first (the write above is two events on some platforms). Bounded by
+        // count AND per-wait, never by a clock.
+        let thread = "urn:file:live.txt".to_string();
+        let mut cut = false;
+        for _ in 0..64 {
+            match watch.apply_next(Duration::from_secs(10)) {
+                Some(threads) if threads.contains(&thread) => {
+                    cut = true;
+                    break;
+                }
+                Some(_) => continue,
+                None => break,
+            }
+        }
+        assert!(
+            cut,
+            "the watcher never reported {thread} within its deadline"
+        );
+        assert_eq!(
+            read(),
+            "two",
+            "a cut thread must make the next read recompute"
+        );
     }
 
     #[test]
