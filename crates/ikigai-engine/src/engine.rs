@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use futures::executor::block_on;
 use futures::future::join_all;
 use ikigai_core::{
-    ArgRef, BoxFuture, Capability, Description, Expiry, InputSource, Iri, Provenance,
+    ArgRef, BoxFuture, Capability, Description, Expiry, InputSource, Iri, Provenance, ReprType,
     Representation, Request, Spawner, Thread, TraceEvent, Tracer, Verb,
 };
 use ikigai_resolve::{CacheStatus, Resolver};
@@ -41,6 +41,10 @@ use std::collections::BTreeSet;
 /// and the terminal display — decode, each with an error naming what needed text.
 struct Staged {
     bytes: Vec<u8>,
+    /// What the bytes are — carried beside them so the terminal display can say what
+    /// it decoded (the line's [`Entry`] reports it) without ever deciding it from the
+    /// bytes. Sniffing is the kernel's job (`urn:sniff:*`), not the display's.
+    repr_type: ReprType,
     expiry: Expiry,
     threads: BTreeSet<Thread>,
 }
@@ -74,10 +78,17 @@ fn root_provenance() -> Provenance {
 /// Join several stage outputs (fork branches or mapped items) into one, combining
 /// their provenance: the result is cacheable only if *every* part is (the most
 /// restrictive expiry wins), and depends on the union of their threads.
+///
+/// The join is a newline-separated list — the kernel's textual list convention — so
+/// it keeps the parts' representation type only when they all agree; parts of
+/// differing types joined into one list are just `text/plain`. Claiming the first
+/// part's type for a list that also holds another would name something that is not
+/// what the bytes are.
 fn combine_outputs(parts: Vec<Staged>) -> Staged {
     let mut expiry = Expiry::Never;
     let mut threads = BTreeSet::new();
     let mut bytes = Vec::new();
+    let mut repr_type: Option<ReprType> = None;
     for (index, part) in parts.into_iter().enumerate() {
         expiry = expiry.most_restrictive(part.expiry);
         threads.extend(part.threads);
@@ -85,9 +96,15 @@ fn combine_outputs(parts: Vec<Staged>) -> Staged {
             bytes.push(b'\n');
         }
         bytes.extend_from_slice(&part.bytes);
+        repr_type = Some(match repr_type {
+            Some(prior) if prior != part.repr_type => ReprType::new("text/plain"),
+            Some(prior) => prior,
+            None => part.repr_type,
+        });
     }
     Staged {
         bytes,
+        repr_type: repr_type.unwrap_or_else(|| ReprType::new("text/plain")),
         expiry,
         threads,
     }
@@ -150,12 +167,22 @@ try:
   cap read-only ; sink urn:file:notes.txt nope   (write now refused)
   describe urn:iki:fn:toUpper text/turtle";
 
-/// One evaluated request: the line the user typed, what came back, and how the
-/// kernel's cache served it.
+/// One evaluated request: the line the user typed, what came back, what kind of
+/// representation it came back as, and how the kernel's cache served it.
 pub struct Entry {
     pub input: String,
     pub result: Result<String, String>,
     pub cache: CacheStats,
+    /// The type of the representation the line resolved to — what `result`'s text was
+    /// decoded from. Its `Display` (= [`ReprType::canonical`]) is the form to show:
+    /// `text/turtle`, `text/plain;charset=utf-8`, parameters sorted. `None` when the
+    /// line produced no representation at all: engine-synthesized text (`list`, `cap`,
+    /// `config`, `trace`) or a failure before anything resolved. A pipeline reports its
+    /// LAST stage's type; a fork or map join reports the type its parts share, or
+    /// `text/plain` when they differ (the join is a text list). Set even when `result`
+    /// is the not-UTF-8 error — the representation resolved, it just could not be
+    /// shown, and "it was `application/pdf`" is what that error wants beside it.
+    pub repr_type: Option<ReprType>,
 }
 
 /// A tally of the cache outcomes across the (possibly many) requests one input
@@ -237,6 +264,10 @@ pub struct Engine {
     /// Interior-mutable so the `&self` resolution path can tally without
     /// threading an accumulator through every stage; the REPL is single-threaded.
     cache: Cell<CacheStats>,
+    /// The type of the representation the current `eval` displayed, recorded by
+    /// [`display`](Self::display) — the one place a line's final stage becomes text —
+    /// and read back into the line's [`Entry`]. Same per-line side channel as `cache`.
+    repr_type: RefCell<Option<ReprType>>,
     /// The session's current authority — every request resolves under it. It
     /// starts at `identity` and the `cap` command can only ever *narrow* it.
     capability: RefCell<Capability>,
@@ -291,6 +322,7 @@ impl Engine {
         Self {
             resolver: Arc::new(resolver),
             cache: Cell::new(CacheStats::default()),
+            repr_type: RefCell::new(None),
             capability: RefCell::new(identity.clone()),
             identity: RefCell::new(identity),
             profiles: RefCell::new(HashMap::new()),
@@ -355,10 +387,11 @@ impl Engine {
         self.fan_out.borrow().clone()
     }
 
-    /// Start a fresh per-line tally: the cache outcomes and the fan-out note both
-    /// describe *this* line, so both are cleared together.
+    /// Start a fresh per-line tally: the cache outcomes, the displayed representation
+    /// type and the fan-out note all describe *this* line, so all are cleared together.
     fn reset_line_stats(&self) {
         self.cache.set(CacheStats::default());
+        *self.repr_type.borrow_mut() = None;
         *self.fan_out.borrow_mut() = None;
     }
 
@@ -462,6 +495,7 @@ impl Engine {
             input: src.to_string(),
             result,
             cache: self.cache.get(),
+            repr_type: self.repr_type.borrow().clone(),
         })
     }
 
@@ -496,6 +530,7 @@ impl Engine {
                 input: line.to_string(),
                 result,
                 cache: this.cache.get(),
+                repr_type: this.repr_type.borrow().clone(),
             })
         };
 
@@ -545,9 +580,10 @@ impl Engine {
     /// [`run_source`](Self::run_source).
     async fn run_pipeline(&self, spec: &str) -> Result<String, String> {
         let pipeline = parse_spec(spec)?;
-        self.run_pipeline_node(&pipeline, None, root_provenance())
-            .await?
-            .into_text()
+        let staged = self
+            .run_pipeline_node(&pipeline, None, root_provenance())
+            .await?;
+        self.display(staged)
     }
 
     /// Evaluate an s-expression as Lisp: issue `source urn:lisp:eval` with the
@@ -582,6 +618,7 @@ impl Engine {
                 input: line.to_string(),
                 result: Ok("lisp mode cancelled".to_string()),
                 cache: CacheStats::default(),
+                repr_type: None,
             });
         }
         if !line.is_empty() && line != ":end" {
@@ -602,6 +639,7 @@ impl Engine {
             input: src,
             result,
             cache: self.cache.get(),
+            repr_type: self.repr_type.borrow().clone(),
         })
     }
 
@@ -875,6 +913,7 @@ impl Engine {
             let threads = representation.threads().clone();
             outputs.push(Staged {
                 bytes: representation.bytes,
+                repr_type: representation.repr_type,
                 expiry,
                 threads,
             });
@@ -1485,7 +1524,19 @@ impl Engine {
     /// a probe.
     async fn run(&self, request: Request) -> Result<String, String> {
         // No pipe upstream (sink / meta / a single source): resolve on its own merits.
-        self.run_staged(request, None).await?.into_text()
+        let staged = self.run_staged(request, None).await?;
+        self.display(staged)
+    }
+
+    /// Turn a line's final stage into its display text, noting the representation type
+    /// it arrived as so the line's [`Entry`] can report it. Noted BEFORE the decode, on
+    /// purpose: a binary representation fails to become text, and the type is exactly
+    /// what that error wants beside it. Every command whose text comes from a
+    /// representation passes through here; the ones that synthesize their own text
+    /// (`list`, `cap`, `trace`, …) never do, so their entries carry `None`.
+    fn display(&self, staged: Staged) -> Result<String, String> {
+        *self.repr_type.borrow_mut() = Some(staged.repr_type.clone());
+        staged.into_text()
     }
 
     /// Issue a request — optionally carrying the upstream pipe `incoming` provenance,
@@ -1518,6 +1569,7 @@ impl Engine {
         let threads = representation.threads().clone();
         Ok(Staged {
             bytes: representation.bytes,
+            repr_type: representation.repr_type,
             expiry,
             threads,
         })
@@ -2726,6 +2778,135 @@ mod tests {
             Action::Output(entry) => entry,
             _ => panic!("expected Action::Output"),
         }
+    }
+
+    /// The canonical form of an entry's representation type — what a frontend shows.
+    fn repr_type_of(action: Action) -> Option<String> {
+        entry(action).repr_type.map(|ty| ty.canonical())
+    }
+
+    /// An engine over two echo endpoints that differ only in the type they answer with:
+    /// `urn:test:typed` says `text/plain;charset=utf-8` (a PARAMETER, so the canonical
+    /// form is pinned with one), `urn:test:plain` says bare `text/plain`.
+    fn typed_engine() -> Engine {
+        let echo = |name: &'static str, ty: ReprType| {
+            FnEndpoint::new(name, move |inv: &Invocation<'_>| {
+                let value = inv.inline_str("in").unwrap_or("");
+                Ok(Representation::new(ty.clone(), value.as_bytes().to_vec()))
+            })
+            .with_description(
+                Description::new(name)
+                    .verb(Verb::Source)
+                    .verb(Verb::Meta)
+                    .input(ArgSpec::new("in")),
+            )
+        };
+        let space = EndpointSpace::new()
+            .bind(
+                Exact::new("urn:test:typed"),
+                echo(
+                    "typed",
+                    ReprType::new("text/plain").with_param("charset", "utf-8"),
+                ),
+            )
+            .bind(
+                Exact::new("urn:test:plain"),
+                echo("plain", ReprType::new("text/plain")),
+            );
+        Engine::new(Kernel::with_meta_renderer(
+            Arc::new(space),
+            Arc::new(JsonRenderer),
+        ))
+    }
+
+    #[test]
+    fn entry_names_the_representation_type_in_canonical_form() {
+        let engine = typed_engine();
+        let entry = entry(engine.eval("source urn:test:typed hi"));
+        assert_eq!(entry.result.as_deref(), Ok("hi"));
+        // The canonical string, parameters included — the form a frontend displays.
+        assert_eq!(
+            entry.repr_type.as_ref().map(ReprType::canonical).as_deref(),
+            Some("text/plain;charset=utf-8")
+        );
+        assert_eq!(
+            entry.repr_type.as_ref().map(ToString::to_string).as_deref(),
+            Some("text/plain;charset=utf-8")
+        );
+        assert_eq!(
+            repr_type_of(engine.eval("source urn:test:plain hi")).as_deref(),
+            Some("text/plain")
+        );
+    }
+
+    #[test]
+    fn entry_has_no_representation_type_when_nothing_resolved() {
+        let engine = typed_engine();
+        // Prime the side channel, then prove each following line starts clean.
+        assert!(repr_type_of(engine.eval("source urn:test:typed hi")).is_some());
+        // Engine-synthesized text: no representation was produced.
+        assert_eq!(repr_type_of(engine.eval("list")), None);
+        assert_eq!(repr_type_of(engine.eval("cap")), None);
+        // Failed before anything resolved.
+        let unresolved = entry(engine.eval("source urn:test:nope hi"));
+        assert!(unresolved.result.is_err());
+        assert_eq!(unresolved.repr_type, None);
+        let unknown = entry(engine.eval("bogus"));
+        assert!(unknown.result.is_err());
+        assert_eq!(unknown.repr_type, None);
+    }
+
+    #[test]
+    fn pipeline_reports_the_last_stage_type() {
+        let engine = typed_engine();
+        assert_eq!(
+            repr_type_of(engine.eval("source urn:test:plain hi | urn:test:typed")).as_deref(),
+            Some("text/plain;charset=utf-8")
+        );
+        assert_eq!(
+            repr_type_of(engine.eval("source urn:test:typed hi | urn:test:plain")).as_deref(),
+            Some("text/plain")
+        );
+    }
+
+    #[test]
+    fn fork_and_map_report_the_shared_type_or_text_plain_when_parts_differ() {
+        let engine = typed_engine();
+        // Branches that agree: the join keeps their type.
+        assert_eq!(
+            repr_type_of(
+                engine.eval("source urn:test:typed hi | ( urn:test:typed ; urn:test:typed )")
+            )
+            .as_deref(),
+            Some("text/plain;charset=utf-8")
+        );
+        // Branches that differ: the newline-joined list is just text.
+        assert_eq!(
+            repr_type_of(
+                engine.eval("source urn:test:typed hi | ( urn:test:typed ; urn:test:plain )")
+            )
+            .as_deref(),
+            Some("text/plain")
+        );
+        // A map joins per-item outputs the same way — items all of one type keep it.
+        let out = entry(engine.eval("source urn:test:plain \"a\nb\" .. urn:test:typed"));
+        assert_eq!(out.result.as_deref(), Ok("a\nb"));
+        assert_eq!(
+            out.repr_type.as_ref().map(ReprType::canonical).as_deref(),
+            Some("text/plain;charset=utf-8")
+        );
+    }
+
+    #[test]
+    fn a_binary_result_still_names_its_type_beside_the_decode_error() {
+        let engine = binary_engine();
+        let entry = entry(engine.eval("source urn:test:pdf"));
+        let err = entry.result.unwrap_err();
+        assert!(err.contains("not UTF-8"), "{err}");
+        assert_eq!(
+            entry.repr_type.as_ref().map(ReprType::canonical).as_deref(),
+            Some("application/pdf")
+        );
     }
 
     /// An engine with a stand-in `urn:lisp:eval` that echoes its `in` argument — so a

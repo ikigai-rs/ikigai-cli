@@ -1112,6 +1112,7 @@ fn submit(state: &mut State, engine: &Engine) -> bool {
             input: line,
             result: Ok(HELP.to_string()),
             cache: CacheStats::default(),
+            repr_type: None,
         }),
         Action::Output(entry) => state.transcript.push(entry),
         // Drop the scrollback transcript; `state.history` (line recall) is untouched,
@@ -1572,11 +1573,13 @@ mod tests {
             input: "source urn:iki:fn:toUpper hi".into(),
             result: Ok("line one\nline two".into()),
             cache: CacheStats::default(),
+            repr_type: None,
         });
         state.transcript.push(Entry {
             input: "source urn:iki:fn:nope".into(),
             result: Err("no endpoint resolved".into()),
             cache: CacheStats::default(),
+            repr_type: None,
         });
         render(80, 5, &state); // transcript taller than the area → scrolled
         render(80, 24, &state);
