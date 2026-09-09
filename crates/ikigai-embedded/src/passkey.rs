@@ -241,7 +241,7 @@ const PASSKEY_APP_JS: &str = r#"(function(){
 })();
 "#;
 
-/// Serves [`PASSKEY_APP_JS`] as a same-origin JavaScript file so the strict edge CSP admits it.
+/// Serves `PASSKEY_APP_JS` as a same-origin JavaScript file so the strict edge CSP admits it.
 pub struct PasskeyJs;
 
 #[async_trait::async_trait]
