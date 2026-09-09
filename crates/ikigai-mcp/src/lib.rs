@@ -3,9 +3,9 @@
 //! MCP (the Model Context Protocol) asks a server for three things: a list of
 //! tools, a typed input schema per tool, and a way to call one. ikigai already
 //! has all three under other names — `urn:kernel:actions` (the capability-scoped
-//! manifold), [`ArgSpec`](ikigai_core::ArgSpec) contracts, and kernel invocation.
+//! manifold), [`ikigai_core::ArgSpec`] contracts, and kernel invocation.
 //! This crate is the *translation*: it turns an [`Action`](ikigai_core::ActionSpec)
-//! on an endpoint's [`Description`](ikigai_core::Description) into an MCP tool
+//! on an endpoint's [`ikigai_core::Description`] into an MCP tool
 //! descriptor (name + description + JSON-Schema input), and maps the tool name
 //! back to the `(endpoint, verb)` it came from so a `tools/call` can be routed.
 //!

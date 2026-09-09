@@ -196,7 +196,7 @@ fn literal_len(pattern: &UriTemplate) -> usize {
 }
 
 /// The catalog row that names `target`: the most specific matching pattern, ties
-/// broken by catalog order — the same rule [`RemoteNames`] applies to a mount's
+/// broken by catalog order — the same rule the private `RemoteNames` applies to a mount's
 /// forwarded targets, over a plain slice of entries.
 ///
 /// This is what a *renderer* wants (the REPL's `trace` labels each span's target
@@ -537,7 +537,7 @@ pub trait Resolver: Send + Sync {
     /// Install an execution [`Tracer`] for the next resolution — the `trace` command
     /// records one real `source` to show which worker each node ran on. Default
     /// no-op: a wire resolver can't yet trace the remote kernel; the in-process
-    /// kernel forwards to [`Kernel::set_tracer`]. Paired with [`clear_tracer`].
+    /// kernel forwards to [`Kernel::set_tracer`]. Paired with [`Kernel::clear_tracer`].
     fn set_tracer(&self, tracer: Arc<dyn Tracer>) {
         let _ = tracer;
     }
@@ -635,7 +635,7 @@ impl Resolver for Kernel {
 
 /// Resolve `request` on `kernel` recording the resolution's spans into `tracer`,
 /// with the same cache-status probe as [`Resolver::issue_as`]. This is the
-/// **per-call** traced path a wire server dispatches [`Call::IssueTraced`] on:
+/// **per-call** traced path a wire server dispatches `Call::IssueTraced` on:
 /// each connection's trace records into its own collector
 /// ([`Kernel::issue_traced`]), so concurrent traced calls on the shared kernel
 /// can no longer interleave into one process-global tracer (the cross-tenant
