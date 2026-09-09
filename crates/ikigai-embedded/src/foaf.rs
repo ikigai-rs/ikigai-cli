@@ -14,7 +14,11 @@
 //! - The HTTP adapter (`ikigai-web`) turns the first media type of `Accept` into the `as`
 //!   argument unless it is `*/*`, and query parameters into named arguments — so `src`
 //!   arrives as `src`, a browser's `text/html` arrives as `as`, and `curl`'s `*/*` arrives
-//!   as nothing. `as` is the adapter's argument, not declared here.
+//!   as nothing. `as` is the adapter's argument, not declared here — and the adapter
+//!   RESERVES it, so `?as=…` on the query string is dropped and a plain link cannot
+//!   choose a face by it. `format=` is the declared way to do that (`html`, `rdfxml`,
+//!   `jsonld`, `turtle`, `ntriples`, `nquads`, `trig`); when present it wins, and
+//!   `Accept` decides only when it is absent.
 //! - Every step is issued THROUGH the kernel (`inv.issue`), never called as a library:
 //!   `urn:httpGet` fetches, `urn:xslt:transform` styles, `urn:rdf:transrept` re-serializes,
 //!   `urn:jsonld:compact` shortens. That is what makes the capability, the cache and the
@@ -36,12 +40,12 @@
 //!
 //! ## Faces
 //!
-//! | `as` | what | built by |
-//! |---|---|---|
-//! | absent, `*/*`, `application/rdf+xml` | the fetched document, unchanged | — |
-//! | `text/html` | a page (`fragment=1`: only `<main id="main">`) | `urn:xslt:transform` with `urn:file:foaf.xsl` / `urn:file:foaf-fragment.xsl` |
-//! | `application/ld+json` | JSON-LD, compacted against `urn:file:foaf.context.jsonld` | `urn:rdf:transrept` then `urn:jsonld:compact` |
-//! | `text/turtle`, `application/n-triples`, `application/n-quads`, `application/trig` | the graph re-serialized | `urn:rdf:transrept` |
+//! | `as` (`Accept`) | `format=` | what | built by |
+//! |---|---|---|---|
+//! | absent, `*/*`, `application/rdf+xml` | `rdfxml` | the fetched document, unchanged | — |
+//! | `text/html` | `html` | a page (`fragment=1`: only `<main id="main">`) | `urn:xslt:transform` with `urn:file:foaf.xsl` / `urn:file:foaf-fragment.xsl` |
+//! | `application/ld+json` | `jsonld` | JSON-LD, compacted against `urn:file:foaf.context.jsonld` | `urn:rdf:transrept` then `urn:jsonld:compact` |
+//! | `text/turtle`, `application/n-triples`, `application/n-quads`, `application/trig` | `turtle`, `ntriples`, `nquads`, `trig` | the graph re-serialized | `urn:rdf:transrept` |
 //!
 //! Anything else is a typed `InvalidArgument` naming the faces that exist, which the HTTP
 //! face maps to 400 (the adapter has no 406 mapping today). The stylesheet renders a
@@ -87,6 +91,12 @@ pub const FACES: &[&str] = &[
     "application/n-triples",
     "application/n-quads",
     "application/trig",
+];
+
+/// The `format=` names, one per face, in [`FACES`] order — what a plain link says where a
+/// header cannot (`?format=turtle`). A closed set: a generated form renders it as a select.
+pub const FORMATS: &[&str] = &[
+    "html", "rdfxml", "jsonld", "turtle", "ntriples", "nquads", "trig",
 ];
 
 /// `urn:foaf` — see the module docs.
@@ -178,6 +188,16 @@ impl Endpoint for Foaf {
                     .class(XSD_ANY_URI),
             )
             .input(
+                ArgSpec::new("format")
+                    .summary(
+                        "the face, for a plain link (the adapter reserves `as`, so `?as=` is \
+                         dropped): html, rdfxml, jsonld, turtle, ntriples, nquads or trig. \
+                         When present it wins; `Accept` decides only when it is absent",
+                    )
+                    .one_of(FORMATS.iter().copied())
+                    .optional(),
+            )
+            .input(
                 ArgSpec::new("fragment")
                     .summary(
                         "HTML face only: emit just `<main id=\"main\">` (for transclusion) \
@@ -197,10 +217,30 @@ impl Endpoint for Foaf {
     }
 }
 
-/// The face `as` names, parameters stripped and lower-cased: absent, empty or `*/*` is
-/// the document itself; anything not in [`FACES`] is a typed bad request naming the faces
-/// that exist.
+/// The face asked for. `format=` (a [`FORMATS`] name) wins when present — it is the only
+/// channel a plain link has, since the HTTP adapter reserves `as`. Otherwise `as`,
+/// parameters stripped and lower-cased: absent, empty or `*/*` is the document itself.
+/// A value outside the set on either channel is a typed bad request naming that channel
+/// and the faces that exist.
 fn requested_face(inv: &Invocation<'_>) -> Result<&'static str> {
+    if let Some(format) = inv
+        .inline_str("format")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+    {
+        return FORMATS
+            .iter()
+            .position(|name| *name == format)
+            .map(|i| FACES[i])
+            .ok_or_else(|| Error::InvalidArgument {
+                name: "format".to_string(),
+                detail: format!(
+                    "`{format}` is not a face of this document; the formats are {}",
+                    FORMATS.join(", ")
+                ),
+            });
+    }
     let asked = inv
         .inline_str("as")
         .ok()
@@ -546,6 +586,38 @@ mod tests {
     }
 
     #[test]
+    fn format_chooses_a_face_for_a_plain_link_and_wins_over_accept() {
+        let root = workspace("format");
+        let (kernel, _) = kernel(&root);
+        let cap = ceiling(&root);
+        // Every name maps onto the face in the same position — a link can name any face.
+        for (name, face) in FORMATS.iter().zip(FACES) {
+            let repr = resolve(&kernel, &cap, &[("format", name)]).unwrap();
+            assert!(
+                repr.repr_type.to_string().starts_with(face),
+                "format={name}: got {}",
+                repr.repr_type
+            );
+        }
+        // A browser follows a `?format=turtle` link with `Accept: text/html`; the link wins.
+        let turtle = resolve(&kernel, &cap, &[("as", "text/html"), ("format", "turtle")]).unwrap();
+        assert_eq!(turtle.repr_type.to_string(), "text/turtle;charset=utf-8");
+        // With no `format`, `Accept` decides (the browser case, tested above), and an empty
+        // `format=` is the same as none.
+        let page = resolve(&kernel, &cap, &[("as", "text/html"), ("format", "")]).unwrap();
+        assert!(page.repr_type.to_string().starts_with("text/html"));
+        // A name outside the closed set is a typed bad request on THAT channel.
+        let err = resolve(&kernel, &cap, &[("format", "pdf")]).unwrap_err();
+        match &err {
+            Error::InvalidArgument { name, detail } => {
+                assert_eq!(name, "format");
+                assert!(detail.contains("turtle"), "{detail}");
+            }
+            other => panic!("expected InvalidArgument (→ 400), got {other:?}"),
+        }
+    }
+
+    #[test]
     fn a_face_the_chain_does_not_reach_is_a_typed_bad_request() {
         let root = workspace("unreachable");
         let (kernel, _) = kernel(&root);
@@ -669,6 +741,17 @@ mod tests {
             .expect("fragment declared");
         assert!(!fragment.required);
         assert_eq!(fragment.class.as_deref(), Some(XSD_BOOLEAN));
+        let format = d
+            .inputs
+            .iter()
+            .find(|i| i.name == "format")
+            .expect("format declared");
+        assert!(!format.required);
+        assert_eq!(
+            format.one_of,
+            FORMATS.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        );
+        assert_eq!(FORMATS.len(), FACES.len(), "one name per face, by position");
         assert!(
             d.inputs.iter().all(|i| i.name != "as"),
             "`as` is the adapter's"

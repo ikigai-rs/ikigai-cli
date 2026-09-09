@@ -258,7 +258,8 @@ tuple into a space), the emailed decision links and the passkey ceremony, it car
 **`urn:foaf`**: one FOAF document (`src=`), every face by negotiation — the RDF/XML as
 fetched by default, `text/html` through a workspace stylesheet (`urn:file:foaf.xsl`;
 `fragment=1` for just `<main>`), `application/ld+json` compacted against a workspace
-context, and Turtle / N-Triples / N-Quads / TriG re-serialized. The source must sit
+context, and Turtle / N-Triples / N-Quads / TriG re-serialized (`format=turtle` for a
+plain link, since a link has no `Accept`). The source must sit
 under a `urn:cap:net:<host>` grant on the unit, so the allowlist is the capability,
 not code in the endpoint.
 
