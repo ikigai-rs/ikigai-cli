@@ -36,8 +36,13 @@ pub use ikigai_wire::HelloMode;
 /// the socket (replacing a stale one), restrict it to `0600`, and serve each
 /// same-user connection on its own thread. Connections from another UID are
 /// refused — defense in depth over the `0700` directory.
-pub fn serve(kernel: Kernel, path: &Path) -> io::Result<()> {
-    let kernel = Arc::new(kernel);
+///
+/// Takes the kernel by value OR already shared: a served kernel that runs a workspace
+/// watcher (`ikigai_embedded::trusted_kernel_for`) arrives as an `Arc` the watcher
+/// also holds, and wrapping a fresh `Arc` around a moved `Kernel` would have cut it
+/// off from that watcher — every connection would then read a cache nothing invalidates.
+pub fn serve(kernel: impl Into<Arc<Kernel>>, path: &Path) -> io::Result<()> {
+    let kernel: Arc<Kernel> = kernel.into();
     let _ = std::fs::remove_file(path); // a leftover socket would fail the bind
     let listener = UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;

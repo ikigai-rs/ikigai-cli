@@ -263,6 +263,14 @@ plain link, since a link has no `Accept`). The source must sit
 under a `urn:cap:net:<host>` grant on the unit, so the allowlist is the capability,
 not code in the endpoint.
 
+**Workspace files are live.** Every served kernel — the HTTP door, the QUIC and IPC
+faces — runs the same filesystem watcher the REPL and the daemon do, scoped to
+`~/.ikigai/workspace`. `urn:file:*` reads are cached on a golden thread, and the
+watcher cuts that thread when the file changes on disk, so replacing `foaf.xsl` or a
+JSON-LD context is served on the next request without restarting the unit. (Through
+0.1.19 the served kernels ran no watcher and kept a replaced file's cached
+representation until restart.)
+
 ## Lisp, s-expressions, and signing
 
 The embedded host mounts a family of modules that make **code, queries, and graphs

@@ -123,7 +123,7 @@ const UNAUTHORIZED: u32 = 1;
 pub const DEFAULT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 pub fn serve(
-    kernel: Kernel,
+    kernel: impl Into<Arc<Kernel>>,
     addr: SocketAddr,
     identity: &Identity,
     trusted_client_cert_pems: &[String],
@@ -140,19 +140,24 @@ pub fn serve(
 }
 
 /// [`serve`] with an explicit idle timeout (see [`DEFAULT_IDLE_TIMEOUT`]).
+///
+/// The kernel may arrive by value or already shared. A served kernel that runs a
+/// workspace watcher (`ikigai_embedded::served_kernel`) is an `Arc` the watcher also
+/// holds; wrapping a moved `Kernel` in a fresh `Arc` here would serve a cache that
+/// watcher can no longer cut.
 pub fn serve_with(
-    kernel: Kernel,
+    kernel: impl Into<Arc<Kernel>>,
     addr: SocketAddr,
     identity: &Identity,
     trusted_client_cert_pems: &[String],
     minter: Minter,
     idle: std::time::Duration,
 ) -> io::Result<()> {
+    let kernel: Arc<Kernel> = kernel.into();
     let config = server_config(identity, trusted_client_cert_pems, idle)?;
     let runtime = Runtime::new()?;
     runtime.block_on(async move {
         let endpoint = bind_endpoint(config, addr)?;
-        let kernel = Arc::new(kernel);
         while let Some(incoming) = endpoint.accept().await {
             let kernel = Arc::clone(&kernel);
             let minter = Arc::clone(&minter);
