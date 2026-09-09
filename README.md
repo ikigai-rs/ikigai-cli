@@ -4,6 +4,10 @@ The `ikigai` command — a REPL client for resource-resolution kernels. It attac
 a kernel instance over a pluggable transport and lets you issue requests, inspect
 self-descriptions, and observe the cache.
 
+**New here? Start with [The ikigai Book](https://ikigai-rs.github.io/ikigai-tutorial/)** —
+the tutorial walks from resolution to a kernel behind a socket, and its Part III is this
+crate's transports, identity and mounts seen from the outside.
+
 This repository carries the transport dependencies, keeping
 [`ikigai-core`](https://github.com/ikigai-rs/ikigai-core) lean and WebAssembly-friendly.
 
