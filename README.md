@@ -247,6 +247,22 @@ OS GUI shortcuts (⌘C etc.), so terminal-native editing *is* readline/Emacs. Th
 demo space is composed in `ikigai-embedded`; a real host binds its own
 endpoints there.
 
+## The HTTP door
+
+`ikigai serve --http <port> --routes <file> --routes-only --cap <scope>…` serves the
+kernel over plain HTTP behind a reverse proxy (`crates/ikigai-web`): a route maps a
+path to a resource, `Accept` becomes the `as=` face, query parameters become named
+arguments, and every request resolves under the `--cap` ceiling. Besides the public
+intakes (`urn:contact:submit`, `urn:booking:submit` — validated forms that drop a
+tuple into a space), the emailed decision links and the passkey ceremony, it carries
+**`urn:foaf`**: one FOAF document (`src=`), every face by negotiation — the RDF/XML as
+fetched by default, `text/html` through a workspace stylesheet (`urn:file:foaf.xsl`;
+`fragment=1` for just `<main>`), `application/ld+json` compacted against a workspace
+context, and Turtle / N-Triples / N-Quads / TriG re-serialized (`format=turtle` for a
+plain link, since a link has no `Accept`). The source must sit
+under a `urn:cap:net:<host>` grant on the unit, so the allowlist is the capability,
+not code in the endpoint.
+
 ## Lisp, s-expressions, and signing
 
 The embedded host mounts a family of modules that make **code, queries, and graphs

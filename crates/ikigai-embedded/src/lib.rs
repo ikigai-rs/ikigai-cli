@@ -32,6 +32,7 @@ pub mod config;
 pub mod contactblock;
 pub mod decide;
 pub mod decisions;
+pub mod foaf;
 pub mod jsonl;
 pub mod passkey;
 pub mod people;
@@ -4909,12 +4910,33 @@ pub fn trusted_kernel_with_mounts(nature: &'static str, mounts: Vec<MountSpec>) 
         .with_aliases(alias_table())
 }
 
-/// Build a **served** kernel for an *unauthenticated* transport (QUIC), labelled
-/// `nature`. It has **no personal space**: a QUIC peer has no capability for it
-/// yet and the server resolves under a default authority, so exposing
-/// `urn:personal:*` would leak it — gated on remote auth + capability-on-the-wire.
+/// Build the **HTTP door's** kernel (`ikigai serve --http`), labelled `nature`: the
+/// served space plus the transreption chain `urn:foaf` resolves through. It has **no
+/// personal space**: the door resolves every request under the operator's `--cap`
+/// ceiling (or the public, empty capability), so `urn:personal:*` stays off it.
+///
+/// The chain — `urn:httpGet`, `urn:rdf:transrept`, `urn:xslt:transform`, `urn:jsonld:*`
+/// — was bound only in the embedded root until 2026-09-09; `served_space` had none of
+/// it, so an endpoint issuing through it resolved to nothing on the edge even though the
+/// binary linked every crate. Binding it here widens REACH, not authority: `urn:httpGet`
+/// is default-deny without a `urn:cap:net:<host>` grant, the transreptors are pure, and
+/// a stylesheet or context read runs under the caller's capability. Under `--routes-only`
+/// (the edge's posture) an un-routed path never reaches any of them: the route table is
+/// the surface allowlist, the capability the authority ceiling, and this list is what
+/// those two gate. The QUIC face ([`served_kernel`]) is unchanged.
 pub fn kernel_for(nature: &'static str) -> Kernel {
-    Kernel::with_meta_renderer(Arc::new(served_space(nature)), Arc::new(CliRenderer))
+    let spaces: Vec<Arc<dyn Space>> = vec![
+        Arc::new(served_space(nature)) as Arc<dyn Space>,
+        // `urn:foaf`, the negotiated FOAF face (see [`foaf`]), routed as `/foaf` on the
+        // edge. Beside its chain rather than in `served_space`, so it exists exactly where
+        // the resources it issues through exist.
+        Arc::new(EndpointSpace::new().bind(Exact::new("urn:foaf"), foaf::Foaf)) as Arc<dyn Space>,
+        Arc::new(http_space()) as Arc<dyn Space>,
+        Arc::new(ikigai_rdf::space()) as Arc<dyn Space>,
+        Arc::new(ikigai_xslt::space()) as Arc<dyn Space>,
+        Arc::new(ikigai_jsonld::space()) as Arc<dyn Space>,
+    ];
+    Kernel::with_meta_renderer(Arc::new(Fallback::new(spaces)), Arc::new(CliRenderer))
         .with_aliases(base_alias_table())
 }
 

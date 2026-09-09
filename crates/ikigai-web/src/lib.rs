@@ -2558,4 +2558,23 @@ mod tests {
             "only the declared five bytes are the body, got: {out}"
         );
     }
+
+    /// `Accept` → `as`: the FIRST media type, parameters dropped. A browser sends
+    /// `text/html;q=0.9, */*` (and Chrome a longer list starting the same way), so the
+    /// page face wins; `curl` sends `*/*`, which the adapter does not pass on at all — the
+    /// resource's default face answers.
+    #[test]
+    fn first_media_is_the_first_type_without_its_parameters() {
+        assert_eq!(first_media("text/html;q=0.9, */*"), "text/html");
+        assert_eq!(
+            first_media(
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,\
+                 image/webp,*/*;q=0.8"
+            ),
+            "text/html"
+        );
+        assert_eq!(first_media("application/ld+json"), "application/ld+json");
+        assert_eq!(first_media("*/*"), "*/*");
+        assert_eq!(first_media(""), "");
+    }
 }
