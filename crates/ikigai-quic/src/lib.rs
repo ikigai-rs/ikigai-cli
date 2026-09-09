@@ -80,7 +80,7 @@ pub struct Session {
 /// across toolchains and match what certificate tooling prints). A third derived
 /// attribute later adds a field instead of rewriting every minter signature.
 pub struct PeerIdentity {
-    /// The legacy namespace id — see [`peer_cert_id`].
+    /// The legacy namespace id — see the private `peer_cert_id`.
     pub segment_id: String,
     /// Lowercase hex SHA-256 of the leaf certificate DER — see [`fingerprint`].
     pub fingerprint: String,
@@ -219,7 +219,7 @@ fn peer_leaf_der(connection: &quinn::Connection) -> Option<Vec<u8>> {
 /// cert (unreachable with the client-cert verifier in force).
 ///
 /// This is the id an operator writes in a config file, so it has two hard
-/// requirements [`peer_cert_id`] cannot meet. It must be stable *forever* —
+/// requirements the private `peer_cert_id` cannot meet. It must be stable *forever* —
 /// `DefaultHasher` is explicitly not guaranteed stable across Rust releases, so
 /// keying a config on it would silently re-map every enrolled client on some
 /// future toolchain upgrade. And it must be *obtainable*: this is byte-for-byte

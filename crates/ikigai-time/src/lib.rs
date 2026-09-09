@@ -237,7 +237,7 @@ pub struct JobHealth {
 
 /// The registry of timed jobs — shared (cheaply cloneable) between the `urn:time:*`
 /// control endpoints and the timer backend. A job fires a kernel request through the
-/// installed [`Resolver`] under [`Inner::capability`].
+/// installed [`Resolver`] under the private `Inner::capability`.
 #[derive(Clone)]
 pub struct JobRegistry {
     inner: Arc<Mutex<Inner>>,

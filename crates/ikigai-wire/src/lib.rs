@@ -264,7 +264,7 @@ pub fn write_message<W: Write, T: Serialize>(writer: &mut W, message: &T) -> io:
 }
 
 /// Read one length-prefixed message and deserialize it. Rejects a frame larger
-/// than [`MAX_FRAME`] before allocating for it.
+/// than the private `MAX_FRAME` before allocating for it.
 pub fn read_message<R: Read, T: DeserializeOwned>(reader: &mut R) -> io::Result<T> {
     let mut len = [0u8; 4];
     reader.read_exact(&mut len)?;

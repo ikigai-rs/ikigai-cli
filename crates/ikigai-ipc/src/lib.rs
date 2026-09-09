@@ -170,8 +170,8 @@ fn dial(path: &Path, timeout: Option<Duration>) -> io::Result<UnixStream> {
 /// failing every subsequent call forever (the 2026-08-09 incident: one dev-server
 /// restart turned every `urn:repo:*` forward into "unavailable: Broken pipe"
 /// until the daemon itself was restarted). The redial runs the full
-/// [`handshake`], hello included. What may be *replayed* on the fresh
-/// connection follows the Retry/Failover discipline — see [`replay_may_follow`].
+/// the private `handshake`, hello included. What may be *replayed* on the fresh
+/// connection follows the Retry/Failover discipline — see the private `replay_may_follow`.
 pub struct IpcResolver {
     /// The server's socket path, kept so a broken connection can be redialed.
     path: PathBuf,
@@ -274,8 +274,8 @@ impl IpcResolver {
     /// Send a call and read its reply, healing a dead connection on use.
     ///
     /// A broken established connection is dropped and redialed (full
-    /// [`handshake`], fresh hello) — at most ONE redial per call. Whether this
-    /// call is then replayed on the fresh connection is [`replay_may_follow`]'s
+    /// the private `handshake`, fresh hello) — at most ONE redial per call. Whether this
+    /// call is then replayed on the fresh connection is the private `replay_may_follow`'s
     /// verdict; when it must not replay, the dead connection is still cleared so
     /// the NEXT call redials, and this one surfaces its error (a typed transient
     /// via [`wire_error`]) for the caller to retry.
