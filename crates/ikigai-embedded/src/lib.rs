@@ -214,7 +214,7 @@ fn host_info(nature: &'static str) -> FnEndpoint {
 /// `urn:time:cancel` / `urn:time:jobs` control plane, driven by the native
 /// [`ThreadTimer`](ikigai_time::ThreadTimer). Built once and shared (a clone shares
 /// the same `Arc`-backed registry), so the `urn:time:*` endpoints bound in
-/// [`root_space`] and the kernel handle installed in [`watched_kernel`] act on one
+/// `root_space` and the kernel handle installed in [`watched_kernel`] act on one
 /// registry. The kernel handle is set *after* the kernel is built, since the
 /// endpoints are bound into that same kernel.
 pub fn time_registry() -> JobRegistry {
@@ -232,7 +232,7 @@ pub fn time_registry() -> JobRegistry {
 /// Process-global flag: is the interactive runbook (`urn:runbook:*`) active? OFF by
 /// default — the CLI is a tool, not a demo. `--demo` sets it at startup; `sink
 /// urn:host:demo on|off` (the `demo` command) flips it at runtime. One source of
-/// truth, read by the [`Gated`] runbook space and (later) the TUI's tab bar.
+/// truth, read by the `Gated` runbook space and (later) the TUI's tab bar.
 pub fn demo_flag() -> Arc<AtomicBool> {
     static DEMO: OnceLock<Arc<AtomicBool>> = OnceLock::new();
     DEMO.get_or_init(|| Arc::new(AtomicBool::new(false)))
@@ -639,7 +639,7 @@ fn base_space(nature: &'static str) -> EndpointSpace {
 /// tests, which cannot call a setter before the harness starts — a throwaway per-thread
 /// directory substituted under `cfg(test)`.
 ///
-/// Twelve of the bindings in [`root_space`] reach this function, so a test that merely
+/// Twelve of the bindings in `root_space` reach this function, so a test that merely
 /// builds a kernel — the case that looks like nothing at the call site — would otherwise
 /// create the developer's real `~/.ikigai/workspace`, bind the file module to it, and load
 /// whatever `*.scm` handlers happen to sit there. Nothing fails when it does: the test
@@ -3947,7 +3947,7 @@ pub enum MountKind {
     /// and the mount is composed BEFORE the local spaces. If the remote is down,
     /// the resolution FAILS — that is the point: you asked for that machine.
     Override,
-    /// `--prefer`: like an override, but wrapped in a [`Failover`] over the local
+    /// `--prefer`: like an override, but wrapped in a [`Failover`](ikigai_throttle::Failover) over the local
     /// spaces — the remote when it answers, this machine when it doesn't. Only
     /// TRANSIENT failures fall through (a capability denial still propagates, and
     /// a mutating verb is never replayed), so "graceful" never means "silently
@@ -4147,7 +4147,7 @@ fn drain_every() -> Option<std::time::Duration> {
 const CLIENT_TEMPLATE: &str = "urn:client:{token}";
 
 /// The capability to look up a client record — deliberately its OWN grant, not filesystem
-/// authority. See [`ClientRegistry`].
+/// authority. See `ClientRegistry`.
 pub const CAP_CLIENT_READ: &str = "urn:cap:client:read";
 
 /// Who a handed-out booking link belongs to: `urn:client:{token}` → the JSON record at

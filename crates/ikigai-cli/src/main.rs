@@ -11,7 +11,7 @@
 //! With `-c '<command>'` (repeatable) it runs the command(s) and exits. Otherwise,
 //! on an interactive terminal it launches a full-screen [`tui`] REPL; piped or
 //! with `--plain` it falls back to the line-oriented [`repl`]. All drive the same
-//! renderer-agnostic [`engine`] over the chosen [`Resolver`](ikigai_resolve::Resolver).
+//! renderer-agnostic [`engine`](ikigai_engine) over the chosen [`Resolver`](ikigai_resolve::Resolver).
 
 #[cfg(not(target_family = "wasm"))]
 mod clipboard;
@@ -1309,7 +1309,7 @@ fn shellexpand_home(path: &str) -> String {
     }
 }
 
-/// Turn a parsed [`Mount`] into a [`MountSpec`], connecting eagerly or lazily
+/// Turn a parsed [`Mount`] into a [`MountSpec`](ikigai_embedded::MountSpec), connecting eagerly or lazily
 /// according to its kind. The target picks the transport the same way `--connect`
 /// does: `quic://host:port` for a remote kernel over mutually-pinned TLS (federation
 /// across machines), else a Unix socket path (a same-machine peer).
@@ -1352,7 +1352,7 @@ fn resolve_mount(mount: Mount) -> Result<ikigai_embedded::MountSpec, String> {
 /// when it woke. Deferring the connect makes "when it's around" mean *now*, not
 /// *at startup*.
 ///
-/// A failure to connect is reported as the transient [`Error::Unavailable`] it is,
+/// A failure to connect is reported as the transient [`Error::Unavailable`](ikigai_core::Error::Unavailable) it is,
 /// which is exactly what makes the `Failover` above it fall through to the local
 /// binding.
 ///

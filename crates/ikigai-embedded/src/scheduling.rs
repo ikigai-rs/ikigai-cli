@@ -111,7 +111,7 @@ fn resolved() -> &'static (Scheduler, SchedulerSource) {
     })
 }
 
-/// The process scheduler (see [`resolved`]). Cheap to clone.
+/// The process scheduler (see `resolved`). Cheap to clone.
 pub fn scheduler() -> Scheduler {
     resolved().0.clone()
 }

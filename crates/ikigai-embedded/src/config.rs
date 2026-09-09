@@ -12,7 +12,7 @@
 //! (keybindings) read the same `config.toml`.
 //!
 //! Settings that already had environment variables keep them as an override — the file is the
-//! home, the env is an escape hatch for CI and containers. [`email_config`](crate::email_config)
+//! home, the env is an escape hatch for CI and containers. `email_config`
 //! reads `mail.from` / `mail.host` / `mail.port` this way.
 
 use std::ffi::OsString;
