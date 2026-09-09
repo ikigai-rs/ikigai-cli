@@ -19,7 +19,7 @@
 //!
 //! A candidate must be a bound pattern whose **final `:`-separated segment is
 //! exactly** the failed IRI's final segment. Among those, the ones sharing the
-//! **longest run of trailing segments** win, and ties beyond [`MAX`] are dropped
+//! **longest run of trailing segments** win, and ties beyond the private `MAX` are dropped
 //! entirely.
 //!
 //! Two limits, both deliberate and both worth knowing:

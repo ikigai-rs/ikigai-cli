@@ -442,7 +442,7 @@ impl Engine {
     /// so a buffer that opens with a comment or a blank line still evaluates as Lisp.
     /// Returns [`Action::Output`] carrying the result, or [`Action::Noop`] for an empty
     /// program. Synchronous `block_on` over [`eval_lisp_async`](Self::eval_lisp_async),
-    /// like [`eval`].
+    /// like `eval`.
     pub fn eval_lisp(&self, src: &str) -> Action {
         block_on(self.eval_lisp_async(src))
     }
