@@ -43,6 +43,13 @@ use std::sync::Arc;
 /// The tuplespace URI template: `urn:space:{name}` — the `{name}` is the space's identity.
 pub const SPACE_TEMPLATE: &str = "urn:space:{name}";
 
+/// The XSD datatype every scalar input of this module declares.
+///
+/// A tuple id, a space name and a SPARQL ASK are all strings on the wire. `xsd:string` is a
+/// claim about what the WIRE carries, not about the value's grammar — there is no XSD
+/// datatype for "a query" — and the summaries carry the rest (conformance PENDING #14).
+const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+
 /// `out` (dropping a tuple) requires this capability — the gate a stranger drops under.
 pub const CAP_OUT: &str = "urn:cap:space:out";
 /// `rd` (reading the space, non-destructively) requires this capability.
@@ -368,6 +375,16 @@ impl Endpoint for SpaceEndpoint {
 
     fn describe(&self) -> Description {
         use ikigai_core::ArgSpec;
+        // The space NAME is the `{name}` of `urn:space:{name}`. Declared on every action as a
+        // binding input, because without it the manifold cannot form the IRI from the
+        // contract: the action is reachable by resolution and undrivable from
+        // `urn:kernel:actions` (the shape ikigai-log hit through four releases).
+        let name = || {
+            ArgSpec::new("name")
+                .binding()
+                .class(XSD_STRING)
+                .summary("the space: the `{name}` of `urn:space:{name}`")
+        };
         Description::new("space")
             .title("Tuplespace")
             .summary(
@@ -378,19 +395,26 @@ impl Endpoint for SpaceEndpoint {
             .action(
                 ActionSpec::new(Verb::Source)
                     .summary("rd — list the tuple ids, read one (`tuple=<id>`), or filter (`match=<ASK>`)")
+                    .input(name())
                     .input(
                         ArgSpec::new("tuple")
                             .optional()
+                            .class(XSD_STRING)
                             .summary("a tuple id to read; omit to list"),
                     )
                     .input(
                         ArgSpec::new("match")
                             .optional()
+                            // A SPARQL ASK query — a string to the wire, and there is no XSD
+                            // datatype for "a query in a query language". `xsd:string` is
+                            // what the wire carries, not a claim about the syntax.
+                            .class(XSD_STRING)
                             .summary("a SPARQL ASK; list only the tuple ids whose graph satisfies it"),
                     )
                     .input(
                         ArgSpec::new("state")
                             .optional()
+                            .class(XSD_STRING)
                             .one_of(["inbox", "outbox", "error"])
                             .summary("which stage to read (default inbox): inbox | outbox | error"),
                     )
@@ -399,9 +423,21 @@ impl Endpoint for SpaceEndpoint {
             .action(
                 ActionSpec::new(Verb::Sink)
                     .summary("out — drop a tuple (the piped content) into the space")
+                    .input(name())
+                    // The tuple itself. Declared because a mutating verb's pipe lands in
+                    // `content` BY CONTRACT — the summary above has said "the piped content"
+                    // since this was written, and a Sink that reads a payload it does not
+                    // declare is a contract bug, not a convenience.
+                    .input(
+                        ArgSpec::new("content")
+                            .optional()
+                            .class(XSD_STRING)
+                            .summary("the tuple to drop (the piped value); omit only with `retry=`"),
+                    )
                     .input(
                         ArgSpec::new("retry")
                             .optional()
+                            .class(XSD_STRING)
                             .summary(
                                 "instead of dropping: move this dead-lettered tuple back to \
                                  the inbox for another pass (and clear its .err note)",
@@ -412,14 +448,17 @@ impl Endpoint for SpaceEndpoint {
             .action(
                 ActionSpec::new(Verb::Delete)
                     .summary("take — atomically remove a tuple and return it (by id, by match, or any)")
+                    .input(name())
                     .input(
                         ArgSpec::new("tuple")
                             .optional()
+                            .class(XSD_STRING)
                             .summary("take this specific tuple id"),
                     )
                     .input(
                         ArgSpec::new("match")
                             .optional()
+                            .class(XSD_STRING)
                             .summary("a SPARQL ASK; take the first tuple whose graph satisfies it"),
                     )
                     .requires(CAP_TAKE),

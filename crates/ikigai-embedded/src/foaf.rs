@@ -1,4 +1,13 @@
-//! `urn:foaf` — one RDF document, every face by negotiation.
+//! `urn:iki:foaf` — one RDF document, every face by negotiation.
+//!
+//! ⚠ **The name moved in 0.1.20.** This face shipped as a bare `urn:foaf` in 0.1.19 — an
+//! invented top-level namespace, which is exactly the shape the book's "bind into a
+//! namespace you own" chapter warns against. The canonical name is now [`RESOURCE`], and
+//! `urn:foaf` keeps resolving through an `exact` rewrite rule in the host's alias table
+//! (`ikigai_embedded::base_rules`). That is a rewrite, not a second binding: the kernel
+//! adopts the canonical target before it derives the cache id and fires the golden-thread
+//! cut, so both spellings are ONE resource with one cache entry and one thread. The live
+//! edge's `/foaf` route still names the old spelling and keeps working unchanged.
 //!
 //! `https://api.bosatsu.net/foaf?src=https://w3id.org/people/bsletten`: in a browser it
 //! renders as a page; with no preference it returns the RDF/XML exactly as fetched; with
@@ -66,6 +75,16 @@ use ikigai_core::{
     Request, Result, Verb,
 };
 
+/// The resource this endpoint is bound at — the canonical name, in the `urn:iki:`
+/// namespace this project owns.
+///
+/// Single-sourced because three places must agree: the binding in
+/// `ikigai_embedded::kernel_for`, the alias rule that keeps `urn:foaf` resolving, and the
+/// tests below. A string literal in each is how the alias rule and the binding drift apart
+/// into a rewrite onto a name nothing binds — which fails at RUNTIME, with the table
+/// reporting a clean rewrite.
+pub const RESOURCE: &str = "urn:iki:foaf";
+
 /// The stylesheet for the page face: a workspace resource, so it is edited on disk.
 pub const STYLESHEET: &str = "urn:file:foaf.xsl";
 /// The stylesheet for `fragment=1`: only `<main id="main">…</main>`, for transclusion.
@@ -75,6 +94,9 @@ pub const CONTEXT: &str = "urn:file:foaf.context.jsonld";
 
 const XSD_ANY_URI: &str = "http://www.w3.org/2001/XMLSchema#anyURI";
 const XSD_BOOLEAN: &str = "http://www.w3.org/2001/XMLSchema#boolean";
+// The `format=` names are this document's own closed vocabulary (`turtle`, `jsonld`, …),
+// so the class is what the wire carries and the `one_of` is the real constraint.
+const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
 const RDF_XML: &str = "application/rdf+xml";
 const HTML: &str = "text/html";
@@ -99,7 +121,7 @@ pub const FORMATS: &[&str] = &[
     "html", "rdfxml", "jsonld", "turtle", "ntriples", "nquads", "trig",
 ];
 
-/// `urn:foaf` — see the module docs.
+/// `urn:iki:foaf` — see the module docs.
 pub struct Foaf;
 
 #[async_trait]
@@ -189,6 +211,7 @@ impl Endpoint for Foaf {
             )
             .input(
                 ArgSpec::new("format")
+                    .class(XSD_STRING)
                     .summary(
                         "the face, for a plain link (the adapter reserves `as`, so `?as=` is \
                          dropped): html, rdfxml, jsonld, turtle, ntriples, nquads or trig. \
@@ -398,15 +421,20 @@ mod tests {
         root
     }
 
-    /// The HTTP door's shape, hermetically: `urn:foaf` beside the chain it resolves
+    /// The HTTP door's shape, hermetically: `urn:iki:foaf` beside the chain it resolves
     /// through, the web stubbed, the workspace a scratch directory. A clock is injected so
     /// the document's `max-age` becomes a deadline the cache can honor.
+    ///
+    /// The alias table is the REAL one ([`crate::base_alias_table`]), not a stand-in, so the
+    /// `urn:foaf` → `urn:iki:foaf` rewrite these tests rely on is the rule `kernel_for`
+    /// installs. A stand-in table would agree with itself by construction; this is the same
+    /// reasoning the annotation rename tests in `lib.rs` spell out.
     fn kernel(root: &Path) -> (Arc<Kernel>, Arc<Web>) {
         let web = Arc::new(Web {
             fetches: AtomicUsize::new(0),
         });
         let spaces: Vec<Arc<dyn Space>> = vec![
-            Arc::new(EndpointSpace::new().bind(Exact::new("urn:foaf"), Foaf)),
+            Arc::new(EndpointSpace::new().bind(Exact::new(RESOURCE), Foaf)),
             Arc::new(ikigai_http::space(
                 Arc::clone(&web) as Arc<dyn HttpTransport>
             )),
@@ -415,7 +443,9 @@ mod tests {
             Arc::new(ikigai_jsonld::space()),
             Arc::new(ikigai_fs::cacheable_space(root)),
         ];
-        let kernel = Kernel::new(Arc::new(Fallback::new(spaces))).with_clock(Arc::new(SystemClock));
+        let kernel = Kernel::new(Arc::new(Fallback::new(spaces)))
+            .with_clock(Arc::new(SystemClock))
+            .with_aliases(crate::base_alias_table());
         (Arc::new(kernel), web)
     }
 
@@ -429,7 +459,13 @@ mod tests {
     }
 
     fn request(src: &str, args: &[(&str, &str)]) -> Request {
-        let mut request = Request::new(Verb::Source, iri("urn:foaf"))
+        request_at(RESOURCE, src, args)
+    }
+
+    /// The same request against an arbitrary spelling of the resource — the canonical name
+    /// or the pre-0.1.20 `urn:foaf` the alias rewrites.
+    fn request_at(target: &str, src: &str, args: &[(&str, &str)]) -> Request {
+        let mut request = Request::new(Verb::Source, iri(target))
             .with_arg("src", ArgRef::Inline(src.as_bytes().to_vec()));
         for (name, value) in args {
             request = request.with_arg(*name, ArgRef::Inline(value.as_bytes().to_vec()));
@@ -669,12 +705,73 @@ mod tests {
         let root = workspace("missing");
         let (kernel, _) = kernel(&root);
         let err =
-            block_on(kernel.issue(Request::new(Verb::Source, iri("urn:foaf")), &ceiling(&root)))
+            block_on(kernel.issue(Request::new(Verb::Source, iri(RESOURCE)), &ceiling(&root)))
                 .unwrap_err();
         assert!(
             matches!(err, Error::MissingArgument(ref name) if name == "src"),
             "{err:?}"
         );
+    }
+
+    /// ★ **Both spellings are ONE resource** — the rename window, end to end.
+    ///
+    /// `urn:foaf` was the 0.1.19 name and is still what the live edge's `/foaf` route
+    /// targets. It must keep resolving, and it must do so as a REWRITE rather than a second
+    /// binding: the kernel adopts the canonical target before it derives the cache id, so a
+    /// read under the old name is served from — and warms — the same cache entry the
+    /// canonical name uses, under the same golden threads. Two bindings would give two
+    /// entries, one thread set each, and a cut on one would leave the other stale.
+    ///
+    /// The witness is the stubbed transport's fetch counter, not the bytes: identical bytes
+    /// would also be produced by two independent resolutions, and it is the second FETCH
+    /// (or its absence) that says whether the cache was shared.
+    #[test]
+    fn the_old_spelling_and_the_canonical_name_are_one_cache_entry() {
+        let root = workspace("alias");
+        let (kernel, web) = kernel(&root);
+        let cap = ceiling(&root);
+
+        let canonical = block_on(kernel.issue(request(IDENTIFIER, &[]), &cap)).unwrap();
+        // Two hops: the identifier redirects to the document (see `Web::get`). What matters
+        // below is that this number does not MOVE, not what it is.
+        let after_first = web.fetches.load(Ordering::SeqCst);
+        assert_eq!(after_first, 2);
+
+        // The pre-0.1.20 spelling, rewritten by the table `kernel_for` installs.
+        let old = block_on(kernel.issue(request_at("urn:foaf", IDENTIFIER, &[]), &cap)).unwrap();
+        assert_eq!(old.bytes, canonical.bytes);
+        assert_eq!(
+            web.fetches.load(Ordering::SeqCst),
+            after_first,
+            "the old spelling hit the canonical name's cache entry: another fetch would mean \
+             two entries, hence two thread sets and a cut that reaches only one"
+        );
+
+        // And the cache reports the entry under the CANONICAL name, whichever spelling the
+        // caller wrote — which is the property a golden-thread cut depends on.
+        assert!(kernel.is_cached(&request(IDENTIFIER, &[]), &cap));
+    }
+
+    /// The alias is not doing the work by accident: without the table, the old spelling
+    /// resolves to nothing at all.
+    ///
+    /// Ablated rather than assumed, because a passing rename test is also what a host that
+    /// still BOUND both names would produce, and a rewrite and a second binding differ in
+    /// exactly the way that matters (one cache entry versus two).
+    #[test]
+    fn without_the_alias_the_old_spelling_is_unresolved() {
+        let web = Arc::new(Web {
+            fetches: AtomicUsize::new(0),
+        });
+        let spaces: Vec<Arc<dyn Space>> = vec![
+            Arc::new(EndpointSpace::new().bind(Exact::new(RESOURCE), Foaf)),
+            Arc::new(ikigai_http::space(web as Arc<dyn HttpTransport>)),
+        ];
+        let bare = Kernel::new(Arc::new(Fallback::new(spaces)));
+        let err =
+            block_on(bare.issue(request_at("urn:foaf", IDENTIFIER, &[]), &Capability::root()))
+                .unwrap_err();
+        assert!(matches!(err, Error::Unresolved(_)), "{err:?}");
     }
 
     #[test]

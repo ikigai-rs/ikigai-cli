@@ -635,6 +635,20 @@ impl Endpoint for IntakeEndpoint {
             }
             action = action.input(spec);
         }
+        // ★ THE BODY, declared because it is the only thing this endpoint actually READS.
+        //
+        // The field ArgSpecs above are the FORM — what `?description` projects and a
+        // generated UI renders. They are not how a value arrives: every one of them is
+        // parsed out of the urlencoded or JSON submission, which reaches a Sink as
+        // `content`. Undeclared, the manifold offered eight named arguments the endpoint
+        // never looks at and hid the one required input it does — so a pipeline, a top-level
+        // `sink`, and an agent forming a call from the manifold alike had no way to see how
+        // to drive it. Required, because `invoke` answers `MissingArgument("content")`
+        // without it.
+        action = action.input(ArgSpec::new("content").class(XSD_STRING).summary(
+            "the submission itself: a urlencoded or JSON body carrying the fields \
+                     above (a form POST's body, or a pipeline's upstream value)",
+        ));
         Description::new(self.config.id.clone())
             .title("Form intake")
             .summary(format!(

@@ -36,6 +36,17 @@ use ikigai_core::{
 };
 use ikigai_resolve::Resolver;
 
+/// A resource IRI — what `target=` is, on both `urn:time:schedule` and `urn:time:cancel`.
+const XSD_ANY_URI: &str = "http://www.w3.org/2001/XMLSchema#anyURI";
+/// A duration spelling (`1s`, `10m`) or a job id: a string on the wire.
+///
+/// ⚠ **Not** `xsd:duration`. `every=1m` / `after=5s` are this module's own compact grammar,
+/// not ISO 8601 (`PT1M`), so declaring the XSD duration type would tell
+/// `urn:kernel:validate` that every value this endpoint actually accepts is malformed —
+/// a class that is a lie in the direction that breaks callers. `xsd:string` is what the
+/// wire carries; the summary carries the grammar (conformance PENDING #14/#15).
+const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+
 /// When a job fires. Today only a fixed interval; a `Cron(..)` variant (parsed by a
 /// wasm-friendly cron crate) is the planned extension — the registry only needs the
 /// next interval, so adding it won't disturb anything here.
@@ -593,20 +604,27 @@ pub fn space(registry: JobRegistry) -> EndpointSpace {
                          every=<dur> recurs; after=<dur> is one-shot; method=<verb> picks the verb.",
                     )
                     .verb(Verb::Source)
-                    .input(ArgSpec::new("target").summary("the resource IRI to invoke"))
+                    .input(ArgSpec::new("target")
+                            .summary("the resource IRI to invoke")
+                            .class(XSD_ANY_URI))
                     .input(
                         ArgSpec::new("every")
                             .summary("recurring interval, e.g. 1s, 10s, 1m")
+                            .class(XSD_STRING)
                             .optional(),
                     )
                     .input(
                         ArgSpec::new("after")
                             .summary("one-shot delay, e.g. 5s")
+                            .class(XSD_STRING)
                             .optional(),
                     )
                     .input(
                         ArgSpec::new("method")
                             .summary("verb to invoke (source|sink|exists|delete|meta); default source")
+                            .class(XSD_STRING)
+                            .one_of(["source", "sink", "exists", "delete", "meta"])
+                            .default_value("source")
                             .optional(),
                     )
                     .output("text/plain;charset=utf-8"),
@@ -656,10 +674,14 @@ pub fn space(registry: JobRegistry) -> EndpointSpace {
                          non-persistent job), or target=<iri> (every job firing that resource).",
                     )
                     .verb(Verb::Source)
-                    .input(ArgSpec::new("id").summary("the job id to cancel, or 'all'").optional())
+                    .input(ArgSpec::new("id")
+                            .summary("the job id to cancel, or 'all'")
+                            .class(XSD_STRING)
+                            .optional())
                     .input(
                         ArgSpec::new("target")
                             .summary("cancel every job firing this target IRI")
+                            .class(XSD_ANY_URI)
                             .optional(),
                     )
                     .output("text/plain;charset=utf-8"),

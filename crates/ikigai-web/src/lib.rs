@@ -1206,6 +1206,7 @@ fn openapi_of(desc: &ikigai_core::Description, path: &str) -> serde_json::Value 
             let params: Vec<Value> = action
                 .inputs
                 .iter()
+                .filter(|a| !ADAPTER_OWNED.contains(&a.name.as_str()))
                 .map(|a| {
                     json!({
                         "name": a.name,
@@ -1265,11 +1266,26 @@ fn operation_id(method: &str, path: &str) -> String {
 /// and the keys silently alphabetize on the way out while `required` (a `Vec`) does not,
 /// which is exactly the asymmetry that gave this away. Pinned by
 /// `description_projects_properties_in_declaration_order`.
+/// Input names this ADAPTER owns, and which therefore must not be projected as a query
+/// parameter or a request-body property.
+///
+/// Both are already reserved on the way IN (see `handle`: an `?as=` or `?content=` on the
+/// query string is dropped, and a write's body becomes `content`), so projecting them on the
+/// way OUT describes a call no client can make. `content` matters most: an endpoint that
+/// declares it — which the module recipe asks every mutating action to do, and which
+/// `ikigai-conformance`'s PIPELINE check enforces — would otherwise appear in its own
+/// request body as a property named `content`, i.e. the body inside the body. `as` is the
+/// same mistake on the read side: it is the `Accept` header here, not a query parameter.
+const ADAPTER_OWNED: &[&str] = &["as", "content"];
+
 fn schema_properties(inputs: &[ikigai_core::ArgSpec]) -> (serde_json::Value, Vec<String>) {
     use serde_json::{Map, Value};
     let mut props = Map::new();
     let mut required = Vec::new();
-    for a in inputs {
+    for a in inputs
+        .iter()
+        .filter(|a| !ADAPTER_OWNED.contains(&a.name.as_str()))
+    {
         props.insert(a.name.clone(), arg_schema(a));
         if a.required {
             required.push(a.name.clone());

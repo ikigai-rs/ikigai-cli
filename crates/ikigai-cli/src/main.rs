@@ -3029,3 +3029,290 @@ mod version_flag_tests {
         );
     }
 }
+
+/// ★ **The command adapter's capability gate**, pinned where the composition lives.
+///
+/// A runbook step is TEXT. The runbook crate renders `hx-get="/k/<command>"` buttons and has
+/// no Sink, no capability and nothing to gate (ikigai-cli PENDING §5) — the authority
+/// decision belongs entirely to whatever turns that text into a request. In this workspace
+/// that is [`Engine::eval`] over the embedded kernel under the session capability, driven by
+/// the REPL, the TUI, and (in the browser host) the page's `/k/` bridge. `ikigai-web-demo`
+/// #57 landed this check for its own `/k/` face; this is the native half.
+///
+/// ## Why the test is HERE, in the binary, rather than in `tests/`
+///
+/// The thing under test is not `Engine::eval` — it is the COMPOSITION: the embedded kernel's
+/// spaces, plus [`with_profiles`], which decides what `cap read-only` actually grants by
+/// reading [`ikigai_embedded::file_root`]. Both are private to this binary, and a `tests/`
+/// binary could only re-create them — which is the arrangement that let `ikigai-web`'s HTTP
+/// tests build kernels by hand while the one function with the defect went untested. So the
+/// steps are the real runbook's, the profiles are the real `with_profiles`, and the kernel is
+/// the real `ikigai_embedded::kernel()`.
+///
+/// ## Two gates, two witnesses, and neither is a status code
+///
+/// * **The kernel's floor** (declared = enforced). A session holding no grant under the
+///   family the action declares is refused BEFORE dispatch, and core reports that as a
+///   [`TraceEvent`] tagged [`DENIED_NOTE`] with `started == None` — the one event that names
+///   something which never ran.
+/// * **The module's ACL** (the parameterized rule). A session holding a grant under the
+///   family but not for THIS path passes the floor and is refused inside `invoke`. That
+///   refusal leaves NO trace event (core records an invocation only after `invoke` returns
+///   `Ok` — reported for the hub), so the witness is the disk: no file, no directory.
+///
+/// In both the text the adapter shows begins `denied:`, which is prose — `Entry.result` is
+/// `Result<String, String>`, so the taxonomy does not survive to the page. The TYPE is
+/// asserted at the kernel, issued under the very capability the session holds.
+///
+/// ## What this test will not do
+///
+/// The ZeroTrust tab's steps 8 and 9 reach `httpbin.org` and `w3id.org`. A conformance-style
+/// walk of a composing host is a remote-code-execution surface (conformance PENDING #139),
+/// and the same is true of replaying a walkthrough: step 9 is a denial that is *supposed* to
+/// happen before the request leaves, but a test whose failure mode is "we fetched a URL" is
+/// not a test of the gate. They are asserted to be PRESENT and are not run.
+#[cfg(all(test, feature = "embedded"))]
+mod adapter_gate_tests {
+    use super::*;
+    use ikigai_core::{
+        ArgRef, Capability, Error, Iri, Kernel, Request, TraceEvent, Tracer, Verb, DENIED_NOTE,
+    };
+    use ikigai_engine::Action;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex, MutexGuard};
+
+    /// Every event the kernel reported: computed invocations and pre-dispatch denials.
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<TraceEvent>>);
+
+    impl Tracer for Recorder {
+        fn record(&self, event: TraceEvent) {
+            self.0.lock().expect("recorder").push(event);
+        }
+    }
+
+    impl Recorder {
+        fn events(&self) -> Vec<TraceEvent> {
+            self.0.lock().expect("recorder").clone()
+        }
+    }
+
+    /// `set_file_root` and the demo flag are process-global (their own docs say so), so the
+    /// sessions here run one at a time rather than racing over one workspace root.
+    static SESSION: Mutex<()> = Mutex::new(());
+
+    struct Session {
+        _lock: MutexGuard<'static, ()>,
+        root: PathBuf,
+        kernel: Arc<Kernel>,
+        engine: Engine,
+        trace: Arc<Recorder>,
+    }
+
+    /// The host as the REPL builds it, over a scratch workspace.
+    ///
+    /// `HOME`/`XDG_CONFIG_HOME` are redirected before the kernel is built because
+    /// `root_space()` reads the config home (the `browse.root` lines); a test that reads the
+    /// developer's real home and asserts only type-shape reads as clean while being about
+    /// the machine it ran on (the hermetic-test rule). `set_file_root` is the typed channel
+    /// `ikigai-embedded` documents for exactly this — `cfg(test)` does not reach a consumer.
+    fn session(name: &str) -> Session {
+        let lock = SESSION.lock().unwrap_or_else(|p| p.into_inner());
+        let scratch =
+            std::env::temp_dir().join(format!("ikigai-adapter-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(scratch.join("config")).expect("scratch config home");
+        std::env::set_var("HOME", &scratch);
+        std::env::set_var("XDG_CONFIG_HOME", scratch.join("config"));
+        let root = scratch.join("workspace");
+        std::fs::create_dir_all(&root).expect("scratch workspace");
+        // Canonical: the file module compares canonical paths, so a capability scope naming
+        // `/var/...` would not match a jail rooted at `/private/var/...` on macOS.
+        let root = root.canonicalize().expect("canonical workspace");
+        ikigai_embedded::set_file_root(root.clone());
+        // The runbook is gated off by default (the CLI reads as a tool, not a demo).
+        ikigai_embedded::demo_flag().store(true, Ordering::SeqCst);
+
+        let kernel = Arc::new(ikigai_embedded::kernel());
+        let trace = Arc::new(Recorder::default());
+        kernel.set_tracer(trace.clone() as Arc<dyn Tracer>);
+        let engine = with_profiles(Engine::new(Arc::clone(&kernel)));
+        Session {
+            _lock: lock,
+            root,
+            kernel,
+            engine,
+            trace,
+        }
+    }
+
+    /// What the adapter does with a line — the same call the REPL, the TUI and the browser
+    /// bridge all make.
+    fn run(engine: &Engine, cmd: &str) -> Result<String, String> {
+        match engine.eval(cmd) {
+            Action::Output(entry) => entry.result,
+            Action::Clear => Ok(String::new()),
+            _ => panic!("`{cmd}` is not an output"),
+        }
+    }
+
+    /// Reverse the runbook's attribute escaping (`esc` in ikigai-runbook).
+    fn unescape(s: &str) -> String {
+        s.replace("&quot;", "\"")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&")
+    }
+
+    /// Every `hx-get="/k/<command>"` the rendered tab carries, in order, minus the tab
+    /// strip's own navigation and the `clear` button — the same slice the page's
+    /// `htmx:beforeRequest` handler takes.
+    fn steps(html: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = html;
+        while let Some(at) = rest.find("hx-get=\"/k/") {
+            rest = &rest[at + "hx-get=\"/k/".len()..];
+            let end = rest.find('"').expect("a closed attribute");
+            let cmd = unescape(&rest[..end]);
+            rest = &rest[end..];
+            if cmd == "clear" || cmd.starts_with("source urn:runbook:") {
+                continue;
+            }
+            out.push(cmd);
+        }
+        out
+    }
+
+    /// The same Sink the step issues, at the kernel, under `capability` — the TYPED answer,
+    /// which is the one thing the adapter's `Result<String, String>` cannot carry.
+    fn typed_sink(kernel: &Kernel, target: &str, capability: &Capability) -> Error {
+        let request = Request::new(Verb::Sink, Iri::parse(target.to_string()).expect("iri"))
+            .with_arg("content", ArgRef::Inline(b"nope".to_vec()));
+        futures::executor::block_on(kernel.issue(request, capability))
+            .err()
+            .unwrap_or_else(|| panic!("`{target}` resolved under {capability:?}"))
+    }
+
+    fn read(path: &Path) -> String {
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    /// **The floor gate**: a step naming a gated resource, under a session that holds no
+    /// grant under the declared family, is a typed `Denied` and the endpoint never runs.
+    #[test]
+    fn a_step_is_refused_before_dispatch_when_the_session_lacks_the_declared_family() {
+        let s = session("floor");
+        let tab = run(&s.engine, "source urn:runbook:zerotrust as=text/html")
+            .expect("the demo flag is on, so the tab renders");
+        let steps = steps(&tab);
+        assert_eq!(steps.len(), 10, "{steps:?}");
+        assert_eq!(steps[1], "cap read-only");
+        assert_eq!(steps[2], "sink urn:file:note.txt nope");
+        // Not run, and named so the omission is deliberate rather than forgotten.
+        assert!(steps[7].contains("httpbin.org"), "{:?}", steps[7]);
+        assert!(steps[8].contains("w3id.org"), "{:?}", steps[8]);
+
+        run(&s.engine, &steps[0]).expect("1 · at root the write lands");
+        let note = s.root.join("note.txt");
+        assert_eq!(read(&note), "remember the milk");
+
+        run(&s.engine, &steps[1]).expect("2 · cap read-only");
+        assert_eq!(
+            s.engine.capability(),
+            Capability::root().attenuate([format!("urn:cap:fs:read:{}", s.root.display())]),
+            "the profile `with_profiles` actually registers"
+        );
+
+        let before = s.trace.events().len();
+        let refused = run(&s.engine, &steps[2]).expect_err("3 · write → denied");
+        assert!(refused.starts_with("denied:"), "{refused}");
+        assert_eq!(read(&note), "remember the milk", "the file is untouched");
+
+        let events = s.trace.events();
+        assert_eq!(
+            events.len(),
+            before + 1,
+            "one event, the denial: {events:?}"
+        );
+        let denial = &events[before];
+        assert_eq!(denial.target, "urn:file:note.txt");
+        assert_eq!(
+            denial.notes,
+            vec![(DENIED_NOTE.to_string(), "urn:cap:fs:write:*".to_string())],
+            "refused at the floor, for the scope the action declares"
+        );
+        assert!(
+            denial.started.is_none() && denial.ended.is_none(),
+            "nothing ran: {denial:?}"
+        );
+        assert!(
+            matches!(
+                typed_sink(&s.kernel, "urn:file:note.txt", &s.engine.capability()),
+                Error::Denied(_)
+            ),
+            "typed at the kernel, under the session's own capability"
+        );
+
+        // Reads still resolve, and the jail holds even at full authority.
+        assert_eq!(
+            run(&s.engine, &steps[3]).expect("4 · read → ok"),
+            "remember the milk"
+        );
+        run(&s.engine, &steps[4]).expect_err("5 · the jail refuses `..`");
+        run(&s.engine, &steps[5]).expect("6 · cap reset");
+        assert_eq!(s.engine.capability(), Capability::root());
+        run(&s.engine, &steps[4]).expect_err("the jail holds at root too");
+    }
+
+    /// **The module's ACL gate**: a session that DOES hold a grant under the family, but for
+    /// another path, clears the floor and is refused inside `invoke` — with no trace event
+    /// at all, so the only witness is that nothing reached the disk.
+    ///
+    /// This is the half a status code cannot distinguish: both gates answer 403 through the
+    /// HTTP face and `denied:` through this one, and only the absence of the file says the
+    /// endpoint was not entered.
+    #[test]
+    fn a_step_outside_the_granted_segment_is_denied_and_never_reaches_the_disk() {
+        let s = session("acl");
+        let root = s.root.display();
+        let login = run(
+            &s.engine,
+            &format!(
+                "sink urn:host:login urn:cap:fs:read:{root}/mine urn:cap:fs:write:{root}/mine"
+            ),
+        )
+        .expect("login is a session operation");
+        assert!(login.starts_with("logged in"), "{login}");
+
+        run(&s.engine, "sink urn:file:mine/secret.txt mine only")
+            .expect("a write inside the segment lands");
+        assert_eq!(read(&s.root.join("mine/secret.txt")), "mine only");
+
+        let before = s.trace.events().len();
+        let refused = run(&s.engine, "sink urn:file:someone-else/secret.txt nope")
+            .expect_err("outside the segment is refused");
+        assert!(refused.starts_with("denied:"), "{refused}");
+        assert!(
+            !s.root.join("someone-else").exists(),
+            "nothing was written outside the granted segment"
+        );
+        let after = s.trace.events();
+        assert_eq!(
+            after.len(),
+            before,
+            "the module's ACL refused inside invoke, which core does not trace: {after:?}"
+        );
+        assert!(
+            matches!(
+                typed_sink(
+                    &s.kernel,
+                    "urn:file:someone-else/secret.txt",
+                    &s.engine.capability()
+                ),
+                Error::Denied(_)
+            ),
+            "the floor passed (a write grant IS held) and the endpoint's own rule refused"
+        );
+    }
+}

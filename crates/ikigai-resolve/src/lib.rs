@@ -12,6 +12,7 @@
 //! directly (no client-side cache probing across the wire). The wire protocol
 //! that remote resolvers speak lives in the companion `ikigai-wire` crate.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -254,6 +255,9 @@ impl Space for RemoteSpace {
             endpoint: Arc::new(ForwardingEndpoint {
                 resolver: Arc::clone(&self.resolver),
                 name: self.names.name_for(&request.target),
+                // A bare `RemoteSpace` is mounted by a caller that holds the resolver;
+                // it carries no origin label of its own (`MountedRemote` does).
+                origin: None,
                 request: request.clone(),
             }),
             bindings: Bindings::new(),
@@ -285,6 +289,11 @@ struct ForwardingEndpoint {
     /// be the REMOTE's name, not a transport label. `None` falls back to
     /// `"remote"`.
     name: Option<String>,
+    /// The mount's origin label (`ipc:~/.ikigai/dev.sock`, `quic:plasma:4433`), when the
+    /// space that built this endpoint has one. Used only to NAME the peer in the
+    /// contract-unavailable path ([`unavailable`]) — a diagnostic that says "a mounted
+    /// peer" is one an operator with three mounts cannot act on.
+    origin: Option<String>,
 }
 
 #[async_trait]
@@ -320,15 +329,90 @@ impl Endpoint for ForwardingEndpoint {
     fn describe(&self) -> Description {
         // Forward a Meta request (JSON face) so the engine can route named args by
         // the *remote* endpoint's own contract — otherwise `compose src=…` over a
-        // mount loses its `src`. Best-effort: a bare description on any error.
+        // mount loses its `src`. Best-effort, and [`unavailable`] is what makes the
+        // best-effort part audible rather than silent.
         let meta = Request::new(Verb::Meta, self.request.target.clone())
             .with_arg("as", ArgRef::Inline(b"application/json".to_vec()));
-        self.resolver
-            .issue_as(meta, &Capability::root())
-            .ok()
-            .and_then(|(repr, _status)| serde_json::from_slice(&repr.bytes).ok())
-            .unwrap_or_else(|| Description::new("remote"))
+        let reason = match self.resolver.issue_as(meta, &Capability::root()) {
+            Ok((repr, _status)) => match serde_json::from_slice::<Description>(&repr.bytes) {
+                Ok(description) => return description,
+                // The shape that cost a day: a peer below `ikigai-vocab` 0.1.47 has no
+                // JSON Meta renderer, answers `as=application/json` with the canonical
+                // TURTLE, and the parse fails here — so the media type is named, because
+                // "expected JSON, got text/turtle" is the whole diagnosis.
+                Err(error) => format!(
+                    "its Meta answer is {} ({} byte(s)), not a JSON Description: {error}",
+                    repr.repr_type,
+                    repr.bytes.len()
+                ),
+            },
+            Err(error) => format!("it refused the Meta request: {error}"),
+        };
+        unavailable(
+            self.origin.as_deref(),
+            self.request.target.as_str(),
+            &reason,
+        )
     }
+}
+
+/// The description a mounted endpoint gets when its peer's contract could not be read —
+/// and the note that says so, once.
+///
+/// ## Why this is not just `Description::new("remote")`
+///
+/// It was, until 0.1.20, and the consequence is that a peer whose Meta answer cannot be
+/// parsed becomes one anonymous, action-less row: the engine stops routing named arguments
+/// (`compose src=…` over the mount silently loses its `src`), the catalog shows a contract
+/// with no verbs, and **a whole federated kernel reads as SMALL rather than as broken**.
+/// Both halves of that were paid for: `ikigai-dev-server` #8 took crate archaeology to
+/// trace a `ikigai-vocab` floor below 0.1.47 back to this line, and `ikigai-web` #14 found
+/// a walk over a renderer-less peer reporting `endpoints = 1` and reading as a small
+/// kernel. The failure is indistinguishable from a peer that genuinely serves one thing.
+///
+/// So the fallback now SAYS it is a fallback, in two places:
+///
+/// * the description itself carries a title and a summary naming the peer and the reason,
+///   so it is visible wherever a contract is — the catalog, `urn:kernel:actions`, MCP;
+/// * one line on stderr per (peer, reason), because a description is only seen by someone
+///   already looking at the catalog, and the operator who needs this is looking at a
+///   command that lost an argument.
+///
+/// ⚠ The id stays `remote`. It is what core's template-probe guard compares against and
+/// what a consumer (`ikigai-web`'s conformance walk, conformance PENDING #133) already
+/// tests for; changing it would trade a known detector for a prettier string.
+///
+/// ## Why the note is deduplicated
+///
+/// `describe()` is called per dispatch, not once per mount (ikigai-core AUDIT 2026-09-08),
+/// so an un-deduplicated note would print on every request through a degraded mount — which
+/// is not "loud", it is noise that gets filtered out. Keyed by (peer, reason) so a peer that
+/// later fails differently still says so; bounded by peers × failure kinds.
+fn unavailable(origin: Option<&str>, target: &str, reason: &str) -> Description {
+    let peer = origin.unwrap_or("a mounted peer");
+    let once = format!("{peer}\u{1}{reason}");
+    let first = {
+        static SEEN: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+        // A poisoned lock here must not take down a describe: treat it as "already said".
+        SEEN.lock()
+            .map(|mut seen| seen.insert(once))
+            .unwrap_or(false)
+    };
+    if first {
+        eprintln!(
+            "ikigai: {peer} did not answer with a contract for `{target}` — {reason}. \
+             Its endpoints will present no actions and named arguments will not be routed \
+             to them. (A peer needs a Meta renderer and `ikigai-vocab` >= 0.1.47 to serve \
+             the JSON Meta face.)"
+        );
+    }
+    Description::new("remote")
+        .title("contract unavailable")
+        .summary(format!(
+            "{peer} did not answer with a contract for `{target}`: {reason}. This row is a \
+             placeholder, not the peer's declaration — the actions it really offers are \
+             unknown here, and named arguments are not routed."
+        ))
 }
 
 /// A **prefix-mounted** remote kernel: requests under `prefix` are rewritten
@@ -418,6 +502,7 @@ impl Space for MountedRemote {
             endpoint: Arc::new(ForwardingEndpoint {
                 resolver: Arc::clone(&self.resolver),
                 name: self.names.name_for(&forwarded.target),
+                origin: Some(self.origin.clone()),
                 request: forwarded,
             }),
             bindings: Bindings::new(),
