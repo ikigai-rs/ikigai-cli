@@ -29,7 +29,7 @@ ikigai-throttle = { workspace = true }
 # mDNS announce/browse. The one sibling this host names by path rather than through
 # `[workspace.dependencies]`; the version is the LOCKSTEP version, not a floor (see the root
 # manifest for why, and `crates/ikigai-cli/tests/lockstep_pins.rs` for the check).
-ikigai-discovery = { path = "../ikigai-discovery", version = "0.1.19" }
+ikigai-discovery = { path = "../ikigai-discovery", version = "0.1.20" }
 ikigai-fs = { workspace = true }
 ikigai-http = { workspace = true }
 ikigai-runbook = { workspace = true }
@@ -99,6 +99,16 @@ async-trait = "0.1"
 
 [dev-dependencies]
 futures = { workspace = true }
+# What "done" means for a module, as one test — run here over the two kernels this crate
+# COMPOSES (`kernel()` and `kernel_for()`), not over a module's own space. See
+# `tests/conformance.rs` for what that changes: the walk fires endpoints under root, and a
+# composing host binds subprocess, network, inference, mail and platform seams.
+ikigai-conformance = "0.1.0"
+# The conformance fixture SEEDS the two edge verifying keys and one signing key, so the
+# decision faces are walked over real state instead of reporting "did not resolve". Same
+# version and features as the library dependency above: the fixture must write exactly the
+# encodings `verifying_key_at` / `parse_signing_key` read (SPKI PEM and PKCS8 PEM).
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "pkcs8", "pem"] }
 # The passkey endpoint tests play the authenticator: a fixed P-256 key signs assertions.
 p256 = { version = "0.13", features = ["ecdsa", "pem"] }
 sha2 = "0.10"

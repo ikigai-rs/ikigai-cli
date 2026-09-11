@@ -352,6 +352,34 @@ mod tests {
 
     // A tiny echo-like endpoint: Source reads `in`, returns it wrapped, and
     // requires a capability so we can watch the manifold shrink.
+    /// The tools that are the MODULE's, i.e. everything but the kernel's own operations.
+    ///
+    /// Since ikigai-core 0.1.67 the kernel projects `kernel-actions` and `kernel-validate`
+    /// to an agent holding no inspect grant (the selection funnel's deterministic stages),
+    /// and more of its operations to one that does. A test about what a MODULE offers
+    /// therefore has to say so rather than count the whole list.
+    fn module_tools(tools: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+        tools
+            .iter()
+            .filter(|t| {
+                !t["name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("kernel-")
+            })
+            .collect()
+    }
+
+    /// The kernel operations in a tool list, by name, in order.
+    fn kernel_ops(tools: &[serde_json::Value]) -> Vec<String> {
+        tools
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .filter(|n| n.starts_with("kernel-"))
+            .map(str::to_string)
+            .collect()
+    }
+
     fn kernel() -> Kernel {
         let echo = FnEndpoint::new("echo", |inv| {
             let text = inv.inline_str("in").unwrap_or("");
@@ -411,12 +439,22 @@ mod tests {
         )
         .unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["name"], "echo__source");
+        // ★ The kernel's OWN operations project too, and since `ikigai-core` 0.1.67 two of
+        // them reach an agent holding no inspect grant at all: `kernel-actions` and
+        // `kernel-validate`, the two deterministic stages of the selection funnel. That is
+        // right — an agent that cannot see the narrowing step cannot narrow — but it means a
+        // tool list is never only the module's, so every count here is over the module's own
+        // rows. The funnel pair is PINNED rather than filtered away silently: if core stops
+        // projecting it, an agent's menu quietly loses the thing that makes it navigable.
         assert_eq!(
-            tools[0]["inputSchema"]["properties"]["in"]["type"],
-            "string"
+            kernel_ops(tools),
+            ["kernel-actions__source", "kernel-validate__source"],
+            "the funnel projects to a scoped agent: {tools:?}"
         );
+        let mine = module_tools(tools);
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0]["name"], "echo__source");
+        assert_eq!(mine[0]["inputSchema"]["properties"]["in"]["type"], "string");
 
         // Without it: the manifold is empty — affordance equals authorization.
         let bare = Capability::scoped(["urn:cap:unrelated"]);
@@ -427,7 +465,10 @@ mod tests {
             &json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
         )
         .unwrap();
-        assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            module_tools(resp["result"]["tools"].as_array().unwrap()).len(),
+            0
+        );
     }
 
     /// ★★ The tool name is an IDENTITY KEY and `sanitize_id` is LOSSY. One endpoint bound
@@ -462,7 +503,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            resp["result"]["tools"].as_array().unwrap().is_empty(),
+            module_tools(resp["result"]["tools"].as_array().unwrap()).is_empty(),
             "an ambiguous name is not offered: {resp}"
         );
 
@@ -802,7 +843,10 @@ mod tests {
             &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
         )
         .unwrap();
-        assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            module_tools(resp["result"]["tools"].as_array().unwrap()).len(),
+            0
+        );
 
         // A show list that doesn't include echo hides it too; one that does keeps it.
         let only_other = ToolFilter {
@@ -816,7 +860,10 @@ mod tests {
             &json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
         )
         .unwrap();
-        assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            module_tools(resp["result"]["tools"].as_array().unwrap()).len(),
+            0
+        );
     }
 
     #[test]

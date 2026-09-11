@@ -349,7 +349,11 @@ impl Endpoint for DecideLink {
                 ActionSpec::new(Verb::Source)
                     .summary("mint — the signed links for a pending booking")
                     .requires(CAP_DECIDE_MINT)
-                    .input(ArgSpec::new("id").summary("the pending booking's tuple id")),
+                    .input(
+                        ArgSpec::new("id")
+                            .summary("the pending booking's tuple id")
+                            .class(crate::XSD_STRING),
+                    ),
             )
             .output("text/plain; charset=utf-8")
     }
@@ -394,6 +398,21 @@ pub(crate) fn page(title: &str, body: &str) -> Representation {
 
 /// The action this resource IS, from the last segment of its own IRI
 /// (`urn:calendar-request:approve` → `approve`).
+/// The `{action}` of `urn:calendar-request:{action}`, as a declared binding input.
+///
+/// Declared on BOTH actions because a template variable that is not a declared binding input
+/// makes the action undrivable from `urn:kernel:actions`: the manifold cannot form the IRI
+/// from the contract, however reachable the resource is by direct resolution. The `one_of` is
+/// the closed set [`CalendarRequest::invoke`] branches on — `decline` is the `_` arm, so the
+/// list is the whole grammar rather than a subset of it.
+fn action_binding() -> ArgSpec {
+    ArgSpec::new("action")
+        .binding()
+        .class(crate::XSD_STRING)
+        .one_of(["approve", "approve-zoom", "decline", "block"])
+        .summary("the decision: the `{action}` of `urn:calendar-request:{action}`")
+}
+
 fn action_of(inv: &Invocation<'_>) -> String {
     inv.request
         .target
@@ -517,16 +536,70 @@ impl Endpoint for CalendarRequest {
             .action(
                 ActionSpec::new(Verb::Source)
                     .summary("show — what this link would decide")
-                    .input(ArgSpec::new("id").summary("the booking id"))
-                    .input(ArgSpec::new("exp").summary("expiry, unix seconds"))
-                    .input(ArgSpec::new("t").summary("the signature")),
+                    .input(action_binding())
+                    .input(
+                        ArgSpec::new("id")
+                            .summary("the booking id")
+                            .class(crate::XSD_STRING),
+                    )
+                    .input(
+                        ArgSpec::new("exp")
+                            .summary("expiry, unix seconds")
+                            .class(crate::XSD_INTEGER),
+                    )
+                    .input(
+                        ArgSpec::new("t")
+                            .summary("the signature")
+                            .class(crate::XSD_STRING),
+                    )
+                    // ⚠ DECLARED because it is READ: a `<form method=post>` puts its
+                    // fields in the BODY, which the HTTP face hands over as the piped
+                    // `content`, and `param()` looks there when a name is not an argument.
+                    // Undeclared, the one channel every browser submission actually uses
+                    // was invisible to the manifold.
+                    .input(
+                        ArgSpec::new("content")
+                            .optional()
+                            .class(crate::XSD_STRING)
+                            .summary(
+                                "a urlencoded form body; the inputs above are read from it \
+                                 when they are not named arguments",
+                            ),
+                    ),
             )
             .action(
                 ActionSpec::new(Verb::Sink)
                     .summary("decide — record the decision")
-                    .input(ArgSpec::new("id").summary("the booking id"))
-                    .input(ArgSpec::new("exp").summary("expiry, unix seconds"))
-                    .input(ArgSpec::new("t").summary("the signature")),
+                    .input(action_binding())
+                    .input(
+                        ArgSpec::new("id")
+                            .summary("the booking id")
+                            .class(crate::XSD_STRING),
+                    )
+                    .input(
+                        ArgSpec::new("exp")
+                            .summary("expiry, unix seconds")
+                            .class(crate::XSD_INTEGER),
+                    )
+                    .input(
+                        ArgSpec::new("t")
+                            .summary("the signature")
+                            .class(crate::XSD_STRING),
+                    )
+                    // ⚠ DECLARED because it is READ: a `<form method=post>` puts its
+                    // fields in the BODY, which the HTTP face hands over as the piped
+                    // `content`, and `param()` looks there when a name is not an argument.
+                    // Undeclared, the one channel every browser submission actually uses
+                    // was invisible to the manifold.
+                    .input(
+                        ArgSpec::new("content")
+                            .optional()
+                            .class(crate::XSD_STRING)
+                            .summary(
+                                "a urlencoded form body; the inputs above are read from it \
+                                 when they are not named arguments",
+                            ),
+                    ),
             )
             .output("text/html; charset=utf-8")
     }
@@ -597,7 +670,11 @@ impl Endpoint for DecideAccept {
                 ActionSpec::new(Verb::Sink)
                     .summary("accept — verify a decision tuple and run confirm")
                     .requires(CAP_DECIDE_ACCEPT)
-                    .input(ArgSpec::new("content").summary("the decision tuple")),
+                    .input(
+                        ArgSpec::new("content")
+                            .summary("the decision tuple")
+                            .class(crate::XSD_STRING),
+                    ),
             )
             .output("text/plain; charset=utf-8")
     }

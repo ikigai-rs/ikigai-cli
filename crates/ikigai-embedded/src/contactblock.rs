@@ -205,7 +205,11 @@ impl Endpoint for ContactBlockLink {
                 ActionSpec::new(Verb::Source)
                     .summary("mint — the signed block link for one address")
                     .requires(CAP_CONTACTBLOCK_MINT)
-                    .input(ArgSpec::new("email").summary("the sender address to block")),
+                    .input(
+                        ArgSpec::new("email")
+                            .summary("the sender address to block")
+                            .class(crate::XSD_STRING),
+                    ),
             )
             .output("text/plain; charset=utf-8")
     }
@@ -313,16 +317,68 @@ impl Endpoint for ContactBlock {
             .action(
                 ActionSpec::new(Verb::Source)
                     .summary("show — the address this link would block")
-                    .input(ArgSpec::new("email").summary("the sender address"))
-                    .input(ArgSpec::new("exp").summary("expiry, unix seconds"))
-                    .input(ArgSpec::new("t").summary("the signature")),
+                    .input(
+                        ArgSpec::new("email")
+                            .summary("the sender address")
+                            .class(crate::XSD_STRING),
+                    )
+                    .input(
+                        ArgSpec::new("exp")
+                            .summary("expiry, unix seconds")
+                            .class(crate::XSD_INTEGER),
+                    )
+                    .input(
+                        ArgSpec::new("t")
+                            .summary("the signature")
+                            .class(crate::XSD_STRING),
+                    )
+                    // ⚠ DECLARED because it is READ: a `<form method=post>` puts its
+                    // fields in the BODY, which the HTTP face hands over as the piped
+                    // `content`, and `param()` looks there when a name is not an argument.
+                    // Undeclared, the one channel every browser submission actually uses
+                    // was invisible to the manifold.
+                    .input(
+                        ArgSpec::new("content")
+                            .optional()
+                            .class(crate::XSD_STRING)
+                            .summary(
+                                "a urlencoded form body; the inputs above are read from it \
+                                 when they are not named arguments",
+                            ),
+                    ),
             )
             .action(
                 ActionSpec::new(Verb::Sink)
                     .summary("block — record the block")
-                    .input(ArgSpec::new("email").summary("the sender address"))
-                    .input(ArgSpec::new("exp").summary("expiry, unix seconds"))
-                    .input(ArgSpec::new("t").summary("the signature")),
+                    .input(
+                        ArgSpec::new("email")
+                            .summary("the sender address")
+                            .class(crate::XSD_STRING),
+                    )
+                    .input(
+                        ArgSpec::new("exp")
+                            .summary("expiry, unix seconds")
+                            .class(crate::XSD_INTEGER),
+                    )
+                    .input(
+                        ArgSpec::new("t")
+                            .summary("the signature")
+                            .class(crate::XSD_STRING),
+                    )
+                    // ⚠ DECLARED because it is READ: a `<form method=post>` puts its
+                    // fields in the BODY, which the HTTP face hands over as the piped
+                    // `content`, and `param()` looks there when a name is not an argument.
+                    // Undeclared, the one channel every browser submission actually uses
+                    // was invisible to the manifold.
+                    .input(
+                        ArgSpec::new("content")
+                            .optional()
+                            .class(crate::XSD_STRING)
+                            .summary(
+                                "a urlencoded form body; the inputs above are read from it \
+                                 when they are not named arguments",
+                            ),
+                    ),
             )
             .output("text/html; charset=utf-8")
     }

@@ -78,7 +78,7 @@ impl Endpoint for DecisionLog {
                         "recording a decision requires `{CAP_DECISIONS_WRITE}`"
                     )));
                 }
-                let arg = |name: &str| inv.inline_str(name).unwrap_or("").trim().to_string();
+                let arg = |name: &str| crate::decide::param(inv, name);
                 let action = arg("action");
                 if !matches!(action.as_str(), "approve" | "decline" | "block") {
                     return Err(Error::InvalidArgument {
@@ -178,11 +178,14 @@ impl Endpoint for DecisionLog {
                     .input(
                         ArgSpec::new("action")
                             .optional()
+                            .class(crate::XSD_STRING)
+                            .one_of(["approve", "decline", "block"])
                             .summary("filter — `block` lists blocked addresses"),
                     )
                     .input(
                         ArgSpec::new("blocked")
                             .optional()
+                            .class(crate::XSD_STRING)
                             .summary("an email — answers yes/no"),
                     ),
             )
@@ -190,15 +193,54 @@ impl Endpoint for DecisionLog {
                 ActionSpec::new(Verb::Sink)
                     .summary("append a decision")
                     .requires(CAP_DECISIONS_WRITE)
-                    .input(ArgSpec::new("action").summary("approve, decline or block"))
-                    .input(ArgSpec::new("id").optional().summary("the booking id"))
-                    .input(ArgSpec::new("name").optional().summary("the requester"))
+                    .input(
+                        ArgSpec::new("action")
+                            .class(crate::XSD_STRING)
+                            .one_of(["approve", "decline", "block"])
+                            .summary("approve, decline or block"),
+                    )
+                    .input(
+                        ArgSpec::new("id")
+                            .optional()
+                            .class(crate::XSD_STRING)
+                            .summary("the booking id"),
+                    )
+                    .input(
+                        ArgSpec::new("name")
+                            .optional()
+                            .class(crate::XSD_STRING)
+                            .summary("the requester"),
+                    )
                     .input(
                         ArgSpec::new("email")
                             .optional()
+                            .class(crate::XSD_STRING)
                             .summary("the requester's address"),
                     )
-                    .input(ArgSpec::new("when").optional().summary("the meeting time")),
+                    // ⚠ `xsd:string`, NOT `xsd:dateTime`: this is the human-readable
+                    // meeting time as the decision link carried it, echoed into the log
+                    // verbatim. Nothing here parses it, and a dateTime class would tell
+                    // `urn:kernel:validate` to reject the values this endpoint accepts.
+                    .input(
+                        ArgSpec::new("when")
+                            .optional()
+                            .class(crate::XSD_STRING)
+                            .summary("the meeting time, as the decision link carried it"),
+                    )
+                    // A Sink's pipe — and an HTTP `<form method=post>` body — arrive as
+                    // `content`, so a mutating action that cannot read it is undrivable
+                    // from a pipeline. `param()` reads the named argument first and falls
+                    // back to the urlencoded body, so every existing caller is unaffected.
+                    .input(
+                        ArgSpec::new("content")
+                            .optional()
+                            .class(crate::XSD_STRING)
+                            .summary(
+                                "a urlencoded body (a pipe's value, or a form POST); the \
+                                 inputs above are read from it when they are not named \
+                                 arguments",
+                            ),
+                    ),
             )
             .output("text/plain; charset=utf-8")
     }

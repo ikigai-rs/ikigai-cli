@@ -104,7 +104,7 @@ impl Endpoint for PeopleLedger {
                         "recording a contact requires `{CAP_PEOPLE_WRITE}`"
                     )));
                 }
-                let arg = |name: &str| inv.inline_str(name).unwrap_or("").trim().to_string();
+                let arg = |name: &str| crate::decide::param(inv, name);
                 let email = arg("email");
                 // The address is the whole point of the ledger — a record without one can
                 // never be reached, so reject it rather than store a dead entry.
@@ -174,6 +174,7 @@ impl Endpoint for PeopleLedger {
                     .input(
                         ArgSpec::new("email")
                             .optional()
+                            .class(crate::XSD_STRING)
                             .summary("an address — its full contact history"),
                     ),
             )
@@ -181,17 +182,42 @@ impl Endpoint for PeopleLedger {
                 ActionSpec::new(Verb::Sink)
                     .summary("record a contact")
                     .requires(CAP_PEOPLE_WRITE)
-                    .input(ArgSpec::new("email").summary("the address — the ledger key"))
-                    .input(ArgSpec::new("name").optional().summary("who they are"))
+                    .input(
+                        ArgSpec::new("email")
+                            .class(crate::XSD_STRING)
+                            .summary("the address — the ledger key"),
+                    )
+                    .input(
+                        ArgSpec::new("name")
+                            .optional()
+                            .class(crate::XSD_STRING)
+                            .summary("who they are"),
+                    )
                     .input(
                         ArgSpec::new("source")
                             .optional()
+                            .class(crate::XSD_STRING)
                             .summary("where they came from — booking, contact, …"),
                     )
                     .input(
                         ArgSpec::new("note")
                             .optional()
+                            .class(crate::XSD_STRING)
                             .summary("freeform — the client link, an organisation, …"),
+                    )
+                    // A Sink's pipe — and an HTTP `<form method=post>` body — arrive as
+                    // `content`, so a mutating action that cannot read it is undrivable
+                    // from a pipeline. `param()` reads the named argument first and falls
+                    // back to the urlencoded body, so every existing caller is unaffected.
+                    .input(
+                        ArgSpec::new("content")
+                            .optional()
+                            .class(crate::XSD_STRING)
+                            .summary(
+                                "a urlencoded body (a pipe's value, or a form POST); the \
+                                 inputs above are read from it when they are not named \
+                                 arguments",
+                            ),
                     ),
             )
             .output("text/plain; charset=utf-8")

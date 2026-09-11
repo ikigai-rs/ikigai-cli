@@ -26,6 +26,24 @@ pub use scheduling::{
     RoutingSource, SchedulerSource,
 };
 
+/// The XSD datatype IRIs this host's own endpoints declare their scalar inputs with.
+///
+/// One place, because "every input has a class" is only as good as the class being TRUE, and
+/// the arguable cases are the ones worth deciding once rather than per call site:
+///
+/// * [`XSD_STRING`] is what the WIRE carries, and it is the honest class for a value whose
+///   grammar is this host's own (a token, a signature, an id, a `yes`/`no` flag). A narrower
+///   class that the endpoint does not actually parse would tell `urn:kernel:validate` to
+///   reject values the endpoint accepts — a lie in the direction that breaks callers.
+/// * [`XSD_INTEGER`] only where an integer is genuinely parsed (a unix second, an hour).
+/// * [`XSD_BOOLEAN`] only where `true`/`false` is the accepted spelling. `yes`/`no` is NOT
+///   the XSD boolean lexical space, so those stay strings with a `one_of`.
+const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+/// See [`XSD_STRING`].
+const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
+/// See [`XSD_STRING`].
+const XSD_BOOLEAN: &str = "http://www.w3.org/2001/XMLSchema#boolean";
+
 mod browse;
 pub mod clients;
 pub mod config;
@@ -552,6 +570,9 @@ fn clock_now() -> FnEndpoint {
             .input(
                 ArgSpec::new("html")
                     .summary("html=true wraps the colon in a span (default: plain HH:MM)")
+                    .class(XSD_BOOLEAN)
+                    .one_of(["true", "false"])
+                    .default_value("false")
                     .optional(),
             )
             .output("text/plain;charset=utf-8"),
@@ -1125,15 +1146,35 @@ Authorized candidate actions:
             )
             .verb(Verb::Source)
             .verb(Verb::Meta)
-            .input(ArgSpec::new("goal").summary("natural-language intent for the residual").optional())
-            .input(ArgSpec::new("types").summary("present RDF class IRIs").optional())
+            .input(
+                ArgSpec::new("goal")
+                    .summary("natural-language intent for the residual")
+                    .class(XSD_STRING)
+                    .optional(),
+            )
+            // ⚠ A LIST of class IRIs, comma- or space-separated — so `xsd:anyURI` would tell
+            // `urn:kernel:validate` that `a, b` is malformed, which it is not. There is no
+            // ArgSpec spelling for cardinality (conformance PENDING #15); the class states
+            // what the wire carries and the summary states the grammar.
+            .input(
+                ArgSpec::new("types")
+                    .summary("present RDF class IRIs, comma- or space-separated")
+                    .class(XSD_STRING)
+                    .optional(),
+            )
             .input(
                 ArgSpec::new("verb")
                     .summary("only actions answering this verb")
+                    .class(XSD_STRING)
                     .one_of(["source", "sink", "exists", "delete"])
                     .optional(),
             )
-            .input(ArgSpec::new("want").summary("only actions producing this media type").optional())
+            .input(
+                ArgSpec::new("want")
+                    .summary("only actions producing this media type")
+                    .class(XSD_STRING)
+                    .optional(),
+            )
             .output("text/turtle")
             .output("text/plain;charset=utf-8")
     }
@@ -1802,13 +1843,23 @@ impl Endpoint for LispAliases {
                     .input(
                         ArgSpec::new("as")
                             .optional()
+                            .class(XSD_STRING)
                             .one_of(["text/x-scheme", "text/x-emacs-lisp"])
+                            .default_value("text/x-scheme")
                             .summary("which lisp to emit (default Scheme, for urn:lisp:eval)"),
                     )
-                    .input(ArgSpec::new("prefix").optional().summary(
-                        "only endpoints whose IRI starts with this (e.g. `urn:iki:fn:`), \
-                                 for a prelude scoped to one family",
-                    ))
+                    .input(
+                        ArgSpec::new("prefix")
+                            .optional()
+                            // An IRI PREFIX, not an IRI: `urn:iki:fn:` is not itself a
+                            // well-formed absolute IRI reference, so `xsd:anyURI` would be
+                            // false of every value this accepts.
+                            .class(XSD_STRING)
+                            .summary(
+                                "only endpoints whose IRI starts with this (e.g. \
+                                 `urn:iki:fn:`), for a prelude scoped to one family",
+                            ),
+                    )
                     .requires(CAP_KERNEL_INSPECT),
             )
     }
@@ -2630,7 +2681,9 @@ impl Endpoint for KernelHealth {
                     .input(
                         ArgSpec::new("as")
                             .optional()
+                            .class(XSD_STRING)
                             .one_of(["text/plain", "text/turtle"])
+                            .default_value("text/plain")
                             .summary("the representation to return (default text/plain)"),
                     )
                     .requires(CAP_KERNEL_INSPECT),
@@ -2889,6 +2942,8 @@ impl Endpoint for PeerList {
                     .input(
                         ArgSpec::new("trusted")
                             .optional()
+                            // `yes`/`no`, which is not the `xsd:boolean` lexical space.
+                            .class(XSD_STRING)
                             .one_of(["yes", "no"])
                             .summary(
                                 "yes = only peers this machine holds a pinned certificate \
@@ -2898,7 +2953,9 @@ impl Endpoint for PeerList {
                     .input(
                         ArgSpec::new("as")
                             .optional()
+                            .class(XSD_STRING)
                             .one_of(["text/plain", "text/turtle"])
+                            .default_value("text/plain")
                             .summary("the representation to return (default text/plain)"),
                     )
                     .requires(CAP_NET_DISCOVER),
@@ -3432,7 +3489,27 @@ fn base_alias_table() -> Arc<AliasTable> {
 /// root table is a superset.
 fn base_rules(table: AliasTable) -> AliasTable {
     // ikigai-fn 0.2.0: the function library's own namespace.
-    table.prefix("urn:fn:", "urn:iki:fn:")
+    table
+        .prefix("urn:fn:", "urn:iki:fn:")
+        // ★ ONE rule, and the inverse of the annotation case below: `urn:foaf` is a BARE
+        // root with no children at all — no `urn:foaf:<anything>` is bound, and none is
+        // planned — so the `exact` rule is the whole namespace and a prefix rule would
+        // match nothing that exists. The general shape from [`alias_table`]'s note still
+        // holds; this is the other end of it (check what a namespace actually binds before
+        // writing either line).
+        //
+        // The canonical name is [`foaf::RESOURCE`] and the binding lives in
+        // [`kernel_for`], which installs THIS table. The rule is in `base_rules` rather
+        // than beside that binding so the two tables cannot disagree about it; in the
+        // embedded root it rewrites a name nothing binds to a name nothing binds, which is
+        // a no-op with a counter rather than the "rewrite before mount matching" hazard the
+        // annotation rules carry (nothing mounts `urn:foaf` either).
+        //
+        // ⚠ The live edge routes `/foaf` at `urn:foaf` (`edge-routes.json`, owned by
+        // ikigai-devtools and deployed by hand). This rule is what keeps that route working
+        // across the rename, so it outlives the route-table edit rather than being retired
+        // with it.
+        .exact("urn:foaf", foaf::RESOURCE)
 }
 
 /// The host's URN **rewrite table** — the transition window for the `urn:iki:`
@@ -4219,6 +4296,15 @@ impl Endpoint for ClientRegistry {
                  clients/<token>.json in the workspace; revoke by deleting it.",
             )
             .verb(Verb::Source)
+            // The `{token}` of `urn:client:{token}`. Without it the manifold cannot form
+            // the IRI from the contract and the action is undrivable from
+            // `urn:kernel:actions`, however reachable it is by direct resolution.
+            .input(
+                ArgSpec::new("token")
+                    .binding()
+                    .class(XSD_STRING)
+                    .summary("the handed-out token: the `{token}` of `urn:client:{token}`"),
+            )
             .requires(CAP_CLIENT_READ)
             .output("application/json")
     }
@@ -4299,11 +4385,11 @@ impl Endpoint for ClientIssue {
             )));
         }
 
+        // Named argument first, urlencoded `content` second — so this Sink is drivable by a
+        // pipe and by a form POST, not only by a hand-written argument list.
         let arg = |name: &str| {
-            inv.inline_str(name)
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
+            let value = crate::decide::param(inv, name);
+            (!value.is_empty()).then_some(value)
         };
         let name = arg("name").ok_or_else(|| Error::MissingArgument("name".to_string()))?;
         let id = arg("id").unwrap_or_else(|| slug(&name));
@@ -4402,38 +4488,71 @@ impl Endpoint for ClientIssue {
                 ActionSpec::new(Verb::Sink)
                     .summary("issue — mint a durable booking link for one client")
                     .requires(CAP_CLIENT_ISSUE)
-                    .input(ArgSpec::new("name").summary("the client's name"))
+                    .input(
+                        ArgSpec::new("name")
+                            .class(XSD_STRING)
+                            .summary("the client's name"),
+                    )
                     .input(
                         ArgSpec::new("id")
                             .optional()
+                            .class(XSD_STRING)
                             .summary("short id recorded on their bookings (default: from name)"),
                     )
                     .input(
                         ArgSpec::new("email")
                             .optional()
+                            .class(XSD_STRING)
                             .summary("pre-filled in the link, and where `send=yes` posts it"),
                     )
-                    .input(ArgSpec::new("organisation").optional().summary("their org"))
+                    .input(
+                        ArgSpec::new("organisation")
+                            .optional()
+                            .class(XSD_STRING)
+                            .summary("their org"),
+                    )
                     .input(
                         ArgSpec::new("note")
                             .optional()
+                            .class(XSD_STRING)
                             .summary("a note to yourself"),
                     )
+                    // An HOUR, 0..23 — `xsd:integer` rather than `xsd:time`: the value is a
+                    // bare hour number, and the endpoint parses it as one.
                     .input(
                         ArgSpec::new("earliest")
                             .optional()
+                            .class(XSD_INTEGER)
                             .summary("earliest bookable hour for THIS client, host-local 0..23"),
                     )
                     .input(
                         ArgSpec::new("latest")
                             .optional()
+                            .class(XSD_INTEGER)
                             .summary("latest bookable hour for THIS client, host-local 0..23"),
                     )
+                    // ⚠ `xsd:string`, not `xsd:boolean`: the accepted spellings are `yes`
+                    // and `no`, which are not the XSD boolean lexical space (`true`/`false`/
+                    // `1`/`0`). The `one_of` is the real constraint.
                     .input(
                         ArgSpec::new("send")
                             .optional()
+                            .class(XSD_STRING)
                             .one_of(["yes", "no"])
+                            .default_value("no")
                             .summary("email the link to them (default no)"),
+                    )
+                    // A Sink's pipe and an HTTP form body both arrive as `content`; without
+                    // it declared, a mutating action with only by-value inputs cannot be
+                    // driven by either.
+                    .input(
+                        ArgSpec::new("content")
+                            .optional()
+                            .class(XSD_STRING)
+                            .summary(
+                                "a urlencoded body; the inputs above are read from it when \
+                                 they are not named arguments",
+                            ),
                     ),
             )
             .output("text/plain; charset=utf-8")
@@ -4715,13 +4834,44 @@ fn watch_org(kernel: Arc<Kernel>) {
             if event.kind.is_access() {
                 continue;
             }
-            let relevant = event.paths.iter().any(|path| {
-                path.file_name()
-                    .map(|name| watched.iter().any(|w| w.as_str() == name.to_string_lossy()))
-                    .unwrap_or(false)
-            });
-            if !relevant {
+            let changed: Vec<&String> = event
+                .paths
+                .iter()
+                .filter_map(|path| {
+                    let name = path.file_name()?.to_string_lossy().into_owned();
+                    watched.iter().find(|w| w.as_str() == name)
+                })
+                .collect();
+            if changed.is_empty() {
                 continue;
+            }
+            // ★ CUT FIRST, AND OUTSIDE THE DEBOUNCE. `ikigai-fs` threads a cacheable read
+            // under `inv.request.target` — the IRI the HOST bound it at — so an org file
+            // read through this mount carries the thread `urn:orgfile:<name>`, not a
+            // `urn:file:` one. That is the name to cut, and there is no collision with the
+            // workspace watcher's threads even when the two directories share a filename.
+            //
+            // Two placement decisions, both deliberate:
+            //
+            // * BEFORE the debounce, because a cut is a hash-set insert and skipping it is
+            //   exactly the staleness the thread exists to prevent — the debounce exists to
+            //   stop a burst from running N *derivations*, not to stop it invalidating N
+            //   caches.
+            // * BEFORE the derive, so the derivation itself reads post-change bytes rather
+            //   than whatever a cache was holding.
+            //
+            // ⚠ This is latent today and stated so rather than left to be discovered:
+            // `urn:orgfile:{path}` is bound WITHOUT `.cacheable()` (see `local_space`), so
+            // every read is live and there is nothing for these cuts to invalidate. They are
+            // here because `ikigai-org` 0.1.7 made absolute-period agendas cacheable, which
+            // makes mounting the org dir cacheable a reasonable next step — and a host that
+            // takes it should not also have to remember this. ⚠ The other half of the
+            // residue: this whole watcher is gated on `derive_every()`, so a host that mounts
+            // the org dir cacheable and does NOT sync gets no cuts at all. Freshness and
+            // syncing are one switch here; separating them is a change to what threads this
+            // process starts, not a line in this loop.
+            for name in changed {
+                kernel.cut(format!("urn:orgfile:{name}"));
             }
             // Debounce the burst, then let straggler events settle before deriving.
             if last_run.elapsed() < std::time::Duration::from_secs(3) {
@@ -4911,7 +5061,7 @@ pub fn trusted_kernel_with_mounts(nature: &'static str, mounts: Vec<MountSpec>) 
 }
 
 /// Build the **HTTP door's** kernel (`ikigai serve --http`), labelled `nature`: the
-/// served space plus the transreption chain `urn:foaf` resolves through. It has **no
+/// served space plus the transreption chain `urn:iki:foaf` resolves through. It has **no
 /// personal space**: the door resolves every request under the operator's `--cap`
 /// ceiling (or the public, empty capability), so `urn:personal:*` stays off it.
 ///
@@ -4927,16 +5077,37 @@ pub fn trusted_kernel_with_mounts(nature: &'static str, mounts: Vec<MountSpec>) 
 pub fn kernel_for(nature: &'static str) -> Kernel {
     let spaces: Vec<Arc<dyn Space>> = vec![
         Arc::new(served_space(nature)) as Arc<dyn Space>,
-        // `urn:foaf`, the negotiated FOAF face (see [`foaf`]), routed as `/foaf` on the
+        // `urn:iki:foaf`, the negotiated FOAF face (see [`foaf`]), routed as `/foaf` on the
         // edge. Beside its chain rather than in `served_space`, so it exists exactly where
-        // the resources it issues through exist.
-        Arc::new(EndpointSpace::new().bind(Exact::new("urn:foaf"), foaf::Foaf)) as Arc<dyn Space>,
+        // the resources it issues through exist. The pre-0.1.20 spelling `urn:foaf` reaches
+        // it through the `exact` rule in [`base_rules`] — one binding, one cache entry, one
+        // golden thread.
+        Arc::new(EndpointSpace::new().bind(Exact::new(foaf::RESOURCE), foaf::Foaf))
+            as Arc<dyn Space>,
         Arc::new(http_space()) as Arc<dyn Space>,
         Arc::new(ikigai_rdf::space()) as Arc<dyn Space>,
         Arc::new(ikigai_xslt::space()) as Arc<dyn Space>,
         Arc::new(ikigai_jsonld::space()) as Arc<dyn Space>,
     ];
     Kernel::with_meta_renderer(Arc::new(Fallback::new(spaces)), Arc::new(CliRenderer))
+        // ★ A CLOCK, and it is not decoration — this door was built without one until
+        // 0.1.20 and that made every time-bounded result on it UNCACHEABLE.
+        //
+        // `Expiry::At(deadline)` is meaningless to a kernel that cannot ask what time it is,
+        // so the kernel treats such a result as live and recomputes on every request. The
+        // door binds `http_space()`, and `urn:httpGet` turns an origin's
+        // `Cache-Control: max-age` into exactly that expiry — so the FOAF face re-fetched
+        // `src=` from w3id.org on every hit, and `urn:time:now` recomputed per render tick.
+        // `kernel()`'s own doc comment has said why the clock is there since it was written;
+        // this door simply never got the line.
+        //
+        // Found by the conformance walk (`tests/conformance.rs`), which reported
+        // `clock-now`/`tz-now` as "marked cacheable but the second resolution recomputed …
+        // or the result carries `Expiry::At` on a clockless kernel" against this kernel and
+        // not against `kernel()`. Nothing else would have: the two kernels are the same code
+        // and the types are identical, so the difference is invisible to every test that
+        // builds only one of them.
+        .with_clock(Arc::new(SystemClock))
         .with_aliases(base_alias_table())
 }
 
@@ -5203,6 +5374,13 @@ mod tests {
     #[test]
     fn every_kernel_carries_the_fn_rule_and_only_root_kernels_carry_annotation() {
         let fn_rule = ("urn:fn:".to_string(), "urn:iki:fn:".to_string());
+        // The 0.1.20 FOAF rename. One `exact` rule and no prefix one, because `urn:foaf` is
+        // a bare root with no children — the inverse of the annotation case below, where the
+        // bare form is the minting IRI and BOTH rules are needed. Asserted on every kernel
+        // for the same reason the `urn:fn:` rule is: it lives in `base_rules`, so a new
+        // constructor that forgets the table resolves the canonical name only, and the
+        // omission is invisible until the live edge's `/foaf` route arrives.
+        let foaf_rule = ("urn:foaf".to_string(), foaf::RESOURCE.to_string());
         let annotation_prefix = (
             "urn:annotation:".to_string(),
             "urn:iki:annotation:".to_string(),
@@ -5218,6 +5396,7 @@ mod tests {
         ] {
             let rules = rules_of(label, &kernel);
             assert!(rules.contains(&fn_rule), "{label}: {rules:?}");
+            assert!(rules.contains(&foaf_rule), "{label}: {rules:?}");
             assert!(rules.contains(&annotation_prefix), "{label}: {rules:?}");
             assert!(rules.contains(&annotation_exact), "{label}: {rules:?}");
         }
@@ -5234,6 +5413,10 @@ mod tests {
             ("calendar_server_kernel", calendar_server_kernel()),
         ] {
             let rules = rules_of(label, &kernel);
+            assert!(
+                rules.contains(&foaf_rule),
+                "{label}: the FOAF rename's rule is missing: {rules:?}"
+            );
             assert!(
                 rules.contains(&fn_rule),
                 "{label} binds urn:iki:fn:* through base_space, so it owes the rewrite: \
@@ -6727,6 +6910,15 @@ mod tests {
     }
 
     /// The names `?description` offers, which ARE the fields a generated form renders.
+    /// The FORM fields the booking intake offers, in declaration order.
+    ///
+    /// `content` is filtered out, and the filter is the point rather than a convenience:
+    /// since 0.1.20 the intake declares `content` — the urlencoded or JSON body the fields
+    /// are actually parsed out of — because a mutating action that does not declare where
+    /// its payload arrives is undrivable from a pipe or a manifold. That input belongs to
+    /// the TRANSPORT, not to the form (`ikigai-web` reserves both `as` and `content` on the
+    /// way in and no longer projects them on the way out), so a reader asking "what does the
+    /// form ask for" must not see it. `content_is_declared_and_is_last` holds the other half.
     fn offered_fields() -> Vec<String> {
         ikigai_intake::submit(booking_intake())
             .describe()
@@ -6734,7 +6926,26 @@ mod tests {
             .inputs
             .iter()
             .map(|i| i.name.clone())
+            .filter(|name| name != "content")
             .collect()
+    }
+
+    /// The body input exists, is required, and sits after every form field.
+    ///
+    /// Required because `invoke` answers `MissingArgument("content")` without it: the fields
+    /// above are not read from named arguments at all, they are parsed out of this. Last
+    /// because declaration order IS projection order, so a consumer that renders the inputs
+    /// in order shows the form first and the envelope after it.
+    #[test]
+    fn content_is_declared_and_is_last() {
+        let described = ikigai_intake::submit(booking_intake()).describe();
+        let inputs = &described.action_specs()[0].inputs;
+        let last = inputs.last().expect("a Sink with inputs");
+        assert_eq!(last.name, "content", "{:?}", inputs);
+        assert!(
+            last.required,
+            "the body is the only thing `invoke` requires"
+        );
     }
 
     #[test]
