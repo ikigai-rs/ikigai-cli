@@ -565,7 +565,11 @@ impl Endpoint for CalendarRequest {
                                 "a urlencoded form body; the inputs above are read from it \
                                  when they are not named arguments",
                             ),
-                    ),
+                    )
+                    // On the ACTION: an explicit `ActionSpec` is taken WHOLE by
+                    // `action_specs()`, which never folds the flat `.output()` below into
+                    // it — so the flat declaration alone left both faces unannounced.
+                    .output("text/html; charset=utf-8"),
             )
             .action(
                 ActionSpec::new(Verb::Sink)
@@ -599,7 +603,8 @@ impl Endpoint for CalendarRequest {
                                 "a urlencoded form body; the inputs above are read from it \
                                  when they are not named arguments",
                             ),
-                    ),
+                    )
+                    .output("text/html; charset=utf-8"),
             )
             .output("text/html; charset=utf-8")
     }

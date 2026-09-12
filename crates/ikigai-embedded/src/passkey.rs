@@ -259,7 +259,17 @@ impl Endpoint for PasskeyJs {
         Description::new("passkey-js")
             .title("The passkey ceremony script")
             .summary("The same-origin script the decision and register pages load to run the WebAuthn ceremony.")
-            .action(ActionSpec::new(Verb::Source).summary("the script"))
+            // ★ ON THE ACTION, not beside it. `Description::action` takes an explicit
+            // `ActionSpec` WHOLE — `action_specs()` never merges the flat `.output()` into
+            // one — so the flat declaration below is invisible to every consumer that reads
+            // the manifold's actions. Kept as well because `Description::outputs` is its own
+            // public field; the action is the one that is read. (Conformance 0.2.0's OUTPUTS
+            // check found all four passkey faces undeclared this way.)
+            .action(
+                ActionSpec::new(Verb::Source)
+                    .summary("the script")
+                    .output("application/javascript; charset=utf-8"),
+            )
             .output("application/javascript; charset=utf-8")
     }
 }
@@ -387,7 +397,11 @@ impl Endpoint for PasskeyChallenge {
         Description::new("passkey-challenge")
             .title("Issue a WebAuthn challenge")
             .summary("A fresh single-use challenge plus the registered credential ids, for a login ceremony.")
-            .action(ActionSpec::new(Verb::Source).summary("mint a challenge"))
+            .action(
+                ActionSpec::new(Verb::Source)
+                    .summary("mint a challenge")
+                    .output("application/json; charset=utf-8"),
+            )
             .output("application/json; charset=utf-8")
     }
 }
@@ -427,6 +441,7 @@ impl Endpoint for PasskeyEnrollOpen {
             .action(
                 ActionSpec::new(Verb::Sink)
                     .summary("open the window")
+                    .output("text/plain; charset=utf-8")
                     .requires(CAP_PASSKEY_ENROLL),
             )
             .output("text/plain; charset=utf-8")
@@ -526,8 +541,16 @@ impl Endpoint for PasskeyRegister {
         Description::new("passkey-register")
             .title("Register a passkey")
             .summary("GET shows the enrolment page; POST stores a credential while an enrollment window is open.")
-            .action(ActionSpec::new(Verb::Source).summary("show the enrolment page"))
-            .action(ActionSpec::new(Verb::Sink).summary("store a credential (window must be open)"))
+            .action(
+                ActionSpec::new(Verb::Source)
+                    .summary("show the enrolment page")
+                    .output("text/html; charset=utf-8"),
+            )
+            .action(
+                ActionSpec::new(Verb::Sink)
+                    .summary("store a credential (window must be open)")
+                    .output("text/html; charset=utf-8"),
+            )
             .output("text/html; charset=utf-8")
     }
 }

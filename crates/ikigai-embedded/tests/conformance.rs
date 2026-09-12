@@ -56,20 +56,28 @@
 //! `set_file_root` is the typed channel this crate documents for exactly this: `cfg(test)`
 //! does not reach a `tests/` binary, so the redirect has to be a call, not a compile flag.
 //!
-//! ## Fixtures and declarations, stated here because 0.1.0 prints the declarations only
+//! ## Fixtures
 //!
-//! (Conformance PENDING #3.) Real Turtle for the `urn:rdf:*` trio, real queries for the four
-//! `sparql-*` reads, a real JSON-LD document for the three `jsonld-*` operators, a stylesheet
-//! and a document for `xslt-transform`, and `path` / `name` / `token` / `action` bindings for
-//! the template-bound entries. Without them those endpoints report "did not resolve with the
-//! minimal inputs", which reads as a caching finding (PENDING #33) and means the walk failed
-//! to CALL rather than that the endpoint failed to conform.
+//! Real Turtle for the `urn:rdf:*` trio, real queries for the four `sparql-*` reads, a real
+//! JSON-LD document AND a context for the three `jsonld-*` operators, a seeded stylesheet and
+//! document (named by IRI) for `xslt-transform`, urlencoded submissions for the two public
+//! intake Sinks, and `path` / `name` / `token` / `action` bindings for the template-bound
+//! entries. Without them those endpoints report "did not resolve with the minimal inputs",
+//! which reads as a caching finding (conformance PENDING #33) and means the walk failed to
+//! CALL rather than that the endpoint failed to conform.
+//!
+//! ⚠ **A fixture is a claim, and 0.2.0 is the first version that audits it.** Under the 0.1.0
+//! pin this file carried six fixtures that bought nothing — three whose ids the walk never
+//! reached on the kernel being walked, and three (`xslt-transform`, `jsonld-compact`, and the
+//! `contact`/`booking` Sinks) that named inputs the endpoint could not use, so the endpoint
+//! was never probed while the report printed a `fixture:` line for it. Its DECLARATIONS check
+//! is what said so; see [`base`] for the structural half of the same lesson.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use ikigai_conformance::{Fixture, Report, Suite};
+use ikigai_conformance::{rdf, Check, Fixture, Report, Suite};
 use ikigai_core::{Kernel, Verb};
 
 // ---------------------------------------------------------------------------
@@ -259,10 +267,17 @@ fn fixture_home() -> &'static Path {
         // the jail root is the EMPTY path — the process's working directory — and the walk
         // fires the file module's Sink. Writing this config is what keeps a conformance run
         // out of the checkout.
+        //
+        // ⚠ `view` is REQUIRED and was missing until 2026-09-12. ONE file, TWO independent
+        // readers: `org_config` parses it with raw serde_json (so the org jail was always
+        // set correctly), while `calendar_config` parses it as `CalendarConfig` — which
+        // has no `serde(default)` for `view` and so rejected the whole document, printing
+        // eight "parse error … — ignoring" lines per run. Nothing failed, and that is the
+        // problem: a fixture that half-parses is a fixture whose reach nobody measures.
         std::fs::write(
             dir.join("config/ikigai/calendar.json"),
             format!(
-                r#"{{"org_dir":"{}","org_files":["agenda.org"]}}"#,
+                r#"{{"view":"Conformance-View","org_dir":"{}","org_files":["agenda.org"]}}"#,
                 dir.join("org").display()
             ),
         )
@@ -290,6 +305,11 @@ fn fixture_home() -> &'static Path {
 ///   they fail at the first line of `invoke` and nothing downstream is ever reached.
 /// * `contact-block.key` — the PKCS8 PEM signing half, so `urn:contactblock:link` can mint.
 /// * `clients/conformance.json` — so `urn:client:{token}` resolves for the bound fixture.
+/// * `conformance.txt` / `conformance.xsl` — the two documents the `file` and
+///   `xslt-transform` fixtures name. `urn:xslt:transform`'s `stylesheet` is a resolvable
+///   resource IRI, not inline markup: passing the stylesheet BY VALUE failed at
+///   `Iri::parse` with "invalid IRI code point '<'", so that endpoint was never probed at
+///   all while its fixture sat in the report looking like coverage.
 ///
 /// A FIXED key (`[9u8; 32]`), not a generated one: the walk only needs the file to parse,
 /// and a deterministic fixture is one less thing that differs between runs.
@@ -319,6 +339,9 @@ fn seed_workspace(root: &Path) {
         r#"{"id":"conformance","name":"Conformance Fixture"}"#,
     )
     .expect("client record");
+    std::fs::write(root.join("conformance.txt"), "a fixture document\n").expect("file fixture");
+    std::fs::write(root.join("conformance.xsl"), XSL).expect("stylesheet fixture");
+    std::fs::write(root.join("conformance.xml"), "<doc/>").expect("xml fixture");
 }
 
 fn root_kernel() -> Kernel {
@@ -352,10 +375,33 @@ const TURTLE: &str = "<http://example.org/a> <http://purl.org/dc/terms/title> \"
 /// PENDING #26, which the suite's own README example has).
 const JSON_LD: &str = r#"{"@context":{"title":"http://purl.org/dc/terms/title"},"@id":"http://example.org/a","title":"demo"}"#;
 
+/// The context `urn:jsonld:compact` compacts against — the same term [`JSON_LD`] carries, so
+/// the round trip has something to shorten. A bare context value; the module also accepts a
+/// `{"@context": …}` document.
+const JSON_LD_CONTEXT: &str = r#"{"title":"http://purl.org/dc/terms/title"}"#;
+
 /// An identity stylesheet — enough for `xslt-transform` to have a real transform to run.
 const XSL: &str = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="xml"/><xsl:template match="/"><ok/></xsl:template></xsl:stylesheet>"#;
 
-fn suite() -> Suite {
+/// ★ **A `Suite` is a statement about the MANIFOLD it walks — so there are three of them.**
+///
+/// This crate composes two kernels, and they are not the same catalog: sixty-six ids are on
+/// the REPL root only (the whole personal/Lisp/repo/LLM surface), six are on the HTTP door
+/// only (`foaf`, the passkey trio, `calendar-request`, `contact-block`), and forty are on
+/// both. One shared builder therefore carried, on every run, a pile of declarations that
+/// could not apply to the kernel being walked — a `sparql-select` fixture over a door with no
+/// SPARQL, a `foaf` opt-out over a root that does not bind it.
+///
+/// Conformance 0.1.0 printed those as `opted out:` and `fixture:` lines, indistinguishable
+/// from the ones that did something: a report that reads as coverage and is not. 0.2.0's
+/// DECLARATIONS check reports them, and the fix is to split the builder rather than to change
+/// any id — [`base`] is what is true of both manifolds, [`root_suite`] and [`door_suite`] add
+/// what is true of one. (Same shape and same conclusion as ikigai-module #17.)
+///
+/// The split is also a claim a diff can see: moving an endpoint between the two compositions
+/// now has to move its declarations too, and `the_walked_catalog_is_classified` fails first if
+/// it does not.
+fn base() -> Suite {
     Suite::new()
         // ---- fired, with inputs that work ----------------------------------------
         .fixture(
@@ -374,34 +420,58 @@ fn suite() -> Suite {
                 .arg("content", TURTLE)
                 .arg("as", "application/n-triples"),
         )
-        .fixture(Fixture::new("sniff", Verb::Source).arg("content", TURTLE))
-        .fixture(Fixture::new("transrept-auto", Verb::Source).arg("content", TURTLE))
         .fixture(Fixture::new("jsonld-expand", Verb::Source).arg("content", JSON_LD))
         .fixture(Fixture::new("jsonld-flatten", Verb::Source).arg("content", JSON_LD))
-        .fixture(Fixture::new("jsonld-compact", Verb::Source).arg("content", JSON_LD))
+        // ⚠ `context` is REQUIRED and was missing until 2026-09-12, so the walk supplied its
+        // own sample `x` and the endpoint failed at `bad context IRI` — `urn:jsonld:compact`
+        // has never actually been probed here. Inline JSON is accepted (the module tells an
+        // inline context from a resource reference by its first character).
+        .fixture(
+            Fixture::new("jsonld-compact", Verb::Source)
+                .arg("content", JSON_LD)
+                .arg("context", JSON_LD_CONTEXT),
+        )
+        // ⚠ BY IRI, not by value — BOTH of them. `src` and `stylesheet` are each "a
+        // resolvable resource IRI", so the inline markup this used to pass for `stylesheet`
+        // failed at `Iri::parse` ("invalid IRI code point '<'") and the walk's own sample
+        // `x` for the undeclared-by-the-fixture `src` failed the same way. `urn:xslt:transform`
+        // has therefore never been probed here at all — a fixture in the report that bought
+        // nothing. Both documents are seeded into the hermetic workspace by `seed_workspace`.
+        //
+        // ⚠ What firing it revealed, for ikigai-xslt rather than for here: under NO grants it
+        // now refuses with `Denied` because reading a `urn:file:` stylesheet needs
+        // `urn:cap:fs:read:*`, which the endpoint does not declare. That floor is inherited
+        // from whatever the `src`/`stylesheet` IRIs resolve THROUGH, so it is parameterized —
+        // the wildcard form the recipe describes. Reported up, not worked around.
         .fixture(
             Fixture::new("xslt-transform", Verb::Source)
-                .arg("content", "<doc/>")
-                .arg("stylesheet", XSL),
-        )
-        .fixture(
-            Fixture::new("sparql-select", Verb::Source)
-                .arg("query", "SELECT * WHERE { ?s ?p ?o } LIMIT 1"),
-        )
-        .fixture(Fixture::new("sparql-ask", Verb::Source).arg("query", "ASK { ?s ?p ?o }"))
-        .fixture(
-            Fixture::new("sparql-describe", Verb::Source).arg("query", "DESCRIBE <urn:demo:a>"),
-        )
-        .fixture(
-            Fixture::new("sparql-construct", Verb::Source)
-                .arg("query", "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o } LIMIT 1"),
+                .arg("src", "urn:file:conformance.xml")
+                .arg("stylesheet", "urn:file:conformance.xsl")
+                // `as` is declared REQUIRED, so the walk supplies it whatever we do — and
+                // its sample `x` came back as the served media type verbatim, unvalidated.
+                // A real one keeps the probe line honest (another one for ikigai-xslt).
+                .arg("as", "text/html"),
         )
         // Bindings are per ENTRY and a binding-only fixture's verb is ignored
         // (conformance PENDING #2): one binding per template variable is all the walk reads.
         .fixture(Fixture::new("file", Verb::Source).binding("path", "conformance.txt"))
         .fixture(Fixture::new("space", Verb::Source).binding("name", "conformance"))
         .fixture(Fixture::new("client", Verb::Source).binding("token", "conformance"))
-        .fixture(Fixture::new("calendar-request", Verb::Source).binding("action", "decline"))
+        // ★ The two public intake Sinks, FIRED — and the reason a fixture is right here
+        // rather than a waiver. `content` is a urlencoded submission, so the walk's sample
+        // value (`x`) can never satisfy the declared fields and OUTPUTS reported only "the
+        // minimal resolution failed". These are hermetic: the handler consults `urn:decisions`
+        // and `urn:client:*` (local files under the fixture root) and drops a tuple into a
+        // local space. Nothing is mailed and nothing leaves the machine — the reactive handler
+        // that would act on the tuple is a WATCHER, and no watcher runs in this binary.
+        .fixture(Fixture::new("contact", Verb::Sink).arg(
+            "content",
+            "name=Conformance&email=someone%40example.org&message=a+fixture+enquiry",
+        ))
+        .fixture(Fixture::new("booking", Verb::Sink).arg(
+            "content",
+            "name=Conformance&email=someone%40example.org&period=week&zone=UTC",
+        ))
         // Real IANA zones: the suite's `x` is refused by the tzdata lookup, which reads as a
         // caching finding on an endpoint whose caching is fine (PENDING #33).
         .fixture(
@@ -409,10 +479,6 @@ fn suite() -> Suite {
                 .arg("in", "2026-01-01T12:00:00Z")
                 .arg("from", "UTC")
                 .arg("to", "America/New_York"),
-        )
-        // An address, because the endpoint refuses anything that is not one before it mints.
-        .fixture(
-            Fixture::new("contactblock-link", Verb::Source).arg("email", "someone@example.org"),
         )
         // ---- declared -------------------------------------------------------------
         // Constant documents compiled into the binary: `urn:data:page` / `:control` /
@@ -432,18 +498,71 @@ fn suite() -> Suite {
         .pure("tz-convert")
         // ⚠ A STATED DEVIATION, not a claim of purity. `urn:time:now` and `urn:tz:now` read
         // the kernel's CLOCK, so by the wave's rule 3 they are not pure functions of their
-        // inputs. They are `cacheable_until(next minute)` — `Expiry::At` — and 0.1.0 has no
-        // declaration for that: `pure` is the only spelling that says "an empty thread set is
-        // correct here", and it is correct here for a reason the suite cannot express, namely
-        // that a clock is not a resource and no `depends_on` could name it. The expiry itself
-        // is pinned by hand in `a_clock_derived_result_expires_rather_than_threading` below,
-        // so the declaration covers nothing that test does not check. Reported as conformance
-        // PENDING #86/#123 (`Suite::cacheable_until`), which ikigai-web-demo #57 also wanted.
+        // inputs. They are `cacheable_until(next minute)` — `Expiry::At` — and 0.2.0 still has
+        // no declaration for that: `pure` is the only spelling that says "an empty thread set
+        // is correct here", and it is correct here for a reason the suite cannot express,
+        // namely that a clock is not a resource and no `depends_on` could name it. The expiry
+        // itself is pinned by hand in `a_clock_derived_result_expires_rather_than_threading`
+        // below, so the declaration covers nothing that test does not check. Reported as
+        // conformance PENDING #86/#123 (`Suite::cacheable_until`), which ikigai-web-demo #57
+        // also wanted.
         .pure("clock-now")
         .pure("tz-now")
         // ---- NOT fired, and which hazard each one is -----------------------------
         //
         // ★ Written from the catalog BEFORE the first invoking run. See the module docs.
+        //
+        // Reaches the network. All six HTTP verbs are backed by a REAL transport here
+        // (`ureq`), so the walk would issue live requests to whatever the sample `url`
+        // happens to be. Bound on BOTH compositions, so they live in the base.
+        .opt_out("httpGet", None, "outbound HTTP over a real transport")
+        .opt_out("httpHead", None, "outbound HTTP over a real transport")
+        .opt_out("httpPost", None, "outbound HTTP over a real transport")
+        .opt_out("httpPut", None, "outbound HTTP over a real transport")
+        .opt_out("httpPatch", None, "outbound HTTP over a real transport")
+        .opt_out("httpDelete", None, "outbound HTTP over a real transport")
+}
+
+/// [`base`] plus everything bound only on the REPL/TUI root — which is where every one of
+/// this host's five hazards actually lives.
+fn root_suite() -> Suite {
+    base()
+        // ---- fired, with inputs that work ----------------------------------------
+        .fixture(Fixture::new("sniff", Verb::Source).arg("content", TURTLE))
+        .fixture(Fixture::new("transrept-auto", Verb::Source).arg("content", TURTLE))
+        .fixture(
+            Fixture::new("sparql-select", Verb::Source)
+                .arg("query", "SELECT * WHERE { ?s ?p ?o } LIMIT 1"),
+        )
+        .fixture(Fixture::new("sparql-ask", Verb::Source).arg("query", "ASK { ?s ?p ?o }"))
+        .fixture(
+            Fixture::new("sparql-describe", Verb::Source).arg("query", "DESCRIBE <urn:demo:a>"),
+        )
+        .fixture(
+            Fixture::new("sparql-construct", Verb::Source)
+                .arg("query", "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o } LIMIT 1"),
+        )
+        // An address, because the endpoint refuses anything that is not one before it mints.
+        .fixture(
+            Fixture::new("contactblock-link", Verb::Source).arg("email", "someone@example.org"),
+        )
+        // ---- waived, per check, with the exception pinned by hand -----------------
+        // ★ A REAL VOCABULARY GAP, in a repo that cannot fix it. Declaring `urn:host:health`'s
+        // `text/turtle` face (it was served and unannounced) brought it under VOCABULARY,
+        // which found four `ik:` terms `ikigai-vocab` does not define — not at the pinned
+        // version and not at HEAD. The fix is `vocabulary.ttl` in ikigai-core plus a manual
+        // deploy of https://ikigai-rs.dev/ns; both belong to that repo, so this waits.
+        //
+        // ⚠ `opt_out_check`, never `opt_out`: the coarse lever would take ENFORCED,
+        // CACHEABLE and SKOLEM-RDF down with it on a capability-gated endpoint. And the
+        // exception is pinned EXACTLY in `the_health_graph_uses_exactly_four_undefined_terms`
+        // below, so this goes red in both directions — including the day the terms land.
+        .opt_out_check(
+            "kernel-health",
+            Check::Vocabulary,
+            "ik:Health / ik:verdict / ik:uptimeSeconds / ik:staleJobs are undefined in              ikigai-vocab (at the pin AND at HEAD); the fix is vocabulary.ttl in ikigai-core              plus a /ns deploy. The exact undefined set is pinned by hand below.",
+        )
+        // ---- NOT fired, and which hazard each one is -----------------------------
         //
         // Spawns a process.
         .opt_out("system-exec", None, "spawns a subprocess")
@@ -460,21 +579,7 @@ fn suite() -> Suite {
             "shells out to `gh`: network and auth",
         )
         .opt_out("repo-pr-view", None, "shells out to `gh`: network and auth")
-        // Reaches the network. All six HTTP verbs are backed by a REAL transport here
-        // (`ureq`), so the walk would issue live requests to whatever the sample `url`
-        // happens to be.
-        .opt_out("httpGet", None, "outbound HTTP over a real transport")
-        .opt_out("httpHead", None, "outbound HTTP over a real transport")
-        .opt_out("httpPost", None, "outbound HTTP over a real transport")
-        .opt_out("httpPut", None, "outbound HTTP over a real transport")
-        .opt_out("httpPatch", None, "outbound HTTP over a real transport")
-        .opt_out("httpDelete", None, "outbound HTTP over a real transport")
-        // Ours, and it fetches: every face of `urn:iki:foaf` starts with a `urn:httpGet` of
-        // `src=`. Its capability floor is pinned by hand instead, in
-        // `foaf::tests::without_a_net_grant_the_door_refuses` — which is the check `opt_out`
-        // drops (conformance PENDING #21) and the one that matters for a network-backed
-        // action.
-        .opt_out("foaf", None, "issues urn:httpGet: reaches the network")
+        // Reaches the network.
         .opt_out("llm-ask", None, "POSTs to a live inference server")
         .opt_out("llm-ollama-ask", None, "POSTs to a live inference server")
         .opt_out("llm-ollama-up", None, "probes a live inference server")
@@ -573,6 +678,22 @@ fn suite() -> Suite {
             None,
             "reads the signing key through urn:secret:*: Keychain, behind a Touch ID prompt",
         )
+}
+
+/// [`base`] plus the six resources bound only on the public HTTP door.
+///
+/// A short list, and that is the door's whole point: it is the SUBSET, and
+/// `the_http_door_serves_no_owner_only_resource` states the other half as a red line.
+fn door_suite() -> Suite {
+    base()
+        // A binding-only fixture: `urn:calendar-request:{action}` cannot be formed without it.
+        .fixture(Fixture::new("calendar-request", Verb::Source).binding("action", "decline"))
+        // Ours, and it fetches: every face of `urn:iki:foaf` starts with a `urn:httpGet` of
+        // `src=`. Its capability floor is pinned by hand instead, in
+        // `foaf::tests::without_a_net_grant_the_door_refuses` — which is the check `opt_out`
+        // drops (conformance PENDING #21) and the one that matters for a network-backed
+        // action.
+        .opt_out("foaf", None, "issues urn:httpGet: reaches the network")
         // ★ A FALSE POSITIVE with a real observation inside it, and the reason it is an
         // opt-out rather than a fix.
         //
@@ -588,6 +709,9 @@ fn suite() -> Suite {
         // has no way to say "this action is offered only while the host is in state S", so
         // the manifold over-offers on an axis that is not the capability axis. Reported for
         // the hub rather than worked around in the endpoint.
+        //
+        // ⚠ Per VERB, and per this manifold: `urn:passkey:register` is bound on the door
+        // alone, so the same line on the root suite would be a DECLARATIONS finding.
         .opt_out(
             "passkey-register",
             Some(Verb::Sink),
@@ -686,19 +810,23 @@ fn conforms() {
     let mut ours: Vec<String> = Vec::new();
     let own: BTreeSet<&str> = OWN.iter().map(|(id, _)| *id).collect();
 
-    for (label, kernel) in [
+    // Each composition gets the suite written FOR it — see `base` for why one shared
+    // builder is a statement about a manifold that is only half true of either kernel.
+    for (label, kernel, suite) in [
         (
             "ikigai_embedded::kernel() — the REPL/TUI root",
             root_kernel(),
+            root_suite(),
         ),
         (
             "ikigai_embedded::kernel_for() — the HTTP door",
             http_kernel(),
+            door_suite(),
         ),
     ] {
-        let report = suite().run_blocking(&kernel);
-        // The fixtures are not printed by 0.1.0 (PENDING #3) and neither is which run
-        // produced a report, so the header is this file's own (PENDING #138).
+        let report = suite.run_blocking(&kernel);
+        // Which run produced a report is not printed by 0.2.0 (PENDING #138), so the header
+        // is this file's own.
         eprintln!("--- {label} ---\n{report}");
         eprintln!("findings by owning crate: {:?}", by_owner(&report));
 
@@ -816,4 +944,52 @@ fn the_http_door_serves_no_owner_only_resource() {
     ] {
         assert!(door.contains(id), "`{id}` is missing from the HTTP door");
     }
+}
+
+/// ★ **The health graph's undefined terms, as an EXACT list — the waiver's other half.**
+///
+/// `opt_out_check("kernel-health", Check::Vocabulary, …)` in [`root_suite`] silences a rule
+/// this repo cannot satisfy: `urn:host:health`'s `text/turtle` face names four `ik:` terms no
+/// version of `ikigai-vocab` defines. A waiver alone would also waive the FIFTH invented term
+/// somebody adds next, so the set is pinned here instead, reproducing `VOCABULARY` from the
+/// public [`rdf`] helpers. It fails in both directions: a new invented term, and the day
+/// `vocabulary.ttl` defines these.
+///
+/// ⚠ **What this does NOT cover, stated because the count looks complete and is not.** The
+/// same face emits `ik:Job`, `ik:intervalSeconds`, `ik:runs` and `ik:stale` for each recurring
+/// job, and those are undefined too — the fixture kernel simply schedules none, so the walk
+/// never sees them. Eight terms need defining; four are what a test can hold.
+#[test]
+fn the_health_graph_uses_exactly_four_undefined_terms() {
+    use ikigai_core::{Capability, Iri, Request, Verb};
+
+    let kernel = root_kernel();
+    let repr = futures::executor::block_on(
+        kernel.issue(
+            Request::new(
+                Verb::Source,
+                Iri::parse("urn:host:health".to_string()).expect("iri"),
+            )
+            .with_arg("as", ikigai_core::ArgRef::Inline(b"text/turtle".to_vec())),
+            &Capability::root(),
+        ),
+    )
+    .expect("the health graph face resolves");
+    let triples =
+        rdf::parse(&repr.repr_type.media_type, &repr.bytes).expect("the face parses as Turtle");
+    let undefined: Vec<String> = rdf::terms(&triples)
+        .into_iter()
+        .filter(|t| !rdf::is_defined(t, &[]))
+        .collect();
+    assert_eq!(
+        undefined,
+        vec![
+            "https://ikigai-rs.dev/ns#Health",
+            "https://ikigai-rs.dev/ns#staleJobs",
+            "https://ikigai-rs.dev/ns#uptimeSeconds",
+            "https://ikigai-rs.dev/ns#verdict",
+        ],
+        "the waived vocabulary exception has changed — widen the waiver's reason, or drop \
+         both it and this test if `vocabulary.ttl` now defines these"
+    );
 }

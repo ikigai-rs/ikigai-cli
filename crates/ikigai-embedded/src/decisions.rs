@@ -187,7 +187,11 @@ impl Endpoint for DecisionLog {
                             .optional()
                             .class(crate::XSD_STRING)
                             .summary("an email — answers yes/no"),
-                    ),
+                    )
+                    // On the ACTION: `action_specs()` takes an explicit `ActionSpec` whole
+                    // and never folds the flat `.output()` below into it, so the flat one
+                    // alone left both faces undeclared in the manifold.
+                    .output("text/plain; charset=utf-8"),
             )
             .action(
                 ActionSpec::new(Verb::Sink)
@@ -240,7 +244,8 @@ impl Endpoint for DecisionLog {
                                  inputs above are read from it when they are not named \
                                  arguments",
                             ),
-                    ),
+                    )
+                    .output("text/plain; charset=utf-8"),
             )
             .output("text/plain; charset=utf-8")
     }
