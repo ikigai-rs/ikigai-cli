@@ -176,7 +176,10 @@ impl Endpoint for PeopleLedger {
                             .optional()
                             .class(crate::XSD_STRING)
                             .summary("an address — its full contact history"),
-                    ),
+                    )
+                    // On the ACTION: `action_specs()` takes an explicit `ActionSpec` WHOLE
+                    // and never folds the flat `.output()` below into it.
+                    .output("text/plain; charset=utf-8"),
             )
             .action(
                 ActionSpec::new(Verb::Sink)
@@ -218,7 +221,8 @@ impl Endpoint for PeopleLedger {
                                  inputs above are read from it when they are not named \
                                  arguments",
                             ),
-                    ),
+                    )
+                    .output("text/plain; charset=utf-8"),
             )
             .output("text/plain; charset=utf-8")
     }

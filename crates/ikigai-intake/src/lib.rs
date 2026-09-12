@@ -649,6 +649,20 @@ impl Endpoint for IntakeEndpoint {
             "the submission itself: a urlencoded or JSON body carrying the fields \
                      above (a form POST's body, or a pipeline's upstream value)",
         ));
+        // ★ THE FACE IS A FUNCTION OF `redirect`, and it is declared ON THE ACTION.
+        //
+        // Two things this one line gets wrong if written the obvious way. First, a
+        // configured `redirect` makes `accepted` serve the meta-refresh SHIM — `text/html`,
+        // not `text/plain` — so a fixed declaration is a lie on exactly the deployment that
+        // has one (this host's `urn:contact`). Second, `Description::output` is the FLAT
+        // authoring form: `action_specs()` takes an explicit `ActionSpec` whole and never
+        // merges the flat fields into it, so a `.output()` sitting beside `.action(…)`
+        // declares nothing any consumer of the manifold can see. Conformance 0.2.0's OUTPUTS
+        // check is what said so; both halves were silent before it.
+        let face = match self.config.redirect {
+            Some(_) => "text/html; charset=utf-8",
+            None => "text/plain; charset=utf-8",
+        };
         Description::new(self.config.id.clone())
             .title("Form intake")
             .summary(format!(
@@ -658,8 +672,8 @@ impl Endpoint for IntakeEndpoint {
                  literal.",
                 self.config.space
             ))
-            .action(action)
-            .output("text/plain; charset=utf-8")
+            .action(action.output(face))
+            .output(face)
     }
 }
 
@@ -867,6 +881,41 @@ mod tests {
         let rep = block_on(k.issue(post("name=A&email=a%40x.example&message=hi"), &cap())).unwrap();
         assert_eq!(rep.repr_type.media_type, "text/plain");
         assert_eq!(String::from_utf8(rep.bytes).unwrap(), "received\n");
+    }
+
+    /// ★ **The declared face equals the served face, in BOTH polarities, ON THE ACTION.**
+    ///
+    /// Two failures this holds shut, neither of which the response tests above can see.
+    ///
+    /// 1. `outputs` is a function of `redirect` — a single-polarity assertion over a
+    ///    configuration-dependent declaration is not an assertion, so both are here.
+    /// 2. The declaration must live on the `ActionSpec`. `Description::action_specs()` takes
+    ///    an explicit action WHOLE and never merges the flat `Description::outputs` into it,
+    ///    so the flat `.output()` this used to carry alone was invisible to every consumer
+    ///    that reads the manifold's actions — `urn:kernel:actions`, the MCP projection and
+    ///    the conformance walk included. Reading through `action_specs()` is the point.
+    #[test]
+    fn the_declared_output_is_the_face_actually_served_for_either_redirect_setting() {
+        for (redirect, expected) in [
+            (None, "text/plain; charset=utf-8"),
+            (Some("https://bosatsu.net"), "text/html; charset=utf-8"),
+        ] {
+            let mut cfg = config();
+            cfg.redirect = redirect.map(str::to_string);
+            let described = submit(cfg).describe();
+            assert_eq!(
+                described.outputs,
+                vec![expected.to_string()],
+                "the flat declaration"
+            );
+            let specs = described.action_specs();
+            assert_eq!(specs.len(), 1);
+            assert_eq!(
+                specs[0].outputs,
+                vec![expected.to_string()],
+                "the ACTION's declaration — the one a consumer of the manifold reads"
+            );
+        }
     }
 
     #[test]

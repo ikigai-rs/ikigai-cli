@@ -418,6 +418,11 @@ impl Endpoint for SpaceEndpoint {
                             .one_of(["inbox", "outbox", "error"])
                             .summary("which stage to read (default inbox): inbox | outbox | error"),
                     )
+                    // TWO faces, because `tuple=` changes what a read IS: listing or matching
+                    // answers ids (a newline list, the `..` map convention), reading one
+                    // answers the tuple's own bytes, which the space never interprets.
+                    .output("text/plain; charset=utf-8")
+                    .output("application/octet-stream")
                     .requires(CAP_READ),
             )
             .action(
@@ -443,6 +448,9 @@ impl Endpoint for SpaceEndpoint {
                                  the inbox for another pass (and clear its .err note)",
                             ),
                     )
+                    // The dropped tuple's id — the content hash, so a caller can read or
+                    // take back exactly what it dropped.
+                    .output("text/plain; charset=utf-8")
                     .requires(CAP_OUT),
             )
             .action(
@@ -461,6 +469,8 @@ impl Endpoint for SpaceEndpoint {
                             .class(XSD_STRING)
                             .summary("a SPARQL ASK; take the first tuple whose graph satisfies it"),
                     )
+                    // The taken tuple itself, uninterpreted.
+                    .output("application/octet-stream")
                     .requires(CAP_TAKE),
             )
     }

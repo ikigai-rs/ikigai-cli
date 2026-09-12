@@ -1860,6 +1860,12 @@ impl Endpoint for LispAliases {
                                  `urn:iki:fn:`), for a prelude scoped to one family",
                             ),
                     )
+                    // Both dialects `as=` offers: the prelude is emitted as one or the
+                    // other and nothing else. Declared on the ACTION, which is what
+                    // `action_specs()` hands a consumer — a flat `.output()` beside an
+                    // explicit `.action()` is discarded.
+                    .output("text/x-scheme")
+                    .output("text/x-emacs-lisp")
                     .requires(CAP_KERNEL_INSPECT),
             )
     }
@@ -2604,6 +2610,7 @@ impl Endpoint for HostHeartbeat {
             .action(
                 ActionSpec::new(Verb::Source)
                     .summary("the health report, also left on disk for an external watcher")
+                    .output("text/plain")
                     .requires(CAP_KERNEL_INSPECT),
             )
     }
@@ -2686,6 +2693,11 @@ impl Endpoint for KernelHealth {
                             .default_value("text/plain")
                             .summary("the representation to return (default text/plain)"),
                     )
+                    // Both faces `as=` offers. ⚠ Declaring `text/turtle` brings this
+                    // endpoint's graph face under the conformance RDF checks, which is the
+                    // point: an announced face is one somebody may rely on.
+                    .output("text/plain")
+                    .output("text/turtle")
                     .requires(CAP_KERNEL_INSPECT),
             )
     }

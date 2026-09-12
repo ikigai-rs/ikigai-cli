@@ -209,7 +209,11 @@ impl Endpoint for ContactBlockLink {
                         ArgSpec::new("email")
                             .summary("the sender address to block")
                             .class(crate::XSD_STRING),
-                    ),
+                    )
+                    // On the ACTION: `action_specs()` takes an explicit `ActionSpec` WHOLE
+                    // and never folds the flat `.output()` below into it, so the flat
+                    // declaration alone announced nothing.
+                    .output("text/plain; charset=utf-8"),
             )
             .output("text/plain; charset=utf-8")
     }
@@ -345,7 +349,8 @@ impl Endpoint for ContactBlock {
                                 "a urlencoded form body; the inputs above are read from it \
                                  when they are not named arguments",
                             ),
-                    ),
+                    )
+                    .output("text/html; charset=utf-8"),
             )
             .action(
                 ActionSpec::new(Verb::Sink)
@@ -378,7 +383,8 @@ impl Endpoint for ContactBlock {
                                 "a urlencoded form body; the inputs above are read from it \
                                  when they are not named arguments",
                             ),
-                    ),
+                    )
+                    .output("text/html; charset=utf-8"),
             )
             .output("text/html; charset=utf-8")
     }

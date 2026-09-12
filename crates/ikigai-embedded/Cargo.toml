@@ -103,7 +103,11 @@ futures = { workspace = true }
 # COMPOSES (`kernel()` and `kernel_for()`), not over a module's own space. See
 # `tests/conformance.rs` for what that changes: the walk fires endpoints under root, and a
 # composing host binds subprocess, network, inference, mail and platform seams.
-ikigai-conformance = "0.1.0"
+#
+# 0.2.0, not 0.1: DECLARATIONS audits the suite's OWN declarations, and a composing host is
+# where that matters most — ONE `Suite` over TWO manifolds carried declarations that could
+# not apply to whichever kernel was being walked. `tests/conformance.rs` is three suites now.
+ikigai-conformance = "0.2.0"
 # The conformance fixture SEEDS the two edge verifying keys and one signing key, so the
 # decision faces are walked over real state instead of reporting "did not resolve". Same
 # version and features as the library dependency above: the fixture must write exactly the
