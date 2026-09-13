@@ -187,6 +187,9 @@ const INHERITED: &[(&str, &str)] = &[
     ("repo-list", "ikigai-repo"),
     ("repo-log", "ikigai-repo"),
     ("repo-pr-checks", "ikigai-repo"),
+    ("repo-pr-diff", "ikigai-repo"),
+    ("repo-pr-files", "ikigai-repo"),
+    ("repo-pr-list", "ikigai-repo"),
     ("repo-pr-view", "ikigai-repo"),
     ("repo-status", "ikigai-repo"),
     ("system-exec", "ikigai-repo"),
@@ -206,6 +209,8 @@ const INHERITED: &[(&str, &str)] = &[
     ("sparql-select", "ikigai-sparql"),
     ("urn:meeting:zoom:schedule", "ikigai-meeting"),
     ("urn:secret", "ikigai-secret"),
+    ("secret-generate", "ikigai-secret"),
+    ("secret-unlock", "ikigai-secret"),
     ("grep", "ikigai-text"),
     ("head", "ikigai-text"),
     ("nl", "ikigai-text"),
@@ -233,6 +238,8 @@ const OWNER_ONLY: &[&str] = &[
     "system-exec",
     "repo-status",
     "urn:secret",
+    "secret-generate",
+    "secret-unlock",
     "send",
     "urn:meeting:zoom:schedule",
     "client-issue",
@@ -447,9 +454,12 @@ fn base() -> Suite {
             Fixture::new("xslt-transform", Verb::Source)
                 .arg("src", "urn:file:conformance.xml")
                 .arg("stylesheet", "urn:file:conformance.xsl")
-                // `as` is declared REQUIRED, so the walk supplies it whatever we do — and
-                // its sample `x` came back as the served media type verbatim, unvalidated.
-                // A real one keeps the probe line honest (another one for ikigai-xslt).
+                // `as` was declared REQUIRED through ikigai-xslt 0.1.1, so the walk supplied
+                // it whatever we did — and its sample `x` came back as the served media type
+                // verbatim, unvalidated (one for ikigai-xslt, reported up). 0.1.2 makes `as`
+                // optional and takes the media type from the stylesheet's `xsl:output` when it
+                // is absent; the fixture keeps supplying a real one, because the point of the
+                // arg here is to probe the negotiated face rather than the default.
                 .arg("as", "text/html"),
         )
         // Bindings are per ENTRY and a binding-only fixture's verb is ignored
@@ -579,6 +589,9 @@ fn root_suite() -> Suite {
             "shells out to `gh`: network and auth",
         )
         .opt_out("repo-pr-view", None, "shells out to `gh`: network and auth")
+        .opt_out("repo-pr-list", None, "shells out to `gh`: network and auth")
+        .opt_out("repo-pr-diff", None, "shells out to `gh`: network and auth")
+        .opt_out("repo-pr-files", None, "shells out to `gh`: network and auth")
         // Reaches the network.
         .opt_out("llm-ask", None, "POSTs to a live inference server")
         .opt_out("llm-ollama-ask", None, "POSTs to a live inference server")
@@ -657,6 +670,35 @@ fn root_suite() -> Suite {
             "urn:secret",
             None,
             "macOS Keychain, behind a Touch ID prompt",
+        )
+        // ★ **A hazard waiver keyed on an endpoint ID does not survive the module splitting
+        // that endpoint** — and the failure is silent in the direction that matters.
+        //
+        // Through ikigai-secret 0.1.5, `unlock` and `type=`/`into=` rode on the
+        // `urn:secret:{name}` template, so the one waiver above covered them. 0.1.6 binds
+        // `urn:secret:unlock` and `urn:secret:generate` as their OWN endpoints ahead of the
+        // template — a strictly better contract, and the right change in that repo — and the
+        // waiver stopped reaching them without anything saying so. The 0.1.6 walk therefore
+        // FIRED both against the real Keychain: `secret-unlock` was probed and served eight
+        // bytes, and `secret-generate` reached `keychain write` and came back "The
+        // authorization was canceled by the user" — i.e. it got as far as a Touch ID prompt on
+        // a developer's machine, in a test.
+        //
+        // Nothing in the suite could have warned: an id that is not in any table is a
+        // classification failure, but an id that IS classified and simply not opted out is
+        // indistinguishable from one the walk is welcome to fire. The general lesson for this
+        // file, recorded because it will happen again on the next module that splits a
+        // template: **re-read the hazard list whenever a module pin moves, not only when this
+        // host binds something new.**
+        .opt_out(
+            "secret-unlock",
+            None,
+            "macOS Keychain, behind a Touch ID prompt",
+        )
+        .opt_out(
+            "secret-generate",
+            None,
+            "mints a real key into the macOS Keychain, behind a Touch ID prompt",
         )
         // Mutates process-global state the rest of the binary shares: the job registry is a
         // static, so a walk that schedules or cancels is not confined to its own kernel.

@@ -13,7 +13,15 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 [workspace.dependencies]
 # The released kernel, consumed from crates.io. For local cross-repo development
 # against a sibling checkout, use .cargo/config.toml (see .cargo/config.toml.example).
-ikigai-core = "0.1.64" # 0.1.64 = `Resolved.canonical`, the field a `Space` sets when its
+ikigai-core = "0.1.64" # ★ UNCHANGED at the 2026-09-12 pin sweep, deliberately, and this is
+# the worked example for the framing below: 0.1.70 is published and the caret has always
+# admitted it, but no source in THIS workspace calls anything added since 0.1.64 —
+# `Invocation::with_bindings` and `Space for Arc<S>` (0.1.65), `escape_iri_fragment` /
+# `is_iri_safe` (0.1.66), `Kernel::with_cache_policy` and the `cache::*` types (0.1.70) are
+# all absent from `crates/`. The lock resolves 0.1.70 and gets the behaviour — the kernel
+# joining its own manifold (0.1.67), the lost-cut race and cache eviction (0.1.70) — without
+# the pin claiming an API we do not use. Raise it the day a call site appears, not before.
+# 0.1.64 = `Resolved.canonical`, the field a `Space` sets when its
 # resolution REWROTE the request's target; the kernel adopts that name before it computes the
 # cache id and fires the golden-thread cut, so a logical name and its backing name stay ONE
 # resource. A hard floor, not a soft one: the field has no default in a struct literal, so an
@@ -27,9 +35,58 @@ ikigai-core = "0.1.64" # 0.1.64 = `Resolved.canonical`, the field a `Space` sets
 # holds beneath it: below that a MOUNTED template row whose local name-guess collides with a
 # shorter sibling is dropped from the manifold, so `ikigai mcp` silently stops projecting
 # browse-pr-explain and browse-pr-review.
-ikigai-vocab = "0.1.33" # + event terms (ik:calendar/allDay/alert) + LLM trait terms
+ikigai-vocab = "0.1.69" # 0.1.69 defines the six terms the modules composed BELOW already
+# serve through this host: `ik:batchAt` (ikigai-llm), `ik:passcode` (ikigai-meeting) and
+# `ik:Review`/`ik:orphanedItems`/`ik:reviewedBytes`/`ik:totalBytes` (ikigai-browse). The
+# conformance suite's VOCABULARY rule walks THIS host's composed manifold, so an undefined
+# term is a finding here rather than in the crate that emitted it —
+# `the_health_graph_uses_exactly_four_undefined_terms` pins the exception list exactly, and it
+# is four, not ten, only from 0.1.69.
+#
+# ⚠ There is a SECOND vocab floor in the ecosystem — 0.1.40 is the first version whose
+# `TurtleRenderer` answers `Meta as=application/json` instead of ERRORING — and this host is
+# NOT subject to it, which is worth writing down because it looks like it should be.
+# `ikigai_embedded::CliRenderer` projects the JSON face ITSELF and only falls through to
+# `TurtleRenderer` for Turtle and text, so every kernel built here answers a contract fetch
+# whatever vocab is resolved beneath it. The floor binds a PEER we mount that renders Meta
+# with a plain `TurtleRenderer`, and it bites at `Engine::describe_struct`, which fetches the
+# contract with exactly that request and fails OPEN when it cannot — returning `None`, so
+# `source_request` routes the value to an input literally named `in` and every pipe over
+# `--connect` appears to work while named arguments are silently not recognised as named.
+# So: raise this pin for the terms, and remember the 0.1.40 number when a MOUNT misbehaves.
+# (0.1.33 = event terms ik:calendar/allDay/alert + the LLM trait terms.)
+
+# ── ★ What a pin means HERE, because this crate is a HOST and not a library ──────────────
+#
+# Constitution rule 5 says a pin states the true minimum API you use. For a library consumer
+# that is the set of Rust items it calls. **This crate's product is the composed manifold** —
+# `urn:kernel:catalog`, the capability-scoped `urn:kernel:actions`, the MCP tool list, the
+# `describe` face every client and every agent reads. A module's `describe()` is therefore
+# part of THIS crate's observable output, and `crates/ikigai-embedded/tests/conformance.rs`
+# asserts on it over both compositions. A declaration fix in a module is consequently an API
+# floor here in a way it is not for a library that merely calls the module's Rust functions.
+#
+# That is the reason most of the pins below moved in one pass on 2026-09-12, and each still
+# says which specific defect it is the floor for. It is NOT a licence to pin the newest: where
+# a release changed nothing this host serves or calls, the pin stays where it was and says so
+# (`ikigai-core`, below, is the worked example).
+#
+# ⚠ The OTHER half, which no pin can state and which is what actually kept the fixes out:
+# **this repo COMMITS `Cargo.lock`, so CI builds the graph we froze and an upstream fix is
+# invisible here by construction** (constitution 9e). Every caret below already admitted the
+# newest published version on the day this was written — not one of the twenty-five pins was a
+# CEILING. The lock alone was holding `ikigai-fn` at 0.2.0 and shipping a manifold that
+# contradicted itself. Refresh the lock when you touch these, and diff the lock FILE.
 # The reusable function library, linked in as a published module crate.
-ikigai-fn = "0.2.0" # 0.2.0 = the namespace this library owns moved to `urn:iki:fn:*`
+ikigai-fn = "0.2.2" # 0.2.2 REMOVED `urn:iki:fn:compose`'s `.output("text/html")`. The
+# declaration was a guess and it was false — compose serves the SOURCE's media type, which
+# is what its own summary said all along, so the manifold this host publishes contradicted
+# itself on one endpoint. Held out for two releases purely by the committed lock: the caret
+# admitted 0.2.2 from the day it was published, and the signed `ikigai` 0.1.20 on this
+# machine still emitted the false face. 0.2.1 typed every ArgSpec (`src` and the conditional
+# trio as xsd:anyURI), which is what makes these endpoints visible to the selection funnel's
+# `urn:kernel:actions types=` narrowing at all.
+# 0.2.0 = the namespace this library owns moved to `urn:iki:fn:*`
 # (toUpper/reverseList/compose/conditional). A HARD floor: the old names are not bound at all
 # by 0.2.0, so a lower pin resolving here would leave this host's alias rule rewriting every
 # `urn:fn:` request to a name nothing binds — the reverse trap, and it fails at runtime, not
@@ -38,53 +95,162 @@ ikigai-fn = "0.2.0" # 0.2.0 = the namespace this library owns moved to `urn:iki:
 # Personal contexts (urn:personal:*), macOS-backed, linked as a published module.
 ikigai-personal = "0.7.1" # 0.7.1 = multi-day events block every spanned day (free/busy + booking); notes/URL/attendees on the graph face + description= Sink (detail preservation)
 # Capability-gated file/store module, linked as a published module crate.
-ikigai-fs = "0.1.5" # 0.1.5 = path declared as Binding input (urn:file/orgfile rows in urn:kernel:actions)
+ikigai-fs = "0.1.6" # 0.1.6 joins the Exists answer to the READ's golden thread inside
+# `cacheable_space` — one Sink or Delete now cuts every representation of the file rather
+# than the bytes only, so a cached Exists cannot outlive the file it answered about. A floor
+# with two named sites in this workspace, both of them `ikigai_fs::cacheable_space`:
+# `foaf.rs` (the door's document store) and the conformance fixture kernel. The default
+# live mount is unchanged, so nothing else here moves.
+# 0.1.5 = path declared as Binding input (urn:file/orgfile rows in urn:kernel:actions)
 # Outbound HTTP-client module (urn:httpGet…), linked as a published module crate.
-ikigai-http = "0.1.7" # 0.1.7 = endpoint-owned redirects (transport must not follow; SSRF hardening)
+ikigai-http = "0.1.8" # 0.1.8 = every input of the six verbs had been declared REQUIRED —
+# `authorization`, `range`, `headers` and the rest. `ikigai-mcp` projects `required` straight
+# into each tool's `inputSchema`, so this host was telling every agent that an optional
+# header was mandatory; forty inputs also gained classes (`url` xsd:anyURI, `max_age`
+# xsd:nonNegativeInteger) and `httpHead` now declares the text/plain it always served.
+# 0.1.7 = endpoint-owned redirects (transport must not follow; SSRF hardening)
 # Interactive runbook module (urn:runbook:*) — Linked Data demo tab since 0.1.3;
 # 0.1.5 adds the JSON-LD demo tab (expand/flatten/compact), which works here because
 # the CLI links its own pipe-fixed ikigai-engine.
-ikigai-runbook = "0.1.12" # Lisp page: + generated aliases (named verbs, cap-scoped, transcluded)
+ikigai-runbook = "0.1.14" # 0.1.14 DECLARES the text/plain and application/json faces the
+# pages have served since 0.1.1 and never announced, and makes `as` optional (it always was,
+# in the body) with its real one_of and default. Undeclared-but-served is precisely the class
+# `ikigai-conformance` 0.2.0 added a check for, and this host is what serves these pages.
+# 0.1.13 added `hide_tab`/`tab_ids`, which this workspace does not call yet.
+# 0.1.12 Lisp page: + generated aliases (named verbs, cap-scoped, transcluded)
 # Linked Data toolkit (separate ikigai-linkeddata repo): RDF transreption + SPARQL.
-ikigai-rdf = "0.1.3" # + urn:rdf:union / urn:rdf:diff (graph set ops, with= carries ?k=v args)
-ikigai-sparql = "0.1.6" # 0.1.6 = space_with_store (shared-store seam for browse/annotations)
+ikigai-rdf = "0.1.8" # 0.1.8 = `urn:rdf:transrept` declares all seven faces it produces
+# (its outputs and its transreptsTo set are pinned equal upstream), and `mode=` carries its
+# one_of/default. 0.1.9 is a dev-dependency bump for this crate only, so 0.1.8 is the true
+# minimum rather than the newest. 0.1.3 = + urn:rdf:union / urn:rdf:diff (graph set ops,
+# with= carries ?k=v args)
+ikigai-sparql = "0.1.9" # 0.1.9 REFUSES an `as=` it cannot serve, naming the target and the
+# accepted list, where `serialize_results` used to substitute in silence — `as=text/turtle`
+# on a SELECT fell back to JSON and the caller was never told. Every SPARQL call in this
+# workspace (`route_load.rs`, one `urn:sparql:select` for the RDF route table) passes NO
+# `as=` and takes the declared default, so the refusal changes nothing here and the floor is
+# about what this host tells its callers. 0.1.7 also bound `urn:sparql:update` under
+# `space_with_store` — which the browse composition uses — behind `urn:cap:sparql:update`.
+# 0.1.6 = space_with_store (shared-store seam for browse/annotations)
 # Content sniffing + sniff-and-dispatch (urn:sniff, urn:transrept:auto).
-ikigai-sniff = "0.1.1"
+ikigai-sniff = "0.1.9" # 0.1.9 sniffs a leading `<urn:…>` subject as text/turtle. Below it
+# `angle_token_is_iri` tested for `://` — an AUTHORITY, not a scheme — so every Turtle
+# document whose first subject is a URN sniffed as application/rdf+xml and died in the XML
+# parser. This ecosystem skolemizes into `urn:` by rule (`urn:ikigai:endpoint:*`,
+# `urn:event:*`), so that is most of the graphs this host emits, and it broke
+# `source <urn: graph> | urn:rdf:transrept` and `urn:transrept:auto` — both bound here.
+# 0.1.9 also declares `urn:transrept:auto`'s own text/turtle face and refuses an unknown `as=`.
 # Neutral s-expr foundation: Sexpr datum + urn:sparql:from-sexpr transreptor (text/x-sexpr → SPARQL).
-ikigai-sexpr = "0.1.0"
+ikigai-sexpr = "0.1.3" # 0.1.3 bounds the reader and the code-graph encoder at
+# MAX_READ_DEPTH 512 and answers a clean parse error. Below it, hostile input (`"("` a
+# hundred thousand times, or a long flat list) aborted the WHOLE PROCESS on a stack
+# overflow — and it got there through CAPABILITY-FREE transreptors, so no grant stood in
+# the way and `urn:transrept:auto`, which this host binds and dispatches by sniff, was a
+# reachable path to it. A hard floor for a host that serves untrusted bytes.
+# 0.1.1/0.1.2 added `urn:rdf:from-sexpr` and the lossless code-as-graph codec
+# (`urn:sexpr:to-rdf`/`from-rdf`), both of which this host binds.
 # Signing + verification: urn:sign:sign (cap-gated) / urn:sign:verify (open), Ed25519.
-ikigai-sign = "0.2.0"
+ikigai-sign = "0.2.2" # 0.2.2 fixed the key ArgSpec summaries, which had said Ed25519-only
+# since ES256 shipped in 0.2.0 — a manifold this host publishes describing an argument it
+# does not have, and the same family of defect as the `ikigai-fn` one above. It also makes a
+# signature as cacheable as its KEY, so over a key served under a thread a rotation's cut
+# recomputes it and over an uncacheable key nothing caches.
+# ⚠ 0.2.1 changed the signature NODE IRI from `urn:sign:<hex>` to `urn:sign:sha256:<hex>`
+# (the derivation is unchanged). Nothing in this workspace stores or matches that IRI —
+# `tests/wire_eval.rs` round-trips through `urn:sign:sign` and `urn:sign:verify` and reads
+# the graph, never the node name — but anything downstream that persisted the old spelling
+# does not match after this bump.
 # Public-key encryption (urn:encrypt:encrypt/decrypt, age/X25519) — the dual of sign.
 # Keys resolved through the kernel (urn:secret:<id>.enc). Embedded-only (off the wire).
-ikigai-encrypt = "0.1.0"
+ikigai-encrypt = "0.1.1" # 0.1.1 stops declaring `urn:encrypt:encrypt` cacheable. age mints
+# a FRESH ephemeral key on every call, so the result is not a function of its inputs and a
+# cached ciphertext is a cached answer to a question nobody asked twice; `decrypt` is as
+# cacheable as its key, which is the correct claim. This host served the cached one.
 # Secrets custody: urn:secret:{name} (cap-gated read) + urn:secret:generate/unlock
 # (Ed25519 keygen + Touch ID), macOS Keychain backend. Owner-only, not served.
-ikigai-secret = "0.1.5" # 0.1.5 = the urn:secret Sink write face (owns the item's ACL → silent reads)
+ikigai-secret = "0.1.6" # 0.1.6 gives `urn:secret:{name}` per-verb ActionSpecs — Source under
+# `urn:cap:secret:read:*`, Sink under `urn:cap:secret:write:*` with a required, typed
+# `content`. The Sink shipped in 0.1.5 with NO `describe()` line at all, so the write face
+# existed and was undrivable from `urn:kernel:actions` and from this host's MCP projection:
+# enforcement without declaration, the converse of over-offering and the worse of the two.
+# `urn:secret:unlock` and `urn:secret:generate` are now bound as their OWN endpoints ahead of
+# the template, each with its own scope, so `into=`/`type=` no longer ride on every secret
+# read. ⚠ That re-binding is why `tests/conformance.rs` grew two more opt-outs — see the note
+# there: a hazard waiver keyed on an endpoint ID does not survive the module splitting it.
+# 0.1.5 = the urn:secret Sink write face (owns the item's ACL → silent reads)
 # XSLT transform module (urn:xslt:transform) — linked natively (no download cost in a
 # native binary; the dynamic/lazy form is a browser/WASI concern).
-ikigai-xslt = "0.1.0"
+ikigai-xslt = "0.1.2" # 0.1.2 DECLARES `content`, which the endpoint already read. That is
+# pipeline citizenship and it is load-bearing in THIS workspace specifically: the engine
+# routes a piped body by the declared contract, so an undeclared intake is an endpoint you
+# cannot pipe into from the REPL. It also makes `as` optional and takes the result's media
+# type from the stylesheet's `xsl:output` when `as` is absent, where it previously always
+# claimed text/html, and accepts a stylesheet inline as well as by IRI.
 # JSON-LD operators (urn:jsonld:expand/compact/flatten) — linked natively (the heavy
 # json-ld tree is a browser-wasm concern, lazy-loaded there; native links it directly).
-ikigai-jsonld = "0.1.1"
+ikigai-jsonld = "0.1.2" # 0.1.2 types `content`/`context`/`base`. Untyped inputs are
+# invisible to the selection funnel's deterministic first stage — `urn:kernel:actions`
+# narrows on `ik:class`, and this host is the thing that serves that manifold — so the three
+# operators could not be narrowed to before matching fell through to the LLM residual.
 # SHACL validation (urn:shacl:validate) — rudof's validator is native-only (gated off wasm),
 # so it's linked natively here; the browser serves the same resource via shacl-engine (JS).
-ikigai-shacl = "0.1.1" # 0.1.1 = compiles against shacl 0.3.17+ (validate() grew a 3rd arg in a PATCH release) + real upper bounds
+ikigai-shacl = "0.1.2" # 0.1.2 SKOLEMIZES the report graph under `urn:ikigai:shacl:report:`
+# instead of emitting blank nodes — the recipe's "skolemize, no blank nodes" rule, in a graph
+# this host serves from `urn:shacl:validate` and from the pre-flight leg of the selection
+# funnel. Its application/json face also gained `message` (the resolved, language-tagged
+# sh:resultMessage) and `value`, and `{?value}`/`{$value}`/`{?this}`/`{?path}` templates are
+# now resolved on BOTH faces — authored by shape writers since forever and never once seen.
+# 0.1.1 = compiles against shacl 0.3.17+ (validate() grew a 3rd arg in a PATCH release) + real upper bounds
 # The org-mode agenda (urn:org:agenda:{period}) — reads org files through the
 # kernel (urn:orgfile:*) and speaks the same skolemized event graph as the
 # calendar, so the two union/diff as graphs.
-ikigai-org = "0.1.6" # 0.1.6 = drawer properties are read wherever the drawer sits (:ID:/:URL: below SCHEDULED:) + :ZOOM_PASSCODE:
+ikigai-org = "0.1.7" # 0.1.7 makes the text/turtle face a DECLARED output with `as` listing
+# its faces, and declares the agenda cacheable. The caching claim is only safe on a host that
+# actually cuts the org files' threads, which this one does — `tests::the_watcher_cuts_a_
+# thread_on_an_out_of_band_change` is that guarantee — so an absolute period now caches under
+# those threads and the clock instead of recomputing every read.
+# 0.1.6 = drawer properties are read wherever the drawer sits (:ID:/:URL: below SCHEDULED:) + :ZOOM_PASSCODE:
 # Unix-like text endpoints (urn:text:wc/head/tail/grep/sort/uniq/nl/rev) — the
 # first satellite-built module; pure text, wasm-clean, ArgSpec showcase.
-ikigai-text = "0.1.0"
+ikigai-text = "0.1.1" # 0.1.1 types `in`/`count`/`pattern` and declares all eight endpoints
+# pure and cacheable. Same reason as ikigai-jsonld above — an untyped input is invisible to
+# `urn:kernel:actions` narrowing — and upstream calls the typing "a contract change consumers
+# can see", which for a host is the literal truth: it is in our catalog.
 # Semantic-CMS transreptors (urn:cms:*): personal content (org bookmarks/notes,
 # library metadata) as one RDF graph on the dc:subject tag axis.
-ikigai-cms = "0.1.1" # 0.1.1 = stitch wrapped bookmark titles (no dropped entries)
+ikigai-cms = "0.1.3" # 0.1.2 SKOLEMIZES the bookmark subject to
+# `urn:cms:bookmark:<fnv1a-of-url>` and carries the URL as a `dc:identifier` literal. Using
+# the raw URL as the subject meant a bookmark with a bare `%` or a stray `#` produced an
+# INVALID subject IRI in a graph this host emits. 0.1.3 declares the Turtle face and marks
+# the endpoint pure and cacheable.
+# ⚠ This is a GRAPH-SHAPE change, not just a declaration: any query keyed on the bookmark
+# URL being the subject has to move to `dc:identifier`. Nothing in this workspace queries
+# `urn:cms:*` — it binds the transreptors and serves them — but ikigai-cms-web does.
+# 0.1.1 = stitch wrapped bookmark titles (no dropped entries)
 # Dev-tooling seam: git/gh/cargo as resources (urn:system:exec, urn:repo:*).
-ikigai-repo = "0.1.2" # 0.1.2 = typed Error::Denied for capability denials
+ikigai-repo = "0.1.6" # A floor a test in this repo actually holds, rather than an argument:
+# 0.1.3 and 0.1.5 bound `urn:repo:pr:list`, `urn:repo:pr:diff` and `urn:repo:pr:files`, and
+# `conformance::the_walked_catalog_is_classified` now names all three. Below 0.1.6 they are
+# unbound and that test fails the other way — "classified but no longer bound". 0.1.4 also
+# gave `pr:list` a `state=` enum refused before `gh` runs, and 0.1.6 typed twenty-three
+# inputs while deliberately declaring nothing pure or cacheable (every one of these shells
+# out). ⚠ `pr:list`'s TEXT face gained a `state` column and now orders by most-recently-
+# UPDATED rather than newest-created; nothing in this workspace parses it, but a line parser
+# written against 0.1.3 breaks. 0.1.2 = typed Error::Denied for capability denials
 # Repository browsing (urn:repo:{root}:tree/file/state/hash/explain +
 # urn:iki:annotation:*) over configured roots — opt-in via `browse.root` config lines
 # (embedded host).
-ikigai-browse = "0.3.0" # 0.3.0 is a NAMING floor, and the reason it is hard rather than
+ikigai-browse = "0.3.2" # 0.3.2 declares `content` on the annotation Sink — the piped body was
+# undeclared, and on this host the engine routes a pipe BY the declaration, so minting an
+# annotation from a pipe was not a thing the REPL could do. It also fixes three `as` defaults
+# that were not members of their own `one_of` (a contract that cannot be satisfied by taking
+# its own default) and types thirty-four inputs.
+# 0.3.2 also added `Mount::space_watched() -> (EndpointSpace, StyleWatch)`, which is what
+# would finally cut `urn:file:<a11y.toml>`'s thread on an out-of-band edit — this host still
+# calls `space_with_explain`, so `urn:repo:style` keeps serving the stylesheet the process
+# started with. Adopting the watch is a code change, not a pin, and is left to its own arc.
+# 0.3.1 added the `migrate-annotation-ns` tool for stores written before the 0.3.0 rename.
+# 0.3.0 is a NAMING floor, and the reason it is hard rather than
 # cosmetic: the annotation family moved from `urn:annotation:*` to `urn:iki:annotation:*`,
 # and this host answers the OLD spelling through the alias table installed in
 # `ikigai_embedded::alias_table` (see the two rules there). Pinned below 0.3.0 the host
@@ -95,8 +261,25 @@ ikigai-browse = "0.3.0" # 0.3.0 is a NAMING floor, and the reason it is hard rat
 # 0.2.11 it also leaked the light theme into dark mode, rendering parameters at 1.03:1.
 # Steel-backed Lisp evaluator (urn:lisp:eval): code is a resource, builtins ARE the
 # cap-scoped kernel verbs. Embedded-only (arbitrary code); gated by urn:cap:lisp.
-ikigai-lisp = "0.1.12" # 0.1.12 = scope_sync migration (core-owned bridge; channels deleted)
-ikigai-throttle = "0.1.9" # 0.1.9 = each `Failover` candidate is invoked on its OWN grammar's
+ikigai-lisp = "0.1.15" # Two floors, both behavioural, both with named sites here.
+# 0.1.13: Steel keeps ONE module-global reader that never cleared on a mid-form eof, so a
+# single malformed input left a partial form in it and POISONED every later `read` in that
+# worker for the life of the process. This host runs `urn:lisp:eval` on a long-lived worker,
+# which is exactly the shape that turns one bad input into a permanent fault.
+# 0.1.15: a capability denial inside a sub-resolution propagates as a TYPED `Denied` instead
+# of `Error::Endpoint("lisp: Error: Generic: \"denied: …\"")`. That matters at this
+# workspace's own boundaries and nowhere else: `ikigai-wire` v7 carries typed errors, and a
+# client reads `Endpoint` as RETRYABLE — so a permanent authority refusal came back over IPC
+# and QUIC as something worth trying again, and the HTTP face mapped it to 500 rather than
+# 403. 0.1.12 = scope_sync migration (core-owned bridge; channels deleted)
+ikigai-throttle = "0.1.10" # 0.1.10 = the over-budget `RateLimit` stand-in FORWARDS the
+# wrapped endpoint's `describe()`. Below it the stand-in described itself ("rate-limited",
+# no `requires`), so once a prefix went over budget the wrapped endpoint's declared-capability
+# floor vanished with it: a caller holding no grant for a gated resource was told the prefix
+# was rate-limited instead of being Denied, and this host's catalog through an overlay
+# advertised no `requires` at all. Declared = enforced is the rule the overlay was breaking,
+# and this workspace is where the overlays are composed. The refusal itself is unchanged.
+# 0.1.9 = each `Failover` candidate is invoked on its OWN grammar's
 # captures. A behavioural floor with a named site right here: `--prefer` composes
 # `Failover::new([MountedRemote, local])` (see `crates/ikigai-embedded`), and `MountedRemote`
 # hits with `Bindings::new()`. Under 0.1.8, which invoked EVERY candidate with the first hit's
@@ -120,14 +303,31 @@ ikigai-throttle = "0.1.9" # 0.1.9 = each `Failover` candidate is invoked on its 
 # Timeout governor + Failover (the --prefer mount degrades through it)
 # LLM inference (urn:llm:ask + urn:llm:<provider>:ask + urn:llm:config): a facade grammar
 # over pluggable backends. OpenAI-compatible REST backend (Ollama/vLLM/llama.cpp/mlx_lm).
-ikigai-llm = "0.12" # 0.12 = `caps.batchAt` + the `batchAt<=W` need term: the declared
+ikigai-llm = "0.12.1" # 0.12.1 stops a backend's 4xx body reaching the error text verbatim —
+# only the OpenAI-shaped `error.message` is kept — so a PROMPT can no longer appear in an
+# error this host composes and relays over the wire. In the same release `require_net`
+# refuses with the typed permanent `Denied` instead of `Error::Endpoint`, which a wire client
+# reads as retryable (the same defect, and the same reasoning, as the ikigai-lisp floor
+# above), and `urn:llm:config`/`:models`/`:select` become cacheable under ONE golden thread,
+# `urn:llm:config`, so a host that reloads config cuts that thread once. ⚠ This host does not
+# cut it today — a live config reload will serve stale llm answers until the process
+# restarts. 0.12.2 is the xsd-typed `ik:batchAt` literal, which matters to a consumer
+# diffing the Turtle face against the JSON-LD one; nothing here does, so this pin states
+# 0.12.1 rather than the newest.
+# 0.12 = `caps.batchAt` + the `batchAt<=W` need term: the declared
 # concurrency at or above which a backend is the throughput winner, which is what the engine's
 # automatic fan-out hint resolves against. An API floor AND a breaking one — `Caps` gained a
 # public field, so a caret pin on 0.11 does not reach it. Carries 0.10's
 # urn:llm:{provider}:model, which browse's explain archive keys its version tags on.
 # Video-conference scheduling (urn:meeting:schedule + urn:meeting:<provider>:schedule): a facade
 # over provider backends, Zoom first. Now on crates.io — the git-rev bridge retired at first publish.
-ikigai-meeting = "0.1.0"
+ikigai-meeting = "0.1.1" # 0.1.1 runs the module's OWN rules — both Zoom hosts, port-aware,
+# and each credential name — BEFORE any secret is read. The original read all three secrets
+# and then let its net gate refuse, so a call that was never going to be allowed had already
+# touched the keystore. It also declares `urn:cap:net:*` + `urn:cap:secret:read:*` on the
+# Sink (they were enforced and undeclared), declares `content`, types every input so a
+# garbled `start`/`duration` is a typed InvalidArgument that names the argument without
+# echoing it, and scrubs provider errors.
 # ── Intra-workspace siblings: LOCKSTEP pins, not floors ───────────────────────
 # The seventeen members that take `version.workspace = true` are released TOGETHER, at one
 # version, always. So every sibling pin below states the CURRENT workspace version rather
