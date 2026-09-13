@@ -41,14 +41,20 @@ ikigai-vocab = "0.1.69" # 0.1.69 defines the six terms the modules composed BELO
 # conformance suite's VOCABULARY rule walks THIS host's composed manifold, so an undefined
 # term is a finding here rather than in the crate that emitted it —
 # `the_health_graph_uses_exactly_four_undefined_terms` pins the exception list exactly, and it
-# is four, not ten, only from 0.1.69. Beneath that sits an older behavioural floor worth
-# stating because nothing about it is visible in a type: **0.1.40 is the first version whose
-# `TurtleRenderer` answers `Meta as=application/json` instead of ERRORING**, and both kernels
-# this workspace composes render Meta with it. `Engine::describe_struct` fetches a contract
-# with exactly that request and, when it fails, fails OPEN — it returns `None` and
-# `source_request` routes the value to an input literally named `in`. So below 0.1.40 every
-# pipe over `--connect` appears to work while named arguments are silently not recognised as
-# named. (0.1.33 = event terms ik:calendar/allDay/alert + the LLM trait terms.)
+# is four, not ten, only from 0.1.69.
+#
+# ⚠ There is a SECOND vocab floor in the ecosystem — 0.1.40 is the first version whose
+# `TurtleRenderer` answers `Meta as=application/json` instead of ERRORING — and this host is
+# NOT subject to it, which is worth writing down because it looks like it should be.
+# `ikigai_embedded::CliRenderer` projects the JSON face ITSELF and only falls through to
+# `TurtleRenderer` for Turtle and text, so every kernel built here answers a contract fetch
+# whatever vocab is resolved beneath it. The floor binds a PEER we mount that renders Meta
+# with a plain `TurtleRenderer`, and it bites at `Engine::describe_struct`, which fetches the
+# contract with exactly that request and fails OPEN when it cannot — returning `None`, so
+# `source_request` routes the value to an input literally named `in` and every pipe over
+# `--connect` appears to work while named arguments are silently not recognised as named.
+# So: raise this pin for the terms, and remember the 0.1.40 number when a MOUNT misbehaves.
+# (0.1.33 = event terms ik:calendar/allDay/alert + the LLM trait terms.)
 
 # ── ★ What a pin means HERE, because this crate is a HOST and not a library ──────────────
 #
