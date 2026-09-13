@@ -17,6 +17,16 @@ embedded = ["dep:ikigai-embedded"]
 ipc = ["dep:ikigai-ipc"]   # Unix only; the dep is empty elsewhere
 quic = ["dep:ikigai-quic", "dep:ikigai-discovery", "dep:ikigai-wire"] # opt-in; pulls quinn/rustls/tokio
 web = ["dep:ikigai-web", "dep:tokio", "dep:serde_yaml"] # opt-in inbound HTTP face; pulls Tokio (like quic)
+# The durable RDF store (`urn:iki:store:*`) and the work ledger that rides on it. Opt-in
+# like `quic` and `web`, and it implies `embedded` because the store is bound in the
+# embedded root space and nowhere else — a served kernel must not hand a remote caller a
+# dataset whose write scope is `DROP ALL`.
+#
+# ⚠ Turning this feature on does NOT open a dataset. A `store = true` line in the config
+# home has to name this instance as well, because the directory can only be held by one
+# process at a time — `ikigai-embedded/src/store.rs` and `docs/durable-store.md` argue it.
+# Install it with: cargo install --locked --features store --path crates/ikigai-cli
+store = ["embedded", "ikigai-embedded/store"]
 
 [dependencies]
 async-trait = "0.1"

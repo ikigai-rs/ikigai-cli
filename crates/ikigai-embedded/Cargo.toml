@@ -7,6 +7,20 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# The durable RDF store (`urn:iki:store:*`) and, riding on it, the work ledger. Opt-in
+# twice over: this feature has to be on for the code to exist, and a `store = true` line
+# in the config home has to name THIS instance for a dataset to be opened. See
+# `src/store.rs` for why the second switch exists (one writer per directory).
+#
+# ⚠ There is no `required-features` target behind this — it is a `cfg(feature)` path
+# inside a LIBRARY, which `--all-targets` cannot see and `ci-drift`'s check cannot
+# report. What covers it is the caller's `features: "*"` input in `.github/workflows/
+# ci.yml`, which runs clippy and test under `--all-features` on Linux and macOS. Removing
+# that input silently stops linting and testing everything below.
+store = ["dep:ikigai-store"]
+
 [dependencies]
 ikigai-core = { workspace = true }
 ikigai-vocab = { workspace = true }
@@ -71,6 +85,9 @@ ikigai-meeting = { workspace = true }
 # same pure-Rust Oxigraph crates ikigai-rdf already pulls into this tree.
 oxrdf = "0.3"
 oxrdfio = "0.2"
+# The durable dataset behind `urn:iki:store:*`, opened from a path this host holds for
+# the life of the process. Optional: see `[features]` above and `src/store.rs`.
+ikigai-store = { workspace = true, optional = true }
 ikigai-scheduler = { workspace = true }
 # The time transport (urn:time:schedule/cancel/jobs): fires a kernel resource-request
 # on a timer. Bound in root_space; its kernel handle is installed in watched_kernel.
