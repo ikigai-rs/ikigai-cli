@@ -2602,6 +2602,7 @@ dependencies = [
  "ikigai-sign",
  "ikigai-sniff",
  "ikigai-sparql",
+ "ikigai-store",
  "ikigai-text",
  "ikigai-throttle",
  "ikigai-time",
@@ -2959,6 +2960,19 @@ dependencies = [
  "ikigai-core",
  "ikigai-vocab",
  "oxigraph",
+]
+
+[[package]]
+name = "ikigai-store"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ced6c6d333e1e6ecb0c71b0bc5953af8358c4c73e3d604d823ff3d1937296b56"
+dependencies = [
+ "async-trait",
+ "ikigai-core",
+ "oxigraph",
+ "serde",
+ "toml 0.8.23",
 ]
 
 [[package]]

@@ -328,6 +328,28 @@ ikigai-meeting = "0.1.1" # 0.1.1 runs the module's OWN rules — both Zoom hosts
 # Sink (they were enforced and undeclared), declares `content`, types every input so a
 # garbled `start`/`duration` is a typed InvalidArgument that names the argument without
 # echoing it, and scrubs provider errors.
+# The persistent RDF store (urn:iki:store:*): a dataset opened from a path and owned by
+# ONE process, rather than rebuilt from its sources on every boot. Optional, behind this
+# workspace's `store` feature (ikigai-embedded), because a host that wants no dataset
+# should carry none — and because the ledger that rides on it is opt-in too.
+#
+# `features = ["persistent"]` is the whole point of taking this dependency: the crate is
+# in-memory by DEFAULT and the durable backend lives behind a `cfg(feature)` inside a
+# LIBRARY, which is not a target, so nothing — not `--all-targets`, not `ci-drift`'s
+# required-features check — would report its absence. Without it `DurableStore::open` does
+# not exist and this host would compile against a store that forgets.
+#
+# ⚠ And the RocksDB it enables is ALREADY in this workspace's graph unconditionally:
+# `ikigai-embedded` turns on `oxigraph/rocksdb` for the browse/sparql shared store, so
+# `oxrocksdb-sys` compiles on every default build here whatever this line says. Cargo
+# feature unification is global, so the two cannot disagree. (Measured 2026-09-13:
+# `oxrocksdb-sys` is in this repo's Cargo.lock on main, before this dependency existed.)
+#
+# 0.2.0 is the floor AND the first version that exists to depend on: 0.1.70 was the
+# in-memory placeholder a lockstep sweep published by accident and Brian yanked.
+# ⚠ `"0.2.0"` is a RANGE, `>=0.2.0, <0.3.0` — when the store reaches 0.3 this line must
+# move or this host silently freezes out of every release after it.
+ikigai-store = { version = "0.2.0", features = ["persistent"] }
 # ── Intra-workspace siblings: LOCKSTEP pins, not floors ───────────────────────
 # The seventeen members that take `version.workspace = true` are released TOGETHER, at one
 # version, always. So every sibling pin below states the CURRENT workspace version rather

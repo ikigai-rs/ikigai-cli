@@ -55,6 +55,12 @@ pub mod jsonl;
 pub mod passkey;
 pub mod people;
 pub mod scheduling;
+// The durable RDF store (`urn:iki:store:*`) and — with it — the work ledger. Behind the
+// `store` feature because a host that does not want a dataset should not carry one, and
+// opt-in from the config home on top of that: see the module note for the one-writer
+// topology the whole thing hangs on.
+#[cfg(feature = "store")]
+pub mod store;
 pub mod tenant;
 use ikigai_time::JobRegistry;
 use ikigai_vocab::TurtleRenderer;
@@ -3766,6 +3772,23 @@ fn root_space_with_mounts(mounts: Vec<MountSpec>) -> Arc<dyn Space> {
     // Exacts without shadowing (reserved names are refused at setup).
     if let Some(b) = browse {
         spaces.push(Arc::new(b.space) as Arc<dyn Space>);
+    }
+    // The durable RDF store (urn:iki:store:{select,ask,construct,describe,info,update,
+    // load}), when `store = true` (or `<instance>.store = true`) configured it — see the
+    // `store` module for the switch, the topology and what a held directory prints.
+    //
+    // ⚠ It is pushed as an `Arc` of ONE space, memoised per process, because the dataset
+    // is opened once per process and not once per kernel: `DurableStore::open` refuses a
+    // second open on the same path even from the same process, and several modes here
+    // build more than one kernel (the test binaries build a dozen).
+    //
+    // NOT in `served_space` and not in the HTTP door: the dataset holds whatever this
+    // host ever put in it, and a remote caller with `urn:cap:store:write` holds
+    // `DROP ALL`. A peer reaches it the way every other exclusive resource here is
+    // reached — by mounting this kernel over IPC, under that connection's own ceiling.
+    #[cfg(feature = "store")]
+    if let Some(space) = store::setup() {
+        spaces.push(space as Arc<dyn Space>);
     }
     // The booking handler: `schedule.scm` bound as an endpoint (`ikigai_lisp::program` — the
     // program IS the endpoint), IF the workspace provides `booking-handler.scm`. The reactive
