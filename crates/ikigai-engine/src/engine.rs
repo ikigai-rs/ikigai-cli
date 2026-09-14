@@ -994,6 +994,12 @@ impl Engine {
     /// named args, while letting `sink urn:httpPost url=https://… the body` name the
     /// URL and still pass an arbitrary body. The contract is only consulted when the
     /// first word looks like `key=value`, so a plain content write needs no lookup.
+    ///
+    /// ⚠ `content` is itself a declared argument of most sinks, so `content="…"` names
+    /// the body directly — which is the way to send a *structured* body, since the
+    /// remainder is verbatim down to the quote characters. When `content=` is named the
+    /// remainder fallback is skipped entirely (it would otherwise overwrite it), and a
+    /// remainder alongside `content=` is refused rather than silently resolved.
     async fn write_request(&self, verb: Verb, rest: &str) -> Result<Request, String> {
         let (target, mut tail) = split_first_word(rest);
         if target.is_empty() {
@@ -1016,10 +1022,29 @@ impl Engine {
             Vec::new()
         };
 
-        let mut request = Request::new(verb, iri);
+        let mut request = Request::new(verb, iri.clone());
+        let mut content_named = false;
         while let Some((key, value, after)) = take_named_arg(tail, &declared) {
+            content_named |= key == "content";
             request = request.with_arg(key, ArgRef::Inline(value.into_bytes()));
             tail = after;
+        }
+        // `content=` names the body explicitly — and `with_arg` is LAST-WINS, so the
+        // remainder fallback below must not run or it overwrites the named value with the
+        // empty remainder. That was silent: most sinks accept an empty body as a legal
+        // no-op (an empty SPARQL update reports success), so the write simply did nothing
+        // while `urn:kernel:actions` went on advertising `content` as a named argument.
+        // A remainder *alongside* `content=` is two bodies with no rule for choosing
+        // between them, so refuse rather than pick one and drop the other.
+        if content_named {
+            if !tail.is_empty() {
+                return Err(format!(
+                    "`{}` was given content twice — named `content=` and the trailing \
+                     `{tail}`; use one or the other",
+                    iri.as_str()
+                ));
+            }
+            return Ok(request);
         }
         // The verbatim remainder is the content. When a `sink` carries none, a one-shot piped
         // stdin payload feeds it instead — so a value (e.g. a secret) can be piped in without
@@ -1174,7 +1199,10 @@ impl Engine {
     /// piped upstream value fills `content`. Unlike the top-level `sink` command,
     /// whose content is the verbatim spec remainder, a pipeline sink's content is
     /// the previous stage's output — so a stray positional word (which would have
-    /// nowhere to go) is a usage error rather than silent content.
+    /// nowhere to go) is a usage error rather than silent content. A named
+    /// `content=` wins over the pipe fallback when nothing is piped in (a fork
+    /// branch or a lone `sink` stage) and is refused as a second body when
+    /// something is.
     async fn sink_request(
         &self,
         target: &str,
@@ -1192,6 +1220,7 @@ impl Engine {
         };
 
         let mut request = Request::new(Verb::Sink, iri.clone());
+        let mut content_named = false;
         for arg in args {
             match arg.split_once('=') {
                 // `as` is the universal conneg selector (carried as an arg, not
@@ -1200,6 +1229,7 @@ impl Engine {
                     request = request.with_arg("as", ArgRef::Inline(value.as_bytes().to_vec()));
                 }
                 Some((key, value)) if declared.iter().any(|name| name == key) => {
+                    content_named |= key == "content";
                     request = request.with_arg(key, ArgRef::Inline(value.as_bytes().to_vec()));
                 }
                 _ => {
@@ -1210,6 +1240,21 @@ impl Engine {
                     ))
                 }
             }
+        }
+
+        // Same last-wins hazard as the top-level `sink`: a named `content=` must survive,
+        // so the pipe fallback below cannot run unconditionally. Here the competing body is
+        // the pipe itself, and a stage fed by a pipe that also names its content has two
+        // bodies — the same ambiguity a stray positional word already refuses.
+        if content_named {
+            if incoming.is_some() {
+                return Err(format!(
+                    "`sink {}` was given content twice — named `content=` and the piped \
+                     value; drop one",
+                    iri.as_str()
+                ));
+            }
+            return Ok(request);
         }
 
         // The piped upstream value is the content (empty if nothing flows in).
@@ -2937,6 +2982,86 @@ mod tests {
             output(engine.eval("delete urn:test:write url=https://h/p")).unwrap(),
             "Delete url=https://h/p content="
         );
+    }
+
+    #[test]
+    fn sink_honours_a_named_content_argument() {
+        // The regression: `content` is a declared argument, so `content=` was consumed as
+        // a named arg — and then overwritten by the unconditional remainder fallback,
+        // because `with_arg` is last-wins. The body arrived EMPTY, which most sinks accept
+        // (an empty SPARQL update is a legal no-op), so the write read as a success while
+        // storing nothing.
+        let engine = write_engine();
+        assert_eq!(
+            output(
+                engine.eval(r#"sink urn:test:write content="INSERT DATA { <urn:a> <urn:b> 42 }""#)
+            )
+            .unwrap(),
+            "Sink url= content=INSERT DATA { <urn:a> <urn:b> 42 }"
+        );
+        // …and it composes with the other named arguments, in either order.
+        assert_eq!(
+            output(engine.eval(r#"sink urn:test:write url=https://h/p content="body""#)).unwrap(),
+            "Sink url=https://h/p content=body"
+        );
+        assert_eq!(
+            output(engine.eval(r#"sink urn:test:write content="body" url=https://h/p"#)).unwrap(),
+            "Sink url=https://h/p content=body"
+        );
+    }
+
+    #[test]
+    fn delete_honours_a_named_content_argument() {
+        // `delete` shares `write_request`, so it had the same defect — and the same fix.
+        let engine = write_engine();
+        assert_eq!(
+            output(engine.eval(r#"delete urn:test:write content="a body""#)).unwrap(),
+            "Delete url= content=a body"
+        );
+    }
+
+    #[test]
+    fn sink_refuses_a_body_given_both_ways() {
+        // Two bodies with no rule for choosing between them: refuse rather than pick one
+        // and drop the other, which is the failure mode this whole fix is about.
+        let engine = write_engine();
+        let err =
+            output(engine.eval(r#"sink urn:test:write content="a" and also this"#)).unwrap_err();
+        assert!(err.contains("content twice"), "{err}");
+        assert!(err.contains("and also this"), "{err}");
+    }
+
+    #[test]
+    fn a_named_content_is_not_the_whole_remainder() {
+        // Only the *named* value is the body — a following word that happens to look like
+        // an undeclared `key=value` is still a remainder, so this stays an error rather
+        // than quietly appending to the named body.
+        let engine = write_engine();
+        assert!(output(engine.eval(r#"sink urn:test:write content="a" nope=1"#)).is_err());
+    }
+
+    #[test]
+    fn a_pipeline_sink_stage_honours_named_content_when_nothing_is_piped() {
+        // A `sink` stage with no upstream (here: the only stage of a spec) has no pipe to
+        // take its body from, so `content=` is the body — the `unwrap_or(&[])` fallback
+        // used to overwrite it with the empty slice.
+        let engine = pipe_sink_engine();
+        assert_eq!(
+            output(engine.eval(r#"source sink urn:test:write content="stored""#)).unwrap(),
+            "Sink url= content=stored"
+        );
+    }
+
+    #[test]
+    fn a_piped_sink_stage_refuses_a_named_content() {
+        // The pipe IS the body of a piped sink stage, so naming one too is two bodies —
+        // the same ambiguity a stray positional word already refuses.
+        let engine = pipe_sink_engine();
+        let err = output(
+            engine.eval(r#"source urn:test:upper hi | sink urn:test:write content="other""#),
+        )
+        .unwrap_err();
+        assert!(err.contains("content twice"), "{err}");
     }
 
     /// An engine with both a `toUpper` source and the `urn:test:write` sink, so a
