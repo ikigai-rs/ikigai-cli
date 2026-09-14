@@ -440,8 +440,8 @@ impl Plan {
             }
         }
 
-        let step_iris = ordered_nodes(&graph, &plan_iri, "step", "Step")?;
-        let fork_iris = ordered_nodes(&graph, &plan_iri, "fork", "Fork")?;
+        let step_iris = ordered_steps(&graph, &plan_iri)?;
+        let fork_iris = ordered_forks(&graph, &plan_iri);
         let index: BTreeMap<&str, NodeRef> = step_iris
             .iter()
             .enumerate()
@@ -600,47 +600,50 @@ impl Plan {
     }
 }
 
-/// The `ik:{predicate}` nodes of the plan, ordered by the `{n}` in their skolem IRIs.
-///
-/// `{n}` is only a step's position in the text face, so nothing depends on it — but
-/// reading it back preserves the numbering a render produced, which keeps a plan's
-/// rendered form stable across a round trip and therefore diffable.
-fn ordered_nodes(
-    graph: &Graph,
-    plan_iri: &str,
-    predicate: &str,
-    class: &str,
-) -> Result<Vec<String>, String> {
-    let mut iris: Vec<String> = if predicate == "step" {
-        graph
-            .objects(plan_iri, predicate)
-            .iter()
-            .map(|object| object.iri(plan_iri, predicate).map(str::to_string))
-            .collect::<Result<_, _>>()?
-    } else {
-        // Forks are not linked from the process — they are reached through the steps that
-        // branch off them, so the graph's own `a ik:Fork` assertions are the list.
-        graph
-            .of_class(class)
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
-    };
-    if predicate == "step" && iris.is_empty() {
+/// The plan's steps, ordered by the `{n}` in their skolem IRIs.
+fn ordered_steps(graph: &Graph, plan_iri: &str) -> Result<Vec<String>, String> {
+    let mut iris: Vec<String> = graph
+        .objects(plan_iri, "step")
+        .iter()
+        .map(|object| object.iri(plan_iri, "step").map(str::to_string))
+        .collect::<Result<_, _>>()?;
+    if iris.is_empty() {
         return Err(format!(
             "<{plan_iri}> has no ik:step — a plan runs something"
         ));
     }
-    let prefix = format!("{plan_iri}:{predicate}:");
+    number_by_iri(&mut iris, &format!("{plan_iri}:step:"));
+    Ok(iris)
+}
+
+/// The plan's forks. Nothing links a process to them — they are reached through the steps
+/// that branch off them — so the graph's own `a ik:Fork` assertions are the list.
+fn ordered_forks(graph: &Graph, plan_iri: &str) -> Vec<String> {
+    let mut iris: Vec<String> = graph
+        .of_class("Fork")
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    number_by_iri(&mut iris, &format!("{plan_iri}:fork:"));
+    iris
+}
+
+/// Order skolemized nodes by the `{n}` their IRIs carry, falling back to the IRI itself.
+///
+/// `{n}` is only a node's position in the text face, so nothing *depends* on it — but
+/// reading it back preserves the numbering a render produced, which keeps a plan's
+/// rendered form stable across a round trip and therefore diffable. Turtle is unordered,
+/// so without this the numbering would follow whatever order the document happened to
+/// have, and a plan would not survive being reserialized.
+fn number_by_iri(iris: &mut Vec<String>, prefix: &str) {
     iris.sort_by_key(|iri| {
         let n = iri
-            .strip_prefix(&prefix)
+            .strip_prefix(prefix)
             .and_then(|rest| rest.parse::<usize>().ok())
             .unwrap_or(usize::MAX);
         (n, iri.clone())
     });
     iris.dedup();
-    Ok(iris)
 }
 
 fn read_step(
