@@ -355,7 +355,22 @@ ikigai-meeting = "0.1.1" # 0.1.1 runs the module's OWN rules — both Zoom hosts
 # in-memory placeholder a lockstep sweep published by accident and Brian yanked.
 # ⚠ `"0.2.0"` is a RANGE, `>=0.2.0, <0.3.0` — when the store reaches 0.3 this line must
 # move or this host silently freezes out of every release after it.
-ikigai-store = { version = "0.2.0", features = ["persistent"] }
+# ⚠ 0.2.2, not 0.2.0: that is where the store's NARROW per-graph doors arrive
+# (`urn:iki:store:graph-select` / `graph-update`, gated by
+# `urn:cap:store:{read,write}:graph:<G>`), and every read and write `ikigai-ledger` makes
+# goes through them. Nothing in this host calls them directly — the floor states the API
+# the COMPOSITION uses, which is the same rule read one level out.
+ikigai-store = { version = "0.2.2", features = ["persistent"] }
+# The work ledger (`urn:iki:ledger:*`): items, comments, labels, links, claims and
+# `next`, as RDF in the store above. It owns no bytes — every read is a scoped SPARQL
+# query at `urn:iki:store:graph-select` and every write a scoped UPDATE at
+# `urn:iki:store:graph-update` — so it is inert without a store space in the same kernel,
+# and the two are bound together or not at all (`crates/ikigai-embedded/src/store.rs`).
+#
+# ⚠ `"0.2"` is a RANGE, `>=0.2.0, <0.3.0`, and 0.2.0 is also the floor: 0.1.0 named every
+# resource and every grant differently (`urn:iki:ledger:append` was the only ledger there
+# was), so this host has never seen those IRIs and must not resolve against them.
+ikigai-ledger = "0.2"
 # ── Intra-workspace siblings: LOCKSTEP pins, not floors ───────────────────────
 # The seventeen members that take `version.workspace = true` are released TOGETHER, at one
 # version, always. So every sibling pin below states the CURRENT workspace version rather

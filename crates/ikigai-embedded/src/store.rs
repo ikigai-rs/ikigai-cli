@@ -1,4 +1,12 @@
-//! The durable RDF store (`urn:iki:store:*`) — the switch, the topology, and the refusal.
+//! The durable RDF store (`urn:iki:store:*`) and the work ledger (`urn:iki:ledger:*`)
+//! that rides on it — the switch, the topology, and the refusal.
+//!
+//! **One switch binds both, because the ledger owns no bytes.** Every read
+//! `ikigai-ledger` makes is a SPARQL query at `urn:iki:store:graph-select` and every write
+//! an UPDATE at `urn:iki:store:graph-update`, each naming one ledger's named graph — so a
+//! ledger space bound without a store space beside it is a set of resources that resolve
+//! and then fail. They are composed here in one [`Fallback`], **store first**, matching
+//! `ikigai-ledger`'s own composition; nothing else in this host binds either.
 //!
 //! Opt-in from the config home, exactly like the browse family next door and for exactly
 //! the same reason: the dataset is a RocksDB directory, **RocksDB permits one writer per
@@ -19,6 +27,10 @@
 //! #     `serve.browse.root` already uses.
 //! serve.store = true
 //! mount = "prefer urn:iki:store:=/Users/you/.ikigai/serve.sock"
+//! # ⚠ A mount claims ONE prefix, so the ledger takes a second line — as the browse family
+//! #   takes one for urn:repo: and one for urn:iki:annotation:. One switch binds both
+//! #   locally; two lines reach both remotely.
+//! mount = "prefer urn:iki:ledger:=/Users/you/.ikigai/serve.sock"
 //! ```
 //!
 //! Mixing the two spellings is refused loud: a scoped line for instance A plus an
@@ -30,6 +42,21 @@
 //! config home and defaults the dataset to `~/.ikigai/store` under the data home. Config
 //! home for the setting, data home for the bytes, and no environment variable names
 //! either — one setting, one spelling, one file that `ikigai config` can see.
+//!
+//! # Capabilities: the ledger needs the store's NARROW doors, never the broad one
+//!
+//! A sub-request carries the **caller's** capability unchanged, so whatever the ledger
+//! asks the store for, the caller must hold. The everyday REPL session is root and needs
+//! nothing. A narrowed session (`cap`), a served connection or an agent needs **both
+//! halves** — the ledger's own grant and the store's per-graph token for that ledger's
+//! graph — and [`grants_for`] is the whole list, computed rather than transcribed.
+//!
+//! ⚠ **The broad `urn:cap:store:write` does not work here, and it fails as a `Denied` that
+//! looks like a bug in the ledger.** `urn:iki:store:graph-update` declares and enforces
+//! `urn:cap:store:write:graph:*` — the broad key is not a prefix of that and is refused by
+//! design, so a grant list that reaches for the powerful token produces a ledger that can
+//! read nothing and write nothing. Narrow is not merely the better grant; it is the only
+//! one that works.
 //!
 //! # ★ One open per PROCESS, not per kernel
 //!
@@ -57,14 +84,18 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use ikigai_core::{EndpointSpace, Error};
+use ikigai_core::{Error, Fallback, Space};
 use ikigai_store::DurableStore;
 
 use crate::config;
 
 /// The one open, memoised for the life of the process. `None` = not configured for this
 /// instance, or configured and held by somebody else. See the module note.
-static STORE_SPACE: OnceLock<Option<Arc<EndpointSpace>>> = OnceLock::new();
+///
+/// `dyn Space` rather than `EndpointSpace`: what is bound is a [`Fallback`] over two
+/// spaces — the store's and the ledger's — and the pair is what a kernel gets, always
+/// together.
+static STORE_SPACE: OnceLock<Option<Arc<dyn Space>>> = OnceLock::new();
 
 /// A directory to open instead of the configured one.
 static PATH_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
@@ -83,7 +114,8 @@ pub fn set_store_path(dir: PathBuf) {
     *PATH_OVERRIDE.lock().expect("store path lock") = Some(dir);
 }
 
-/// The durable store's space, when this instance is the one that holds the dataset.
+/// The durable store's space with the ledger's beside it, when this instance is the one
+/// that holds the dataset.
 ///
 /// # Panics
 ///
@@ -91,15 +123,23 @@ pub fn set_store_path(dir: PathBuf) {
 /// `store` value that is neither `true` nor `false`, or scoped and unscoped switches in
 /// one file. A held directory is *not* a misconfiguration and does not panic; see the
 /// module note.
-pub(crate) fn setup() -> Option<Arc<EndpointSpace>> {
+pub(crate) fn setup() -> Option<Arc<dyn Space>> {
     STORE_SPACE.get_or_init(build).clone()
 }
 
 /// Read the configuration and open, once.
-fn build() -> Option<Arc<EndpointSpace>> {
+fn build() -> Option<Arc<dyn Space>> {
     let path = path()?;
     match DurableStore::open(&path) {
-        Ok(store) => Some(Arc::new(ikigai_store::space(store))),
+        // ★ **Store FIRST.** `Fallback` tries its spaces in order, and the two grammars do
+        // not overlap (`urn:iki:store:*` against `urn:iki:ledger:*`), so the order cannot
+        // change which endpoint answers — but it is the order `ikigai-ledger`'s own tests
+        // and README compose in, and a host that agrees with the crate it binds is one
+        // fewer difference to reason about if a future grammar ever does overlap.
+        Ok(store) => Some(Arc::new(Fallback::new(vec![
+            Arc::new(ikigai_store::space(store)) as Arc<dyn Space>,
+            Arc::new(ikigai_ledger::space()) as Arc<dyn Space>,
+        ]))),
         // The typed transient: somebody else holds the directory. One line, and the
         // binding is left out so a mount can answer for it.
         Err(e @ Error::Unavailable(_)) => {
@@ -114,6 +154,86 @@ fn build() -> Option<Arc<EndpointSpace>> {
             config_home_display()
         ),
     }
+}
+
+/// How much authority over one ledger a grant list should carry. Cumulative: each level
+/// includes the ones above it, because there is no useful "may delete but may not read".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Authority {
+    /// `items`, `next`, `ledgers` — and `item:{id}`, once `ikigai-ledger` stops
+    /// over-declaring the broad `urn:cap:store:read` on it (0.2.0 does; see
+    /// `ikigai-cli/tests/ledger.rs::reading_one_item_still_demands_the_broad_store_read_grant`,
+    /// which fails when that is fixed). This list is deliberately NOT widened to work
+    /// around it: adding `urn:cap:store:read` here would hand every ledger caller every
+    /// graph in the dataset, which is the boundary the per-graph tokens exist to draw.
+    Read,
+    /// …plus `append`, `comment`, `close`, `reopen`, `claim`, `defer`, `link`, `label`
+    /// and editing an item.
+    Write,
+    /// …plus `Delete` on an item, which moves its quads to that ledger's graveyard.
+    Delete,
+    /// …plus `purge`, which destroys the content in both graphs.
+    Purge,
+}
+
+/// Every capability token a **non-root** caller needs to use the ledger called `ledger` at
+/// `authority` — the ledger's own grant and the store's per-graph tokens underneath it,
+/// in one list.
+///
+/// The everyday REPL session is root and needs none of this. This is the answer for
+/// `ikigai serve --cap …`, for the REPL's `cap` command, and for an agent's ceiling.
+///
+/// ★ **Computed from both crates' own spellings, never transcribed.** A token is matched
+/// exactly and a ledger's graph IRI is `ikigai-ledger`'s to name, so this calls
+/// `Ledger::graph` and `ikigai_store::cap_read_graph` rather than formatting strings —
+/// which means a host that is one version behind on either crate fails to compile instead
+/// of handing an operator a grant list that silently denies.
+///
+/// ⚠ **Nothing here is `urn:cap:store:write`.** That token means the whole dataset,
+/// `DROP ALL` included, and `urn:iki:store:graph-update` — which is the only write door
+/// the ledger goes through — **refuses it**: the action declares and enforces
+/// `urn:cap:store:write:graph:*`, and the broad key is not under that prefix. A grant list
+/// built around the powerful token produces a ledger that cannot write, failing with a
+/// `Denied` that reads like a bug in the ledger. See `docs/durable-store.md`.
+///
+/// ```no_run
+/// # use ikigai_embedded::store::{grants_for, Authority};
+/// let grants = grants_for("default", Authority::Write).unwrap();
+/// assert!(grants.contains(&"urn:cap:ledger:write:default".to_string()));
+/// assert!(grants.contains(
+///     &"urn:cap:store:write:graph:urn:iki:ledger:graph:default".to_string()
+/// ));
+/// ```
+///
+/// # Errors
+///
+/// If `ledger` is not a usable ledger name — the wrong character class, too long, or one
+/// of the eighteen words the bare-form sugar reserves.
+pub fn grants_for(ledger: &str, authority: Authority) -> Result<Vec<String>, Error> {
+    let ledger = ikigai_ledger::Ledger::parse(ledger)?;
+    let graph = ledger.graph();
+    // Read is the floor: every level below reads, and a ledger you may write and not read
+    // is one whose own listing refuses.
+    let mut grants = vec![ledger.cap_read(), ikigai_store::cap_read_graph(&graph)];
+    if authority == Authority::Read {
+        return Ok(grants);
+    }
+    grants.push(ledger.cap_write());
+    grants.push(ikigai_store::cap_write_graph(&graph));
+    if authority == Authority::Write {
+        return Ok(grants);
+    }
+    // ⚠ The graveyard is a SECOND graph and a scoped write cannot reach across, so a
+    // delete needs a second store write token. This is the line an operator gets wrong.
+    grants.push(ledger.cap_delete());
+    grants.push(ikigai_store::cap_write_graph(&ledger.deleted_graph()));
+    if authority == Authority::Delete {
+        return Ok(grants);
+    }
+    // A purge clears the graveyard and the live graph — the same two store tokens as a
+    // delete, plus its own ledger grant, which is the whole difference in authority.
+    grants.push(ledger.cap_purge());
+    Ok(grants)
 }
 
 /// Which directory this process should hold, or `None` when it holds none.
@@ -210,11 +330,13 @@ fn truthy(key: &str, value: Option<&str>) -> bool {
 /// and a message that does not carry the whole answer leaves them where the silence did.
 fn refusal(path: &Path, e: &Error) -> String {
     format!(
-        "ikigai: urn:iki:store:* is NOT bound here — the durable store at {} is held by \
-         another process, and RocksDB permits one writer per directory.\n  \
+        "ikigai: urn:iki:store:* and urn:iki:ledger:* are NOT bound here — the durable \
+         store at {} is held by another process, and RocksDB permits one writer per \
+         directory.\n  \
          fix: this is topology, not a retry. Let ONE process hold the dataset and resolve \
-         through it — mount = \"prefer urn:iki:store:=<its socket>\" in {}/config.toml \
-         (and urn:iki:ledger: beside it for the ledger). See docs/durable-store.md.\n  \
+         through it — mount = \"prefer urn:iki:store:=<its socket>\" in {}/config.toml, \
+         and a SECOND line for urn:iki:ledger: (a mount matches one prefix, so the ledger \
+         needs its own). See docs/durable-store.md.\n  \
          underlying: {e}",
         path.display(),
         config_home_display()
@@ -230,9 +352,100 @@ fn config_home_display() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{enabled_in, refusal, truthy};
+    use super::{enabled_in, grants_for, refusal, truthy, Authority};
     use ikigai_core::Error;
     use std::path::Path;
+
+    /// ★ The grant list an operator copies, spelled out **as literals** — the one place in
+    /// this crate that does not compute them.
+    ///
+    /// `grants_for` calls `Ledger::graph` and `ikigai_store::cap_read_graph`, so a test
+    /// that built its expectation the same way would assert only that a function is
+    /// deterministic. These strings are what goes into a config file and a `--cap` line,
+    /// and a change to how either crate spells a graph IRI or a token has to fail HERE,
+    /// where the operator's file would have to change too.
+    #[test]
+    fn the_write_grant_names_the_ledger_and_its_graph_and_nothing_broader() {
+        let grants = grants_for("acme", Authority::Write).expect("a valid ledger name");
+        assert_eq!(
+            grants,
+            vec![
+                "urn:cap:ledger:read:acme",
+                "urn:cap:store:read:graph:urn:iki:ledger:graph:acme",
+                "urn:cap:ledger:write:acme",
+                "urn:cap:store:write:graph:urn:iki:ledger:graph:acme",
+            ]
+        );
+        // ⚠ The whole point: the broad key is ABSENT. `urn:iki:store:graph-update` refuses
+        // it, so a list carrying it would be a ledger that cannot write — and the `Denied`
+        // reads like a bug in the ledger rather than a grant that was never going to work.
+        assert!(
+            !grants.iter().any(|g| g == ikigai_store::CAP_WRITE),
+            "the broad store write grant is DROP ALL and the narrow door refuses it: {grants:?}"
+        );
+        assert!(
+            !grants.iter().any(|g| g == ikigai_store::CAP_READ),
+            "{grants:?}"
+        );
+    }
+
+    /// A delete needs write authority over TWO graphs, because the graveyard is a second
+    /// graph and a scoped write cannot reach across. The row an operator gets wrong.
+    #[test]
+    fn a_delete_grant_carries_the_graveyard_too() {
+        let grants = grants_for("acme", Authority::Delete).expect("a valid ledger name");
+        assert!(
+            grants.contains(&"urn:cap:ledger:delete:acme".to_string()),
+            "{grants:?}"
+        );
+        assert!(
+            grants.contains(
+                &"urn:cap:store:write:graph:urn:iki:ledger:graph:acme:deleted".to_string()
+            ),
+            "the graveyard is a second graph and therefore a second token: {grants:?}"
+        );
+        // Purge adds its own ledger grant and no further store scope — the same two
+        // graphs, a different authority over them.
+        let purge = grants_for("acme", Authority::Purge).expect("a valid ledger name");
+        assert_eq!(purge.len(), grants.len() + 1, "{purge:?}");
+        assert!(
+            purge.contains(&"urn:cap:ledger:purge:acme".to_string()),
+            "{purge:?}"
+        );
+    }
+
+    /// The bare `urn:iki:ledger:*` forms mean the ledger called `default`, and its grants
+    /// say so — the name is in the token even when the request did not carry one.
+    #[test]
+    fn the_default_ledgers_grants_name_it_explicitly() {
+        let grants = grants_for("default", Authority::Read).expect("default is a ledger name");
+        assert_eq!(
+            grants,
+            vec![
+                "urn:cap:ledger:read:default",
+                "urn:cap:store:read:graph:urn:iki:ledger:graph:default",
+            ]
+        );
+    }
+
+    /// A name that cannot be a ledger is refused rather than turned into a token nothing
+    /// will ever match — a capability is matched exactly, so a typo would be a silent
+    /// denial at the first use instead of an error at the point of configuration.
+    #[test]
+    fn a_name_that_cannot_be_a_ledger_is_refused_here() {
+        assert!(
+            grants_for("items", Authority::Read).is_err(),
+            "reserved by the sugar"
+        );
+        assert!(
+            grants_for("Acme", Authority::Read).is_err(),
+            "case is not a distinction"
+        );
+        assert!(
+            grants_for("a:b", Authority::Read).is_err(),
+            "would forge a token"
+        );
+    }
 
     /// Nobody scopes `store` ⇒ the unscoped line governs, and absence is off.
     #[test]
