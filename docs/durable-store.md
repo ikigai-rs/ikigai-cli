@@ -112,7 +112,10 @@ host that started anyway would be one whose durable store silently was not there
 ikigai -c 'source urn:iki:store:info'
 ikigai -c 'source urn:iki:store:select query="SELECT ?s ?o WHERE { GRAPH <urn:demo:g> { ?s ?p ?o } }"'
 
-# write — the remainder after the IRI is the body, VERBATIM and unquoted
+# write — a named `content=` is the body, quotes stripped
+ikigai -c 'sink urn:iki:store:update content="INSERT DATA { GRAPH <urn:demo:g> { <urn:demo:s> <urn:demo:p> \"it survives\" } }"'
+
+# or the remainder after the IRI, which is VERBATIM and unquoted
 ikigai -c 'sink urn:iki:store:update INSERT DATA { GRAPH <urn:demo:g> { <urn:demo:s> <urn:demo:p> "it survives" } }'
 
 # or pipe the body in, which is what a heredoc or a file wants
@@ -124,11 +127,9 @@ this module's and both silent:
 
 * On `sink`, the text after the IRI is taken **verbatim** — quotes included. So
   `sink urn:iki:store:update "INSERT DATA { … }"` sends a body that literally begins with
-  a double quote, and the store rejects it as not-a-SPARQL-update. Leave the quotes off.
-* `sink <iri> content="…"` **does not work**: `content` is a declared argument, so it is
-  consumed as a named argument and then *overwritten* by the (empty) verbatim remainder.
-  An empty SPARQL update is a valid no-op, so the answer is `updated: 0 -> 0 quads` and
-  nothing says the body was dropped. Use the remainder or a pipe.
+  a double quote, and the store rejects it as not-a-SPARQL-update. Leave the quotes off,
+  or name the body with `content="…"` (which does strip the quotes, and is the form to
+  reach for with any structured body).
 * A `sink` with no remainder **reads piped stdin** — that is how a secret gets in without
   reaching the command line. The reader is installed only when stdin is *not* a terminal
   (`main.rs` checks `is_terminal`), so an interactive one-shot is unaffected. In a
