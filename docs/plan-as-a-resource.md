@@ -95,6 +95,22 @@ the branch, or make the inner fork **one resource**.
   result, so what runs is what the answer depends on; nothing schedules, retries, or
   resumes.
 
+## ⚠ The reader is a feature, and that is about wasm
+
+`ikigai-engine` is documented as compiling to `wasm32-unknown-unknown` —
+`ikigai-web-demo` runs the kernel in a browser — and reading a plan back needs a Turtle
+parser, which pulls `oxrdf` → `rand` → `getrandom`, and **getrandom does not compile for
+wasm32-unknown-unknown** without a rustflag only the final consumer can set. So:
+
+* **`plan` costs nothing** and is always available.
+* **`run` is behind `ikigai-engine/plan-reader`**, off by default, enabled by `ikigai-cli`.
+  A build without it answers `run` by naming the missing feature rather than acting as if
+  the command does not exist.
+
+The claim that this crate builds for wasm was a comment and nothing checked it; `ci.yml`
+now runs `cargo clippy -p ikigai-engine --lib --target wasm32-unknown-unknown` under
+default features, so it is a gate.
+
 ## Not built yet
 
 * **Named results** (`x = …`, `@x` — `ik:binds`, `ik:ref`, a process's `ik:input`). The

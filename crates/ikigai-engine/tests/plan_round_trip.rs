@@ -1,5 +1,11 @@
 //! The round trip that IS the bar for the plan face.
 //!
+//! Reader-only: without `plan-reader` this build renders plans but cannot read one back,
+//! so there is no round trip to make. `cargo test --all-features` (what the gates and CI
+//! run) has it on.
+#![cfg(feature = "plan-reader")]
+
+//!
 //! For each shape the REPL grammar can make: run the spec, render it as an `ik:Process`
 //! graph, read that graph back, run it — and require **the same execution**, witnessed as
 //! the exact sequence of requests every endpoint received. Not the same AST: a plan is the

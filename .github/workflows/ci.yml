@@ -11,3 +11,11 @@ jobs:
     with:
       features: "*"
       macos: true
+      # `ikigai-engine` is documented as compiling to wasm32 — ikigai-web-demo runs the
+      # kernel in a browser — and until now nothing checked it. It does not hold for the
+      # whole workspace (quinn, tokio, the transports), so the job is scoped to the one
+      # member that claims it, under its DEFAULT features: the plan reader's Turtle stack
+      # pulls getrandom, which does not build for wasm32, and that is exactly why it is
+      # behind `plan-reader` rather than unconditional.
+      wasm-lib: true
+      wasm-packages: "ikigai-engine"

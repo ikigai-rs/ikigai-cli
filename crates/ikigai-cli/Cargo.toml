@@ -43,7 +43,10 @@ ikigai-core = { workspace = true }
 # at all. They no longer set the number. `tests/lockstep_pins.rs` fails if any of them falls
 # out of step with `workspace.package.version` — six of the seventeen sibling pins a lockstep
 # bump has to touch are in this file.
-ikigai-engine = { path = "../ikigai-engine", version = "0.1.21" } # API history — 0.1.16 = with_width_routing + last_fan_out: the fan-out switch and the note the REPL prints
+# `plan-reader` is the `run <spec>` half of the plan face: it is off by default so the
+# engine still compiles to wasm32 (see that crate's [features]), and a host that is not a
+# browser wants it.
+ikigai-engine = { path = "../ikigai-engine", version = "0.1.21", features = ["plan-reader"] } # API history — 0.1.16 = with_width_routing + last_fan_out: the fan-out switch and the note the REPL prints
 ikigai-resolve = { workspace = true }
 serde_json = { workspace = true }
 ikigai-embedded = { path = "../ikigai-embedded", version = "0.1.21", optional = true } # API history — 0.1.16 = set_width_routing/width_routing: the --width-routing channel, beside set_scheduler_spec

@@ -46,17 +46,26 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 
-use ikigai_core::{ArgRef, ContentId, Iri, Request, Verb};
+use ikigai_core::{ContentId, Iri, Verb};
+#[cfg(feature = "plan-reader")]
 use oxrdf::{NamedOrBlankNode, Term};
+#[cfg(feature = "plan-reader")]
 use oxttl::TurtleParser;
 
+#[cfg(feature = "plan-reader")]
+use ikigai_core::{ArgRef, Request};
+
+#[cfg(feature = "plan-reader")]
+use crate::engine::{combine_outputs, root_provenance, Staged};
 use crate::engine::{
-    combine_outputs, declared_arguments, parse_spec, parse_target, root_provenance,
-    route_value_name, Connector, Engine, Node, Pipeline, Staged,
+    declared_arguments, parse_spec, parse_target, route_value_name, Connector, Engine, Node,
+    Pipeline,
 };
 
 /// The ikigai vocabulary namespace — the terms a plan graph is written in.
+#[cfg(feature = "plan-reader")]
 const IK: &str = "https://ikigai-rs.dev/ns#";
+#[cfg(feature = "plan-reader")]
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
 /// A node of a plan: a step, or a fork — which stands where a step can, as an upstream or
@@ -241,6 +250,7 @@ fn verb_name(verb: Verb) -> &'static str {
     }
 }
 
+#[cfg(feature = "plan-reader")]
 fn parse_verb(name: &str) -> Option<Verb> {
     Some(match name {
         "Source" => Verb::Source,
@@ -277,6 +287,7 @@ fn literal(s: &str) -> String {
 
 // --- reading -----------------------------------------------------------------
 
+#[cfg(feature = "plan-reader")]
 /// An object of a triple: a plan graph is skolemized, so only IRIs and literals appear.
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum Obj {
@@ -284,6 +295,7 @@ enum Obj {
     Literal(String),
 }
 
+#[cfg(feature = "plan-reader")]
 impl Obj {
     fn iri(&self, subject: &str, predicate: &str) -> Result<&str, String> {
         match self {
@@ -306,10 +318,12 @@ impl Obj {
 
 /// The parsed triples, indexed by subject then predicate — enough of a graph to read a
 /// plan out of, and no more.
+#[cfg(feature = "plan-reader")]
 struct Graph {
     subjects: BTreeMap<String, BTreeMap<String, Vec<Obj>>>,
 }
 
+#[cfg(feature = "plan-reader")]
 impl Graph {
     fn parse(turtle: &str) -> Result<Graph, String> {
         let mut subjects: BTreeMap<String, BTreeMap<String, Vec<Obj>>> = BTreeMap::new();
@@ -395,6 +409,7 @@ impl Graph {
     }
 }
 
+#[cfg(feature = "plan-reader")]
 fn blank_node_refusal(label: &str) -> String {
     format!(
         "a plan graph is skolemized, so every node has a stable IRI — `_:{label}` is a \
@@ -402,6 +417,7 @@ fn blank_node_refusal(label: &str) -> String {
     )
 }
 
+#[cfg(feature = "plan-reader")]
 impl Plan {
     /// Read a plan back out of an `ik:Process` graph.
     ///
@@ -601,6 +617,7 @@ impl Plan {
 }
 
 /// The plan's steps, ordered by the `{n}` in their skolem IRIs.
+#[cfg(feature = "plan-reader")]
 fn ordered_steps(graph: &Graph, plan_iri: &str) -> Result<Vec<String>, String> {
     let mut iris: Vec<String> = graph
         .objects(plan_iri, "step")
@@ -618,6 +635,7 @@ fn ordered_steps(graph: &Graph, plan_iri: &str) -> Result<Vec<String>, String> {
 
 /// The plan's forks. Nothing links a process to them — they are reached through the steps
 /// that branch off them — so the graph's own `a ik:Fork` assertions are the list.
+#[cfg(feature = "plan-reader")]
 fn ordered_forks(graph: &Graph, plan_iri: &str) -> Vec<String> {
     let mut iris: Vec<String> = graph
         .of_class("Fork")
@@ -635,6 +653,7 @@ fn ordered_forks(graph: &Graph, plan_iri: &str) -> Vec<String> {
 /// rendered form stable across a round trip and therefore diffable. Turtle is unordered,
 /// so without this the numbering would follow whatever order the document happened to
 /// have, and a plan would not survive being reserialized.
+#[cfg(feature = "plan-reader")]
 fn number_by_iri(iris: &mut Vec<String>, prefix: &str) {
     iris.sort_by_key(|iri| {
         let n = iri
@@ -646,6 +665,7 @@ fn number_by_iri(iris: &mut Vec<String>, prefix: &str) {
     iris.dedup();
 }
 
+#[cfg(feature = "plan-reader")]
 fn read_step(
     graph: &Graph,
     step_iri: &str,
@@ -950,12 +970,14 @@ fn push_step(builder: &RefCell<Builder>, step: Step) -> NodeRef {
 
 /// Per-run state: each node's representation, computed once, and the stack that catches a
 /// cycle the shapes did not (a graph is validated by whoever chooses to).
+#[cfg(feature = "plan-reader")]
 #[derive(Default)]
 struct Run {
     done: RefCell<BTreeMap<NodeRef, Staged>>,
     visiting: RefCell<Vec<NodeRef>>,
 }
 
+#[cfg(feature = "plan-reader")]
 impl Engine {
     /// Run a plan and return the representation of its `ik:result`.
     ///
@@ -1067,7 +1089,9 @@ impl Engine {
         }
         Ok(request)
     }
+}
 
+impl Engine {
     /// `plan <spec>` — render the spec as an `ik:Process` graph instead of running it.
     pub(crate) async fn run_plan(&self, spec: &str) -> Result<String, String> {
         if spec.trim().is_empty() {
@@ -1079,6 +1103,7 @@ impl Engine {
 
     /// `run <spec>` — resolve `<spec>` (the full `source` grammar) and execute the
     /// `ik:Process` graph it returns. `sink` stores a plan; this runs a stored one.
+    #[cfg(feature = "plan-reader")]
     pub(crate) async fn run_stored_plan(&self, spec: &str) -> Result<String, String> {
         if spec.trim().is_empty() {
             return Err(
@@ -1089,9 +1114,24 @@ impl Engine {
         let plan = Plan::from_turtle(&turtle)?;
         self.execute_plan(&plan).await?.into_text()
     }
+
+    /// Without the reader there is no Turtle parser in this build, so say which feature is
+    /// missing rather than pretending the command does not exist — a wasm host still
+    /// RENDERS plans, and a `run` that answers "unknown command" would read like a bug.
+    #[cfg(not(feature = "plan-reader"))]
+    pub(crate) async fn run_stored_plan(&self, _spec: &str) -> Result<String, String> {
+        Err(
+            "`run` needs the `plan-reader` feature of ikigai-engine — this build renders \
+             plans (`plan <spec>`) but cannot read one back"
+                .to_string(),
+        )
+    }
 }
 
-#[cfg(test)]
+// Every test here reads a rendered plan back — that IS the assertion, since a renderer is
+// only right if what it wrote means what the spec meant. So the module needs the reader;
+// `cargo test --all-features` (the gates and CI) has it.
+#[cfg(all(test, feature = "plan-reader"))]
 mod tests {
     use super::*;
 
