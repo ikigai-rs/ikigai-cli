@@ -1,9 +1,16 @@
-# The durable store on this host — who opens it, and what to do when you are not them
+# The durable store and the work ledger on this host — who opens them, and what to do when you are not them
 
 `ikigai-store` gives this host a dataset that survives a restart: `urn:iki:store:select`
-/ `ask` / `construct` / `describe` / `info` / `update` / `load`, and whatever is built on
-top of it. It is **opt-in twice**, and this page is about the second switch, because the
-first question it generates is *"why does my second terminal say the store is not bound?"*
+/ `ask` / `construct` / `describe` / `info` / `update` / `load`, their per-graph twins
+(`graph-select`, `graph-update`, …), and whatever is built on top of it. **`ikigai-ledger`
+is what is built on top of it here** — `urn:iki:ledger:*`, the work items — and the two are
+bound by the **same switch**, because the ledger owns no bytes: every read it makes is a
+scoped SPARQL query at `urn:iki:store:graph-select` and every write a scoped UPDATE at
+`urn:iki:store:graph-update`. A ledger without a store beside it is a set of resources that
+resolve and then fail, so this host never binds one without the other.
+
+It is **opt-in twice**, and this page is about the second switch, because the first
+question it generates is *"why does my second terminal say the store is not bound?"*
 
 ## The rule the whole design hangs on
 
@@ -43,6 +50,10 @@ store = true
 #     `serve.browse.root` already uses for the browse archive.
 serve.store = true
 mount = "prefer urn:iki:store:=/Users/you/.ikigai/serve.sock"
+# ⚠ A mount claims ONE prefix, so the ledger needs its own line — exactly as the browse
+#   family needs one for urn:repo: and one for urn:iki:annotation:. One switch binds both
+#   locally; two lines reach both remotely.
+mount = "prefer urn:iki:ledger:=/Users/you/.ikigai/serve.sock"
 ```
 
 and run the holder:
@@ -86,11 +97,13 @@ Three lines on stderr — the fact, the fix, the underlying error — and the st
 simply **not bound** in this process:
 
 ```text
-ikigai: urn:iki:store:* is NOT bound here — the durable store at /Users/you/.ikigai/store
-is held by another process, and RocksDB permits one writer per directory.
+ikigai: urn:iki:store:* and urn:iki:ledger:* are NOT bound here — the durable store at
+/Users/you/.ikigai/store is held by another process, and RocksDB permits one writer per
+directory.
   fix: this is topology, not a retry. Let ONE process hold the dataset and resolve through
-  it — mount = "prefer urn:iki:store:=<its socket>" in /Users/you/.config/ikigai/config.toml
-  (and urn:iki:ledger: beside it for the ledger). See docs/durable-store.md.
+  it — mount = "prefer urn:iki:store:=<its socket>" in /Users/you/.config/ikigai/config.toml,
+  and a SECOND line for urn:iki:ledger: (a mount matches one prefix, so the ledger needs its
+  own). See docs/durable-store.md.
   underlying: unavailable: … IO error: While lock file: …/store/LOCK: Resource temporarily
   unavailable
 ```
@@ -100,6 +113,24 @@ the config is right and another process is simply running — and it is the one 
 system has an answer for: with a `mount` line naming the holder, the absent local binding
 is precisely what lets the mount answer, and the resource resolves remotely with nothing
 else to do.
+
+★ **And once both mount lines are there, you see nothing at all.** In topology (b) a held
+directory is not an event — it is *every command you will ever type* — so three lines of
+stderr on each one would be a host teaching you to stop reading stderr. When a `mount`
+covers both `urn:iki:store:` and `urn:iki:ledger:` (two lines, or one at a shorter prefix
+such as `urn:iki:`), the message is suppressed entirely: the local binding is absent
+because it is supposed to be, and the mount answers.
+
+⚠ **One mount line out of two gets its own message**, because that is the mistake this
+design actually generates and its symptom lies. The store answers over the wire, the ledger
+does not, and a ledger failing on the store underneath it reads as a broken ledger rather
+than a missing config line. The refusal names the prefix that is missing:
+
+```text
+  fix: a mount already reaches urn:iki:store:* but NOTHING reaches urn:iki:ledger:* — a
+  mount claims one prefix, so the ledger needs its own line. Add
+  mount = "prefer urn:iki:ledger:=<the holder's socket>" to /Users/you/.config/ikigai/config.toml.
+```
 
 Everything else **is** a misconfiguration and **panics**: an unwritable directory, a
 `store.toml` that cannot be parsed, a `store` value that is neither `true` nor `false`. A
@@ -137,25 +168,119 @@ this module's and both silent:
   step, an agent harness — `ikigai -c 'sink urn:X'` blocks until EOF. Redirect
   `< /dev/null` in scripts.
 
+## Typing at the ledger
+
+```sh
+# file one — the text after the IRI is the item: first line the title, the rest the body
+ikigai -c 'sink urn:iki:ledger:append Bind the ledger into the embedded host'
+#=> #1 urn:iki:ledger:default:item:01m2h5t1z80m3b2f
+
+ikigai -c 'sink urn:iki:ledger:append priority=0 labels=cli Say what to type'
+
+# read — `items` lists the OPEN items; `status=` takes open (default), closed or all
+ikigai -c 'source urn:iki:ledger:items'
+ikigai -c 'source urn:iki:ledger:items status=all'
+ikigai -c 'source urn:iki:ledger:item:1'
+
+# comment, rank, close
+ikigai -c 'sink urn:iki:ledger:comment item=#1 author=brian It resolves from a one-shot'
+ikigai -c 'source urn:iki:ledger:next'
+ikigai -c 'sink urn:iki:ledger:close item=#2 reason=done Shipped'
+
+# a second ledger is a NAME in the IRI, not an argument and not a tag
+ikigai -c 'sink urn:iki:ledger:acme:append Their Q4 migration'
+ikigai -c 'source urn:iki:ledger:ledgers'
+
+# query is the store's, not the ledger's — one graph per ledger
+ikigai -c 'source urn:iki:store:graph-select graph=urn:iki:ledger:graph:default query="SELECT ?t WHERE { ?i <http://purl.org/dc/terms/title> ?t }"'
+```
+
+⚠ **`urn:iki:ledger:append` is the ledger called `default`**, not a ledger called
+`append` — the bare forms are an alias for `urn:iki:ledger:default:*`, one binding under
+one capability. The catalog lists the canonical template (`urn:iki:ledger:{ledger}:append`)
+and never the sugar, so a tool reading the manifold expands the `ledger` argument's
+declared default rather than looking for the short name.
+
+⚠ The two engine behaviours in the section above apply here unchanged: the text after the
+IRI is **verbatim**, quotes included, and a `sink` with no remainder reads piped stdin.
+
+### Loading a batch
+
+`-c` is repeatable and **`run_commands` returns exit 1 if any command failed**, so a batch
+that must not half-apply goes in one process as a list of `-c` flags:
+
+```sh
+ikigai -c 'sink urn:iki:ledger:gonk:append First' \
+       -c 'sink urn:iki:ledger:gonk:append Second' \
+       -c 'sink urn:iki:ledger:gonk:link item=#2 type=blocks #1'
+```
+
+⚠ **A script on stdin (`ikigai --plain < items.iki`) has NO exit status.** That path is the
+line REPL reading to EOF: a failed line prints `error: …` on stderr and the loop carries on,
+and the process still exits 0. It is the convenient form for twenty appends and the wrong
+form for a load you need to trust — so if you use it, verify afterwards with a count:
+
+```sh
+ikigai --plain < items.iki
+ikigai -c 'source urn:iki:ledger:gonk:items status=all'   # does the count match the file?
+```
+
 ## Capabilities
 
 The REPL's own session is root, so nothing is needed for ordinary use. A narrowed session
-(`cap`), a served connection or an agent needs the store's own scopes:
+(`cap`), a served connection or an agent needs scopes — and **which ones depends on which
+door**, because the store has two families:
 
 | scope | what it opens |
 | --- | --- |
-| `urn:cap:store:read` | `select`, `ask`, `construct`, `describe`, `info` |
-| `urn:cap:store:write` | `update`, `load` |
+| `urn:cap:store:read` | the whole dataset: `select`, `ask`, `construct`, `describe`, `info` |
+| `urn:cap:store:write` | the whole dataset: `update`, `load` — `DROP ALL` included |
+| `urn:cap:store:read:graph:<G>` | `graph-select` / `graph-ask` / … over the one graph `<G>` |
+| `urn:cap:store:write:graph:<G>` | `graph-update` over the one graph `<G>` |
 
-⚠ **`urn:cap:store:write` is the keys to the whole dataset**, `DROP ALL` included: the
-store's write scope is all-or-nothing, with no per-graph attenuation. Anything built on
-this store inherits that — a domain module's write action needs `urn:cap:store:write`
-transitively, because a sub-request carries the **caller's** capability unchanged. Grant
-it to the host and to trusted local sessions; do not hand it down a wire.
+⚠ **The broad pair is the keys to the whole dataset and the narrow doors REFUSE it.** They
+are not a hierarchy: `urn:iki:store:graph-update` declares and enforces
+`urn:cap:store:write:graph:*`, and `urn:cap:store:write` is not under that prefix, so a
+grant list built around the powerful token opens the broad doors and **nothing else**.
+Grant the broad pair to the host and to trusted local sessions; do not hand it down a wire.
 
-That is also why the store is bound in the **embedded root space only** — never in
-`served_space` and never behind the HTTP door. A peer reaches it by mounting this kernel
-over IPC, under that connection's own clamped ceiling.
+### The ledger's grants
+
+Every ledger read and write goes through the narrow doors, so a ledger caller needs **two
+halves** — the ledger's own grant and the store's token for that ledger's graph. Per ledger
+`L`:
+
+| to do this in `L` | at the ledger | …and at the store |
+| --- | --- | --- |
+| read | `urn:cap:ledger:read:L` | `urn:cap:store:read:graph:urn:iki:ledger:graph:L` |
+| write | `urn:cap:ledger:write:L` | the above **and** `urn:cap:store:write:graph:urn:iki:ledger:graph:L` |
+| delete | `urn:cap:ledger:delete:L` | both of those **and** `urn:cap:store:write:graph:urn:iki:ledger:graph:L:deleted` |
+| purge | `urn:cap:ledger:purge:L` | the same three as delete |
+
+⚠ **Delete and purge need write authority over TWO graphs**: the graveyard is a second
+graph and a scoped write cannot reach across. That is the row an operator gets wrong.
+
+⚠ **The name goes LAST in the token** — `urn:cap:ledger:write:acme`, never
+`urn:cap:ledger:acme:write`. The kernel matches a wildcard only as a trailing `*`, so a
+parameter that is not last cannot be a family at all.
+
+Rather than transcribe that table, compute it — `ikigai_embedded::store::grants_for("acme",
+Authority::Write)` returns exactly the list, built from `ikigai-ledger`'s and
+`ikigai-store`'s own spellings, so a host one version behind fails to compile instead of
+handing you a grant list that silently denies.
+
+⚠ **Why the floor is `ikigai-ledger = "0.2.1"` and not `"0.2"`.** Through 0.2.0,
+`urn:iki:ledger:{ledger}:item:{id}` over-declared the *broad* `urn:cap:store:read` on its
+`Source` and `Exists`, so a caller holding exactly the table above could list a ledger and
+was **denied on reading one item out of it** — and the only thing that made it work was
+handing over every graph in the dataset, which is the boundary this table exists to draw.
+0.2.1 declares the per-graph family there too. The floor is what keeps that a checked
+claim: `crates/ikigai-cli/tests/ledger.rs::the_narrow_per_graph_grants_work_and_the_broad_store_key_does_not`
+reads one item under exactly these tokens, and goes red against 0.2.0.
+
+That two-family split is also why the store is bound in the **embedded root space only** —
+never in `served_space` and never behind the HTTP door. A peer reaches it by mounting this
+kernel over IPC, under that connection's own clamped ceiling.
 
 ## Two RocksDB directories, not one
 

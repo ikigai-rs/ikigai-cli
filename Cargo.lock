@@ -2585,6 +2585,7 @@ dependencies = [
  "ikigai-intake",
  "ikigai-intray",
  "ikigai-jsonld",
+ "ikigai-ledger",
  "ikigai-lisp",
  "ikigai-llm",
  "ikigai-meeting",
@@ -2725,6 +2726,22 @@ dependencies = [
  "futures",
  "ikigai-core",
  "json-ld",
+]
+
+[[package]]
+name = "ikigai-ledger"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e4b140e9f7cbbaa6eb47b6f0a285c9201a45d3d104205e66e7a7e29c57d3e60"
+dependencies = [
+ "async-trait",
+ "ikigai-core",
+ "ikigai-store",
+ "oxrdf",
+ "oxrdfio",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -2968,14 +2985,15 @@ dependencies = [
 
 [[package]]
 name = "ikigai-store"
-version = "0.2.0"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ced6c6d333e1e6ecb0c71b0bc5953af8358c4c73e3d604d823ff3d1937296b56"
+checksum = "8d44c538b5b7d94dcb01f97bcd0dcb3bb659cc6b44b5c1077768fd772f70e65f"
 dependencies = [
  "async-trait",
  "ikigai-core",
  "oxigraph",
  "serde",
+ "serde_json",
  "toml 0.8.23",
 ]
 
