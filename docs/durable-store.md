@@ -129,8 +129,12 @@ this module's and both silent:
   consumed as a named argument and then *overwritten* by the (empty) verbatim remainder.
   An empty SPARQL update is a valid no-op, so the answer is `updated: 0 -> 0 quads` and
   nothing says the body was dropped. Use the remainder or a pipe.
-* A `sink` with no remainder **reads stdin** and will wait forever on a terminal. Redirect
-  (`< /dev/null`) or pipe.
+* A `sink` with no remainder **reads piped stdin** — that is how a secret gets in without
+  reaching the command line. The reader is installed only when stdin is *not* a terminal
+  (`main.rs` checks `is_terminal`), so an interactive one-shot is unaffected. In a
+  NON-interactive context whose stdin is an open pipe nobody closes — a supervisor, a CI
+  step, an agent harness — `ikigai -c 'sink urn:X'` blocks until EOF. Redirect
+  `< /dev/null` in scripts.
 
 ## Capabilities
 
