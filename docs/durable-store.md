@@ -114,6 +114,24 @@ system has an answer for: with a `mount` line naming the holder, the absent loca
 is precisely what lets the mount answer, and the resource resolves remotely with nothing
 else to do.
 
+★ **And once both mount lines are there, you see nothing at all.** In topology (b) a held
+directory is not an event — it is *every command you will ever type* — so three lines of
+stderr on each one would be a host teaching you to stop reading stderr. When a `mount`
+covers both `urn:iki:store:` and `urn:iki:ledger:` (two lines, or one at a shorter prefix
+such as `urn:iki:`), the message is suppressed entirely: the local binding is absent
+because it is supposed to be, and the mount answers.
+
+⚠ **One mount line out of two gets its own message**, because that is the mistake this
+design actually generates and its symptom lies. The store answers over the wire, the ledger
+does not, and a ledger failing on the store underneath it reads as a broken ledger rather
+than a missing config line. The refusal names the prefix that is missing:
+
+```text
+  fix: a mount already reaches urn:iki:store:* but NOTHING reaches urn:iki:ledger:* — a
+  mount claims one prefix, so the ledger needs its own line. Add
+  mount = "prefer urn:iki:ledger:=<the holder's socket>" to /Users/you/.config/ikigai/config.toml.
+```
+
 Everything else **is** a misconfiguration and **panics**: an unwritable directory, a
 `store.toml` that cannot be parsed, a `store` value that is neither `true` nor `false`. A
 host that started anyway would be one whose durable store silently was not there.
@@ -251,11 +269,14 @@ Authority::Write)` returns exactly the list, built from `ikigai-ledger`'s and
 `ikigai-store`'s own spellings, so a host one version behind fails to compile instead of
 handing you a grant list that silently denies.
 
-⚠ **Known gap, `ikigai-ledger` 0.2.0:** `urn:iki:ledger:{ledger}:item:{id}` over-declares
-the *broad* `urn:cap:store:read` on its `Source` and `Exists`, so a caller holding exactly
-the table above is denied on reading one item even though the listing works. Pinned by
-`crates/ikigai-cli/tests/ledger.rs::reading_one_item_still_demands_the_broad_store_read_grant`,
-which is written to fail when the ledger is fixed.
+⚠ **Why the floor is `ikigai-ledger = "0.2.1"` and not `"0.2"`.** Through 0.2.0,
+`urn:iki:ledger:{ledger}:item:{id}` over-declared the *broad* `urn:cap:store:read` on its
+`Source` and `Exists`, so a caller holding exactly the table above could list a ledger and
+was **denied on reading one item out of it** — and the only thing that made it work was
+handing over every graph in the dataset, which is the boundary this table exists to draw.
+0.2.1 declares the per-graph family there too. The floor is what keeps that a checked
+claim: `crates/ikigai-cli/tests/ledger.rs::the_narrow_per_graph_grants_work_and_the_broad_store_key_does_not`
+reads one item under exactly these tokens, and goes red against 0.2.0.
 
 That two-family split is also why the store is bound in the **embedded root space only** —
 never in `served_space` and never behind the HTTP door. A peer reaches it by mounting this

@@ -71,12 +71,16 @@
 //!
 //! # Two failures, two different answers
 //!
-//! * **The directory is HELD** (`Error::Unavailable` — the typed, transient shape) — one
-//!   loud line on stderr and the space is not bound. That is not a misconfiguration: the
-//!   config is right and another process is simply running, and the ikigai answer to it
-//!   is the wire. If a `mount` line names the holder the resource resolves there (mounts
-//!   are tried after every local space, so the absent local binding is what lets the
-//!   mount answer); if not, the operator has the sentence that says so.
+//! * **The directory is HELD** (`Error::Unavailable` — the typed, transient shape) — the
+//!   space is not bound, and *whether anything is said depends on the config*. That is not
+//!   a misconfiguration: the config is right and another process is simply running, and
+//!   the ikigai answer to it is the wire. If `mount` lines cover both families the
+//!   resource resolves there (mounts are tried after every local space, so the absent
+//!   local binding is exactly what lets the mount answer) and this host says **nothing** —
+//!   in topology (b) a held directory is not an event but every command forever, and a
+//!   host that printed three lines on each one would be teaching its operator to ignore
+//!   stderr. If the lines are missing, or cover only one of the two families, the operator
+//!   gets the sentence that names what is missing. See [`refusal`].
 //! * **Anything else** — an unwritable path, a `store.toml` that cannot be parsed, a
 //!   config home that does not exist — is a misconfiguration, and it **panics**. A host
 //!   that started anyway would be one whose durable store silently is not there.
@@ -140,10 +144,12 @@ fn build() -> Option<Arc<dyn Space>> {
             Arc::new(ikigai_store::space(store)) as Arc<dyn Space>,
             Arc::new(ikigai_ledger::space()) as Arc<dyn Space>,
         ]))),
-        // The typed transient: somebody else holds the directory. One line, and the
-        // binding is left out so a mount can answer for it.
+        // The typed transient: somebody else holds the directory. The binding is left out
+        // so a mount can answer for it — and whether one *does* decides what to say.
         Err(e @ Error::Unavailable(_)) => {
-            eprintln!("{}", refusal(&path, &e));
+            if let Some(message) = refusal(&path, &e, &mount_lines()) {
+                eprintln!("{message}");
+            }
             None
         }
         Err(e) => panic!(
@@ -160,12 +166,17 @@ fn build() -> Option<Arc<dyn Space>> {
 /// includes the ones above it, because there is no useful "may delete but may not read".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Authority {
-    /// `items`, `next`, `ledgers` — and `item:{id}`, once `ikigai-ledger` stops
-    /// over-declaring the broad `urn:cap:store:read` on it (0.2.0 does; see
-    /// `ikigai-cli/tests/ledger.rs::reading_one_item_still_demands_the_broad_store_read_grant`,
-    /// which fails when that is fixed). This list is deliberately NOT widened to work
-    /// around it: adding `urn:cap:store:read` here would hand every ledger caller every
-    /// graph in the dataset, which is the boundary the per-graph tokens exist to draw.
+    /// `items`, `next`, `ledgers` and `item:{id}`.
+    ///
+    /// ⚠ `item:{id}` is the one that needed the workspace floor moved. Through
+    /// `ikigai-ledger` 0.2.0 it over-declared the **broad** `urn:cap:store:read` on its
+    /// `Source`/`Exists`, so a caller holding exactly this list could list a ledger and
+    /// was denied on reading one item out of it. This list was deliberately NOT widened
+    /// to work around that — adding `urn:cap:store:read` here would hand every ledger
+    /// caller every graph in the dataset, which is the boundary the per-graph tokens
+    /// exist to draw — and the floor moved to 0.2.1 instead, where the per-graph family
+    /// is declared there too. Exercised by
+    /// `ikigai-cli/tests/ledger.rs::the_narrow_per_graph_grants_work_and_the_broad_store_key_does_not`.
     Read,
     /// …plus `append`, `comment`, `close`, `reopen`, `claim`, `defer`, `link`, `label`
     /// and editing an item.
@@ -323,25 +334,103 @@ fn truthy(key: &str, value: Option<&str>) -> bool {
     }
 }
 
-/// What an operator sees when the dataset is already held.
+/// The `mount` lines this config home carries, verbatim.
+#[cfg(not(test))]
+fn mount_lines() -> Vec<String> {
+    config::all("mount")
+}
+
+/// Unit tests drive [`refusal`] directly; nothing here should read the developer's own
+/// config home, for the reason [`path`] documents at length.
+#[cfg(test)]
+fn mount_lines() -> Vec<String> {
+    Vec::new()
+}
+
+/// Does some `mount` line already answer for every IRI under `family`?
 ///
-/// Three lines — the fact, the fix, and the underlying error — because the next thing
-/// this operator sees is a bare "no endpoint resolved" for an IRI they just configured,
-/// and a message that does not carry the whole answer leaves them where the silence did.
-fn refusal(path: &Path, e: &Error) -> String {
-    format!(
-        "ikigai: urn:iki:store:* and urn:iki:ledger:* are NOT bound here — the durable \
+/// A mount claims an IRI PREFIX, so `urn:iki:` covers both families and
+/// `urn:iki:ledger:` covers one — hence `family.starts_with(prefix)` rather than equality.
+/// A mount NARROWER than the family (`urn:iki:store:select:`) answers for part of it and
+/// is deliberately not counted: a partial answer is not an answer, and an operator whose
+/// warning disappeared on one would lose the only signal they had.
+///
+/// The line is `[<mode>] <prefix>=<target>` (`prefer urn:iki:store:=/path/x.sock`), so
+/// the prefix is the last whitespace-separated token before the first `=`.
+fn some_mount_claims(lines: &[String], family: &str) -> bool {
+    lines.iter().any(|line| {
+        line.split('=')
+            .next()
+            .and_then(|head| head.split_whitespace().next_back())
+            .is_some_and(|prefix| family.starts_with(prefix))
+    })
+}
+
+/// What an operator sees when the dataset is already held — **or nothing at all**, when
+/// the config already says where to reach it.
+///
+/// ★ The silence is the point, and it is what the module note promised before the code
+/// did it: in the served topology (b) a held directory is not an event, it is *every
+/// single command*, forever. A host that printed three lines of stderr on each one would
+/// be training the operator to ignore the one channel it has for saying something real.
+/// So when a `mount` covers BOTH families the absent local binding is the design working
+/// and this returns `None`.
+///
+/// Otherwise three lines — the fact, the fix, and the underlying error — because the next
+/// thing this operator sees is a bare "no endpoint resolved" for an IRI they just
+/// configured, and a message that does not carry the whole answer leaves them where the
+/// silence did.
+///
+/// ⚠ **Half a topology gets its own sentence.** One mount line rather than two is the
+/// mistake this design actually generates — `docs/durable-store.md` warns about it twice
+/// and the warning is easy to read past — and its symptom is the worst kind: the store
+/// answers over the wire, the ledger does not, and the half that fails looks like a broken
+/// ledger rather than a missing line. Naming the prefix that is missing turns that into a
+/// one-line fix.
+fn refusal(path: &Path, e: &Error, mounts: &[String]) -> Option<String> {
+    let store = some_mount_claims(mounts, STORE_PREFIX);
+    let ledger = some_mount_claims(mounts, LEDGER_PREFIX);
+    if store && ledger {
+        return None;
+    }
+    let fix = match (store, ledger) {
+        (true, true) => unreachable!("returned above"),
+        (true, false) => format!(
+            "fix: a mount already reaches {STORE_PREFIX}* but NOTHING reaches \
+             {LEDGER_PREFIX}* — a mount claims one prefix, so the ledger needs its own \
+             line. Add mount = \"prefer {LEDGER_PREFIX}=<the holder's socket>\" to \
+             {}/config.toml.",
+            config_home_display()
+        ),
+        (false, true) => format!(
+            "fix: a mount already reaches {LEDGER_PREFIX}* but NOTHING reaches \
+             {STORE_PREFIX}* — and the ledger owns no bytes, so it will fail on the \
+             store underneath it. Add mount = \"prefer {STORE_PREFIX}=<the holder's \
+             socket>\" to {}/config.toml.",
+            config_home_display()
+        ),
+        (false, false) => format!(
+            "fix: this is topology, not a retry. Let ONE process hold the dataset and \
+             resolve through it — mount = \"prefer {STORE_PREFIX}=<its socket>\" in \
+             {}/config.toml, and a SECOND line for {LEDGER_PREFIX} (a mount matches one \
+             prefix, so the ledger needs its own). See docs/durable-store.md.",
+            config_home_display()
+        ),
+    };
+    Some(format!(
+        "ikigai: {STORE_PREFIX}* and {LEDGER_PREFIX}* are NOT bound here — the durable \
          store at {} is held by another process, and RocksDB permits one writer per \
          directory.\n  \
-         fix: this is topology, not a retry. Let ONE process hold the dataset and resolve \
-         through it — mount = \"prefer urn:iki:store:=<its socket>\" in {}/config.toml, \
-         and a SECOND line for urn:iki:ledger: (a mount matches one prefix, so the ledger \
-         needs its own). See docs/durable-store.md.\n  \
+         {fix}\n  \
          underlying: {e}",
         path.display(),
-        config_home_display()
-    )
+    ))
 }
+
+/// The two IRI families this binding owns, named once so the refusal and the mount check
+/// cannot drift from each other.
+const STORE_PREFIX: &str = "urn:iki:store:";
+const LEDGER_PREFIX: &str = "urn:iki:ledger:";
 
 /// The config home as text, for a message that has to tell somebody which file to edit.
 fn config_home_display() -> String {
@@ -490,12 +579,74 @@ mod tests {
     /// before a bare "no endpoint" for an IRI they just configured.
     #[test]
     fn the_refusal_names_the_path_and_the_fix() {
-        let text = refusal(
-            Path::new("/tmp/ikigai-store"),
-            &Error::Unavailable("the store at /tmp/ikigai-store is already held".into()),
-        );
+        let text = held(&[]).expect("no mount, so the operator needs the sentence");
         assert!(text.contains("/tmp/ikigai-store"), "{text}");
         assert!(text.contains("one writer per directory"), "{text}");
         assert!(text.contains("prefer urn:iki:store:="), "{text}");
+        assert!(text.contains("SECOND line for urn:iki:ledger:"), "{text}");
+    }
+
+    /// ★ **The served topology is SILENT.** A held directory under a config that already
+    /// says where to reach it is not an event — it is every command this operator will
+    /// ever type — and three lines of stderr on each one is how a channel stops being
+    /// read. Both spellings that cover the two families are silent: the two exact lines
+    /// the docs publish, and one broader prefix that covers both.
+    #[test]
+    fn a_mount_over_both_families_says_nothing() {
+        assert_eq!(
+            held(&[
+                "prefer urn:iki:store:=/Users/you/.ikigai/serve.sock".into(),
+                "prefer urn:iki:ledger:=/Users/you/.ikigai/serve.sock".into(),
+            ]),
+            None
+        );
+        // One mount at a shorter prefix answers for both families, so it is also complete.
+        assert_eq!(held(&["prefer urn:iki:=peer:plasma".into()]), None);
+        // …and a mount for some unrelated family is not an answer for either.
+        assert!(held(&["prefer urn:llm:=peer:plasma".into()]).is_some());
+    }
+
+    /// ⚠ **Half a topology is the mistake this design generates**, and its symptom lies:
+    /// the store answers over the wire, the ledger does not, and the operator reads that
+    /// as a broken ledger rather than a missing config line. So the message names the
+    /// prefix that is missing rather than re-printing the generic pair.
+    #[test]
+    fn one_mount_of_the_two_names_the_missing_prefix() {
+        let store_only =
+            held(&["prefer urn:iki:store:=/x.sock".into()]).expect("half a topology warns");
+        assert!(
+            store_only.contains("NOTHING reaches urn:iki:ledger:"),
+            "{store_only}"
+        );
+        assert!(
+            store_only.contains("prefer urn:iki:ledger:=<the holder's socket>"),
+            "{store_only}"
+        );
+
+        let ledger_only =
+            held(&["prefer urn:iki:ledger:=/x.sock".into()]).expect("half a topology warns");
+        assert!(
+            ledger_only.contains("NOTHING reaches urn:iki:store:"),
+            "{ledger_only}"
+        );
+        // The ledger owns no bytes, so this half fails on the store underneath it — the
+        // reason this case is not merely the mirror image of the one above.
+        assert!(ledger_only.contains("owns no bytes"), "{ledger_only}");
+    }
+
+    /// A mount NARROWER than the family answers for part of it, which is not an answer —
+    /// and silencing the warning on one would take away the operator's only signal.
+    #[test]
+    fn a_mount_narrower_than_the_family_is_not_an_answer() {
+        assert!(held(&["prefer urn:iki:store:select=/x.sock".into()]).is_some());
+    }
+
+    /// The held-directory message for one set of `mount` lines.
+    fn held(mounts: &[String]) -> Option<String> {
+        refusal(
+            Path::new("/tmp/ikigai-store"),
+            &Error::Unavailable("the store at /tmp/ikigai-store is already held".into()),
+            mounts,
+        )
     }
 }

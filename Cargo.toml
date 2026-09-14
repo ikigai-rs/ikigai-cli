@@ -360,17 +360,30 @@ ikigai-meeting = "0.1.1" # 0.1.1 runs the module's OWN rules — both Zoom hosts
 # `urn:cap:store:{read,write}:graph:<G>`), and every read and write `ikigai-ledger` makes
 # goes through them. Nothing in this host calls them directly — the floor states the API
 # the COMPOSITION uses, which is the same rule read one level out.
-ikigai-store = { version = "0.2.2", features = ["persistent"] }
+# ⚠ …and 0.2.3, not 0.2.2, because 0.2.2 DOES NOT COMPILE here — the strongest form a
+# floor can take. `term_to_json` matched `oxrdf::Term` exhaustively without the RDF-star
+# arm, true of the store's own graph and false under Cargo's global feature unification:
+# this workspace pulls rudof through `ikigai-shacl`, which enables `oxigraph/rdf-12` →
+# `oxrdf/rdf-12`, so `Term::Triple` exists and the match is non-exhaustive. The store's own
+# CI passes `features: "persistent"` and never sees it. A floor of 0.2.2 would be a floor
+# on a version no consumer of this workspace can build.
+ikigai-store = { version = "0.2.3", features = ["persistent"] }
 # The work ledger (`urn:iki:ledger:*`): items, comments, labels, links, claims and
 # `next`, as RDF in the store above. It owns no bytes — every read is a scoped SPARQL
 # query at `urn:iki:store:graph-select` and every write a scoped UPDATE at
 # `urn:iki:store:graph-update` — so it is inert without a store space in the same kernel,
 # and the two are bound together or not at all (`crates/ikigai-embedded/src/store.rs`).
 #
-# ⚠ `"0.2"` is a RANGE, `>=0.2.0, <0.3.0`, and 0.2.0 is also the floor: 0.1.0 named every
-# resource and every grant differently (`urn:iki:ledger:append` was the only ledger there
-# was), so this host has never seen those IRIs and must not resolve against them.
-ikigai-ledger = "0.2"
+# ⚠ `"0.2.1"` is a RANGE, `>=0.2.1, <0.3.0`. 0.1.0 named every resource and every grant
+# differently (`urn:iki:ledger:append` was the only ledger there was), so this host has
+# never seen those IRIs and must not resolve against them — and 0.2.0 compiles but is
+# WRONG here: `urn:iki:ledger:{ledger}:item:{id}` over-declared the broad
+# `urn:cap:store:read` on its `Source`/`Exists`, so a session holding exactly the list
+# `store::grants_for` issues could file an item and list the ledger and was DENIED on
+# reading one item back. The floor states the behaviour the composition depends on, which
+# is what `tests/ledger.rs::the_narrow_per_graph_grants_work_and_the_broad_store_key_does_not`
+# now exercises end to end.
+ikigai-ledger = "0.2.1"
 # ── Intra-workspace siblings: LOCKSTEP pins, not floors ───────────────────────
 # The seventeen members that take `version.workspace = true` are released TOGETHER, at one
 # version, always. So every sibling pin below states the CURRENT workspace version rather

@@ -229,52 +229,25 @@ fn the_narrow_per_graph_grants_work_and_the_broad_store_key_does_not() {
         list.contains("Filed under the narrow per-graph tokens"),
         "{list}"
     );
-}
 
-/// ⚠ **A DEFECT IN `ikigai-ledger` 0.2.0, pinned here rather than worked around** — and
-/// this test is written to FAIL when it is fixed, so whoever fixes it comes and deletes
-/// this note.
-///
-/// `urn:iki:ledger:{ledger}:item:{id}` declares the **broad** `urn:cap:store:read` on its
-/// `Source` and `Exists` actions (`endpoints.rs`'s `read_action`, where the sibling
-/// `read_scopes` correctly declares `urn:cap:store:read:graph:*`). Core's capability
-/// pre-check requires every declared scope, and `Capability::allows` is exact set
-/// membership for a scope with no trailing `*` — so the token must be held literally.
-///
-/// The consequence is not cosmetic. A caller holding exactly the grant list that crate's
-/// own README publishes can list a ledger and file into it, and is **denied on reading one
-/// item**; the only way to make it work is to hand it `urn:cap:store:read`, which is every
-/// graph in the dataset — the precise tenancy hole 0.2.0 exists to close. It is invisible
-/// upstream because that suite's positive grant tests cover `append`, `items` and
-/// `ledgers`, and every `item:{id}` read in it runs under root.
-///
-/// Reported to the hub; `ikigai-ledger` is out of this arc's bounds.
-#[test]
-fn reading_one_item_still_demands_the_broad_store_read_grant() {
-    use ikigai_embedded::store::{grants_for, Authority};
-
-    let narrow = engine();
-    line(
-        &narrow,
-        "sink urn:iki:ledger:itemgrant:append Filed so there is something to read",
-    );
-    let grants = grants_for("itemgrant", Authority::Write).expect("a valid ledger name");
-    line(&narrow, &format!("cap {}", grants.join(" ")));
-
-    // The listing works, so the grants are right for everything the README claims…
-    let list = line(&narrow, "source urn:iki:ledger:itemgrant:items");
+    // ★ …and READING ONE ITEM, which is the assertion this test exists for as much as the
+    // listing. Through `ikigai-ledger` 0.2.0 this line was DENIED:
+    // `urn:iki:ledger:{ledger}:item:{id}` declared the broad `urn:cap:store:read` on its
+    // `Source`/`Exists` where the sibling `read_scopes` correctly used the per-graph
+    // family, so a caller holding exactly the list `grants_for` issues could file an item
+    // and list the ledger and then fail to read back the single item behind the line it
+    // had just listed. Core's pre-check requires every declared scope and `allows` is exact
+    // set membership for a scope with no trailing `*`, so nothing narrower satisfied it —
+    // the only cure was handing over `urn:cap:store:read`, every graph in the dataset,
+    // which is the precise tenancy hole 0.2.0 existed to close.
+    //
+    // 0.2.1 declares the per-graph family here too, and the workspace floor is pinned there
+    // (`ikigai-ledger = "0.2.1"`). This line is what makes that floor a checked claim rather
+    // than a comment: resolve against 0.2.0 and it goes red.
+    let item = line(&narrow, "source urn:iki:ledger:grants:item:1");
     assert!(
-        list.contains("Filed so there is something to read"),
-        "{list}"
-    );
-
-    // …and asking for the single item behind that very line does not.
-    let denied = refused(&narrow, "source urn:iki:ledger:itemgrant:item:1");
-    assert!(
-        denied.contains("urn:cap:store:read") && !denied.contains("urn:cap:store:read:graph"),
-        "expected the over-declared BROAD store read grant. If this now passes because \
-         ikigai-ledger declares the per-graph family here too, DELETE this whole test and \
-         fold the item read into the narrow-grants test above: {denied}"
+        item.contains("Filed under the narrow per-graph tokens"),
+        "one item reads under the narrow grants, without `urn:cap:store:read`: {item}"
     );
 }
 
