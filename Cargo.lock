@@ -2640,6 +2640,10 @@ dependencies = [
  "ikigai-core",
  "ikigai-fs",
  "ikigai-resolve",
+ "ikigai-shacl",
+ "ikigai-vocab",
+ "oxrdf",
+ "oxttl",
  "serde_json",
 ]
 

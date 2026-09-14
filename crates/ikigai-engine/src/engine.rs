@@ -39,22 +39,23 @@ use std::collections::BTreeSet;
 /// The bytes stay bytes: a plain `|` passes any representation (a PDF, an image)
 /// through untouched; only the inherently textual surfaces — the `..` item split
 /// and the terminal display — decode, each with an error naming what needed text.
-struct Staged {
-    bytes: Vec<u8>,
+#[derive(Clone)]
+pub(crate) struct Staged {
+    pub(crate) bytes: Vec<u8>,
     expiry: Expiry,
     threads: BTreeSet<Thread>,
 }
 
 impl Staged {
     /// The provenance this stage hands to the next.
-    fn provenance(&self) -> Provenance {
+    pub(crate) fn provenance(&self) -> Provenance {
         Provenance::new(self.expiry, self.threads.clone())
     }
 
     /// The output as owned text — the terminal display surface. A binary
     /// representation flows *through* a pipe fine; what it can't do is be
     /// printed, so the error points at the `sink` terminal that stores it.
-    fn into_text(self) -> Result<String, String> {
+    pub(crate) fn into_text(self) -> Result<String, String> {
         let len = self.bytes.len();
         String::from_utf8(self.bytes).map_err(|_| {
             format!(
@@ -67,14 +68,14 @@ impl Staged {
 /// The neutral upstream for the first stage of a pipeline (no pipe feeds it): a
 /// `Never`/empty provenance folds as the identity, so the first stage resolves on
 /// its own merits.
-fn root_provenance() -> Provenance {
+pub(crate) fn root_provenance() -> Provenance {
     Provenance::new(Expiry::Never, BTreeSet::new())
 }
 
 /// Join several stage outputs (fork branches or mapped items) into one, combining
 /// their provenance: the result is cacheable only if *every* part is (the most
 /// restrictive expiry wins), and depends on the union of their threads.
-fn combine_outputs(parts: Vec<Staged>) -> Staged {
+pub(crate) fn combine_outputs(parts: Vec<Staged>) -> Staged {
     let mut expiry = Expiry::Never;
     let mut threads = BTreeSet::new();
     let mut bytes = Vec::new();
@@ -103,6 +104,8 @@ commands:
   source a [input] | b | c   pipeline: `|` pipes the whole output into the next stage
   source a [input] .. b      map: run `b` per newline-item of `a`'s output, rejoin
   source a | ( b ; c )       fork: fan the input to each branch, join their outputs
+  plan <spec>                render a pipeline as an ik:Process graph (Turtle) instead of running it
+  run <spec>                 resolve <spec> and RUN the ik:Process graph it returns
   sink <iri> [k=v …] <content>  SINK into a resource: leading k=v name declared args, the rest is content
   source a | sink <iri> [k=v …]  pipeline write-terminal: store the piped value as the sink's content
   delete <iri> [k=v …]       DELETE a resource (the delete verb)
@@ -142,6 +145,9 @@ try:
   source urn:iki:fn:toUpper \"a | b\"
   source urn:demo:split \"a,b,c\" .. urn:iki:fn:toUpper
   source urn:demo:split \"a,b,c\" | ( urn:iki:fn:toUpper ; urn:iki:fn:reverseList )
+  plan urn:iki:fn:toUpper hello | urn:iki:fn:toUpper
+  sink urn:file:plan.ttl content=\"…the Turtle `plan` printed…\"
+  run urn:file:plan.ttl
   sink urn:file:notes.txt remember the milk
   source urn:iki:fn:toUpper hello | sink urn:file:shout.txt
   source urn:file:notes.txt
@@ -379,7 +385,7 @@ impl Engine {
     /// or a multi-stage branch (which must run in sequence, so a spawned branch is
     /// always a single resolve). Its achievable width is 1 **by definition** — reporting
     /// the branch count here would name a concurrency the run never reaches.
-    fn record_sequential_fan_out(&self, nominal: usize) {
+    pub(crate) fn record_sequential_fan_out(&self, nominal: usize) {
         self.record_fan_out(FanOut {
             nominal,
             effective: 1,
@@ -523,6 +529,8 @@ impl Engine {
             ":lisp" => output(self, self.enter_lisp_mode()),
             ":load" => output(self, self.run_load(rest).await),
             "source" | "src" => output(self, self.run_pipeline(rest).await),
+            "plan" => output(self, self.run_plan(rest).await),
+            "run" => output(self, self.run_stored_plan(rest).await),
             "sink" => output(self, self.run_sink(rest).await),
             "delete" | "del" => output(self, self.run_delete(rest).await),
             "describe" | "desc" => {
@@ -543,7 +551,7 @@ impl Engine {
     /// literal operator can appear inside an IRI or input. Every leaf is just a
     /// `source`, so routing, the binding-only error, and caching all come from
     /// [`run_source`](Self::run_source).
-    async fn run_pipeline(&self, spec: &str) -> Result<String, String> {
+    pub(crate) async fn run_pipeline(&self, spec: &str) -> Result<String, String> {
         let pipeline = parse_spec(spec)?;
         self.run_pipeline_node(&pipeline, None, root_provenance())
             .await?
@@ -1128,66 +1136,9 @@ impl Engine {
         }
 
         if let Some(value) = value {
-            let value = ArgRef::Inline(value.to_vec());
-            match description {
-                // No contract: assume the conventional `in`, as before.
-                None => request = request.with_arg("in", value),
-                Some(ref description) => {
-                    let remaining: Vec<&str> = declared
-                        .iter()
-                        .map(String::as_str)
-                        .filter(|name| !named.iter().any(|(named, _)| named == name))
-                        .collect();
-                    match remaining.as_slice() {
-                        [name] => request = request.with_arg(*name, value),
-                        [] if description.inputs.is_empty() => {
-                            request = request.with_arg("in", value)
-                        }
-                        [] if declared.is_empty() => {
-                            return Err(format!(
-                                "`{}` takes no by-value argument — its parameter is captured \
-                                 from the identifier, so put the value in the IRI",
-                                iri.as_str()
-                            ))
-                        }
-                        [] => {
-                            return Err(format!(
-                                "`{}` has no argument left for the value — every declared \
-                                 argument is already set by name",
-                                iri.as_str()
-                            ))
-                        }
-                        many => {
-                            // Several inputs are unnamed — but optional ones default to unset,
-                            // so if exactly one *required* input is unnamed, the piped/positional
-                            // value fills it (e.g. `… | urn:jsonld:flatten` → `content`, leaving
-                            // optional `base` unset). Only genuinely ambiguous when 2+ required
-                            // inputs are still unnamed.
-                            let required: Vec<&str> = many
-                                .iter()
-                                .copied()
-                                .filter(|name| {
-                                    description
-                                        .inputs
-                                        .iter()
-                                        .any(|i| i.name == *name && i.required)
-                                })
-                                .collect();
-                            match required.as_slice() {
-                                [name] => request = request.with_arg(*name, value),
-                                _ => {
-                                    return Err(format!(
-                                        "`{}` accepts multiple arguments ({}); name one with \
-                                         `key=value`",
-                                        iri.as_str(),
-                                        many.join(", ")
-                                    ))
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            let names: Vec<&str> = named.iter().map(|(name, _)| *name).collect();
+            let name = route_value_name(&iri, description.as_ref(), &names)?;
+            request = request.with_arg(name, ArgRef::Inline(value.to_vec()));
         }
         Ok(request)
     }
@@ -1508,7 +1459,7 @@ impl Engine {
 
     /// Fetch a target's structured self-description via a `Meta` request rendered
     /// as `application/json`. `None` if it doesn't resolve or isn't JSON-renderable.
-    async fn describe_struct(&self, iri: &Iri) -> Option<Description> {
+    pub(crate) async fn describe_struct(&self, iri: &Iri) -> Option<Description> {
         let request = Request::new(Verb::Meta, iri.clone())
             .with_arg("as", ArgRef::Inline(b"application/json".to_vec()));
         // The contract fetch is internal plumbing — its cache outcome isn't part
@@ -1538,7 +1489,7 @@ impl Engine {
     /// served it, and return the stage's bytes plus its own provenance for the next
     /// stage. The resolver reports the [`CacheStatus`] directly (a remote kernel knows
     /// it without a probe).
-    async fn run_staged(
+    pub(crate) async fn run_staged(
         &self,
         request: Request,
         incoming: Option<Provenance>,
@@ -1657,9 +1608,76 @@ fn parse_config_assignment(rest: &str) -> Result<(&'static str, String), String>
     Ok((key, value.to_string()))
 }
 
+/// Which declared argument a by-value input fills — a pipe, a mapped item, a fork's
+/// input, or positional text on the command line.
+///
+/// The text face's one implicit routing decision, stated in one place so the runner and
+/// the plan renderer cannot drift apart about it: `source_request` calls it to build a
+/// request, and `Engine::build_plan` calls it to write the resolved name into the graph.
+///
+/// `named` is the arguments already set by name (including the reserved `as`).
+///
+/// ⚠ The `None` arm is the one that fails OPEN: an endpoint whose contract could not be
+/// fetched routes to the conventional `in`, so on a kernel with no JSON Meta renderer
+/// every pipe appears to work and a routing defect is invisible (cli PENDING §7).
+pub(crate) fn route_value_name(
+    iri: &Iri,
+    description: Option<&Description>,
+    named: &[&str],
+) -> Result<String, String> {
+    let declared = declared_arguments(description);
+    // No contract: assume the conventional `in`, as before.
+    let Some(description) = description else {
+        return Ok("in".to_string());
+    };
+    let remaining: Vec<&str> = declared
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !named.contains(name))
+        .collect();
+    match remaining.as_slice() {
+        [name] => Ok((*name).to_string()),
+        [] if description.inputs.is_empty() => Ok("in".to_string()),
+        [] if declared.is_empty() => Err(format!(
+            "`{}` takes no by-value argument — its parameter is captured from the \
+             identifier, so put the value in the IRI",
+            iri.as_str()
+        )),
+        [] => Err(format!(
+            "`{}` has no argument left for the value — every declared argument is already \
+             set by name",
+            iri.as_str()
+        )),
+        many => {
+            // Several inputs are unnamed — but optional ones default to unset, so if
+            // exactly one *required* input is unnamed, the piped/positional value fills it
+            // (e.g. `… | urn:jsonld:flatten` → `content`, leaving optional `base` unset).
+            // Only genuinely ambiguous when 2+ required inputs are still unnamed.
+            let required: Vec<&str> = many
+                .iter()
+                .copied()
+                .filter(|name| {
+                    description
+                        .inputs
+                        .iter()
+                        .any(|input| input.name == *name && input.required)
+                })
+                .collect();
+            match required.as_slice() {
+                [name] => Ok((*name).to_string()),
+                _ => Err(format!(
+                    "`{}` accepts multiple arguments ({}); name one with `key=value`",
+                    iri.as_str(),
+                    many.join(", ")
+                )),
+            }
+        }
+    }
+}
+
 /// The names of a target's declared by-value arguments, in declaration order.
 /// Binding inputs (captured from the IRI) and an absent contract yield none.
-fn declared_arguments(description: Option<&Description>) -> Vec<String> {
+pub(crate) fn declared_arguments(description: Option<&Description>) -> Vec<String> {
     let Some(description) = description else {
         return Vec::new();
     };
@@ -1688,7 +1706,7 @@ fn declared_arguments(description: Option<&Description>) -> Vec<String> {
 
 /// How a stage's output feeds the next stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Connector {
+pub(crate) enum Connector {
     /// `|` — pass the whole output as the next stage's input.
     Pipe,
     /// `..` — map the next stage over the output's newline-separated items.
@@ -1712,7 +1730,7 @@ fn single_source_branches(branches: &[Pipeline]) -> Option<Vec<&[String]>> {
 
 /// One stage of a pipeline.
 #[derive(Debug, PartialEq, Eq)]
-enum Node {
+pub(crate) enum Node {
     /// A `source` leaf: the first word is the IRI, the rest the literal input.
     Source(Vec<String>),
     /// A `sink` leaf: a stage written `sink <iri> [key=value …]`. The first word
@@ -1727,17 +1745,23 @@ enum Node {
 
 /// A non-first stage and the connector that feeds it from the previous stage.
 #[derive(Debug, PartialEq, Eq)]
-struct Step {
-    connector: Connector,
-    node: Node,
+pub(crate) struct Step {
+    pub(crate) connector: Connector,
+    pub(crate) node: Node,
 }
 
 /// A pipeline: a first stage followed by connector-fed stages. A branch of a
 /// fork is itself a `Pipeline`, so forks nest.
+///
+/// ★ `pub(crate)`, deliberately not `pub`. [`plan`](crate::plan) walks this tree to build
+/// an `ik:Process` graph, which needs the fields — but the AST is an internal reading of
+/// the grammar, not an API. A *public* field is a flag day for every consumer the day a
+/// stage grows one (`Resolved.canonical` broke published `ikigai-resolve` 0.1.16 on
+/// crates.io exactly that way), and nothing outside this crate should be parsing specs.
 #[derive(Debug, PartialEq, Eq)]
-struct Pipeline {
-    first: Node,
-    rest: Vec<Step>,
+pub(crate) struct Pipeline {
+    pub(crate) first: Node,
+    pub(crate) rest: Vec<Step>,
 }
 
 /// A lexical token. `Word` carries already-unquoted text.
@@ -1826,7 +1850,7 @@ fn tokenize(spec: &str) -> Result<Vec<Token>, String> {
 
 /// Parse a whole spec into a [`Pipeline`], rejecting trailing `)`/`;` that no
 /// `(` opened.
-fn parse_spec(spec: &str) -> Result<Pipeline, String> {
+pub(crate) fn parse_spec(spec: &str) -> Result<Pipeline, String> {
     let mut parser = Parser {
         tokens: tokenize(spec)?,
         pos: 0,
@@ -1926,7 +1950,7 @@ impl Parser {
     }
 }
 
-fn parse_target(target: &str) -> Result<Iri, String> {
+pub(crate) fn parse_target(target: &str) -> Result<Iri, String> {
     if target.is_empty() {
         return Err("expected an IRI".to_string());
     }

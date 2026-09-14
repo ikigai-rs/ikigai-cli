@@ -10,7 +10,17 @@ repository.workspace = true
 [dependencies]
 ikigai-core = { workspace = true }
 ikigai-resolve = { workspace = true }
+# The process vocabulary (`ik:Process`/`ik:Step`/`ik:Argument`/`ik:Fork`) and the one
+# place the plan IRI scheme is coded — `plan.rs` builds every skolem IRI through it
+# rather than re-spelling `urn:plan:{id}:step:{n}` and drifting from the published terms.
+ikigai-vocab = { workspace = true }
 serde_json = { workspace = true }
+# Reading a stored plan back. oxttl is the Turtle parser the rest of the ecosystem's RDF
+# already sits on, and its default features are pure parsing (no tokio), so the engine
+# stays wasm-clean. oxrdf comes with it: oxttl yields `oxrdf::Triple` and re-exports none
+# of those types, and oxttl pins `oxrdf = "=0.3.4"`, so the pin here is that exact version.
+oxttl = { workspace = true }
+oxrdf = { workspace = true }
 # block_on + join_all for the parallel fork/map path. Only block_on/join_all are
 # used (no ThreadPool), so the engine still compiles to wasm; without an injected
 # spawner the parallel path is never taken (sequential fallback).
@@ -19,3 +29,9 @@ futures = { workspace = true }
 [dev-dependencies]
 # End-to-end `sink`/`source`/`cap` tests mount the real file module.
 ikigai-fs = { workspace = true }
+# The plan round-trip validates every rendered `ik:Process` graph against the published
+# shapes (`ikigai_vocab::SHAPES`). A renderer that emits a shape-invalid plan must fail the
+# build here, not the reader out there — and `ikigai-vocab` parses its shapes for SYNTAX
+# only, so the real validator has to come from somewhere.
+ikigai-shacl = { workspace = true }
+serde_json = { workspace = true }

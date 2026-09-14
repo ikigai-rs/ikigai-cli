@@ -35,7 +35,13 @@ ikigai-core = "0.1.64" # ★ UNCHANGED at the 2026-09-12 pin sweep, deliberately
 # holds beneath it: below that a MOUNTED template row whose local name-guess collides with a
 # shorter sibling is dropped from the manifold, so `ikigai mcp` silently stops projecting
 # browse-pr-explain and browse-pr-review.
-ikigai-vocab = "0.1.69" # 0.1.69 defines the six terms the modules composed BELOW already
+ikigai-vocab = "0.1.70" # 0.1.70 is the first version carrying the PROCESS vocabulary —
+# `ik:Process`/`ik:Step`/`ik:Argument`/`ik:Fork`, the plan shapes in `SHAPES`, and the
+# `ikigai_vocab::plan` IRI builders — which `ikigai-engine`'s `plan.rs` renders and reads.
+# (The terms and the module first appear in 0.1.68; 0.1.70 is what the lock resolves and
+# what this repo's tests validate against, so the floor is stated where it is tested.)
+#
+# Previously 0.1.69, for this reason, which still holds: 0.1.69 defines the six terms the modules composed BELOW already
 # serve through this host: `ik:batchAt` (ikigai-llm), `ik:passcode` (ikigai-meeting) and
 # `ik:Review`/`ik:orphanedItems`/`ik:reviewedBytes`/`ik:totalBytes` (ikigai-browse). The
 # conformance suite's VOCABULARY rule walks THIS host's composed manifold, so an undefined
@@ -443,6 +449,12 @@ ikigai-time = { path = "crates/ikigai-time", version = "0.2.0" }
 # transport like ipc/quic/mcp; only the `web`-featured CLI pulls it (and Tokio).
 ikigai-web = { path = "crates/ikigai-web", version = "0.1.21" }
 futures = "0.3"
+# Turtle parsing for the engine's plan face — reading a stored `ik:Process` graph back.
+# Default features only: no tokio, so `ikigai-engine` still compiles to wasm. oxttl pins
+# `oxrdf = "=0.3.4"` and re-exports none of its types, so the oxrdf pin is that version
+# exactly — a looser one would resolve a second oxrdf that oxttl's triples are not from.
+oxttl = "0.2.4"
+oxrdf = "0.3.4"
 serde = { version = "1", features = ["derive"] }
 # `preserve_order` makes `serde_json::Map` an IndexMap instead of a BTreeMap, so a JSON
 # object serializes in the order its keys were INSERTED rather than alphabetically. Every
