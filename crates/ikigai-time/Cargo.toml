@@ -18,7 +18,13 @@ description = "The time transport: originates kernel resource-requests on a time
 # `JobRegistry::new(Arc::new(ThreadTimer))` at exactly that pin: a caret bump must never break
 # a build, so the break gets a version that says so. Consumers add one argument
 # (`Arc::new(SystemClock)` natively, the `Date.now()`-backed clock in a browser).
-version = "0.2.0"
+# 0.3.0 — MAJOR again, for the same class of reason. `JobHealth` gained three PUBLIC FIELDS
+# (`last_success`, `since_last_success`, `failures_in_a_row`) so that a job's lateness can be
+# judged in AWAKE time and a run of failures can be told from being overdue (#334); a struct
+# literal without them no longer compiles, which is source-breaking however defaulted the
+# readers are. `JobRegistry::with_sleep_clock` is additive beside it. Nothing outside this
+# workspace is known to construct `JobHealth`, but a caret bump must never break a build.
+version = "0.3.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
