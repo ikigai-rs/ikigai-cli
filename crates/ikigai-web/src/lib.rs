@@ -538,7 +538,6 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
         return Resp::text(404, "Not Found", "no route");
     }
     let kernel = &shared.kernel;
-    let cap_fn = &shared.cap_fn;
     // A matched route supplies the target IRI (from its template); otherwise the mechanical
     // `/noun/partition/key` → `urn:` default.
     let iri_str = match matched {
@@ -561,12 +560,29 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
     let allow = allow_header(declared);
 
     // `?description` (a reserved query param) is the self-description face: a GET projects the
-    // resource's `describe()` into an API description — OpenAPI today, Hydra/Turtle by conneg
+    // resource's contract into an API description — OpenAPI today, Hydra/Turtle by conneg
     // later. It's what a code-on-demand client reads to generate a form for the resource.
+    //
+    // ★ UNDER THE REQUEST'S CAPABILITY, like every other answer here. It projects only the
+    // actions `urn:kernel:actions` would offer this capability (see `offered_actions`), and a
+    // resource offering none answers exactly as a missing one does. It used to answer for any
+    // bound IRI BEFORE the capability was even computed, so a door that empties the capability
+    // to refuse a request (gonk's foreign `Host`, a cross-site write) still disclosed the
+    // contract of every resource behind it.
     if (req.method == "GET" || req.method == "HEAD")
         && req.query.iter().any(|(k, _)| k == "description")
     {
-        return describe_response(described.as_ref(), &req.path, req.method == "HEAD");
+        let cap = request_capability(shared, req, matched);
+        let offered = described
+            .as_ref()
+            .map(|d| offered_actions(kernel, &iri, d, &cap))
+            .unwrap_or_default();
+        return describe_response(
+            described.as_ref(),
+            &offered,
+            &req.path,
+            req.method == "HEAD",
+        );
     }
 
     if req.method == "OPTIONS" {
@@ -641,12 +657,7 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
         }
     }
 
-    // A matched route may pin a per-route capability ceiling (the multi-tenant seam);
-    // otherwise the server-wide `cap_fn` applies.
-    let cap = match matched.and_then(|m| m.cap.as_ref()) {
-        Some(scopes) => Capability::scoped(scopes.clone()),
-        None => cap_fn(req),
-    };
+    let cap = request_capability(shared, req, matched);
 
     // Write-side preconditions (optimistic concurrency): If-Match / If-None-Match are
     // checked against the resource's CURRENT ETag before the mutation runs — a lost-update
@@ -683,6 +694,60 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
         }
         Err(e) => error_resp(&e),
     }
+}
+
+/// The capability a request resolves under: a matched route's per-route ceiling (the
+/// multi-tenant seam) when it pins one, otherwise the server-wide `cap_fn`. One function, so
+/// the description face and resolution cannot disagree about who is asking.
+fn request_capability(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) -> Capability {
+    match matched.and_then(|m| m.cap.as_ref()) {
+        Some(scopes) => Capability::scoped(scopes.clone()),
+        None => (shared.cap_fn)(req),
+    }
+}
+
+/// The actions of `desc` that the capability-scoped action manifold offers `cap` at `iri`.
+///
+/// ★ This REUSES the manifold's predicate rather than restating it: it asks
+/// `Kernel::select_actions` — the call `urn:kernel:actions` answers — under `cap`, and keeps
+/// the rows that name this resource. A second copy of "is this action offered" (each
+/// `requires` against `Capability::allows`, the `…:*` wildcard, template drivability) would
+/// drift from the one agents and the MCP projection read, and this face would then disagree
+/// with the manifold about what a caller may do. The price is a walk of every binding per
+/// `?description` request — a form load, not a hot path.
+///
+/// A row names this resource when its pattern IS this IRI or a template this IRI matches, AND
+/// its description id is this resource's; the id alone would let a same-id sibling bound
+/// elsewhere vouch for it. Conservative by construction: a resource the manifold cannot name
+/// (a template whose variables are not declared bindings, an entry no probe can describe) is
+/// offered nothing here, exactly as it is offered nothing there.
+fn offered_actions(
+    kernel: &Kernel,
+    iri: &Iri,
+    desc: &ikigai_core::Description,
+    cap: &Capability,
+) -> Vec<ikigai_core::ActionSpec> {
+    let query = ikigai_core::ActionQuery {
+        capability: Some(cap),
+        ..Default::default()
+    };
+    let verbs: Vec<Verb> = kernel
+        .select_actions(&query)
+        .into_iter()
+        .filter(|m| m.id == desc.id && row_names(&m.endpoint, iri))
+        .map(|m| m.verb)
+        .collect();
+    desc.action_specs()
+        .into_iter()
+        .filter(|a| verbs.contains(&a.verb))
+        .collect()
+}
+
+/// Whether a manifold row's pattern (an exact IRI or a URI template) names `iri`.
+fn row_names(pattern: &str, iri: &Iri) -> bool {
+    use ikigai_core::Grammar;
+    pattern == iri.as_str()
+        || ikigai_core::UriTemplate::parse(pattern).is_ok_and(|t| t.match_iri(iri).is_some())
 }
 
 /// Whether the request carries a write precondition header.
@@ -1019,9 +1084,9 @@ fn verb_for_method(method: &str) -> Option<Verb> {
 ///
 /// ⚠ This does not widen what a narrower capability can learn. Resolution runs BEFORE the
 /// declared-capability floor (core's `issue`), so an out-of-scope resource that exists is
-/// already a 403 and a missing one was already distinguishable (as a 500); and `?description`
-/// answers for any bound IRI without consulting the capability at all. A 404 here names no
-/// more than those already do.
+/// already a 403 and a missing one was already distinguishable (as a 500). A 404 here names
+/// no more than that already does. (`?description` once answered for any bound IRI without
+/// consulting the capability; it now answers an out-of-scope resource with this same 404.)
 fn error_resp(e: &ikigai_core::Error) -> Resp {
     use ikigai_core::Error;
     let (status, reason) = match e {
@@ -1382,13 +1447,30 @@ fn media_type_of(repr: &ikigai_core::Representation) -> String {
 
 /// `?description` → project the resource's `describe()` into an API description. Today this
 /// emits OpenAPI 3.1 (JSON) — the format a code-on-demand client turns into a form; Hydra
-/// (`application/ld+json`) and the raw Turtle manifold are the conneg follow-ups. A resource
-/// with no description (unknown IRI) → 404.
-fn describe_response(desc: Option<&ikigai_core::Description>, path: &str, head_only: bool) -> Resp {
-    let Some(desc) = desc else {
-        return Resp::text(404, "Not Found", "no such resource to describe");
+/// (`application/ld+json`) and the raw Turtle manifold are the conneg follow-ups.
+///
+/// Only `offered` is projected — the actions this request's capability is offered (see
+/// `offered_actions`). A resource with no description, and one offering this capability no
+/// projectable action, answer the SAME 404, byte for byte: telling them apart would tell a
+/// caller what exists beyond its authority.
+fn describe_response(
+    desc: Option<&ikigai_core::Description>,
+    offered: &[ikigai_core::ActionSpec],
+    path: &str,
+    head_only: bool,
+) -> Resp {
+    let projectable = offered
+        .iter()
+        .any(|a| matches!(a.verb, Verb::Source | Verb::Sink | Verb::Delete));
+    let Some(desc) = desc.filter(|_| projectable) else {
+        let mut resp = Resp::text(404, "Not Found", "no such resource to describe");
+        // HEAD carries no body on the refusal either; `Resp::text` does not know the method.
+        if head_only {
+            resp.body.clear();
+        }
+        return resp;
     };
-    let body = serde_json::to_vec_pretty(&openapi_of(desc, path)).unwrap_or_default();
+    let body = serde_json::to_vec_pretty(&openapi_of(desc, offered, path)).unwrap_or_default();
     Resp {
         content_type: "application/vnd.oai.openapi+json; charset=utf-8".to_string(),
         body: if head_only { Vec::new() } else { body },
@@ -1398,14 +1480,19 @@ fn describe_response(desc: Option<&ikigai_core::Description>, path: &str, head_o
 }
 
 /// Project a [`Description`](ikigai_core::Description) to a minimal OpenAPI 3.1 document at
-/// `path`: one operation per declared verb (Source→get, Sink→post, Delete→delete), with a
-/// write verb's inputs as the request-body schema and a read verb's as query parameters.
-fn openapi_of(desc: &ikigai_core::Description, path: &str) -> serde_json::Value {
+/// `path`: one operation per action in `actions` (Source→get, Sink→post, Delete→delete), with
+/// a write verb's inputs as the request-body schema and a read verb's as query parameters.
+/// `actions` is the caller's offered subset, never simply `desc.action_specs()`.
+fn openapi_of(
+    desc: &ikigai_core::Description,
+    actions: &[ikigai_core::ActionSpec],
+    path: &str,
+) -> serde_json::Value {
     use ikigai_core::Verb;
     use serde_json::{json, Map, Value};
 
     let mut ops = Map::new();
-    for action in desc.action_specs() {
+    for action in actions {
         let method = match action.verb {
             Verb::Source => "get",
             Verb::Sink => "post",
@@ -1677,8 +1764,8 @@ async fn write(sock: &mut TcpStream, resp: Resp) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use ikigai_core::{
-        ArgSpec, Description, EndpointSpace, Error, Exact, FnEndpoint, Invocation, ReprType,
-        Representation,
+        ActionSpec, ArgSpec, Description, EndpointSpace, Error, Exact, FnEndpoint, Invocation,
+        ReprType, Representation, UriTemplate,
     };
     use std::sync::Arc;
 
@@ -1868,7 +1955,41 @@ mod tests {
         // No faces declared at all.
         let undeclared = FnEndpoint::new("undeclared", echo_as)
             .with_description(Description::new("undeclared").verb(Verb::Source));
+        // Capability-scoped `?description` fixtures. `sealed` requires one scope for its only
+        // verb; `split` requires a different scope per verb, the way a calendar's read and
+        // write do; `tpl` is template-bound, so its manifold row is a pattern, not its IRI.
+        let sealed = FnEndpoint::new("sealed", echo_as).with_description(
+            Description::new("sealed").title("Sealed").action(
+                ActionSpec::new(Verb::Source)
+                    .summary("read the sealed thing")
+                    .requires("urn:cap:test:sealed"),
+            ),
+        );
+        let split = FnEndpoint::new("split", echo_as).with_description(
+            Description::new("split")
+                .action(
+                    ActionSpec::new(Verb::Source)
+                        .summary("read")
+                        .requires("urn:cap:test:split:read"),
+                )
+                .action(
+                    ActionSpec::new(Verb::Sink)
+                        .summary("write")
+                        .input(ArgSpec::new("content"))
+                        .requires("urn:cap:test:split:write"),
+                ),
+        );
+        let tpl = FnEndpoint::new("tpl", echo_as).with_description(
+            Description::new("tpl").action(
+                ActionSpec::new(Verb::Source)
+                    .summary("read one")
+                    .input(ArgSpec::new("name").binding()),
+            ),
+        );
         let space = EndpointSpace::new()
+            .bind(Exact::new("urn:test:sealed"), sealed)
+            .bind(Exact::new("urn:test:split"), split)
+            .bind(UriTemplate::parse("urn:test:tpl:{name}").unwrap(), tpl)
             .bind(Exact::new("urn:test:faces"), faces)
             .bind(Exact::new("urn:test:plain-only"), plain_only)
             .bind(Exact::new("urn:test:undeclared"), undeclared)
@@ -1921,6 +2042,10 @@ mod tests {
     }
 
     async fn start_with(config: EdgeConfig) -> SocketAddr {
+        start_with_cap(config, public_cap()).await
+    }
+
+    async fn start_with_cap(config: EdgeConfig, cap_fn: CapFn) -> SocketAddr {
         // Bind the ephemeral port here and hand the live listener to the server. Because the
         // socket is already listening before we return `addr`, any connect the caller makes
         // queues in the accept backlog — there is no bind/rebind window and no need to sleep
@@ -1929,7 +2054,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let kernel = test_kernel();
         tokio::spawn(async move {
-            let _ = serve_with_listener(kernel, public_cap(), listener, config).await;
+            let _ = serve_with_listener(kernel, cap_fn, listener, config).await;
         });
         addr
     }
@@ -2645,6 +2770,197 @@ mod tests {
         let addr = start().await;
         let resp = roundtrip(addr, "GET /nope/x?description HTTP/1.1\r\nHost: x\r\n\r\n").await;
         assert!(resp.starts_with("HTTP/1.1 404"), "got: {resp}");
+    }
+
+    /// `METHOD path` under `Host: host`, as one raw HTTP/1.1 request.
+    fn raw_request(method: &str, path: &str, host: &str) -> String {
+        format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\n\r\n")
+    }
+
+    /// A response's OpenAPI body, parsed.
+    fn openapi_body(resp: &str) -> serde_json::Value {
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("openapi json ({e}): {resp}"))
+    }
+
+    #[tokio::test]
+    async fn a_description_in_scope_projects_the_offered_action() {
+        let addr = start_with_cap(
+            EdgeConfig::default(),
+            fixed_cap(vec!["urn:cap:test:sealed".to_string()]),
+        )
+        .await;
+        let resp = roundtrip(addr, &raw_request("GET", "/test/sealed?description", "x")).await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
+        let v = openapi_body(&resp);
+        assert_eq!(v["info"]["title"], "Sealed");
+        assert_eq!(
+            v["paths"]["/test/sealed"]["get"]["summary"],
+            "read the sealed thing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_description_out_of_scope_is_byte_identical_to_a_missing_resource() {
+        // Public (empty) capability: `sealed` is bound and described, but not offered.
+        let addr = start().await;
+        let out_of_scope =
+            roundtrip(addr, &raw_request("GET", "/test/sealed?description", "x")).await;
+        let missing = roundtrip(
+            addr,
+            &raw_request("GET", "/test/nothing-bound?description", "x"),
+        )
+        .await;
+        assert!(
+            out_of_scope.starts_with("HTTP/1.1 404"),
+            "got: {out_of_scope}"
+        );
+        assert_eq!(
+            out_of_scope, missing,
+            "an out-of-scope description must not be distinguishable from an absent one"
+        );
+        // The mechanism, not just the outcome: resolution sees the same boundary.
+        let read = roundtrip(addr, &raw_request("GET", "/test/sealed", "x")).await;
+        assert!(read.starts_with("HTTP/1.1 403"), "got: {read}");
+    }
+
+    #[tokio::test]
+    async fn an_emptied_capability_describes_only_what_it_could_invoke() {
+        // The gonk shape: a door that answers a foreign `Host` with an EMPTY capability rather
+        // than a refusal. The description face must follow it, not answer ahead of it.
+        let cap: CapFn = Arc::new(|req: &HttpRequest| {
+            if req.header("host") == Some("ours") {
+                Capability::scoped(vec!["urn:cap:test:sealed".to_string()])
+            } else {
+                Capability::scoped(Vec::<String>::new())
+            }
+        });
+        let addr = start_with_cap(EdgeConfig::default(), cap).await;
+        let ours = roundtrip(
+            addr,
+            &raw_request("GET", "/test/sealed?description", "ours"),
+        )
+        .await;
+        assert!(ours.starts_with("HTTP/1.1 200 OK"), "got: {ours}");
+        let foreign = roundtrip(
+            addr,
+            &raw_request("GET", "/test/sealed?description", "evil"),
+        )
+        .await;
+        let missing = roundtrip(
+            addr,
+            &raw_request("GET", "/test/nothing-bound?description", "evil"),
+        )
+        .await;
+        assert!(foreign.starts_with("HTTP/1.1 404"), "got: {foreign}");
+        assert_eq!(foreign, missing);
+        // ⚠ The manifold's predicate, stated: an action requiring NOTHING is offered to the
+        // empty capability — because the empty capability can invoke it. Describing it is no
+        // wider than serving it; a door that wants a foreign Host to see nothing at all must
+        // refuse the request, not empty its capability.
+        let free = roundtrip(
+            addr,
+            &raw_request("GET", "/test/booking?description", "evil"),
+        )
+        .await;
+        assert!(free.starts_with("HTTP/1.1 200 OK"), "got: {free}");
+    }
+
+    #[tokio::test]
+    async fn a_multi_verb_description_is_trimmed_to_the_offered_verbs() {
+        let read_only = start_with_cap(
+            EdgeConfig::default(),
+            fixed_cap(vec!["urn:cap:test:split:read".to_string()]),
+        )
+        .await;
+        let v = openapi_body(
+            &roundtrip(
+                read_only,
+                &raw_request("GET", "/test/split?description", "x"),
+            )
+            .await,
+        );
+        let ops = v["paths"]["/test/split"]
+            .as_object()
+            .expect("an operations object");
+        assert_eq!(ops.keys().collect::<Vec<_>>(), ["get"], "got: {v}");
+
+        let write_only = start_with_cap(
+            EdgeConfig::default(),
+            fixed_cap(vec!["urn:cap:test:split:write".to_string()]),
+        )
+        .await;
+        let v = openapi_body(
+            &roundtrip(
+                write_only,
+                &raw_request("GET", "/test/split?description", "x"),
+            )
+            .await,
+        );
+        let ops = v["paths"]["/test/split"]
+            .as_object()
+            .expect("an operations object");
+        assert_eq!(ops.keys().collect::<Vec<_>>(), ["post"], "got: {v}");
+
+        let both = start_with_cap(
+            EdgeConfig::default(),
+            fixed_cap(vec![
+                "urn:cap:test:split:read".to_string(),
+                "urn:cap:test:split:write".to_string(),
+            ]),
+        )
+        .await;
+        let v = openapi_body(
+            &roundtrip(both, &raw_request("GET", "/test/split?description", "x")).await,
+        );
+        let ops = v["paths"]["/test/split"]
+            .as_object()
+            .expect("an operations object");
+        assert_eq!(ops.keys().collect::<Vec<_>>(), ["get", "post"], "got: {v}");
+    }
+
+    #[tokio::test]
+    async fn a_template_bound_resource_is_described_through_its_manifold_row() {
+        // The manifold names this resource by PATTERN (`urn:test:tpl:{name}`), never by the
+        // concrete IRI asked for — the row must still be recognised as this resource.
+        let addr = start().await;
+        let resp = roundtrip(
+            addr,
+            &raw_request("GET", "/test/tpl/anything?description", "x"),
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
+    }
+
+    #[tokio::test]
+    async fn head_on_a_description_matches_get() {
+        /// Status line and headers, minus `Content-Length` (this transport sends 0 on every
+        /// HEAD, reads included), plus the body.
+        fn parts(resp: &str) -> (Vec<&str>, &str) {
+            let (head, body) = resp.split_once("\r\n\r\n").unwrap_or((resp, ""));
+            let lines = head
+                .split("\r\n")
+                .filter(|l| !l.to_ascii_lowercase().starts_with("content-length:"))
+                .collect();
+            (lines, body)
+        }
+        let addr = start_with_cap(
+            EdgeConfig::default(),
+            fixed_cap(vec!["urn:cap:test:sealed".to_string()]),
+        )
+        .await;
+        for path in ["/test/sealed?description", "/test/split?description"] {
+            let got = roundtrip(addr, &raw_request("GET", path, "x")).await;
+            let head = roundtrip(addr, &raw_request("HEAD", path, "x")).await;
+            let (got_head, got_body) = parts(&got);
+            let (head_head, head_body) = parts(&head);
+            assert_eq!(
+                got_head, head_head,
+                "{path}: HEAD must carry GET's status and headers"
+            );
+            assert!(!got_body.is_empty(), "{path}: GET has a body");
+            assert!(head_body.is_empty(), "{path}: HEAD has none, got: {head}");
+        }
     }
 
     #[tokio::test]
