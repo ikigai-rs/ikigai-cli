@@ -588,14 +588,30 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
     // composition can read; a write verb carries the body as the piped `content`,
     // with the request Content-Type surfaced as `content-type`.
     let mut request = Request::new(verb, iri.clone());
-    if let Some(accept) = req.header("accept") {
-        let media = first_media(accept);
-        if !media.is_empty() && media != "*/*" {
-            request = request.with_arg("as", ArgRef::Inline(media.into_bytes()));
+    // CONTENT NEGOTIATION, against the faces the resource DECLARES for this verb. A face
+    // asked for explicitly (`?as=`) beats `Accept`; nothing acceptable is a 406, never a 400
+    // — a client naming the format it can read has not supplied an invalid argument.
+    let faces = Faces::declared(described.as_ref(), verb);
+    let explicit = req
+        .query
+        .iter()
+        .find(|(k, _)| k == "as")
+        .map(|(_, v)| v.as_str())
+        .filter(|v| !v.trim().is_empty());
+    let negotiated = match explicit {
+        Some(asked) => faces.explicit(asked),
+        None => faces.negotiate(req.header("accept")),
+    };
+    match negotiated {
+        Negotiated::Default => {}
+        Negotiated::Face(face) => {
+            request = request.with_arg("as", ArgRef::Inline(face.into_bytes()));
         }
+        Negotiated::NotAcceptable => return not_acceptable(&faces, explicit, req),
     }
     for (k, v) in &req.query {
-        // `as`/`content` are the adapter's own. On a write, so are the provenance names:
+        // `as`/`content` are the adapter's own (`as` was negotiated above). On a write, so
+        // are the provenance names:
         // the transport supplies them below, and a submitter must not be able to forge an
         // origin by appending `?client=…` to the URL.
         let reserved = k == "as" || k == "content" || (verb.is_mutating() && is_provenance(k));
@@ -994,13 +1010,23 @@ fn verb_for_method(method: &str) -> Option<Verb> {
     }
 }
 
-/// Map a typed kernel error onto an HTTP status. (NotFound→404 lands when the host links
-/// ikigai-core ≥0.1.47; for now a missing resource surfaces as the endpoint's own error.)
+/// Map a typed kernel error onto an HTTP status.
+///
+/// `Unresolved` — the kernel found no endpoint bound to the target — is a **404**, the same
+/// as a bound endpoint reporting `NotFound`: to a client both are "nothing here". It used to
+/// fall through to 500, which told every visitor to an unrouted path that the server had
+/// broken, and made consumers compose their own not-found catch-all to avoid it.
+///
+/// ⚠ This does not widen what a narrower capability can learn. Resolution runs BEFORE the
+/// declared-capability floor (core's `issue`), so an out-of-scope resource that exists is
+/// already a 403 and a missing one was already distinguishable (as a 500); and `?description`
+/// answers for any bound IRI without consulting the capability at all. A 404 here names no
+/// more than those already do.
 fn error_resp(e: &ikigai_core::Error) -> Resp {
     use ikigai_core::Error;
     let (status, reason) = match e {
         Error::Denied(_) => (403, "Forbidden"),
-        Error::NotFound(_) => (404, "Not Found"),
+        Error::NotFound(_) | Error::Unresolved(_) => (404, "Not Found"),
         Error::MissingArgument(_) | Error::InvalidArgument { .. } => (400, "Bad Request"),
         _ if e.is_transient() => (503, "Service Unavailable"),
         _ => (500, "Internal Server Error"),
@@ -1133,17 +1159,220 @@ fn iri_from_path(path: &str) -> String {
     format!("urn:{joined}")
 }
 
-/// The first media type in an `Accept` header (ignoring q-values, for now).
-fn first_media(accept: &str) -> String {
-    accept
-        .split(',')
-        .next()
-        .unwrap_or("")
+/// The faces a resource declares for one verb, read from its description the way the
+/// resource itself reads them: an `as` input's `one_of` when it has one (that is the list an
+/// endpoint refuses outside of), else the verb's declared `outputs`. Media types are kept
+/// bare and lowercase; the first listed is the default unless `as` names one.
+#[derive(Debug, Default)]
+struct Faces {
+    served: Vec<String>,
+    default: Option<String>,
+}
+
+/// What negotiation decided to hand the resource as `as`.
+#[derive(Debug, PartialEq)]
+enum Negotiated {
+    /// Send no `as`: the client accepts the resource's own default face (a `*/*` or
+    /// `type/*` match, or no preference at all).
+    Default,
+    /// Send this face as `as`.
+    Face(String),
+    /// None of the declared faces is acceptable to the client → 406.
+    NotAcceptable,
+}
+
+impl Faces {
+    fn declared(desc: Option<&ikigai_core::Description>, verb: Verb) -> Faces {
+        let Some(action) = desc.and_then(|d| d.action_specs().into_iter().find(|a| a.verb == verb))
+        else {
+            return Faces::default();
+        };
+        let as_input = action.inputs.iter().find(|i| i.name == "as");
+        let listed: Vec<String> = match as_input {
+            Some(input) if !input.one_of.is_empty() => input.one_of.clone(),
+            _ => action.outputs.clone(),
+        };
+        let mut served: Vec<String> = Vec::new();
+        for face in listed.iter().map(|f| bare_media(f)) {
+            if !face.is_empty() && !served.contains(&face) {
+                served.push(face);
+            }
+        }
+        let default = as_input
+            .and_then(|i| i.default.as_deref())
+            .map(bare_media)
+            .filter(|d| served.contains(d))
+            .or_else(|| served.first().cloned());
+        Faces { served, default }
+    }
+
+    /// An explicit `?as=`: it names the face, and `Accept` is not consulted. Refused only
+    /// when the resource declares its faces and this is not one of them.
+    fn explicit(&self, asked: &str) -> Negotiated {
+        if self.served.is_empty() || self.served.contains(&bare_media(asked)) {
+            Negotiated::Face(asked.trim().to_string())
+        } else {
+            Negotiated::NotAcceptable
+        }
+    }
+
+    /// RFC 9110 §12.5.1 proactive negotiation over the declared faces.
+    ///
+    /// Each face scores the quality of the MOST SPECIFIC range that matches it (`type/sub`
+    /// over `type/*` over `*/*`), so `text/plain;q=0, */*` excludes plain while admitting
+    /// everything else. The highest non-zero score wins; ties go to the default face, then
+    /// to declaration order. A winner that is the default face is sent as no `as` at all —
+    /// the resource's own default answers, exactly as it does for a client with no `Accept`.
+    ///
+    /// A resource that declares no faces cannot be negotiated for, and is never refused: it
+    /// is handed the client's most preferred concrete type (the only party that can judge it
+    /// is the endpoint), unless the client prefers a wildcard over every concrete type.
+    fn negotiate(&self, accept: Option<&str>) -> Negotiated {
+        let ranges = accept.map(parse_accept).unwrap_or_default();
+        if ranges.is_empty() {
+            return Negotiated::Default;
+        }
+        if self.served.is_empty() {
+            let best_concrete = ranges
+                .iter()
+                .filter(|r| r.kind != "*" && r.subtype != "*" && r.q > 0.0)
+                .fold(None::<&MediaRange>, |best, r| match best {
+                    Some(b) if b.q >= r.q => Some(b),
+                    _ => Some(r),
+                });
+            let best_wild = ranges
+                .iter()
+                .filter(|r| r.kind == "*" || r.subtype == "*")
+                .map(|r| r.q)
+                .fold(0.0_f32, f32::max);
+            return match best_concrete {
+                Some(r) if r.q >= best_wild => {
+                    Negotiated::Face(format!("{}/{}", r.kind, r.subtype))
+                }
+                _ => Negotiated::Default,
+            };
+        }
+        let mut winner: Option<(&String, f32)> = None;
+        for face in &self.served {
+            let q = quality_of(face, &ranges);
+            if q <= 0.0 {
+                continue;
+            }
+            let better = match winner {
+                None => true,
+                Some((current, best)) => {
+                    q > best
+                        || (q == best && Some(face) == self.default.as_ref() && current != face)
+                }
+            };
+            if better {
+                winner = Some((face, q));
+            }
+        }
+        match winner {
+            None => Negotiated::NotAcceptable,
+            Some((face, _)) if Some(face) == self.default.as_ref() => Negotiated::Default,
+            Some((face, _)) => Negotiated::Face(face.clone()),
+        }
+    }
+}
+
+/// One media range from `Accept`, lowercased, with its quality weight.
+#[derive(Debug, PartialEq)]
+struct MediaRange {
+    kind: String,
+    subtype: String,
+    q: f32,
+}
+
+/// Parse a whole `Accept` header. A bare `*` (sent by some older clients) reads as `*/*`. A
+/// range that is not `type/subtype`, or whose `q` is not a number in 0..=1, is dropped rather
+/// than guessed at — an unreadable preference is no preference.
+fn parse_accept(accept: &str) -> Vec<MediaRange> {
+    let mut ranges = Vec::new();
+    for part in accept.split(',') {
+        let mut pieces = part.split(';');
+        let media = pieces.next().unwrap_or("").trim().to_ascii_lowercase();
+        if media.is_empty() {
+            continue;
+        }
+        let (kind, subtype) = match media.split_once('/') {
+            Some((k, s)) if !k.trim().is_empty() && !s.trim().is_empty() => {
+                (k.trim().to_string(), s.trim().to_string())
+            }
+            None if media == "*" => ("*".to_string(), "*".to_string()),
+            _ => continue,
+        };
+        if kind == "*" && subtype != "*" {
+            continue;
+        }
+        let mut q = 1.0_f32;
+        let mut readable = true;
+        for param in pieces {
+            if let Some((name, value)) = param.split_once('=') {
+                if name.trim().eq_ignore_ascii_case("q") {
+                    match value.trim().parse::<f32>() {
+                        Ok(v) if (0.0..=1.0).contains(&v) => q = v,
+                        _ => readable = false,
+                    }
+                }
+            }
+        }
+        if readable {
+            ranges.push(MediaRange { kind, subtype, q });
+        }
+    }
+    ranges
+}
+
+/// The quality a client gives `face`: the weight of the most specific range matching it,
+/// or 0 when nothing does.
+fn quality_of(face: &str, ranges: &[MediaRange]) -> f32 {
+    let (kind, subtype) = face.split_once('/').unwrap_or((face, ""));
+    let mut best: Option<(u8, f32)> = None;
+    for r in ranges {
+        let specificity = if r.kind == kind && r.subtype == subtype {
+            2
+        } else if r.kind == kind && r.subtype == "*" {
+            1
+        } else if r.kind == "*" && r.subtype == "*" {
+            0
+        } else {
+            continue;
+        };
+        // The most specific range decides; among equally specific ranges, the first stated.
+        if best.is_none_or(|(s, _)| specificity > s) {
+            best = Some((specificity, r.q));
+        }
+    }
+    best.map(|(_, q)| q).unwrap_or(0.0)
+}
+
+/// A media type without parameters, lowercased.
+fn bare_media(media: &str) -> String {
+    media
         .split(';')
         .next()
         .unwrap_or("")
         .trim()
-        .to_string()
+        .to_ascii_lowercase()
+}
+
+/// 406: the client named what it can read and this resource serves none of it. The body
+/// lists the faces it does serve, so the next request can be right.
+fn not_acceptable(faces: &Faces, explicit: Option<&str>, req: &HttpRequest) -> Resp {
+    let asked = match explicit {
+        Some(asked) => format!("as={asked}"),
+        None => format!("Accept: {}", req.header("accept").unwrap_or("")),
+    };
+    Resp::text(
+        406,
+        "Not Acceptable",
+        &format!(
+            "not acceptable ({asked}); this resource serves one of {}",
+            faces.served.join(", ")
+        ),
+    )
 }
 
 /// The representation's media type as a header value.
@@ -1611,7 +1840,38 @@ mod tests {
                 .verb(Verb::Source)
                 .verb(Verb::Sink),
         );
+        // Negotiation fixtures: each echoes the `as` it was handed, or `default` when none.
+        let echo_as = |inv: &Invocation<'_>| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                inv.inline_str("as")
+                    .unwrap_or("default")
+                    .as_bytes()
+                    .to_vec(),
+            ))
+        };
+        // Two faces declared the way the ledger declares them: an `as` with `one_of`.
+        let faces = FnEndpoint::new("faces", echo_as).with_description(
+            Description::new("faces").verb(Verb::Source).input(
+                ArgSpec::new("as")
+                    .optional()
+                    .one_of(["text/plain", "text/turtle"])
+                    .default_value("text/plain"),
+            ),
+        );
+        // One face, declared only as an output.
+        let plain_only = FnEndpoint::new("plain-only", echo_as).with_description(
+            Description::new("plain-only")
+                .verb(Verb::Source)
+                .output("text/plain"),
+        );
+        // No faces declared at all.
+        let undeclared = FnEndpoint::new("undeclared", echo_as)
+            .with_description(Description::new("undeclared").verb(Verb::Source));
         let space = EndpointSpace::new()
+            .bind(Exact::new("urn:test:faces"), faces)
+            .bind(Exact::new("urn:test:plain-only"), plain_only)
+            .bind(Exact::new("urn:test:undeclared"), undeclared)
             .bind(Exact::new("urn:test:provenance"), provenance)
             .bind(Exact::new("urn:test:booking"), booking)
             .bind(Exact::new("urn:test:id:hello"), hello)
@@ -2575,22 +2835,228 @@ mod tests {
         );
     }
 
-    /// `Accept` → `as`: the FIRST media type, parameters dropped. A browser sends
-    /// `text/html;q=0.9, */*` (and Chrome a longer list starting the same way), so the
-    /// page face wins; `curl` sends `*/*`, which the adapter does not pass on at all — the
-    /// resource's default face answers.
-    #[test]
-    fn first_media_is_the_first_type_without_its_parameters() {
-        assert_eq!(first_media("text/html;q=0.9, */*"), "text/html");
-        assert_eq!(
-            first_media(
-                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,\
-                 image/webp,*/*;q=0.8"
-            ),
-            "text/html"
+    // Real headers, verbatim. A suite that only ever sends `*/*` is exactly how a
+    // browser-refusing adapter shipped: curl's header matches everything.
+    const CHROME: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,\
+                          image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7";
+    const FIREFOX: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+    const SAFARI: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+    const CURL: &str = "*/*";
+
+    async fn get(addr: SocketAddr, path: &str, accept: Option<&str>) -> String {
+        let accept = accept
+            .map(|a| format!("Accept: {a}\r\n"))
+            .unwrap_or_default();
+        roundtrip(
+            addr,
+            &format!("GET {path} HTTP/1.1\r\nHost: x\r\n{accept}\r\n"),
+        )
+        .await
+    }
+
+    fn two_faces() -> Faces {
+        Faces {
+            served: vec!["text/plain".into(), "text/turtle".into()],
+            default: Some("text/plain".into()),
+        }
+    }
+
+    /// Every browser's navigation header, curl's, and none at all reach a resource that
+    /// serves only plain text and Turtle — and each is answered by its DEFAULT face, not
+    /// refused. This is the defect: the first type (`text/html`) used to be forced as `as`.
+    #[tokio::test]
+    async fn every_browser_curl_and_no_accept_get_the_default_face() {
+        let addr = start().await;
+        for (who, accept) in [
+            ("chrome", Some(CHROME)),
+            ("firefox", Some(FIREFOX)),
+            ("safari", Some(SAFARI)),
+            ("curl", Some(CURL)),
+            ("none", None),
+        ] {
+            let out = get(addr, "/test/faces", accept).await;
+            assert!(out.starts_with("HTTP/1.1 200 "), "{who}: {out}");
+            assert!(
+                out.ends_with("default"),
+                "{who} gets the default face: {out}"
+            );
+            let out = get(addr, "/test/plain-only", accept).await;
+            assert!(
+                out.starts_with("HTTP/1.1 200 "),
+                "{who} on plain-only: {out}"
+            );
+        }
+    }
+
+    /// A concrete preference for a served face is honoured, by quality, not by position.
+    #[tokio::test]
+    async fn a_preferred_served_face_is_handed_to_the_resource() {
+        let addr = start().await;
+        let out = get(addr, "/test/faces", Some("text/turtle")).await;
+        assert!(out.ends_with("text/turtle"), "{out}");
+        let out = get(
+            addr,
+            "/test/faces",
+            Some("text/plain;q=0.2, text/turtle;q=0.9"),
+        )
+        .await;
+        assert!(
+            out.ends_with("text/turtle"),
+            "higher q wins over position: {out}"
         );
-        assert_eq!(first_media("application/ld+json"), "application/ld+json");
-        assert_eq!(first_media("*/*"), "*/*");
-        assert_eq!(first_media(""), "");
+        // q=0 is "not acceptable": plain is excluded, so turtle answers via `*/*`.
+        let out = get(addr, "/test/faces", Some("text/plain;q=0, */*")).await;
+        assert!(out.ends_with("text/turtle"), "{out}");
+    }
+
+    /// Explicit stays strict: asking ONLY for a face the resource does not serve is a 406
+    /// that lists what it does serve — not a 400, and not a substituted default.
+    #[tokio::test]
+    async fn nothing_acceptable_is_406_listing_the_faces() {
+        let addr = start().await;
+        let out = get(addr, "/test/plain-only", Some("text/turtle")).await;
+        assert!(out.starts_with("HTTP/1.1 406 "), "{out}");
+        assert!(out.contains("text/plain"), "the faces are listed: {out}");
+        let out = get(addr, "/test/faces", Some("text/html")).await;
+        assert!(out.starts_with("HTTP/1.1 406 "), "{out}");
+        assert!(out.contains("text/plain, text/turtle"), "{out}");
+        let out = get(addr, "/test/faces", Some("text/plain;q=0, text/turtle;q=0")).await;
+        assert!(out.starts_with("HTTP/1.1 406 "), "all excluded: {out}");
+    }
+
+    /// `?as=` is an explicit face selection and beats `Accept` — a link in a page cannot set
+    /// a header. A face the resource does not serve is refused the same way `Accept` is.
+    #[tokio::test]
+    async fn a_query_as_beats_accept_and_is_checked_against_the_faces() {
+        let addr = start().await;
+        let out = get(addr, "/test/faces?as=text/turtle", Some(CHROME)).await;
+        assert!(out.starts_with("HTTP/1.1 200 "), "{out}");
+        assert!(out.ends_with("text/turtle"), "{out}");
+        let out = get(addr, "/test/faces?as=text/html", Some(CURL)).await;
+        assert!(out.starts_with("HTTP/1.1 406 "), "{out}");
+        assert!(
+            out.contains("as=text/html"),
+            "the refusal names what was asked: {out}"
+        );
+    }
+
+    /// A resource that declares no faces cannot be negotiated for, so it is never refused:
+    /// it is handed the client's most preferred concrete type, which only it can judge.
+    #[tokio::test]
+    async fn an_undeclared_resource_is_handed_the_preferred_type_and_never_refused() {
+        let addr = start().await;
+        let out = get(addr, "/test/undeclared", Some(CHROME)).await;
+        assert!(out.starts_with("HTTP/1.1 200 "), "{out}");
+        assert!(out.ends_with("text/html"), "{out}");
+        let out = get(addr, "/test/undeclared", Some(CURL)).await;
+        assert!(out.ends_with("default"), "{out}");
+        let out = get(addr, "/test/undeclared", Some("text/csv;q=0.1, */*")).await;
+        assert!(
+            out.ends_with("default"),
+            "a preferred wildcard is no preference: {out}"
+        );
+    }
+
+    /// A path nothing is bound to is a 404, not a 500 — nothing broke, nothing is here.
+    #[tokio::test]
+    async fn an_unrouted_path_is_404_not_500() {
+        let addr = start().await;
+        for accept in [Some(CHROME), Some(CURL), None] {
+            let out = get(addr, "/nothing/bound/here", accept).await;
+            assert!(out.starts_with("HTTP/1.1 404 "), "{out}");
+        }
+        let out = get(addr, "/", Some(CHROME)).await;
+        assert!(out.starts_with("HTTP/1.1 404 "), "{out}");
+    }
+
+    #[test]
+    fn accept_parses_every_range_with_its_quality() {
+        let ranges = parse_accept(CHROME);
+        assert_eq!(ranges.len(), 8);
+        assert_eq!(
+            ranges[6],
+            MediaRange {
+                kind: "*".into(),
+                subtype: "*".into(),
+                q: 0.8
+            }
+        );
+        // A non-q parameter is not a quality: signed-exchange keeps its own q=0.7.
+        assert_eq!(ranges[7].q, 0.7);
+        // A bare `*`, case, whitespace; malformed ranges and weights are dropped.
+        let ranges = parse_accept(" Text/HTML ; Q=0.5 ,*, nonsense, text/plain;q=2, */x");
+        assert_eq!(
+            ranges,
+            vec![
+                MediaRange {
+                    kind: "text".into(),
+                    subtype: "html".into(),
+                    q: 0.5
+                },
+                MediaRange {
+                    kind: "*".into(),
+                    subtype: "*".into(),
+                    q: 1.0
+                },
+            ]
+        );
+        assert!(parse_accept("").is_empty());
+    }
+
+    #[test]
+    fn negotiation_follows_the_most_specific_matching_range() {
+        let faces = two_faces();
+        for header in [CHROME, FIREFOX, SAFARI, CURL] {
+            assert_eq!(
+                faces.negotiate(Some(header)),
+                Negotiated::Default,
+                "{header}"
+            );
+        }
+        assert_eq!(faces.negotiate(None), Negotiated::Default);
+        assert_eq!(faces.negotiate(Some("")), Negotiated::Default);
+        // `text/*` matches both; the tie goes to the default.
+        assert_eq!(faces.negotiate(Some("text/*")), Negotiated::Default);
+        // The specific range decides even when a broader one is heavier.
+        assert_eq!(
+            faces.negotiate(Some("text/*;q=1, text/plain;q=0.1")),
+            Negotiated::Face("text/turtle".into())
+        );
+        assert_eq!(faces.negotiate(Some("image/*")), Negotiated::NotAcceptable);
+        // The default is not always reachable by wildcard; a matching face still is.
+        let faces = Faces {
+            served: vec!["text/plain".into(), "application/ld+json".into()],
+            default: Some("text/plain".into()),
+        };
+        assert_eq!(
+            faces.negotiate(Some("application/*")),
+            Negotiated::Face("application/ld+json".into())
+        );
+    }
+
+    #[test]
+    fn faces_are_read_from_as_one_of_before_outputs() {
+        let desc = Description::new("x")
+            .verb(Verb::Source)
+            .output("text/html")
+            .input(
+                ArgSpec::new("as")
+                    .one_of(["text/plain", "Text/Turtle; charset=utf-8"])
+                    .default_value("text/turtle"),
+            );
+        let faces = Faces::declared(Some(&desc), Verb::Source);
+        assert_eq!(faces.served, vec!["text/plain", "text/turtle"]);
+        assert_eq!(faces.default.as_deref(), Some("text/turtle"));
+        let desc = Description::new("y")
+            .verb(Verb::Source)
+            .output("text/html")
+            .output("application/json");
+        let faces = Faces::declared(Some(&desc), Verb::Source);
+        assert_eq!(faces.served, vec!["text/html", "application/json"]);
+        assert_eq!(faces.default.as_deref(), Some("text/html"));
+        assert!(Faces::declared(None, Verb::Source).served.is_empty());
+        // Faces are per verb: a Sink-only description declares none for Source.
+        let desc = Description::new("z").verb(Verb::Sink).output("text/plain");
+        assert!(Faces::declared(Some(&desc), Verb::Source).served.is_empty());
     }
 }

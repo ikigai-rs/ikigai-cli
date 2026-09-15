@@ -35,7 +35,7 @@ edge.
 | `PUT` / `POST` / `PATCH` | `Sink` |
 | `DELETE` | `Delete` |
 | `OPTIONS` | the allow-list |
-| `Accept:` | the `as=` conneg target (transreptor selection) |
+| `Accept:` / `?as=` | the `as=` face, negotiated against the faces the resource declares |
 | query params | inspectable request args |
 | request body (a write) | the piped `content`, with `Content-Type` as `content-type` |
 
@@ -47,8 +47,27 @@ edge.
   capability derived from its identity. The default is a public (empty-scope)
   capability, or a fixed `--cap` ceiling that narrows the edge; a per-user capability
   (magic-link / passkey) fills the same seam.
-- **Typed error → status:** `Denied` → 403, `NotFound` → 404, invalid/missing arg →
-  400, transient → 503, else 500.
+- **Typed error → status:** `Denied` → 403, `NotFound` and `Unresolved` (no endpoint
+  bound to the path) → 404, invalid/missing arg → 400, transient → 503, else 500.
+
+## Content negotiation
+
+`Accept` is negotiated per RFC 9110 §12.5.1 against the **faces the resource declares**
+for the verb: its `as` input's `one_of` when it has one, otherwise the verb's `outputs`.
+
+- Every range is read with its `q`; `q=0` means "not acceptable". Each face takes the
+  weight of the most specific range matching it (`text/turtle` over `text/*` over `*/*`),
+  and the heaviest face wins, ties going to the default face (the `as` default, else the
+  first declared).
+- When the default face wins — a `*/*` or `type/*` match, or no `Accept` at all — no `as`
+  is sent and the resource answers in its own default. A browser's navigation header
+  (`text/html,…,*/*;q=0.8`) therefore reads a plain-text resource rather than being refused.
+- Nothing acceptable is **`406 Not Acceptable`**, listing the faces. `Accept: text/turtle`
+  on a plain-only resource is still refused.
+- **`?as=<type>`** names the face explicitly and beats `Accept` — a link in a page cannot
+  set a header. A type outside the declared faces is a 406 too.
+- A resource that declares no faces cannot be negotiated for and is never refused: it is
+  handed the client's most preferred concrete type as `as`, and judges it itself.
 
 ## Conditional requests and caching
 
