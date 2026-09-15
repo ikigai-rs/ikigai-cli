@@ -215,7 +215,33 @@ struct JobRecord {
     /// read makes `now` earlier than this stamp. That case clamps to zero rather than
     /// underflowing — see `since_last` on [`JobHealth`].
     last_run: Option<Time>,
+    /// The [`SleepClock`] reading taken with `last_run` — how long the machine had been
+    /// asleep, cumulatively, when this job last completed. `None` without a sleep clock.
+    asleep_at_last_run: Option<Duration>,
+    /// When this job last completed a fire that did NOT fail, on the same wall clock.
+    last_success: Option<Time>,
+    /// Consecutive completed fires that failed; any success resets it.
+    failures_in_a_row: u64,
     handle: TimerHandle,
+}
+
+/// Cumulative time this machine has spent **asleep** (suspended), measured from a fixed
+/// origin such as boot — the evidence that separates a job that was LATE from a machine
+/// that was not running at all.
+///
+/// A second injected seam beside the kernel's [`Clock`], not a replacement for it. `Clock`
+/// is wall time, and wall time keeps moving while a laptop or a sleepy Mac mini is
+/// suspended, so "overdue by three cadences" measured on it calls every job stale after
+/// every nap. Two readings of this clock bracket a window: their difference is the part of
+/// that window spent asleep, which a health report can discount and say it discounted.
+///
+/// Only DIFFERENCES are meaningful, so the origin is the implementor's. Return `None` when
+/// the platform cannot tell; the registry then reports no discount, which errs toward
+/// calling a sleeping machine's jobs stale — the behavior before this seam existed —
+/// rather than toward excusing a job that really stopped.
+pub trait SleepClock: Send + Sync {
+    /// Total time asleep since this clock's origin, or `None` if it cannot be measured.
+    fn asleep(&self) -> Option<Duration>;
 }
 
 struct Inner {
@@ -243,6 +269,17 @@ pub struct JobHealth {
     /// Conflating the two would tell a health report that a job which has run 400
     /// times has never run at all.
     pub since_last: Option<std::time::Duration>,
+    /// How much of `since_last` the machine spent asleep, from the registry's
+    /// [`SleepClock`]. `None` when there is no evidence — no sleep clock installed, the
+    /// platform cannot measure it, or the job has never completed — and never a guess:
+    /// `None` means "count all of `since_last` as lateness".
+    pub asleep_since_last: Option<std::time::Duration>,
+    /// How long since the job last completed a run that did not fail, on the wall clock.
+    /// `None` means it has never succeeded (it may still have run and failed).
+    pub since_last_success: Option<std::time::Duration>,
+    /// Consecutive completed runs that failed. A job can run exactly on time and fail every
+    /// time; `since_last` alone reads that as healthy.
+    pub failures_in_a_row: u64,
     pub last_output: String,
 }
 
@@ -260,6 +297,10 @@ pub struct JobRegistry {
     /// the clock outside the lock makes "stamp before you lock" structural instead of
     /// a rule someone has to remember.
     clock: Arc<dyn Clock>,
+    /// Evidence of machine sleep, read beside `clock` and for the same reason outside the
+    /// mutex. Optional: a browser host has none to offer, and a registry without it reports
+    /// lateness in wall time exactly as it always did.
+    sleep: Option<Arc<dyn SleepClock>>,
 }
 
 impl JobRegistry {
@@ -285,7 +326,23 @@ impl JobRegistry {
                 backend,
             })),
             clock,
+            sleep: None,
         }
+    }
+
+    /// Install a [`SleepClock`], so [`health`](Self::health) can report how much of each
+    /// job's lateness the machine spent asleep. Install it before scheduling: a job that
+    /// completed without one has no reading to difference against until it runs again.
+    pub fn with_sleep_clock(mut self, sleep: Arc<dyn SleepClock>) -> Self {
+        self.sleep = Some(sleep);
+        self
+    }
+
+    /// Whether this registry can currently measure machine sleep — a sleep clock is
+    /// installed AND it answers. A health report says so when it cannot, because then a
+    /// late job may only have been asleep.
+    pub fn measures_sleep(&self) -> bool {
+        self.sleep.as_ref().and_then(|s| s.asleep()).is_some()
     }
 
     /// Set the authority timed requests fire under (defaults to root).
@@ -375,6 +432,9 @@ impl JobRegistry {
                 runs: 0,
                 last_output: String::new(),
                 last_run: None,
+                asleep_at_last_run: None,
+                last_success: None,
+                failures_in_a_row: 0,
                 handle,
             },
         );
@@ -454,21 +514,29 @@ impl JobRegistry {
             }
         };
         let (resolver, capability) = resolver;
-        let outcome = match Iri::parse(target) {
+        let (outcome, succeeded) = match Iri::parse(target) {
             Ok(iri) => match resolver.issue_as(Request::new(verb, iri), &capability) {
-                Ok((rep, _status)) => one_line(&String::from_utf8_lossy(&rep.bytes)),
-                Err(e) => format!("error: {}", one_line(&e.to_string())),
+                Ok((rep, _status)) => (one_line(&String::from_utf8_lossy(&rep.bytes)), true),
+                Err(e) => (format!("error: {}", one_line(&e.to_string())), false),
             },
-            Err(e) => format!("error: bad target: {e}"),
+            Err(e) => (format!("error: bad target: {e}"), false),
         };
-        // Stamp BEFORE locking. The clock is host-injected code; reading it inside the
+        // Stamp BEFORE locking. The clocks are host-injected code; reading one inside the
         // critical section is what turned one panic into a permanently dead registry.
         let at = self.clock.now();
+        let asleep = self.sleep.as_ref().and_then(|s| s.asleep());
         let mut inner = self.inner.lock().expect("time registry lock");
         if let Some(job) = inner.jobs.get_mut(&id) {
             job.runs += 1;
             job.last_output = outcome;
             job.last_run = Some(at);
+            job.asleep_at_last_run = asleep;
+            if succeeded {
+                job.last_success = Some(at);
+                job.failures_in_a_row = 0;
+            } else {
+                job.failures_in_a_row += 1;
+            }
         }
     }
 
@@ -480,25 +548,40 @@ impl JobRegistry {
     pub fn health(&self) -> Vec<JobHealth> {
         // Read the clock before locking, for the same reason `fire` does.
         let now = self.clock.now().as_millis();
+        let asleep_now = self.sleep.as_ref().and_then(|s| s.asleep());
         let inner = self.inner.lock().expect("time registry lock");
+        // `saturating_sub`: a wall clock can step BACKWARDS between the fire and this read,
+        // and an age of zero ("just now") is the honest answer there. Underflowing would
+        // report ~584 million years, and reporting `None` would claim a job that has run
+        // has never run.
+        let age = |at: Time| Duration::from_millis(now.saturating_sub(at.as_millis()));
         inner
             .jobs
             .values()
-            .map(|job| JobHealth {
-                id: job.id,
-                target: job.target.clone(),
-                interval: job.schedule.interval(),
-                recurring: job.recurring,
-                persistent: job.persistent,
-                runs: job.runs,
-                // `saturating_sub`: a wall clock can step BACKWARDS between the fire
-                // and this read, and an age of zero ("just now") is the honest answer
-                // there. Underflowing would report ~584 million years, and reporting
-                // `None` would claim a job that has run has never run.
-                since_last: job
-                    .last_run
-                    .map(|at| Duration::from_millis(now.saturating_sub(at.as_millis()))),
-                last_output: job.last_output.clone(),
+            .map(|job| {
+                let since_last = job.last_run.map(age);
+                // Evidence needs BOTH readings. A sleep clock that answered at the fire but
+                // not now (or the reverse) proves nothing, and no discount is taken. The
+                // discount can never exceed the window it is taken from.
+                let asleep_since_last = match (job.asleep_at_last_run, asleep_now, since_last) {
+                    (Some(then), Some(latest), Some(window)) => {
+                        Some(latest.saturating_sub(then).min(window))
+                    }
+                    _ => None,
+                };
+                JobHealth {
+                    id: job.id,
+                    target: job.target.clone(),
+                    interval: job.schedule.interval(),
+                    recurring: job.recurring,
+                    persistent: job.persistent,
+                    runs: job.runs,
+                    since_last,
+                    asleep_since_last,
+                    since_last_success: job.last_success.map(age),
+                    failures_in_a_row: job.failures_in_a_row,
+                    last_output: job.last_output.clone(),
+                }
             })
             .collect()
     }
@@ -960,6 +1043,141 @@ mod tests {
         let health = reg.health();
         assert_eq!(health[0].runs, 1);
         assert_eq!(health[0].since_last, Some(Duration::ZERO));
+    }
+
+    /// A sleep clock the test drives by hand; `u64::MAX` stands for "cannot measure".
+    struct ManualSleep(Arc<AtomicU64>);
+    impl SleepClock for ManualSleep {
+        fn asleep(&self) -> Option<Duration> {
+            match self.0.load(Ordering::SeqCst) {
+                u64::MAX => None,
+                secs => Some(Duration::from_secs(secs)),
+            }
+        }
+    }
+
+    /// A resolver whose every issue fails while `failing` is set.
+    struct FlakyResolver {
+        failing: Arc<AtomicBool>,
+    }
+    impl Resolver for FlakyResolver {
+        fn issue(
+            &self,
+            _request: Request,
+        ) -> std::result::Result<(Representation, CacheStatus), Error> {
+            if self.failing.load(Ordering::SeqCst) {
+                Err(Error::Endpoint("drain refused".to_string()))
+            } else {
+                Ok((text("drained".to_string()), CacheStatus::Uncacheable))
+            }
+        }
+        fn is_cached(&self, _request: &Request, _capability: &Capability) -> bool {
+            false
+        }
+        fn entries(&self) -> Option<Vec<SpaceEntry>> {
+            None
+        }
+    }
+
+    /// The asleep part of a job's lateness is measured from two sleep-clock readings — one
+    /// taken when the job completed, one when health is read — and never exceeds the window.
+    #[test]
+    fn asleep_since_last_differences_the_sleep_clock_across_the_window() {
+        let millis = Arc::new(AtomicU64::new(1_000_000));
+        let asleep = Arc::new(AtomicU64::new(40));
+        let backend = Arc::new(ManualBackend::default());
+        let reg = JobRegistry::new(
+            backend.clone(),
+            Arc::new(FixedClock(Arc::clone(&millis))) as Arc<dyn Clock>,
+        )
+        .with_sleep_clock(Arc::new(ManualSleep(Arc::clone(&asleep))));
+        reg.set_resolver(Arc::new(StubResolver {
+            issued: Arc::new(AtomicU64::new(0)),
+        }));
+        reg.schedule(
+            "urn:booking:drain".to_string(),
+            Verb::Source,
+            Schedule::Every(Duration::from_secs(30)),
+            true,
+        )
+        .expect("scheduled");
+        assert!(reg.measures_sleep());
+        assert_eq!(
+            reg.health()[0].asleep_since_last,
+            None,
+            "never ran: no window"
+        );
+
+        backend.fire_all(1);
+        // A 300s nap, then 20s awake: 320s of wall clock, 300 of it asleep.
+        millis.store(1_320_000, Ordering::SeqCst);
+        asleep.store(340, Ordering::SeqCst);
+        let health = reg.health();
+        assert_eq!(health[0].since_last, Some(Duration::from_secs(320)));
+        assert_eq!(health[0].asleep_since_last, Some(Duration::from_secs(300)));
+
+        // A sleep clock that cannot answer now proves nothing: no discount, not a stale one.
+        asleep.store(u64::MAX, Ordering::SeqCst);
+        assert!(!reg.measures_sleep());
+        assert_eq!(reg.health()[0].asleep_since_last, None);
+
+        // Readings that disagree with the wall clock are clamped to the window.
+        asleep.store(10_000, Ordering::SeqCst);
+        assert_eq!(
+            reg.health()[0].asleep_since_last,
+            Some(Duration::from_secs(320))
+        );
+    }
+
+    /// Without a sleep clock nothing changes: no evidence, and no claim of any.
+    #[test]
+    fn a_registry_without_a_sleep_clock_reports_no_evidence() {
+        let reg = JobRegistry::new(Arc::new(ManualBackend::default()), Arc::new(SystemClock));
+        assert!(!reg.measures_sleep());
+    }
+
+    /// LATE IS NOT FAILING. A job that completes on time and fails every time used to read
+    /// as healthy; the run of failures and the last SUCCESS are now facts of their own.
+    #[test]
+    fn failures_in_a_row_and_last_success_are_tracked_apart_from_last_run() {
+        let millis = Arc::new(AtomicU64::new(1_000_000));
+        let failing = Arc::new(AtomicBool::new(false));
+        let backend = Arc::new(ManualBackend::default());
+        let reg = JobRegistry::new(
+            backend.clone(),
+            Arc::new(FixedClock(Arc::clone(&millis))) as Arc<dyn Clock>,
+        );
+        reg.set_resolver(Arc::new(FlakyResolver {
+            failing: Arc::clone(&failing),
+        }));
+        reg.schedule(
+            "urn:booking:drain".to_string(),
+            Verb::Source,
+            Schedule::Every(Duration::from_secs(30)),
+            true,
+        )
+        .expect("scheduled");
+        let health = reg.health();
+        assert_eq!(health[0].since_last_success, None);
+        assert_eq!(health[0].failures_in_a_row, 0);
+
+        backend.fire_all(1); // succeeds at t=1000s
+        failing.store(true, Ordering::SeqCst);
+        millis.store(1_030_000, Ordering::SeqCst);
+        backend.fire_all(3); // three failures at t=1030s
+        millis.store(1_035_000, Ordering::SeqCst);
+        let health = reg.health();
+        assert_eq!(health[0].runs, 4);
+        assert_eq!(health[0].failures_in_a_row, 3);
+        assert_eq!(health[0].since_last, Some(Duration::from_secs(5)));
+        assert_eq!(health[0].since_last_success, Some(Duration::from_secs(35)));
+        assert!(health[0].last_output.starts_with("error"));
+
+        failing.store(false, Ordering::SeqCst);
+        backend.fire_all(1);
+        let health = reg.health();
+        assert_eq!(health[0].failures_in_a_row, 0, "a success resets the run");
+        assert_eq!(health[0].since_last_success, Some(Duration::ZERO));
     }
 
     /// A backend whose cancel closure re-enters the registry — the shape of real

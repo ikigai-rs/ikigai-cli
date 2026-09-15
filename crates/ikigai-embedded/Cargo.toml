@@ -30,6 +30,8 @@ store = ["dep:ikigai-store", "dep:ikigai-ledger"]
 
 [dependencies]
 ikigai-core = { workspace = true }
+# `clock_gettime` on the two clock pairs that measure machine sleep (see `HostSleepClock`).
+libc = { workspace = true }
 ikigai-vocab = { workspace = true }
 ikigai-fn = { workspace = true }
 ikigai-personal = { workspace = true }

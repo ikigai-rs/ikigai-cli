@@ -249,9 +249,66 @@ pub fn time_registry() -> JobRegistry {
             // The registry stamps `last_run` from this clock — the SAME seam the kernel
             // uses. A native host passes the system clock; the browser host passes its
             // `Date.now()`-backed one.
+            // Beside it, the host's sleep evidence, so `urn:host:health` measures lateness
+            // in AWAKE time: a job is not late for the minutes its machine was suspended.
             JobRegistry::new(Arc::new(ikigai_time::ThreadTimer), Arc::new(SystemClock))
+                .with_sleep_clock(Arc::new(HostSleepClock))
         })
         .clone()
+}
+
+/// This machine's cumulative sleep, as the difference of two kernel clocks that share an
+/// origin and differ ONLY in whether suspended time counts.
+///
+/// - **Darwin:** `CLOCK_MONOTONIC_RAW` (backed by `mach_continuous_time`, which keeps
+///   counting while asleep) minus `CLOCK_UPTIME_RAW` (`mach_absolute_time`, which stops).
+///   Both are raw: neither is slewed by NTP, so the difference is sleep and nothing else.
+/// - **Linux:** `CLOCK_BOOTTIME` (counts suspend) minus `CLOCK_MONOTONIC` (does not). Both
+///   are slewed identically, so the slew cancels in the difference.
+/// - **Anything else:** `None`. The registry then takes no discount and the health report
+///   says sleep is not measurable — failing toward the old wall-clock verdict, which can
+///   call a sleeping machine stale but can never excuse a stopped job.
+///
+/// Chosen over `kern.monotonicclock_usecs` (what `health-watch.sh` reads) because it is one
+/// syscall pair with no parsing, the same shape on both platforms, and immune to wall-clock
+/// steps — `SystemTime` minus uptime would count every NTP correction as sleep.
+struct HostSleepClock;
+
+impl ikigai_time::SleepClock for HostSleepClock {
+    fn asleep(&self) -> Option<std::time::Duration> {
+        #[cfg(target_os = "macos")]
+        let (counts_sleep, excludes_sleep) = (libc::CLOCK_MONOTONIC_RAW, libc::CLOCK_UPTIME_RAW);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let (counts_sleep, excludes_sleep) = (libc::CLOCK_BOOTTIME, libc::CLOCK_MONOTONIC);
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+        {
+            // The excluding clock is read FIRST, so the pair can only overstate sleep by the
+            // nanoseconds between the two calls, never read negative.
+            let awake = clock_reading(excludes_sleep)?;
+            let total = clock_reading(counts_sleep)?;
+            Some(total.saturating_sub(awake))
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+        None
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+fn clock_reading(clock: libc::clockid_t) -> Option<std::time::Duration> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid, writable timespec for the duration of the call, and
+    // `clock_gettime` writes only through that pointer.
+    let rc = unsafe { libc::clock_gettime(clock, &mut ts) };
+    if rc != 0 || ts.tv_sec < 0 || ts.tv_nsec < 0 {
+        return None;
+    }
+    Some(std::time::Duration::new(
+        ts.tv_sec as u64,
+        ts.tv_nsec as u32,
+    ))
 }
 
 /// Process-global flag: is the interactive runbook (`urn:runbook:*`) active? OFF by
@@ -2586,7 +2643,7 @@ impl Endpoint for HostHeartbeat {
             .and_then(|browser| browser.as_ref())
             .map(|browser| browser.peers())
             .unwrap_or_default();
-        let report = health_text(&jobs, &peers);
+        let report = health_text(&jobs, &peers, &HealthContext::now());
         let path = heartbeat_path();
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)
@@ -2669,10 +2726,11 @@ impl Endpoint for KernelHealth {
             .inline_str("as")
             .map(|v| v.contains("turtle"))
             .unwrap_or(false);
+        let context = HealthContext::now();
         let (body, repr) = if turtle {
-            (health_turtle(&jobs, &peers), "text/turtle")
+            (health_turtle(&jobs, &peers, &context), "text/turtle")
         } else {
-            (health_text(&jobs, &peers), "text/plain")
+            (health_text(&jobs, &peers, &context), "text/plain")
         };
         Ok(Representation::new(ReprType::new(repr), body.into_bytes()))
     }
@@ -2709,10 +2767,38 @@ impl Endpoint for KernelHealth {
     }
 }
 
-/// Is a recurring job overdue by more than [`STALE_CADENCES`] of its own interval?
+/// The facts a health verdict is judged against besides the jobs themselves. Passed in, not
+/// read inside the renderers, so a test can state an uptime without waiting for one.
+struct HealthContext {
+    /// How long this process has been up, in awake time (see [`process_uptime`]).
+    uptime: std::time::Duration,
+    /// Whether the job registry could measure machine sleep. When it cannot, a late job
+    /// may only have been asleep, and the report says so rather than implying it checked.
+    sleep_measured: bool,
+}
+
+impl HealthContext {
+    fn now() -> HealthContext {
+        HealthContext {
+            uptime: process_uptime(),
+            sleep_measured: time_registry().measures_sleep(),
+        }
+    }
+}
+
+/// Is a recurring job overdue by more than [`STALE_CADENCES`] of its own interval, counted in
+/// AWAKE time?
+///
+/// The time since its last run has the machine's measured sleep over that window taken off
+/// first: a Mac that napped for six minutes did not make its 30-second drain late by six
+/// minutes. The bound itself is unchanged — three cadences of awake lateness is stale however
+/// much sleep surrounds it. With no sleep evidence nothing is discounted (see
+/// [`ikigai_time::SleepClock`]), which is the wall-clock verdict this replaced.
 ///
 /// A job that has NEVER run is not yet stale — it may simply be younger than its first
 /// tick; it becomes stale once more than that many intervals of process life have passed.
+/// Process uptime is already awake time: `std::time::Instant` reads `CLOCK_UPTIME_RAW` on
+/// Darwin and `CLOCK_MONOTONIC` on Linux, neither of which counts suspend.
 /// Non-recurring jobs are never stale: they were meant to fire once.
 fn job_is_stale(job: &ikigai_time::JobHealth, uptime: std::time::Duration) -> bool {
     if !job.recurring {
@@ -2720,39 +2806,91 @@ fn job_is_stale(job: &ikigai_time::JobHealth, uptime: std::time::Duration) -> bo
     }
     let limit = job.interval * STALE_CADENCES;
     match job.since_last {
-        Some(age) => age > limit,
+        Some(age) => age.saturating_sub(job.asleep_since_last.unwrap_or_default()) > limit,
         None => uptime > limit,
     }
 }
 
-fn health_text(jobs: &[ikigai_time::JobHealth], peers: &[ikigai_discovery::Peer]) -> String {
-    let uptime = process_uptime();
-    let stale: Vec<&ikigai_time::JobHealth> =
-        jobs.iter().filter(|j| job_is_stale(j, uptime)).collect();
+/// Has a job failed [`STALE_CADENCES`] runs in a row? Late and failing are different faults:
+/// a job that fires exactly on time and errors every time is not stale, and used to read ok.
+fn job_is_failing(job: &ikigai_time::JobHealth) -> bool {
+    job.failures_in_a_row >= u64::from(STALE_CADENCES)
+}
+
+/// One job's status word. STALE outranks FAILING: a job that has stopped completing runs at
+/// all cannot also be judged on how its runs went.
+fn job_status(job: &ikigai_time::JobHealth, uptime: std::time::Duration) -> &'static str {
+    if job_is_stale(job, uptime) {
+        "STALE"
+    } else if job_is_failing(job) {
+        "FAILING"
+    } else {
+        "ok"
+    }
+}
+
+fn health_text(
+    jobs: &[ikigai_time::JobHealth],
+    peers: &[ikigai_discovery::Peer],
+    context: &HealthContext,
+) -> String {
+    let uptime = context.uptime;
+    let stale = jobs.iter().filter(|j| job_is_stale(j, uptime)).count();
+    let failing = jobs
+        .iter()
+        .filter(|j| job_status(j, uptime) == "FAILING")
+        .count();
+    // The verdict word leads the file, and `health-watch.sh` keys on `^STALE`: that word
+    // keeps its meaning, and FAILING is only the verdict when nothing is stale.
+    let verdict = if stale > 0 {
+        "STALE"
+    } else if failing > 0 {
+        "FAILING"
+    } else {
+        "ok"
+    };
     let mut out = format!(
-        "{}  ·  {} up  ·  {} job(s), {} stale\n\n",
-        if stale.is_empty() { "ok" } else { "STALE" },
+        "{verdict}  ·  {} up  ·  {} job(s), {stale} stale, {failing} failing\n",
         fmt_secs(uptime),
         jobs.len(),
-        stale.len()
     );
+    if !context.sleep_measured {
+        out.push_str(
+            "  (sleep not measurable here: lateness includes any time this machine was asleep)\n",
+        );
+    }
+    out.push('\n');
     for job in jobs {
         let age = match job.since_last {
             Some(age) => fmt_secs(age),
             None => "never".to_string(),
         };
-        out.push_str(&format!(
-            "  {:<7} {:<34} every {:<7} runs {:<5} last {}\n",
-            if job_is_stale(job, uptime) {
-                "STALE"
-            } else {
-                "ok"
-            },
+        // The column order up to `last` is what health-watch.sh parses; evidence is appended.
+        let mut line = format!(
+            "  {:<7} {:<34} every {:<7} runs {:<5} last {}",
+            job_status(job, uptime),
             job.target,
             fmt_secs(job.interval),
             job.runs,
             age
-        ));
+        );
+        if job.runs > 0 {
+            let success = job
+                .since_last_success
+                .map(fmt_secs)
+                .unwrap_or_else(|| "never".to_string());
+            line.push_str(&format!("  ·  success {success}"));
+        }
+        if job.failures_in_a_row > 0 {
+            line.push_str(&format!("  ·  {} failed in a row", job.failures_in_a_row));
+        }
+        // The sleep this verdict DISCOUNTED, so a reader can see why a job whose last run
+        // was long ago is not called stale.
+        if let Some(asleep) = job.asleep_since_last.filter(|a| a.as_secs() > 0) {
+            line.push_str(&format!("  ·  asleep {} of that", fmt_secs(asleep)));
+        }
+        out.push_str(&line);
+        out.push('\n');
         // The last thing it SAID, when it failed — a job can run on time and still be
         // doing nothing useful, which is the failure that hid for sixteen hours.
         if job.last_output.starts_with("error") {
@@ -2779,28 +2917,55 @@ fn health_text(jobs: &[ikigai_time::JobHealth], peers: &[ikigai_discovery::Peer]
     out
 }
 
-fn health_turtle(jobs: &[ikigai_time::JobHealth], peers: &[ikigai_discovery::Peer]) -> String {
-    let uptime = process_uptime();
+fn health_turtle(
+    jobs: &[ikigai_time::JobHealth],
+    peers: &[ikigai_discovery::Peer],
+    context: &HealthContext,
+) -> String {
+    let uptime = context.uptime;
     let stale = jobs.iter().filter(|j| job_is_stale(j, uptime)).count();
+    let failing = jobs
+        .iter()
+        .filter(|j| job_status(j, uptime) == "FAILING")
+        .count();
     let mut out = String::from(
         "@prefix ik: <https://ikigai-rs.dev/ns#> .\n@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\n",
     );
     out.push_str(&format!(
         "<urn:host:health> a ik:Health ;\n    ik:verdict \"{}\" ;\n    ik:uptimeSeconds {} ;\n    ik:staleJobs {stale} .\n\n",
-        if stale == 0 { "ok" } else { "stale" },
+        if stale > 0 {
+            "stale"
+        } else if failing > 0 {
+            "failing"
+        } else {
+            "ok"
+        },
         uptime.as_secs()
     ));
+    // Sleep evidence rides on each JOB (`ik:asleepSeconds`), never as a new term on this
+    // node: its undefined-term set is pinned at exactly four by the conformance suite. A job
+    // that has run and carries no `ik:asleepSeconds` had no sleep measurement to discount.
     for job in jobs {
         out.push_str(&format!(
-            "<urn:host:health:job:{}> a ik:Job ;\n    ik:target <{}> ;\n    ik:intervalSeconds {} ;\n    ik:runs {} ;\n    ik:stale \"{}\"^^xsd:boolean",
+            "<urn:host:health:job:{}> a ik:Job ;\n    ik:target <{}> ;\n    ik:intervalSeconds {} ;\n    ik:runs {} ;\n    ik:stale \"{}\"^^xsd:boolean ;\n    ik:failuresInARow {}",
             job.id,
             job.target,
             job.interval.as_secs(),
             job.runs,
-            job_is_stale(job, uptime)
+            job_is_stale(job, uptime),
+            job.failures_in_a_row
         ));
         if let Some(age) = job.since_last {
             out.push_str(&format!(" ;\n    ik:sinceLastSeconds {}", age.as_secs()));
+        }
+        if let Some(age) = job.since_last_success {
+            out.push_str(&format!(
+                " ;\n    ik:sinceLastSuccessSeconds {}",
+                age.as_secs()
+            ));
+        }
+        if let Some(asleep) = job.asleep_since_last {
+            out.push_str(&format!(" ;\n    ik:asleepSeconds {}", asleep.as_secs()));
         }
         out.push_str(" .\n\n");
     }
@@ -6179,6 +6344,9 @@ mod tests {
             persistent: true,
             runs: since_last.map(|_| 5).unwrap_or(0),
             since_last: since_last.map(std::time::Duration::from_secs),
+            asleep_since_last: None,
+            since_last_success: since_last.map(std::time::Duration::from_secs),
+            failures_in_a_row: 0,
             last_output: String::new(),
         }
     }
@@ -6230,7 +6398,7 @@ mod tests {
     #[test]
     fn peers_do_not_affect_the_verdict() {
         let jobs = vec![job(300, Some(60), true)];
-        let with_none = health_text(&jobs, &[]);
+        let with_none = health_text(&jobs, &[], &context(3600, true));
         let with_peer = health_text(
             &jobs,
             &[ikigai_discovery::Peer {
@@ -6242,6 +6410,7 @@ mod tests {
                 version: None,
                 trusted: true,
             }],
+            &context(3600, true),
         );
         assert!(with_none.starts_with("ok"), "{with_none}");
         assert!(with_peer.starts_with("ok"), "{with_peer}");
@@ -6249,6 +6418,181 @@ mod tests {
             with_none.contains("none heard"),
             "an absent peer is reported, not escalated: {with_none}"
         );
+    }
+
+    fn context(uptime_secs: u64, sleep_measured: bool) -> HealthContext {
+        HealthContext {
+            uptime: std::time::Duration::from_secs(uptime_secs),
+            sleep_measured,
+        }
+    }
+
+    /// A wall clock and a sleep clock the test moves by hand — no real time passes.
+    struct Moved(Arc<std::sync::atomic::AtomicU64>);
+    impl ikigai_core::Clock for Moved {
+        fn now(&self) -> ikigai_core::Time {
+            ikigai_core::Time::from_millis(self.0.load(std::sync::atomic::Ordering::SeqCst))
+        }
+    }
+    impl ikigai_time::SleepClock for Moved {
+        fn asleep(&self) -> Option<std::time::Duration> {
+            Some(std::time::Duration::from_millis(
+                self.0.load(std::sync::atomic::Ordering::SeqCst),
+            ))
+        }
+    }
+
+    /// Captures each job's tick so the test fires it, out of band, like a real timer.
+    #[derive(Default)]
+    struct Ticks(std::sync::Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>);
+    impl ikigai_time::TimerBackend for Ticks {
+        fn start(
+            &self,
+            _interval: std::time::Duration,
+            _recurring: bool,
+            on_tick: Arc<dyn Fn() + Send + Sync>,
+        ) -> ikigai_time::TimerHandle {
+            self.0.lock().unwrap().push(on_tick);
+            ikigai_time::TimerHandle::new(|| {})
+        }
+    }
+    impl Ticks {
+        fn fire(&self) {
+            for tick in self.0.lock().unwrap().clone() {
+                tick();
+            }
+        }
+    }
+
+    struct Answers;
+    impl ikigai_resolve::Resolver for Answers {
+        fn issue(
+            &self,
+            _request: Request,
+        ) -> std::result::Result<(Representation, ikigai_resolve::CacheStatus), ikigai_core::Error>
+        {
+            Ok((
+                Representation::new(ReprType::new("text/plain"), b"drained".to_vec()),
+                ikigai_resolve::CacheStatus::Uncacheable,
+            ))
+        }
+        fn is_cached(&self, _request: &Request, _capability: &Capability) -> bool {
+            false
+        }
+        fn entries(&self) -> Option<Vec<ikigai_core::SpaceEntry>> {
+            None
+        }
+    }
+
+    /// ★ THE NAP IS NOT LATENESS — the defect seen on bug, where every nap turned a 30s
+    /// drain STALE. Driven through a real registry with injected wall and sleep clocks: a nap
+    /// of TEN cadences leaves the job healthy and the report shows the sleep it discounted;
+    /// the same job then left alone for more than three cadences AWAKE is stale again.
+    #[test]
+    fn a_nap_is_discounted_but_three_awake_cadences_are_still_stale() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let wall = Arc::new(AtomicU64::new(1_000_000));
+        let slept = Arc::new(AtomicU64::new(0));
+        let ticks = Arc::new(Ticks::default());
+        let registry = JobRegistry::new(ticks.clone(), Arc::new(Moved(Arc::clone(&wall))))
+            .with_sleep_clock(Arc::new(Moved(Arc::clone(&slept))));
+        registry.set_resolver(Arc::new(Answers));
+        registry
+            .schedule(
+                "urn:booking:drain".to_string(),
+                Verb::Source,
+                ikigai_time::Schedule::Every(std::time::Duration::from_secs(30)),
+                true,
+            )
+            .unwrap();
+        ticks.fire();
+        let up = context(86_400, registry.measures_sleep());
+
+        // Asleep for 300s (ten cadences), then awake for 20s.
+        wall.fetch_add(320_000, Ordering::SeqCst);
+        slept.fetch_add(300_000, Ordering::SeqCst);
+        let jobs = registry.health();
+        assert!(!job_is_stale(&jobs[0], up.uptime), "a nap is not lateness");
+        let text = health_text(&jobs, &[], &up);
+        assert!(text.starts_with("ok"), "{text}");
+        assert!(
+            text.contains("asleep 5m of that"),
+            "the discount is shown: {text}"
+        );
+        assert!(!text.contains("not measurable"), "{text}");
+        let turtle = health_turtle(&jobs, &[], &up);
+        assert!(turtle.contains("ik:asleepSeconds 300"), "{turtle}");
+        assert!(
+            turtle.contains("ik:stale \"false\"^^xsd:boolean"),
+            "{turtle}"
+        );
+
+        // Now 80 more seconds, all of them awake: 100s of awake lateness > 3 × 30s.
+        wall.fetch_add(80_000, Ordering::SeqCst);
+        let jobs = registry.health();
+        assert!(
+            job_is_stale(&jobs[0], up.uptime),
+            "awake lateness is still stale"
+        );
+        let text = health_text(&jobs, &[], &up);
+        assert!(text.starts_with("STALE"), "{text}");
+        assert!(text.contains("  STALE   urn:booking:drain"), "{text}");
+
+        // It runs again and is healthy; the old nap is no longer part of any window.
+        ticks.fire();
+        let jobs = registry.health();
+        assert!(!job_is_stale(&jobs[0], up.uptime));
+        assert_eq!(jobs[0].asleep_since_last, Some(std::time::Duration::ZERO));
+    }
+
+    /// The bound is unchanged where there is no evidence: without a sleep measurement the
+    /// whole wall-clock age counts, and the report says the check could not be made.
+    #[test]
+    fn without_sleep_evidence_the_wall_clock_verdict_stands_and_says_so() {
+        let mut napped = job(30, Some(320), true);
+        napped.asleep_since_last = None;
+        let text = health_text(std::slice::from_ref(&napped), &[], &context(86_400, false));
+        assert!(text.starts_with("STALE"), "{text}");
+        assert!(text.contains("sleep not measurable here"), "{text}");
+        let turtle = health_turtle(&[napped], &[], &context(86_400, false));
+        assert!(
+            !turtle.contains("ik:asleepSeconds"),
+            "no evidence, no claim: {turtle}"
+        );
+        assert!(
+            !turtle.contains("sleepMeasured"),
+            "no new term on the health node: {turtle}"
+        );
+    }
+
+    /// A job that runs on time and fails every time is FAILING, not ok and not STALE; the
+    /// verdict word STALE keeps meaning only "overdue", which health-watch.sh keys on.
+    #[test]
+    fn a_run_of_failures_marks_the_job_failing_not_stale() {
+        let mut failing = job(30, Some(10), true);
+        failing.failures_in_a_row = 3;
+        failing.since_last_success = Some(std::time::Duration::from_secs(100));
+        failing.last_output = "error: drain refused".to_string();
+        assert!(!job_is_stale(
+            &failing,
+            std::time::Duration::from_secs(86_400)
+        ));
+        let text = health_text(std::slice::from_ref(&failing), &[], &context(86_400, true));
+        assert!(text.starts_with("FAILING"), "{text}");
+        assert!(text.contains("0 stale, 1 failing"), "{text}");
+        assert!(text.contains("  FAILING urn:view:derive:tick"), "{text}");
+        assert!(text.contains("success 1m"), "{text}");
+        assert!(text.contains("3 failed in a row"), "{text}");
+        let turtle = health_turtle(&[failing.clone()], &[], &context(86_400, true));
+        assert!(turtle.contains("ik:verdict \"failing\""), "{turtle}");
+        assert!(turtle.contains("ik:failuresInARow 3"), "{turtle}");
+        assert!(
+            turtle.contains("ik:sinceLastSuccessSeconds 100"),
+            "{turtle}"
+        );
+        // Two failures is noise, the same bar staleness uses.
+        failing.failures_in_a_row = 2;
+        assert!(health_text(&[failing], &[], &context(86_400, true)).starts_with("ok"));
     }
 
     /// A mount target that is always down (or always denies), so the composition's

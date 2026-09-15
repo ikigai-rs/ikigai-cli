@@ -998,9 +998,10 @@ fn the_http_door_serves_no_owner_only_resource() {
 /// `vocabulary.ttl` defines these.
 ///
 /// ⚠ **What this does NOT cover, stated because the count looks complete and is not.** The
-/// same face emits `ik:Job`, `ik:intervalSeconds`, `ik:runs` and `ik:stale` for each recurring
+/// same face emits `ik:Job`, `ik:intervalSeconds`, `ik:runs`, `ik:stale`, `ik:sinceLastSeconds`,
+/// `ik:failuresInARow`, `ik:sinceLastSuccessSeconds` and `ik:asleepSeconds` for each recurring
 /// job, and those are undefined too — the fixture kernel simply schedules none, so the walk
-/// never sees them. Eight terms need defining; four are what a test can hold.
+/// never sees them. Twelve terms need defining; four are what a test can hold.
 #[test]
 fn the_health_graph_uses_exactly_four_undefined_terms() {
     use ikigai_core::{Capability, Iri, Request, Verb};
