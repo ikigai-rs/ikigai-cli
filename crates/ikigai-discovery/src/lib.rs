@@ -24,14 +24,24 @@
 //! we have simply never heard of, and only the former is [`Presence::Withdrawn`]. A caller
 //! may skip a dial on `Withdrawn`; skipping on `Unknown` would refuse a peer that is right
 //! there, which is worse than the wait it saves.
+//!
+//! # An announcement says what it actually advertises
+//!
+//! [`announce`] owns the address set it puts in the record rather than delegating it to the
+//! responder, re-reads the host's addresses every [`ADDRESS_CHECK_INTERVAL`], and reports
+//! every change as an [`AnnounceEvent`] naming the addresses. A record with no routable
+//! address is never registered: no peer could use it (see [`AnnounceEvent::Withheld`]).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt;
 use std::io;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{DaemonEvent, ServiceDaemon, ServiceEvent, ServiceInfo};
 
 /// The DNS-SD service type every ikigai kernel announces under. UDP because the transport
 /// that matters is QUIC.
@@ -44,6 +54,11 @@ pub const TXT_CEILING: &str = "cap";
 /// TXT key: the wire protocol version, so a client can tell an incompatible peer apart from
 /// an absent one before it dials.
 pub const TXT_VERSION: &str = "v";
+
+/// How often an announcement re-reads this host's addresses. The same period `mdns-sd` polls
+/// its own interface list on, so the watcher adds no new cadence to the machine.
+pub const ADDRESS_CHECK_INTERVAL: Duration =
+    Duration::from_secs(mdns_sd::IP_CHECK_INTERVAL_IN_SECS_DEFAULT as u64);
 
 /// One kernel heard on the network.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,15 +130,376 @@ pub enum Presence {
     Unknown,
 }
 
+/// One address this host holds, and the interface it is on.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HostAddr {
+    pub interface: String,
+    pub ip: IpAddr,
+}
+
+impl HostAddr {
+    /// Whether a peer on ANOTHER machine could dial it: neither loopback nor link-local.
+    ///
+    /// Link-local does not count, and that is load-bearing rather than fussy: an interface
+    /// gets its `fe80::` address the moment the link comes up, well before DHCP hands out
+    /// the address a peer can actually use, so counting it would re-open exactly the
+    /// login-before-the-network window this rule exists to close. A peer's
+    /// [`Peer::socket_addr`] ranks link-local below every routable address for the same
+    /// reason.
+    pub fn is_routable(&self) -> bool {
+        address_rank(&self.ip) <= 1
+    }
+}
+
+impl fmt::Display for HostAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} ({})", self.ip, self.interface)
+    }
+}
+
+/// What an announcement did, reported as it happens. Its `Display` is the log line, and it
+/// names ADDRESSES — "announcing as plasma" alone is an assertion of intent that stayed true
+/// for an hour while the only address in the record was `127.0.0.1`.
+///
+/// ```
+/// use ikigai_discovery::{AnnounceEvent, HostAddr};
+///
+/// let lan = HostAddr { interface: "en0".into(), ip: "192.168.4.178".parse().unwrap() };
+/// let lo = HostAddr { interface: "lo0".into(), ip: "127.0.0.1".parse().unwrap() };
+///
+/// let up = AnnounceEvent::Announced { name: "plasma".into(), addrs: vec![lan.clone(), lo.clone()] };
+/// assert_eq!(
+///     up.to_string(),
+///     "announcing \"plasma\" on _ikigai._udp.local. at 192.168.4.178 (en0), 127.0.0.1 (lo0)"
+/// );
+///
+/// let waiting = AnnounceEvent::Withheld { name: "plasma".into(), addrs: vec![lo], withdrawn: false };
+/// assert_eq!(
+///     waiting.to_string(),
+///     "warning: NOT announcing \"plasma\": no routable address (only 127.0.0.1 (lo0)), so no \
+///      peer could reach it; will announce when one appears"
+/// );
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AnnounceEvent {
+    /// A record is registered carrying exactly `addrs`, most dialable first.
+    Announced { name: String, addrs: Vec<HostAddr> },
+    /// The host's addresses changed, and the record was re-registered in place (no goodbye,
+    /// so a peer never sees a false withdrawal).
+    Reannounced {
+        name: String,
+        added: Vec<HostAddr>,
+        removed: Vec<HostAddr>,
+        addrs: Vec<HostAddr>,
+    },
+    /// This host has no routable address, so nothing is registered: a loopback-only record
+    /// is one no peer can use. `withdrawn` is true when a live record was just taken down
+    /// because its last routable address went away. Announcing resumes by itself.
+    Withheld {
+        name: String,
+        addrs: Vec<HostAddr>,
+        withdrawn: bool,
+    },
+    /// The responder lost a name conflict and renamed a record. A peer looking for the
+    /// original name will not find it under the new one.
+    Renamed {
+        original: String,
+        renamed: String,
+        interface: String,
+    },
+    /// Something failed. The watcher retries on its next check; a repeat of the same error
+    /// is not reported again.
+    Failed { name: String, error: String },
+}
+
+impl fmt::Display for AnnounceEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AnnounceEvent::Announced { name, addrs } => {
+                write!(
+                    f,
+                    "announcing \"{name}\" on {SERVICE_TYPE} at {}",
+                    list(addrs)
+                )
+            }
+            AnnounceEvent::Reannounced {
+                name,
+                added,
+                removed,
+                addrs,
+            } => write!(
+                f,
+                "re-announcing \"{name}\": addresses changed (added {}; removed {}), now at {}",
+                list(added),
+                list(removed),
+                list(addrs)
+            ),
+            AnnounceEvent::Withheld {
+                name,
+                addrs,
+                withdrawn: false,
+            } => write!(
+                f,
+                "warning: NOT announcing \"{name}\": no routable address (only {}), so no peer \
+                 could reach it; will announce when one appears",
+                list(addrs)
+            ),
+            AnnounceEvent::Withheld {
+                name,
+                addrs,
+                withdrawn: true,
+            } => write!(
+                f,
+                "warning: WITHDREW the announcement of \"{name}\": no routable address left \
+                 (only {}); will announce again when one appears",
+                list(addrs)
+            ),
+            AnnounceEvent::Renamed {
+                original,
+                renamed,
+                interface,
+            } => write!(
+                f,
+                "warning: mDNS name conflict on {interface}: \"{original}\" was renamed \
+                 \"{renamed}\", so a peer looking for the original name will not find it"
+            ),
+            AnnounceEvent::Failed { name, error } => {
+                write!(
+                    f,
+                    "warning: announcing \"{name}\" failed: {error}; retrying"
+                )
+            }
+        }
+    }
+}
+
+fn list(addrs: &[HostAddr]) -> String {
+    if addrs.is_empty() {
+        return "no addresses".to_string();
+    }
+    addrs
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Most dialable first, then stable — the order a reader of the log wants.
+fn ranked<'a>(addrs: impl IntoIterator<Item = &'a HostAddr>) -> Vec<HostAddr> {
+    let mut out: Vec<HostAddr> = addrs.into_iter().cloned().collect();
+    out.sort_by(|a, b| {
+        (address_rank(&a.ip), &a.interface, a.ip).cmp(&(address_rank(&b.ip), &b.interface, b.ip))
+    });
+    out
+}
+
+/// Where an announcement learns this host's addresses. The seam exists so the property that
+/// matters — an address that appears AFTER startup ends up in the record — can be tested
+/// without multicast, which a CI runner does not reliably carry.
+trait AddressSource: Send + 'static {
+    fn addresses(&self) -> io::Result<BTreeSet<HostAddr>>;
+}
+
+/// The real interfaces, filtered the way `mdns-sd` filters the ones it will send on: up, not
+/// point-to-point (so not a `utun`), and not Apple's peer-to-peer Wi-Fi. An address the
+/// responder would never announce must not appear in a log line claiming it is announced.
+struct HostInterfaces;
+
+impl AddressSource for HostInterfaces {
+    fn addresses(&self) -> io::Result<BTreeSet<HostAddr>> {
+        Ok(if_addrs::get_if_addrs()?
+            .into_iter()
+            .filter(|i| i.is_oper_up() && !i.is_p2p() && !is_apple_p2p(&i.name))
+            .map(|i| HostAddr {
+                ip: i.ip(),
+                interface: i.name,
+            })
+            .collect())
+    }
+}
+
+/// `awdl*` / `llw*`: AirDrop-style peer-to-peer links, which `mdns-sd` skips by default.
+fn is_apple_p2p(interface: &str) -> bool {
+    interface.starts_with("awdl") || interface.starts_with("llw")
+}
+
+/// Where a record goes. The daemon in production; a recorder in tests.
+trait Registrar: Send + 'static {
+    fn register(&mut self, record: ServiceInfo) -> io::Result<()>;
+    fn unregister(&mut self, fullname: &str) -> io::Result<()>;
+}
+
+impl Registrar for ServiceDaemon {
+    fn register(&mut self, record: ServiceInfo) -> io::Result<()> {
+        ServiceDaemon::register(self, record).map_err(other)
+    }
+
+    fn unregister(&mut self, fullname: &str) -> io::Result<()> {
+        ServiceDaemon::unregister(self, fullname)
+            .map(|_| ())
+            .map_err(other)
+    }
+}
+
+/// The SRV target for an instance: `ikigai-plasma.local.`, NEVER `plasma.local.`.
+///
+/// `plasma.local.` is the machine's OWN mDNS hostname, owned by the operating system's
+/// responder, so announcing under it starts a name conflict with the host itself. Measured
+/// 2026-09-14 by standing a second responder on the host name and registering our service
+/// before the LAN interface was in use: once the LAN interface came in, the loser renamed its
+/// host AND its instance (`victim (4)`), and a fresh browser resolved it with only loopback
+/// and link-local addresses — plasma's exact symptom, `peer:plasma … no peer is announcing
+/// under that name` included. Plasma's own LocalHostName was `plasma-2` when that was
+/// measured, which is what macOS does to itself after losing that conflict.
+///
+/// Still derived from the instance name, so two kernels on one machine (a peer server and a
+/// scratch server) do not collide with each other either.
+fn host_name(name: &str) -> String {
+    format!("ikigai-{name}.local.")
+}
+
+/// Keeps one record truthful: re-reads the host's addresses and re-registers whenever the
+/// set changes. Synchronous and clock-free on purpose — the watcher thread supplies the
+/// cadence, and a test drives [`Announcer::check`] directly.
+struct Announcer<S, R> {
+    source: S,
+    registrar: R,
+    name: String,
+    host: String,
+    fullname: String,
+    port: u16,
+    props: HashMap<String, String>,
+    /// The address set in the registered record, if one is registered.
+    advertised: Option<BTreeSet<HostAddr>>,
+    /// The last loopback-only set reported as withheld, so it is reported once, not per check.
+    withheld: Option<BTreeSet<HostAddr>>,
+    last_failure: Option<String>,
+}
+
+impl<S: AddressSource, R: Registrar> Announcer<S, R> {
+    fn new(source: S, registrar: R, name: &str, port: u16, props: HashMap<String, String>) -> Self {
+        Announcer {
+            source,
+            registrar,
+            name: name.to_string(),
+            host: host_name(name),
+            fullname: format!("{name}.{SERVICE_TYPE}"),
+            port,
+            props,
+            advertised: None,
+            withheld: None,
+            last_failure: None,
+        }
+    }
+
+    /// Bring the record in line with the host's addresses, reporting what changed.
+    fn check(&mut self) -> Option<AnnounceEvent> {
+        let current = match self.source.addresses() {
+            Ok(addrs) => addrs,
+            Err(e) => return self.failed(format!("could not read this host's addresses: {e}")),
+        };
+
+        if !current.iter().any(HostAddr::is_routable) {
+            let withdrawn = self.advertised.take().is_some();
+            if withdrawn {
+                // Best-effort goodbye. The interface it would have gone out on is the one
+                // that just lost its address, so a failure here says nothing new.
+                let _ = self.registrar.unregister(&self.fullname);
+            }
+            if withdrawn || self.withheld.as_ref() != Some(&current) {
+                let addrs = ranked(&current);
+                self.withheld = Some(current);
+                return Some(AnnounceEvent::Withheld {
+                    name: self.name.clone(),
+                    addrs,
+                    withdrawn,
+                });
+            }
+            return None;
+        }
+        self.withheld = None;
+
+        if self.advertised.as_ref() == Some(&current) {
+            return None;
+        }
+
+        // Re-registering the same fullname REPLACES the record and re-announces it with the
+        // cache-flush bit, so a peer drops the old addresses. Unregistering first would send
+        // a goodbye, and a peer would briefly (and falsely) hold this kernel as `Withdrawn`.
+        let registered = self
+            .record(&current)
+            .and_then(|record| self.registrar.register(record));
+        if let Err(e) = registered {
+            // `advertised` is left as it was, so the next check tries again.
+            return self.failed(e.to_string());
+        }
+        self.last_failure = None;
+
+        let addrs = ranked(&current);
+        let event = match self.advertised.replace(current) {
+            None => AnnounceEvent::Announced {
+                name: self.name.clone(),
+                addrs,
+            },
+            Some(previous) => {
+                let now = self.advertised.as_ref().unwrap_or(&previous);
+                AnnounceEvent::Reannounced {
+                    name: self.name.clone(),
+                    added: ranked(now.difference(&previous)),
+                    removed: ranked(previous.difference(now)),
+                    addrs,
+                }
+            }
+        };
+        Some(event)
+    }
+
+    /// The record itself, with the addresses given EXPLICITLY. `enable_addr_auto` would let
+    /// the responder choose them, and then nothing in this process could say — or test —
+    /// what a peer is actually being told.
+    fn record(&self, addrs: &BTreeSet<HostAddr>) -> io::Result<ServiceInfo> {
+        let ips: Vec<IpAddr> = addrs.iter().map(|a| a.ip).collect();
+        ServiceInfo::new(
+            SERVICE_TYPE,
+            &self.name,
+            &self.host,
+            &ips[..],
+            self.port,
+            self.props.clone(),
+        )
+        .map_err(other)
+    }
+
+    fn failed(&mut self, error: String) -> Option<AnnounceEvent> {
+        if self.last_failure.as_deref() == Some(error.as_str()) {
+            return None;
+        }
+        self.last_failure = Some(error.clone());
+        Some(AnnounceEvent::Failed {
+            name: self.name.clone(),
+            error,
+        })
+    }
+
+    /// Send the goodbye for a live record.
+    fn withdraw(&mut self) {
+        if self.advertised.take().is_some() {
+            let _ = self.registrar.unregister(&self.fullname);
+        }
+    }
+}
+
 /// A live announcement. Dropping it withdraws the service, so a peer that exits cleanly
 /// tells its neighbours rather than leaving them to time it out.
 pub struct Announcement {
     daemon: ServiceDaemon,
     fullname: String,
+    stop: Arc<AtomicBool>,
+    watcher: Option<JoinHandle<()>>,
 }
 
 impl Announcement {
-    /// The full DNS-SD name this kernel registered under.
+    /// The full DNS-SD name this kernel registers under.
     pub fn fullname(&self) -> &str {
         &self.fullname
     }
@@ -131,38 +507,106 @@ impl Announcement {
 
 impl Drop for Announcement {
     fn drop(&mut self) {
-        // Best-effort: send the goodbye, then stop the daemon. A peer that vanishes without
-        // this is exactly the `Unknown`-vs-`Withdrawn` distinction the browser has to make.
-        let _ = self.daemon.unregister(&self.fullname);
+        // The watcher sends the goodbye on its way out (it owns the record); only then stop
+        // the daemon. A peer that vanishes without the goodbye is exactly the
+        // `Unknown`-vs-`Withdrawn` distinction the browser has to make.
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(watcher) = self.watcher.take() {
+            let _ = watcher.join();
+        }
         let _ = self.daemon.shutdown();
     }
 }
 
-/// Announce this kernel under `name` on `port`, carrying `props` as TXT records.
-///
-/// The host name is derived from `name` so two kernels on one machine (a peer server and a
-/// scratch server) don't collide.
+/// Announce this kernel under `name` on `port`, carrying `props` as TXT records, reporting
+/// what is advertised to stderr. See [`announce_with`].
 pub fn announce(name: &str, port: u16, props: &[(&str, &str)]) -> io::Result<Announcement> {
+    announce_with(name, port, props, |event| {
+        eprintln!("ikigai-discovery: {event}")
+    })
+}
+
+/// Announce this kernel under `name` on `port`, carrying `props` as TXT records, and hand
+/// every [`AnnounceEvent`] to `report` as it happens.
+///
+/// The first check runs before this returns, so the caller's log shows what was actually
+/// advertised (or withheld) at once. After that a watcher thread re-reads the host's
+/// addresses every [`ADDRESS_CHECK_INTERVAL`] and re-registers when they change: an agent
+/// started at login, before DHCP finished, announces as soon as the LAN has an address, and
+/// a new lease or a wake from sleep replaces the old address in the record.
+///
+/// `Err` only when the responder cannot start at all. A failure to register is reported
+/// through `report` and retried; it does not stop a kernel from serving everyone who
+/// already knows its address.
+pub fn announce_with<F>(
+    name: &str,
+    port: u16,
+    props: &[(&str, &str)],
+    report: F,
+) -> io::Result<Announcement>
+where
+    F: Fn(&AnnounceEvent) + Send + 'static,
+{
     let daemon = ServiceDaemon::new().map_err(other)?;
+    let monitor = daemon.monitor().map_err(other)?;
     let properties: HashMap<String, String> = props
         .iter()
         .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
         .collect();
-    // `enable_addr_auto` fills in this host's addresses and keeps them current: a hardcoded
-    // address is the very thing discovery exists to avoid.
-    let info = ServiceInfo::new(
-        SERVICE_TYPE,
-        name,
-        &format!("{name}.local."),
-        "",
-        port,
-        properties,
-    )
-    .map_err(other)?
-    .enable_addr_auto();
-    let fullname = info.get_fullname().to_string();
-    daemon.register(info).map_err(other)?;
-    Ok(Announcement { daemon, fullname })
+    let mut announcer = Announcer::new(HostInterfaces, daemon.clone(), name, port, properties);
+    let fullname = announcer.fullname.clone();
+    if let Some(event) = announcer.check() {
+        report(&event);
+    }
+
+    // Short slices so dropping the announcement is prompt; the check runs once per interval.
+    const SLICE: Duration = Duration::from_millis(250);
+    let slices = (ADDRESS_CHECK_INTERVAL.as_millis() / SLICE.as_millis()).max(1);
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopping = Arc::clone(&stop);
+    let watcher = std::thread::Builder::new()
+        .name("ikigai-announce".to_string())
+        .spawn(move || {
+            // One rename is reported once, not once per record type it touched.
+            let mut renames: HashSet<(String, String)> = HashSet::new();
+            'watch: loop {
+                for _ in 0..slices {
+                    if stopping.load(Ordering::Relaxed) {
+                        break 'watch;
+                    }
+                    match monitor.recv_timeout(SLICE) {
+                        Ok(DaemonEvent::NameChange(change)) => {
+                            if renames.insert((change.original.clone(), change.new_name.clone())) {
+                                report(&AnnounceEvent::Renamed {
+                                    original: change.original,
+                                    renamed: change.new_name,
+                                    interface: change.intf_name,
+                                });
+                            }
+                        }
+                        Ok(DaemonEvent::Error(e)) => report(&AnnounceEvent::Failed {
+                            name: announcer.name.clone(),
+                            error: e.to_string(),
+                        }),
+                        Ok(_) => {}
+                        // A dead daemon returns at once; do not spin on it.
+                        Err(_) if monitor.is_disconnected() => std::thread::sleep(SLICE),
+                        Err(_) => {}
+                    }
+                }
+                if let Some(event) = announcer.check() {
+                    report(&event);
+                }
+            }
+            announcer.withdraw();
+        })?;
+
+    Ok(Announcement {
+        daemon,
+        fullname,
+        stop,
+        watcher: Some(watcher),
+    })
 }
 
 /// A running browse, maintaining a cache of what has been heard.
@@ -438,6 +882,266 @@ mod tests {
         assert_eq!(names, vec!["bug", "edge", "plasma"]);
     }
 
+    // ---- announcing: an injected address source and a recording registrar, no multicast ----
+
+    fn addr(interface: &str, ip: &str) -> HostAddr {
+        HostAddr {
+            interface: interface.to_string(),
+            ip: ip.parse().unwrap(),
+        }
+    }
+
+    /// The host's addresses, as a test changes them.
+    #[derive(Clone, Default)]
+    struct Addrs(Arc<Mutex<BTreeSet<HostAddr>>>);
+
+    impl Addrs {
+        fn set(&self, addrs: &[HostAddr]) {
+            *self.0.lock().unwrap() = addrs.iter().cloned().collect();
+        }
+    }
+
+    impl AddressSource for Addrs {
+        fn addresses(&self) -> io::Result<BTreeSet<HostAddr>> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+    }
+
+    #[derive(Debug)]
+    enum Op {
+        // Boxed: a `ServiceInfo` is ~264 bytes and clippy's large_enum_variant is denied.
+        Register(Box<ServiceInfo>),
+        Unregister(String),
+    }
+
+    /// Every record handed to the responder, in order.
+    #[derive(Clone, Default)]
+    struct Recorded(Arc<Mutex<Vec<Op>>>);
+
+    impl Recorded {
+        fn ops(&self) -> usize {
+            self.0.lock().unwrap().len()
+        }
+        /// The addresses in the most recently registered record.
+        fn last_record(&self) -> Option<BTreeSet<IpAddr>> {
+            self.0.lock().unwrap().iter().rev().find_map(|op| match op {
+                Op::Register(info) => Some(info.get_addresses().iter().copied().collect()),
+                Op::Unregister(_) => None,
+            })
+        }
+        fn unregistered(&self) -> bool {
+            self.0.lock().unwrap().iter().any(
+                |op| matches!(op, Op::Unregister(name) if name == "plasma._ikigai._udp.local."),
+            )
+        }
+    }
+
+    impl Registrar for Recorded {
+        fn register(&mut self, record: ServiceInfo) -> io::Result<()> {
+            self.0.lock().unwrap().push(Op::Register(Box::new(record)));
+            Ok(())
+        }
+        fn unregister(&mut self, fullname: &str) -> io::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(Op::Unregister(fullname.to_string()));
+            Ok(())
+        }
+    }
+
+    fn announcer(addrs: &Addrs, recorded: &Recorded) -> Announcer<Addrs, Recorded> {
+        Announcer::new(
+            addrs.clone(),
+            recorded.clone(),
+            "plasma",
+            4433,
+            HashMap::new(),
+        )
+    }
+
+    /// ★ The field failure (2026-09-14): an agent started at login, before DHCP finished,
+    /// with only loopback addressed. The LAN address appears later — and the record a peer
+    /// is told about MUST carry it. Before this, plasma logged `announcing as "plasma"` for an
+    /// hour while its record said only `127.0.0.1`.
+    #[test]
+    fn an_address_that_appears_after_startup_is_in_the_record() {
+        let addrs = Addrs::default();
+        let recorded = Recorded::default();
+        addrs.set(&[addr("lo0", "127.0.0.1"), addr("lo0", "fe80::1")]);
+        let mut announcer = announcer(&addrs, &recorded);
+        announcer.check();
+
+        // DHCP finishes.
+        addrs.set(&[
+            addr("lo0", "127.0.0.1"),
+            addr("lo0", "fe80::1"),
+            addr("en0", "192.168.4.178"),
+        ]);
+        let event = announcer.check();
+
+        let lan: IpAddr = "192.168.4.178".parse().unwrap();
+        let record = recorded
+            .last_record()
+            .expect("a record once a routable address exists");
+        assert!(
+            record.contains(&lan),
+            "the record must carry the LAN address that appeared after startup; it carries {record:?}"
+        );
+        match event {
+            Some(AnnounceEvent::Announced { addrs, .. }) => {
+                assert_eq!(
+                    addrs[0],
+                    addr("en0", "192.168.4.178"),
+                    "most dialable first"
+                )
+            }
+            other => panic!("expected Announced, got {other:?}"),
+        }
+    }
+
+    /// A record whose only addresses are loopback and link-local is one no peer can use, so
+    /// it is not registered at all — and the log says so, once, rather than claiming success.
+    #[test]
+    fn a_loopback_only_announcement_is_withheld_and_said_so_once() {
+        let addrs = Addrs::default();
+        let recorded = Recorded::default();
+        addrs.set(&[addr("lo0", "127.0.0.1"), addr("en0", "fe80::425:1")]);
+        let mut announcer = announcer(&addrs, &recorded);
+
+        match announcer.check() {
+            Some(AnnounceEvent::Withheld {
+                withdrawn: false, ..
+            }) => {}
+            other => panic!("expected Withheld, got {other:?}"),
+        }
+        assert_eq!(recorded.ops(), 0, "nothing registered while unreachable");
+        assert_eq!(announcer.check(), None, "reported once, not every check");
+        assert_eq!(recorded.ops(), 0);
+    }
+
+    /// A new lease (plasma went `.91` → `.178` on the day this was written) replaces the
+    /// address IN PLACE: re-registered with the new set, no goodbye in between — a goodbye
+    /// would make every peer hold this kernel as `Withdrawn` for a moment it was not.
+    #[test]
+    fn a_changed_lease_is_reannounced_in_place() {
+        let addrs = Addrs::default();
+        let recorded = Recorded::default();
+        addrs.set(&[addr("lo0", "127.0.0.1"), addr("en0", "192.168.4.91")]);
+        let mut announcer = announcer(&addrs, &recorded);
+        assert!(matches!(
+            announcer.check(),
+            Some(AnnounceEvent::Announced { .. })
+        ));
+        assert_eq!(announcer.check(), None, "no change, no re-registration");
+        assert_eq!(recorded.ops(), 1);
+
+        addrs.set(&[addr("lo0", "127.0.0.1"), addr("en0", "192.168.4.178")]);
+        match announcer.check() {
+            Some(AnnounceEvent::Reannounced { added, removed, .. }) => {
+                assert_eq!(added, vec![addr("en0", "192.168.4.178")]);
+                assert_eq!(removed, vec![addr("en0", "192.168.4.91")]);
+            }
+            other => panic!("expected Reannounced, got {other:?}"),
+        }
+        let record = recorded.last_record().unwrap();
+        assert!(record.contains(&"192.168.4.178".parse().unwrap()));
+        assert!(!record.contains(&"192.168.4.91".parse().unwrap()));
+        assert!(!recorded.unregistered(), "no goodbye for a lease change");
+    }
+
+    /// When the last routable address goes, the record is withdrawn (a record pointing at an
+    /// address this host no longer holds is a lie), and it comes back by itself.
+    #[test]
+    fn losing_the_network_withdraws_and_regaining_it_reannounces() {
+        let addrs = Addrs::default();
+        let recorded = Recorded::default();
+        addrs.set(&[addr("lo0", "127.0.0.1"), addr("en0", "192.168.4.178")]);
+        let mut announcer = announcer(&addrs, &recorded);
+        announcer.check();
+
+        addrs.set(&[addr("lo0", "127.0.0.1")]);
+        assert!(matches!(
+            announcer.check(),
+            Some(AnnounceEvent::Withheld {
+                withdrawn: true,
+                ..
+            })
+        ));
+        assert!(recorded.unregistered());
+
+        addrs.set(&[addr("lo0", "127.0.0.1"), addr("en0", "192.168.4.178")]);
+        assert!(matches!(
+            announcer.check(),
+            Some(AnnounceEvent::Announced { .. })
+        ));
+    }
+
+    /// A registration that fails is retried on the next check, and the same error is not
+    /// logged every five seconds.
+    #[test]
+    fn a_failed_registration_is_retried_and_reported_once() {
+        struct Refuses(Arc<Mutex<usize>>);
+        impl Registrar for Refuses {
+            fn register(&mut self, _: ServiceInfo) -> io::Result<()> {
+                *self.0.lock().unwrap() += 1;
+                Err(io::Error::other("responder not ready"))
+            }
+            fn unregister(&mut self, _: &str) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let attempts = Arc::new(Mutex::new(0));
+        let addrs = Addrs::default();
+        addrs.set(&[addr("en0", "192.168.4.178")]);
+        let mut announcer = Announcer::new(
+            addrs,
+            Refuses(Arc::clone(&attempts)),
+            "plasma",
+            4433,
+            HashMap::new(),
+        );
+        assert!(matches!(
+            announcer.check(),
+            Some(AnnounceEvent::Failed { .. })
+        ));
+        assert_eq!(announcer.check(), None, "the same error is not repeated");
+        assert_eq!(*attempts.lock().unwrap(), 2, "but it IS retried");
+    }
+
+    /// The SRV target must not be the machine's own mDNS hostname — see [`host_name`].
+    #[test]
+    fn the_record_host_is_not_the_machines_own_hostname() {
+        assert_eq!(host_name("plasma"), "ikigai-plasma.local.");
+        let addrs = Addrs::default();
+        let recorded = Recorded::default();
+        addrs.set(&[addr("en0", "192.168.4.178")]);
+        let mut announcer = announcer(&addrs, &recorded);
+        announcer.check();
+        let guard = recorded.0.lock().unwrap();
+        let Some(Op::Register(info)) = guard.first() else {
+            panic!("expected a registration");
+        };
+        assert_ne!(info.get_hostname(), "plasma.local.");
+        assert_eq!(info.get_fullname(), "plasma._ikigai._udp.local.");
+    }
+
+    #[test]
+    fn routable_means_neither_loopback_nor_link_local() {
+        for ip in [
+            "192.168.4.178",
+            "10.0.0.2",
+            "fd4d:3dde:5b1:4894::1",
+            "2001:db8::1",
+        ] {
+            assert!(addr("en0", ip).is_routable(), "{ip} is routable");
+        }
+        for ip in ["127.0.0.1", "::1", "169.254.3.4", "fe80::1"] {
+            assert!(!addr("en0", ip).is_routable(), "{ip} is not");
+        }
+        assert!(is_apple_p2p("awdl0") && is_apple_p2p("llw0") && !is_apple_p2p("en0"));
+    }
+
     /// A REAL announce + browse over the loopback/LAN multicast group. Ignored by default:
     /// it needs multicast to work in the sandbox CI runs in, and on macOS it can trip the
     /// local-network privacy prompt. Run it by hand:
@@ -473,6 +1177,10 @@ mod tests {
         println!("heard: {peer:?}");
         assert_eq!(peer.port, 4499);
         assert_eq!(peer.surface.as_deref(), Some("host + fs + llm"));
-        assert!(!peer.addrs.is_empty(), "an address is what a mount needs");
+        assert!(
+            peer.addrs.iter().any(|ip| address_rank(ip) <= 1),
+            "a ROUTABLE address is what a mount on another machine needs; heard {:?}",
+            peer.addrs
+        );
     }
 }

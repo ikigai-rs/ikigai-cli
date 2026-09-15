@@ -12,3 +12,7 @@ repository.workspace = true
 # channels) — so discovery does not drag an async runtime into a kernel that
 # doesn't already have one.
 mdns-sd = { version = "0.20", default-features = false }
+# The host's own addresses, so an announcement puts an explicit, loggable, testable set in its
+# record instead of `enable_addr_auto`. Already in the graph (mdns-sd depends on it at ^0.15),
+# so this adds nothing to the build; keep the range in step with mdns-sd's to stay one copy.
+if-addrs = "0.15"
