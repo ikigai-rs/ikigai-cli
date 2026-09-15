@@ -304,7 +304,13 @@ fn localize(request: &mut Request, segment: &str) {
 /// Answer one [`Call`] against the local kernel, resolved under the connection's
 /// `session` (the principal the mTLS handshake authenticated), with its file namespace
 /// rooted at its segment.
-fn dispatch(kernel: &Kernel, call: Call, session: &Session) -> Reply {
+///
+/// Public so that ANOTHER transport answers calls through exactly this function
+/// (`ikigai-p2p`, behind its `p2p` feature): the clamp of a carried capability to the
+/// session, the capability-scoped `Entries`, and the per-call trace collector are the
+/// server half of capability-on-the-wire, and a second copy of them is how two doors
+/// to one kernel end up enforcing different rules.
+pub fn dispatch(kernel: &Kernel, call: Call, session: &Session) -> Reply {
     let issue = |mut request: Request, capability: &Capability| {
         localize(&mut request, &session.file_segment);
         match Resolver::issue_as(kernel, request, capability) {

@@ -167,14 +167,27 @@ fn parse(text: &str) -> Result<Enrolment, String> {
     })
 }
 
-/// Fold a fingerprint into its canonical form: lowercase, no colons or whitespace.
-/// `openssl` prints `AB:CD:…`; this file may say `abcd…`; they are the same client.
-fn normalize(fingerprint: &str) -> String {
-    fingerprint
+/// Fold an identity key into its canonical form.
+///
+/// A **certificate fingerprint** — 64 hex digits once colons and whitespace are gone —
+/// folds to lowercase: `openssl` prints `AB:CD:…`, this file may say `abcd…`, and they are
+/// the same client.
+///
+/// Anything else is kept **verbatim** (trimmed), because the same map also enrols a libp2p
+/// **PeerId** (`12D3KooW…`, see `docs/design/p2p-mobility-design.md`), and a PeerId is
+/// base58 — CASE-SENSITIVE. Folding it the way a fingerprint folds would turn every PeerId
+/// entry into a key no connection can ever present: fail-closed, but silently inert, which
+/// is the failure this file exists to refuse.
+fn normalize(key: &str) -> String {
+    let compact: String = key
         .chars()
         .filter(|c| !c.is_whitespace() && *c != ':')
-        .flat_map(char::to_lowercase)
-        .collect()
+        .collect();
+    if compact.len() == 64 && compact.chars().all(|c| c.is_ascii_hexdigit()) {
+        compact.to_ascii_lowercase()
+    } else {
+        key.trim().to_string()
+    }
 }
 
 /// Resolve an authenticated fingerprint to the authority its connection runs under,
@@ -260,6 +273,26 @@ mod tests {
         let e = enrolled(openssl, "contacts-ro");
         assert_eq!(e.grant_for(FP), Some("contacts-ro"));
         assert_eq!(e.grant_for(openssl), Some("contacts-ro"));
+    }
+
+    /// A libp2p PeerId enrols in the SAME map as a certificate fingerprint and names a grant
+    /// the same way — one table for one concept. It is base58 and case-sensitive, so it must
+    /// NOT fold the way a fingerprint folds: before this, `normalize` lowercased every key,
+    /// and a PeerId entry became a key no connection could ever present.
+    #[test]
+    fn a_peer_id_enrols_beside_a_fingerprint_and_keeps_its_case() {
+        let peer = "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN";
+        let e = parse(&format!(
+            r#"{{"clients": {{"{FP}": "everything", "{peer}": {{"grant": "contacts-ro", "label": "plasma over p2p"}}}}}}"#
+        ))
+        .unwrap();
+        assert_eq!(e.grant_for(peer), Some("contacts-ro"));
+        assert_eq!(e.grant_for(FP), Some("everything"));
+        // One character's case is a DIFFERENT key — never a fuzzy match onto a grant.
+        assert_eq!(e.grant_for(&peer.to_lowercase()), None);
+        let (grant, capability) = authority_in(&e, peer, &Capability::root(), grants).unwrap();
+        assert_eq!(grant, "contacts-ro");
+        assert!(!capability.allows("urn:cap:personal:calendar:read:detail"));
     }
 
     /// The bare-string entry form is equivalent to the object form.
