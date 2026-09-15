@@ -2549,6 +2549,7 @@ dependencies = [
 name = "ikigai-discovery"
 version = "0.1.21"
 dependencies = [
+ "if-addrs",
  "mdns-sd",
 ]
 

@@ -2042,10 +2042,15 @@ fn serve_quic(
         //
         // Held for the process lifetime: dropping it sends the mDNS goodbye, which is what
         // lets a peer distinguish "gone" from "never heard of".
+        //
+        // Every line it logs names the ADDRESSES in the record — or says nothing is
+        // announced because only loopback is up (an agent started at login, before DHCP) —
+        // and it re-announces by itself when the addresses change. A bare "announcing as
+        // plasma" once stayed true for an hour while the record held only 127.0.0.1.
         let _announcement = if announce {
             let name = ikigai_embedded::instance_name();
             let wire_version = ikigai_wire::PROTOCOL_VERSION.to_string();
-            match ikigai_discovery::announce(
+            match ikigai_discovery::announce_with(
                 name,
                 addr.port(),
                 &[
@@ -2053,14 +2058,9 @@ fn serve_quic(
                     (ikigai_discovery::TXT_CEILING, posture.as_str()),
                     (ikigai_discovery::TXT_VERSION, wire_version.as_str()),
                 ],
+                |event| eprintln!("ikigai: {event}"),
             ) {
-                Ok(handle) => {
-                    eprintln!(
-                        "ikigai: announcing as \"{name}\" on {}",
-                        ikigai_discovery::SERVICE_TYPE
-                    );
-                    Some(handle)
-                }
+                Ok(handle) => Some(handle),
                 // Not fatal: a kernel that cannot announce still serves everyone who knows
                 // its address. Loud, though — silently not announcing would look like a
                 // network with nobody on it.
