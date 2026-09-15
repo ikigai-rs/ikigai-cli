@@ -3116,6 +3116,7 @@ dependencies = [
  "ikigai-view",
  "ikigai-vocab",
  "ikigai-xslt",
+ "libc",
  "notify",
  "oxigraph",
  "oxrdf",
