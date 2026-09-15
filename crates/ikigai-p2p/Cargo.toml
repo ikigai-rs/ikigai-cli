@@ -28,12 +28,10 @@ p2p = [
 [dependencies]
 ikigai-core = { workspace = true, optional = true }
 # For `Session` and `dispatch` — the server half of capability-on-the-wire, shared rather
-# than copied. ⚠ The TRUE floor is the release after 0.1.21: `dispatch` becomes public in
-# this change, and 0.1.21 is already on crates.io without it. The pin cannot say 0.1.22 yet —
-# the path member still declares 0.1.21, and cargo refuses a requirement its path dep does
-# not meet — so it is satisfied by the PATH only. Harmless while `publish = false`; the day
-# this crate publishes, this line moves to the lockstep version that carries `dispatch`.
-ikigai-quic = { path = "../ikigai-quic", version = "0.1.21", optional = true }
+# than copied. ⚠ The TRUE floor is 0.1.22, which this line now names: `dispatch` became public
+# in #332, and 0.1.21 on crates.io does not have it. Satisfied by the path member until 0.1.22
+# is published; `publish = false` here means nothing outside this workspace resolves it.
+ikigai-quic = { path = "../ikigai-quic", version = "0.1.22", optional = true }
 ikigai-wire = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 tokio = { version = "1.53", default-features = false, features = ["rt-multi-thread", "macros", "time", "sync"], optional = true }
@@ -64,7 +62,7 @@ libp2p = { version = "0.57.0", default-features = false, optional = true, featur
 [dev-dependencies]
 # The host's own `clients.json`/`grants.json` reader, so a test proves a PeerId is
 # authorized by the SAME table as a certificate fingerprint rather than by a lookalike.
-ikigai-embedded = { path = "../ikigai-embedded", version = "0.1.21" }
+ikigai-embedded = { path = "../ikigai-embedded", version = "0.1.22" }
 
 # The off-LAN trial binaries. Run them with `--features p2p`; see the design note.
 [[example]]
