@@ -20,14 +20,24 @@
 //!
 //! ## How the parts fit
 //!
-//! - The HTTP adapter (`ikigai-web`) turns the first media type of `Accept` into the `as`
-//!   argument unless it is `*/*`, and query parameters into named arguments — so `src`
-//!   arrives as `src`, a browser's `text/html` arrives as `as`, and `curl`'s `*/*` arrives
-//!   as nothing. `as` is the adapter's argument, not declared here — and the adapter
-//!   RESERVES it, so `?as=…` on the query string is dropped and a plain link cannot
-//!   choose a face by it. `format=` is the declared way to do that (`html`, `rdfxml`,
-//!   `jsonld`, `turtle`, `ntriples`, `nquads`, `trig`); when present it wins, and
-//!   `Accept` decides only when it is absent.
+//! - The HTTP adapter (`ikigai-web`) negotiates `Accept` against the faces this endpoint
+//!   DECLARES — its `outputs`, since there is no `as` input here to carry a `one_of` — and
+//!   hands the winning face over as the `as` argument; query parameters arrive as named
+//!   arguments. So `src` arrives as `src`, a browser's `text/html` arrives as
+//!   `as=text/html`, and `curl`'s `*/*` (a preference for no face in particular) arrives
+//!   as nothing at all, which is what leaves the bare document as the answer to a caller
+//!   who asked for nothing.
+//! - ⚠ **`as` is the adapter's argument, not declared here — but it is no longer dropped.**
+//!   Since ikigai-web's conneg rewrite, `?as=…` on the query string is honoured, beats
+//!   `Accept`, and a face this endpoint does not declare is refused with a 406. `format=`
+//!   survives as this document's own closed vocabulary for the same job (`html`, `rdfxml`,
+//!   `jsonld`, `turtle`, `ntriples`, `nquads`, `trig`) — the channel a generated form can
+//!   render as a select — and when present it wins over both. 0.1.22 is the one release
+//!   where `Accept: text/html` did NOT reach the page: the adapter withheld `as` whenever
+//!   the negotiated face was the one it had guessed was this resource's default (the first
+//!   declared output, which is the HTML face), so the document answered instead. The fix
+//!   is in `ikigai-web`'s `negotiate`: a face the client named concretely is always handed
+//!   over, and `as` is withheld only for a client that named no face at all.
 //! - Every step is issued THROUGH the kernel (`inv.issue`), never called as a library:
 //!   `urn:httpGet` fetches, `urn:xslt:transform` styles, `urn:rdf:transrept` re-serializes,
 //!   `urn:jsonld:compact` shortens. That is what makes the capability, the cache and the
@@ -213,9 +223,9 @@ impl Endpoint for Foaf {
                 ArgSpec::new("format")
                     .class(XSD_STRING)
                     .summary(
-                        "the face, for a plain link (the adapter reserves `as`, so `?as=` is \
-                         dropped): html, rdfxml, jsonld, turtle, ntriples, nquads or trig. \
-                         When present it wins; `Accept` decides only when it is absent",
+                        "the face, for a plain link, as a closed set a form can render: \
+                         html, rdfxml, jsonld, turtle, ntriples, nquads or trig. When \
+                         present it wins; `as` and `Accept` decide only when it is absent",
                     )
                     .one_of(FORMATS.iter().copied())
                     .optional(),
@@ -240,8 +250,9 @@ impl Endpoint for Foaf {
     }
 }
 
-/// The face asked for. `format=` (a [`FORMATS`] name) wins when present — it is the only
-/// channel a plain link has, since the HTTP adapter reserves `as`. Otherwise `as`,
+/// The face asked for. `format=` (a [`FORMATS`] name) wins when present — a plain link's
+/// own channel, and the closed set a generated form renders. Otherwise `as`, which carries
+/// both an explicit `?as=` and whatever the HTTP adapter negotiated out of `Accept`,
 /// parameters stripped and lower-cased: absent, empty or `*/*` is the document itself.
 /// A value outside the set on either channel is a typed bad request naming that channel
 /// and the faces that exist.
@@ -855,5 +866,42 @@ mod tests {
         );
         assert_eq!(d.requires, vec!["urn:cap:net:*".to_string()]);
         assert!(d.verbs.contains(&Verb::Source));
+    }
+
+    /// ★ What an HTTP adapter negotiates `Accept` against is this description, read the way
+    /// `ikigai-web`'s `Faces::declared` reads it: the SOURCE action's `outputs`, because
+    /// there is no `as` input here to carry a `one_of` and a default. Two facts about that
+    /// list are load-bearing and neither is visible at the builder calls that produce it —
+    /// the flat `.output()` calls ARE the Source action's outputs (core synthesizes the
+    /// action from the flat fields), and the FIRST of them is not what a request carrying
+    /// no `as` returns. `urn:iki:foaf` declares the HTML face first because that is the
+    /// reading order of the form and the `format=` list, while the document itself
+    /// (`application/rdf+xml`) is what answers a caller who asked for nothing — see
+    /// `the_default_face_is_the_document_itself`. An adapter that reads declaration order
+    /// as a statement about the default face answers `Accept: text/html` with RDF/XML,
+    /// which is exactly what 0.1.22 shipped. Reorder FACES and this test says so.
+    #[test]
+    fn the_faces_an_adapter_negotiates_over_are_the_source_outputs() {
+        let d = Foaf.describe();
+        let source = d
+            .action_specs()
+            .into_iter()
+            .find(|a| a.verb == Verb::Source)
+            .expect("a Source action");
+        assert_eq!(
+            source.outputs,
+            FACES.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "every face, in declaration order"
+        );
+        assert!(
+            source.inputs.iter().all(|i| i.name != "as"),
+            "no `as` input, so nothing here DECLARES a default face"
+        );
+        assert_eq!(FACES[0], HTML);
+        assert_ne!(
+            FACES[0], RDF_XML,
+            "declaration order is not the default face: the first face is the page, the \
+             default is the document"
+        );
     }
 }
