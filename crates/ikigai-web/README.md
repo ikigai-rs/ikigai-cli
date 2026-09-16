@@ -59,9 +59,20 @@ for the verb: its `as` input's `one_of` when it has one, otherwise the verb's `o
   weight of the most specific range matching it (`text/turtle` over `text/*` over `*/*`),
   and the heaviest face wins, ties going to the default face (the `as` default, else the
   first declared).
-- When the default face wins — a `*/*` or `type/*` match, or no `Accept` at all — no `as`
-  is sent and the resource answers in its own default. A browser's navigation header
-  (`text/html,…,*/*;q=0.8`) therefore reads a plain-text resource rather than being refused.
+- The winning face is sent as `as` unless the client can be said not to have asked for it:
+  no `Accept` at all, or a winner that is the default face and was matched only by a
+  wildcard. Then no `as` is sent and the resource answers in its own default. A browser's
+  navigation header (`text/html,…,*/*;q=0.8`) therefore reads a plain-text resource
+  through its trailing `*/*` rather than being refused.
+- ⚠ How the winner was MATCHED decides that, never whether it equals the default:
+  `Accept: text/html` on a resource whose HTML face is its first declared output is a
+  request for HTML and is answered with `as=text/html`. (0.1.22 elided `as` there, and the
+  HTML face of `urn:iki:foaf` went missing over `Accept` while `?as=` still worked.)
+- The default face is the `as` input's `default_value` when the resource DECLARED one,
+  else this adapter's guess at the first declared face. A guess breaks ties but is not a
+  promise about the bytes a request carrying no `as` returns, so a guessed default only
+  elides `as` for a `*/*` client — one that reads anything, whatever the default turns out
+  to be. Declare `as` with `one_of` and a `default_value` to be negotiated for exactly.
 - Nothing acceptable is **`406 Not Acceptable`**, listing the faces. `Accept: text/turtle`
   on a plain-only resource is still refused.
 - **`?as=<type>`** names the face explicitly and beats `Accept` — a link in a page cannot

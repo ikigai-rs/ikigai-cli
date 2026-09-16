@@ -1232,6 +1232,12 @@ fn iri_from_path(path: &str) -> String {
 struct Faces {
     served: Vec<String>,
     default: Option<String>,
+    /// Whether `default` is what the resource SAID its default face is (an `as` input's
+    /// `default_value`) or what this adapter guessed from declaration order. A guess is
+    /// good enough to break a tie — first listed is a real preference order — but it is
+    /// not a promise about the bytes a request carrying no `as` gets back, so it cannot
+    /// license leaving `as` off a request whose client named a face.
+    default_declared: bool,
 }
 
 /// What negotiation decided to hand the resource as `as`.
@@ -1263,12 +1269,17 @@ impl Faces {
                 served.push(face);
             }
         }
-        let default = as_input
+        let declared_default = as_input
             .and_then(|i| i.default.as_deref())
             .map(bare_media)
-            .filter(|d| served.contains(d))
-            .or_else(|| served.first().cloned());
-        Faces { served, default }
+            .filter(|d| served.contains(d));
+        let default_declared = declared_default.is_some();
+        let default = declared_default.or_else(|| served.first().cloned());
+        Faces {
+            served,
+            default,
+            default_declared,
+        }
     }
 
     /// An explicit `?as=`: it names the face, and `Accept` is not consulted. Refused only
@@ -1286,8 +1297,21 @@ impl Faces {
     /// Each face scores the quality of the MOST SPECIFIC range that matches it (`type/sub`
     /// over `type/*` over `*/*`), so `text/plain;q=0, */*` excludes plain while admitting
     /// everything else. The highest non-zero score wins; ties go to the default face, then
-    /// to declaration order. A winner that is the default face is sent as no `as` at all —
-    /// the resource's own default answers, exactly as it does for a client with no `Accept`.
+    /// to declaration order.
+    ///
+    /// The winner is then NAMED as `as` unless the client can be said to have expressed no
+    /// preference for it — which is the case only when the winner is the default face AND
+    /// nothing in `Accept` named it concretely: a browser's trailing `*/*;q=0.8` tolerates
+    /// the default, it does not ask for it. Then no `as` is sent and the resource's own
+    /// default answers, exactly as it does for a client with no `Accept` at all. ⚠ How the
+    /// winner was MATCHED is what decides this, never whether it happens to equal the
+    /// default: `Accept: text/html` on a resource whose first declared output is
+    /// `text/html` is a request for HTML, and answering it with the resource's own default
+    /// is how the HTML face of `urn:iki:foaf` went missing in 0.1.22. When the default face
+    /// was only GUESSED from declaration order, that tolerance narrows once more: only a
+    /// `*/*` client gets `as` withheld, since it reads whatever the unknown default turns
+    /// out to be. A `type/*` client is handed the winning face by name instead, because a
+    /// guessed default may be a type that wildcard excludes and no one can ask the resource.
     ///
     /// A resource that declares no faces cannot be negotiated for, and is never refused: it
     /// is handed the client's most preferred concrete type (the only party that can judge it
@@ -1317,27 +1341,70 @@ impl Faces {
                 _ => Negotiated::Default,
             };
         }
-        let mut winner: Option<(&String, f32)> = None;
+        let mut winner: Option<(&String, Match)> = None;
         for face in &self.served {
-            let q = quality_of(face, &ranges);
-            if q <= 0.0 {
+            let Some(matched) = match_of(face, &ranges) else {
+                continue;
+            };
+            if matched.q <= 0.0 {
                 continue;
             }
             let better = match winner {
                 None => true,
                 Some((current, best)) => {
-                    q > best
-                        || (q == best && Some(face) == self.default.as_ref() && current != face)
+                    matched.q > best.q
+                        || (matched.q == best.q
+                            && Some(face) == self.default.as_ref()
+                            && current != face)
                 }
             };
             if better {
-                winner = Some((face, q));
+                winner = Some((face, matched));
             }
         }
         match winner {
             None => Negotiated::NotAcceptable,
-            Some((face, _)) if Some(face) == self.default.as_ref() => Negotiated::Default,
+            Some((face, matched))
+                if Some(face) == self.default.as_ref()
+                    && matched.tolerated_only(self.default_declared) =>
+            {
+                Negotiated::Default
+            }
             Some((face, _)) => Negotiated::Face(face.clone()),
+        }
+    }
+}
+
+/// How the range that decided a face's quality named it. Ordered least to most specific,
+/// so the derived `Ord` is the "most specific range wins" rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum MatchedBy {
+    /// `*/*` — this client reads anything, so it tolerates the face without asking for it.
+    AnyWildcard,
+    /// `type/*` — narrower, but still not a request for this particular face.
+    TypeWildcard,
+    /// `type/subtype` — the client named this face. That is a request, not tolerance.
+    Name,
+}
+
+/// One face's standing with a client: how it was named and at what quality.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Match {
+    by: MatchedBy,
+    q: f32,
+}
+
+impl Match {
+    /// Is this face merely TOLERATED — matched by a wildcard rather than named — so that
+    /// letting the resource answer with its own default serves the client as well as
+    /// naming the face would? `default_is_declared` says whether the resource told us what
+    /// its default face is: when it did not, only `*/*` is broad enough to be sure the
+    /// unknown default is acceptable, because a `type/*` client excludes whole types.
+    fn tolerated_only(&self, default_is_declared: bool) -> bool {
+        match self.by {
+            MatchedBy::Name => false,
+            MatchedBy::TypeWildcard => default_is_declared,
+            MatchedBy::AnyWildcard => true,
         }
     }
 }
@@ -1390,27 +1457,27 @@ fn parse_accept(accept: &str) -> Vec<MediaRange> {
     ranges
 }
 
-/// The quality a client gives `face`: the weight of the most specific range matching it,
-/// or 0 when nothing does.
-fn quality_of(face: &str, ranges: &[MediaRange]) -> f32 {
+/// How a client's `Accept` matches one face: the weight of the most specific range that
+/// matches it and how that range named it, or `None` when no range matches at all.
+fn match_of(face: &str, ranges: &[MediaRange]) -> Option<Match> {
     let (kind, subtype) = face.split_once('/').unwrap_or((face, ""));
-    let mut best: Option<(u8, f32)> = None;
+    let mut best: Option<Match> = None;
     for r in ranges {
-        let specificity = if r.kind == kind && r.subtype == subtype {
-            2
+        let by = if r.kind == kind && r.subtype == subtype {
+            MatchedBy::Name
         } else if r.kind == kind && r.subtype == "*" {
-            1
+            MatchedBy::TypeWildcard
         } else if r.kind == "*" && r.subtype == "*" {
-            0
+            MatchedBy::AnyWildcard
         } else {
             continue;
         };
         // The most specific range decides; among equally specific ranges, the first stated.
-        if best.is_none_or(|(s, _)| specificity > s) {
-            best = Some((specificity, r.q));
+        if best.is_none_or(|b| by > b.by) {
+            best = Some(Match { by, q: r.q });
         }
     }
-    best.map(|(_, q)| q).unwrap_or(0.0)
+    best
 }
 
 /// A media type without parameters, lowercased.
@@ -1952,6 +2019,32 @@ mod tests {
                 .verb(Verb::Source)
                 .output("text/plain"),
         );
+        // ★ The FOAF shape: several faces declared FLAT as outputs, HTML first, no `as`
+        // input at all — and a default representation (`application/rdf+xml`, the document
+        // itself) that is NOT the first declared output. Declaration order is a reading
+        // order, not a statement about what the resource returns when asked for nothing in
+        // particular, and the adapter must not read it as one. Echoes the `as` it was
+        // handed (or its own default when it was handed none) and the `fragment` flag,
+        // which rides the same request as an ordinary query argument.
+        let foaf_shaped = FnEndpoint::new("foaf-shaped", |inv: &Invocation<'_>| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!(
+                    "as={} fragment={}",
+                    inv.inline_str("as").unwrap_or("application/rdf+xml"),
+                    inv.inline_str("fragment").unwrap_or("-")
+                )
+                .into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("foaf-shaped")
+                .verb(Verb::Source)
+                .output("text/html")
+                .output("application/rdf+xml")
+                .output("application/ld+json")
+                .output("text/turtle"),
+        );
         // No faces declared at all.
         let undeclared = FnEndpoint::new("undeclared", echo_as)
             .with_description(Description::new("undeclared").verb(Verb::Source));
@@ -1992,6 +2085,7 @@ mod tests {
             .bind(UriTemplate::parse("urn:test:tpl:{name}").unwrap(), tpl)
             .bind(Exact::new("urn:test:faces"), faces)
             .bind(Exact::new("urn:test:plain-only"), plain_only)
+            .bind(Exact::new("urn:test:foaf-shaped"), foaf_shaped)
             .bind(Exact::new("urn:test:undeclared"), undeclared)
             .bind(Exact::new("urn:test:provenance"), provenance)
             .bind(Exact::new("urn:test:booking"), booking)
@@ -3170,10 +3264,12 @@ mod tests {
         .await
     }
 
+    /// The `/test/faces` shape: two faces and a DECLARED default (`as` … `default_value`).
     fn two_faces() -> Faces {
         Faces {
             served: vec!["text/plain".into(), "text/turtle".into()],
             default: Some("text/plain".into()),
+            default_declared: true,
         }
     }
 
@@ -3202,6 +3298,55 @@ mod tests {
                 "{who} on plain-only: {out}"
             );
         }
+    }
+
+    /// ★ The regression #333 shipped (0.1.22, caught on the live `urn:iki:foaf` edge): a
+    /// resource that declares its faces as flat `outputs` and whose own default is NOT the
+    /// first of them lost every face it declared first. A browser asks for `text/html`
+    /// CONCRETELY and at top quality; the adapter picked `text/html`, saw it equal the face
+    /// it had GUESSED was the default (the first output), and sent no `as` at all — so the
+    /// resource answered with its own default, `application/rdf+xml`, and the HTML page was
+    /// unreachable over `Accept` while `?as=text/html` still worked.
+    #[tokio::test]
+    async fn a_concretely_asked_face_is_named_even_when_it_is_the_first_declared_output() {
+        let addr = start().await;
+        for (who, accept) in [
+            ("chrome", CHROME),
+            ("firefox", FIREFOX),
+            ("safari", SAFARI),
+            ("a bare header", "text/html"),
+        ] {
+            let out = get(addr, "/test/foaf-shaped", Some(accept)).await;
+            assert!(out.starts_with("HTTP/1.1 200 "), "{who}: {out}");
+            assert!(
+                out.ends_with("as=text/html fragment=-"),
+                "{who} asked for HTML by name: {out}"
+            );
+        }
+        // The other faces were never broken — they are not the guessed default.
+        for face in ["application/ld+json", "text/turtle"] {
+            let out = get(addr, "/test/foaf-shaped", Some(face)).await;
+            assert!(out.ends_with(&format!("as={face} fragment=-")), "{out}");
+        }
+        // A client with no face preference still gets the resource's OWN default, not the
+        // first declared output: `*/*` and no `Accept` are not requests for HTML.
+        for (who, accept) in [("curl", Some(CURL)), ("no accept", None)] {
+            let out = get(addr, "/test/foaf-shaped", accept).await;
+            assert!(
+                out.ends_with("as=application/rdf+xml fragment=-"),
+                "{who}: {out}"
+            );
+        }
+    }
+
+    /// The fragment face is the same request with one more query argument: it broke with
+    /// the page face and comes back with it, rather than being a second code path here.
+    #[tokio::test]
+    async fn a_query_argument_rides_along_with_the_negotiated_face() {
+        let addr = start().await;
+        let out = get(addr, "/test/foaf-shaped?fragment=1", Some(CHROME)).await;
+        assert!(out.starts_with("HTTP/1.1 200 "), "{out}");
+        assert!(out.ends_with("as=text/html fragment=1"), "{out}");
     }
 
     /// A concrete preference for a served face is honoured, by quality, not by position.
@@ -3343,10 +3488,43 @@ mod tests {
         let faces = Faces {
             served: vec!["text/plain".into(), "application/ld+json".into()],
             default: Some("text/plain".into()),
+            default_declared: true,
         };
         assert_eq!(
             faces.negotiate(Some("application/*")),
             Negotiated::Face("application/ld+json".into())
+        );
+    }
+
+    /// Whether the default face was DECLARED or GUESSED decides how far tolerance goes.
+    /// A resource that named its default can answer a `text/*` client with it; one whose
+    /// default this adapter merely guessed from declaration order cannot be trusted to —
+    /// its real default may be a type that `text/*` excludes, and nothing can ask it — so
+    /// the winning face is named instead. `*/*` admits anything, so both elide.
+    #[test]
+    fn a_guessed_default_is_named_unless_the_client_reads_anything() {
+        assert_eq!(two_faces().negotiate(Some("text/*")), Negotiated::Default);
+        // The FOAF shape: faces read off `outputs`, so the default is a guess.
+        let guessed = Faces {
+            served: vec![
+                "text/html".into(),
+                "application/rdf+xml".into(),
+                "text/turtle".into(),
+            ],
+            default: Some("text/html".into()),
+            default_declared: false,
+        };
+        assert_eq!(guessed.negotiate(Some(CURL)), Negotiated::Default);
+        assert_eq!(guessed.negotiate(None), Negotiated::Default);
+        assert_eq!(
+            guessed.negotiate(Some("text/*")),
+            Negotiated::Face("text/html".into()),
+            "a guessed default cannot answer a client that excludes whole types"
+        );
+        assert_eq!(
+            guessed.negotiate(Some(CHROME)),
+            Negotiated::Face("text/html".into()),
+            "named concretely at the top quality: a request, not tolerance"
         );
     }
 
@@ -3363,13 +3541,18 @@ mod tests {
         let faces = Faces::declared(Some(&desc), Verb::Source);
         assert_eq!(faces.served, vec!["text/plain", "text/turtle"]);
         assert_eq!(faces.default.as_deref(), Some("text/turtle"));
+        assert!(faces.default_declared, "the resource named its default");
         let desc = Description::new("y")
             .verb(Verb::Source)
             .output("text/html")
             .output("application/json");
+        // Flat `.output()` faces ARE the declaration for a verb with no explicit
+        // `ActionSpec` — core synthesizes one from the flat fields. The default, though,
+        // is only this adapter's guess at declaration order.
         let faces = Faces::declared(Some(&desc), Verb::Source);
         assert_eq!(faces.served, vec!["text/html", "application/json"]);
         assert_eq!(faces.default.as_deref(), Some("text/html"));
+        assert!(!faces.default_declared, "nothing declared a default face");
         assert!(Faces::declared(None, Verb::Source).served.is_empty());
         // Faces are per verb: a Sink-only description declares none for Source.
         let desc = Description::new("z").verb(Verb::Sink).output("text/plain");
