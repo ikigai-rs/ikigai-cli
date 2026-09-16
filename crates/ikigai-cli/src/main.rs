@@ -251,6 +251,19 @@ struct Mount {
 /// function would then silently cover every flag after it too, which is the failure mode
 /// the lint exists to prevent. Named fields also make the call site say which `bool` is
 /// which.
+///
+/// ⚠ The `allow` is for the `web`-less build ONLY, where `serve_http` is the stub that
+/// exits with "needs the `web` feature". The struct is still CONSTRUCTED there (the
+/// dispatch arm is not feature-gated) and nothing reads it, so `-D dead-code` fires on
+/// every field. Invisible to `cargo clippy --all-features`; CI's default-feature job is
+/// what catches it.
+#[cfg_attr(
+    not(all(feature = "embedded", feature = "web")),
+    allow(
+        dead_code,
+        reason = "the web-less build hands this to a stub that exits"
+    )
+)]
 struct HttpDoor<'a> {
     /// `--http <port|host:port>`: a bare port binds loopback.
     bind: &'a str,
