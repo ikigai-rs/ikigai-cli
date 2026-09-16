@@ -28,7 +28,7 @@ use rustls::crypto::WebPkiSupportedAlgorithms;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
-use tokio::runtime::Runtime;
+use tokio::runtime::{Handle, Runtime};
 
 /// The ALPN protocol ids — since v7, exactly one: `ikigai/{PROTOCOL_VERSION}`.
 /// The TLS handshake IS the version gate on this transport; a version-mismatched
@@ -310,7 +310,41 @@ fn localize(request: &mut Request, segment: &str) {
 /// session, the capability-scoped `Entries`, and the per-call trace collector are the
 /// server half of capability-on-the-wire, and a second copy of them is how two doors
 /// to one kernel end up enforcing different rules.
+///
+/// ★ **A panic in an endpoint costs ONE CALL, never the connection.** Without this
+/// boundary the panic unwinds the door's task, the connection dies mid-stream, and the
+/// caller is told `unavailable: quic transport: read error: connection lost` — a
+/// diagnosis that names the transport for a fault that was never in it, with the real
+/// cause visible only in the server's own log. That misdirection was most of the cost of
+/// the mounted-resolver panic this crate also fixes, and it would be paid again by the
+/// next endpoint that panics for some other reason. The panic still prints through the
+/// default hook, so the server's log keeps the backtrace; what changes is that the client
+/// now learns a *typed* reason. It sits inside `dispatch` rather than in
+/// `serve_connection` deliberately: both doors that answer through here get it once.
 pub fn dispatch(kernel: &Kernel, call: Call, session: &Session) -> Reply {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        dispatch_call(kernel, call, session)
+    })) {
+        Ok(reply) => reply,
+        Err(payload) => Reply::ErrorTyped(ikigai_wire::WireError::Endpoint(format!(
+            "the server panicked handling this call: {}",
+            panic_message(payload)
+        ))),
+    }
+}
+
+/// The message a panic carried, for the two payload types `panic!` actually produces.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "panicked".to_string()
+}
+
+fn dispatch_call(kernel: &Kernel, call: Call, session: &Session) -> Reply {
     let issue = |mut request: Request, capability: &Capability| {
         localize(&mut request, &session.file_segment);
         match Resolver::issue_as(kernel, request, capability) {
@@ -378,7 +412,11 @@ pub fn connect_with(
 ) -> io::Result<QuicResolver> {
     let config = client_config(identity, trusted_server_cert_pem, idle)?;
     let runtime = Runtime::new()?;
-    let (endpoint, connection) = runtime.block_on(async move {
+    // ⚠ THE DIAL IS A `block_on` TOO, and it is the one that gets missed. A host that
+    // wrapped every mounted *call* off-thread and left the dial here still panics on the
+    // first resolve — measured in gonk 2026-09-16, and the reason `drive` is used here
+    // rather than a bare `runtime.block_on`.
+    let (endpoint, connection) = drive(&runtime, async move {
         let bind: SocketAddr = if addr.is_ipv6() {
             "[::]:0"
         } else {
@@ -390,21 +428,86 @@ pub fn connect_with(
         endpoint.set_default_client_config(config);
         let connection = dial(&endpoint, addr).await?;
         io::Result::Ok((endpoint, connection))
-    })?;
+    })??;
     Ok(QuicResolver {
-        runtime,
-        endpoint,
-        addr,
-        connection: Mutex::new(connection),
+        runtime: Some(runtime),
+        wire: Arc::new(Wire {
+            endpoint,
+            addr,
+            connection: Mutex::new(connection),
+        }),
         tracer: Mutex::new(None),
     })
 }
 
+/// Drive `future` to completion on `runtime` and hand its value back to this
+/// **synchronous** caller — which may itself be running on somebody else's tokio runtime.
+///
+/// ★ **A [`Resolver`] is a sync trait and this one owns a runtime, so every call is a
+/// `block_on`. Tokio panics — "Cannot start a runtime from within a runtime" — when
+/// `block_on` is entered from a thread that is already driving one**, and every wire door
+/// in the ecosystem dispatches from exactly such a thread ([`serve`] spawns each connection
+/// as a task; an inbound HTTP door resolves inside its async handler). So a mounted resolve
+/// from any of them did not fail, it PANICKED the worker — and the caller was told
+/// `connection lost`, with the real cause visible only in the server's log.
+///
+/// [`Handle::try_current`] is the detector, and the fix is to put the work somewhere that
+/// is not the caller's runtime. It goes on the resolver's OWN runtime — which already
+/// exists and already has worker threads — and this thread blocks on a channel for the
+/// answer. The alternatives were weighed and rejected:
+///
+/// - **A thread per call** (the shape `ikigai-gonk` derived for its mount) works and is
+///   what a host can build from outside, but it pays a thread spawn per resolve for a
+///   runtime we already own. Measured on a loopback round trip (release, 2000 calls after
+///   a warm-up, M-series): 55.6µs/call for a plain `block_on`, 53.1µs through this hop
+///   (free — within run-to-run noise), 67.0µs with a thread per call. So the thread costs
+///   ~12µs, which is ~25% of a loopback round trip and nothing at all against a real
+///   network hop or a model call — it is affordable, just unnecessary. Fixing it here
+///   instead of in each host is the point: every embedder otherwise re-derives the same
+///   wrapper, and one already had.
+/// - **`tokio::task::block_in_place`** is multi-thread-only, so it would make correctness
+///   depend on how the CALLER built its runtime — coupling that comes back.
+///
+/// Blocking a caller's worker thread is a real cost and is unavoidable: the trait is sync.
+/// It cannot deadlock, because the work makes progress on a different runtime's threads
+/// than the one being blocked — including when the caller is a current-thread runtime.
+///
+/// A panic inside the spawned task drops the sender, so it arrives here as a closed channel
+/// and becomes a typed [`Unavailable`](Error::Unavailable) naming the cause, rather than
+/// unwinding a door's worker.
+fn drive<T: Send + 'static>(
+    runtime: &Runtime,
+    future: impl std::future::Future<Output = T> + Send + 'static,
+) -> io::Result<T> {
+    if Handle::try_current().is_err() {
+        // Not on a runtime thread: this thread is ours to block, as it always was.
+        return Ok(runtime.block_on(future));
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    runtime.spawn(async move {
+        let _ = tx.send(future.await);
+    });
+    rx.recv()
+        .map_err(|_| io::Error::other("the resolver's task panicked before replying"))
+}
+
 /// A [`Resolver`] backed by a kernel server over QUIC.
 pub struct QuicResolver {
-    runtime: Runtime,
+    /// The resolver's own tokio runtime. `Option` ONLY so [`Drop`] can move it out and
+    /// hand it to a thread that is allowed to block; it is `Some` for every call.
+    runtime: Option<Runtime>,
+    /// The connection state, behind an `Arc` so a round trip can be a `'static` future
+    /// spawned onto [`runtime`](Self::runtime) (see [`drive`]).
+    wire: Arc<Wire>,
+    /// The tracer the `trace` command installs; when set, a resolution is sent as
+    /// [`Call::IssueTraced`] and the server's returned spans are forwarded here.
+    tracer: Mutex<Option<Arc<dyn Tracer>>>,
+}
+
+/// Everything a round trip touches, shared with the spawned task.
+struct Wire {
     /// The client endpoint — kept alive, and reused to re-`connect` when the current
-    /// connection has died (see [`round_trip`](Self::round_trip)).
+    /// connection has died (see [`round_trip`](Wire::round_trip)).
     endpoint: quinn::Endpoint,
     /// The server address, held so a dropped connection can be re-established.
     addr: SocketAddr,
@@ -412,12 +515,9 @@ pub struct QuicResolver {
     /// (a daemon's mount) must survive the peer restarting or an idle timeout, not wedge
     /// on the one connection it opened at startup.
     connection: Mutex<quinn::Connection>,
-    /// The tracer the `trace` command installs; when set, a resolution is sent as
-    /// [`Call::IssueTraced`] and the server's returned spans are forwarded here.
-    tracer: Mutex<Option<Arc<dyn Tracer>>>,
 }
 
-impl QuicResolver {
+impl Wire {
     /// One call → one bidirectional stream → one reply.
     ///
     /// A QUIC connection does not live forever: the peer may restart, or an idle spell may
@@ -427,23 +527,20 @@ impl QuicResolver {
     /// survives the reconnect (the peer is genuinely down) surfaces as normal, for the
     /// reliability overlays to treat as the transient [`Unavailable`](Error::Unavailable)
     /// it is.
-    fn round_trip(&self, call: Call) -> io::Result<Reply> {
-        let request = encode(&call)?;
-        self.runtime.block_on(async {
-            match self.attempt(&request).await {
-                Ok(reply) => Ok(reply),
-                Err(_) => {
-                    self.reconnect().await?;
-                    self.attempt(&request).await
-                }
+    async fn round_trip(&self, request: Vec<u8>) -> io::Result<Reply> {
+        match self.attempt(&request).await {
+            Ok(reply) => Ok(reply),
+            Err(_) => {
+                self.reconnect().await?;
+                self.attempt(&request).await
             }
-        })
+        }
     }
 
     /// One attempt on the current connection. Cloning the connection out of the lock
     /// (cheap — it is an `Arc` inside) keeps the guard from being held across an await.
     async fn attempt(&self, request: &[u8]) -> io::Result<Reply> {
-        let connection = { self.connection.lock().unwrap().clone() };
+        let connection = { self.connection().clone() };
         let (mut send, mut recv) = connection.open_bi().await.map_err(other)?;
         send.write_all(request).await.map_err(other)?;
         send.finish().map_err(other)?;
@@ -456,8 +553,43 @@ impl QuicResolver {
     /// taken only to swap the result in, after the await completes.
     async fn reconnect(&self) -> io::Result<()> {
         let connection = dial(&self.endpoint, self.addr).await?;
-        *self.connection.lock().unwrap() = connection;
+        *self.connection() = connection;
         Ok(())
+    }
+
+    /// The connection lock, taken through the poison. A panic while this lock was held
+    /// must cost one call, never wedge the mount for the life of the process: the guarded
+    /// value is a `quinn::Connection` handle, which no unwind can leave half-written.
+    fn connection(&self) -> std::sync::MutexGuard<'_, quinn::Connection> {
+        self.connection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl QuicResolver {
+    /// The resolver's runtime. See [`runtime`](Self::runtime) for why it is an `Option`.
+    fn runtime(&self) -> &Runtime {
+        self.runtime
+            .as_ref()
+            .expect("the resolver's runtime is taken only by Drop")
+    }
+
+    fn round_trip(&self, call: Call) -> io::Result<Reply> {
+        let request = encode(&call)?;
+        let wire = Arc::clone(&self.wire);
+        drive(
+            self.runtime(),
+            async move { wire.round_trip(request).await },
+        )?
+    }
+
+    /// The tracer lock, taken through the poison — same reasoning as
+    /// [`Wire::connection`].
+    fn tracer(&self) -> std::sync::MutexGuard<'_, Option<Arc<dyn Tracer>>> {
+        self.tracer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -465,10 +597,28 @@ impl Drop for QuicResolver {
     fn drop(&mut self) {
         // Tell the peer we're done so it stops promptly instead of waiting out
         // the idle timeout; then let the endpoint flush the close frame.
-        self.connection.lock().unwrap().close(0u32.into(), b"bye");
-        let _ = self.runtime.block_on(async {
-            tokio::time::timeout(std::time::Duration::from_secs(1), self.endpoint.wait_idle()).await
-        });
+        self.wire.connection().close(0u32.into(), b"bye");
+        let Some(runtime) = self.runtime.take() else {
+            return;
+        };
+        let wire = Arc::clone(&self.wire);
+        let flush = async move {
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(1), wire.endpoint.wait_idle())
+                    .await;
+        };
+        // ★ THE THIRD `block_on` SITE, and the one where a panic would be worst. Dropping
+        // a resolver from inside a runtime is ordinary — a mount released mid-resolution,
+        // a `LazyResolver` swapping a dead peer out — and here BOTH the flush and the
+        // `Runtime`'s own drop want to block, which tokio refuses on a runtime thread.
+        // So hand both to a thread that is allowed to block and do not wait for it: the
+        // close frame is best-effort by nature (the peer's idle timeout is the backstop),
+        // and a drop must not stall a caller's worker for up to a second.
+        if Handle::try_current().is_ok() {
+            std::thread::spawn(move || runtime.block_on(flush));
+        } else {
+            runtime.block_on(flush);
+        }
     }
 }
 
@@ -507,7 +657,7 @@ impl Resolver for QuicResolver {
         request: Request,
         capability: &Capability,
     ) -> Result<(Representation, CacheStatus), Error> {
-        let tracer = self.tracer.lock().expect("tracer lock").clone();
+        let tracer = self.tracer().clone();
         let call = if tracer.is_some() {
             Call::IssueTraced(
                 request,
@@ -546,11 +696,11 @@ impl Resolver for QuicResolver {
     }
 
     fn set_tracer(&self, tracer: Arc<dyn Tracer>) {
-        *self.tracer.lock().expect("tracer lock") = Some(tracer);
+        *self.tracer() = Some(tracer);
     }
 
     fn clear_tracer(&self) {
-        *self.tracer.lock().expect("tracer lock") = None;
+        *self.tracer() = None;
     }
 
     fn is_cached(&self, request: &Request, capability: &Capability) -> bool {
@@ -1536,12 +1686,157 @@ mod idle_timeout {
         .unwrap();
         std::thread::sleep(std::time::Duration::from_secs(3));
         let reason = {
-            let conn = client.connection.lock().unwrap().clone();
+            let conn = client.wire.connection().clone();
             conn.close_reason()
         };
         assert!(
             reason.is_some(),
             "a 1s idle must close a connection quiet for 3s"
         );
+    }
+}
+
+#[cfg(test)]
+mod runtime_reentrancy {
+    use super::*;
+    use ikigai_core::{
+        builtins, ArgRef, Capability, EndpointSpace, Error, Exact, FnEndpoint, Invocation, Iri,
+        Representation, Verb,
+    };
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::thread;
+
+    fn kernel() -> Kernel {
+        Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),
+        ))
+    }
+
+    /// Serve `kernel` at root on an ephemeral port until the client goes away. Returns
+    /// the address, a client identity pinned to it, the server's certificate, and the
+    /// serving thread.
+    fn serve_scratch(kernel: Kernel) -> (SocketAddr, Identity, String, thread::JoinHandle<()>) {
+        let server_id = generate();
+        let client_id = generate();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server_cfg = server_config(
+            &server_id,
+            std::slice::from_ref(&client_id.cert_pem),
+            DEFAULT_IDLE_TIMEOUT,
+        )
+        .unwrap();
+        let rt = Runtime::new().unwrap();
+        let endpoint = rt
+            .block_on(async { quinn::Endpoint::server(server_cfg, addr) })
+            .unwrap();
+        let server_addr = endpoint.local_addr().unwrap();
+        let kernel = Arc::new(kernel);
+        let session = Session {
+            capability: Capability::root(),
+            file_segment: String::new(),
+        };
+        let server = thread::spawn(move || {
+            rt.block_on(async move {
+                let incoming = endpoint.accept().await.unwrap();
+                let connection = incoming.await.unwrap();
+                serve_connection(&kernel, connection, &session).await;
+            });
+        });
+        (server_addr, client_id, server_id.cert_pem, server)
+    }
+
+    fn upper(word: &str) -> Request {
+        Request::new(Verb::Source, Iri::parse("urn:test:upper").unwrap())
+            .with_arg("in", ArgRef::Inline(word.as_bytes().to_vec()))
+    }
+
+    /// ★ **The regression test, and "from inside a runtime" IS the test.** Every other
+    /// test in this module dials and resolves from a plain thread, where `block_on` is
+    /// legal — which is exactly why a whole release shipped with every mounted call
+    /// panicking. The condition that triggers the bug had never been exercised.
+    ///
+    /// All three `block_on` sites are covered here, in the order a host hits them: the
+    /// DIAL inside `connect`, the round trip inside `issue`, and the `Drop` when the
+    /// resolver is released — each on a worker thread of somebody else's multi-thread
+    /// runtime, which is what `serve` and an inbound HTTP door both are.
+    #[test]
+    fn a_resolver_dials_resolves_and_drops_inside_someone_elses_runtime() {
+        let (server_addr, client_id, server_cert, server) = serve_scratch(kernel());
+        let caller = Runtime::new().unwrap();
+        let answer = caller.block_on(async move {
+            tokio::spawn(async move {
+                let client = connect(server_addr, &client_id, &server_cert).unwrap();
+                let (representation, _) = client.issue(upper("hi")).unwrap();
+                drop(client);
+                String::from_utf8(representation.bytes).unwrap()
+            })
+            .await
+            .expect("the mounted resolve must not panic the caller's worker")
+        });
+        assert_eq!(answer, "HI");
+        server.join().unwrap();
+    }
+
+    /// The same three sites from the OTHER runtime-thread shape: directly inside
+    /// `block_on`, which is where an inbound HTTP handler resolves. `Handle::try_current`
+    /// answers `Ok` here too, and a `block_on` would panic just the same.
+    #[test]
+    fn a_resolver_works_directly_inside_block_on() {
+        let (server_addr, client_id, server_cert, server) = serve_scratch(kernel());
+        let caller = Runtime::new().unwrap();
+        let answer = caller.block_on(async {
+            let client = connect(server_addr, &client_id, &server_cert).unwrap();
+            let (representation, _) = client.issue(upper("ok")).unwrap();
+            String::from_utf8(representation.bytes).unwrap()
+        });
+        assert_eq!(answer, "OK");
+        server.join().unwrap();
+    }
+
+    /// A panicking endpoint must cost ONE CALL, not the connection — and the caller must
+    /// be told what happened. Before the boundary in [`dispatch`], the panic unwound the
+    /// door's task, the stream died, and the client reported `read error: connection
+    /// lost`: the transport blamed for a fault that was never in it.
+    ///
+    /// (The panic still prints through the default hook, so this test is noisy on
+    /// purpose — that output is the server log keeping the backtrace.)
+    #[test]
+    fn an_endpoint_panic_becomes_a_typed_error_and_the_connection_survives() {
+        let boom = FnEndpoint::new(
+            "boom",
+            |_: &Invocation<'_>| -> Result<Representation, Error> {
+                panic!("the endpoint fell over")
+            },
+        );
+        let kernel = Kernel::new(Arc::new(
+            EndpointSpace::new()
+                .bind(Exact::new("urn:test:upper"), builtins::to_upper())
+                .bind(Exact::new("urn:test:boom"), boom),
+        ));
+        let (server_addr, client_id, server_cert, server) = serve_scratch(kernel);
+        let client = connect(server_addr, &client_id, &server_cert).unwrap();
+
+        let error = client
+            .issue(Request::new(
+                Verb::Source,
+                Iri::parse("urn:test:boom").unwrap(),
+            ))
+            .expect_err("a panicking endpoint must not resolve");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("panicked") && rendered.contains("the endpoint fell over"),
+            "the error must NAME the panic, not the transport: {rendered}"
+        );
+        assert!(
+            !rendered.contains("connection lost"),
+            "the connection must not be what the caller is told about: {rendered}"
+        );
+
+        // The connection is still usable — the whole point of catching it.
+        let (representation, _) = client.issue(upper("after")).unwrap();
+        assert_eq!(String::from_utf8(representation.bytes).unwrap(), "AFTER");
+        drop(client);
+        server.join().unwrap();
     }
 }
