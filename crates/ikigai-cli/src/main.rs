@@ -243,6 +243,29 @@ struct Mount {
     kind: ikigai_embedded::MountKind,
 }
 
+/// Everything `serve --http` was told, in one value.
+///
+/// A struct rather than eight positional arguments, and not to placate
+/// `clippy::too_many_arguments`: the door had already reached the limit, so the next flag
+/// was always going to be added either here or under an `#[allow]` — and an allow on this
+/// function would then silently cover every flag after it too, which is the failure mode
+/// the lint exists to prevent. Named fields also make the call site say which `bool` is
+/// which.
+struct HttpDoor<'a> {
+    /// `--http <port|host:port>`: a bare port binds loopback.
+    bind: &'a str,
+    /// `--cap`: the fixed ceiling every request resolves under. Empty ⇒ the public
+    /// (empty-scope) capability.
+    caps: &'a [String],
+    trust_proxy: bool,
+    cors_origins: &'a [String],
+    routes: Option<&'a str>,
+    routes_only: bool,
+    max_body: Option<usize>,
+    /// `--mount`/`--override`/`--prefer`, or the machine's topology from the config home.
+    mounts: Vec<Mount>,
+}
+
 /// Whether a `serve`/`--connect` target names a QUIC endpoint.
 fn is_quic(target: &str) -> bool {
     target.starts_with("quic://")
@@ -828,15 +851,16 @@ fn main() {
             max_body,
         } => match (http, target.as_deref()) {
             // The inbound HTTP face takes precedence over IPC/QUIC when `--http` is given.
-            (Some(bind), _) => serve_http(
-                &bind,
-                &caps,
+            (Some(bind), _) => serve_http(HttpDoor {
+                bind: &bind,
+                caps: &caps,
                 trust_proxy,
-                &cors_origins,
-                routes.as_deref(),
+                cors_origins: &cors_origins,
+                routes: routes.as_deref(),
                 routes_only,
                 max_body,
-            ),
+                mounts,
+            }),
             (None, Some(t)) if is_quic(t) => serve_quic(t, &certs, &caps, announce, mounts),
             (None, _) if !caps.is_empty() => {
                 eprintln!("ikigai: --cap sets a per-connection ceiling and needs a quic:// target");
@@ -2309,15 +2333,17 @@ fn serve_ipc(_path: Option<String>, _mounts: Vec<Mount>) -> ! {
 /// S0 resolves every request under the public capability; the per-tenant door (the
 /// identity→capability lookup) fills the same seam in a later slice.
 #[cfg(all(feature = "embedded", feature = "web"))]
-fn serve_http(
-    bind: &str,
-    caps: &[String],
-    trust_proxy: bool,
-    cors_origins: &[String],
-    routes: Option<&str>,
-    routes_only: bool,
-    max_body: Option<usize>,
-) -> ! {
+fn serve_http(door: HttpDoor<'_>) -> ! {
+    let HttpDoor {
+        bind,
+        caps,
+        trust_proxy,
+        cors_origins,
+        routes,
+        routes_only,
+        max_body,
+        mounts,
+    } = door;
     use std::net::SocketAddr;
     let addr: SocketAddr = if let Ok(port) = bind.parse::<u16>() {
         SocketAddr::from(([127, 0, 0, 1], port))
@@ -2330,7 +2356,58 @@ fn serve_http(
             }
         }
     };
-    let kernel = std::sync::Arc::new(ikigai_embedded::kernel_for("Remote (HTTP)"));
+    // Flags are POSTURE and win wholesale when given; otherwise the machine's own topology
+    // from the config home — the same rule as serve_ipc and serve_quic. Until 2026-09-16
+    // this door had none of it: `Mode::Serve` destructured `mounts`, handed them to the
+    // other two doors, and dropped them here. No warning, no refusal, exit 0.
+    let mounts = match mounts_or_config(mounts) {
+        Ok(mounts) => mounts,
+        // A topology that does not parse must never look like no topology.
+        Err(e) => {
+            eprintln!("ikigai: {e}");
+            std::process::exit(2);
+        }
+    };
+    // ⚠ NO SELF-MOUNT GUARD HERE, and that is a decision rather than an omission. The
+    // guard the other two doors run asks "does this mount target the address I am about to
+    // serve on?" — answerable there because an IPC server IS a socket path and a QUIC
+    // server IS a UDP address, which is exactly what a mount line names. This door serves
+    // TCP HTTP, which is not a mountable target at all (`resolve_mount` takes `quic://`,
+    // `peer:`, or a Unix socket path), so no config line can point at us. Copying the QUIC
+    // guard would be worse than nothing: it compares host:port, so `serve --http 4433`
+    // beside another process's QUIC server on UDP/4433 would silently SKIP a legitimate
+    // mount.
+    //
+    // Connect the mounts BEFORE announcing readiness, exactly as the other two doors do: a
+    // host that says it is serving and then cannot reach the peer it was told to compose is
+    // worse than one that refuses to start. (`--prefer` is exempt — its peer being absent is
+    // normal, and it dials on demand.)
+    let mut resolved = Vec::new();
+    for mount in mounts {
+        match resolve_mount(mount) {
+            Ok(spec) => resolved.push(spec),
+            Err(e) => {
+                eprintln!("ikigai: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+    let mount_note = if resolved.is_empty() {
+        String::new()
+    } else {
+        // The QUIC banner has always printed this; the HTTP banner printed a full posture
+        // line without it — so the ONE place the missing mounts would have shown was the
+        // one place the count was left out.
+        format!("; {} mount(s)", resolved.len())
+    };
+    // `kernel_for_with_mounts`, NOT `served_kernel_with_mounts`: this door's kernel also
+    // carries `urn:iki:foaf` and the transreption chain it issues through (the `/foaf`
+    // face on the public edge), which the QUIC composer does not. And it stays the PUBLIC
+    // kernel — a mount widens reach, never authority.
+    let kernel = std::sync::Arc::new(ikigai_embedded::kernel_for_with_mounts(
+        "Remote (HTTP)",
+        resolved,
+    ));
     // `--cap` clamps every request to a fixed ceiling — how the public HTTP face is
     // narrowed for the edge (a request can reach only what the ceiling grants). Without
     // it, the public (empty-scope) capability: only cap-free resources resolve.
@@ -2445,7 +2522,7 @@ fn serve_http(
         "no proxy trust"
     };
     eprintln!(
-        "ikigai: serving HTTP on {addr}  ({posture}; {route_note}; {cors_note}; {proxy_note}; terminate TLS at your proxy)  (Ctrl-C to stop)"
+        "ikigai: serving HTTP on {addr}{mount_note}  ({posture}; {route_note}; {cors_note}; {proxy_note}; terminate TLS at your proxy)  (Ctrl-C to stop)"
     );
     match runtime.block_on(ikigai_web::serve_with(kernel, cap_fn, addr, config)) {
         Ok(()) => std::process::exit(0),
@@ -2457,15 +2534,7 @@ fn serve_http(
 }
 
 #[cfg(not(all(feature = "embedded", feature = "web")))]
-fn serve_http(
-    _bind: &str,
-    _caps: &[String],
-    _trust_proxy: bool,
-    _cors_origins: &[String],
-    _routes: Option<&str>,
-    _routes_only: bool,
-    _max_body: Option<usize>,
-) -> ! {
+fn serve_http(_door: HttpDoor<'_>) -> ! {
     eprintln!("ikigai: the inbound HTTP face needs the `web` feature (build with --features web)");
     std::process::exit(1);
 }
