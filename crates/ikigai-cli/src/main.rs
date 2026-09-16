@@ -1360,10 +1360,12 @@ fn resolve_mount(mount: Mount) -> Result<ikigai_embedded::MountSpec, String> {
 /// re-establish their own connections (`QuicResolver::round_trip` redials on any
 /// transport error; `IpcResolver::round_trip` heals a dead connection on use),
 /// so a peer that goes and returns is handled a layer down.
-/// Dropping it here instead looks tempting and wedges the REPL: `QuicResolver`'s
-/// `Drop` blocks on its runtime to flush the close frame, and doing that from
-/// inside a resolution — which is already running under a runtime — is exactly
-/// the context where blocking is not allowed.
+/// Dropping it here instead looks tempting and is still not what this does — but the
+/// reason has changed. Until 2026-09-16 `QuicResolver::drop` called `block_on` on its own
+/// runtime, so releasing a resolver from inside a resolution (which runs under a runtime)
+/// was the context where blocking is not allowed. `ikigai-quic` now detects that and hands
+/// the flush to a thread of its own, so a drop here would be SAFE; it is simply not needed,
+/// because the transport heals its own connection a layer down.
 struct LazyResolver {
     target: String,
     certs: Certs,
