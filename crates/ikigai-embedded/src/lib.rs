@@ -5275,6 +5275,29 @@ pub fn trusted_kernel_with_mounts(nature: &'static str, mounts: Vec<MountSpec>) 
 /// the surface allowlist, the capability the authority ceiling, and this list is what
 /// those two gate. The QUIC face ([`served_kernel`]) is unchanged.
 pub fn kernel_for(nature: &'static str) -> Kernel {
+    kernel_for_with_mounts(nature, Vec::new())
+}
+
+/// [`kernel_for`], composing remote kernels into the HTTP door's surface — the third
+/// face of THE HOST OWNS THE TOPOLOGY, beside [`served_kernel_with_mounts`] (QUIC) and
+/// [`trusted_kernel_with_mounts`] (IPC). `ikigai serve --http` took `--mount`/
+/// `--override`/`--prefer` and silently discarded every one of them until 2026-09-16:
+/// the flags parsed, the process started, the banner printed, and the namespace simply
+/// was not there (404, and zero mounted rows in the catalog).
+///
+/// ⚠ **This is a separate composer on purpose — do NOT route this door through
+/// [`served_kernel_with_mounts`] to get mounts.** The two kernels differ: only this one
+/// carries `urn:iki:foaf` and the transreption chain it issues through, which is the
+/// `/foaf` face on the live public edge. Swapping composers would compile, pass every
+/// gate, and drop that face — a path that already regressed once this month.
+///
+/// ⚠ **And it stays the PUBLIC kernel.** `serve_ipc` uses [`trusted_kernel_with_mounts`],
+/// which is right for a Unix socket and wrong here. A mount widens REACH, never
+/// authority: a request still resolves under the door's `--cap` ceiling (or the public,
+/// empty capability), and that capability travels to the mounted peer, which clamps it
+/// again. Promoting this door to a trusted kernel in order to reach a peer would hand
+/// every anonymous HTTP caller the operator's own authority.
+pub fn kernel_for_with_mounts(nature: &'static str, mounts: Vec<MountSpec>) -> Kernel {
     let spaces: Vec<Arc<dyn Space>> = vec![
         Arc::new(served_space(nature)) as Arc<dyn Space>,
         // `urn:iki:foaf`, the negotiated FOAF face (see [`foaf`]), routed as `/foaf` on the
@@ -5289,7 +5312,7 @@ pub fn kernel_for(nature: &'static str) -> Kernel {
         Arc::new(ikigai_xslt::space()) as Arc<dyn Space>,
         Arc::new(ikigai_jsonld::space()) as Arc<dyn Space>,
     ];
-    Kernel::with_meta_renderer(Arc::new(Fallback::new(spaces)), Arc::new(CliRenderer))
+    Kernel::with_meta_renderer(compose_mounts(spaces, mounts), Arc::new(CliRenderer))
         // ★ A CLOCK, and it is not decoration — this door was built without one until
         // 0.1.20 and that made every time-bounded result on it UNCACHEABLE.
         //
@@ -5308,6 +5331,10 @@ pub fn kernel_for(nature: &'static str) -> Kernel {
         // and the types are identical, so the difference is invisible to every test that
         // builds only one of them.
         .with_clock(Arc::new(SystemClock))
+        // ⚠ Same ordering caveat as `served_kernel_with_mounts`: `with_aliases` wraps the
+        // ROOT and the mounts were composed into it above, so a `--prefer urn:fn:=…` mount
+        // sits INSIDE the alias and never sees a `urn:fn:` request again — the rewrite
+        // happens first. A mount over this family must name `urn:iki:fn:`.
         .with_aliases(base_alias_table())
 }
 
@@ -6824,6 +6851,91 @@ mod tests {
             Some("test://peer"),
             "an override-mounted entry names where it resolves"
         );
+    }
+
+    /// The catalog the HTTP door serves, as text — what a client sees at the edge, and
+    /// what the absence of the mount was originally detected by ("the served catalog
+    /// carries zero `urn:llm:` rows").
+    fn http_catalog(kernel: &Kernel) -> String {
+        let request = Request::new(
+            Verb::Source,
+            Iri::parse("urn:kernel:catalog").expect("a constant IRI"),
+        );
+        let representation = block_on(kernel.issue(request, &Capability::root()))
+            .expect("the catalog resolves on the HTTP door");
+        String::from_utf8_lossy(&representation.bytes).into_owned()
+    }
+
+    fn peer_mount(kind: MountKind) -> MountSpec {
+        MountSpec {
+            prefix: "urn:py:".to_string(),
+            origin: "test://peer".to_string(),
+            resolver: Arc::new(ListingPeer),
+            kind,
+        }
+    }
+
+    /// ★ `serve --http` took `--mount`/`--override`/`--prefer` and silently discarded
+    /// every one of them: `serve_http` had no `mounts` parameter at all and built a bare
+    /// `kernel_for`. Measured against 0.1.23 — the process started normally, the banner
+    /// printed a full posture line, `/llm/ollama/up` returned 404, and the served catalog
+    /// carried zero mounted rows. Exit 0 throughout.
+    ///
+    /// The control matters as much as the assertion: the same catalog on the same door
+    /// with no mounts must NOT carry the prefix, or this test would pass on the bug.
+    #[test]
+    fn the_http_door_composes_its_mounts() {
+        for kind in [MountKind::Alias, MountKind::Override, MountKind::Prefer] {
+            let mounted = http_catalog(&kernel_for_with_mounts(
+                "Remote (HTTP)",
+                vec![peer_mount(kind)],
+            ));
+            assert!(
+                mounted.contains("urn:py:hello"),
+                "a {kind:?} mount must reach the HTTP door's catalog: {mounted}"
+            );
+        }
+        let bare = http_catalog(&kernel_for("Remote (HTTP)"));
+        assert!(
+            !bare.contains("urn:py:hello"),
+            "the control: with no mounts the prefix is absent"
+        );
+    }
+
+    /// ⚠ The regression this composer exists to avoid. `kernel_for` is its OWN composer,
+    /// not `served_kernel_with_mounts`: it carries `urn:iki:foaf`, the negotiated FOAF
+    /// face routed as `/foaf` on the live public edge, and the QUIC composer does not.
+    /// Reaching for the existing mounted builder instead of mirroring its composition
+    /// here would compile, pass every other gate, and quietly take `/foaf` off
+    /// `ikigai-rs.dev` — a path that already regressed once this month.
+    #[test]
+    fn the_foaf_face_survives_mount_composition() {
+        for mounts in [Vec::new(), vec![peer_mount(MountKind::Override)]] {
+            let kernel = kernel_for_with_mounts("Remote (HTTP)", mounts);
+            // Bound (it enumerates). ⚠ The catalog names a LOCAL endpoint by its skolem
+            // id, not by the IRI it resolves at — `<urn:ikigai:endpoint:foaf>`, never
+            // `urn:iki:foaf` — so this cannot be grepped for the resolvable name. (A
+            // MOUNTED row does carry its prefix, which is the only reason the absent
+            // mounts above were detectable in the catalog at all.)
+            assert!(
+                http_catalog(&kernel).contains("<urn:ikigai:endpoint:foaf>"),
+                "the FOAF face must stay on the HTTP door's catalog"
+            );
+            // … and routable: Meta reaches the endpoint itself, without the network the
+            // FOAF face's Source would want.
+            let described = block_on(kernel.issue(
+                Request::new(
+                    Verb::Meta,
+                    Iri::parse(foaf::RESOURCE).expect("a constant IRI"),
+                ),
+                &Capability::root(),
+            ));
+            assert!(
+                described.is_ok(),
+                "`{}` must still route: {described:?}",
+                foaf::RESOURCE
+            );
+        }
     }
 
     /// A kernel with just the client endpoints, rooted at a scratch directory.
