@@ -129,6 +129,15 @@ pub(crate) fn setup() -> Option<Browse> {
     // the shared store gets NOTHING automatically, so load the bundled ikigai
     // vocabulary the way space()'s private per-query store always has it.
     // Idempotent — same triples into the same named graph on every start.
+    //
+    // ⚠ That named graph is the reason this host's `ikigai-browse` floor is 0.4.0: through
+    // 0.3.2 browse read with no graph at all, which matches EVERY graph in the store, so
+    // browse's reads were scanning this vocabulary in production. Nothing matched (the
+    // vocabulary declares no `oa:` term at all), which is luck about the data rather than
+    // a property of the code. 0.4.0 confines a mount's reads to its own graph — for a
+    // mount that names none, the DEFAULT graph, which is where browse has always written.
+    // `tests/browse_graph.rs` holds that over this composition. This host does NOT call
+    // `Mount::graph`: see the manifest pin for the four obligations opting in would owe.
     ikigai_sparql::load_vocabulary(&store)
         .unwrap_or_else(|e| panic!("ikigai: loading the vocabulary into browse.store: {e:?}"));
 

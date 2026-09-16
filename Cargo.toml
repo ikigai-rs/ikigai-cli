@@ -246,7 +246,23 @@ ikigai-repo = "0.1.6" # A floor a test in this repo actually holds, rather than 
 # Repository browsing (urn:repo:{root}:tree/file/state/hash/explain +
 # urn:iki:annotation:*) over configured roots — opt-in via `browse.root` config lines
 # (embedded host).
-ikigai-browse = "0.3.2" # 0.3.2 declares `content` on the annotation Sink — the piped body was
+ikigai-browse = "0.4.0" # A READ-CONFINEMENT floor, and it is about THIS host's COMPOSITION
+# rather than about an API we call. Through 0.3.2 every browse read passed `None` for the
+# graph, which in `quads_for_pattern` means EVERY graph in the store — while this host loads
+# the bundled vocabulary into the NAMED graph `urn:ikigai:vocab` in that same shared store
+# (`ikigai_sparql::load_vocabulary`, called from `crates/ikigai-embedded/src/browse.rs`). So
+# browse's reads have been scanning another writer's graph in production. Nothing ever
+# matched — no vocabulary subject is an `oa:Annotation` — which is luck about the data, not a
+# property of the code. 0.4.0 is the first version whose reads are confined to the mount's
+# graph; for a mount that names none, that is the DEFAULT graph, which is where browse has
+# always written. `crates/ikigai-embedded/tests/browse_graph.rs` holds the confinement over
+# this host's own composition, with a decoy annotation planted in the vocabulary graph.
+# ⛔ This host deliberately does NOT call `Mount::graph`. Naming a graph is an opt-in that
+# owes four things browse documents — the `migrate-annotation-ns --graph` run (or the archive
+# reads EMPTY), narrow `urn:cap:store:{read,write}:graph:<iri>` grants, a redone freshness
+# argument, and any cross-graph query rewritten — and none of that is prepared here. Default
+# is what this host had, byte for byte; only the cross-graph reads stop.
+# 0.3.2 declares `content` on the annotation Sink — the piped body was
 # undeclared, and on this host the engine routes a pipe BY the declaration, so minting an
 # annotation from a pipe was not a thing the REPL could do. It also fixes three `as` defaults
 # that were not members of their own `one_of` (a contract that cannot be satisfied by taking
