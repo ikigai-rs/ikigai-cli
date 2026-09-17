@@ -10,3 +10,7 @@
 *~undo-tree~
 \#*\#
 .\#*
+
+# Claude Code session state — local to a machine, never shared
+.claude/settings.local.json
+.claude/worktrees/
