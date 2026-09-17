@@ -1451,6 +1451,20 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Connect once the server thread has bound its socket — polling rather than
+    /// sleeping a guess, but BOUNDED: an unbounded `loop` that never connects is a
+    /// hung CI job with no diagnosis, which is the same class of failure this whole
+    /// change is about.
+    fn connect_when_up(path: &Path) -> IpcResolver {
+        for _ in 0..200 {
+            if let Ok(client) = connect(path) {
+                return client;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the test server never came up at {}", path.display());
+    }
+
     /// ★ The case with NO COVERAGE before ledger #404, and the reason it shipped: a peer
     /// that ACCEPTS the connection, completes the version hello, and then answers nothing
     /// at all. A refused connect fails fast and a dead socket fails fast; only *accepted
@@ -1648,11 +1662,7 @@ mod tests {
                     let _ = serve(kernel(), &live_path);
                 }
             });
-            let healthy = loop {
-                if let Ok(client) = connect(&live_path) {
-                    break client;
-                }
-            };
+            let healthy = connect_when_up(&live_path);
             let silent = connect_with_timeout(&silent_path, Some(Duration::from_secs(30)))
                 .unwrap()
                 .with_describe_timeout(Some(BOUND));
@@ -1902,12 +1912,8 @@ mod tests {
                     let _ = serve(kernel(), &path);
                 }
             });
-            // Wait for the socket to appear rather than sleeping a guess.
-            let client = loop {
-                if let Ok(client) = connect(&path) {
-                    break client.with_describe_timeout(Some(Duration::from_secs(30)));
-                }
-            };
+            let client =
+                connect_when_up(&path).with_describe_timeout(Some(Duration::from_secs(30)));
             let mounted = MountedRemote::new(Arc::new(client), "urn:edge:", "ipc:healthy.sock");
 
             let start = std::time::Instant::now();
