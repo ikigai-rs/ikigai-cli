@@ -1478,6 +1478,18 @@ impl ikigai_resolve::Resolver for LazyResolver {
     }
 
     fn entries(&self) -> Option<Vec<ikigai_core::SpaceEntry>> {
+        self.try_entries().ok().flatten()
+    }
+
+    /// The enumeration, keeping the failure — with ONE failure deliberately swallowed.
+    ///
+    /// ★ A `--prefer` mount's whole contract is that the peer may be absent, so a peer
+    /// that will not DIAL is normal operation, not a degraded catalog: reporting it as an
+    /// error would put a "mount unavailable" row in the manifold of every laptop whose
+    /// workstation is asleep. A peer that is CONNECTED and then goes silent is the
+    /// opposite — it was there, its resources are real, and the catalog is now missing
+    /// them — so that error propagates.
+    fn try_entries(&self) -> Result<Option<Vec<ikigai_core::SpaceEntry>>, ikigai_core::Error> {
         // An explicit enumeration deserves the truth: dial if we never have.
         // Without this, a prefer-mounted namespace the local kernel does not
         // also bind was INVISIBLE to `list` until something else used the peer
@@ -1486,20 +1498,20 @@ impl ikigai_resolve::Resolver for LazyResolver {
         // dial budget) and paid at most once per ENTRIES_REDIAL_AFTER while
         // the peer is asleep — resolutions keep their retry-on-every-use.
         if let Some(resolver) = self.inner.lock().unwrap().clone() {
-            return resolver.entries();
+            return resolver.try_entries();
         }
         {
             let failed = self.entries_failed.lock().unwrap();
             if let Some(at) = *failed {
                 if at.elapsed() < ENTRIES_REDIAL_AFTER {
-                    return None; // asleep a moment ago; don't stall every list
+                    return Ok(None); // asleep a moment ago; don't stall every list
                 }
             }
         }
         match self.get() {
             Ok(resolver) => {
                 *self.entries_failed.lock().unwrap() = None;
-                resolver.entries()
+                resolver.try_entries()
             }
             Err(_) => {
                 // Native-only: `ikigai-cli` is the host BINARY — clap, the QUIC/IPC transports,
@@ -1511,7 +1523,7 @@ impl ikigai_resolve::Resolver for LazyResolver {
                 #[allow(clippy::disallowed_methods)]
                 let failed_at = std::time::Instant::now();
                 *self.entries_failed.lock().unwrap() = Some(failed_at);
-                None
+                Ok(None)
             }
         }
     }
@@ -1628,6 +1640,29 @@ fn resolve_peer(name: &str, _certs: &Certs) -> Result<(String, Certs), String> {
     ))
 }
 
+/// The deadline a mounted peer's SELF-DESCRIPTION runs under: `describe.timeout`
+/// (seconds) in the host config, else the transport default. `0` takes the bound off.
+///
+/// One key for both transports on purpose. What it bounds is a peer describing itself —
+/// an enumeration, or one endpoint's contract — and that is the same act whether the peer
+/// is behind a Unix socket or a QUIC connection. Two keys would make a federation's
+/// legibility depend on which socket a peer happened to be reached through, which is not a
+/// distinction an operator is thinking about when their catalog stops returning.
+///
+/// Config home, not an environment variable. ⚠ Raise it when the federation is DEEP:
+/// enumeration is transitive and the bound is per hop, so three kernels deep the outermost
+/// one needs headroom for both the hops below it.
+#[cfg(feature = "embedded")]
+fn describe_timeout(default: std::time::Duration) -> Option<std::time::Duration> {
+    match ikigai_embedded::config::get("describe.timeout")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        Some(0) => None,
+        Some(secs) => Some(std::time::Duration::from_secs(secs)),
+        None => Some(default),
+    }
+}
+
 /// The QUIC idle timeout: `quic.timeout` (seconds) in the host config, else the
 /// generous default. Like `ipc.timeout` (#259), what this bounds is SILENCE — and for
 /// a long resolution the silence is the work.
@@ -1649,7 +1684,8 @@ fn connect_mount_quic(
     let identity = quic::client_identity(certs)?;
     let trusted = quic::trusted_server_cert(certs)?;
     let resolver = ikigai_quic::connect_with(addr, &identity, &trusted, quic_idle_timeout())
-        .map_err(|e| format!("{flag}: connect {target}: {e}"))?;
+        .map_err(|e| format!("{flag}: connect {target}: {e}"))?
+        .with_describe_timeout(describe_timeout(ikigai_quic::DEFAULT_DESCRIBE_TIMEOUT));
     Ok(std::sync::Arc::new(resolver))
 }
 
@@ -1679,7 +1715,8 @@ fn connect_mount_ipc(
         _ => ikigai_ipc::HelloMode::Verbatim,
     };
     let resolver = ikigai_ipc::connect_as(std::path::Path::new(socket), mode)
-        .map_err(|e| format!("{flag}: connect {socket}: {e}"))?;
+        .map_err(|e| format!("{flag}: connect {socket}: {e}"))?
+        .with_describe_timeout(describe_timeout(ikigai_ipc::DEFAULT_DESCRIBE_TIMEOUT));
     Ok(std::sync::Arc::new(resolver))
 }
 
@@ -2136,7 +2173,8 @@ fn connect_quic(target: &str, certs: &Certs) -> Result<Engine, String> {
     let identity = quic::client_identity(certs)?;
     let trusted = quic::trusted_server_cert(certs)?;
     let resolver = ikigai_quic::connect_with(addr, &identity, &trusted, quic_idle_timeout())
-        .map_err(|e| format!("connect {target}: {e}"))?;
+        .map_err(|e| format!("connect {target}: {e}"))?
+        .with_describe_timeout(describe_timeout(ikigai_quic::DEFAULT_DESCRIBE_TIMEOUT));
     Ok(with_profiles(Engine::new(resolver)))
 }
 
@@ -2250,7 +2288,8 @@ fn connect_ipc(path: Option<String>) -> Result<Engine, String> {
         .map(std::time::Duration::from_secs)
         .unwrap_or(ikigai_ipc::DEFAULT_TIMEOUT);
     let resolver = ikigai_ipc::connect_with_timeout(&socket, Some(timeout))
-        .map_err(|e| format!("connect {}: {e}", socket.display()))?;
+        .map_err(|e| format!("connect {}: {e}", socket.display()))?
+        .with_describe_timeout(describe_timeout(ikigai_ipc::DEFAULT_DESCRIBE_TIMEOUT));
     Ok(with_profiles(Engine::new(resolver)))
 }
 

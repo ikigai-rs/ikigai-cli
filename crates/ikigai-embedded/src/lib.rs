@@ -4123,14 +4123,19 @@ fn compose_mounts(mut spaces: Vec<Arc<dyn Space>>, mounts: Vec<MountSpec>) -> Ar
     // Alias mounts join the local list; overrides/prefers go in FRONT of it, so
     // the local spaces must be sealed into one space first — that sealed space is
     // also what a `--prefer` mount falls back TO.
+    //
+    // One health record per PEER across this kernel's mounts (`PeerHealth`): silence is a
+    // property of the peer process, not of the local prefix we gave it, so a peer mounted
+    // twice — plasma mounts `ikigai-gonk` under `urn:iki:store:` and `urn:iki:ledger:` —
+    // costs one describe deadline on a manifold read rather than one per mount.
+    let peers = ikigai_resolve::PeerHealth::default();
     let mut fronting: Vec<MountSpec> = Vec::new();
     for mount in mounts {
         if mount.kind == MountKind::Alias {
-            spaces.push(Arc::new(ikigai_resolve::MountedRemote::new(
-                mount.resolver,
-                mount.prefix,
-                mount.origin,
-            )));
+            spaces.push(Arc::new(
+                ikigai_resolve::MountedRemote::new(mount.resolver, mount.prefix, mount.origin)
+                    .sharing(&peers),
+            ));
         } else {
             fronting.push(mount);
         }
@@ -4153,11 +4158,10 @@ fn compose_mounts(mut spaces: Vec<Arc<dyn Space>>, mounts: Vec<MountSpec>) -> Ar
         kind,
     } in fronting
     {
-        let remote = Arc::new(ikigai_resolve::MountedRemote::overriding(
-            resolver,
-            prefix.clone(),
-            origin,
-        )) as Arc<dyn Space>;
+        let remote = Arc::new(
+            ikigai_resolve::MountedRemote::overriding(resolver, prefix.clone(), origin)
+                .sharing(&peers),
+        ) as Arc<dyn Space>;
         ordered.push(match kind {
             // The failover pair must stay INSIDE the prefix. `Failover` resolves
             // every target, so an unguarded `[remote, local]` would also answer
