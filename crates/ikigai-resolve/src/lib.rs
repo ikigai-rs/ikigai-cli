@@ -258,6 +258,9 @@ impl Space for RemoteSpace {
                 // A bare `RemoteSpace` is mounted by a caller that holds the resolver;
                 // it carries no origin label of its own (`MountedRemote` does).
                 origin: None,
+                // …and with no mount identity, a failure here has nothing to be
+                // attributed to, so it is not remembered. See `DescribeHealth`.
+                health: None,
                 request: request.clone(),
             }),
             bindings: Bindings::new(),
@@ -294,6 +297,10 @@ struct ForwardingEndpoint {
     /// contract-unavailable path ([`unavailable`]) — a diagnostic that says "a mounted
     /// peer" is one an operator with three mounts cannot act on.
     origin: Option<String>,
+    /// What the mount has learned about this peer's ability to describe itself, when the
+    /// space that built this endpoint tracks it. `None` for a [`RemoteSpace`], which has
+    /// no mount identity to attribute a failure to.
+    health: Option<Arc<DescribeHealth>>,
 }
 
 #[async_trait]
@@ -331,6 +338,17 @@ impl Endpoint for ForwardingEndpoint {
         // the *remote* endpoint's own contract — otherwise `compose src=…` over a
         // mount loses its `src`. Best-effort, and [`unavailable`] is what makes the
         // best-effort part audible rather than silent.
+        // ★ A peer already known to be silent is NOT asked again. `describe()` is called
+        // once per catalog row on a manifold read, so without this the transport's
+        // deadline would be paid per row and a bounded call would still add up to an
+        // unbounded walk — the deadline bounds a CALL, this bounds the WALK.
+        if let Some(reason) = self.health.as_ref().and_then(|health| health.failing()) {
+            return unavailable(
+                self.origin.as_deref(),
+                self.request.target.as_str(),
+                &reason,
+            );
+        }
         let meta = Request::new(Verb::Meta, self.request.target.clone())
             .with_arg("as", ArgRef::Inline(b"application/json".to_vec()));
         let reason = match self.resolver.issue_as(meta, &Capability::root()) {
@@ -346,7 +364,14 @@ impl Endpoint for ForwardingEndpoint {
                     repr.bytes.len()
                 ),
             },
-            Err(error) => format!("it refused the Meta request: {error}"),
+            Err(error) => {
+                // Silence here is the same silence an enumeration would meet, so it counts
+                // against the same health — one row's timeout spares every later row.
+                if let Some(health) = &self.health {
+                    health.record(&error);
+                }
+                format!("it refused the Meta request: {error}")
+            }
         };
         unavailable(
             self.origin.as_deref(),
@@ -415,6 +440,218 @@ fn unavailable(origin: Option<&str>, target: &str, reason: &str) -> Description 
         ))
 }
 
+/// How long a mount believes that its peer cannot describe itself, before asking again.
+///
+/// ★ **This is what actually bounds a manifold read, and the deadline alone does not.**
+/// A manifold read is one `entries()` plus one `describe()` PER ROW — core's
+/// `select_actions` walks the catalog and Metas every entry — so a per-call deadline over
+/// a silent peer costs `rows × deadline`, which is not a bound a human would recognize as
+/// one. Once a peer has missed its deadline, this mount stops asking for the length of the
+/// cooldown and every later describe fails instantly, so a manifold read costs ONE deadline
+/// per unhealthy mount, whatever the peer's catalog size.
+///
+/// Thirty seconds, matching the deadline itself and `ENTRIES_REDIAL_AFTER` in the CLI's
+/// lazy mount: long enough that a single `urn:kernel:actions` never pays twice, short
+/// enough that a peer which comes back is picked up by the next command rather than at the
+/// end of the session. ⚠ It gates only SELF-DESCRIPTION. Resolutions through the mount are
+/// untouched — a peer too slow to describe itself may still be serving reads perfectly, and
+/// deciding otherwise on its behalf would be this fix causing the outage it prevents.
+const DESCRIBE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What a mount remembers about a peer that failed to describe itself: when, and why.
+///
+/// Shared by `Arc` between the [`MountedRemote`] (which enumerates) and every
+/// [`ForwardingEndpoint`] it hands out (which describe), because those are the two calls
+/// a manifold read makes and one peer's silence should be learned once, not per row.
+#[derive(Default)]
+struct DescribeHealth {
+    /// `Some((when, why))` while the peer is considered undescribable.
+    failed: Mutex<Option<(std::time::Instant, String)>>,
+}
+
+/// One kernel's view of which of its PEERS can describe themselves — handed to every
+/// [`MountedRemote`] a composer builds, so mounts of the same peer share one verdict.
+///
+/// ★ **Silence is a property of the PEER, not of the local name a mount gave it.** plasma
+/// mounts one `ikigai-gonk` under two prefixes; with a record per mount, one silent process
+/// cost TWO deadlines on every manifold read — measured at 60s where one deadline is 30s —
+/// and a host mounting the same peer five times would have paid five. Keyed on the origin
+/// label, which is the only peer identity a mount is given (two mounts of one socket carry
+/// two connections, but one server process).
+///
+/// ⚠ **Scoped to a composition, deliberately not a process-global.** A `static` registry is
+/// the obvious implementation and it is wrong twice: it makes two kernels in one process
+/// share a verdict about peers they reached differently, and — the way it was caught — it
+/// makes a test suite ORDER-DEPENDENT, because two tests naming a peer `test://peer` are
+/// then the same peer. A composer knows which mounts are one kernel's; nothing else does.
+#[derive(Default, Clone)]
+pub struct PeerHealth(Arc<Mutex<std::collections::BTreeMap<String, Arc<DescribeHealth>>>>);
+
+impl PeerHealth {
+    /// The record for the peer at `origin`, creating it on first sight.
+    fn get(&self, origin: &str) -> Arc<DescribeHealth> {
+        let mut peers = match self.0.lock() {
+            Ok(peers) => peers,
+            // A poisoned lock must cost sharing, never a mount: this one gets its own.
+            Err(_) => return Arc::new(DescribeHealth::default()),
+        };
+        Arc::clone(peers.entry(origin.to_string()).or_default())
+    }
+}
+
+impl DescribeHealth {
+    /// Why the peer is currently considered undescribable, if it is — clearing a record
+    /// that has aged past [`DESCRIBE_COOLDOWN`] so the next call tries the peer again.
+    fn failing(&self) -> Option<String> {
+        let mut failed = match self.failed.lock() {
+            Ok(failed) => failed,
+            // A poisoned lock must cost knowledge, never a describe: forget the record.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match &*failed {
+            Some((at, why)) if at.elapsed() < DESCRIBE_COOLDOWN => Some(why.clone()),
+            Some(_) => {
+                *failed = None;
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Record that the peer went silent, if `error` is the kind of failure that means
+    /// silence. A [`Timeout`](Error::Timeout) or an [`Unavailable`](Error::Unavailable) is
+    /// the transport saying nothing came back; anything else — a `Denied`, an endpoint
+    /// error, a contract that parsed badly — is the peer ANSWERING, and a peer that answers
+    /// is not one to stop asking.
+    fn record(&self, error: &Error) {
+        if !matches!(error, Error::Timeout(_) | Error::Unavailable(_)) {
+            return;
+        }
+        // Native-and-wasm: `ikigai-resolve` builds for wasm, where `Instant::now` is
+        // provided by the browser shim the workspace already links. The kernel `Clock`
+        // is not in scope on this path — a mount's health is transport bookkeeping, not
+        // a resolution's notion of time — and this is a monotonic elapsed measure, which
+        // is what `Instant` is for. Bound to a `let` so the opt-out covers this call
+        // rather than widening over the whole method (an attribute on an assignment
+        // expression is not stable, E0658).
+        #[allow(clippy::disallowed_methods)]
+        let now = std::time::Instant::now();
+        let mut failed = match self.failed.lock() {
+            Ok(failed) => failed,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *failed = Some((now, error.to_string()));
+    }
+
+    /// Forget any record — the peer just answered.
+    fn clear(&self) {
+        let mut failed = match self.failed.lock() {
+            Ok(failed) => failed,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *failed = None;
+    }
+}
+
+/// The IRI a mount claims for ITSELF, so a mount that could not enumerate its peer has
+/// somewhere to say so: `{prefix}:ikigai:mount-unavailable`.
+///
+/// ★ **Why an IRI and not just a log line.** The requirement is that a degraded manifold
+/// NAME the peer that did not answer, in a form a caller can act on — and a caller of
+/// `urn:kernel:actions` reads a list of actions, not a terminal. So the statement has to be
+/// a row in that list, which means it has to be an entry, which means it has to be an IRI
+/// that resolves to something with a contract. It does: sourcing it returns the diagnosis.
+///
+/// ★ **And why INSIDE the mount's own prefix**, which looks like namespace pollution and is
+/// the load-bearing choice. A host wraps a mount in whatever it needs — `ikigai-embedded`'s
+/// `--prefer` puts a `PrefixGuard` in front of a `Failover`, and that guard answers `Miss`
+/// for every IRI outside the prefix before the mount is ever consulted. A status IRI in a
+/// neutral namespace therefore ENUMERATED (the guard passes entries straight through) and
+/// then failed to RESOLVE, so the row appeared in `urn:kernel:catalog` and vanished from
+/// `urn:kernel:actions` — visible in the listing nobody automates against, absent from the
+/// one an agent reads. Measured on plasma, 2026-09-17. Inside the prefix it travels through
+/// every prefix-scoped wrapper there is or will be, in this host and in any other, without
+/// those wrappers knowing anything about it. The cost is that a peer resource of this exact
+/// name would be shadowed by the mount; that is a trade taken deliberately.
+///
+/// It is keyed on the PREFIX rather than on the peer because the prefix is the namespace
+/// whose contents are missing — plasma mounts one `ikigai-gonk` twice, and one row for two
+/// silenced namespaces would under-report exactly the case this exists for. The peer is
+/// named in the description instead, where the text can carry a socket path unmangled.
+fn mount_status_iri(prefix: &str) -> String {
+    let stem = prefix.trim_end_matches(':');
+    format!("{stem}:ikigai:mount-unavailable")
+}
+
+/// The endpoint `urn:ikigai:mount:{slug}:unavailable` resolves to: a real, local,
+/// capability-free resource whose whole content is *which peer did not answer, and why*.
+///
+/// It declares a `Source` action deliberately. A [`Description`] with no actions produces
+/// no rows in `select_actions`, so a contract-only placeholder would appear in
+/// `urn:kernel:catalog` and be **invisible in `urn:kernel:actions`** — which is the
+/// resource an agent reads, and the resource #404 was about. Declaring the verb it really
+/// serves is also just the recipe: declared capabilities equal enforced capabilities, and
+/// this one needs none.
+struct MountUnavailable {
+    /// The mount's local prefix — the namespace whose contents are missing.
+    prefix: String,
+    /// The mount's origin label (`ipc:~/.ikigai/gonk.sock`, `quic:plasma:4433`).
+    origin: String,
+    /// The transport's own words for the failure, when this kernel holds a record of one.
+    ///
+    /// `None` is the honest answer to a caller that reached this row without an
+    /// enumeration having failed *in this process* — a one-shot `ikigai -c` that read the
+    /// IRI out of a manifold some earlier process printed. Saying "it did not answer"
+    /// there would be a claim this kernel cannot support.
+    reason: Option<String>,
+}
+
+impl MountUnavailable {
+    fn summary(&self) -> String {
+        match &self.reason {
+            Some(reason) => format!(
+                "`{}` is mounted from {}, and that peer did not answer an enumeration: {}. \
+                 The resources under `{}` are NOT listed in this catalog — they are unknown \
+                 here, not absent. This row is the statement that they are missing.",
+                self.prefix, self.origin, reason, self.prefix
+            ),
+            None => format!(
+                "`{}` is mounted from {}. This row exists to say so when that peer does not \
+                 answer an enumeration, and this kernel holds no current record of one: \
+                 either the peer has answered since, or nothing has asked it yet in this \
+                 process. Enumerate (`source urn:kernel:catalog`) and read this again.",
+                self.prefix, self.origin
+            ),
+        }
+    }
+}
+
+#[async_trait]
+impl Endpoint for MountUnavailable {
+    async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation, Error> {
+        // The default expiry is `Always` — never cached — and that is what this wants:
+        // the peer may be back before this line is read again, and a cached
+        // "unavailable" is exactly the lie the row exists to prevent. Stated rather
+        // than left implicit, because "don't cache this" is the load-bearing part.
+        Ok(
+            Representation::new(ikigai_core::ReprType::new("text/plain"), self.summary())
+                .with_expiry(Expiry::Always),
+        )
+    }
+
+    fn name(&self) -> &str {
+        "mount-unavailable"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("mount-unavailable")
+            .title(format!("mount unavailable: {}", self.origin))
+            .summary(self.summary())
+            .verb(Verb::Source)
+            .output("text/plain")
+    }
+}
+
 /// A **prefix-mounted** remote kernel: requests under `prefix` are rewritten
 /// (`<prefix>rest` → `urn:rest`) and forwarded, and the remote's catalog is
 /// surfaced back **re-prefixed** (`urn:rest` → `<prefix>rest`) and tagged with
@@ -428,6 +665,9 @@ pub struct MountedRemote {
     origin: String,
     mode: MountMode,
     names: RemoteNames,
+    /// What this mount has learned about its peer's ability to describe itself, shared
+    /// with every [`ForwardingEndpoint`] it hands out. See [`DESCRIBE_COOLDOWN`].
+    health: Arc<DescribeHealth>,
 }
 
 /// How a mount relates the local namespace to the remote one.
@@ -460,6 +700,7 @@ impl MountedRemote {
             origin: origin.into(),
             mode: MountMode::Alias,
             names: RemoteNames::new(),
+            health: Arc::new(DescribeHealth::default()),
         }
     }
 
@@ -477,12 +718,73 @@ impl MountedRemote {
             origin: origin.into(),
             mode: MountMode::Override,
             names: RemoteNames::new(),
+            health: Arc::new(DescribeHealth::default()),
         }
+    }
+
+    /// Share this mount's peer-health record through `peers` (builder), so every mount of
+    /// the SAME origin reaches one verdict about that peer instead of each paying its own
+    /// deadline. A composer that builds a kernel's mounts calls this with one
+    /// [`PeerHealth`]; a mount built alone keeps a private record and behaves as before.
+    ///
+    /// Call it at construction. The record is captured by every forwarding endpoint the
+    /// mount hands out, so replacing it later would leave endpoints consulting the old one.
+    pub fn sharing(mut self, peers: &PeerHealth) -> Self {
+        self.health = peers.get(&self.origin);
+        self
+    }
+
+    /// The one row a mount contributes when its peer did not answer an enumeration:
+    /// the mount's own status IRI (see [`mount_status_iri`]), tagged with the origin so a
+    /// federated `list` shows it exactly where the peer's rows would have been.
+    ///
+    /// The stderr note is the second half, and it is deduplicated for the same reason
+    /// [`unavailable`]'s is: `entries()` is called per catalog walk, not once per mount, so
+    /// an un-deduplicated line prints on every `list` through a degraded mount — which is
+    /// not loud, it is noise that gets filtered out. Keyed by (prefix, reason), so a peer
+    /// that later fails differently still says so.
+    fn unenumerated(&self, reason: &str) -> SpaceEntry {
+        let once = format!("{}\u{1}{reason}", self.prefix);
+        let first = {
+            static SEEN: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+            // A poisoned lock must not take down an enumeration: treat it as "already said".
+            SEEN.lock()
+                .map(|mut seen| seen.insert(once))
+                .unwrap_or(false)
+        };
+        if first {
+            eprintln!(
+                "ikigai: {} did not answer an enumeration — {reason}. The resources under \
+                 `{}` are missing from this catalog and manifold; they are unknown, not \
+                 absent. `source {}` says so, and `describe.timeout` (seconds, config home) \
+                 is the bound that was reached.",
+                self.origin,
+                self.prefix,
+                mount_status_iri(&self.prefix)
+            );
+        }
+        SpaceEntry::new(mount_status_iri(&self.prefix), "mount-unavailable")
+            .with_origin(&self.origin)
     }
 }
 
 impl Space for MountedRemote {
     fn resolve(&self, request: &Request, _scope: &Scope) -> Resolution {
+        // The mount's own status resource, claimed OUTSIDE the prefix on purpose: it must
+        // not be forwarded (the peer it describes is the one that is not answering), and
+        // it must not sit inside a namespace the peer owns, where a real remote resource
+        // could collide with it.
+        if request.target.as_str() == mount_status_iri(&self.prefix) {
+            return Resolution::Hit(Resolved {
+                endpoint: Arc::new(MountUnavailable {
+                    prefix: self.prefix.clone(),
+                    origin: self.origin.clone(),
+                    reason: self.health.failing(),
+                }),
+                bindings: Bindings::new(),
+                canonical: None,
+            });
+        }
         // Only our namespace.
         let Some(rest) = request.target.as_str().strip_prefix(&self.prefix) else {
             return Resolution::Miss;
@@ -503,6 +805,7 @@ impl Space for MountedRemote {
                 resolver: Arc::clone(&self.resolver),
                 name: self.names.name_for(&forwarded.target),
                 origin: Some(self.origin.clone()),
+                health: Some(Arc::clone(&self.health)),
                 request: forwarded,
             }),
             bindings: Bindings::new(),
@@ -526,7 +829,27 @@ impl Space for MountedRemote {
     }
 
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
-        let entries = self.resolver.entries()?;
+        // A peer already known to be silent is not asked again for the cooldown — a
+        // manifold read must cost ONE deadline per unhealthy mount, not one per attempt.
+        if let Some(reason) = self.health.failing() {
+            return Some(vec![self.unenumerated(&reason)]);
+        }
+        let entries = match self.resolver.try_entries() {
+            Ok(Some(entries)) => {
+                self.health.clear();
+                entries
+            }
+            // The peer does not enumerate at all. Nothing is missing that it would have
+            // named, so there is nothing to say — this is the old `None` and it is right.
+            Ok(None) => return None,
+            // ★ It should have answered and did not. Returning `None` here is what made a
+            // silent peer read like an empty one; instead the mount contributes exactly
+            // one row, which says whose resources are missing and why.
+            Err(error) => {
+                self.health.record(&error);
+                return Some(vec![self.unenumerated(&error.to_string())]);
+            }
+        };
         // Keep the name map current so template probes resolve under real names.
         self.names.refresh(&entries);
         match self.mode {
@@ -636,7 +959,32 @@ pub trait Resolver: Send + Sync {
     fn is_cached(&self, request: &Request, capability: &Capability) -> bool;
 
     /// The resources bound in the kernel's space, or `None` if it can't enumerate.
+    ///
+    /// ⚠ This signature cannot tell "does not enumerate" from "failed to enumerate" —
+    /// prefer [`try_entries`](Self::try_entries) wherever the difference matters, which
+    /// is everywhere a caller would otherwise report a peer's silence as an empty peer.
     fn entries(&self) -> Option<Vec<SpaceEntry>>;
+
+    /// Enumerate, keeping the failure.
+    ///
+    /// * `Ok(Some(entries))` — the peer answered.
+    /// * `Ok(None)` — this resolver does not enumerate at all (a rewrite, a peer with no
+    ///   catalog). Nothing is wrong and nothing is missing.
+    /// * `Err(error)` — it should have answered and did not: a deadline, a dead socket, a
+    ///   refusal. **Resources exist that are not in the returned catalog.**
+    ///
+    /// ★ That third case is the whole reason this method exists. [`entries`](Self::entries)
+    /// collapses it into `None`, and a `None` mount contributes nothing to the catalog —
+    /// so a peer that went silent reads exactly like a peer that has nothing, and the
+    /// manifold quietly UNDER-OFFERS. A caller then concludes a capability does not exist
+    /// when the truth is that nobody asked successfully. A bound must refuse, not truncate;
+    /// this is the channel the refusal travels on.
+    ///
+    /// The default preserves the old lossy behaviour, so an implementor that predates this
+    /// still compiles — at the cost of reporting every failure as `Ok(None)`.
+    fn try_entries(&self) -> Result<Option<Vec<SpaceEntry>>, Error> {
+        Ok(self.entries())
+    }
 
     /// A short human label for the transport this resolver speaks over — shown by
     /// the REPL's `trace` command. The default is the in-process kernel.
@@ -805,6 +1153,16 @@ impl<R: Resolver + ?Sized> Resolver for Arc<R> {
 
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
         (**self).entries()
+    }
+
+    /// ⚠ **A DEFAULTED method that is not forwarded here is silently REPLACED, not
+    /// inherited** — the same trap the `issue_as_async_with_incoming` arm above records,
+    /// and it cost this arc a debugging round. Without this line, `Arc<dyn Resolver>` took
+    /// the trait's default (`Ok(self.entries())`), which collapses a transport failure back
+    /// into `Ok(None)`: every mount holds its resolver as an `Arc`, so the error channel
+    /// existed, compiled, was implemented on both transports — and reached nobody.
+    fn try_entries(&self) -> Result<Option<Vec<SpaceEntry>>, Error> {
+        (**self).try_entries()
     }
 
     fn transport(&self) -> String {

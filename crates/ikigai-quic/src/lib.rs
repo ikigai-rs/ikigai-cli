@@ -122,6 +122,18 @@ const UNAUTHORIZED: u32 = 1;
 /// worse than reporting late. `quic.timeout` (seconds) in the host config overrides.
 pub const DEFAULT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// The deadline for a peer's **self-description** — an `Entries` enumeration or a `Meta`
+/// issue — as opposed to [`DEFAULT_IDLE_TIMEOUT`], which bounds a *resolution*.
+///
+/// The reasoning is `ikigai_ipc::DEFAULT_DESCRIBE_TIMEOUT`'s, and the value is deliberately
+/// the same: the two transports mount the same kind of peer, and an operator who raises one
+/// bound and not the other would get a federation whose legibility depended on which socket
+/// a peer happened to be behind. What it bounds is a peer describing itself, and nothing is
+/// ever *working* during a self-description — except transitively, which is why it is thirty
+/// seconds and not one (ledger #404: the hub blocked here, three kernels deep, with no bound
+/// at any hop).
+pub const DEFAULT_DESCRIBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub fn serve(
     kernel: Kernel,
     addr: SocketAddr,
@@ -437,6 +449,7 @@ pub fn connect_with(
             connection: Mutex::new(connection),
         }),
         tracer: Mutex::new(None),
+        describe_timeout: Some(DEFAULT_DESCRIBE_TIMEOUT),
     })
 }
 
@@ -502,6 +515,9 @@ pub struct QuicResolver {
     /// The tracer the `trace` command installs; when set, a resolution is sent as
     /// [`Call::IssueTraced`] and the server's returned spans are forwarded here.
     tracer: Mutex<Option<Arc<dyn Tracer>>>,
+    /// The deadline a SELF-DESCRIPTION call runs under (see [`DEFAULT_DESCRIBE_TIMEOUT`]);
+    /// `None` leaves it on the connection's idle timeout like everything else.
+    describe_timeout: Option<std::time::Duration>,
 }
 
 /// Everything a round trip touches, shared with the spawned task.
@@ -567,7 +583,29 @@ impl Wire {
     }
 }
 
+/// Whether `call` asks the peer to DESCRIBE ITSELF rather than to do work — the calls that
+/// run under [`DEFAULT_DESCRIBE_TIMEOUT`]. The IPC transport draws the same line, in
+/// `ikigai_ipc::is_describe`, and for the same reasons: `Entries` is the enumeration, a
+/// `Meta` issue is one endpoint's contract, and `IsCached` is a question about work.
+fn is_describe(call: &Call) -> bool {
+    match call {
+        Call::Entries => true,
+        Call::Issue(request) | Call::IssueAs(request, _) | Call::IssueTraced(request, _, _) => {
+            request.verb == ikigai_core::Verb::Meta
+        }
+        Call::IsCached(_) => false,
+    }
+}
+
 impl QuicResolver {
+    /// Set the deadline a SELF-DESCRIPTION call runs under (builder) — see
+    /// [`DEFAULT_DESCRIBE_TIMEOUT`], which is what [`connect`] installs. `None` takes the
+    /// bound off.
+    pub fn with_describe_timeout(mut self, describe_timeout: Option<std::time::Duration>) -> Self {
+        self.describe_timeout = describe_timeout;
+        self
+    }
+
     /// The resolver's runtime. See [`runtime`](Self::runtime) for why it is an `Option`.
     fn runtime(&self) -> &Runtime {
         self.runtime
@@ -578,10 +616,32 @@ impl QuicResolver {
     fn round_trip(&self, call: Call) -> io::Result<Reply> {
         let request = encode(&call)?;
         let wire = Arc::clone(&self.wire);
-        drive(
-            self.runtime(),
-            async move { wire.round_trip(request).await },
-        )?
+        // A self-description is bounded; a resolution is not (the idle timeout is its
+        // only ceiling, and for a long resolution the silence IS the work). `deadline`
+        // is computed here, outside the future, because `call` does not cross the spawn.
+        let deadline = is_describe(&call)
+            .then_some(self.describe_timeout)
+            .flatten();
+        drive(self.runtime(), async move {
+            match deadline {
+                None => wire.round_trip(request).await,
+                // ★ This bounds the WHOLE exchange — the reconnect-and-retry inside
+                // `Wire::round_trip` included. Bounding each attempt separately would let
+                // a peer that accepts and never answers cost two deadlines per call.
+                Some(deadline) => {
+                    match tokio::time::timeout(deadline, wire.round_trip(request)).await {
+                        Ok(reply) => reply,
+                        Err(_) => Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "the peer did not describe itself within {}s",
+                                deadline.as_secs()
+                            ),
+                        )),
+                    }
+                }
+            }
+        })?
     }
 
     /// The tracer lock, taken through the poison — same reasoning as
@@ -626,6 +686,13 @@ impl Drop for QuicResolver {
 /// [`Unavailable`](Error::Unavailable) the reliability overlays (Retry/Failover) can
 /// act on, rather than a permanent error.
 fn quic_error(e: io::Error) -> Error {
+    // A deadline is its own transient, distinct from unreachability: the peer IS there and
+    // accepted the stream, it just did not answer in time. A mount reads the difference —
+    // `Unavailable` means "nothing is listening", `Timeout` means "it is listening and
+    // silent", and only the second says a degraded catalog is hiding real resources.
+    if e.kind() == io::ErrorKind::TimedOut {
+        return Error::Timeout(format!("quic transport: {e}"));
+    }
     Error::Unavailable(format!("quic transport: {e}"))
 }
 
@@ -714,9 +781,17 @@ impl Resolver for QuicResolver {
     }
 
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
-        match self.round_trip(Call::Entries) {
-            Ok(Reply::Entries(entries)) => entries,
-            _ => None,
+        self.try_entries().ok().flatten()
+    }
+
+    fn try_entries(&self) -> Result<Option<Vec<SpaceEntry>>, Error> {
+        match self.round_trip(Call::Entries).map_err(quic_error)? {
+            Reply::Entries(entries) => Ok(entries),
+            Reply::ErrorTyped(wire) => Err(wire.into()),
+            Reply::Error(message) => Err(Error::Endpoint(message)),
+            other => Err(Error::Endpoint(format!(
+                "unexpected reply to Entries: {other:?}"
+            ))),
         }
     }
 
@@ -1838,5 +1913,75 @@ mod runtime_reentrancy {
         assert_eq!(String::from_utf8(representation.bytes).unwrap(), "AFTER");
         drop(client);
         server.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod describe_timeout {
+    use super::*;
+    use std::net::SocketAddr;
+    use tokio::runtime::Runtime;
+
+    /// ★ The QUIC half of ledger #404: a peer that ACCEPTS the connection and never
+    /// answers the enumeration. This is the shape the hub's own `ikigai-gonk` was in —
+    /// blocked in `QuicResolver::entries` one hop further down — and with no bound here a
+    /// mount of that peer takes the manifold of every kernel that can reach it.
+    ///
+    /// The idle timeout is left long on purpose: a test that passes proves the DESCRIBE
+    /// bound fired, not that the connection eventually gave up.
+    #[test]
+    // Native-only (QUIC is not built for wasm), and elapsed time is the measurement: it is
+    // the only way to tell a bound that fired from a hang that was lucky.
+    #[allow(clippy::disallowed_methods)]
+    fn a_peer_that_never_answers_an_enumeration_is_bounded_not_awaited() {
+        let server_id = generate();
+        let client_id = generate();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server_cfg = server_config(
+            &server_id,
+            std::slice::from_ref(&client_id.cert_pem),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        let rt = Runtime::new().unwrap();
+        let endpoint = rt
+            .block_on(async { quinn::Endpoint::server(server_cfg, addr) })
+            .unwrap();
+        let server_addr = endpoint.local_addr().unwrap();
+        // Accepts the connection, then never reads a stream and never writes a reply.
+        let _server = std::thread::spawn(move || {
+            rt.block_on(async move {
+                let Some(incoming) = endpoint.accept().await else {
+                    return;
+                };
+                let _connection = incoming.await;
+                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            });
+        });
+
+        let client = connect_with(
+            server_addr,
+            &client_id,
+            &server_id.cert_pem,
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_describe_timeout(Some(std::time::Duration::from_millis(300)));
+
+        let start = std::time::Instant::now();
+        let error = client
+            .try_entries()
+            .expect_err("a peer that never answers is an ERROR, not a wait");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "bounded by the describe deadline, not the 30s idle timeout: {elapsed:?}"
+        );
+        // A deadline is a TRANSIENT Timeout, distinct from `Unavailable`: the peer is
+        // there and accepted the stream, it is simply silent. A mount reads that
+        // difference when it decides whether real resources are missing from its catalog.
+        assert!(matches!(error, Error::Timeout(_)), "{error:?}");
+        assert!(error.is_transient(), "{error:?}");
     }
 }

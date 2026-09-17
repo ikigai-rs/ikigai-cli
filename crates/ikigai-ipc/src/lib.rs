@@ -69,6 +69,29 @@ pub fn serve(kernel: Kernel, path: &Path) -> io::Result<()> {
 /// little detection is lost by being patient about silence.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// The deadline for a peer's **self-description** — an `Entries` enumeration, or a `Meta`
+/// issue — as opposed to [`DEFAULT_TIMEOUT`], which bounds a *resolution*.
+///
+/// ★ The two deadlines exist because they bound different things, and conflating them is
+/// what let one slow peer take out a whole federation (ledger #404). [`DEFAULT_TIMEOUT`] is
+/// five minutes because what it bounds is SILENCE during work, and a 70B model loading
+/// ~40GB is silent while it works — for a resolution, the silence IS the work. **Nothing is
+/// ever working during a self-description.** `Entries` reads a binding table the peer
+/// already holds; `Meta` returns a `Description` the endpoint already holds. Neither
+/// computes, neither calls out — except transitively, which is the whole problem:
+/// enumeration fans out across the mount graph, so a peer's answer includes its own peers'.
+/// That is why this is thirty seconds and not one: it must cover a healthy peer that is
+/// itself federating (~10s measured through `ikigai-gonk` on plasma, 2026-09-17), while
+/// staying far enough below five minutes that a human reads a miss as a failure rather than
+/// as a hang.
+///
+/// ⚠ **A fixed per-hop deadline does not compose.** Three kernels deep, every hop bounds at
+/// the same value, so the outer hop cuts off at exactly the moment the inner hop would have
+/// answered with its own degraded catalog. The real answer is a *budget* carried on the
+/// wire and decremented per hop; that is a protocol change and is not this. Until then, a
+/// deep federation raises `describe.timeout` at the outermost kernel.
+pub const DEFAULT_DESCRIBE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Connect to a kernel server listening on `path`, with the default I/O timeout.
 pub fn connect(path: &Path) -> io::Result<IpcResolver> {
     connect_as(path, HelloMode::Verbatim)
@@ -100,6 +123,7 @@ pub fn connect_with(
     Ok(IpcResolver {
         path: path.to_path_buf(),
         timeout,
+        describe_timeout: Some(DEFAULT_DESCRIBE_TIMEOUT),
         mode,
         stream: Mutex::new(Some(stream)),
         tracer: Mutex::new(None),
@@ -177,6 +201,9 @@ pub struct IpcResolver {
     path: PathBuf,
     /// The I/O deadline every (re)dial installs on its stream.
     timeout: Option<Duration>,
+    /// The shorter deadline a SELF-DESCRIPTION call runs under (see
+    /// [`DEFAULT_DESCRIBE_TIMEOUT`]); `None` means describe like everything else.
+    describe_timeout: Option<Duration>,
     /// The hello mode every (re)dial declares — a redialed alias mount must
     /// re-present itself as one.
     mode: HelloMode,
@@ -206,6 +233,56 @@ enum Phase {
 struct ExchangeFailed {
     phase: Phase,
     error: io::Error,
+}
+
+/// Whether `call` asks the peer to DESCRIBE ITSELF rather than to do work — the calls that
+/// run under [`DEFAULT_DESCRIBE_TIMEOUT`] instead of [`DEFAULT_TIMEOUT`].
+///
+/// `Entries` is the enumeration; a `Meta` issue is one endpoint's contract (it is what
+/// `ForwardingEndpoint::describe` sends, so every row of a mounted manifold is one of
+/// these). `IsCached` is deliberately NOT here: it is a probe about a *resolution*, and
+/// answering it may require the peer to look at work in flight.
+fn is_describe(call: &Call) -> bool {
+    match call {
+        Call::Entries => true,
+        Call::Issue(request) | Call::IssueAs(request, _) | Call::IssueTraced(request, _, _) => {
+            request.verb == ikigai_core::Verb::Meta
+        }
+        Call::IsCached(_) => false,
+    }
+}
+
+/// Installs a read deadline on a stream for the life of the guard and restores the
+/// connection's standing one on drop — so a describe's short bound cannot leak onto the
+/// next resolution, which shares the connection.
+///
+/// Restoring on DROP rather than after the exchange is deliberate: the exchange returns
+/// early on every error path, and a bound left installed by an error would silently
+/// shorten every later call on that connection.
+struct ReadDeadline<'a> {
+    stream: &'a UnixStream,
+    restore: Option<Duration>,
+}
+
+impl<'a> ReadDeadline<'a> {
+    /// Apply `deadline` to `stream`, remembering `restore` for the drop. Returns `None`
+    /// (installing nothing) when there is no deadline to apply, so the ordinary path pays
+    /// no syscall at all.
+    fn apply(
+        stream: &'a UnixStream,
+        deadline: Option<Duration>,
+        restore: Option<Duration>,
+    ) -> Option<Self> {
+        let deadline = deadline?;
+        stream.set_read_timeout(Some(deadline)).ok()?;
+        Some(ReadDeadline { stream, restore })
+    }
+}
+
+impl Drop for ReadDeadline<'_> {
+    fn drop(&mut self) {
+        let _ = self.stream.set_read_timeout(self.restore);
+    }
 }
 
 /// One request/reply exchange on an established stream.
@@ -271,6 +348,15 @@ fn replay_may_follow(phase: &Phase, call: &Call) -> bool {
 }
 
 impl IpcResolver {
+    /// Set the deadline a SELF-DESCRIPTION call runs under (builder) — see
+    /// [`DEFAULT_DESCRIBE_TIMEOUT`], which is what a plain [`connect`] installs.
+    /// `None` takes the bound off, leaving describe calls on the connection's
+    /// standing I/O deadline.
+    pub fn with_describe_timeout(mut self, describe_timeout: Option<Duration>) -> Self {
+        self.describe_timeout = describe_timeout;
+        self
+    }
+
     /// Send a call and read its reply, healing a dead connection on use.
     ///
     /// A broken established connection is dropped and redialed (full
@@ -286,10 +372,19 @@ impl IpcResolver {
             // A previous call found the connection dead: heal on use.
             *guard = Some(handshake(&self.path, self.timeout, self.mode)?);
         }
-        let stream = guard.as_ref().expect("stream just ensured");
-        let failed = match exchange(stream, &call) {
-            Ok(reply) => return Ok(reply),
-            Err(failed) => failed,
+        // A self-description runs under the SHORT deadline; everything else keeps the
+        // connection's standing one. The guard restores it however this call leaves, and
+        // is scoped so the stream borrow ends before the dead-connection path clears it.
+        let deadline = is_describe(&call)
+            .then_some(self.describe_timeout)
+            .flatten();
+        let failed = {
+            let stream = guard.as_ref().expect("stream just ensured");
+            let _bound = ReadDeadline::apply(stream, deadline, self.timeout);
+            match exchange(stream, &call) {
+                Ok(reply) => return Ok(reply),
+                Err(failed) => failed,
+            }
         };
         if !is_dead_connection(&failed.error) {
             return Err(failed.error);
@@ -300,9 +395,14 @@ impl IpcResolver {
         if dialed_this_call || !replay_may_follow(&failed.phase, &call) {
             return Err(failed.error);
         }
-        // One redial + one replay; a second failure surfaces as-is.
+        // One redial + one replay; a second failure surfaces as-is. The replay is bounded
+        // exactly as the first attempt was — a redial must not quietly restore patience.
         let fresh = handshake(&self.path, self.timeout, self.mode)?;
-        match exchange(&fresh, &call) {
+        let second_attempt = {
+            let _bound = ReadDeadline::apply(&fresh, deadline, self.timeout);
+            exchange(&fresh, &call)
+        };
+        match second_attempt {
             Ok(reply) => {
                 *guard = Some(fresh);
                 Ok(reply)
@@ -434,9 +534,17 @@ impl Resolver for IpcResolver {
     }
 
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
-        match self.round_trip(Call::Entries) {
-            Ok(Reply::Entries(entries)) => entries,
-            _ => None,
+        self.try_entries().ok().flatten()
+    }
+
+    fn try_entries(&self) -> Result<Option<Vec<SpaceEntry>>, Error> {
+        match self.round_trip(Call::Entries).map_err(wire_error)? {
+            Reply::Entries(entries) => Ok(entries),
+            Reply::ErrorTyped(wire) => Err(wire.into()),
+            Reply::Error(message) => Err(Error::Endpoint(message)),
+            other => Err(Error::Endpoint(format!(
+                "unexpected reply to Entries: {other:?}"
+            ))),
         }
     }
 
@@ -1341,5 +1449,487 @@ mod tests {
         assert_eq!(peer_uid(&server_side), Some(own_uid()));
         drop(client);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// ★ The case with NO COVERAGE before ledger #404, and the reason it shipped: a peer
+    /// that ACCEPTS the connection, completes the version hello, and then answers nothing
+    /// at all. A refused connect fails fast and a dead socket fails fast; only *accepted
+    /// and silent* reaches a blocking read with nobody on the other end.
+    mod a_peer_that_accepts_and_never_answers {
+        use super::*;
+        use ikigai_core::{ActionQuery, Fallback, Space};
+        use ikigai_resolve::MountedRemote;
+
+        /// The deadline under test. Short enough that a wall-clock assertion is honest
+        /// about what it proves, and long enough that a loopback round trip (~50µs) is
+        /// never mistaken for a miss.
+        const BOUND: Duration = Duration::from_millis(200);
+
+        /// A peer that accepts, says hello, and then answers NOTHING — counting the calls
+        /// that reached it, so a test can prove a mount stopped asking. The loop ends when
+        /// the client hangs up, which is what makes `join()` a valid end-of-test barrier.
+        fn silent_peer(path: &Path, received: Arc<AtomicUsize>) -> thread::JoinHandle<()> {
+            silent_peer_for(path, received, 1)
+        }
+
+        /// The same double, serving `connections` clients — one mount dials one
+        /// connection, so a test with two mounts of one peer needs two.
+        fn silent_peer_for(
+            path: &Path,
+            received: Arc<AtomicUsize>,
+            connections: usize,
+        ) -> thread::JoinHandle<()> {
+            let _ = std::fs::remove_file(path);
+            let listener = UnixListener::bind(path).unwrap();
+            thread::spawn(move || {
+                let mut served = Vec::new();
+                for _ in 0..connections {
+                    let Ok((stream, _)) = listener.accept() else {
+                        break;
+                    };
+                    let received = Arc::clone(&received);
+                    served.push(thread::spawn(move || {
+                        let mut s = &stream;
+                        let _ = read_frame(&mut s); // the client's hello
+                        let _ = write_hello(
+                            &mut s,
+                            &Hello {
+                                version: PROTOCOL_VERSION,
+                                mode: HelloMode::Verbatim,
+                            },
+                        );
+                        while read_frame(&mut s).is_ok() {
+                            received.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }));
+                }
+                for handle in served {
+                    let _ = handle.join();
+                }
+            })
+        }
+
+        /// A mount whose peer is silent, beside a local endpoint. `BOUND` is the DESCRIBE
+        /// deadline; the connection's own I/O deadline is left long, so a test that passes
+        /// proves the new bound fired and not the old one.
+        /// One peer per socket: the label a mount carries, and the key a `PeerHealth`
+        /// shares its verdict under.
+        fn origin_of(path: &Path) -> String {
+            format!("ipc:{}", path.display())
+        }
+
+        fn kernel_with_a_silent_mount(path: &Path) -> Kernel {
+            let client = connect_with_timeout(path, Some(Duration::from_secs(30)))
+                .unwrap()
+                .with_describe_timeout(Some(BOUND));
+            Kernel::new(Arc::new(Fallback::new(vec![
+                Arc::new(
+                    EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),
+                ) as Arc<dyn Space>,
+                Arc::new(MountedRemote::new(
+                    Arc::new(client),
+                    "urn:edge:",
+                    origin_of(path),
+                )) as Arc<dyn Space>,
+            ])))
+        }
+
+        /// Isolation probe kept as a test in its own right: the MOUNT, with no kernel
+        /// around it, answers a silent peer with exactly one row.
+        #[test]
+        fn the_mount_itself_contributes_one_naming_row() {
+            let path = socket_path("silent-mount-only");
+            let received = Arc::new(AtomicUsize::new(0));
+            let server = silent_peer(&path, Arc::clone(&received));
+            let client = connect_with_timeout(&path, Some(Duration::from_secs(30)))
+                .unwrap()
+                .with_describe_timeout(Some(BOUND));
+            assert!(
+                matches!(Resolver::try_entries(&client), Err(Error::Timeout(_))),
+                "the transport reports the silence as a deadline"
+            );
+            let mounted = MountedRemote::new(Arc::new(client), "urn:edge:", origin_of(&path));
+            let entries = Space::entries(&mounted).expect("a failed enumeration still SAYS so");
+            assert_eq!(entries.len(), 1, "{entries:?}");
+            assert_eq!(entries[0].pattern, "urn:edge:ikigai:mount-unavailable");
+            assert_eq!(entries[0].origin, Some(origin_of(&path)));
+
+            drop(mounted);
+            server.join().unwrap();
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// The headline: the manifold RETURNS, within a bound, and it SAYS which peer did
+        /// not answer. A timeout that silently dropped the peer would pass the first half
+        /// and fail the second — and that is the defect this arc exists not to ship, since
+        /// a caller would then conclude the peer's capabilities do not exist.
+        #[test]
+        // Native-only: the IPC transport is Unix sockets. The test measures elapsed time,
+        // which is the only way to prove a bound fired rather than a hang being lucky.
+        #[allow(clippy::disallowed_methods)]
+        fn the_manifold_returns_bounded_and_names_the_peer() {
+            let path = socket_path("silent-manifold");
+            let received = Arc::new(AtomicUsize::new(0));
+            let server = silent_peer(&path, Arc::clone(&received));
+            let kernel = kernel_with_a_silent_mount(&path);
+
+            let start = std::time::Instant::now();
+            let matches = kernel.select_actions(&ActionQuery::default());
+            let elapsed = start.elapsed();
+
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "the manifold returned on the bound, not on a hang: {elapsed:?}"
+            );
+            let named: Vec<&str> = matches.iter().map(|m| m.endpoint.as_str()).collect();
+            assert!(
+                named.contains(&"urn:edge:ikigai:mount-unavailable"),
+                "the degraded manifold NAMES the peer that did not answer: {named:?}"
+            );
+            // …and the rest of the kernel is intact. A bound that dropped the silent peer
+            // AND the local bindings would be a worse lie than the hang.
+            assert!(
+                named.contains(&"urn:test:upper"),
+                "every other action is still offered: {named:?}"
+            );
+
+            drop(kernel);
+            server.join().unwrap();
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// The row is not decoration: it RESOLVES, and what it resolves to is the whole
+        /// diagnosis — which namespace is missing, from which peer, and why. That is what
+        /// "in a form a caller can act on" has to mean for something an agent reads.
+        #[test]
+        fn the_row_resolves_to_which_peer_and_why() {
+            let path = socket_path("silent-row");
+            let received = Arc::new(AtomicUsize::new(0));
+            let server = silent_peer(&path, Arc::clone(&received));
+            let kernel = kernel_with_a_silent_mount(&path);
+
+            // The enumeration is what discovers the silence; the row is its record.
+            let _ = Resolver::entries(&kernel);
+            let request = Request::new(
+                Verb::Source,
+                Iri::parse("urn:edge:ikigai:mount-unavailable").unwrap(),
+            );
+            let (representation, _) =
+                Resolver::issue_as(&kernel, request, &Capability::root()).unwrap();
+            let said = String::from_utf8(representation.bytes).unwrap();
+            assert!(said.contains(&origin_of(&path)), "names the peer: {said}");
+            assert!(said.contains("urn:edge:"), "names the namespace: {said}");
+            assert!(
+                said.contains("not absent") || said.contains("unknown"),
+                "says the resources are UNKNOWN, not absent: {said}"
+            );
+
+            drop(kernel);
+            server.join().unwrap();
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// ★ The failure mode this arc must not introduce: a bound that silently DROPS the
+        /// slow peer would pass "the manifold returns" and quietly under-offer. The other
+        /// direction matters just as much — one silent peer must not cost a healthy peer's
+        /// rows, which is what a whole-enumeration failure would have done.
+        #[test]
+        fn a_silent_mount_costs_the_healthy_mount_nothing() {
+            use ikigai_core::Space;
+
+            let silent_path = socket_path("mixed-silent");
+            let live_path = socket_path("mixed-live");
+            let received = Arc::new(AtomicUsize::new(0));
+            let server = silent_peer(&silent_path, Arc::clone(&received));
+            let _ = std::fs::remove_file(&live_path);
+            let live = thread::spawn({
+                let live_path = live_path.clone();
+                move || {
+                    let _ = serve(kernel(), &live_path);
+                }
+            });
+            let healthy = loop {
+                if let Ok(client) = connect(&live_path) {
+                    break client;
+                }
+            };
+            let silent = connect_with_timeout(&silent_path, Some(Duration::from_secs(30)))
+                .unwrap()
+                .with_describe_timeout(Some(BOUND));
+
+            let kernel = Kernel::new(Arc::new(Fallback::new(vec![
+                Arc::new(MountedRemote::new(
+                    Arc::new(silent),
+                    "urn:edge:",
+                    origin_of(&silent_path),
+                )) as Arc<dyn Space>,
+                Arc::new(MountedRemote::new(
+                    Arc::new(healthy),
+                    "urn:live:",
+                    origin_of(&live_path),
+                )) as Arc<dyn Space>,
+            ])));
+
+            // The catalog carries the healthy peer's bindings, complete and re-prefixed…
+            let catalog = Resolver::entries(&kernel).expect("the kernel enumerates");
+            assert!(
+                catalog.iter().any(|e| e.pattern == "urn:live:test:upper"),
+                "the healthy peer's bindings are COMPLETE beside a silent one: {catalog:?}"
+            );
+            // …and the manifold, which is the resource an agent reads, names the silent one.
+            // (The healthy peer's kernel here has no JSON Meta renderer, so its rows carry
+            // no actions — a pre-existing, separately-diagnosed condition, and the reason
+            // this half asserts over the catalog rather than over the manifold.)
+            let named: Vec<String> = kernel
+                .select_actions(&ActionQuery::default())
+                .into_iter()
+                .map(|m| m.endpoint)
+                .collect();
+            assert!(
+                named
+                    .iter()
+                    .any(|e| e == "urn:edge:ikigai:mount-unavailable"),
+                "the silent mount is named in the manifold: {named:?}"
+            );
+
+            drop(kernel);
+            server.join().unwrap();
+            let _ = std::fs::remove_file(&silent_path);
+            let _ = std::fs::remove_file(&live_path);
+            drop(live);
+        }
+
+        /// ★ Silence is a property of the PEER, not of the local name a mount gave it.
+        /// plasma mounts one `ikigai-gonk` under two prefixes; with a record per mount that
+        /// one silent process cost TWO deadlines on every manifold read (measured at 60s
+        /// where one deadline is 30s), and five mounts would have cost five.
+        ///
+        /// Both namespaces still get their own row — what they share is the verdict, not
+        /// the statement. One row for two silenced namespaces would under-report exactly
+        /// the case this exists for.
+        #[test]
+        fn two_mounts_of_one_silent_peer_cost_one_deadline_and_still_name_both() {
+            use ikigai_core::Space;
+
+            let path = socket_path("silent-shared");
+            let received = Arc::new(AtomicUsize::new(0));
+            let server = silent_peer_for(&path, Arc::clone(&received), 2);
+            let origin = origin_of(&path);
+            // One `PeerHealth` for this kernel's mounts — what a composer hands every
+            // mount it builds. Two mounts, one peer, one verdict.
+            let peers = ikigai_resolve::PeerHealth::default();
+            let mut mounts: Vec<Arc<dyn Space>> = Vec::new();
+            for prefix in ["urn:one:", "urn:two:"] {
+                let client = connect_with_timeout(&path, Some(Duration::from_secs(30)))
+                    .unwrap()
+                    .with_describe_timeout(Some(BOUND));
+                mounts.push(Arc::new(
+                    MountedRemote::new(Arc::new(client), prefix, origin.clone()).sharing(&peers),
+                ));
+            }
+            let kernel = Kernel::new(Arc::new(Fallback::new(mounts)));
+
+            let named: Vec<String> = kernel
+                .select_actions(&ActionQuery::default())
+                .into_iter()
+                .map(|m| m.endpoint)
+                .collect();
+            assert!(
+                named
+                    .iter()
+                    .any(|e| e == "urn:one:ikigai:mount-unavailable")
+                    && named
+                        .iter()
+                        .any(|e| e == "urn:two:ikigai:mount-unavailable"),
+                "both silenced namespaces say so: {named:?}"
+            );
+            assert_eq!(
+                received.load(Ordering::SeqCst),
+                1,
+                "…and the peer was asked once, not once per mount"
+            );
+
+            drop(kernel);
+            server.join().unwrap();
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// ⚠ The row is reachable in a process where nothing has failed — a one-shot
+        /// `ikigai -c` reading an IRI out of a manifold an earlier process printed. It must
+        /// not claim a failure it cannot support. (It said "it has answered since; this row
+        /// is stale" for a peer that had never been asked, which is a contradiction in one
+        /// sentence and was exactly the first thing a live run printed.)
+        #[test]
+        fn with_no_failure_recorded_the_row_does_not_claim_one() {
+            let path = socket_path("silent-unasked");
+            let received = Arc::new(AtomicUsize::new(0));
+            let server = silent_peer(&path, Arc::clone(&received));
+            let kernel = kernel_with_a_silent_mount(&path);
+
+            // Deliberately NO enumeration first.
+            let request = Request::new(
+                Verb::Source,
+                Iri::parse("urn:edge:ikigai:mount-unavailable").unwrap(),
+            );
+            let (representation, _) =
+                Resolver::issue_as(&kernel, request, &Capability::root()).unwrap();
+            let said = String::from_utf8(representation.bytes).unwrap();
+            assert!(
+                said.contains("no current record"),
+                "it says what it knows, which is nothing: {said}"
+            );
+            assert!(
+                said.contains(&origin_of(&path)),
+                "and still names the peer: {said}"
+            );
+
+            drop(kernel);
+            server.join().unwrap();
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// ★ The deadline bounds a CALL; this bounds the WALK. A manifold read is one
+        /// enumeration plus one `describe()` per catalog row, so a per-call deadline over a
+        /// silent peer would cost `rows × deadline` — bounded arithmetic that is still a
+        /// hang to a human. The mount asks ONCE and believes the answer for a cooldown.
+        #[test]
+        fn a_silent_peer_is_asked_once_per_walk_not_once_per_row() {
+            let path = socket_path("silent-once");
+            let received = Arc::new(AtomicUsize::new(0));
+            let server = silent_peer(&path, Arc::clone(&received));
+            let kernel = kernel_with_a_silent_mount(&path);
+
+            // Three full manifold walks, each of which would re-ask an unguarded mount.
+            for _ in 0..3 {
+                let _ = kernel.select_actions(&ActionQuery::default());
+            }
+            assert_eq!(
+                received.load(Ordering::SeqCst),
+                1,
+                "the peer was asked once and believed; every later describe failed instantly"
+            );
+
+            drop(kernel);
+            server.join().unwrap();
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// The other half of the bound: a healthy peer must not pay for it, and a RESOLUTION
+    /// must not inherit it. A deadline implemented as "wait, then check" would trade a hang
+    /// for a tax on every call, which is not a fix.
+    mod the_bound_costs_a_healthy_peer_nothing {
+        use super::*;
+        use ikigai_core::Space;
+        use ikigai_resolve::MountedRemote;
+
+        /// A peer that answers everything, but only after `delay`. One delay, two
+        /// outcomes: it is under the connection's I/O deadline and over the describe one,
+        /// so the SAME server on the SAME connection serves a resolution and misses a
+        /// self-description. Nothing else in the test distinguishes the two calls.
+        fn slow_peer(path: &Path, delay: Duration) -> thread::JoinHandle<()> {
+            let _ = std::fs::remove_file(path);
+            let listener = UnixListener::bind(path).unwrap();
+            thread::spawn(move || {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut s = &stream;
+                let _ = read_frame(&mut s);
+                let _ = write_hello(
+                    &mut s,
+                    &Hello {
+                        version: PROTOCOL_VERSION,
+                        mode: HelloMode::Verbatim,
+                    },
+                );
+                while let Ok(call) = read_message::<_, Call>(&mut s) {
+                    std::thread::sleep(delay);
+                    let reply = match call {
+                        Call::Entries => Reply::Entries(Some(Vec::new())),
+                        _ => Reply::Resolved(
+                            Representation::new(ikigai_core::ReprType::new("text/plain"), "slow"),
+                            ikigai_resolve::CacheStatus::Uncacheable,
+                        ),
+                    };
+                    if write_message(&mut s, &reply).is_err() {
+                        return;
+                    }
+                }
+            })
+        }
+
+        #[test]
+        fn a_resolution_keeps_the_patient_deadline_a_describe_does_not() {
+            let path = socket_path("slow-peer");
+            let server = slow_peer(&path, Duration::from_millis(300));
+            let client = connect_with_timeout(&path, Some(Duration::from_secs(30)))
+                .unwrap()
+                .with_describe_timeout(Some(Duration::from_millis(100)));
+
+            // A resolution takes 300ms and succeeds: its deadline is 30s, untouched.
+            let (representation, _) = client
+                .issue(Request::new(
+                    Verb::Source,
+                    Iri::parse("urn:test:slow").unwrap(),
+                ))
+                .expect("a slow resolution is still a resolution");
+            assert_eq!(representation.bytes, b"slow");
+
+            // The same peer, the same 300ms, an enumeration: bounded at 100ms, refused.
+            let error = Resolver::try_entries(&client)
+                .expect_err("a self-description that misses its deadline is an ERROR");
+            assert!(matches!(error, Error::Timeout(_)), "{error:?}");
+            assert!(error.is_transient(), "a deadline is transient: {error:?}");
+
+            drop(client);
+            server.join().unwrap();
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// A healthy mount's enumeration costs a round trip, not a deadline. The assertion
+        /// is deliberately far below the bound: what it rules out is an implementation that
+        /// waits out the deadline before looking.
+        #[test]
+        // Native-only, and elapsed time is the measurement — see the module above.
+        #[allow(clippy::disallowed_methods)]
+        fn a_healthy_enumeration_does_not_pay_a_deadline() {
+            let path = socket_path("healthy-enum");
+            let _ = std::fs::remove_file(&path);
+            let server = thread::spawn({
+                let path = path.clone();
+                move || {
+                    let _ = serve(kernel(), &path);
+                }
+            });
+            // Wait for the socket to appear rather than sleeping a guess.
+            let client = loop {
+                if let Ok(client) = connect(&path) {
+                    break client.with_describe_timeout(Some(Duration::from_secs(30)));
+                }
+            };
+            let mounted = MountedRemote::new(Arc::new(client), "urn:edge:", "ipc:healthy.sock");
+
+            let start = std::time::Instant::now();
+            let entries = Space::entries(&mounted).expect("a healthy peer enumerates");
+            let elapsed = start.elapsed();
+
+            assert!(
+                entries.iter().any(|e| e.pattern == "urn:edge:test:upper"),
+                "the peer's real bindings, re-prefixed: {entries:?}"
+            );
+            assert!(
+                !entries.iter().any(|e| e.endpoint == "mount-unavailable"),
+                "no degraded row on a healthy mount: {entries:?}"
+            );
+            assert!(
+                elapsed < Duration::from_millis(500),
+                "a round trip, not a deadline: {elapsed:?}"
+            );
+
+            drop(mounted);
+            let _ = std::fs::remove_file(&path);
+            drop(server);
+        }
     }
 }

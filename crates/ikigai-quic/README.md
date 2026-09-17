@@ -39,6 +39,26 @@ per-connection `Session` from it:
   `<segment>/…`, so each tenant addresses files as if its segment were the root and
   never sees another's.
 
+## Two deadlines: patience for work, a bound for self-description
+
+`DEFAULT_IDLE_TIMEOUT` is **five minutes**, because what a connection's idle bound
+measures is SILENCE and a resolution is silent while it works — a 70B model loads ~40GB
+before its first token, and a bound that cannot tell *hung* from *busy* reports the
+wrong thing confidently.
+
+Nothing is ever working during a **self-description**, so those calls run under
+`DEFAULT_DESCRIBE_TIMEOUT` (**30s**, `describe.timeout` in the config home) instead: a
+`Call::Entries`, and a `Meta` issue — the one `MountedRemote`'s forwarding endpoint
+sends to read a peer's contract. Without that split, one silent peer took out
+`urn:kernel:catalog` and `urn:kernel:actions` for every kernel that could reach it,
+and the manifold is the resource an agent must read before it can do anything at all.
+
+⚠ Enumeration is **transitive**, so the bound is per hop and per-hop bounds do not
+compose: three kernels deep, the outer hop cuts off at exactly the moment the inner hop
+would have answered with its own degraded catalog. A deep federation raises
+`describe.timeout` at the outermost kernel. Carrying a decrementing *budget* on the wire
+is the real answer and is a protocol change.
+
 ## Build
 
 Native only, opt-in behind the CLI's `quic` feature. Built on **quinn + rustls +
