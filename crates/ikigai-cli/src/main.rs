@@ -77,6 +77,10 @@ usage:
                                is unreachable (transient failures only; denials still propagate)
   <t> = peer:<name>            find that peer on the local network (mDNS) instead of naming an
                                address; needs a pinned cert at <config>/ikigai/quic-<name>/
+  ikigai --no-config-mounts    compose ZERO mounts: decline the machine's topology instead of
+                               enumerating a replacement. Honoured by every mode that builds a
+                               kernel (REPL, -c, --daemon, serve, mcp); refuses to start beside
+                               --mount/--override/--prefer, which declare a topology of their own
   ikigai --react               run the space reactor in this session — claims and executes tuples
                                dropped in the workspace. OFF by default; the daemon is the worker
   ikigai cert generate         create the pinned QUIC certificates (--dir <d> for a dedicated set)
@@ -130,7 +134,7 @@ enum Mode {
     Daemon {
         /// Each mount carries its own certificates, so the daemon needs no
         /// default set of its own (it never `--connect`s).
-        mounts: Vec<Mount>,
+        mounts: Mounts,
     },
     Serve {
         target: Option<String>,
@@ -173,7 +177,7 @@ enum Mode {
         /// `--prefer`, same syntax as the REPL). THE HOST OWNS THE TOPOLOGY: a local client
         /// then reaches a peer through this socket without knowing where it is, holding its
         /// certificates, or needing the platform permission discovery requires.
-        mounts: Vec<Mount>,
+        mounts: Mounts,
     },
     /// Serve the capability-scoped manifold as an MCP (Model Context Protocol)
     /// server over stdio. `grants`/`scopes` union into the session capability —
@@ -185,7 +189,7 @@ enum Mode {
         /// `--prefer`, same syntax as the REPL; no flags ⇒ the machine's own topology
         /// from the config home). A federated mount is most useful HERE: the MCP
         /// client gets tools that resolve on a peer without holding its certificates.
-        mounts: Vec<Mount>,
+        mounts: Mounts,
     },
     CertGenerate {
         force: bool,
@@ -220,8 +224,8 @@ struct ReplArgs {
     /// (a Unix socket path or a `quic://host:port` URL). Each mounts a `RemoteSpace`
     /// so a resource under `prefix` resolves on the remote kernel. Embedded
     /// (non-`--connect`) only. Each carries its OWN certificates — distinct peers
-    /// never share a cert set.
-    mounts: Vec<Mount>,
+    /// never share a cert set. `--no-config-mounts` rides along as the DECLINE posture.
+    mounts: Mounts,
     certs: Certs,
     /// Run the space reactor in this session (`--react`), claiming and executing tuples
     /// dropped into the workspace. OFF by default: reacting means competing with the
@@ -241,6 +245,63 @@ struct Mount {
     target: String,
     certs: Certs,
     kind: ikigai_embedded::MountKind,
+}
+
+/// What a kernel-building mode was TOLD about its mounts. THREE postures, not two:
+///
+/// - mount flags (`--mount`/`--override`/`--prefer`) are the WHOLE topology;
+/// - `--no-config-mounts` composes ZERO, and does not read the config home at all;
+/// - neither ⇒ the machine's own topology, from the config home's `mount` lines.
+///
+/// One value rather than a `Vec` plus a loose `bool`, so no door can plumb half of it: the
+/// decline has to reach EVERY mode that builds a kernel, because the `mount` key is shared
+/// by all of them — a decline honoured in one mode only would be the next version of the
+/// bug it fixes (ledger #410).
+#[derive(Default, Clone)]
+struct Mounts {
+    /// The mount flags, in argv order. Non-empty ⇒ the config home is not read.
+    flags: Vec<Mount>,
+    /// `--no-config-mounts`: compose nothing, and do not read the config home.
+    declined: bool,
+}
+
+impl Mounts {
+    /// The two postures are mutually exclusive, and that is a STARTUP ERROR rather than a
+    /// precedence rule. A silent winner between "exactly these mounts" and "no mounts at
+    /// all" is precisely the half-and-half mount set [`mounts_or_config`] exists to refuse
+    /// to produce: from outside the process there is no way to tell which one took effect.
+    fn refuse_conflict(&self) -> Result<(), String> {
+        match self.flags.first() {
+            Some(mount) if self.declined => Err(format!(
+                "--no-config-mounts and {flag} cannot be combined: --no-config-mounts composes \
+                 ZERO mounts and does not read the config home, while {flag} `{prefix}={target}` \
+                 declares the whole topology. Pass one or the other.",
+                flag = mount_flag(mount.kind),
+                prefix = mount.prefix,
+                target = mount.target,
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// The one spelling of the declined posture, so every door says it the same way. Saying it
+/// is the point: the peer that started #410 composed the machine's whole topology and its
+/// banner reported only a mount COUNT, so "this server inherited gonk" was invisible.
+const MOUNTS_DECLINED: &str = "mounts declined (--no-config-mounts)";
+
+/// The banner's mount fragment. Three postures, three notes: a count when something
+/// composed, an explicit decline when `--no-config-mounts` said zero, and nothing at all
+/// when the config home simply had no `mount` lines — the last two look identical from a
+/// mount count, which is why the decline gets words.
+fn mount_note(resolved: usize, declined: bool) -> String {
+    if declined {
+        format!("; {MOUNTS_DECLINED}")
+    } else if resolved == 0 {
+        String::new()
+    } else {
+        format!("; {resolved} mount(s)")
+    }
 }
 
 /// Everything `serve --http` was told, in one value.
@@ -275,8 +336,9 @@ struct HttpDoor<'a> {
     routes: Option<&'a str>,
     routes_only: bool,
     max_body: Option<usize>,
-    /// `--mount`/`--override`/`--prefer`, or the machine's topology from the config home.
-    mounts: Vec<Mount>,
+    /// `--mount`/`--override`/`--prefer`, the machine's topology from the config home, or
+    /// nothing at all under `--no-config-mounts`.
+    mounts: Mounts,
 }
 
 /// Whether a `serve`/`--connect` target names a QUIC endpoint.
@@ -458,13 +520,13 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
         let mut routes_only = false;
         let mut max_body = None;
         let mut announce = false;
-        let mut mounts: Vec<Mount> = Vec::new();
+        let mut mounts = Mounts::default();
         while let Some(arg) = argv.next() {
             if cert_flag(&arg, &mut argv, &mut certs)? {
                 // A cert flag FOLLOWING a mount belongs to that mount (the REPL's rule),
                 // so two peers with different identities never share a set. Flags before
                 // any mount are this server's own identity.
-                if let Some(mount) = mounts.last_mut() {
+                if let Some(mount) = mounts.flags.last_mut() {
                     mount.certs = certs.clone();
                 }
                 continue;
@@ -474,6 +536,13 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
             }
             if arg == "--announce" {
                 announce = true;
+                continue;
+            }
+            if arg == "--no-config-mounts" {
+                // DECLINE the machine's topology (see `Mounts`). The motivating case: an
+                // inference peer that wants to be a LEAF, on a box whose shared config home
+                // points every other process at IT.
+                mounts.declined = true;
                 continue;
             }
             if let Some(kind) = match arg.as_str() {
@@ -490,7 +559,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                     .ok_or_else(|| format!("{arg} expects <prefix>=<target>, got `{spec}`"))?;
                 // Cert flags AFTER a mount attach to it (same rule as the REPL), so two
                 // peers with different identities never share a cert set.
-                mounts.push(Mount {
+                mounts.flags.push(Mount {
                     prefix: prefix.to_string(),
                     target: target.to_string(),
                     certs: certs.clone(),
@@ -591,6 +660,8 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 return Err(format!("unexpected argument after `serve`: {arg}"));
             }
         }
+        // Both postures at once is a startup error, not a precedence rule (see `Mounts`).
+        mounts.refuse_conflict()?;
         // Declare the code-signing trust set for whichever serve mode follows:
         // process-global, like the instance name, and read by the kernel
         // builders. Empty ⇒ urn:lisp:run is never bound.
@@ -618,13 +689,13 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
         let mut grants = Vec::new();
         let mut scopes = Vec::new();
         let mut certs = Certs::default();
-        let mut mounts: Vec<Mount> = Vec::new();
+        let mut mounts = Mounts::default();
         while let Some(arg) = argv.next() {
             // Cert flags AFTER a mount attach to it (the REPL's rule), so two peers
             // with different identities never share a set. mcp never `--connect`s,
             // so there is no default-set use for flags before any mount.
             if cert_flag(&arg, &mut argv, &mut certs)? {
-                if let Some(mount) = mounts.last_mut() {
+                if let Some(mount) = mounts.flags.last_mut() {
                     mount.certs = certs.clone();
                 }
                 continue;
@@ -641,7 +712,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 let (prefix, target) = spec
                     .split_once('=')
                     .ok_or_else(|| format!("{arg} expects <prefix>=<target>, got `{spec}`"))?;
-                mounts.push(Mount {
+                mounts.flags.push(Mount {
                     prefix: prefix.to_string(),
                     target: target.to_string(),
                     certs: certs.clone(),
@@ -653,6 +724,8 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 continue;
             }
             match arg.as_str() {
+                // DECLINE the machine's topology (see `Mounts`).
+                "--no-config-mounts" => mounts.declined = true,
                 "--grant" => grants.push(
                     argv.next()
                         .ok_or_else(|| "--grant needs a name".to_string())?,
@@ -664,6 +737,8 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 other => return Err(format!("unknown argument after `mcp`: {other}")),
             }
         }
+        // Both postures at once is a startup error, not a precedence rule (see `Mounts`).
+        mounts.refuse_conflict()?;
         return Ok(Some(Mode::Mcp {
             grants,
             scopes,
@@ -678,7 +753,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
         // --mount b=Y --cert-dir B` gives each peer its own set (which is what
         // ikigai-emacs has always emitted). Before any mount, they form the
         // default set: what `--connect` uses, and what a later mount inherits.
-        let cert_target = match repl.mounts.last_mut() {
+        let cert_target = match repl.mounts.flags.last_mut() {
             Some(mount) => &mut mount.certs,
             None => &mut repl.certs,
         };
@@ -717,7 +792,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                     .ok_or_else(|| format!("--mount expects <prefix>=<socket>, got `{spec}`"))?;
                 // Inherit whatever cert flags preceded this mount; any that FOLLOW
                 // it refine this mount alone (see the cert_flag dispatch above).
-                repl.mounts.push(Mount {
+                repl.mounts.flags.push(Mount {
                     prefix: prefix.to_string(),
                     target: socket.to_string(),
                     certs: repl.certs.clone(),
@@ -737,12 +812,17 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 let (prefix, target) = spec
                     .split_once('=')
                     .ok_or_else(|| format!("--override expects <prefix>=<target>, got `{spec}`"))?;
-                repl.mounts.push(Mount {
+                repl.mounts.flags.push(Mount {
                     prefix: prefix.to_string(),
                     target: target.to_string(),
                     certs: repl.certs.clone(),
                     kind: ikigai_embedded::MountKind::Override,
                 });
+            }
+            "--no-config-mounts" => {
+                // DECLINE the machine's topology (see `Mounts`): compose ZERO mounts and do
+                // not read the config home's `mount` lines.
+                repl.mounts.declined = true;
             }
             "--react" => {
                 repl.react = true;
@@ -759,7 +839,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 let (prefix, target) = spec
                     .split_once('=')
                     .ok_or_else(|| format!("--prefer expects <prefix>=<target>, got `{spec}`"))?;
-                repl.mounts.push(Mount {
+                repl.mounts.flags.push(Mount {
                     prefix: prefix.to_string(),
                     target: target.to_string(),
                     certs: repl.certs.clone(),
@@ -801,6 +881,9 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
             other => return Err(format!("unknown argument: {other}")),
         }
     }
+    // Both postures at once is a startup error, not a precedence rule (see `Mounts`) — for
+    // the REPL, the one-shot `-c`, and `--daemon`, which share this parse.
+    repl.mounts.refuse_conflict()?;
     if daemon {
         return Ok(Some(Mode::Daemon {
             mounts: repl.mounts,
@@ -902,10 +985,11 @@ fn main() {
 /// consolidated-view sync all live in it — then park. This is what a
 /// LaunchAgent runs: the desktop machine as a quiet, always-on resolver.
 #[cfg(feature = "embedded")]
-fn daemon(mounts: Vec<Mount>) {
+fn daemon(mounts: Mounts) {
     // No mount flags -> the machine's own topology (config home), same rule as every
     // kernel-building mode. The booking picker asking urn:llm:ask in THIS process is
     // exactly who a `mount = "prefer urn:llm:=peer:plasma"` line is for.
+    let declined = mounts.declined;
     let mounts = match mounts_or_config(mounts) {
         Ok(mounts) => mounts,
         // A topology that does not parse must never look like no topology.
@@ -944,6 +1028,9 @@ fn daemon(mounts: Vec<Mount>) {
         }
         ikigai_embedded::reactive_kernel_with_mounts(resolved)
     };
+    if declined {
+        eprintln!("ikigai: {MOUNTS_DECLINED} — the config home's `mount` lines are not read");
+    }
     let name = ikigai_embedded::instance_name();
     match ikigai_embedded::standing_sync_interval() {
         Some(every) => eprintln!(
@@ -965,7 +1052,7 @@ fn daemon(mounts: Vec<Mount>) {
 }
 
 #[cfg(not(feature = "embedded"))]
-fn daemon(_mounts: Vec<Mount>) {
+fn daemon(_mounts: Mounts) {
     eprintln!("ikigai: --daemon requires the embedded feature");
     std::process::exit(2);
 }
@@ -1009,7 +1096,7 @@ fn mcp_filter(grants: &[String]) -> ikigai_mcp::ToolFilter {
 /// client's tool list morphs live — no restart. Broadening is safe here because
 /// it is the HUMAN editing the grant (root re-granting), never the client.
 #[cfg(feature = "embedded")]
-fn mcp(grants: Vec<String>, scopes: Vec<String>, mounts: Vec<Mount>) {
+fn mcp(grants: Vec<String>, scopes: Vec<String>, mounts: Mounts) {
     use ikigai_mcp::server::handle;
     use std::io::{BufRead, Write};
     use std::sync::{Arc, Mutex, RwLock};
@@ -1037,6 +1124,7 @@ fn mcp(grants: Vec<String>, scopes: Vec<String>, mounts: Vec<Mount>) {
     // every kernel-building mode. This is where federation pays off for an agent:
     // `mount = "prefer urn:llm:=peer:plasma"` puts the peer's models behind the
     // SAME tool names the local kernel would project, no client-side config at all.
+    let declined = mounts.declined;
     let mounts = match mounts_or_config(mounts) {
         Ok(mounts) => mounts,
         // A topology that does not parse must never look like no topology.
@@ -1045,6 +1133,9 @@ fn mcp(grants: Vec<String>, scopes: Vec<String>, mounts: Vec<Mount>) {
             std::process::exit(2);
         }
     };
+    if declined {
+        eprintln!("ikigai mcp: {MOUNTS_DECLINED} — the config home's `mount` lines are not read");
+    }
     let kernel = if mounts.is_empty() {
         ikigai_embedded::watched_kernel()
     } else {
@@ -1170,7 +1261,7 @@ fn mcp(grants: Vec<String>, scopes: Vec<String>, mounts: Vec<Mount>) {
 }
 
 #[cfg(not(feature = "embedded"))]
-fn mcp(_grants: Vec<String>, _scopes: Vec<String>, _mounts: Vec<Mount>) {
+fn mcp(_grants: Vec<String>, _scopes: Vec<String>, _mounts: Mounts) {
     eprintln!("ikigai: mcp requires the embedded feature");
     std::process::exit(2);
 }
@@ -1212,7 +1303,7 @@ fn with_profiles(engine: Engine) -> Engine {
 #[cfg(feature = "embedded")]
 fn build_engine(
     connect: Option<Option<String>>,
-    mounts: Vec<Mount>,
+    mounts: Mounts,
     certs: &Certs,
     react: bool,
 ) -> Result<Engine, String> {
@@ -1259,8 +1350,19 @@ fn build_engine(
             ))
         }
         Some(target) => {
-            if !mounts.is_empty() {
+            if !mounts.flags.is_empty() {
                 return Err("--mount composes into the embedded kernel; drop --connect".to_string());
+            }
+            // A `--connect` client composes nothing of its own, so declining the config home
+            // would be INERT rather than wrong — and a flag that silently does nothing is how
+            // an operator comes to believe a topology was declined when it was not.
+            if mounts.declined {
+                return Err(
+                    "--no-config-mounts declines the config home for a kernel this process \
+                     BUILDS; a --connect client composes no mounts anyway (the host it attaches \
+                     to owns the topology) — drop one of the two"
+                        .to_string(),
+                );
             }
             match target.as_deref() {
                 Some(t) if is_quic(t) => connect_quic(t, certs),
@@ -1270,18 +1372,43 @@ fn build_engine(
     }
 }
 
-/// The mounts a kernel-building mode composes: flags are POSTURE and win WHOLESALE
-/// when given; otherwise the machine's own topology from the config home. Wholesale
-/// rather than merged, because a half-and-half mount set is the kind of thing nobody
-/// can debug at 2am. Every mode that builds a kernel from nothing routes through
-/// this — the REPL/one-shot, the daemon, the IPC host — so `mount =` lines mean the
-/// MACHINE composes that way, not one lucky process.
+/// The mounts a kernel-building mode composes. THREE postures: flags are POSTURE and win
+/// WHOLESALE when given; `--no-config-mounts` composes ZERO and does not read the config
+/// home at all; otherwise the machine's own topology from the config home. Wholesale rather
+/// than merged, because a half-and-half mount set is the kind of thing nobody can debug at
+/// 2am. Every mode that builds a kernel from nothing routes through this — the REPL/one-shot,
+/// `serve` (all three doors), the daemon, mcp — so `mount =` lines mean the MACHINE composes
+/// that way, not one lucky process, and DECLINING has to reach every one of them too.
+///
+/// ★ Why decline needed a posture of its own rather than an empty flag set: the config home
+/// is SHARED by every process on the box, so a server given no mount flags inherits the
+/// machine's whole topology — including the very lines that point the other processes at IT.
+/// plasma's inference peer composed gonk, gonk mounts the peer for `urn:llm:`, and each
+/// side's self-description then waited out its bound on the other (31s for `Call::Entries`,
+/// ~109s for the HTTP index page that enumerates). Before this flag, declining the config
+/// home meant enumerating a replacement topology the process did not want, because any flag
+/// it was given became its whole topology (ledger #410).
 #[cfg(feature = "embedded")]
-fn mounts_or_config(mounts: Vec<Mount>) -> Result<Vec<Mount>, String> {
-    if mounts.is_empty() {
-        config_mounts()
+fn mounts_or_config(mounts: Mounts) -> Result<Vec<Mount>, String> {
+    resolve_mounts(mounts, config_mounts)
+}
+
+/// [`mounts_or_config`] with the config home's topology as a THUNK, so a test can assert what
+/// the flag actually promises — that declining does not READ the file — instead of only that
+/// the result came back empty, which an absent or unreadable config home produces too.
+fn resolve_mounts(
+    mounts: Mounts,
+    config: impl FnOnce() -> Result<Vec<Mount>, String>,
+) -> Result<Vec<Mount>, String> {
+    // The backstop for the exclusion: each parse site refuses first (with the usage block),
+    // but this is the one function every kernel-building door provably calls.
+    mounts.refuse_conflict()?;
+    if mounts.declined {
+        Ok(Vec::new())
+    } else if mounts.flags.is_empty() {
+        config()
     } else {
-        Ok(mounts)
+        Ok(mounts.flags)
     }
 }
 
@@ -1298,7 +1425,13 @@ fn mounts_or_config(mounts: Vec<Mount>) -> Result<Vec<Mount>, String> {
 /// plist cannot say both. A plist is deployed from the repo and `git pull` would overwrite a
 /// machine's identity with another's; a config file is that machine's own.
 fn config_mounts() -> Result<Vec<Mount>, String> {
-    ikigai_embedded::config::all("mount")
+    mounts_from_config_lines(ikigai_embedded::config::all("mount"))
+}
+
+/// [`config_mounts`] over lines already read, so the line grammar is testable without a
+/// config home: the environment is process-global, and mutating it races the test harness.
+fn mounts_from_config_lines(lines: Vec<String>) -> Result<Vec<Mount>, String> {
+    lines
         .into_iter()
         .map(|line| {
             let mut parts = line.split_whitespace();
@@ -1561,7 +1694,6 @@ fn connect_mount(
 
 /// The flag spelling of a mount kind (a `mount =` config line uses the same
 /// word without the dashes).
-#[cfg(feature = "embedded")]
 fn mount_flag(kind: ikigai_embedded::MountKind) -> &'static str {
     match kind {
         ikigai_embedded::MountKind::Alias => "--mount",
@@ -1850,20 +1982,16 @@ fn cert_add_client(_name: &str, _cert_dir: Option<String>, _force: bool) -> ! {
 // --- QUIC serve / connect ---------------------------------------------------
 
 #[cfg(all(feature = "embedded", feature = "quic"))]
-fn serve_quic(
-    target: &str,
-    certs: &Certs,
-    caps: &[String],
-    announce: bool,
-    mounts: Vec<Mount>,
-) -> ! {
+fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, mounts: Mounts) -> ! {
     let caps = caps.to_vec();
     let result = (|| -> Result<(), String> {
         let addr = quic::parse_addr(target)?;
         let identity = quic::server_identity(certs)?;
         let trusted = quic::trusted_client_certs(certs)?;
-        // Flags are POSTURE and win wholesale when given; otherwise the machine's own
-        // topology from the config home — the same rule as every kernel-building mode.
+        // Flags are POSTURE and win wholesale when given; `--no-config-mounts` composes
+        // none; otherwise the machine's own topology from the config home — the same rule as
+        // every kernel-building mode.
+        let declined = mounts.declined;
         let mounts = mounts_or_config(mounts)?;
         // SELF-MOUNT GUARD, the QUIC face of serve_ipc's: the config home is shared by
         // every process on the machine, so the very lines that point OTHER processes at
@@ -2080,11 +2208,7 @@ fn serve_quic(
             // servable, still bounded by require_net to the granted provider hosts.
             llm: surface_caps.iter().any(|c| c.starts_with("urn:cap:net:")),
         };
-        let mounted = if resolved.is_empty() {
-            String::new()
-        } else {
-            format!("; {} mount(s)", resolved.len())
-        };
+        let mounted = mount_note(resolved.len(), declined);
         let kernel = ikigai_embedded::served_kernel_with_mounts("Remote (QUIC)", surface, resolved);
         let signed_door = ikigai_embedded::code_signers_configured();
         let mut faces = vec![if surface.personal {
@@ -2184,7 +2308,7 @@ fn serve_quic(
     _certs: &Certs,
     _caps: &[String],
     _announce: bool,
-    _mounts: Vec<Mount>,
+    _mounts: Mounts,
 ) -> ! {
     eprintln!("ikigai: `quic://` needs the `quic` feature");
     std::process::exit(1);
@@ -2198,7 +2322,7 @@ fn connect_quic(_target: &str, _certs: &Certs) -> Result<Engine, String> {
 // --- IPC serve / connect ----------------------------------------------------
 
 #[cfg(all(feature = "embedded", feature = "ipc", unix))]
-fn serve_ipc(path: Option<String>, mounts: Vec<Mount>) -> ! {
+fn serve_ipc(path: Option<String>, mounts: Mounts) -> ! {
     let socket = ipc_socket(path);
     // PRE-FLIGHT the sockaddr_un limit: the bind happens LAST — after the mounts
     // dial and after the kernel opens the browse store, taking its exclusive
@@ -2211,6 +2335,7 @@ fn serve_ipc(path: Option<String>, mounts: Vec<Mount>) -> ! {
     // Flags are POSTURE and win wholesale when given; otherwise the machine's own topology
     // from the config home. Wholesale rather than merged, because a half-and-half mount set
     // is the kind of thing nobody can debug at 2am.
+    let declined = mounts.declined;
     let mounts = match mounts_or_config(mounts) {
         Ok(mounts) => mounts,
         // A topology that does not parse must never look like no topology: this host
@@ -2257,11 +2382,7 @@ fn serve_ipc(path: Option<String>, mounts: Vec<Mount>) -> ! {
             }
         }
     }
-    let mounted = if resolved.is_empty() {
-        String::new()
-    } else {
-        format!("; {} mount(s)", resolved.len())
-    };
+    let mounted = mount_note(resolved.len(), declined);
     eprintln!(
         "ikigai: serving on {}{mounted}  (Ctrl-C to stop)",
         socket.display()
@@ -2373,7 +2494,7 @@ fn ipc_socket(path: Option<String>) -> std::path::PathBuf {
 }
 
 #[cfg(all(feature = "embedded", not(all(feature = "ipc", unix))))]
-fn serve_ipc(_path: Option<String>, _mounts: Vec<Mount>) -> ! {
+fn serve_ipc(_path: Option<String>, _mounts: Mounts) -> ! {
     eprintln!("ikigai: a Unix-socket server needs the `ipc` feature on a Unix platform");
     std::process::exit(1);
 }
@@ -2412,6 +2533,7 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
     // from the config home — the same rule as serve_ipc and serve_quic. Until 2026-09-16
     // this door had none of it: `Mode::Serve` destructured `mounts`, handed them to the
     // other two doors, and dropped them here. No warning, no refusal, exit 0.
+    let declined = mounts.declined;
     let mounts = match mounts_or_config(mounts) {
         Ok(mounts) => mounts,
         // A topology that does not parse must never look like no topology.
@@ -2444,14 +2566,10 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
             }
         }
     }
-    let mount_note = if resolved.is_empty() {
-        String::new()
-    } else {
-        // The QUIC banner has always printed this; the HTTP banner printed a full posture
-        // line without it — so the ONE place the missing mounts would have shown was the
-        // one place the count was left out.
-        format!("; {} mount(s)", resolved.len())
-    };
+    // The QUIC banner has always printed the count; the HTTP banner printed a full posture
+    // line without it — so the ONE place the missing mounts would have shown was the one
+    // place the count was left out.
+    let mounted = mount_note(resolved.len(), declined);
     // `kernel_for_with_mounts`, NOT `served_kernel_with_mounts`: this door's kernel also
     // carries `urn:iki:foaf` and the transreption chain it issues through (the `/foaf`
     // face on the public edge), which the QUIC composer does not. And it stays the PUBLIC
@@ -2574,7 +2692,7 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
         "no proxy trust"
     };
     eprintln!(
-        "ikigai: serving HTTP on {addr}{mount_note}  ({posture}; {route_note}; {cors_note}; {proxy_note}; terminate TLS at your proxy)  (Ctrl-C to stop)"
+        "ikigai: serving HTTP on {addr}{mounted}  ({posture}; {route_note}; {cors_note}; {proxy_note}; terminate TLS at your proxy)  (Ctrl-C to stop)"
     );
     match runtime.block_on(ikigai_web::serve_with(kernel, cap_fn, addr, config)) {
         Ok(()) => std::process::exit(0),
@@ -2613,6 +2731,192 @@ fn main() {
 }
 
 #[cfg(test)]
+mod mount_posture_tests {
+    use super::*;
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn mount(kind: ikigai_embedded::MountKind) -> Mount {
+        Mount {
+            prefix: "urn:x:".to_string(),
+            target: "/tmp/x.sock".to_string(),
+            certs: Certs::default(),
+            kind,
+        }
+    }
+
+    /// The posture a mode ends up in, for each shape of command line. `None` = the parse
+    /// refused; otherwise `(flag count, declined)`.
+    fn posture(args: &[&str]) -> Result<(usize, bool), String> {
+        let mounts = match parse_argv(argv(args).into_iter())? {
+            Some(Mode::Repl(repl)) => repl.mounts,
+            Some(Mode::Daemon { mounts }) => mounts,
+            Some(Mode::Serve { mounts, .. }) => mounts,
+            Some(Mode::Mcp { mounts, .. }) => mounts,
+            _ => panic!("expected a kernel-building mode"),
+        };
+        Ok((mounts.flags.len(), mounts.declined))
+    }
+
+    /// The whole point of the flag: ZERO mounts, and the config home is not READ. Asserted
+    /// against a thunk that panics rather than against an empty result — an empty result is
+    /// also what an absent config home gives, so it would pass on a kernel that still paid
+    /// for reading and parsing the machine's topology.
+    #[test]
+    fn declining_composes_zero_and_never_reads_the_config_home() {
+        let declined = Mounts {
+            flags: Vec::new(),
+            declined: true,
+        };
+        let resolved = resolve_mounts(declined, || {
+            panic!("--no-config-mounts must not read the config home")
+        })
+        .expect("declining is not an error");
+        assert!(resolved.is_empty(), "declining composes nothing");
+    }
+
+    /// Unchanged behaviour, stated as a test because the flag is only safe if the DEFAULT
+    /// still inherits the machine: no flags ⇒ the config home's `mount` lines.
+    #[test]
+    fn no_flags_still_compose_the_machines_topology() {
+        let resolved = resolve_mounts(Mounts::default(), || {
+            Ok(vec![mount(ikigai_embedded::MountKind::Prefer)])
+        })
+        .expect("a parsing config home is not an error");
+        assert_eq!(resolved.len(), 1, "the config home is the default posture");
+    }
+
+    /// The other unchanged rule: flags win WHOLESALE, and the config home is not consulted
+    /// to top them up.
+    #[test]
+    fn mount_flags_win_wholesale_over_the_config_home() {
+        let flagged = Mounts {
+            flags: vec![mount(ikigai_embedded::MountKind::Prefer)],
+            declined: false,
+        };
+        let resolved = resolve_mounts(flagged, || panic!("flags win wholesale"))
+            .expect("flags are not an error");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].prefix, "urn:x:");
+    }
+
+    /// Both postures at once is a STARTUP ERROR naming both flags — in EITHER order on the
+    /// command line, for all three mount flags, in every mode that builds a kernel. A silent
+    /// winner would be the half-and-half mount set nobody can debug at 2am.
+    #[test]
+    fn declining_beside_a_mount_flag_refuses_to_start() {
+        let mount_flags = [
+            ("--mount", "urn:a:=/tmp/a.sock"),
+            ("--override", "urn:b:=/tmp/b.sock"),
+            ("--prefer", "urn:c:=/tmp/c.sock"),
+        ];
+        let modes: [&[&str]; 4] = [&[], &["--daemon"], &["serve", "/tmp/s.sock"], &["mcp"]];
+        for prefix in modes {
+            for (flag, spec) in mount_flags {
+                for order in [
+                    vec!["--no-config-mounts", flag, spec],
+                    vec![flag, spec, "--no-config-mounts"],
+                ] {
+                    let args: Vec<&str> = prefix.iter().copied().chain(order).collect();
+                    let e = posture(&args).expect_err(&format!("{args:?} must refuse to start"));
+                    assert!(
+                        e.contains("--no-config-mounts") && e.contains(flag),
+                        "the refusal must name BOTH flags, got: {e}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The flag has to be honoured by every door, because the `mount` key is shared by all
+    /// of them: one that ignored it would be the next version of #410.
+    #[test]
+    fn every_kernel_building_mode_honours_the_flag() {
+        for args in [
+            vec!["--no-config-mounts"],
+            vec!["--daemon", "--no-config-mounts"],
+            vec!["serve", "/tmp/s.sock", "--no-config-mounts"],
+            vec![
+                "serve",
+                "quic://0.0.0.0:4433",
+                "--no-config-mounts",
+                "--announce",
+            ],
+            vec!["serve", "--http", "8642", "--no-config-mounts"],
+            vec!["mcp", "--no-config-mounts"],
+        ] {
+            assert_eq!(
+                posture(&args).unwrap_or_else(|e| panic!("{args:?}: {e}")),
+                (0, true),
+                "{args:?} must reach its kernel builder as the DECLINE posture"
+            );
+        }
+    }
+
+    /// `--connect` composes nothing of its own, so the flag would be INERT there. An inert
+    /// flag is how an operator comes to believe a topology was declined when it was not.
+    #[test]
+    fn declining_beside_connect_refuses_rather_than_doing_nothing() {
+        let declined = Mounts {
+            flags: Vec::new(),
+            declined: true,
+        };
+        let e = match build_engine(
+            Some(Some("/tmp/ikigai-no-such-socket".to_string())),
+            declined,
+            &Certs::default(),
+            false,
+        ) {
+            Err(e) => e,
+            // `Engine` is not `Debug`, so this cannot be an `expect_err`.
+            Ok(_) => panic!("a flag with nothing to do must say so"),
+        };
+        assert!(
+            e.contains("--no-config-mounts") && e.contains("--connect"),
+            "the refusal must name both, got: {e}"
+        );
+    }
+
+    /// The banner is the deliverable as much as the flag is: an inherited topology was
+    /// invisible because a decline and an empty config home printed the same nothing.
+    #[test]
+    fn the_banner_distinguishes_declined_from_simply_none() {
+        assert_eq!(mount_note(0, false), "", "no mounts, nothing to say");
+        assert_eq!(mount_note(2, false), "; 2 mount(s)");
+        assert_eq!(
+            mount_note(0, true),
+            "; mounts declined (--no-config-mounts)"
+        );
+    }
+
+    /// The config-home grammar, over lines rather than a file — proof that the default
+    /// posture still parses what a machine's `config.toml` actually carries (the line here
+    /// is the one on plasma that started #410).
+    #[test]
+    fn a_config_home_mount_line_still_parses() {
+        let mounts = mounts_from_config_lines(vec![
+            "prefer urn:iki:store:=/Users/x/.ikigai/gonk.sock".to_string(),
+            "alias urn:cal:=quic://bug.local:4433 ~/.config/ikigai/quic-bug".to_string(),
+        ])
+        .expect("both lines parse");
+        assert_eq!(mounts.len(), 2);
+        assert_eq!(mounts[0].kind, ikigai_embedded::MountKind::Prefer);
+        assert_eq!(mounts[0].prefix, "urn:iki:store:");
+        assert_eq!(mounts[1].kind, ikigai_embedded::MountKind::Alias);
+        assert!(
+            mounts[1]
+                .certs
+                .cert_dir
+                .as_deref()
+                .is_some_and(|dir| !dir.starts_with('~')),
+            "a config line's `~` is expanded"
+        );
+    }
+}
+
+#[cfg(test)]
 mod mount_cert_tests {
     use super::*;
 
@@ -2622,7 +2926,7 @@ mod mount_cert_tests {
 
     fn mounts_of(args: &[&str]) -> Vec<Mount> {
         match parse_argv(argv(args).into_iter()) {
-            Ok(Some(Mode::Repl(repl))) => repl.mounts,
+            Ok(Some(Mode::Repl(repl))) => repl.mounts.flags,
             Ok(Some(_)) => panic!("expected a repl mode, got another mode"),
             Ok(None) => panic!("expected a repl mode, got no mode"),
             Err(e) => panic!("parse failed: {e}"),
@@ -2768,6 +3072,7 @@ mod mount_cert_tests {
             panic!("expected mcp mode");
         };
         assert_eq!(grants, vec!["cal".to_string()]);
+        let mounts = mounts.flags;
         assert_eq!(mounts.len(), 2);
         assert_eq!(mounts[0].kind, ikigai_embedded::MountKind::Prefer);
         assert_eq!(mounts[0].target, "peer:plasma");
