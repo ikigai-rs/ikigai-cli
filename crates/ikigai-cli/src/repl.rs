@@ -53,11 +53,19 @@ pub fn run_commands(engine: Engine, commands: &[String]) -> i32 {
 }
 
 /// Read-eval-print loop over the kernel until EOF or `quit`.
-pub fn run(engine: Engine) {
+///
+/// `topology` is what this kernel composed — one line per mount. It goes to STDERR beside
+/// the version line, because a session that is silently resolving `urn:iki:ledger:` through
+/// another machine should say so before the first answer, not after a confusing one. Every
+/// serving door printed a mount line and this face printed none (ledger #418).
+pub fn run(engine: Engine, topology: &[String]) {
     println!(
         "ikigai {} — REPL. Type `help`, or `quit` to exit.",
         env!("CARGO_PKG_VERSION")
     );
+    for line in topology {
+        eprintln!("ikigai: {line}");
+    }
     let stdin = io::stdin();
     let mut line = String::new();
     loop {

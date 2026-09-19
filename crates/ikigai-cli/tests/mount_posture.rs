@@ -4,7 +4,9 @@
 //! pins the thing an operator actually sees: a server started with a `config.toml` on disk,
 //! and what its startup banner says it composed. That is the deliverable half of ledger
 //! #410 — the peer that inherited the machine's whole topology had a banner reporting only a
-//! mount COUNT, so "this server mounted its own caller" was invisible from the outside.
+//! mount COUNT, so "this server mounted its own caller" was invisible from the outside. The
+//! count is gone (#418): these assertions name the mounts, because that is what the operator
+//! reads the line for, and a count is true of every topology of that size.
 //!
 //! ★ HERMETIC BY THE CHILD'S ENVIRONMENT, not by `set_var`. `XDG_CONFIG_HOME` points
 //! `config_home()` at a scratch directory, and it is set on the SPAWNED PROCESS only —
@@ -105,9 +107,17 @@ fn no_flags_compose_the_config_homes_mount_lines() {
         ],
     );
     let (seen, _) = serve(&home, &[]);
+    // ★ NAMED, not counted. `; 2 mount(s)` was true of this banner and true of a banner
+    // that had composed two entirely different peers — including, on plasma, two that
+    // pointed back at the caller (#418). Asserting the identities is asserting the thing
+    // the operator reads the line for.
     assert!(
-        seen.contains("; 2 mount(s)"),
-        "the config home's two mount lines must compose: {seen}"
+        seen.contains("mount   prefer urn:iki:store: -> /tmp/iki-np-absent-a.sock"),
+        "the first config line must be named on the banner: {seen}"
+    );
+    assert!(
+        seen.contains("mount   prefer urn:iki:ledger: -> /tmp/iki-np-absent-b.sock"),
+        "the second config line must be named on the banner: {seen}"
     );
 }
 
@@ -125,12 +135,21 @@ fn declining_composes_nothing_and_the_banner_says_so() {
     );
     let (seen, _) = serve(&home, &["--no-config-mounts"]);
     assert!(
-        seen.contains("mounts declined (--no-config-mounts)"),
+        seen.contains("declined (--no-config-mounts)"),
         "the banner must name the declined posture: {seen}"
     );
+    // ⚠ The subtle assertion, and the reason it names the PREFIXES rather than a spelling:
+    // "the declined banner does not say `mount(s)`" would pass for free the moment the word
+    // changed. What has to stay true is that NOTHING FROM THE CONFIG HOME was composed —
+    // so the test looks for the two prefixes that are sitting in `config.toml` on disk and
+    // insists neither reached the banner.
     assert!(
-        !seen.contains("mount(s)"),
-        "nothing composed, so there is no count to print: {seen}"
+        !seen.contains("urn:iki:store:") && !seen.contains("urn:iki:ledger:"),
+        "the config home's mounts were declined and must not be named: {seen}"
+    );
+    assert!(
+        !seen.contains("none composed"),
+        "a decline is not an empty config home, and must not read like one: {seen}"
     );
 }
 
@@ -170,7 +189,29 @@ fn a_mount_flag_still_wins_wholesale_over_the_config_home() {
     );
     let (seen, _) = serve(&home, &["--prefer", "urn:x:=/tmp/iki-np-absent-c.sock"]);
     assert!(
-        seen.contains("; 1 mount(s)"),
+        seen.contains("mount   prefer urn:x: -> /tmp/iki-np-absent-c.sock"),
+        "the flag's mount must be named: {seen}"
+    );
+    assert!(
+        !seen.contains("urn:iki:store:") && !seen.contains("urn:iki:ledger:"),
         "the flag is the WHOLE topology, not an addition to the file's two: {seen}"
+    );
+}
+
+/// The third posture, which used to print NOTHING at all: a config home with no `mount`
+/// lines. "This machine composes no topology" and "this door forgot to say" were the same
+/// observation — the same failure as #426's two servers whose identical count meant
+/// opposite things — so the empty case now says it is empty.
+#[test]
+fn an_empty_config_home_says_it_composed_nothing() {
+    let home = scratch("empty", &[]);
+    let (seen, _) = serve(&home, &[]);
+    assert!(
+        seen.contains("none composed"),
+        "an empty topology is a fact worth stating: {seen}"
+    );
+    assert!(
+        !seen.contains("declined"),
+        "nothing was declined — the config home simply had no mount lines: {seen}"
     );
 }
