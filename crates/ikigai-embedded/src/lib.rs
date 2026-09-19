@@ -54,6 +54,12 @@ pub mod foaf;
 pub mod jsonl;
 pub mod passkey;
 pub mod people;
+// `urn:host:posture` — what THIS PROCESS composed at startup (mounts, trusted client
+// certificates, surface, ceiling), and the one place the startup banner's mount and client
+// lines are rendered. A module rather than another block in this file because the doors in
+// `ikigai-cli` build its value and print from it: the banner and the resource are two faces
+// of one recorded fact, which is what keeps them from drifting into two spellings of it.
+pub mod posture;
 pub mod scheduling;
 // The durable RDF store (`urn:iki:store:*`) and — with it — the work ledger. Behind the
 // `store` feature because a host that does not want a dataset should not carry one, and
@@ -709,6 +715,15 @@ fn base_space(nature: &'static str) -> EndpointSpace {
         .bind(Exact::new("urn:host:demo"), host_demo())
         .bind(Exact::new("urn:host:history"), host_history())
         .bind(Exact::new("urn:host:identity"), host_identity())
+        // What THIS PROCESS composed at startup. On EVERY surface, not just the owner's,
+        // and capability-gated rather than withheld — which is the opposite call from
+        // `urn:peer:list` next door, on purpose. The reason is that the question only has
+        // an answer worth having when it is asked of the RUNNING SERVER: a one-shot CLI
+        // asked about its own posture re-composes from the config home, so it reports what
+        // the FILE says, which is exactly the lie this resource exists to avoid (ledger
+        // #428). The peer that cost plasma a 120s manifold (#408) could only be
+        // interrogated over the door it was serving on.
+        .bind(Exact::new("urn:host:posture"), posture::host_posture())
 }
 
 /// The directory the local file module is jailed to: `$IKIGAI_FILES`, else
