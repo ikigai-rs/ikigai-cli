@@ -1050,7 +1050,6 @@ fn daemon(mounts: Mounts) {
     // "nobody told me", and a door that quietly skipped the call would make its own
     // topology unaskable while looking like a host that composed nothing.
     ikigai_embedded::posture::set_posture(ikigai_embedded::posture::Posture {
-        nature: "Embedded (Native)".to_string(),
         door: "none — the writer daemon serves no transport; it holds the reactive kernel"
             .to_string(),
         mounts: mount_posture(&mounts, declined),
@@ -1183,7 +1182,6 @@ fn mcp(grants: Vec<String>, scopes: Vec<String>, mounts: Mounts) {
     };
     announce_mounts("ikigai mcp", &mounts, declined);
     ikigai_embedded::posture::set_posture(ikigai_embedded::posture::Posture {
-        nature: "Embedded (Native)".to_string(),
         door: "stdio (MCP)".to_string(),
         mounts: mount_posture(&mounts, declined),
         clients: Vec::new(),
@@ -1403,7 +1401,6 @@ fn build_engine(
             // (ledger #408/#428). Recorded anyway, because "unrecorded" must mean
             // unrecorded.
             ikigai_embedded::posture::set_posture(ikigai_embedded::posture::Posture {
-                nature: "Embedded (Native)".to_string(),
                 door: "none — in-process (this REPL/one-shot kernel)".to_string(),
                 mounts: composed,
                 clients: Vec::new(),
@@ -2398,7 +2395,6 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, moun
         // truncated fingerprints, the surface and the ceiling strings — so the two cannot
         // read differently.
         ikigai_embedded::posture::set_posture(ikigai_embedded::posture::Posture {
-            nature: "Remote (QUIC)".to_string(),
             door: target.to_string(),
             mounts: composed,
             clients: identities,
@@ -2565,7 +2561,6 @@ fn serve_ipc(path: Option<String>, mounts: Mounts) -> ! {
     // resolves through without knowing where the peers are — and until now the only way to
     // learn which they were was to have watched this process start.
     ikigai_embedded::posture::set_posture(ikigai_embedded::posture::Posture {
-        nature: "Remote (IPC)".to_string(),
         door: socket.display().to_string(),
         mounts: mount_posture(&mounts, declined),
         // A Unix socket authenticates nobody by certificate: the socket's file permissions
@@ -2912,7 +2907,6 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
     // path describes this disk; a fingerprint is a hash of a public certificate and
     // discloses nothing.
     ikigai_embedded::posture::set_posture(ikigai_embedded::posture::Posture {
-        nature: "Remote (HTTP)".to_string(),
         door: format!("http://{addr}"),
         mounts: composed,
         // TLS terminates at the proxy and the door authenticates no client certificate;

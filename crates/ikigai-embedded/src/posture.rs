@@ -27,7 +27,7 @@
 //!
 //! | fact | when it was decided | can it change without a restart? |
 //! |---|---|---|
-//! | nature, door, surface, authority | startup | no |
+//! | the door, the surface, the authority | startup | no |
 //! | the composed mounts | startup (`mounts_or_config` is wholesale) | no |
 //! | the trusted certificate SET | startup (the PEMs are read once and handed to the transport) | no |
 //! | **which authority each certificate gets** | **per connection** | **yes — `clients.json` is re-read on every connection** |
@@ -88,12 +88,25 @@ pub const CAP_HOST_POSTURE: &str = "urn:cap:host:posture";
 /// whole family came out of: see [`mount_lines`].)
 #[derive(Clone, Debug, Default)]
 pub struct Posture {
-    /// The kernel's nature label, as `urn:host:info` reports it: `Embedded (Native)`,
-    /// `Remote (IPC)`, `Remote (QUIC)`, `Remote (HTTP)`.
-    pub nature: String,
     /// The door this process answers on, in the spelling an operator would type:
     /// `quic://0.0.0.0:4433`, a socket path, `http://127.0.0.1:8080` — or a plain phrase
     /// for the modes that have no door (`in-process`, `stdio (mcp)`).
+    ///
+    /// ★ **There is deliberately no `nature` field beside this.** `urn:host:info` reports
+    /// the kernel's nature and this resource must not be a second answer to a question that
+    /// already has one — a duplicated fact that CAN drift is the whole defect class this
+    /// endpoint came out of. The door says more anyway: `quic://…` versus a socket path
+    /// versus `http://…` distinguishes the transports more precisely than a label does, and
+    /// it names the address as well as the kind.
+    ///
+    /// ⚠ And the two WOULD have disagreed. `serve_ipc` passes `"Remote (IPC)"` to
+    /// [`trusted_kernel_with_mounts`](crate::trusted_kernel_with_mounts), which discards it
+    /// (`let _ = nature;`) and composes `root_space`, whose nature is hard-coded
+    /// `"Embedded (Native)"` — so an IPC door's `urn:host:info` says `Embedded (Native)`
+    /// today while the door is IPC. Reported up rather than fixed here: threading the
+    /// nature through `root_space` changes what the daemon Brian runs reports to every
+    /// client that reads it, which deserves its own item rather than riding on a new
+    /// resource.
     pub door: String,
     /// The topology, and which of the three mount postures produced it.
     pub mounts: MountPosture,
@@ -295,7 +308,6 @@ fn posture_text(posture: Option<&Posture>) -> String {
     let mut row = |key: &str, value: &str| {
         out.push_str(&format!("  {key:KEY$}  {value}\n"));
     };
-    row("nature", &posture.nature);
     row("door", &posture.door);
     if let Some(surface) = &posture.surface {
         row("surface", surface);
@@ -380,12 +392,10 @@ fn posture_turtle(posture: Option<&Posture>) -> String {
     };
     out.push_str(&format!(
         "<urn:host:posture> a ik:Posture ;\n    \
-         ik:nature \"{}\" ;\n    \
          ik:door \"{}\" ;\n    \
          ik:asOf \"startup\" ;\n    \
          rdfs:comment \"what THIS PROCESS composed when it started — not a re-read of the \
          config home. Anything the door re-reads while running is named by ik:reloads.\"",
-        literal(&posture.nature),
         literal(&posture.door),
     ));
     if let Some(surface) = &posture.surface {
@@ -528,7 +538,6 @@ mod tests {
 
     fn a_posture() -> Posture {
         Posture {
-            nature: "Remote (QUIC)".to_string(),
             door: "quic://0.0.0.0:4433".to_string(),
             mounts: MountPosture::Composed(vec![
                 a_mount("prefer", "urn:iki:store:", "/tmp/gonk.sock"),
@@ -593,7 +602,6 @@ mod tests {
     #[test]
     fn the_text_face_names_the_items_and_dates_them() {
         let text = posture_text(Some(&a_posture()));
-        assert!(text.contains("nature     Remote (QUIC)"), "{text}");
         assert!(text.contains("door       quic://0.0.0.0:4433"), "{text}");
         assert!(
             text.contains("mount   prefer urn:iki:store: -> /tmp/gonk.sock"),

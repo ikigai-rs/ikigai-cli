@@ -301,7 +301,6 @@ fn fixture_home() -> &'static Path {
         // That is the fixture-is-a-claim lesson from this file's own header, in the one
         // place where the endpoint's output depends on process state instead of inputs.
         ikigai_embedded::posture::set_posture(ikigai_embedded::posture::Posture {
-            nature: "Test (conformance)".to_string(),
             door: "quic://127.0.0.1:14433".to_string(),
             mounts: ikigai_embedded::posture::MountPosture::Composed(vec![
                 ikigai_embedded::posture::ComposedMount {
@@ -554,7 +553,7 @@ fn base() -> Suite {
         // happens to be. Bound on BOTH compositions, so they live in the base.
         // ★ THE SECOND REAL VOCABULARY GAP, in a repo that cannot fix it — `urn:host:health`
         // next door is the first. Declaring `urn:host:posture`'s `text/turtle` face brings
-        // it under VOCABULARY, which finds seventeen `ik:` terms `ikigai-vocab` does not
+        // it under VOCABULARY, which finds sixteen `ik:` terms `ikigai-vocab` does not
         // define, at the pinned version or at HEAD. The fix is `vocabulary.ttl` in
         // ikigai-core plus a manual deploy of https://ikigai-rs.dev/ns; both belong to that
         // repo, so this waits and the need is reported up.
@@ -562,7 +561,7 @@ fn base() -> Suite {
         // ⚠ `opt_out_check`, never `opt_out`: the coarse lever would take ENFORCED,
         // CACHEABLE and SKOLEM-RDF down with it — on an endpoint whose whole point is a
         // capability gate and an uncacheable read. The exact set is pinned by hand in
-        // `the_posture_graph_uses_exactly_seventeen_undefined_terms`, so this goes red in both
+        // `the_posture_graph_uses_exactly_sixteen_undefined_terms`, so this goes red in both
         // directions, including the day the terms land.
         .opt_out_check(
             "host-posture",
@@ -1037,8 +1036,8 @@ fn the_http_door_serves_no_owner_only_resource() {
 /// ★ **The posture graph's undefined terms, as an EXACT list — that waiver's other half.**
 ///
 /// `opt_out_check("host-posture", Check::Vocabulary, …)` in [`base`] silences a rule this
-/// repo cannot satisfy: `urn:host:posture`'s `text/turtle` face names seventeen `ik:` terms no
-/// version of `ikigai-vocab` defines. A waiver alone would also waive the EIGHTEENTH term
+/// repo cannot satisfy: `urn:host:posture`'s `text/turtle` face names sixteen `ik:` terms no
+/// version of `ikigai-vocab` defines. A waiver alone would also waive the SEVENTEENTH term
 /// somebody adds next, so the set is pinned here, reproducing `VOCABULARY` from the public
 /// [`rdf`] helpers. It fails in both directions: a new invented term, and the day
 /// `vocabulary.ttl` defines these.
@@ -1054,7 +1053,7 @@ fn the_http_door_serves_no_owner_only_resource() {
 /// so reusing them here would entail that a mount IS a route. A synonym is the lesser evil;
 /// widening those domains is the vocabulary change to argue for.
 #[test]
-fn the_posture_graph_uses_exactly_seventeen_undefined_terms() {
+fn the_posture_graph_uses_exactly_sixteen_undefined_terms() {
     use ikigai_core::{Capability, Iri, Request, Verb};
 
     let kernel = root_kernel();
@@ -1091,7 +1090,6 @@ fn the_posture_graph_uses_exactly_seventeen_undefined_terms() {
             "https://ikigai-rs.dev/ns#mountPosture",
             "https://ikigai-rs.dev/ns#mountPrefix",
             "https://ikigai-rs.dev/ns#mountTarget",
-            "https://ikigai-rs.dev/ns#nature",
             "https://ikigai-rs.dev/ns#reloads",
             "https://ikigai-rs.dev/ns#surface",
             "https://ikigai-rs.dev/ns#trustedClient",

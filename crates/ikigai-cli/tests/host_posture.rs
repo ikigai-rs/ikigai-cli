@@ -225,7 +225,6 @@ fn a_serving_door_reports_the_mounts_it_composed() {
     wait_for_socket(&sock);
     let text = ask(&home, &sock, "source urn:host:posture");
 
-    assert!(text.contains("nature     Remote (IPC)"), "{text}");
     assert!(text.contains(&format!("door       {sock}")), "{text}");
     assert!(
         text.contains("mount   prefer urn:iki:store: -> /tmp/iki-hp-absent-a.sock"),
@@ -347,7 +346,10 @@ fn the_public_http_door_refuses_posture_and_a_granted_one_serves_it() {
     );
     let (status, body) = get(granted, "/host/posture");
     assert!(status.contains("200"), "{status} {body}");
-    assert!(body.contains("nature     Remote (HTTP)"), "{body}");
+    assert!(
+        body.contains(&format!("door       http://127.0.0.1:{granted}")),
+        "{body}"
+    );
     assert!(
         body.contains("mount   prefer urn:iki:store: -> /tmp/iki-hp-absent-d.sock"),
         "{body}"
