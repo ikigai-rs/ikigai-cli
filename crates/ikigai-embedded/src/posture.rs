@@ -74,7 +74,7 @@ use crate::XSD_STRING;
 
 /// The scope that reading this host's posture requires.
 ///
-/// Deliberately its own scope rather than [`urn:cap:kernel:inspect`](crate) — see the
+/// Deliberately its own scope rather than `urn:cap:kernel:inspect` — see the
 /// module note: inspect is the manifold grant, and the paths in a posture report are a
 /// strictly bigger disclosure than the tool list.
 pub const CAP_HOST_POSTURE: &str = "urn:cap:host:posture";
@@ -107,8 +107,8 @@ pub struct Posture {
     /// per-identity-grants mode, the per-client workspace default, or the public capability.
     /// `None` where the door has no answer to give.
     ///
-    /// Named for the AUTHORITY rather than the ceiling because only two of the five doors
-    /// have a ceiling: an owner-only socket resolves as the owner, and a workspace door
+    /// Named for the AUTHORITY rather than the ceiling because only two of the six doors
+    /// have a ceiling at all: an owner-only socket resolves as the owner, and a workspace door
     /// derives each caller's authority from its own certificate.
     pub authority: Option<String>,
     /// ★ **Whatever this door RE-READS while it runs, named by the door itself.**
