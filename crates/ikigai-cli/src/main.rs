@@ -288,19 +288,69 @@ impl Mounts {
 /// The one spelling of the declined posture, so every door says it the same way. Saying it
 /// is the point: the peer that started #410 composed the machine's whole topology and its
 /// banner reported only a mount COUNT, so "this server inherited gonk" was invisible.
-const MOUNTS_DECLINED: &str = "mounts declined (--no-config-mounts)";
+const MOUNTS_DECLINED: &str =
+    "declined (--no-config-mounts) — the config home's `mount` lines are not read";
 
-/// The banner's mount fragment. Three postures, three notes: a count when something
-/// composed, an explicit decline when `--no-config-mounts` said zero, and nothing at all
-/// when the config home simply had no `mount` lines — the last two look identical from a
-/// mount count, which is why the decline gets words.
-fn mount_note(resolved: usize, declined: bool) -> String {
+/// The mode word a `mount` line in the config home would use for this kind, so what the
+/// banner prints is greppable in the file that produced it.
+fn mount_mode(kind: ikigai_embedded::MountKind) -> &'static str {
+    match kind {
+        ikigai_embedded::MountKind::Alias => "alias",
+        ikigai_embedded::MountKind::Override => "override",
+        ikigai_embedded::MountKind::Prefer => "prefer",
+    }
+}
+
+/// One mount, named: the mode, the prefix it claims, and the target it claims it from —
+/// plus its own certificate directory when it has one, because a mount that authenticates
+/// as somebody else is a different mount.
+fn mount_line(mount: &Mount) -> String {
+    let certs = match &mount.certs.cert_dir {
+        Some(dir) => format!("  [certs {dir}]"),
+        None => String::new(),
+    };
+    format!(
+        "mount   {} {} -> {}{certs}",
+        mount_mode(mount.kind),
+        mount.prefix,
+        mount.target
+    )
+}
+
+/// The banner's mount block — ONE LINE PER MOUNT, naming what was composed.
+///
+/// ★ This used to be `"; {n} mount(s)"`, and the count was always accurate and never an
+/// answer. plasma's inference peer printed `6 mount(s)` at every startup while two of the
+/// six pointed back at its own caller and cost the machine a ~120s `urn:kernel:actions`
+/// (ledger #410/#418): six was not wrong, it just was not an answer to *which* six. A
+/// diagnostic that prints a count instead of the items cannot answer the question that
+/// makes it worth printing.
+///
+/// Three postures, and all three now say what they mean in words: the mounts themselves, an
+/// explicit decline, or an explicit nothing. The last used to print NOTHING at all, which
+/// made "this machine composes no topology" and "this door forgot to say" the same
+/// observation.
+///
+/// It does not elide. A cap would hide exactly the machine that most needs the list — the
+/// hub with thirty mounts — and this prints once per process start, into a log.
+///
+/// Printed BEFORE the mounts are resolved, so a door that hangs dialing a peer has already
+/// named the peer it is hanging on. That was #410's actual failure mode.
+fn mount_lines(mounts: &[Mount], declined: bool) -> Vec<String> {
     if declined {
-        format!("; {MOUNTS_DECLINED}")
-    } else if resolved == 0 {
-        String::new()
-    } else {
-        format!("; {resolved} mount(s)")
+        return vec![format!("mount   {MOUNTS_DECLINED}")];
+    }
+    if mounts.is_empty() {
+        return vec!["mount   none composed — no `mount` lines in the config home".to_string()];
+    }
+    mounts.iter().map(mount_line).collect()
+}
+
+/// Say what this door composed, on stderr, one line per mount. `who` prefixes every line
+/// (`ikigai`, `ikigai mcp`) so a door's output stays attributable.
+fn announce_mounts(who: &str, mounts: &[Mount], declined: bool) {
+    for line in mount_lines(mounts, declined) {
+        eprintln!("{who}: {line}");
     }
 }
 
@@ -970,12 +1020,14 @@ fn main() {
             if args.demo {
                 ikigai_embedded::demo_flag().store(true, std::sync::atomic::Ordering::SeqCst);
             }
-            let engine = build_engine(args.connect, args.mounts, &args.certs, args.react)
-                .unwrap_or_else(|e| {
-                    eprintln!("ikigai: {e}");
-                    std::process::exit(1);
-                });
-            run_repl(engine, args.plain, &args.commands);
+            let (engine, topology) =
+                build_engine(args.connect, args.mounts, &args.certs, args.react).unwrap_or_else(
+                    |e| {
+                        eprintln!("ikigai: {e}");
+                        std::process::exit(1);
+                    },
+                );
+            run_repl(engine, args.plain, &args.commands, &topology);
         }
     }
 }
@@ -1008,6 +1060,7 @@ fn daemon(mounts: Mounts) {
     // would schedule the drain and then pull nothing from a prefix it cannot resolve.
     // The daemon IS the worker: it holds the reactive kernel, so the workspace's tuples
     // are claimed and run here, under this signed job's identity and grants.
+    announce_mounts("ikigai", &mounts, declined);
     let kernel = if mounts.is_empty() {
         ikigai_embedded::reactive_kernel_with_mounts(Vec::new())
     } else {
@@ -1028,9 +1081,6 @@ fn daemon(mounts: Mounts) {
         }
         ikigai_embedded::reactive_kernel_with_mounts(resolved)
     };
-    if declined {
-        eprintln!("ikigai: {MOUNTS_DECLINED} — the config home's `mount` lines are not read");
-    }
     let name = ikigai_embedded::instance_name();
     match ikigai_embedded::standing_sync_interval() {
         Some(every) => eprintln!(
@@ -1133,20 +1183,14 @@ fn mcp(grants: Vec<String>, scopes: Vec<String>, mounts: Mounts) {
             std::process::exit(2);
         }
     };
-    if declined {
-        eprintln!("ikigai mcp: {MOUNTS_DECLINED} — the config home's `mount` lines are not read");
-    }
+    announce_mounts("ikigai mcp", &mounts, declined);
     let kernel = if mounts.is_empty() {
         ikigai_embedded::watched_kernel()
     } else {
         let mut resolved = Vec::new();
         for mount in mounts {
-            let (target, prefix) = (mount.target.clone(), mount.prefix.clone());
             match resolve_mount(mount) {
-                Ok(spec) => {
-                    eprintln!("ikigai mcp: composing {prefix} via {target}");
-                    resolved.push(spec);
-                }
+                Ok(spec) => resolved.push(spec),
                 // Fatal, like the daemon: an MCP server that silently dropped a mount
                 // would project a manifold missing the tools the topology promised.
                 // (A --prefer mount never lands here — it connects on demand.)
@@ -1300,13 +1344,20 @@ fn with_profiles(engine: Engine) -> Engine {
 
 /// Build the engine over the chosen backend: the embedded kernel, or — with
 /// `--connect` — an IPC or QUIC client, dispatched by the target.
+///
+/// Returns the engine and the TOPOLOGY LINES the interactive REPL should show — what this
+/// kernel composed, in the same words the serving doors print. The REPL had no mount line
+/// at ALL (ledger #418): every server said something about its topology and the one face a
+/// human sits in front of said nothing, so an interactive session could not see what it was
+/// resolving through. A `--connect` client composes nothing of its own and gets no lines;
+/// the host it attaches to owns the topology and prints it.
 #[cfg(feature = "embedded")]
 fn build_engine(
     connect: Option<Option<String>>,
     mounts: Mounts,
     certs: &Certs,
     react: bool,
-) -> Result<Engine, String> {
+) -> Result<(Engine, Vec<String>), String> {
     match connect {
         // The watched kernel: cached workspace reads also invalidate on an
         // out-of-band file change (an editor), not just a `sink` through the REPL.
@@ -1320,7 +1371,9 @@ fn build_engine(
             // No mount flags -> the machine's own topology (config home). Only here in
             // the EMBEDDED branch: a `--connect` client composes nothing — the host it
             // connects to owns the topology.
+            let declined = mounts.declined;
             let mounts = mounts_or_config(mounts)?;
+            let topology = mount_lines(&mounts, declined);
             let kernel = if mounts.is_empty() {
                 if react {
                     ikigai_embedded::reactive_kernel_with_mounts(Vec::new())
@@ -1343,10 +1396,13 @@ fn build_engine(
             // The same process scheduler that decides how wide a fan-out RUNS also
             // decides what it may route on — so the engine reads its achievable width
             // from this spawner, and routes on it only if the host turned that on.
-            Ok(with_profiles(
-                Engine::new(kernel)
-                    .with_spawner(std::sync::Arc::new(ikigai_embedded::scheduler()))
-                    .with_width_routing(ikigai_embedded::width_routing()),
+            Ok((
+                with_profiles(
+                    Engine::new(kernel)
+                        .with_spawner(std::sync::Arc::new(ikigai_embedded::scheduler()))
+                        .with_width_routing(ikigai_embedded::width_routing()),
+                ),
+                topology,
             ))
         }
         Some(target) => {
@@ -1368,6 +1424,7 @@ fn build_engine(
                 Some(t) if is_quic(t) => connect_quic(t, certs),
                 _ => connect_ipc(target),
             }
+            .map(|engine| (engine, Vec::new()))
         }
     }
 }
@@ -1865,8 +1922,13 @@ fn connect_mount_ipc(
 
 /// Drive the engine: one-shot `-c`, else the full-screen TUI on a terminal, else
 /// the line REPL.
+///
+/// `topology` is what this kernel composed (see [`build_engine`]), shown to an INTERACTIVE
+/// session only. A `-c` batch is a shell citizen — its stderr is somebody's script — and
+/// the one-shot caller already chose its mounts on the command line or in the config home
+/// it is reading. The human sitting at a prompt did not.
 #[cfg(feature = "embedded")]
-fn run_repl(engine: Engine, plain: bool, commands: &[String]) {
+fn run_repl(engine: Engine, plain: bool, commands: &[String], topology: &[String]) {
     if !commands.is_empty() {
         // A batch fed on a NON-TTY stdin (`printf %s "$v" | ikigai -c 'sink urn:secret:x'`)
         // routes that stdin to the first content-less `sink` — so a secret is piped in, never
@@ -1896,16 +1958,16 @@ fn run_repl(engine: Engine, plain: bool, commands: &[String]) {
         if !plain && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
             // The keybinding scheme is read before entering the alternate screen
             // so an unsupported-value notice is visible.
-            if let Err(e) = tui::run(engine, ikigai_engine::config::keybindings()) {
+            if let Err(e) = tui::run(engine, ikigai_engine::config::keybindings(), topology) {
                 eprintln!("ikigai: tui error: {e}");
                 std::process::exit(1);
             }
             return;
         }
-        repl::run(engine);
+        repl::run(engine, topology);
     }
     #[cfg(target_family = "wasm")]
-    repl::run(engine);
+    repl::run(engine, topology);
 }
 
 // --- `cert generate` --------------------------------------------------------
@@ -1981,13 +2043,69 @@ fn cert_add_client(_name: &str, _cert_dir: Option<String>, _force: bool) -> ! {
 
 // --- QUIC serve / connect ---------------------------------------------------
 
+/// How much of a certificate fingerprint a diagnostic prints.
+///
+/// The full id is a 64-hex-character SHA-256, and that is what `cert add-client` prints and
+/// what a `clients.json` key must be — a banner listing several of them in full is noise an
+/// operator reads past. Sixteen is a PREFIX of exactly that string, in the same case, so
+/// comparing by eye compares one fact rather than two spellings of it; it is also the
+/// length the per-connection `client … → grant` line has always used, and one truncation
+/// beats two.
+#[cfg(all(feature = "embedded", feature = "quic"))]
+const FINGERPRINT_SHOWN: usize = 16;
+
+/// The leading [`FINGERPRINT_SHOWN`] characters of a fingerprint.
+///
+/// ⚠ A fingerprint is a hash of a PUBLIC certificate. It discloses no authority — holding
+/// it does not let anyone connect, and a client is refused unless it presents the private
+/// key. That is why it is safe on a banner even though these logs land world-readable under
+/// `/tmp`; the certificate it names is already sent in the clear at every handshake.
+#[cfg(all(feature = "embedded", feature = "quic"))]
+fn short_fingerprint(full: &str) -> &str {
+    &full[..full.len().min(FINGERPRINT_SHOWN)]
+}
+
+/// The banner's trusted-client block — ONE LINE PER CERTIFICATE: its label, its
+/// fingerprint, and the file that put it there.
+///
+/// ★ This used to be `"{n} trusted client cert(s)"`. Two servers on bug printed `1 trusted
+/// client cert(s)` on the same afternoon and meant opposite things — one with
+/// `clients/plasma.crt` enrolled, one with no `clients/` directory at all, counting the
+/// base `client.crt` that is always trusted (ledger #426). The count was accurate both
+/// times and answered neither operator's question. `fingerprint_of_pem` has been public
+/// since #286 precisely so a tool could print the id instead of sending someone to
+/// `openssl`; the banner simply never called it.
+///
+/// The base certificate is labelled `base` rather than listed as though it were a peer: it
+/// is the one that made the count lie, so it says what it is.
+#[cfg(all(feature = "embedded", feature = "quic"))]
+fn client_lines(trusted: &[quic::TrustedClient]) -> Vec<String> {
+    let width = trusted.iter().map(|c| c.label.len()).max().unwrap_or(0);
+    trusted
+        .iter()
+        .map(|client| {
+            // An unparseable PEM says so rather than vanishing: a cert this server has
+            // loaded and cannot describe is a fact the operator needs, not one to hide.
+            let fingerprint = ikigai_quic::fingerprint_of_pem(&client.pem).map_or_else(
+                |_| "unreadable".to_string(),
+                |f| short_fingerprint(&f).to_string(),
+            );
+            format!(
+                "client  {label:width$}  {fingerprint}  {path}",
+                label = client.label,
+                path = client.path.display()
+            )
+        })
+        .collect()
+}
+
 #[cfg(all(feature = "embedded", feature = "quic"))]
 fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, mounts: Mounts) -> ! {
     let caps = caps.to_vec();
     let result = (|| -> Result<(), String> {
         let addr = quic::parse_addr(target)?;
         let identity = quic::server_identity(certs)?;
-        let trusted = quic::trusted_client_certs(certs)?;
+        let trusted = quic::trusted_clients(certs)?;
         // Flags are POSTURE and win wholesale when given; `--no-config-mounts` composes
         // none; otherwise the machine's own topology from the config home — the same rule as
         // every kernel-building mode.
@@ -2018,6 +2136,7 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, moun
         // host that says it is serving and then cannot reach the peer it was told to
         // compose is worse than one that refuses to start. (`--prefer` is exempt — its
         // peer being absent is normal, and it dials on demand.)
+        announce_mounts("ikigai", &mounts, declined);
         let mut resolved = Vec::new();
         for mount in mounts {
             resolved.push(resolve_mount(mount)?);
@@ -2101,7 +2220,7 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, moun
                         );
                         eprintln!(
                             "ikigai: client {} → grant \"{grant}\" ({})",
-                            &peer.fingerprint[..peer.fingerprint.len().min(16)],
+                            short_fingerprint(&peer.fingerprint),
                             match capability.scopes() {
                                 None => "unrestricted".to_string(),
                                 Some(s) => format!("{} scope(s)", s.len()),
@@ -2208,7 +2327,6 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, moun
             // servable, still bounded by require_net to the granted provider hosts.
             llm: surface_caps.iter().any(|c| c.starts_with("urn:cap:net:")),
         };
-        let mounted = mount_note(resolved.len(), declined);
         let kernel = ikigai_embedded::served_kernel_with_mounts("Remote (QUIC)", surface, resolved);
         let signed_door = ikigai_embedded::code_signers_configured();
         let mut faces = vec![if surface.personal {
@@ -2226,10 +2344,10 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, moun
             faces.push("signed-run");
         }
         let surface = faces.join(" + ");
-        eprintln!(
-            "ikigai: serving on {target}  ({posture}; surface: {surface}; {} trusted client cert(s){mounted})  (Ctrl-C to stop)",
-            trusted.len()
-        );
+        for line in client_lines(&trusted) {
+            eprintln!("ikigai: {line}");
+        }
+        eprintln!("ikigai: serving on {target}  ({posture}; surface: {surface})  (Ctrl-C to stop)");
         // Announce on the local network, so a client can mount this kernel by NAME rather
         // than by an address that moves. Opt-in: broadcasting what a machine serves is a
         // disclosure, and a server on an untrusted network may want to be found only by
@@ -2272,15 +2390,10 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, moun
         } else {
             None
         };
-        ikigai_quic::serve_with(
-            kernel,
-            addr,
-            &identity,
-            &trusted,
-            minter,
-            quic_idle_timeout(),
-        )
-        .map_err(|e| e.to_string())
+        // The transport wants the PEMs; the banner wanted the identities. Same list.
+        let pems: Vec<String> = trusted.into_iter().map(|client| client.pem).collect();
+        ikigai_quic::serve_with(kernel, addr, &identity, &pems, minter, quic_idle_timeout())
+            .map_err(|e| e.to_string())
     })();
     match result {
         Ok(()) => std::process::exit(0),
@@ -2372,6 +2485,7 @@ fn serve_ipc(path: Option<String>, mounts: Mounts) -> ! {
     // then cannot reach the peer it was told to compose is worse than one that refuses to
     // start. (A `--prefer` mount is exempt — its peer being absent is normal, and it dials
     // on demand.)
+    announce_mounts("ikigai", &mounts, declined);
     let mut resolved = Vec::new();
     for mount in mounts {
         match resolve_mount(mount) {
@@ -2382,11 +2496,7 @@ fn serve_ipc(path: Option<String>, mounts: Mounts) -> ! {
             }
         }
     }
-    let mounted = mount_note(resolved.len(), declined);
-    eprintln!(
-        "ikigai: serving on {}{mounted}  (Ctrl-C to stop)",
-        socket.display()
-    );
+    eprintln!("ikigai: serving on {}  (Ctrl-C to stop)", socket.display());
     let kernel = ikigai_embedded::trusted_kernel_with_mounts("Remote (IPC)", resolved);
     match ikigai_ipc::serve(kernel, &socket) {
         Ok(()) => std::process::exit(0),
@@ -2556,6 +2666,7 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
     // host that says it is serving and then cannot reach the peer it was told to compose is
     // worse than one that refuses to start. (`--prefer` is exempt — its peer being absent is
     // normal, and it dials on demand.)
+    announce_mounts("ikigai", &mounts, declined);
     let mut resolved = Vec::new();
     for mount in mounts {
         match resolve_mount(mount) {
@@ -2566,10 +2677,6 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
             }
         }
     }
-    // The QUIC banner has always printed the count; the HTTP banner printed a full posture
-    // line without it — so the ONE place the missing mounts would have shown was the one
-    // place the count was left out.
-    let mounted = mount_note(resolved.len(), declined);
     // `kernel_for_with_mounts`, NOT `served_kernel_with_mounts`: this door's kernel also
     // carries `urn:iki:foaf` and the transreption chain it issues through (the `/foaf`
     // face on the public edge), which the QUIC composer does not. And it stays the PUBLIC
@@ -2692,7 +2799,7 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
         "no proxy trust"
     };
     eprintln!(
-        "ikigai: serving HTTP on {addr}{mounted}  ({posture}; {route_note}; {cors_note}; {proxy_note}; terminate TLS at your proxy)  (Ctrl-C to stop)"
+        "ikigai: serving HTTP on {addr}  ({posture}; {route_note}; {cors_note}; {proxy_note}; terminate TLS at your proxy)  (Ctrl-C to stop)"
     );
     match runtime.block_on(ikigai_web::serve_with(kernel, cap_fn, addr, config)) {
         Ok(()) => std::process::exit(0),
@@ -2879,16 +2986,163 @@ mod mount_posture_tests {
         );
     }
 
+    /// A mount for the banner tests: the shape a `config.toml` line produces.
+    fn a_mount(prefix: &str, target: &str) -> Mount {
+        Mount {
+            prefix: prefix.to_string(),
+            target: target.to_string(),
+            certs: Certs::default(),
+            kind: ikigai_embedded::MountKind::Prefer,
+        }
+    }
+
     /// The banner is the deliverable as much as the flag is: an inherited topology was
     /// invisible because a decline and an empty config home printed the same nothing.
     #[test]
     fn the_banner_distinguishes_declined_from_simply_none() {
-        assert_eq!(mount_note(0, false), "", "no mounts, nothing to say");
-        assert_eq!(mount_note(2, false), "; 2 mount(s)");
-        assert_eq!(
-            mount_note(0, true),
-            "; mounts declined (--no-config-mounts)"
+        let none = mount_lines(&[], false);
+        assert_eq!(none.len(), 1);
+        assert!(
+            none[0].contains("none composed"),
+            "an empty topology says so in words: {none:?}"
         );
+        let declined = mount_lines(&[a_mount("urn:x:", "/tmp/x.sock")], true);
+        assert_eq!(declined.len(), 1);
+        assert!(
+            declined[0].contains(MOUNTS_DECLINED),
+            "the decline names itself: {declined:?}"
+        );
+        assert!(
+            !declined[0].contains("urn:x:"),
+            "a declined door composed NOTHING and must name no mount: {declined:?}"
+        );
+        assert_ne!(none[0], declined[0], "the two postures never read alike");
+    }
+
+    /// ★ The item itself (#418): the banner prints the mounts, not how many there are. Six
+    /// was never the wrong number — it was never an answer to `which six`, and two of the
+    /// six pointed back at the caller.
+    #[test]
+    fn the_banner_names_every_mount_rather_than_counting_them() {
+        let lines = mount_lines(
+            &[
+                a_mount("urn:iki:store:", "/Users/x/.ikigai/gonk.sock"),
+                a_mount("urn:llm:", "quic://plasma.local:4433"),
+            ],
+            false,
+        );
+        assert_eq!(
+            lines.len(),
+            2,
+            "one line per mount, never a tally: {lines:?}"
+        );
+        assert_eq!(
+            lines[0],
+            "mount   prefer urn:iki:store: -> /Users/x/.ikigai/gonk.sock"
+        );
+        assert_eq!(
+            lines[1],
+            "mount   prefer urn:llm: -> quic://plasma.local:4433"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("2 mount")),
+            "no count survives anywhere in the block: {lines:?}"
+        );
+    }
+
+    /// A mount that authenticates as somebody else is a different mount, so the line says
+    /// which certificates it carries. Two `prefer urn:llm:` lines to the same peer with
+    /// different cert dirs are otherwise indistinguishable on the banner.
+    #[test]
+    fn a_mounts_own_certificates_are_named_on_its_line() {
+        let mut mount = a_mount("urn:cal:", "quic://bug.local:4433");
+        mount.certs.cert_dir = Some("/Users/x/.config/ikigai/quic-bug".to_string());
+        assert_eq!(
+            mount_line(&mount),
+            "mount   prefer urn:cal: -> quic://bug.local:4433  [certs /Users/x/.config/ikigai/quic-bug]"
+        );
+    }
+
+    /// ★ The other half of the item (#426): the banner names the certificates it trusts.
+    /// Two servers printed `1 trusted client cert(s)` on one afternoon and meant opposite
+    /// things — one with a peer enrolled in `clients/`, one with no `clients/` directory at
+    /// all, counting the base cert that is ALWAYS trusted. The count could not express the
+    /// fact the decision turned on.
+    ///
+    /// This also pins the SHAPE of what leaves the process: a 16-character prefix of the
+    /// lowercase-hex SHA-256 that `cert add-client` prints in full and that a
+    /// `clients.json` key must be. A prose comment could drift from that; this cannot.
+    #[cfg(feature = "quic")]
+    #[test]
+    fn the_banner_names_each_trusted_certificate_and_labels_the_base() {
+        let base = ikigai_quic::generate();
+        let peer = ikigai_quic::generate();
+        let full =
+            ikigai_quic::fingerprint_of_pem(&peer.cert_pem).expect("a generated cert parses");
+        let lines = client_lines(&[
+            quic::TrustedClient {
+                label: "base".to_string(),
+                path: "/Users/x/.config/ikigai/quic/client.crt".into(),
+                pem: base.cert_pem.clone(),
+            },
+            quic::TrustedClient {
+                label: "plasma".to_string(),
+                path: "/Users/x/.config/ikigai/quic/clients/plasma.crt".into(),
+                pem: peer.cert_pem.clone(),
+            },
+        ]);
+        assert_eq!(lines.len(), 2, "one line per certificate: {lines:?}");
+        assert!(
+            lines[0].starts_with("client  base  "),
+            "the base cert is labelled as the base, not listed as a peer: {lines:?}"
+        );
+        assert_eq!(
+            lines[1],
+            format!(
+                "client  plasma  {}  /Users/x/.config/ikigai/quic/clients/plasma.crt",
+                &full[..16]
+            )
+        );
+        assert_eq!(full.len(), 64, "the full id stays the SHA-256 hex");
+        assert!(
+            full.starts_with(short_fingerprint(&full)),
+            "what the banner shows is a PREFIX of what `cert add-client` prints"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("cert(s)")),
+            "no count survives anywhere in the block: {lines:?}"
+        );
+    }
+
+    /// A certificate this server has loaded and cannot describe is a fact the operator
+    /// needs. Dropping the row would put the banner back where it started — a list that
+    /// silently disagrees with what is trusted.
+    #[cfg(feature = "quic")]
+    #[test]
+    fn an_unparseable_certificate_still_gets_a_line() {
+        let lines = client_lines(&[quic::TrustedClient {
+            label: "junk".to_string(),
+            path: "/tmp/junk.crt".into(),
+            pem: "not a certificate".to_string(),
+        }]);
+        assert_eq!(lines, vec!["client  junk  unreadable  /tmp/junk.crt"]);
+    }
+
+    /// Each mode word is the one a `config.toml` `mount` line spells, so the banner is
+    /// greppable in the file that produced it.
+    #[test]
+    fn the_mode_word_matches_the_config_lines_grammar() {
+        for (kind, word) in [
+            (ikigai_embedded::MountKind::Alias, "alias"),
+            (ikigai_embedded::MountKind::Override, "override"),
+            (ikigai_embedded::MountKind::Prefer, "prefer"),
+        ] {
+            assert_eq!(mount_mode(kind), word);
+            // …and the grammar really parses it back.
+            let parsed = mounts_from_config_lines(vec![format!("{word} urn:x:=/tmp/x.sock")])
+                .expect("the mode word round-trips through the config grammar");
+            assert_eq!(parsed[0].kind, kind);
+        }
     }
 
     /// The config-home grammar, over lines rather than a file — proof that the default

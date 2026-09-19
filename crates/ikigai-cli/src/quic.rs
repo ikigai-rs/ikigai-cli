@@ -129,7 +129,7 @@ pub fn trusted_client_cert(certs: &Certs) -> Result<String, String> {
 }
 
 /// Mint an additional client identity into `<certdir>/clients/<name>.{crt,key}`.
-/// The server trusts every `clients/*.crt` (see [`trusted_client_certs`]), so this
+/// The server trusts every `clients/*.crt` (see [`trusted_clients`]), so this
 /// adds a principal without disturbing the existing certs. Returns the `.crt` path.
 pub fn add_client(name: &str, certs: &Certs, force: bool) -> Result<PathBuf, String> {
     if name.is_empty() || name.contains('/') || name.contains("..") {
@@ -150,11 +150,40 @@ pub fn add_client(name: &str, certs: &Certs, force: bool) -> Result<PathBuf, Str
     Ok(crt)
 }
 
-/// Every client certificate the server accepts — the configured `client.crt` plus any
-/// extra tenant certs dropped into `<certdir>/clients/*.crt`. Each distinct cert is a
-/// distinct identity (its own `ws/<id>` workspace), so multi-tenant is "add a cert".
-pub fn trusted_client_certs(certs: &Certs) -> Result<Vec<String>, String> {
-    let mut pems = vec![trusted_client_cert(certs)?];
+/// One certificate this server trusts: what it is CALLED, the file that made it true, and
+/// the PEM itself.
+///
+/// The label and the path exist because a COUNT of these cannot answer the question an
+/// operator asks of them. Two servers on one machine printed `1 trusted client cert(s)`
+/// and meant opposite things (ledger #426): one had `clients/plasma.crt` enrolled, the
+/// other had no `clients/` directory at all and was counting the base `client.crt` that
+/// [`trusted_clients`] always includes. Same number, opposite fact.
+pub struct TrustedClient {
+    /// `base` for the configured `client.crt`, else the `clients/<name>.crt` stem.
+    pub label: String,
+    /// The file it was read from — the thing the operator adds or removes.
+    pub path: PathBuf,
+    pub pem: String,
+}
+
+/// Every client certificate the server accepts — the configured `client.crt` (labelled
+/// `base`) plus any extra tenant certs dropped into `<certdir>/clients/*.crt`. Each
+/// distinct cert is a distinct identity (its own `ws/<id>` workspace), so multi-tenant is
+/// "add a cert".
+///
+/// Sorted by label after the base, so the banner a machine prints at startup is the same
+/// every start — `read_dir` order is not.
+pub fn trusted_clients(certs: &Certs) -> Result<Vec<TrustedClient>, String> {
+    let base = match certs.client_cert.clone() {
+        Some(path) => PathBuf::from(path),
+        None => default_path("client.crt", certs)?,
+    };
+    let mut trusted = vec![TrustedClient {
+        label: "base".to_string(),
+        pem: trusted_client_cert(certs)?,
+        path: base,
+    }];
+    let mut extra = Vec::new();
     if let Ok(entries) = base_dir(certs)
         .map(|d| d.join("clients"))
         .and_then(|clients| std::fs::read_dir(&clients).map_err(|e| e.to_string()))
@@ -163,12 +192,20 @@ pub fn trusted_client_certs(certs: &Certs) -> Result<Vec<String>, String> {
             let path = entry.path();
             if path.extension().is_some_and(|e| e == "crt") {
                 if let Ok(pem) = std::fs::read_to_string(&path) {
-                    pems.push(pem);
+                    extra.push(TrustedClient {
+                        label: path
+                            .file_stem()
+                            .map_or_else(|| "?".to_string(), |s| s.to_string_lossy().into_owned()),
+                        path,
+                        pem,
+                    });
                 }
             }
         }
     }
-    Ok(pems)
+    extra.sort_by(|a, b| a.label.cmp(&b.label));
+    trusted.extend(extra);
+    Ok(trusted)
 }
 
 /// The server certificate the client pins.

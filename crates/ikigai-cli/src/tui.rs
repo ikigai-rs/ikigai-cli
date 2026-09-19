@@ -48,9 +48,15 @@ fn demo_index(tab: usize) -> Option<usize> {
 }
 
 /// Run the TUI to completion, restoring the terminal on the way out.
-pub fn run(engine: Engine, keys: Keybindings) -> io::Result<()> {
+///
+/// `topology` is what this kernel composed — one line per mount. It is seeded as the first
+/// transcript entry rather than printed, because this face owns the alternate screen: a
+/// line written before `ratatui::init()` is hidden until the session ENDS, which is the one
+/// moment it is no longer useful. Ledger #418: the REPL had no mount line at all, so an
+/// interactive session could not see the topology its answers came through.
+pub fn run(engine: Engine, keys: Keybindings, topology: &[String]) -> io::Result<()> {
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, &engine, keys);
+    let result = event_loop(&mut terminal, &engine, keys, topology);
     ratatui::restore();
     result
 }
@@ -231,11 +237,22 @@ fn event_loop(
     terminal: &mut DefaultTerminal,
     engine: &Engine,
     keys: Keybindings,
+    topology: &[String],
 ) -> io::Result<()> {
     let mut state = State {
         keys,
         ..State::default()
     };
+    // The composed topology, at the top of the scrollback. An EMPTY `input` marks it as a
+    // note the host wrote rather than a line anyone typed — [`transcript_lines`] renders
+    // those without a prompt, so it cannot be mistaken for a command to recall.
+    if !topology.is_empty() {
+        state.transcript.push(Entry {
+            input: String::new(),
+            result: Ok(topology.join("\n")),
+            cache: CacheStats::default(),
+        });
+    }
     // Preload persisted command history when persistence is on — the flag is seeded
     // from the sticky on-disk marker, so ↑↓ recall spans prior sessions.
     if ikigai_embedded::history_flag().load(std::sync::atomic::Ordering::Relaxed) {
@@ -1498,11 +1515,16 @@ fn mode_label(state: &State) -> String {
 fn transcript_lines(transcript: &[Entry]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for entry in transcript {
-        let mut prompt = vec![format!("ikigai> {}", entry.input).cyan()];
-        if let Some(label) = entry.cache.label() {
-            prompt.push(format!("  ({label})").dim());
+        // An entry with no input is a note the HOST wrote (the startup topology), not a
+        // line the user submitted. Giving it a prompt would invite retyping a command that
+        // does not exist.
+        if !entry.input.is_empty() {
+            let mut prompt = vec![format!("ikigai> {}", entry.input).cyan()];
+            if let Some(label) = entry.cache.label() {
+                prompt.push(format!("  ({label})").dim());
+            }
+            lines.push(Line::from(prompt));
         }
-        lines.push(Line::from(prompt));
         match &entry.result {
             Ok(out) => lines.extend(out.lines().map(|l| Line::from(l.to_string().green()))),
             Err(err) => lines.extend(error_lines(err)),
@@ -1520,6 +1542,25 @@ mod tests {
     fn render(width: u16, height: u16, state: &State) {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| draw(frame, state)).unwrap();
+    }
+
+    /// The startup topology (ledger #418) is a note the HOST wrote, not a line anyone
+    /// typed, so it renders with NO `ikigai>` prompt: one output line in, one line out.
+    /// A prompt would invite recalling a command that does not exist.
+    #[test]
+    fn a_host_note_renders_without_a_prompt_and_a_command_keeps_its_own() {
+        let note = transcript_lines(&[Entry {
+            input: String::new(),
+            result: Ok("mount   prefer urn:llm: -> peer:plasma".to_string()),
+            cache: CacheStats::default(),
+        }]);
+        assert_eq!(note.len(), 1, "no prompt line for a host note: {note:?}");
+        let typed = transcript_lines(&[Entry {
+            input: "source urn:time:now".to_string(),
+            result: Ok("12:00".to_string()),
+            cache: CacheStats::default(),
+        }]);
+        assert_eq!(typed.len(), 2, "a submitted line still gets its prompt");
     }
 
     #[test]
