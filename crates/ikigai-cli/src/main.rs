@@ -285,12 +285,6 @@ impl Mounts {
     }
 }
 
-/// The one spelling of the declined posture, so every door says it the same way. Saying it
-/// is the point: the peer that started #410 composed the machine's whole topology and its
-/// banner reported only a mount COUNT, so "this server inherited gonk" was invisible.
-const MOUNTS_DECLINED: &str =
-    "declined (--no-config-mounts) — the config home's `mount` lines are not read";
-
 /// The mode word a `mount` line in the config home would use for this kind, so what the
 /// banner prints is greppable in the file that produced it.
 fn mount_mode(kind: ikigai_embedded::MountKind) -> &'static str {
@@ -301,49 +295,39 @@ fn mount_mode(kind: ikigai_embedded::MountKind) -> &'static str {
     }
 }
 
-/// One mount, named: the mode, the prefix it claims, and the target it claims it from —
-/// plus its own certificate directory when it has one, because a mount that authenticates
-/// as somebody else is a different mount.
-fn mount_line(mount: &Mount) -> String {
-    let certs = match &mount.certs.cert_dir {
-        Some(dir) => format!("  [certs {dir}]"),
-        None => String::new(),
-    };
-    format!(
-        "mount   {} {} -> {}{certs}",
-        mount_mode(mount.kind),
-        mount.prefix,
-        mount.target
+/// What this door composed, as the value `urn:host:posture` reports and both faces render
+/// from — the facts of each mount, without the connected resolver or the private key
+/// material behind its cert set.
+///
+/// ★ The banner and the resource render from ONE value through one renderer
+/// ([`ikigai_embedded::posture::mount_lines`]). Two renderers over the same facts is how a
+/// diagnostic and a resource end up as two spellings of one thing, which is the defect
+/// class #418/#426 were about; this makes that impossible rather than merely discouraged.
+fn mount_posture(mounts: &[Mount], declined: bool) -> ikigai_embedded::posture::MountPosture {
+    if declined {
+        return ikigai_embedded::posture::MountPosture::Declined;
+    }
+    ikigai_embedded::posture::MountPosture::Composed(
+        mounts
+            .iter()
+            .map(|mount| ikigai_embedded::posture::ComposedMount {
+                mode: mount_mode(mount.kind),
+                prefix: mount.prefix.clone(),
+                target: mount.target.clone(),
+                cert_dir: mount.certs.cert_dir.clone(),
+            })
+            .collect(),
     )
 }
 
-/// The banner's mount block — ONE LINE PER MOUNT, naming what was composed.
-///
-/// ★ This used to be `"; {n} mount(s)"`, and the count was always accurate and never an
-/// answer. plasma's inference peer printed `6 mount(s)` at every startup while two of the
-/// six pointed back at its own caller and cost the machine a ~120s `urn:kernel:actions`
-/// (ledger #410/#418): six was not wrong, it just was not an answer to *which* six. A
-/// diagnostic that prints a count instead of the items cannot answer the question that
-/// makes it worth printing.
-///
-/// Three postures, and all three now say what they mean in words: the mounts themselves, an
-/// explicit decline, or an explicit nothing. The last used to print NOTHING at all, which
-/// made "this machine composes no topology" and "this door forgot to say" the same
-/// observation.
-///
-/// It does not elide. A cap would hide exactly the machine that most needs the list — the
-/// hub with thirty mounts — and this prints once per process start, into a log.
+/// The banner's mount block, in this crate's own terms — one line per mount, from
+/// [`ikigai_embedded::posture::mount_lines`], which is where the reasoning lives (and which
+/// `urn:host:posture` renders through too).
 ///
 /// Printed BEFORE the mounts are resolved, so a door that hangs dialing a peer has already
 /// named the peer it is hanging on. That was #410's actual failure mode.
 fn mount_lines(mounts: &[Mount], declined: bool) -> Vec<String> {
-    if declined {
-        return vec![format!("mount   {MOUNTS_DECLINED}")];
-    }
-    if mounts.is_empty() {
-        return vec!["mount   none composed — no `mount` lines in the config home".to_string()];
-    }
-    mounts.iter().map(mount_line).collect()
+    ikigai_embedded::posture::mount_lines(&mount_posture(mounts, declined))
 }
 
 /// Say what this door composed, on stderr, one line per mount. `who` prefixes every line
@@ -1061,6 +1045,20 @@ fn daemon(mounts: Mounts) {
     // The daemon IS the worker: it holds the reactive kernel, so the workspace's tuples
     // are claimed and run here, under this signed job's identity and grants.
     announce_mounts("ikigai", &mounts, declined);
+    // What this process composed, for `urn:host:posture`. Recorded by EVERY door that
+    // builds a kernel, including the ones with no wire face: an unrecorded posture answers
+    // "nobody told me", and a door that quietly skipped the call would make its own
+    // topology unaskable while looking like a host that composed nothing.
+    ikigai_embedded::posture::set_posture(ikigai_embedded::posture::Posture {
+        nature: "Embedded (Native)".to_string(),
+        door: "none — the writer daemon serves no transport; it holds the reactive kernel"
+            .to_string(),
+        mounts: mount_posture(&mounts, declined),
+        clients: Vec::new(),
+        surface: None,
+        authority: Some("root — this process resolves under the identity it runs as".to_string()),
+        reloads: Vec::new(),
+    });
     let kernel = if mounts.is_empty() {
         ikigai_embedded::reactive_kernel_with_mounts(Vec::new())
     } else {
@@ -1184,6 +1182,28 @@ fn mcp(grants: Vec<String>, scopes: Vec<String>, mounts: Mounts) {
         }
     };
     announce_mounts("ikigai mcp", &mounts, declined);
+    ikigai_embedded::posture::set_posture(ikigai_embedded::posture::Posture {
+        nature: "Embedded (Native)".to_string(),
+        door: "stdio (MCP)".to_string(),
+        mounts: mount_posture(&mounts, declined),
+        clients: Vec::new(),
+        surface: None,
+        // The ceiling is `--grant`/`--scope`, which is also the tool list the client sees:
+        // the manifold is projected under it, so an agent with no `urn:cap:host:posture`
+        // in its grant is not even OFFERED this resource, let alone answered.
+        authority: Some(match capability.read().expect("cap lock").scopes() {
+            None => "root — no --grant/--scope was given (UNRESTRICTED)".to_string(),
+            Some(s) => format!("{} scope(s) from --grant/--scope", s.len()),
+        }),
+        // The grants poller rebuilds the session capability when the file changes and emits
+        // `tools/list_changed`, so the ceiling above is a startup READING of something this
+        // door re-reads — exactly the over-claim `reloads` exists to prevent.
+        reloads: vec![
+            "grants.json — the active grant's scopes are re-read while running, and the \
+             projected tool list is rebuilt live (no restart)"
+                .to_string(),
+        ],
+    });
     let kernel = if mounts.is_empty() {
         ikigai_embedded::watched_kernel()
     } else {
@@ -1373,7 +1393,27 @@ fn build_engine(
             // connects to owns the topology.
             let declined = mounts.declined;
             let mounts = mounts_or_config(mounts)?;
-            let topology = mount_lines(&mounts, declined);
+            let composed = mount_posture(&mounts, declined);
+            let topology = ikigai_embedded::posture::mount_lines(&composed);
+            // ⚠ This door's posture is the least interesting one there is, and saying so is
+            // the point: a one-shot CLI or REPL composes the topology FROM THE CONFIG HOME
+            // at the moment it starts, so asking it about its posture is nearly the same
+            // question as reading the file. The answer worth having comes from a SERVING
+            // process, whose composition happened at a startup you were not present for
+            // (ledger #408/#428). Recorded anyway, because "unrecorded" must mean
+            // unrecorded.
+            ikigai_embedded::posture::set_posture(ikigai_embedded::posture::Posture {
+                nature: "Embedded (Native)".to_string(),
+                door: "none — in-process (this REPL/one-shot kernel)".to_string(),
+                mounts: composed,
+                clients: Vec::new(),
+                surface: None,
+                authority: Some(
+                    "root — the running user IS the owner (`cap` attenuates it voluntarily)"
+                        .to_string(),
+                ),
+                reloads: Vec::new(),
+            });
             let kernel = if mounts.is_empty() {
                 if react {
                     ikigai_embedded::reactive_kernel_with_mounts(Vec::new())
@@ -2065,36 +2105,33 @@ fn short_fingerprint(full: &str) -> &str {
     &full[..full.len().min(FINGERPRINT_SHOWN)]
 }
 
-/// The banner's trusted-client block — ONE LINE PER CERTIFICATE: its label, its
-/// fingerprint, and the file that put it there.
+/// The trusted client certificates as identities: label, SHORT fingerprint, and the file
+/// that put each one in the trusted set.
 ///
-/// ★ This used to be `"{n} trusted client cert(s)"`. Two servers on bug printed `1 trusted
-/// client cert(s)` on the same afternoon and meant opposite things — one with
-/// `clients/plasma.crt` enrolled, one with no `clients/` directory at all, counting the
-/// base `client.crt` that is always trusted (ledger #426). The count was accurate both
-/// times and answered neither operator's question. `fingerprint_of_pem` has been public
-/// since #286 precisely so a tool could print the id instead of sending someone to
-/// `openssl`; the banner simply never called it.
+/// ★ **The fingerprint is truncated exactly once, here.** This is the only place in the
+/// process that shortens one: the banner and `urn:host:posture` both render from the value
+/// this returns, so a reader comparing the two is comparing one fact rather than two
+/// spellings of it. `ikigai-embedded` could not do it anyway — `fingerprint_of_pem` lives
+/// in `ikigai-quic`, which it does not depend on — and that accident happens to enforce
+/// the rule.
 ///
-/// The base certificate is labelled `base` rather than listed as though it were a peer: it
-/// is the one that made the count lie, so it says what it is.
+/// An unparseable PEM becomes `unreadable` rather than vanishing: a certificate this server
+/// has loaded and cannot describe is a fact the operator needs, not one to hide. The base
+/// certificate is labelled `base` rather than listed as though it were a peer — it is the
+/// one that made the old count lie (ledger #426), so it says what it is.
 #[cfg(all(feature = "embedded", feature = "quic"))]
-fn client_lines(trusted: &[quic::TrustedClient]) -> Vec<String> {
-    let width = trusted.iter().map(|c| c.label.len()).max().unwrap_or(0);
+fn trusted_identities(
+    trusted: &[quic::TrustedClient],
+) -> Vec<ikigai_embedded::posture::TrustedIdentity> {
     trusted
         .iter()
-        .map(|client| {
-            // An unparseable PEM says so rather than vanishing: a cert this server has
-            // loaded and cannot describe is a fact the operator needs, not one to hide.
-            let fingerprint = ikigai_quic::fingerprint_of_pem(&client.pem).map_or_else(
+        .map(|client| ikigai_embedded::posture::TrustedIdentity {
+            label: client.label.clone(),
+            fingerprint: ikigai_quic::fingerprint_of_pem(&client.pem).map_or_else(
                 |_| "unreadable".to_string(),
                 |f| short_fingerprint(&f).to_string(),
-            );
-            format!(
-                "client  {label:width$}  {fingerprint}  {path}",
-                label = client.label,
-                path = client.path.display()
-            )
+            ),
+            path: client.path.display().to_string(),
         })
         .collect()
 }
@@ -2137,6 +2174,9 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, moun
         // compose is worse than one that refuses to start. (`--prefer` is exempt — its
         // peer being absent is normal, and it dials on demand.)
         announce_mounts("ikigai", &mounts, declined);
+        // Held for the posture record below, which is built where the LAST of its facts
+        // (the surface and the ceiling) becomes known — the resolve loop consumes `mounts`.
+        let composed = mount_posture(&mounts, declined);
         let mut resolved = Vec::new();
         for mount in mounts {
             resolved.push(resolve_mount(mount)?);
@@ -2344,10 +2384,44 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, moun
             faces.push("signed-run");
         }
         let surface = faces.join(" + ");
-        for line in client_lines(&trusted) {
+        let identities = trusted_identities(&trusted);
+        for line in ikigai_embedded::posture::client_lines(&identities) {
             eprintln!("ikigai: {line}");
         }
         eprintln!("ikigai: serving on {target}  ({posture}; surface: {surface})  (Ctrl-C to stop)");
+        // ★ The same facts the four lines above just printed, recorded as a RESOURCE. This
+        // is the door the whole item came from: the peer that cost plasma a ~120s manifold
+        // (#408) had composed two mounts back at its own caller, and the only way to learn
+        // that was to have been present at its startup. From here it is a question.
+        //
+        // Every value is the one that went to the banner — the mount facts, the SAME
+        // truncated fingerprints, the surface and the ceiling strings — so the two cannot
+        // read differently.
+        ikigai_embedded::posture::set_posture(ikigai_embedded::posture::Posture {
+            nature: "Remote (QUIC)".to_string(),
+            door: target.to_string(),
+            mounts: composed,
+            clients: identities,
+            surface: Some(surface.clone()),
+            authority: Some(posture.clone()),
+            // ⚠ Under per-identity grants the ceiling above is a startup READING: the
+            // minter re-reads clients.json (and grants.json through it) on EVERY
+            // connection, which is what makes editing the file a revocation rather than a
+            // TTL wait. The certificate SET is frozen — the PEMs were read once and handed
+            // to the transport — so which certificates may connect cannot change while this
+            // process runs, but WHICH AUTHORITY each gets can, and nothing here reports it.
+            reloads: if enrolment.is_some() {
+                vec![
+                    "clients.json (and the grants it names) — re-read on EVERY connection, \
+                     so which authority each certificate gets is decided then, not now; an \
+                     edit revokes on the next call. The set of certificates that may \
+                     connect at all is frozen at startup."
+                        .to_string(),
+                ]
+            } else {
+                Vec::new()
+            },
+        });
         // Announce on the local network, so a client can mount this kernel by NAME rather
         // than by an address that moves. Opt-in: broadcasting what a machine serves is a
         // disclosure, and a server on an untrusted network may want to be found only by
@@ -2486,6 +2560,25 @@ fn serve_ipc(path: Option<String>, mounts: Mounts) -> ! {
     // start. (A `--prefer` mount is exempt — its peer being absent is normal, and it dials
     // on demand.)
     announce_mounts("ikigai", &mounts, declined);
+    // ★ The posture of the door a local client (Emacs, the REPL, MCP) actually talks to.
+    // THE HOST OWNS THE TOPOLOGY, so this socket's mounts are the ones a connected client
+    // resolves through without knowing where the peers are — and until now the only way to
+    // learn which they were was to have watched this process start.
+    ikigai_embedded::posture::set_posture(ikigai_embedded::posture::Posture {
+        nature: "Remote (IPC)".to_string(),
+        door: socket.display().to_string(),
+        mounts: mount_posture(&mounts, declined),
+        // A Unix socket authenticates nobody by certificate: the socket's file permissions
+        // are the boundary, which is exactly why the kernel behind it is the TRUSTED one.
+        clients: Vec::new(),
+        surface: None,
+        authority: Some(
+            "root — every request on this socket resolves as the owner; the socket's file \
+             permissions are the boundary"
+                .to_string(),
+        ),
+        reloads: Vec::new(),
+    });
     let mut resolved = Vec::new();
     for mount in mounts {
         match resolve_mount(mount) {
@@ -2667,6 +2760,9 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
     // worse than one that refuses to start. (`--prefer` is exempt — its peer being absent is
     // normal, and it dials on demand.)
     announce_mounts("ikigai", &mounts, declined);
+    // Held for the posture record below: the route table (this door's surface) is not
+    // loaded until further down, and the resolve loop consumes `mounts`.
+    let composed = mount_posture(&mounts, declined);
     let mut resolved = Vec::new();
     for mount in mounts {
         match resolve_mount(mount) {
@@ -2693,7 +2789,9 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
     } else {
         (
             ikigai_web::fixed_cap(caps.to_vec()),
-            format!("ceiling: {}", caps.join(", ")),
+            // `fixed ceiling:`, the same words serve_quic uses for the same posture — two
+            // doors describing one concept in two spellings is the defect this arc is about.
+            format!("fixed ceiling: {}", caps.join(", ")),
         )
     };
     // The edge response policy: strict security headers by default; `--trust-proxy` honors
@@ -2724,6 +2822,9 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
     // kernel's SPARQL on a plain (no-daemon) loader kernel. A load failure is fatal — a
     // misconfigured edge should not silently fall back to the bare default routing. When the
     // resource is a `urn:file:` route file, a poller hot-reloads it on change (no restart).
+    // Set when a poller is watching the route file, so the posture record can NAME the
+    // re-read instead of letting the "as of startup" line cover a table that hot-reloads.
+    let mut routes_watched = false;
     let route_note = match routes {
         Some(iri) => {
             let loader = ikigai_embedded::kernel();
@@ -2776,6 +2877,7 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
                         }
                     }
                 });
+                routes_watched = true;
                 format!("{n} route(s) from {iri}, watching")
             } else {
                 format!("{n} route(s) from {iri}")
@@ -2801,6 +2903,33 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
     eprintln!(
         "ikigai: serving HTTP on {addr}  ({posture}; {route_note}; {cors_note}; {proxy_note}; terminate TLS at your proxy)  (Ctrl-C to stop)"
     );
+    // ★ The public door records its posture like any other — and `urn:host:posture` is
+    // REACHABLE here (`GET /host/posture`) and REFUSED, because the public capability does
+    // not hold `urn:cap:host:posture`. That is the intended shape: the resource is gated by
+    // authority rather than withheld by composition, so an operator can put it on a
+    // monitoring door by granting the one scope, and a stranger gets a 403 either way.
+    // The paths are the sensitive part — a mount target names another machine and a cert
+    // path describes this disk; a fingerprint is a hash of a public certificate and
+    // discloses nothing.
+    ikigai_embedded::posture::set_posture(ikigai_embedded::posture::Posture {
+        nature: "Remote (HTTP)".to_string(),
+        door: format!("http://{addr}"),
+        mounts: composed,
+        // TLS terminates at the proxy and the door authenticates no client certificate;
+        // per-request identity is the route table's `ik:bind` seam, not a cert.
+        clients: Vec::new(),
+        surface: Some(route_note.clone()),
+        authority: Some(posture.clone()),
+        reloads: if routes_watched {
+            vec![
+                "the route table — the watched route resource is re-queried when the file \
+                 changes and swapped live, so the route count above is the startup reading"
+                    .to_string(),
+            ]
+        } else {
+            Vec::new()
+        },
+    });
     match runtime.block_on(ikigai_web::serve_with(kernel, cap_fn, addr, config)) {
         Ok(()) => std::process::exit(0),
         Err(e) => {
@@ -3009,7 +3138,7 @@ mod mount_posture_tests {
         let declined = mount_lines(&[a_mount("urn:x:", "/tmp/x.sock")], true);
         assert_eq!(declined.len(), 1);
         assert!(
-            declined[0].contains(MOUNTS_DECLINED),
+            declined[0].contains(ikigai_embedded::posture::MOUNTS_DECLINED),
             "the decline names itself: {declined:?}"
         );
         assert!(
@@ -3058,8 +3187,8 @@ mod mount_posture_tests {
         let mut mount = a_mount("urn:cal:", "quic://bug.local:4433");
         mount.certs.cert_dir = Some("/Users/x/.config/ikigai/quic-bug".to_string());
         assert_eq!(
-            mount_line(&mount),
-            "mount   prefer urn:cal: -> quic://bug.local:4433  [certs /Users/x/.config/ikigai/quic-bug]"
+            mount_lines(&[mount], false),
+            vec!["mount   prefer urn:cal: -> quic://bug.local:4433  [certs /Users/x/.config/ikigai/quic-bug]"]
         );
     }
 
@@ -3079,7 +3208,7 @@ mod mount_posture_tests {
         let peer = ikigai_quic::generate();
         let full =
             ikigai_quic::fingerprint_of_pem(&peer.cert_pem).expect("a generated cert parses");
-        let lines = client_lines(&[
+        let lines = ikigai_embedded::posture::client_lines(&trusted_identities(&[
             quic::TrustedClient {
                 label: "base".to_string(),
                 path: "/Users/x/.config/ikigai/quic/client.crt".into(),
@@ -3090,7 +3219,7 @@ mod mount_posture_tests {
                 path: "/Users/x/.config/ikigai/quic/clients/plasma.crt".into(),
                 pem: peer.cert_pem.clone(),
             },
-        ]);
+        ]));
         assert_eq!(lines.len(), 2, "one line per certificate: {lines:?}");
         assert!(
             lines[0].starts_with("client  base  "),
@@ -3120,11 +3249,12 @@ mod mount_posture_tests {
     #[cfg(feature = "quic")]
     #[test]
     fn an_unparseable_certificate_still_gets_a_line() {
-        let lines = client_lines(&[quic::TrustedClient {
-            label: "junk".to_string(),
-            path: "/tmp/junk.crt".into(),
-            pem: "not a certificate".to_string(),
-        }]);
+        let lines =
+            ikigai_embedded::posture::client_lines(&trusted_identities(&[quic::TrustedClient {
+                label: "junk".to_string(),
+                path: "/tmp/junk.crt".into(),
+                pem: "not a certificate".to_string(),
+            }]));
         assert_eq!(lines, vec!["client  junk  unreadable  /tmp/junk.crt"]);
     }
 

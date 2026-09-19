@@ -113,6 +113,7 @@ const OWN: &[(&str, &str)] = &[
     ("host-history", "ikigai-embedded"),
     ("host-identity", "ikigai-embedded"),
     ("host-info", "ikigai-embedded"),
+    ("host-posture", "ikigai-embedded"),
     ("kernel-health", "ikigai-embedded"),
     ("lisp-aliases", "ikigai-embedded"),
     ("page", "ikigai-embedded"),
@@ -293,6 +294,32 @@ fn fixture_home() -> &'static Path {
         std::env::set_var("XDG_CONFIG_HOME", dir.join("config"));
         ikigai_embedded::set_file_root(dir.join("workspace"));
         seed_workspace(&dir.join("workspace"));
+        // ★ RECORD a posture, so the walk probes the graph a SERVING host emits rather than
+        // the "unrecorded" placeholder. Without this the `text/turtle` face under test is
+        // four triples long and the VOCABULARY finding names one term — which would make
+        // the pinned waiver below look complete while covering almost none of the graph.
+        // That is the fixture-is-a-claim lesson from this file's own header, in the one
+        // place where the endpoint's output depends on process state instead of inputs.
+        ikigai_embedded::posture::set_posture(ikigai_embedded::posture::Posture {
+            nature: "Test (conformance)".to_string(),
+            door: "quic://127.0.0.1:14433".to_string(),
+            mounts: ikigai_embedded::posture::MountPosture::Composed(vec![
+                ikigai_embedded::posture::ComposedMount {
+                    mode: "prefer",
+                    prefix: "urn:iki:store:".to_string(),
+                    target: "/tmp/conformance.sock".to_string(),
+                    cert_dir: Some("/tmp/conformance/quic".to_string()),
+                },
+            ]),
+            clients: vec![ikigai_embedded::posture::TrustedIdentity {
+                label: "base".to_string(),
+                fingerprint: "0123456789abcdef".to_string(),
+                path: "/tmp/conformance/quic/client.crt".to_string(),
+            }],
+            surface: Some("host + fs".to_string()),
+            authority: Some("per-client workspaces".to_string()),
+            reloads: vec!["clients.json — per connection".to_string()],
+        });
         dir
     })
     .as_path()
@@ -525,6 +552,25 @@ fn base() -> Suite {
         // Reaches the network. All six HTTP verbs are backed by a REAL transport here
         // (`ureq`), so the walk would issue live requests to whatever the sample `url`
         // happens to be. Bound on BOTH compositions, so they live in the base.
+        // ★ THE SECOND REAL VOCABULARY GAP, in a repo that cannot fix it — `urn:host:health`
+        // next door is the first. Declaring `urn:host:posture`'s `text/turtle` face brings
+        // it under VOCABULARY, which finds seventeen `ik:` terms `ikigai-vocab` does not
+        // define, at the pinned version or at HEAD. The fix is `vocabulary.ttl` in
+        // ikigai-core plus a manual deploy of https://ikigai-rs.dev/ns; both belong to that
+        // repo, so this waits and the need is reported up.
+        //
+        // ⚠ `opt_out_check`, never `opt_out`: the coarse lever would take ENFORCED,
+        // CACHEABLE and SKOLEM-RDF down with it — on an endpoint whose whole point is a
+        // capability gate and an uncacheable read. The exact set is pinned by hand in
+        // `the_posture_graph_uses_exactly_seventeen_undefined_terms`, so this goes red in both
+        // directions, including the day the terms land.
+        .opt_out_check(
+            "host-posture",
+            Check::Vocabulary,
+            "ik:Posture / ik:Mount / ik:TrustedClient and their properties are undefined in \
+             ikigai-vocab (at the pin AND at HEAD); the fix is vocabulary.ttl in ikigai-core \
+             plus a /ns deploy. The exact undefined set is pinned by hand below.",
+        )
         .opt_out("httpGet", None, "outbound HTTP over a real transport")
         .opt_out("httpHead", None, "outbound HTTP over a real transport")
         .opt_out("httpPost", None, "outbound HTTP over a real transport")
@@ -986,6 +1032,73 @@ fn the_http_door_serves_no_owner_only_resource() {
     ] {
         assert!(door.contains(id), "`{id}` is missing from the HTTP door");
     }
+}
+
+/// ★ **The posture graph's undefined terms, as an EXACT list — that waiver's other half.**
+///
+/// `opt_out_check("host-posture", Check::Vocabulary, …)` in [`base`] silences a rule this
+/// repo cannot satisfy: `urn:host:posture`'s `text/turtle` face names seventeen `ik:` terms no
+/// version of `ikigai-vocab` defines. A waiver alone would also waive the EIGHTEENTH term
+/// somebody adds next, so the set is pinned here, reproducing `VOCABULARY` from the public
+/// [`rdf`] helpers. It fails in both directions: a new invented term, and the day
+/// `vocabulary.ttl` defines these.
+///
+/// ⚠ Unlike the health graph's list, this one is COMPLETE for the graph as emitted, because
+/// [`fixture_home`] records a posture carrying one of everything — a mount with its own cert
+/// dir, a trusted client, a surface, a ceiling and a reload. An empty posture would emit two
+/// terms and this test would look just as green.
+///
+/// The reused terms are as deliberate as the invented ones: `ik:path` and `rdfs:label` are
+/// DEFINED, and the properties the vocabulary already has for a target, a capability or an
+/// id (`ik:target`, `ik:cap`, `ik:id`) carry an `rdfs:domain` of `ik:Route` or `ik:Endpoint`,
+/// so reusing them here would entail that a mount IS a route. A synonym is the lesser evil;
+/// widening those domains is the vocabulary change to argue for.
+#[test]
+fn the_posture_graph_uses_exactly_seventeen_undefined_terms() {
+    use ikigai_core::{Capability, Iri, Request, Verb};
+
+    let kernel = root_kernel();
+    let repr = futures::executor::block_on(
+        kernel.issue(
+            Request::new(
+                Verb::Source,
+                Iri::parse("urn:host:posture".to_string()).expect("iri"),
+            )
+            .with_arg("as", ikigai_core::ArgRef::Inline(b"text/turtle".to_vec())),
+            &Capability::root(),
+        ),
+    )
+    .expect("the posture graph face resolves");
+    let triples =
+        rdf::parse(&repr.repr_type.media_type, &repr.bytes).expect("the face parses as Turtle");
+    let undefined: Vec<String> = rdf::terms(&triples)
+        .into_iter()
+        .filter(|t| !rdf::is_defined(t, &[]))
+        .collect();
+    assert_eq!(
+        undefined,
+        vec![
+            "https://ikigai-rs.dev/ns#Mount",
+            "https://ikigai-rs.dev/ns#Posture",
+            "https://ikigai-rs.dev/ns#TrustedClient",
+            "https://ikigai-rs.dev/ns#asOf",
+            "https://ikigai-rs.dev/ns#authority",
+            "https://ikigai-rs.dev/ns#certDir",
+            "https://ikigai-rs.dev/ns#door",
+            "https://ikigai-rs.dev/ns#fingerprint",
+            "https://ikigai-rs.dev/ns#mount",
+            "https://ikigai-rs.dev/ns#mountMode",
+            "https://ikigai-rs.dev/ns#mountPosture",
+            "https://ikigai-rs.dev/ns#mountPrefix",
+            "https://ikigai-rs.dev/ns#mountTarget",
+            "https://ikigai-rs.dev/ns#nature",
+            "https://ikigai-rs.dev/ns#reloads",
+            "https://ikigai-rs.dev/ns#surface",
+            "https://ikigai-rs.dev/ns#trustedClient",
+        ],
+        "the waived vocabulary exception has changed — widen the waiver's reason, or drop \
+         both it and this test if `vocabulary.ttl` now defines these"
+    );
 }
 
 /// ★ **The health graph's undefined terms, as an EXACT list — the waiver's other half.**
