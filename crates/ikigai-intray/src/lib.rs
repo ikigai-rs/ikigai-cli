@@ -500,7 +500,10 @@ pub enum Outcome {
 ///
 /// The handler runs under the reactor's OWN `capability` — the owner's processing authority,
 /// configured when the reactor is wired — NEVER the dropper's (who held only `out`) and never
-/// root. A stranger's drop cannot escalate past what the handler is authorized to reach.
+/// root. A stranger's drop cannot escalate past what the handler is authorized to reach, and
+/// that is STRUCTURAL: the only per-space adjustment is [`Capability::attenuate`], which can
+/// subtract scopes and never add one (ledger #445); a host that wants authority out of the
+/// space tree entirely uses [`with_host_authority`](SpaceReactor::with_host_authority).
 ///
 /// This is the deterministic core (`drain`/`process`); the live filesystem watcher that calls
 /// `process` on each drop is a thin wrapper the host installs (Slice 3b).
@@ -510,11 +513,28 @@ pub struct SpaceReactor {
     // would shadow the inherent async `Kernel::issue` in this module's tests.
     resolver: Arc<dyn ikigai_resolve::Resolver>,
     capability: Capability,
+    // `None` = decide a handler's authority from the space's `cap` file (attenuating this
+    // reactor's own capability). `Some` = the HOST decides and the file is never read; see
+    // `with_host_authority` for why a host may want the file out of the loop entirely.
+    host_authority: Option<HostAuthority>,
 }
+
+/// A host's own answer to "what authority does this space's handler run under?", installed
+/// with [`SpaceReactor::with_host_authority`]. `None` from the closure means "no opinion —
+/// use the reactor's configured capability".
+///
+/// This is the TRUSTED path, at the same trust level as the capability passed to
+/// [`SpaceReactor::new`]: whatever it returns is used as-is, because the host that built the
+/// reactor is the authority that bounded it in the first place. The untrusted path — the
+/// `cap` file, which lives in the tree droppers write into — can only ever attenuate.
+pub type HostAuthority = Arc<dyn Fn(&str) -> Option<Capability> + Send + Sync>;
 
 impl SpaceReactor {
     /// Build a reactor over `root` (the same tree the spaces live in), firing handlers
     /// through `resolver` under `capability`.
+    ///
+    /// `capability` is the CEILING for every handler this reactor fires: a space's `cap`
+    /// file can narrow it per space, never widen it.
     pub fn new(
         root: PathBuf,
         resolver: Arc<dyn ikigai_resolve::Resolver>,
@@ -524,7 +544,46 @@ impl SpaceReactor {
             root,
             resolver,
             capability,
+            host_authority: None,
         }
+    }
+
+    /// Take a space's handler authority from the HOST instead of from the space tree.
+    ///
+    /// With this installed the reactor **never reads a `cap` file**. That is the difference
+    /// between "safe because the file happens to be trustworthy" and "safe because the crate
+    /// never reads authority off the dropper's tree at all" — a host with its own checked
+    /// grant store (`ikigai-gonk` has one, and refuses `cap` files outright rather than use
+    /// this path) can decide authority through the same door everything else goes through.
+    ///
+    /// The closure is called per tuple with the space name; `None` means "use the reactor's
+    /// configured capability". A `cap` file left on disk under this policy is INERT, which is
+    /// its own trap — [`ignored_cap_files`](SpaceReactor::ignored_cap_files) is there so a
+    /// host can refuse to start rather than quietly disregard one.
+    pub fn with_host_authority<F>(mut self, decide: F) -> Self
+    where
+        F: Fn(&str) -> Option<Capability> + Send + Sync + 'static,
+    {
+        self.host_authority = Some(Arc::new(decide));
+        self
+    }
+
+    /// The spaces carrying a `cap` file that this reactor will NOT read — always empty
+    /// unless [`with_host_authority`](SpaceReactor::with_host_authority) is installed, in
+    /// which case it names every space whose on-disk `cap` file is being ignored. A host
+    /// that supplies authority itself should call this at startup and refuse (or say so
+    /// loudly) rather than leave an operator believing a file that does nothing.
+    pub fn ignored_cap_files(&self) -> Vec<String> {
+        if self.host_authority.is_none() {
+            return Vec::new();
+        }
+        let mut names: Vec<String> = self
+            .space_names()
+            .into_iter()
+            .filter(|name| self.root.join(name).join("cap").is_file())
+            .collect();
+        names.sort();
+        names
     }
 
     /// A space is REACTIVE iff `<root>/<name>/handler` exists; its content (trimmed) is the
@@ -536,12 +595,40 @@ impl SpaceReactor {
         (!uri.is_empty()).then(|| uri.to_string())
     }
 
-    /// The capability a space's handler runs under: the scopes listed in `<root>/<name>/cap`
-    /// (one per line; blank lines and `#` comments ignored), else the reactor's default. This
-    /// is how a space grants its handler *exactly* the authority it needs — the bookings space
-    /// grants `{urn:cap:lisp, urn:cap:personal:calendar:read:freebusy, urn:cap:llm, urn:cap:space:out}`
-    /// — never root, never the dropper's. Same inspectable file convention as `handler`.
+    /// The capability a space's handler runs under.
+    ///
+    /// With a host seam installed ([`with_host_authority`](SpaceReactor::with_host_authority))
+    /// this is whatever the host says, and no file is read. Otherwise it is the reactor's own
+    /// capability **attenuated** by the scopes listed in `<root>/<name>/cap` (one per line;
+    /// blank lines and `#` comments ignored), or the reactor's capability unchanged when there
+    /// is no file, or the file lists no scopes.
+    ///
+    /// ★ **ATTENUATE, never mint.** `cap` sits in `<root>/<name>/` — the SAME directory as
+    /// `inbox`, the directory a dropper writes into. Until 2026-09-19 this called
+    /// `Capability::scoped(scopes)`, which REPLACES rather than intersects: any scope the file
+    /// named was granted, whether or not the reactor ever held it, so anyone who could drop a
+    /// tuple could also rewrite the authority it ran under. Filesystem permissions were the
+    /// entire boundary. `attenuate` makes the non-escalation structural instead — the file can
+    /// subtract from the reactor's ceiling and can never add to it (ledger #445).
+    ///
+    /// ⚠ The consequence for operators: a `cap` file only ever does something if the reactor
+    /// itself was wired with at least those scopes. A scope the reactor does not hold is
+    /// silently dropped here — and the handler then fails with the kernel's own permission
+    /// error, which names the scope, in the tuple's `.err` note. `ikigai-embedded` wires this
+    /// reactor with the three tuplespace verbs only, so under that host a `cap` file can only
+    /// narrow to a subset of `{out, read, take}`. A handler wanting more (the bookings space's
+    /// `{lisp, personal:calendar:read:freebusy, llm, space:out}`) needs the HOST to grant it —
+    /// by widening the reactor's own ceiling or through the host seam — which is the point: a
+    /// grant of authority is now something the host did, not something a file in the drop tree
+    /// claimed.
+    ///
+    /// ⚠ Intersection here is EXACT string matching ([`Capability::attenuate`]); the trailing-`*`
+    /// family form is a property of DECLARED scopes, not of held grants, so a held scope is
+    /// always concrete and exact intersection is the right primitive.
     fn capability_for(&self, name: &str) -> Capability {
+        if let Some(decide) = &self.host_authority {
+            return decide(name).unwrap_or_else(|| self.capability.clone());
+        }
         match std::fs::read_to_string(self.root.join(name).join("cap")) {
             Ok(raw) => {
                 let scopes: Vec<String> = raw
@@ -553,7 +640,10 @@ impl SpaceReactor {
                 if scopes.is_empty() {
                     self.capability.clone()
                 } else {
-                    Capability::scoped(scopes)
+                    // NOT `Capability::scoped(scopes)` — see the doc comment above. This is
+                    // the whole fix: the reactor's capability is the ceiling, and the file
+                    // chooses a subset of it.
+                    self.capability.attenuate(scopes)
                 }
             }
             Err(_) => self.capability.clone(),
@@ -1363,14 +1453,20 @@ mod tests {
         assert_eq!(inbox_tuple(root, Path::new("/elsewhere/x.tuple")), None);
     }
 
+    /// A space's `cap` file NARROWS the reactor's authority; it cannot mint.
+    ///
+    /// ★ This test is the inverse of the one it replaces
+    /// (`a_space_cap_file_overrides_the_reactor_default`), which pinned the defect: `cap`
+    /// called `Capability::scoped`, REPLACING the reactor's capability, so a file in the same
+    /// directory as the inbox could grant a scope the reactor never held (ledger #445). Same
+    /// fixture, opposite assertion — the file selects a subset of what the reactor already
+    /// holds, and the comment lines and blank lines it may carry are still ignored.
     #[test]
-    fn a_space_cap_file_overrides_the_reactor_default() {
-        // A space's `cap` file grants its handler exactly the authority it needs — the
-        // booking payoff's per-space cap. When present, it wins over the reactor default.
+    fn a_space_cap_file_can_only_narrow_the_reactor_capability() {
         let root = reactive_root("react-percap", "jobs", "urn:test:handler");
         std::fs::write(
             root.join("jobs").join("cap"),
-            "urn:cap:from-file\n# a comment, and a blank line below\n\n",
+            "urn:cap:demo:read\n# a comment, and a blank line below\n\n",
         )
         .unwrap();
         let k = Kernel::new(Arc::new(space(root.clone())));
@@ -1378,23 +1474,165 @@ mod tests {
         let id = out(&k, &cap, "urn:space:jobs", b"work");
 
         let mock = Arc::new(MockResolver::new(true));
-        // The reactor default is urn:cap:demo — the cap file must win over it.
+        // The reactor holds two scopes; the cap file picks one of them.
         let reactor = SpaceReactor::new(
             root,
             mock.clone(),
-            Capability::scoped(vec!["urn:cap:demo".to_string()]),
+            Capability::scoped(vec![
+                "urn:cap:demo:read".to_string(),
+                "urn:cap:demo:write".to_string(),
+            ]),
         );
         assert_eq!(reactor.process("jobs", &id), Outcome::Handled);
         let calls = mock.calls();
         assert_eq!(calls.len(), 1);
         assert!(
-            calls[0].1.allows("urn:cap:from-file"),
-            "the cap file's scope is granted"
+            calls[0].1.allows("urn:cap:demo:read"),
+            "the scope the file named, which the reactor holds, is kept"
         );
         assert!(
-            !calls[0].1.allows("urn:cap:demo"),
-            "the reactor default is NOT used when a cap file is present"
+            !calls[0].1.allows("urn:cap:demo:write"),
+            "the scope the file did not name is dropped — the file still selects"
         );
+    }
+
+    /// The security property itself: a scope the reactor does not hold is DROPPED, not
+    /// granted. `cap` lives beside `inbox`, so whoever can drop a tuple can write this file;
+    /// the worst they can do is take authority away.
+    #[test]
+    fn a_cap_file_scope_the_reactor_does_not_hold_is_dropped() {
+        let root = reactive_root("react-capmint", "jobs", "urn:test:handler");
+        std::fs::write(
+            root.join("jobs").join("cap"),
+            // Everything an attacker would ask for: the broad store token gonk refuses on
+            // every certificate, plus a scope the reactor was never given.
+            "urn:cap:store:write\nurn:cap:exec\nurn:cap:demo:read\n",
+        )
+        .unwrap();
+        let k = Kernel::new(Arc::new(space(root.clone())));
+        let cap = Capability::scoped(vec![CAP_OUT.to_string()]);
+        let id = out(&k, &cap, "urn:space:jobs", b"work");
+
+        let mock = Arc::new(MockResolver::new(true));
+        let reactor = SpaceReactor::new(
+            root,
+            mock.clone(),
+            Capability::scoped(vec!["urn:cap:demo:read".to_string()]),
+        );
+        assert_eq!(reactor.process("jobs", &id), Outcome::Handled);
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 1);
+        let ran_under = &calls[0].1;
+        assert!(
+            !ran_under.allows("urn:cap:store:write"),
+            "a file in the drop tree cannot mint the broad store token"
+        );
+        assert!(
+            !ran_under.allows("urn:cap:exec"),
+            "nor any other scope the reactor never held"
+        );
+        assert!(!ran_under.is_root(), "and never root");
+        assert_eq!(
+            ran_under.scopes().map(|s| s.len()),
+            Some(1),
+            "exactly the intersection survives: {ran_under:?}"
+        );
+        assert!(ran_under.allows("urn:cap:demo:read"));
+    }
+
+    /// A reactor wired with root is the one case where a `cap` file still gets exactly what
+    /// it asks for — `Capability::root().attenuate(s) == scoped(s)` — which is how the
+    /// documented per-space grant keeps working for a host that deliberately gave the
+    /// reactor a root ceiling. Attenuation is the same operation either way.
+    #[test]
+    fn a_root_reactor_attenuates_to_exactly_the_cap_file() {
+        let root = reactive_root("react-caproot", "jobs", "urn:test:handler");
+        std::fs::write(
+            root.join("jobs").join("cap"),
+            "urn:cap:lisp\nurn:cap:space:out\n",
+        )
+        .unwrap();
+        let k = Kernel::new(Arc::new(space(root.clone())));
+        let cap = Capability::scoped(vec![CAP_OUT.to_string()]);
+        let id = out(&k, &cap, "urn:space:jobs", b"work");
+
+        let mock = Arc::new(MockResolver::new(true));
+        let reactor = SpaceReactor::new(root, mock.clone(), Capability::root());
+        assert_eq!(reactor.process("jobs", &id), Outcome::Handled);
+        let ran_under = mock.calls()[0].1.clone();
+        assert!(!ran_under.is_root(), "the handler is narrowed, not root");
+        assert!(ran_under.allows("urn:cap:lisp"));
+        assert!(ran_under.allows("urn:cap:space:out"));
+        assert!(!ran_under.allows("urn:cap:exec"));
+    }
+
+    /// The host seam: authority comes from the host, and the `cap` file is not read at all.
+    /// This is what `ikigai-gonk` wanted and could not have — it refuses `cap` files outright
+    /// (`refuse_cap_file`) rather than trust a file in the drop tree.
+    #[test]
+    fn a_host_seam_decides_authority_and_the_cap_file_is_never_read() {
+        let root = reactive_root("react-capseam", "jobs", "urn:test:handler");
+        std::fs::write(root.join("jobs").join("cap"), "urn:cap:from-file\n").unwrap();
+        let k = Kernel::new(Arc::new(space(root.clone())));
+        let cap = Capability::scoped(vec![CAP_OUT.to_string()]);
+        let id = out(&k, &cap, "urn:space:jobs", b"work");
+
+        let mock = Arc::new(MockResolver::new(true));
+        let reactor = SpaceReactor::new(
+            root.clone(),
+            mock.clone(),
+            Capability::scoped(vec!["urn:cap:demo".to_string()]),
+        )
+        .with_host_authority(|space| {
+            (space == "jobs").then(|| Capability::scoped(vec!["urn:cap:from-host".to_string()]))
+        });
+
+        // The file is inert under this policy — and the host can find out, rather than
+        // leaving an operator believing a file that does nothing.
+        assert_eq!(reactor.ignored_cap_files(), vec!["jobs".to_string()]);
+
+        assert_eq!(reactor.process("jobs", &id), Outcome::Handled);
+        let ran_under = mock.calls()[0].1.clone();
+        assert!(ran_under.allows("urn:cap:from-host"), "the host decided");
+        assert!(
+            !ran_under.allows("urn:cap:from-file"),
+            "the cap file was never read"
+        );
+        assert!(!ran_under.allows("urn:cap:demo"));
+    }
+
+    /// A host seam that has no opinion about a space falls back to the reactor's capability —
+    /// still not the file.
+    #[test]
+    fn a_host_seam_with_no_opinion_falls_back_to_the_reactor_capability() {
+        let root = reactive_root("react-capseam-none", "jobs", "urn:test:handler");
+        std::fs::write(root.join("jobs").join("cap"), "urn:cap:from-file\n").unwrap();
+        let k = Kernel::new(Arc::new(space(root.clone())));
+        let cap = Capability::scoped(vec![CAP_OUT.to_string()]);
+        let id = out(&k, &cap, "urn:space:jobs", b"work");
+
+        let mock = Arc::new(MockResolver::new(true));
+        let reactor = SpaceReactor::new(
+            root,
+            mock.clone(),
+            Capability::scoped(vec!["urn:cap:demo".to_string()]),
+        )
+        .with_host_authority(|_| None);
+        assert_eq!(reactor.process("jobs", &id), Outcome::Handled);
+        let ran_under = mock.calls()[0].1.clone();
+        assert!(ran_under.allows("urn:cap:demo"));
+        assert!(!ran_under.allows("urn:cap:from-file"));
+    }
+
+    /// Without a host seam there is nothing to ignore, so the report is empty — a host that
+    /// reads a `cap` file is not being told its own files are inert.
+    #[test]
+    fn ignored_cap_files_is_empty_without_a_host_seam() {
+        let root = reactive_root("react-capseam-off", "jobs", "urn:test:handler");
+        std::fs::write(root.join("jobs").join("cap"), "urn:cap:from-file\n").unwrap();
+        let mock = Arc::new(MockResolver::new(true));
+        let reactor = SpaceReactor::new(root, mock, Capability::root());
+        assert!(reactor.ignored_cap_files().is_empty());
     }
 
     #[test]

@@ -4354,6 +4354,13 @@ fn build_watched(mounts: Vec<MountSpec>, reactive: bool) -> Arc<Kernel> {
     // read/take from spaces) but not touch fs/net/exec — NEVER root, NEVER the dropper's cap.
     // A space with no `handler` file is left alone, so this is safe over the whole tree.
     //
+    // These three scopes are the CEILING, not a default: a space's `cap` file ATTENUATES this
+    // capability and can never widen past it (ledger #445 — until 2026-09-19 that file minted
+    // authority instead, so anything able to drop a tuple could also choose what it ran under).
+    // Granting a handler more than the tuplespace verbs is therefore a decision made HERE, in
+    // the host, or through `SpaceReactor::with_host_authority` — never by a file sitting in the
+    // same directory as the inbox.
+    //
     // ONLY when this process is the designated worker. Before that was true, EVERY entry
     // point that built a local kernel — a one-shot `ikigai -c`, an open REPL, an MCP
     // server — silently enlisted as a worker on the writer's queue. On 2026-07-31 an idle
