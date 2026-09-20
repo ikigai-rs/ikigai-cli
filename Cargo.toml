@@ -246,7 +246,20 @@ ikigai-repo = "0.1.6" # A floor a test in this repo actually holds, rather than 
 # Repository browsing (urn:repo:{root}:tree/file/state/hash/explain +
 # urn:iki:annotation:*) over configured roots — opt-in via `browse.root` config lines
 # (embedded host).
-ikigai-browse = "0.4.0" # A READ-CONFINEMENT floor, and it is about THIS host's COMPOSITION
+ikigai-browse = "0.5.0" # 0.5.0 (ledger #444) is a BEHAVIOURAL break this host does not use but
+# must not be frozen below: `urn:repo:{repo}:review:{path}` stops minting annotations and
+# produces PENDING findings instead, promoted only by a human, and the review actions stop
+# declaring `urn:cap:annotate` because they no longer write annotations. This host binds browse
+# through `space_with_explain`, compiles clean against it with no code change, and has no test
+# that asserts a review mints anything — so the break costs nothing here. ⚠ The pin moves anyway,
+# because `^0.4.0` means `<0.5.0`: left alone it would have silently ceilinged this host out of
+# every browse release from here on, which is how `ikigai-dev-server` served the 0.10 line of
+# `urn:llm:*` for two minor releases (rule 5's second half). A floor argued in detail is exactly
+# the shape that hides a ceiling nobody stated — see the paragraph below, which is that shape.
+# ⚠ `Cargo.lock` is tracked here, so the caret alone would not have delivered 0.5.0 either
+# (ledger #461); the lock moves in this commit.
+#
+# 0.4.0 remains A READ-CONFINEMENT floor, and it is about THIS host's COMPOSITION
 # rather than about an API we call. Through 0.3.2 every browse read passed `None` for the
 # graph, which in `quads_for_pattern` means EVERY graph in the store — while this host loads
 # the bundled vocabulary into the NAMED graph `urn:ikigai:vocab` in that same shared store
