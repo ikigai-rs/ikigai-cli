@@ -196,6 +196,12 @@ fn dial(path: &Path, timeout: Option<Duration>) -> io::Result<UnixStream> {
 /// until the daemon itself was restarted). The redial runs the full
 /// the private `handshake`, hello included. What may be *replayed* on the fresh
 /// connection follows the Retry/Failover discipline — see the private `replay_may_follow`.
+///
+/// A connection that MISSED A DEADLINE is dropped too, and for a different reason: the
+/// reply the call gave up on is still coming, and replies are matched to calls
+/// positionally, so keeping the stream would answer the next call with the abandoned
+/// one's payload (ledger #479/#487). That drop carries no replay — see the private
+/// `missed_a_deadline`.
 pub struct IpcResolver {
     /// The server's socket path, kept so a broken connection can be redialed.
     path: PathBuf,
@@ -207,10 +213,11 @@ pub struct IpcResolver {
     /// The hello mode every (re)dial declares — a redialed alias mount must
     /// re-present itself as one.
     mode: HelloMode,
-    /// The live connection, or `None` after a dead-connection failure (the next
-    /// call redials). The mutex also serializes whole round-trips: the protocol
-    /// is strict request/reply on one stream, so two concurrent calls
-    /// interleaving frames would desync it.
+    /// The live connection, or `None` after a failure that spent it — the peer gone
+    /// ([`is_dead_connection`]) or a deadline missed mid-exchange
+    /// ([`missed_a_deadline`]) — in which case the next call redials. The mutex also
+    /// serializes whole round-trips: the protocol is strict request/reply on one stream,
+    /// so two concurrent calls interleaving frames would desync it.
     stream: Mutex<Option<UnixStream>>,
     /// The tracer the `trace` command installs. When set, a resolution is sent as
     /// [`Call::IssueTraced`] and the server's returned spans are forwarded here —
@@ -307,9 +314,14 @@ fn exchange(mut stream: &UnixStream, call: &Call) -> Result<Reply, ExchangeFaile
 ///   peer closed cleanly between our write and its reply).
 /// - `NotConnected` / `ConnectionAborted` — platform spellings of the same death.
 ///
-/// Deliberately NOT `TimedOut`/`WouldBlock`: silence is a busy server, not a
-/// dead one (see [`DEFAULT_TIMEOUT`]) — redialing would abandon a resolution
-/// that is still running, and replaying would double it.
+/// Deliberately NOT `TimedOut`/`WouldBlock`: silence is a busy server, not a dead one
+/// (see [`DEFAULT_TIMEOUT`]), so a deadline miss must not trigger the redial-and-REPLAY
+/// path below — replaying would spend a second deadline on a peer that just missed one.
+///
+/// ⚠ That is the whole of what this predicate decides, and it used to decide more. A
+/// missed deadline still leaves the connection unusable, for a different reason and with
+/// a different remedy — see [`missed_a_deadline`], which drops the stream without
+/// replaying anything.
 fn is_dead_connection(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -318,6 +330,37 @@ fn is_dead_connection(error: &io::Error) -> bool {
             | io::ErrorKind::UnexpectedEof
             | io::ErrorKind::NotConnected
             | io::ErrorKind::ConnectionAborted
+    )
+}
+
+/// Whether `error` is a MISSED DEADLINE — a read or write bound elapsed with the
+/// exchange incomplete.
+///
+/// ★ Such a connection is SPENT, and the reason is the protocol, not the peer. Replies
+/// are matched to calls POSITIONALLY — strict request/reply on one stream, no correlation
+/// id on the wire — so the stream's meaning depends on every reply being read in order.
+/// A read that misses its deadline abandons a reply the server is still going to write; a
+/// write that misses one leaves a partial frame the server's `read_exact` will never
+/// complete. Either way the next call on that stream reads the wrong thing: a well-formed
+/// representation of a resource nobody asked for, with no error, for the life of the
+/// connection (ledger #479, diagnosed in #487).
+///
+/// ⚠ That is a capability failure, not only a correctness one. The shifted reply was
+/// computed for a DIFFERENT request, so a host multiplexing identities over one standing
+/// [`IpcResolver`] hands one principal's answer to another with no grant consulted — the
+/// check already passed, for someone else. A Retry overlay makes it worse: the retry
+/// consumes the abandoned reply, reports a clean success, and leaves the shift in place.
+///
+/// ★ `ikigai-quic` is immune, and the asymmetry states exactly what this transport lacks:
+/// its `Wire::attempt` opens a fresh bidirectional stream per call, so an abandoned reply
+/// dies with its stream instead of queueing behind the next one.
+///
+/// The remedy is to drop the stream (the next call redials) and NOT to replay — see
+/// [`IpcResolver::round_trip`].
+fn missed_a_deadline(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
     )
 }
 
@@ -387,6 +430,26 @@ impl IpcResolver {
             }
         };
         if !is_dead_connection(&failed.error) {
+            // ★ A missed deadline is not death, but it SPENDS the connection: the reply
+            // this call gave up on is still coming, and positional matching would hand it
+            // to the next call (see `missed_a_deadline` for why that is a capability
+            // failure and not merely a wrong answer). Drop the stream so the next call
+            // redials onto a clean one.
+            //
+            // ⚠ The objection this code used to carry — "redialing would abandon a
+            // resolution that is still running" — is already void at this point. The
+            // resolution IS abandoned: we are about to return the deadline error and the
+            // caller moves on. All that is left to decide is whether its reply also
+            // corrupts the next call, and the answer is no.
+            //
+            // Deliberately NO replay here, which is why this is not the dead-connection
+            // path below. Replaying would spend a second deadline against a peer that
+            // just missed one — doubling the wait a bound exists to cap, and doubling
+            // what a silent mount costs a manifold walk. The caller (or a Retry overlay)
+            // still owns that decision, and now retries onto a fresh connection.
+            if missed_a_deadline(&failed.error) {
+                *guard = None;
+            }
             return Err(failed.error);
         }
         // The established connection is dead. Drop it FIRST, unconditionally,
@@ -408,8 +471,9 @@ impl IpcResolver {
                 Ok(reply)
             }
             Err(second) => {
-                // Keep the fresh connection unless it too is dead.
-                if !is_dead_connection(&second.error) {
+                // Keep the fresh connection unless it too is dead — or spent by a missed
+                // deadline, which leaves it just as unusable for the next call.
+                if !is_dead_connection(&second.error) && !missed_a_deadline(&second.error) {
                     *guard = Some(fresh);
                 }
                 Err(second.error)
@@ -1837,34 +1901,50 @@ mod tests {
         /// outcomes: it is under the connection's I/O deadline and over the describe one,
         /// so the SAME server on the SAME connection serves a resolution and misses a
         /// self-description. Nothing else in the test distinguishes the two calls.
-        fn slow_peer(path: &Path, delay: Duration) -> thread::JoinHandle<()> {
+        ///
+        /// Serves exactly `connections` clients and then stops accepting, so `join()` is a
+        /// valid end-of-test barrier — a test that dials fewer would hang in `accept`. Two
+        /// is the interesting number: a call that misses its deadline now SPENDS its
+        /// connection, so the call after it redials.
+        fn slow_peer(path: &Path, delay: Duration, connections: usize) -> thread::JoinHandle<()> {
             let _ = std::fs::remove_file(path);
             let listener = UnixListener::bind(path).unwrap();
             thread::spawn(move || {
-                let Ok((stream, _)) = listener.accept() else {
-                    return;
-                };
-                let mut s = &stream;
-                let _ = read_frame(&mut s);
-                let _ = write_hello(
-                    &mut s,
-                    &Hello {
-                        version: PROTOCOL_VERSION,
-                        mode: HelloMode::Verbatim,
-                    },
-                );
-                while let Ok(call) = read_message::<_, Call>(&mut s) {
-                    std::thread::sleep(delay);
-                    let reply = match call {
-                        Call::Entries => Reply::Entries(Some(Vec::new())),
-                        _ => Reply::Resolved(
-                            Representation::new(ikigai_core::ReprType::new("text/plain"), "slow"),
-                            ikigai_resolve::CacheStatus::Uncacheable,
-                        ),
+                let mut served = Vec::new();
+                for _ in 0..connections {
+                    let Ok((stream, _)) = listener.accept() else {
+                        break;
                     };
-                    if write_message(&mut s, &reply).is_err() {
-                        return;
-                    }
+                    served.push(thread::spawn(move || {
+                        let mut s = &stream;
+                        let _ = read_frame(&mut s); // the client's hello
+                        let _ = write_hello(
+                            &mut s,
+                            &Hello {
+                                version: PROTOCOL_VERSION,
+                                mode: HelloMode::Verbatim,
+                            },
+                        );
+                        while let Ok(call) = read_message::<_, Call>(&mut s) {
+                            std::thread::sleep(delay);
+                            let reply = match call {
+                                Call::Entries => Reply::Entries(Some(Vec::new())),
+                                _ => Reply::Resolved(
+                                    Representation::new(
+                                        ikigai_core::ReprType::new("text/plain"),
+                                        "slow",
+                                    ),
+                                    ikigai_resolve::CacheStatus::Uncacheable,
+                                ),
+                            };
+                            if write_message(&mut s, &reply).is_err() {
+                                return;
+                            }
+                        }
+                    }));
+                }
+                for handle in served {
+                    let _ = handle.join();
                 }
             })
         }
@@ -1872,7 +1952,7 @@ mod tests {
         #[test]
         fn a_resolution_keeps_the_patient_deadline_a_describe_does_not() {
             let path = socket_path("slow-peer");
-            let server = slow_peer(&path, Duration::from_millis(300));
+            let server = slow_peer(&path, Duration::from_millis(300), 2);
             let client = connect_with_timeout(&path, Some(Duration::from_secs(30)))
                 .unwrap()
                 .with_describe_timeout(Some(Duration::from_millis(100)));
@@ -1891,6 +1971,22 @@ mod tests {
                 .expect_err("a self-description that misses its deadline is an ERROR");
             assert!(matches!(error, Error::Timeout(_)), "{error:?}");
             assert!(error.is_transient(), "a deadline is transient: {error:?}");
+
+            // ★ ONE MORE CALL — the line this test stopped short of, and the whole of
+            // ledger #479. The enumeration above gave up on a reply the peer is still
+            // going to write; replies match calls POSITIONALLY, so a kept connection
+            // would answer this resolution with that abandoned `Entries`. It must not:
+            // the missed deadline spent the connection, and this call redials.
+            let (after, _) = client
+                .issue(Request::new(
+                    Verb::Source,
+                    Iri::parse("urn:test:slow").unwrap(),
+                ))
+                .expect("the call after a deadline miss gets its OWN reply, not the last one's");
+            assert_eq!(
+                after.bytes, b"slow",
+                "a resolution answered with the abandoned enumeration's reply"
+            );
 
             drop(client);
             server.join().unwrap();
@@ -1936,6 +2032,130 @@ mod tests {
             drop(mounted);
             let _ = std::fs::remove_file(&path);
             drop(server);
+        }
+    }
+    /// ★ Ledger #479 as a test: a call that misses its deadline must not hand its reply to
+    /// the NEXT call. The peer here labels every reply with the IRI it was asked for, so a
+    /// shifted reply is visible as a shifted reply and not merely as an error — which is
+    /// the point, because in the field this failure produced a well-formed, internally
+    /// consistent, completely wrong answer with no error anywhere.
+    mod a_missed_deadline_does_not_poison_the_connection {
+        use super::*;
+
+        /// A peer that answers every resolution with the IRI it was ASKED for, so each
+        /// reply can be traced to its call — and that sleeps `delay` on the FIRST call it
+        /// ever receives and answers everything after it promptly. One slow call is all
+        /// the defect needs; making the rest prompt keeps the test measuring the desync
+        /// rather than the delay.
+        ///
+        /// The call counter is shared ACROSS connections deliberately: the redial must not
+        /// buy a second slow call, or the test could pass by timing out twice.
+        fn identifying_peer(
+            path: &Path,
+            connections: usize,
+            delay: Duration,
+        ) -> thread::JoinHandle<()> {
+            let _ = std::fs::remove_file(path);
+            let listener = UnixListener::bind(path).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            thread::spawn(move || {
+                let mut served = Vec::new();
+                for _ in 0..connections {
+                    let Ok((stream, _)) = listener.accept() else {
+                        break;
+                    };
+                    let calls = Arc::clone(&calls);
+                    served.push(thread::spawn(move || {
+                        let mut s = &stream;
+                        let _ = read_frame(&mut s); // the client's hello
+                        let _ = write_hello(
+                            &mut s,
+                            &Hello {
+                                version: PROTOCOL_VERSION,
+                                mode: HelloMode::Verbatim,
+                            },
+                        );
+                        while let Ok(call) = read_message::<_, Call>(&mut s) {
+                            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                                std::thread::sleep(delay);
+                            }
+                            let asked = match &call {
+                                Call::Issue(request)
+                                | Call::IssueAs(request, _)
+                                | Call::IssueTraced(request, _, _) => {
+                                    request.target.as_str().to_string()
+                                }
+                                other => format!("{other:?}"),
+                            };
+                            let reply = Reply::Resolved(
+                                Representation::new(
+                                    ikigai_core::ReprType::new("text/plain"),
+                                    asked,
+                                ),
+                                ikigai_resolve::CacheStatus::Uncacheable,
+                            );
+                            if write_message(&mut s, &reply).is_err() {
+                                return;
+                            }
+                        }
+                    }));
+                }
+                for handle in served {
+                    let _ = handle.join();
+                }
+            })
+        }
+
+        fn source(iri: &str) -> Request {
+            Request::new(Verb::Source, Iri::parse(iri).unwrap())
+        }
+
+        #[test]
+        fn a_timed_out_call_cannot_hand_its_reply_to_the_next_one() {
+            let path = socket_path("desync");
+            // Two connections: the first is spent by the deadline miss, the second is the
+            // redial. A third would mean we are redialing more than the defect requires.
+            //
+            // ⚠ The two numbers are chosen against EACH OTHER, and both directions matter.
+            // The delay must exceed the bound (or the first call never misses) AND fall
+            // short of twice it (or the abandoned reply arrives after the SECOND call's
+            // deadline too, and the defect hides behind a second timeout instead of
+            // showing itself as a wrong answer). 200/300 leaves 100ms of slack each way.
+            let server = identifying_peer(&path, 2, Duration::from_millis(300));
+            let client = connect_with_timeout(&path, Some(Duration::from_millis(200))).unwrap();
+
+            let missed = client
+                .issue(source("urn:test:a"))
+                .expect_err("300ms of silence against a 200ms bound is a miss");
+            assert!(matches!(missed, Error::Timeout(_)), "{missed:?}");
+
+            // The peer writes `a`'s reply 100ms into THIS call's own deadline. With
+            // positional matching and a kept connection, this call reads it — and reads
+            // it successfully, which is the whole horror of ledger #479: not an error, a
+            // well-formed representation of a resource nobody asked for.
+            let (b, _) = client
+                .issue(source("urn:test:b"))
+                .expect("the call after a deadline miss resolves");
+            assert_eq!(
+                String::from_utf8_lossy(&b.bytes),
+                "urn:test:b",
+                "b was answered with another request's reply"
+            );
+
+            // And the shift, once taken, never went away — so a second clean call is the
+            // difference between a one-off and a poisoned connection.
+            let (c, _) = client
+                .issue(source("urn:test:c"))
+                .expect("and the one after that");
+            assert_eq!(
+                String::from_utf8_lossy(&c.bytes),
+                "urn:test:c",
+                "the connection stayed shifted by one reply"
+            );
+
+            drop(client);
+            server.join().unwrap();
+            let _ = std::fs::remove_file(&path);
         }
     }
 }
