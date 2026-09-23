@@ -26,9 +26,16 @@ members = ["crates/*"]
 # reaches it is routine here — the 30s self-description bound, which plasma's
 # own config.toml documents gonk degrading at.
 #
-# ⚠ `ikigai-engine` and `ikigai-web` were never published at 0.1.24 (crates.io
-# has 0.1.23 for both), so they skip a number here. Harmless, and noted so it is
-# not read as a mistake.
+# ★ A RELEASE OF THIS WORKSPACE IS THE WHOLE WORKSPACE, published in dependency
+# order (`just -f ~/git-personal/ikigai-devtools/justfile registry-drift ikigai-cli`
+# prints the order and the verdict). Twice it was not — 0.1.24 shipped only the
+# transport chain, 0.1.25 at first only resolve → wire → ipc — and nothing noticed
+# for weeks because nothing looked: twelve crates sat two minors behind the tree
+# they ship from (ledger #494; Brian: "nothing was intended"). The 0.1.25 catch-up
+# wave closed the gap and the daily scan now goes red on any publishable member
+# whose tree version is ahead of crates.io. ⚠ So this comment names NO crate as
+# behind or ahead — that was a snapshot of the registry, true for one afternoon
+# and wrong the next, in the most authoritative place in the tree. Ask the gate.
 version = "0.1.25"
 edition = "2021"
 license = "MIT OR Apache-2.0"
@@ -496,10 +503,13 @@ ikigai-email = { path = "crates/ikigai-email", version = "0.1.25" }
 ikigai-intake = { path = "crates/ikigai-intake", version = "0.1.25" }
 # WebAuthn (ES256) assertion verifier: the second factor gating the edge decision links.
 ikigai-passkey = { path = "crates/ikigai-passkey", version = "0.1.25" }
-# Sibling workspace crates pinned to the current release: a published crate must
-# require its siblings at this version too, so the lockstep release publishes in
-# dependency order (resolve → wire → engine → …) and a crate can never build against
-# an older, incompatible sibling on crates.io.
+# Sibling workspace crates pinned to the current release: a published crate requires
+# its siblings at this version too, so ANY subset of the workspace can publish in
+# dependency order (resolve → wire → engine → …) and a crate never builds against an
+# older, incompatible sibling on crates.io. ⚠ That lockstep is a property of the TREE
+# — `crates/ikigai-cli/tests/lockstep_pins.rs` enforces it here — and says nothing
+# about the REGISTRY, which only matches the tree after a full wave. The two parted for
+# weeks without anything saying so (ledger #494); `registry-drift` is what says so now.
 ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.1.25" } # naming_entry: the most specific catalog row names a target (the engine's trace labels use it)
 ikigai-wire = { path = "crates/ikigai-wire", version = "0.1.25" } # v6 hello + ErrorTyped/WireError
 # API history — 0.1.16 = `Spawner::width()`: the scheduler answers how many tasks make progress AT ONCE
