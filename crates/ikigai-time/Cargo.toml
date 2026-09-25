@@ -24,7 +24,16 @@ description = "The time transport: originates kernel resource-requests on a time
 # literal without them no longer compiles, which is source-breaking however defaulted the
 # readers are. `JobRegistry::with_sleep_clock` is additive beside it. Nothing outside this
 # workspace is known to construct `JobHealth`, but a caret bump must never break a build.
-version = "0.3.0"
+# 0.4.0 — MAJOR again, and this time for SECURITY (ledger #79): every job fired under the
+# registry's own capability, which was `Capability::root()`, whoever scheduled it — so an
+# attenuated MCP agent could schedule a Sink or Delete of any IRI and have it fire at root.
+# A job now records the capability that scheduled it and fires under
+# `ceiling.clamp(&recorded)`. `schedule` / `schedule_persistent` gain a REQUIRED `capability`
+# argument (no overload omits it — an ambient default is the bug), `with_capability` narrows a
+# ceiling instead of setting the fire authority, and the three `urn:time:*` actions declare
+# `urn:cap:time:{schedule,cancel,read}`, which the kernel enforces. Source-breaking for every
+# caller of `schedule`, and behavior-breaking for any attenuated caller of `urn:time:*`.
+version = "0.4.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true

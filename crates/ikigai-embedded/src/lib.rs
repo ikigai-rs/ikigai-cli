@@ -4381,6 +4381,11 @@ fn build_watched(mounts: Vec<MountSpec>, reactive: bool) -> Arc<Kernel> {
         ));
         reactor.watch();
     }
+    // ★ Every host job below NAMES the authority it fires under (ledger #79). A job fires
+    // under exactly the capability passed here, so each one states what it resolves — see
+    // `host_job_authority` for the per-target reasoning, including the two that keep root
+    // and why that is a stated limit rather than a default.
+    //
     // Register the tab-bar clock's 1s timer as a PERSISTENT time-transport job, so it
     // shows on the Control tab's Time-jobs readout (the cache demo, live) and a demo
     // cancel-all leaves it running. Mirrors the browser nav clock.
@@ -4389,6 +4394,7 @@ fn build_watched(mounts: Vec<MountSpec>, reactive: bool) -> Arc<Kernel> {
         Verb::Source,
         ikigai_time::Schedule::Every(std::time::Duration::from_secs(1)),
         true,
+        host_job_authority(HostJob::Clock),
     );
     // The standing sync: when calendar.json sets `derive_every` (e.g. "300s",
     // "5m"), register the consolidated-view derivation as a PERSISTENT job —
@@ -4400,6 +4406,7 @@ fn build_watched(mounts: Vec<MountSpec>, reactive: bool) -> Arc<Kernel> {
             Verb::Source,
             ikigai_time::Schedule::Every(every),
             true,
+            host_job_authority(HostJob::Derive),
         );
     }
     // The standing drain: when `IKIGAI_DRAIN_EVERY` is set (e.g. "30s"), pull bookings from
@@ -4412,6 +4419,7 @@ fn build_watched(mounts: Vec<MountSpec>, reactive: bool) -> Arc<Kernel> {
             Verb::Source,
             ikigai_time::Schedule::Every(every),
             true,
+            host_job_authority(HostJob::Drain),
         );
     }
     // The heartbeat: leave this host's health where a watcher can read it, whether or not
@@ -4425,9 +4433,54 @@ fn build_watched(mounts: Vec<MountSpec>, reactive: bool) -> Arc<Kernel> {
             Verb::Source,
             ikigai_time::Schedule::Every(HEARTBEAT_EVERY),
             true,
+            host_job_authority(HostJob::Heartbeat),
         );
     }
     kernel
+}
+
+/// The persistent jobs this host registers on its own time registry.
+#[derive(Clone, Copy, Debug)]
+enum HostJob {
+    /// `urn:time:now`, the tab-bar clock.
+    Clock,
+    /// `urn:view:derive:tick`, the standing calendar sync.
+    Derive,
+    /// `urn:booking:drain`, the edge drain (`drain.scm`).
+    Drain,
+    /// `urn:host:heartbeat`, the health file a watcher reads.
+    Heartbeat,
+}
+
+/// The capability each host job fires under — what it RESOLVES, not what the host holds.
+///
+/// A job fires under exactly this (clamped to the registry's ceiling, which is root here), so
+/// this is where "the host scheduled it" stops meaning "it runs at root":
+///
+/// - **Clock** — `urn:time:now` declares no `requires` and reads nothing else, so it gets the
+///   EMPTY capability: it can resolve the one public resource it needs and nothing more.
+/// - **Heartbeat** — `urn:host:heartbeat` requires exactly [`CAP_KERNEL_INSPECT`] (declared on
+///   its action and re-checked inside), reads the registry directly and writes its file with
+///   `std::fs`. So exactly that one scope.
+/// - ⚠ **Derive and Drain keep ROOT — a stated limit, not a default.** Their reach is not
+///   the host's to enumerate: the derive composes calendars (`urn:cap:personal:calendar:*`
+///   read AND write), the org agenda, and `urn:view:ingest`, which reads and rewrites the org
+///   files named in `calendar.json` through the path-parameterized `urn:cap:fs:{action}:{path}`
+///   grammar — so its true scope is a function of a config file. The drain runs `drain.scm`
+///   from the workspace, a program whose reach is whatever it says. A scope guessed here
+///   would fail CLOSED in the one place no test in this repo reaches — the daemon on bug, under
+///   EventKit — and stop the calendar sync or the booking pipeline with a `denied` in the
+///   health report as the only signal. Both are registered only by this process, from its own
+///   configuration, and a caller can neither borrow their authority (a caller's job carries
+///   its own), cancel them, nor read their output (`urn:time:*` gates both on covering the
+///   job's authority, and root is covered only by root).
+fn host_job_authority(job: HostJob) -> ikigai_core::Capability {
+    use ikigai_core::Capability;
+    match job {
+        HostJob::Clock => Capability::scoped(Vec::<String>::new()),
+        HostJob::Heartbeat => Capability::scoped([CAP_KERNEL_INSPECT]),
+        HostJob::Derive | HostJob::Drain => Capability::root(),
+    }
 }
 
 /// How often to drain the edge, from `IKIGAI_DRAIN_EVERY` (`30s`, `5m`, `1h`). `None`
@@ -6537,6 +6590,46 @@ mod tests {
         }
     }
 
+    /// ★ Each host job fires under the authority it NAMES (ledger #79), and what it names
+    /// is enough for its target — checked against the target itself, not against a comment.
+    #[test]
+    fn host_jobs_fire_under_a_named_authority_their_target_admits() {
+        // Clock: the EMPTY capability — and it really does resolve the host's clock.
+        let clock = host_job_authority(HostJob::Clock);
+        assert_eq!(clock.scopes().map(|s| s.len()), Some(0), "no scopes at all");
+        let kernel = Kernel::new(Arc::new(base_space("test")));
+        let now = block_on(kernel.issue(
+            Request::new(Verb::Source, Iri::parse("urn:time:now").unwrap()),
+            &clock,
+        ));
+        assert!(
+            now.is_ok(),
+            "urn:time:now under the clock job's authority: {now:?}"
+        );
+
+        // Heartbeat: exactly the scopes the heartbeat declares for Source — no more.
+        let declared: Vec<String> = HostHeartbeat
+            .describe()
+            .action_specs()
+            .into_iter()
+            .filter(|spec| spec.verb == Verb::Source)
+            .flat_map(|spec| spec.requires)
+            .collect();
+        let heartbeat = host_job_authority(HostJob::Heartbeat);
+        let held: Vec<String> = heartbeat
+            .scopes()
+            .expect("not root")
+            .iter()
+            .cloned()
+            .collect();
+        assert_eq!(held, declared);
+
+        // Derive and drain keep root — the stated limit in `host_job_authority`'s doc. If
+        // either is ever scoped, this line is the reminder to verify it on the daemon.
+        assert!(host_job_authority(HostJob::Derive).is_root());
+        assert!(host_job_authority(HostJob::Drain).is_root());
+    }
+
     /// ★ THE NAP IS NOT LATENESS — the defect seen on bug, where every nap turned a 30s
     /// drain STALE. Driven through a real registry with injected wall and sleep clocks: a nap
     /// of TEN cadences leaves the job healthy and the report shows the sleep it discounted;
@@ -6556,6 +6649,7 @@ mod tests {
                 Verb::Source,
                 ikigai_time::Schedule::Every(std::time::Duration::from_secs(30)),
                 true,
+                Capability::root(),
             )
             .unwrap();
         ticks.fire();
