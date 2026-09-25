@@ -1180,6 +1180,145 @@ mod tests {
         assert_eq!(health[0].since_last_success, Some(Duration::ZERO));
     }
 
+    // ── Authority: a job fires under the capability that scheduled it (ledger #79) ──
+    //
+    // These drive the REAL kernel, not a stub resolver: the defect lived in which capability
+    // a tick hands the kernel, and only a kernel enforces a declared `requires`. The engine is
+    // not involved (every argument is named), so a meta-less `Kernel::new` hides nothing here.
+
+    /// A Sink/Delete endpoint at `urn:x` gated on `urn:cap:x:write`, counting every entry —
+    /// the counter proves a denial happened BEFORE dispatch, not merely that an error came back.
+    fn gated_target(entered: Arc<AtomicU64>) -> FnEndpoint {
+        FnEndpoint::new("x", move |_inv: &Invocation<'_>| {
+            entered.fetch_add(1, Ordering::SeqCst);
+            Ok(text("written".to_string()))
+        })
+        .with_description(
+            Description::new("x")
+                .verb(Verb::Sink)
+                .verb(Verb::Delete)
+                .requires("urn:cap:x:write"),
+        )
+    }
+
+    /// A registry and a kernel that binds the `urn:time:*` plane beside `urn:x`, with the
+    /// registry's resolver set to that same kernel — the shape every host builds.
+    fn kernel_with_time(
+        registry: &JobRegistry,
+        entered: Arc<AtomicU64>,
+    ) -> Arc<ikigai_core::Kernel> {
+        let space = space(registry.clone()).bind(Exact::new("urn:x"), gated_target(entered));
+        let kernel = Arc::new(ikigai_core::Kernel::new(Arc::new(space)));
+        registry.set_resolver(Arc::clone(&kernel) as Arc<dyn Resolver>);
+        kernel
+    }
+
+    /// Issue `source <iri> k=v…` through the kernel under `capability`.
+    fn call(
+        kernel: &ikigai_core::Kernel,
+        iri: &str,
+        args: &[(&str, &str)],
+        capability: &Capability,
+    ) -> std::result::Result<String, Error> {
+        let mut request = Request::new(Verb::Source, Iri::parse(iri).expect("valid IRI"));
+        for (k, v) in args {
+            request = request.with_arg(*k, ikigai_core::ArgRef::Inline(v.as_bytes().to_vec()));
+        }
+        Resolver::issue_as(kernel, request, capability)
+            .map(|(rep, _)| String::from_utf8_lossy(&rep.bytes).into_owned())
+    }
+
+    /// A caller that may schedule and read jobs but holds NO authority over `urn:x`.
+    fn attenuated() -> Capability {
+        Capability::scoped(["urn:cap:time:schedule", "urn:cap:time:read"])
+    }
+
+    /// ★ THE ESCALATION, reproduced: a caller that cannot Sink `urn:x` schedules a Sink of
+    /// `urn:x`, and the tick must be DENIED — the endpoint never entered — rather than fired
+    /// at the registry's root.
+    #[test]
+    fn a_scheduled_sink_fires_under_the_scheduler_capability_not_root() {
+        let entered = Arc::new(AtomicU64::new(0));
+        let backend = Arc::new(ManualBackend::default());
+        let reg = JobRegistry::new(backend.clone(), Arc::new(SystemClock));
+        let kernel = kernel_with_time(&reg, Arc::clone(&entered));
+
+        // The caller cannot sink urn:x directly — the premise.
+        let direct = Resolver::issue_as(
+            &*kernel,
+            Request::new(Verb::Sink, Iri::parse("urn:x").unwrap()),
+            &attenuated(),
+        );
+        assert!(matches!(direct, Err(Error::Denied(_))), "{direct:?}");
+
+        call(
+            &kernel,
+            "urn:time:schedule",
+            &[("target", "urn:x"), ("every", "1s"), ("method", "sink")],
+            &attenuated(),
+        )
+        .expect("scheduling is within the caller's authority");
+        backend.fire_all(1);
+
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            0,
+            "the tick must not reach an endpoint its scheduler could not"
+        );
+        let health = reg.health();
+        assert_eq!(health[0].runs, 1);
+        assert_eq!(health[0].failures_in_a_row, 1);
+        assert!(
+            health[0].last_output.contains("denied"),
+            "the job records the Denied: {}",
+            health[0].last_output
+        );
+    }
+
+    /// The same hole through the other mutating verb.
+    #[test]
+    fn a_scheduled_delete_fires_under_the_scheduler_capability_not_root() {
+        let entered = Arc::new(AtomicU64::new(0));
+        let backend = Arc::new(ManualBackend::default());
+        let reg = JobRegistry::new(backend.clone(), Arc::new(SystemClock));
+        let kernel = kernel_with_time(&reg, Arc::clone(&entered));
+
+        call(
+            &kernel,
+            "urn:time:schedule",
+            &[("target", "urn:x"), ("after", "1s"), ("method", "delete")],
+            &attenuated(),
+        )
+        .expect("scheduled");
+        backend.fire_all(1);
+
+        assert_eq!(entered.load(Ordering::SeqCst), 0);
+        assert!(reg.health()[0].last_output.contains("denied"));
+    }
+
+    /// The REPL's normal case is unchanged: a job scheduled at root fires at root.
+    #[test]
+    fn a_job_scheduled_at_root_still_fires() {
+        let entered = Arc::new(AtomicU64::new(0));
+        let backend = Arc::new(ManualBackend::default());
+        let reg = JobRegistry::new(backend.clone(), Arc::new(SystemClock));
+        let kernel = kernel_with_time(&reg, Arc::clone(&entered));
+
+        call(
+            &kernel,
+            "urn:time:schedule",
+            &[("target", "urn:x"), ("every", "1s"), ("method", "sink")],
+            &Capability::root(),
+        )
+        .expect("scheduled");
+        backend.fire_all(2);
+
+        assert_eq!(entered.load(Ordering::SeqCst), 2);
+        let health = reg.health();
+        assert_eq!(health[0].failures_in_a_row, 0);
+        assert_eq!(health[0].last_output, "written");
+    }
+
     /// A backend whose cancel closure re-enters the registry — the shape of real
     /// injected host code (`clearInterval` calling back into the page).
     struct ReentrantBackend {
