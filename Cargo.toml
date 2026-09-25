@@ -521,10 +521,10 @@ ikigai-wire = { path = "crates/ikigai-wire", version = "0.1.25" } # v6 hello + E
 ikigai-scheduler = { path = "crates/ikigai-scheduler", version = "0.1.25" }
 # ⚠⚠ EXEMPT from the lockstep above — deliberately, and this pin must NOT be raised to the
 # workspace version. ikigai-time is the eighteenth member and the only one that does not take
-# `version.workspace = true`: it declares `version = "0.2.0"` in its own manifest and is
+# `version.workspace = true`: it declares its own `version` in its own manifest and is
 # published on its own line, because the Clock change below was a BREAKING API change that
-# earned a major bump the other seventeen had no reason to take. 0.2.0 is therefore its
-# current release; `0.1.17` would name a version of ikigai-time that does not exist on
+# earned a major bump the other seventeen had no reason to take (and 0.3.0 and 0.4.0 took
+# two more). That line's version is therefore its current release; `0.1.17` would name a version of ikigai-time that does not exist on
 # crates.io and never will. That one, unlike a stale floor, is loud: cargo checks a path
 # dependency's declared version against the requirement, so `0.1.17` here stops the whole
 # workspace resolving ("candidate versions found which didn't match: 0.2.0") before anything
@@ -533,6 +533,11 @@ ikigai-scheduler = { path = "crates/ikigai-scheduler", version = "0.1.25" }
 # The exemption is encoded BY NAME in `crates/ikigai-cli/tests/lockstep_pins.rs`, which
 # checks this pin against ikigai-time's own declared version — so the two cannot drift, and
 # if ikigai-time ever rejoins the lockstep the test says to delete the exemption.
+# 0.4.0 = a job fires under the capability that SCHEDULED it, clamped to the registry's
+# ceiling, instead of the registry's root (ledger #79). `schedule`/`schedule_persistent` take a
+# required `capability`, so ikigai-embedded's four host jobs now name theirs
+# (`host_job_authority`), and `urn:time:*` declares `urn:cap:time:{schedule,cancel,read}`. A
+# hard floor, and a security one: every 0.3.x fires every job at root.
 # 0.3.0 = `JobHealth` gains `last_success`, `since_last_success` and `failures_in_a_row`,
 # and `JobRegistry::with_sleep_clock` takes the host's `Arc<dyn SleepClock>` (#334). Public
 # STRUCT FIELDS, so anyone constructing a `JobHealth` literal breaks — a major bump under
@@ -542,7 +547,7 @@ ikigai-scheduler = { path = "crates/ikigai-scheduler", version = "0.1.25" }
 # preference: 0.1.x stamps `last_run` with `std::time::Instant::now()`, which panics on
 # wasm32-unknown-unknown under the registry lock and bricks the registry for the life of
 # the process. (0.1.12 gave the older need: JobHealth::last_run for staleness.)
-ikigai-time = { path = "crates/ikigai-time", version = "0.3.0" }
+ikigai-time = { path = "crates/ikigai-time", version = "0.4.0" }
 # Inbound HTTP transport (method↔verb, path↔iri, cap-per-request). A published
 # transport like ipc/quic/mcp; only the `web`-featured CLI pulls it (and Tokio).
 ikigai-web = { path = "crates/ikigai-web", version = "0.1.25" }

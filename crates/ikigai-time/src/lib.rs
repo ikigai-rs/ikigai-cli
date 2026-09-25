@@ -24,8 +24,34 @@
 //! `every=`/`after=` take a simple duration today (`500ms`, `1s`, `10s`, `1m`, `2h`).
 //! [`Schedule`] is an enum so a cron-expression variant can slot in later (parsed by
 //! a wasm-friendly crate) without changing the registry or the resources.
+//!
+//! ## Authority
+//!
+//! **A job fires under the authority that scheduled it — never more.** Each job records
+//! the [`Capability`] it was scheduled with (the invocation's, through `urn:time:schedule`;
+//! an explicit argument through [`JobRegistry::schedule`]), and every tick resolves under
+//! `ceiling.clamp(&recorded)` — the strongest capability BOTH the registry's ceiling and
+//! the scheduler grant. The ceiling defaults to root, which clamps to exactly what the
+//! scheduler held; [`JobRegistry::with_capability`] narrows it for every job at once.
+//! Deferring a request to later is therefore never a way to borrow authority: a caller
+//! that cannot Sink an IRI cannot schedule a Sink of it that succeeds either.
+//!
+//! The control plane is gated three ways, each declared on its action so the manifold
+//! offers exactly what the kernel admits:
+//! - [`CAP_SCHEDULE`] for `urn:time:schedule` — a job costs the host a timer (a thread,
+//!   natively), so registering one is an authority of its own even though the job itself
+//!   borrows nothing;
+//! - [`CAP_CANCEL`] for `urn:time:cancel` — and beyond the token, a caller cancels only jobs
+//!   whose recorded capability its own COVERS (holds every scope of): stopping work you
+//!   could not have scheduled is not yours to do;
+//! - [`CAP_READ`] for `urn:time:jobs` — every job's existence (id, verb, target, cadence,
+//!   runs) is listed to the holder, but a job's last output only to a caller that covers
+//!   the job's authority, because that output is what the job's authority READ.
 
 use std::collections::BTreeMap;
+// Only the native `ThreadTimer` flips an atomic; on wasm these would be unused imports, which
+// `clippy --target wasm32-unknown-unknown -D warnings` refuses.
+#[cfg(not(target_family = "wasm"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -35,6 +61,27 @@ use ikigai_core::{
     Iri, ReprType, Representation, Request, Time, Verb,
 };
 use ikigai_resolve::Resolver;
+
+/// Register a job on `urn:time:schedule`. The job itself fires under the scheduler's own
+/// capability; this token gates only the act of adding a timer to the host.
+pub const CAP_SCHEDULE: &str = "urn:cap:time:schedule";
+/// Stop jobs on `urn:time:cancel` — only those whose authority the caller covers.
+pub const CAP_CANCEL: &str = "urn:cap:time:cancel";
+/// Read the job list on `urn:time:jobs` — a job's last output only where the caller covers
+/// the job's authority.
+pub const CAP_READ: &str = "urn:cap:time:read";
+
+/// Whether `holder` COVERS `recorded` — grants every scope `recorded` grants, so anything a
+/// job under `recorded` could do, `holder` could have done itself. Root covers everything;
+/// only root covers root.
+///
+/// Stated through [`Capability::clamp`] rather than by walking scope sets: clamping `recorded`
+/// to `holder` leaves it unchanged exactly when `holder` already grants all of it. Matching is
+/// exact, as `Capability::allows` is — a held wildcard is not unfolded here, which errs toward
+/// "not covered".
+fn covers(holder: &Capability, recorded: &Capability) -> bool {
+    holder.clamp(recorded) == *recorded
+}
 
 /// A resource IRI — what `target=` is, on both `urn:time:schedule` and `urn:time:cancel`.
 const XSD_ANY_URI: &str = "http://www.w3.org/2001/XMLSchema#anyURI";
@@ -201,6 +248,9 @@ struct JobRecord {
     /// (e.g. the nav clock) that a demo's cancel-all shouldn't stop. Still cancellable
     /// explicitly by id or target.
     persistent: bool,
+    /// The authority this job was scheduled with — what every tick fires under, clamped to
+    /// the registry's ceiling. Recorded at schedule time and never widened.
+    capability: Capability,
     runs: u64,
     last_output: String,
     /// When this job last COMPLETED a fire, stamped from the kernel's injected
@@ -248,7 +298,10 @@ struct Inner {
     next_id: u64,
     jobs: BTreeMap<u64, JobRecord>,
     resolver: Option<Arc<dyn Resolver>>,
-    capability: Capability,
+    /// The CEILING every job is clamped to — never the authority a job fires under by
+    /// itself. Root by default (clamping to root yields the job's own capability), narrowed
+    /// only by [`JobRegistry::with_capability`].
+    ceiling: Capability,
     backend: Arc<dyn TimerBackend>,
 }
 
@@ -285,7 +338,14 @@ pub struct JobHealth {
 
 /// The registry of timed jobs — shared (cheaply cloneable) between the `urn:time:*`
 /// control endpoints and the timer backend. A job fires a kernel request through the
-/// installed [`Resolver`] under the private `Inner::capability`.
+/// installed [`Resolver`] under the capability it was scheduled with, clamped to the
+/// registry's ceiling (see the crate docs, *Authority*).
+///
+/// Holding a `JobRegistry` is holding the HOST's handle: [`cancel`](Self::cancel),
+/// [`cancel_all`](Self::cancel_all), [`cancel_target`](Self::cancel_target) and
+/// [`health`](Self::health) act on every job, because only host code can reach them. Callers
+/// arriving through the kernel reach the registry only through `urn:time:*`, which gates each
+/// of those by the caller's own capability.
 #[derive(Clone)]
 pub struct JobRegistry {
     inner: Arc<Mutex<Inner>>,
@@ -304,8 +364,9 @@ pub struct JobRegistry {
 }
 
 impl JobRegistry {
-    /// A registry driven by `backend` and stamped by `clock`, firing under full
-    /// authority until [`with_capability`](Self::with_capability) narrows it. The
+    /// A registry driven by `backend` and stamped by `clock`. Its ceiling starts at root, so
+    /// each job fires under exactly the capability it was scheduled with until
+    /// [`with_capability`](Self::with_capability) narrows every job at once. The
     /// [`Resolver`] must be installed with [`set_resolver`](Self::set_resolver) before
     /// any job is scheduled (the host does this once the kernel is built).
     ///
@@ -322,7 +383,7 @@ impl JobRegistry {
                 next_id: 1,
                 jobs: BTreeMap::new(),
                 resolver: None,
-                capability: Capability::root(),
+                ceiling: Capability::root(),
                 backend,
             })),
             clock,
@@ -345,9 +406,20 @@ impl JobRegistry {
         self.sleep.as_ref().and_then(|s| s.asleep()).is_some()
     }
 
-    /// Set the authority timed requests fire under (defaults to root).
+    /// Narrow the CEILING every job fires under: each tick resolves under
+    /// `ceiling.clamp(&job's capability)`, so a host can bound every job — root-scheduled or
+    /// not — to `capability` without knowing who scheduled what.
+    ///
+    /// Only ever narrows. The new ceiling is the old one clamped to `capability`, so calling
+    /// this twice keeps the intersection and passing root changes nothing: there is no call
+    /// that widens a ceiling, the same structural non-escalation `Capability` itself keeps.
+    /// It is not, and never was, the authority a job fires under by itself — that is the
+    /// capability passed to [`schedule`](Self::schedule).
     pub fn with_capability(self, capability: Capability) -> Self {
-        self.inner.lock().expect("time registry lock").capability = capability;
+        {
+            let mut inner = self.inner.lock().expect("time registry lock");
+            inner.ceiling = inner.ceiling.clamp(&capability);
+        }
         self
     }
 
@@ -357,30 +429,43 @@ impl JobRegistry {
         self.inner.lock().expect("time registry lock").resolver = Some(resolver);
     }
 
-    /// Register a job and start its timer. Returns the new job id, or an error if no
-    /// resolver is installed yet.
+    /// Register a job that fires under `capability` (clamped to the registry's ceiling) and
+    /// start its timer. Returns the new job id, or an error if no resolver is installed yet.
+    ///
+    /// `capability` is a **required** argument rather than a defaulted one on purpose, for the
+    /// reason [`new`](Self::new) requires a `Clock`: every default moves the hazard rather
+    /// than removing it. The obvious default — the registry's own authority — is what made
+    /// every job fire at root whoever scheduled it (ledger #79). A required argument makes
+    /// "fires at some ambient authority" a compile error in the host that forgot, and makes
+    /// every host job state the authority it fires under at the call site.
+    ///
+    /// Pass the authority the job NEEDS, not the host's: a job that only reads a clock needs
+    /// no scopes at all (`Capability::scoped(Vec::<String>::new())`).
     pub fn schedule(
         &self,
         target: String,
         verb: Verb,
         schedule: Schedule,
         recurring: bool,
+        capability: Capability,
     ) -> std::result::Result<u64, String> {
-        self.schedule_inner(target, verb, schedule, recurring, false)
+        self.schedule_inner(target, verb, schedule, recurring, false, capability)
     }
 
     /// Like [`schedule`](Self::schedule), but the job is **persistent** —
     /// [`cancel_all`](Self::cancel_all) skips it. For host-registered background timers
     /// (the nav clock) that a demo's "cancel all" button shouldn't stop. Cancel it
     /// explicitly with [`cancel`](Self::cancel) or [`cancel_target`](Self::cancel_target).
+    /// `capability` is required for the reason [`schedule`](Self::schedule) gives.
     pub fn schedule_persistent(
         &self,
         target: String,
         verb: Verb,
         schedule: Schedule,
         recurring: bool,
+        capability: Capability,
     ) -> std::result::Result<u64, String> {
-        self.schedule_inner(target, verb, schedule, recurring, true)
+        self.schedule_inner(target, verb, schedule, recurring, true, capability)
     }
 
     fn schedule_inner(
@@ -390,6 +475,7 @@ impl JobRegistry {
         schedule: Schedule,
         recurring: bool,
         persistent: bool,
+        capability: Capability,
     ) -> std::result::Result<u64, String> {
         // Reserve an id and grab the backend handle under a *short* lock, then release
         // it before calling into the backend. `start()` runs injected code that ticks
@@ -407,17 +493,15 @@ impl JobRegistry {
         };
 
         // The per-fire action: issue the request through the kernel, then record the
-        // outcome. `fire` takes the registry lock itself only after resolving, so a
-        // slow resolve never holds the lock.
+        // outcome. `fire` reads the job's target, verb and authority from its RECORD under a
+        // short lock and resolves with the lock released, so a slow resolve never holds it.
         let reg = self.clone();
-        let target_for_tick = target.clone();
-        let on_tick: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            reg.fire(id, &target_for_tick, verb);
-        });
+        let on_tick: Arc<dyn Fn() + Send + Sync> = Arc::new(move || reg.fire(id));
 
         // Start the timer with the lock released. A tick that somehow fires before we
-        // insert the record below finds no job and is dropped (benign); real backends
-        // wait a full interval first, so this window never matters in practice.
+        // insert the record below finds no job and is dropped (benign — it has no recorded
+        // authority to fire under); real backends wait a full interval first, so this
+        // window never matters in practice.
         let handle = backend.start(schedule.interval(), recurring, on_tick);
 
         self.inner.lock().expect("time registry lock").jobs.insert(
@@ -429,6 +513,7 @@ impl JobRegistry {
                 schedule,
                 recurring,
                 persistent,
+                capability,
                 runs: 0,
                 last_output: String::new(),
                 last_run: None,
@@ -478,6 +563,61 @@ impl JobRegistry {
         self.remove_and_cancel(|job| job.target == target)
     }
 
+    /// The kernel-facing cancel: stop job `id` only if `caller` covers the authority it was
+    /// scheduled with. A job the caller could not have scheduled is left running and
+    /// reported as withheld, not as absent — its existence is already public to any
+    /// `urn:time:jobs` reader, so pretending otherwise would hide nothing and mislead.
+    fn cancel_as(&self, id: u64, caller: &Capability) -> CancelOutcome {
+        let removed = {
+            let mut inner = self.inner.lock().expect("time registry lock");
+            match inner.jobs.get(&id) {
+                None => return CancelOutcome::NotFound,
+                Some(job) if !covers(caller, &job.capability) => return CancelOutcome::Withheld,
+                Some(_) => inner.jobs.remove(&id),
+            }
+        };
+        // Host code (the backend's cancel) runs with the lock released — see `cancel`.
+        if let Some(job) = removed {
+            job.handle.cancel();
+        }
+        CancelOutcome::Cancelled
+    }
+
+    /// The kernel-facing bulk cancel: every job matching `predicate` AND covered by `caller`
+    /// is stopped. Returns `(cancelled, withheld)` — how many matched but were left running
+    /// because `caller` does not cover their authority, so a reply can say so rather than
+    /// let "cancelled 0" read as "there was nothing".
+    fn cancel_matching_as(
+        &self,
+        caller: &Capability,
+        predicate: impl Fn(&JobRecord) -> bool,
+    ) -> (usize, usize) {
+        // Count and remove in ONE critical section, so the two numbers describe the same
+        // registry; the timers are cancelled after it, with the lock released (see `cancel`).
+        let (handles, withheld) = {
+            let mut inner = self.inner.lock().expect("time registry lock");
+            let mut withheld = 0;
+            let mut ids = Vec::new();
+            for (id, job) in inner.jobs.iter().filter(|(_, job)| predicate(job)) {
+                if covers(caller, &job.capability) {
+                    ids.push(*id);
+                } else {
+                    withheld += 1;
+                }
+            }
+            let handles: Vec<TimerHandle> = ids
+                .iter()
+                .filter_map(|id| inner.jobs.remove(id))
+                .map(|job| job.handle)
+                .collect();
+            (handles, withheld)
+        };
+        for handle in &handles {
+            handle.cancel();
+        }
+        (handles.len(), withheld)
+    }
+
     /// Drop every job matching `predicate` from the map under the lock, then cancel
     /// their timers with the lock RELEASED — see [`cancel`](Self::cancel) for why the
     /// second half must not happen inside the critical section. Returns how many.
@@ -504,17 +644,28 @@ impl JobRegistry {
     /// Fire one tick of a job: resolve its request and fold the outcome into the
     /// record. A one-shot's timer won't tick again; we leave the record listed (runs
     /// = 1) so the result is visible.
-    fn fire(&self, id: u64, target: &str, verb: Verb) {
-        // Clone the handle out under a short lock; resolve without holding it.
-        let resolver = {
+    ///
+    /// ★ The request resolves under `ceiling.clamp(&job.capability)` — the job's RECORDED
+    /// authority, bounded by the registry's ceiling — and never under the ceiling alone.
+    /// That one line is the whole of ledger #79: this used to pass the registry's own
+    /// capability, which was root, so every job fired at root whoever scheduled it. A tick
+    /// for a job no longer in the map (cancelled, or not yet inserted) has no recorded
+    /// authority and does not fire at all.
+    fn fire(&self, id: u64) {
+        // Copy what the tick needs out under a short lock; resolve without holding it.
+        let (resolver, target, verb, capability) = {
             let inner = self.inner.lock().expect("time registry lock");
-            match &inner.resolver {
-                Some(r) => (Arc::clone(r), inner.capability.clone()),
-                None => return,
-            }
+            let (Some(resolver), Some(job)) = (&inner.resolver, inner.jobs.get(&id)) else {
+                return;
+            };
+            (
+                Arc::clone(resolver),
+                job.target.clone(),
+                job.verb,
+                inner.ceiling.clamp(&job.capability),
+            )
         };
-        let (resolver, capability) = resolver;
-        let (outcome, succeeded) = match Iri::parse(target) {
+        let (outcome, succeeded) = match Iri::parse(&target) {
             Ok(iri) => match resolver.issue_as(Request::new(verb, iri), &capability) {
                 Ok((rep, _status)) => (one_line(&String::from_utf8_lossy(&rep.bytes)), true),
                 Err(e) => (format!("error: {}", one_line(&e.to_string())), false),
@@ -586,8 +737,11 @@ impl JobRegistry {
             .collect()
     }
 
-    /// Render the job list as the `urn:time:jobs` readout.
-    fn render(&self) -> String {
+    /// Render the job list as the `urn:time:jobs` readout, as `caller` may see it: every job's
+    /// existence, but a job's last output only where `caller` covers the job's authority.
+    /// A withheld output is SAID to be withheld — an absent `last:` line already means "has
+    /// not run yet", and the two must not read the same.
+    fn render(&self, caller: &Capability) -> String {
         let inner = self.inner.lock().expect("time registry lock");
         let mut s = String::from("time jobs\n");
         if inner.jobs.is_empty() {
@@ -607,12 +761,26 @@ impl JobRegistry {
                 job.runs,
                 tag,
             ));
+            // Never run: no line, as before — nothing to show or to withhold.
             if !job.last_output.is_empty() {
-                s.push_str(&format!("       last: {}\n", job.last_output));
+                let last = if covers(caller, &job.capability) {
+                    job.last_output.as_str()
+                } else {
+                    "(withheld: scheduled under authority you do not hold)"
+                };
+                s.push_str(&format!("       last: {last}\n"));
             }
         }
         s
     }
+}
+
+/// What a kernel-facing cancel of one job id did.
+enum CancelOutcome {
+    Cancelled,
+    NotFound,
+    /// The job exists and the caller does not cover its authority; it was left running.
+    Withheld,
 }
 
 /// Collapse a (possibly multi-line) body to a single trimmed line, capped, for the
@@ -669,8 +837,16 @@ pub fn space(registry: JobRegistry) -> EndpointSpace {
                 Iri::parse(target)
                     .map_err(|e| Error::Endpoint(format!("bad target '{target}': {e}")))?;
                 let interval = schedule.interval();
+                // The job fires under THIS invocation's capability — the caller's own, as the
+                // kernel handed it here — clamped to the registry's ceiling at every tick.
                 let id = schedule_reg
-                    .schedule(target.to_string(), verb, schedule, recurring)
+                    .schedule(
+                        target.to_string(),
+                        verb,
+                        schedule,
+                        recurring,
+                        inv.capability.clone(),
+                    )
                     .map_err(Error::Endpoint)?;
                 let when = if recurring { "every" } else { "after" };
                 Ok(text(format!(
@@ -683,10 +859,12 @@ pub fn space(registry: JobRegistry) -> EndpointSpace {
                 Description::new("time-schedule")
                     .title("Schedule a timed request")
                     .summary(
-                        "Register a job that fires a resource-request on a timer. \
-                         every=<dur> recurs; after=<dur> is one-shot; method=<verb> picks the verb.",
+                        "Register a job that fires a resource-request on a timer, under the \
+                         caller's own capability. every=<dur> recurs; after=<dur> is one-shot; \
+                         method=<verb> picks the verb.",
                     )
                     .verb(Verb::Source)
+                    .requires(CAP_SCHEDULE)
                     .input(ArgSpec::new("target")
                             .summary("the resource IRI to invoke")
                             .class(XSD_ANY_URI))
@@ -717,12 +895,28 @@ pub fn space(registry: JobRegistry) -> EndpointSpace {
             Exact::new("urn:time:cancel"),
             FnEndpoint::new("time-cancel", move |inv: &Invocation<'_>| {
                 let plural = |n: usize| if n == 1 { "" } else { "s" };
+                let caller = inv.capability;
+                // Jobs the caller does not cover are left running and COUNTED, so a reply of
+                // "cancelled 0" can never be mistaken for "there was nothing to cancel".
+                let withheld = |n: usize| {
+                    if n == 0 {
+                        String::new()
+                    } else {
+                        format!(
+                            " ({n} left running: scheduled under authority you do not hold)"
+                        )
+                    }
+                };
                 // `target=<iri>` cancels every job firing that resource — precise, and
                 // leaves other timers (e.g. the nav clock on urn:time:now) alone.
                 if let Ok(target) = inv.inline_str("target") {
                     let target = target.trim();
-                    let n = cancel_reg.cancel_target(target);
-                    return Ok(text(format!("cancelled {n} job{} for {target}\n", plural(n))));
+                    let (n, kept) = cancel_reg.cancel_matching_as(caller, |job| job.target == target);
+                    return Ok(text(format!(
+                        "cancelled {n} job{} for {target}{}\n",
+                        plural(n),
+                        withheld(kept)
+                    )));
                 }
                 let id_str = inv.inline_str("id").map_err(|_| {
                     Error::Endpoint(
@@ -734,29 +928,39 @@ pub fn space(registry: JobRegistry) -> EndpointSpace {
                 // can't know the running job's id (ids increment and never reuse); it
                 // leaves persistent jobs (the nav clock) running.
                 if id_str.eq_ignore_ascii_case("all") {
-                    let n = cancel_reg.cancel_all();
-                    return Ok(text(format!("cancelled {n} job{}\n", plural(n))));
+                    let (n, kept) = cancel_reg.cancel_matching_as(caller, |job| !job.persistent);
+                    return Ok(text(format!(
+                        "cancelled {n} job{}{}\n",
+                        plural(n),
+                        withheld(kept)
+                    )));
                 }
                 let id: u64 = id_str.parse().map_err(|_| {
                     Error::Endpoint(format!(
                         "invalid job id '{id_str}' (expected a number, 'all', or target=<iri>)"
                     ))
                 })?;
-                let body = if cancel_reg.cancel(id) {
-                    format!("cancelled job #{id}\n")
-                } else {
-                    format!("no job #{id}\n")
-                };
-                Ok(text(body))
+                match cancel_reg.cancel_as(id, caller) {
+                    CancelOutcome::Cancelled => Ok(text(format!("cancelled job #{id}\n"))),
+                    CancelOutcome::NotFound => Ok(text(format!("no job #{id}\n"))),
+                    // Typed, so a caller can tell "not yours" from "not there" without
+                    // parsing prose — and so a trace records it as the refusal it is.
+                    CancelOutcome::Withheld => Err(Error::Denied(format!(
+                        "job #{id} was scheduled under authority you do not hold; \
+                         cancelling it needs a capability that covers it"
+                    ))),
+                }
             })
             .with_description(
                 Description::new("time-cancel")
                     .title("Cancel a timed job")
                     .summary(
                         "Stop and remove a timed job: id=<n> (one), id=all (every \
-                         non-persistent job), or target=<iri> (every job firing that resource).",
+                         non-persistent job), or target=<iri> (every job firing that resource) \
+                         — only jobs whose authority the caller's capability covers.",
                     )
                     .verb(Verb::Source)
+                    .requires(CAP_CANCEL)
                     .input(ArgSpec::new("id")
                             .summary("the job id to cancel, or 'all'")
                             .class(XSD_STRING)
@@ -772,14 +976,18 @@ pub fn space(registry: JobRegistry) -> EndpointSpace {
         )
         .bind(
             Exact::new("urn:time:jobs"),
-            FnEndpoint::new("time-jobs", move |_inv: &Invocation<'_>| {
-                Ok(text(jobs_reg.render()))
+            FnEndpoint::new("time-jobs", move |inv: &Invocation<'_>| {
+                Ok(text(jobs_reg.render(inv.capability)))
             })
             .with_description(
                 Description::new("time-jobs")
                     .title("Scheduled timed jobs")
-                    .summary("The live list of time-transport jobs: target, interval, runs, last output.")
+                    .summary(
+                        "The live list of time-transport jobs: target, interval, runs, and last \
+                         output where the caller's capability covers the job's.",
+                    )
                     .verb(Verb::Source)
+                    .requires(CAP_READ)
                     .output("text/plain;charset=utf-8"),
             ),
         )
@@ -881,6 +1089,7 @@ mod tests {
                 Verb::Source,
                 Schedule::Every(Duration::from_secs(1)),
                 true,
+                Capability::root(),
             )
             .expect("scheduled");
         assert_eq!(id, 1);
@@ -890,7 +1099,7 @@ mod tests {
         backend.fire_all(3);
         assert_eq!(issued.load(Ordering::SeqCst), 3);
 
-        let rendered = reg.render();
+        let rendered = reg.render(&Capability::root());
         assert!(rendered.contains("#1"));
         assert!(rendered.contains("urn:demo:greeter"));
         assert!(rendered.contains("runs 3"));
@@ -898,7 +1107,7 @@ mod tests {
 
         assert!(reg.cancel(1));
         assert!(!reg.cancel(1));
-        assert!(reg.render().contains("(none scheduled)"));
+        assert!(reg.render(&Capability::root()).contains("(none scheduled)"));
     }
 
     #[test]
@@ -910,6 +1119,7 @@ mod tests {
                 Verb::Source,
                 Schedule::Every(Duration::from_secs(1)),
                 true,
+                Capability::root(),
             )
             .unwrap_err();
         assert!(err.contains("not ready"));
@@ -928,6 +1138,7 @@ mod tests {
                 Verb::Source,
                 Schedule::Every(Duration::from_secs(1)),
                 true,
+                Capability::root(),
             )
             .expect("scheduled")
         };
@@ -935,7 +1146,7 @@ mod tests {
         sched("urn:demo:b");
         sched("urn:demo:c");
         assert_eq!(reg.cancel_all(), 3);
-        assert!(reg.render().contains("(none scheduled)"));
+        assert!(reg.render(&Capability::root()).contains("(none scheduled)"));
         // Idempotent, and ids keep advancing (the next schedule is #4, not #1).
         assert_eq!(reg.cancel_all(), 0);
         assert_eq!(sched("urn:demo:d"), 4);
@@ -951,16 +1162,34 @@ mod tests {
         let every = || Schedule::Every(Duration::from_secs(1));
         // A persistent clock + two cancelable demo jobs.
         let clock = reg
-            .schedule_persistent("urn:time:now".to_string(), Verb::Source, every(), true)
+            .schedule_persistent(
+                "urn:time:now".to_string(),
+                Verb::Source,
+                every(),
+                true,
+                Capability::root(),
+            )
             .expect("scheduled");
-        reg.schedule("urn:demo:greeter".to_string(), Verb::Source, every(), true)
-            .unwrap();
-        reg.schedule("urn:demo:greeter".to_string(), Verb::Source, every(), true)
-            .unwrap();
+        reg.schedule(
+            "urn:demo:greeter".to_string(),
+            Verb::Source,
+            every(),
+            true,
+            Capability::root(),
+        )
+        .unwrap();
+        reg.schedule(
+            "urn:demo:greeter".to_string(),
+            Verb::Source,
+            every(),
+            true,
+            Capability::root(),
+        )
+        .unwrap();
 
         // cancel_all removes the two greeters, leaves the persistent clock.
         assert_eq!(reg.cancel_all(), 2);
-        let rendered = reg.render();
+        let rendered = reg.render(&Capability::root());
         assert!(
             rendered.contains("urn:time:now"),
             "clock survives: {rendered}"
@@ -971,7 +1200,7 @@ mod tests {
         // cancel_target removes the persistent clock explicitly (an explicit target
         // is deliberate, so it overrides persistence).
         assert_eq!(reg.cancel_target("urn:time:now"), 1);
-        assert!(reg.render().contains("(none scheduled)"));
+        assert!(reg.render(&Capability::root()).contains("(none scheduled)"));
         // It's gone now, so a follow-up cancel by id finds nothing.
         assert!(!reg.cancel(clock));
     }
@@ -984,14 +1213,32 @@ mod tests {
             issued: Arc::clone(&issued),
         }));
         let every = || Schedule::Every(Duration::from_secs(1));
-        reg.schedule("urn:demo:greeter".to_string(), Verb::Source, every(), true)
-            .unwrap();
-        reg.schedule("urn:demo:greeter".to_string(), Verb::Source, every(), true)
-            .unwrap();
-        reg.schedule("urn:time:now".to_string(), Verb::Source, every(), true)
-            .unwrap();
+        reg.schedule(
+            "urn:demo:greeter".to_string(),
+            Verb::Source,
+            every(),
+            true,
+            Capability::root(),
+        )
+        .unwrap();
+        reg.schedule(
+            "urn:demo:greeter".to_string(),
+            Verb::Source,
+            every(),
+            true,
+            Capability::root(),
+        )
+        .unwrap();
+        reg.schedule(
+            "urn:time:now".to_string(),
+            Verb::Source,
+            every(),
+            true,
+            Capability::root(),
+        )
+        .unwrap();
         assert_eq!(reg.cancel_target("urn:demo:greeter"), 2);
-        let rendered = reg.render();
+        let rendered = reg.render(&Capability::root());
         assert!(rendered.contains("urn:time:now"));
         assert!(!rendered.contains("urn:demo:greeter"));
         assert_eq!(reg.cancel_target("urn:nope:missing"), 0);
@@ -1021,6 +1268,7 @@ mod tests {
             Verb::Source,
             Schedule::Every(Duration::from_secs(1)),
             true,
+            Capability::root(),
         )
         .expect("scheduled");
 
@@ -1099,6 +1347,7 @@ mod tests {
             Verb::Source,
             Schedule::Every(Duration::from_secs(30)),
             true,
+            Capability::root(),
         )
         .expect("scheduled");
         assert!(reg.measures_sleep());
@@ -1155,6 +1404,7 @@ mod tests {
             Verb::Source,
             Schedule::Every(Duration::from_secs(30)),
             true,
+            Capability::root(),
         )
         .expect("scheduled");
         let health = reg.health();
@@ -1319,6 +1569,270 @@ mod tests {
         assert_eq!(health[0].last_output, "written");
     }
 
+    /// Attenuation is not a ban: a caller that DOES hold `urn:x`'s authority schedules a
+    /// Sink that succeeds — the job carries exactly what its scheduler held.
+    #[test]
+    fn a_job_scheduled_by_a_holder_of_the_target_authority_fires() {
+        let entered = Arc::new(AtomicU64::new(0));
+        let backend = Arc::new(ManualBackend::default());
+        let reg = JobRegistry::new(backend.clone(), Arc::new(SystemClock));
+        let kernel = kernel_with_time(&reg, Arc::clone(&entered));
+        let writer = Capability::scoped([CAP_SCHEDULE, "urn:cap:x:write"]);
+
+        call(
+            &kernel,
+            "urn:time:schedule",
+            &[("target", "urn:x"), ("every", "1s"), ("method", "sink")],
+            &writer,
+        )
+        .expect("scheduled");
+        backend.fire_all(1);
+        assert_eq!(entered.load(Ordering::SeqCst), 1);
+    }
+
+    /// The registry's capability is a CEILING: a root-scheduled job fires under it.
+    #[test]
+    fn the_registry_ceiling_narrows_a_root_scheduled_job() {
+        let entered = Arc::new(AtomicU64::new(0));
+        let backend = Arc::new(ManualBackend::default());
+        let reg = JobRegistry::new(backend.clone(), Arc::new(SystemClock))
+            .with_capability(Capability::scoped(["urn:cap:other"]));
+        let kernel = kernel_with_time(&reg, Arc::clone(&entered));
+
+        call(
+            &kernel,
+            "urn:time:schedule",
+            &[("target", "urn:x"), ("every", "1s"), ("method", "sink")],
+            &Capability::root(),
+        )
+        .expect("scheduled");
+        backend.fire_all(1);
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            0,
+            "root clamped to the ceiling"
+        );
+        assert!(reg.health()[0].last_output.contains("denied"));
+
+        // A ceiling that grants the target's authority lets the same job through.
+        let entered = Arc::new(AtomicU64::new(0));
+        let backend = Arc::new(ManualBackend::default());
+        let reg = JobRegistry::new(backend.clone(), Arc::new(SystemClock))
+            .with_capability(Capability::scoped(["urn:cap:x:write"]));
+        let kernel = kernel_with_time(&reg, Arc::clone(&entered));
+        call(
+            &kernel,
+            "urn:time:schedule",
+            &[("target", "urn:x"), ("every", "1s"), ("method", "sink")],
+            &Capability::root(),
+        )
+        .expect("scheduled");
+        backend.fire_all(1);
+        assert_eq!(entered.load(Ordering::SeqCst), 1);
+    }
+
+    /// `with_capability` only narrows: a later root (or broader) ceiling cannot undo an
+    /// earlier narrowing, so no host code path can widen what every job fires under.
+    #[test]
+    fn the_ceiling_never_widens() {
+        let entered = Arc::new(AtomicU64::new(0));
+        let backend = Arc::new(ManualBackend::default());
+        let reg = JobRegistry::new(backend.clone(), Arc::new(SystemClock))
+            .with_capability(Capability::scoped(["urn:cap:other"]))
+            .with_capability(Capability::root())
+            .with_capability(Capability::scoped(["urn:cap:other", "urn:cap:x:write"]));
+        let kernel = kernel_with_time(&reg, Arc::clone(&entered));
+        call(
+            &kernel,
+            "urn:time:schedule",
+            &[("target", "urn:x"), ("every", "1s"), ("method", "sink")],
+            &Capability::root(),
+        )
+        .expect("scheduled");
+        backend.fire_all(1);
+        assert_eq!(entered.load(Ordering::SeqCst), 0);
+    }
+
+    /// Declared = enforced, for all three: without the token the kernel refuses before
+    /// dispatch — nothing is registered, cancelled, or read.
+    #[test]
+    fn each_control_resource_requires_its_declared_token() {
+        let entered = Arc::new(AtomicU64::new(0));
+        let reg = JobRegistry::new(Arc::new(ManualBackend::default()), Arc::new(SystemClock));
+        let kernel = kernel_with_time(&reg, entered);
+        let nothing = Capability::scoped(Vec::<String>::new());
+
+        let scheduled = call(
+            &kernel,
+            "urn:time:schedule",
+            &[("target", "urn:x"), ("every", "1s")],
+            &nothing,
+        );
+        assert!(matches!(scheduled, Err(Error::Denied(_))), "{scheduled:?}");
+        assert!(reg.health().is_empty(), "denied before dispatch: no job");
+
+        reg.schedule(
+            "urn:x".to_string(),
+            Verb::Source,
+            Schedule::Every(Duration::from_secs(1)),
+            true,
+            nothing.clone(),
+        )
+        .expect("host schedules");
+        let cancelled = call(&kernel, "urn:time:cancel", &[("id", "all")], &nothing);
+        assert!(matches!(cancelled, Err(Error::Denied(_))), "{cancelled:?}");
+        assert_eq!(reg.health().len(), 1, "nothing cancelled");
+
+        let listed = call(&kernel, "urn:time:jobs", &[], &nothing);
+        assert!(matches!(listed, Err(Error::Denied(_))), "{listed:?}");
+
+        // And each is declared where the manifold reads it — on the action, per verb.
+        let root = space(reg.clone());
+        for (iri, token) in [
+            ("urn:time:schedule", CAP_SCHEDULE),
+            ("urn:time:cancel", CAP_CANCEL),
+            ("urn:time:jobs", CAP_READ),
+        ] {
+            let request = Request::new(Verb::Source, Iri::parse(iri).unwrap());
+            let ikigai_core::Resolution::Hit(found) =
+                ikigai_core::Space::resolve(&root, &request, &ikigai_core::Scope::empty())
+            else {
+                panic!("{iri} is bound");
+            };
+            let specs = found.endpoint.describe().action_specs();
+            let source = specs
+                .iter()
+                .find(|spec| spec.verb == Verb::Source)
+                .expect("a Source action");
+            assert_eq!(source.requires, vec![token.to_string()], "{iri}");
+        }
+    }
+
+    /// Cancel reaches only what the caller covers. A job scheduled at root (the host's) is
+    /// withheld from an attenuated caller by id — typed Denied, left running — and by
+    /// `id=all`, which says how many it left; the caller's own job is its to cancel, and root
+    /// can cancel anything.
+    #[test]
+    fn a_caller_cancels_only_jobs_its_capability_covers() {
+        let entered = Arc::new(AtomicU64::new(0));
+        let reg = JobRegistry::new(Arc::new(ManualBackend::default()), Arc::new(SystemClock));
+        let kernel = kernel_with_time(&reg, entered);
+        let agent = Capability::scoped([CAP_SCHEDULE, CAP_CANCEL, CAP_READ]);
+        let every = || Schedule::Every(Duration::from_secs(1));
+
+        let host_job = reg
+            .schedule(
+                "urn:x".to_string(),
+                Verb::Source,
+                every(),
+                true,
+                Capability::root(),
+            )
+            .unwrap();
+        call(
+            &kernel,
+            "urn:time:schedule",
+            &[("target", "urn:x"), ("every", "1s")],
+            &agent,
+        )
+        .expect("the agent schedules its own");
+
+        let by_id = call(
+            &kernel,
+            "urn:time:cancel",
+            &[("id", &host_job.to_string())],
+            &agent,
+        );
+        assert!(matches!(by_id, Err(Error::Denied(_))), "{by_id:?}");
+        assert_eq!(reg.health().len(), 2, "the host job is still running");
+
+        let all = call(&kernel, "urn:time:cancel", &[("id", "all")], &agent).unwrap();
+        assert!(all.starts_with("cancelled 1 job ("), "{all}");
+        assert!(all.contains("1 left running"), "{all}");
+        let left = reg.health();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, host_job);
+
+        let by_target = call(&kernel, "urn:time:cancel", &[("target", "urn:x")], &agent).unwrap();
+        assert!(
+            by_target.starts_with("cancelled 0 jobs for urn:x (1 left"),
+            "{by_target}"
+        );
+
+        // Root covers everything.
+        let root = call(
+            &kernel,
+            "urn:time:cancel",
+            &[("id", &host_job.to_string())],
+            &Capability::root(),
+        )
+        .unwrap();
+        assert_eq!(root, format!("cancelled job #{host_job}\n"));
+        assert!(reg.health().is_empty());
+    }
+
+    /// The listing shows every job's EXISTENCE to a reader, but a job's last output only to
+    /// a caller that covers its authority — that output is what the job's authority read.
+    #[test]
+    fn the_job_list_withholds_output_the_reader_could_not_have_read() {
+        let entered = Arc::new(AtomicU64::new(0));
+        let backend = Arc::new(ManualBackend::default());
+        let reg = JobRegistry::new(backend.clone(), Arc::new(SystemClock));
+        let kernel = kernel_with_time(&reg, Arc::clone(&entered));
+        let agent = attenuated();
+
+        reg.schedule(
+            "urn:x".to_string(),
+            Verb::Sink,
+            Schedule::Every(Duration::from_secs(1)),
+            true,
+            Capability::root(),
+        )
+        .unwrap();
+        call(
+            &kernel,
+            "urn:time:schedule",
+            &[("target", "urn:x"), ("every", "1s"), ("method", "sink")],
+            &agent,
+        )
+        .unwrap();
+        backend.fire_all(1);
+
+        let seen = call(&kernel, "urn:time:jobs", &[], &agent).unwrap();
+        assert!(
+            seen.contains("#1  sink urn:x"),
+            "existence is listed: {seen}"
+        );
+        assert!(
+            !seen.contains("last: written"),
+            "the root job's output is withheld: {seen}"
+        );
+        assert!(seen.contains("last: (withheld"), "and says so: {seen}");
+        assert!(
+            seen.contains("last: error: denied"),
+            "the agent's own job's output is its to read: {seen}"
+        );
+
+        let all = call(&kernel, "urn:time:jobs", &[], &Capability::root()).unwrap();
+        assert!(all.contains("last: written"), "{all}");
+        assert!(!all.contains("withheld"), "{all}");
+    }
+
+    /// `covers` is "grants everything the recorded capability grants".
+    #[test]
+    fn covers_is_scope_containment_and_only_root_covers_root() {
+        let ab = Capability::scoped(["a", "b"]);
+        let a = Capability::scoped(["a"]);
+        let none = Capability::scoped(Vec::<String>::new());
+        assert!(covers(&Capability::root(), &Capability::root()));
+        assert!(covers(&Capability::root(), &ab));
+        assert!(!covers(&ab, &Capability::root()));
+        assert!(covers(&ab, &a));
+        assert!(!covers(&a, &ab));
+        assert!(covers(&a, &none));
+        assert!(covers(&none, &none));
+    }
+
     /// A backend whose cancel closure re-enters the registry — the shape of real
     /// injected host code (`clearInterval` calling back into the page).
     struct ReentrantBackend {
@@ -1336,7 +1850,9 @@ mod tests {
             let seen = Arc::clone(&self.seen);
             TimerHandle::new(move || {
                 if let Some(reg) = reg.get() {
-                    seen.lock().expect("seen lock").push(reg.render());
+                    seen.lock()
+                        .expect("seen lock")
+                        .push(reg.render(&Capability::root()));
                 }
             })
         }
@@ -1371,6 +1887,7 @@ mod tests {
                 Verb::Source,
                 Schedule::Every(Duration::from_secs(1)),
                 true,
+                Capability::root(),
             )
             .expect("scheduled");
             assert!(reg.cancel(1));
@@ -1380,6 +1897,7 @@ mod tests {
                 Verb::Source,
                 Schedule::Every(Duration::from_secs(1)),
                 true,
+                Capability::root(),
             )
             .expect("scheduled");
             assert_eq!(reg.cancel_all(), 1);
@@ -1388,6 +1906,7 @@ mod tests {
                 Verb::Source,
                 Schedule::Every(Duration::from_secs(1)),
                 true,
+                Capability::root(),
             )
             .expect("scheduled");
             assert_eq!(reg.cancel_target("urn:demo:greeter"), 1);
