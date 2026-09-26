@@ -27,6 +27,19 @@ From the CLI: `ikigai serve --http <port>` (loopback — front it with TLS at yo
 proxy; see below), with `--trust-proxy` and `--cors-origin <o>` to configure the
 edge.
 
+### Provenance on a write
+
+A mutating request (`PUT`/`POST`/`DELETE`) reaches the endpoint with three arguments
+the transport owns, all **read off the connection, never the payload**: `received`
+(RFC 3339, UTC), `client` (the socket peer, or the trusted proxy's rightmost
+`X-Forwarded-For` hop), and — when the host wires a `PrincipalFn` into
+`EdgeConfig::principal_fn` — `principal`, the opaque string the door authenticated the
+request as (a stable IRI, a label; the transport does not interpret it). A principal is
+**not authority**: the capability from `cap_fn` alone decides what the request may do.
+Reads carry none of the three (an argument is part of the cache key), and all three are
+dropped from the query string on a write, so a submitter cannot name their own origin or
+identity. The doctest on `PrincipalFn` pins the shape.
+
 ## The mapping
 
 | HTTP | kernel |
