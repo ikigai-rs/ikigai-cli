@@ -31,7 +31,7 @@ ikigai-core = { workspace = true, optional = true }
 # than copied. The TRUE floor is 0.1.22 — `dispatch` became public in #332 and 0.1.22 shipped it
 # (published 2026-09-15); 0.1.21 does not have it. The number here is the LOCKSTEP version, which
 # is higher; `publish = false` means nothing outside this workspace ever resolves it anyway.
-ikigai-quic = { path = "../ikigai-quic", version = "0.1.26", optional = true }
+ikigai-quic = { path = "../ikigai-quic", version = "0.1.27", optional = true }
 ikigai-wire = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 tokio = { version = "1.53", default-features = false, features = ["rt-multi-thread", "macros", "time", "sync"], optional = true }
@@ -62,7 +62,7 @@ libp2p = { version = "0.57.0", default-features = false, optional = true, featur
 [dev-dependencies]
 # The host's own `clients.json`/`grants.json` reader, so a test proves a PeerId is
 # authorized by the SAME table as a certificate fingerprint rather than by a lookalike.
-ikigai-embedded = { path = "../ikigai-embedded", version = "0.1.26" }
+ikigai-embedded = { path = "../ikigai-embedded", version = "0.1.27" }
 
 # The off-LAN trial binaries. Run them with `--features p2p`; see the design note.
 [[example]]

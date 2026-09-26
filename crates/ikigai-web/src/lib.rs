@@ -78,6 +78,78 @@ pub fn fixed_cap(scopes: Vec<String>) -> CapFn {
     Arc::new(move |_req| Capability::scoped(scopes.clone()))
 }
 
+/// Map a request → the principal the door authenticated it as, if any. **The identity
+/// twin of [`CapFn`]**: a host that knows WHICH session cookie or passkey signed a request
+/// supplies this, and the transport hands the answer to the endpoint as provenance.
+///
+/// The value is an opaque string the door chooses — a stable IRI
+/// (`urn:iki:gonk:passkey:<credential-id>`) or a label — and the transport does not
+/// interpret it. It is **never authority**: what a request may do is decided by [`CapFn`]
+/// alone; this only says who asked. Wire it through [`EdgeConfig::principal_fn`]; `None`
+/// (the default) stamps nothing and behaves exactly as before the hook existed.
+///
+/// The shape leaving the process, pinned below rather than described: on a **mutating**
+/// verb (Sink, Delete) the answer lands on the request as an inline argument named
+/// **`principal`**, beside `received` and `client`; a **read** carries none (an argument is
+/// part of the cache key, and a per-principal key on every GET would partition the
+/// representation cache by identity); and `?principal=…` in the query string is **dropped**
+/// on a write, so a submitter cannot name their own principal.
+///
+/// ```
+/// use ikigai_core::{
+///     Description, EndpointSpace, Exact, FnEndpoint, Invocation, Kernel, ReprType,
+///     Representation, Verb,
+/// };
+/// use ikigai_web::{EdgeConfig, HttpRequest, PrincipalFn};
+/// use std::sync::Arc;
+/// use tokio::io::{AsyncReadExt, AsyncWriteExt};
+///
+/// # #[tokio::main]
+/// # async fn main() {
+/// // An endpoint that answers with the principal it was handed, or `-` for none.
+/// let whoami = FnEndpoint::new("whoami", |inv: &Invocation<'_>| {
+///     let who = inv.inline_str("principal").unwrap_or("-").to_string();
+///     Ok(Representation::new(ReprType::new("text/plain"), who.into_bytes()))
+/// })
+/// .with_description(Description::new("whoami").verb(Verb::Source).verb(Verb::Sink));
+/// let kernel = Arc::new(Kernel::new(Arc::new(
+///     EndpointSpace::new().bind(Exact::new("urn:test:whoami"), whoami),
+/// )));
+///
+/// // The door authenticated the connection and names its principal.
+/// let door: PrincipalFn = Arc::new(|_req: &HttpRequest| Some("urn:example:alice".to_string()));
+/// let config = EdgeConfig { principal_fn: Some(door), ..EdgeConfig::default() };
+/// let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+/// let addr = listener.local_addr().unwrap();
+/// tokio::spawn(async move {
+///     let _ = ikigai_web::serve_with_listener(kernel, ikigai_web::public_cap(), listener, config).await;
+/// });
+///
+/// async fn send(addr: std::net::SocketAddr, raw: &str) -> String {
+///     let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+///     c.write_all(raw.as_bytes()).await.unwrap();
+///     let mut out = Vec::new();
+///     c.read_to_end(&mut out).await.unwrap();
+///     String::from_utf8_lossy(&out).into_owned()
+/// }
+///
+/// // A write carries the principal, as the argument named `principal`.
+/// let post = send(addr, "POST /test/whoami HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nhi").await;
+/// assert!(post.ends_with("urn:example:alice"), "{post}");
+/// // A read carries none.
+/// let get = send(addr, "GET /test/whoami HTTP/1.1\r\nHost: x\r\n\r\n").await;
+/// assert!(get.ends_with("\r\n-"), "{get}");
+/// // The query string cannot name one: the connection's principal wins.
+/// let forged = send(
+///     addr,
+///     "POST /test/whoami?principal=urn:example:mallory HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nhi",
+/// )
+/// .await;
+/// assert!(forged.ends_with("urn:example:alice"), "{forged}");
+/// # }
+/// ```
+pub type PrincipalFn = Arc<dyn Fn(&HttpRequest) -> Option<String> + Send + Sync>;
+
 /// The largest request body accepted from a client, in bytes.
 ///
 /// This is a TRANSPORT bound, not a form bound: the same door carries `PUT`/`PATCH` of
@@ -121,6 +193,9 @@ pub struct EdgeConfig {
     /// the route table into an exhaustive allow-list (no accidental export), the right posture
     /// for a public edge. Default `false` (fall-through on).
     pub routes_only: bool,
+    /// The principal hook — see [`PrincipalFn`] for the shape it stamps. `None` (the
+    /// default) attaches no `principal` argument to anything.
+    pub principal_fn: Option<PrincipalFn>,
 }
 
 /// A shared, swappable [`RouteTable`] for hot-reload. The server reads the current table per
@@ -151,6 +226,7 @@ impl Default for EdgeConfig {
             live_routes: None,
             routes_only: false,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            principal_fn: None,
         }
     }
 }
@@ -627,9 +703,9 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
     }
     for (k, v) in &req.query {
         // `as`/`content` are the adapter's own (`as` was negotiated above). On a write, so
-        // are the provenance names:
-        // the transport supplies them below, and a submitter must not be able to forge an
-        // origin by appending `?client=…` to the URL.
+        // are the provenance names (`received`, `client`, `principal`): the transport
+        // supplies them below, and a submitter must not be able to forge an origin by
+        // appending `?client=…` to the URL, nor an identity by appending `?principal=…`.
         let reserved = k == "as" || k == "content" || (verb.is_mutating() && is_provenance(k));
         if !reserved {
             request = request.with_arg(k.clone(), ArgRef::Inline(v.clone().into_bytes()));
@@ -654,6 +730,13 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
         request = request.with_arg("received", ArgRef::Inline(now_rfc3339().into_bytes()));
         if let Some(client) = client_ip(req, &shared.config) {
             request = request.with_arg("client", ArgRef::Inline(client.into_bytes()));
+        }
+        // The third provenance name: WHO the door authenticated, when it knows. Read off
+        // the connection through the host's hook (a session cookie → a passkey → an IRI),
+        // never off the payload — the same rule as `client`, for the same reason. Not
+        // authority: the capability above already decided what this request may do.
+        if let Some(principal) = shared.config.principal_fn.as_ref().and_then(|f| f(req)) {
+            request = request.with_arg("principal", ArgRef::Inline(principal.into_bytes()));
         }
     }
 
@@ -1744,9 +1827,10 @@ fn parse_head(head: &str) -> Option<HttpRequest> {
 
 /// The argument names the transport owns on a write. A request may carry them in its
 /// query string, but they are dropped there — provenance the submitter can author is
-/// not provenance.
+/// not provenance. `principal` is reserved even on a door with no [`PrincipalFn`]: a
+/// submitter must not be able to name a principal that no door authenticated.
 fn is_provenance(name: &str) -> bool {
-    name == "received" || name == "client"
+    name == "received" || name == "client" || name == "principal"
 }
 
 /// The submitter's address.
@@ -1977,22 +2061,29 @@ mod tests {
                 ),
         );
         // Echoes back the provenance the transport attached, so a test can see exactly what
-        // the endpoint was told about who called and when.
+        // the endpoint was told about who called and when. A Delete answers 204 with no body
+        // whatever the endpoint returns, so on that verb the echo rides the one channel a
+        // Delete response does carry: the error body (`error_resp` renders `{e}`).
         let provenance = FnEndpoint::new("provenance", |inv: &Invocation<'_>| {
+            let seen = format!(
+                "received={} client={} principal={}",
+                inv.inline_str("received").unwrap_or("-"),
+                inv.inline_str("client").unwrap_or("-"),
+                inv.inline_str("principal").unwrap_or("-")
+            );
+            if inv.request.verb == Verb::Delete {
+                return Err(Error::Denied(seen));
+            }
             Ok(Representation::new(
                 ReprType::new("text/plain"),
-                format!(
-                    "received={} client={}",
-                    inv.inline_str("received").unwrap_or("-"),
-                    inv.inline_str("client").unwrap_or("-")
-                )
-                .into_bytes(),
+                seen.into_bytes(),
             ))
         })
         .with_description(
             Description::new("provenance")
                 .verb(Verb::Source)
-                .verb(Verb::Sink),
+                .verb(Verb::Sink)
+                .verb(Verb::Delete),
         );
         // Negotiation fixtures: each echoes the `as` it was handed, or `default` when none.
         let echo_as = |inv: &Invocation<'_>| {
@@ -2194,6 +2285,115 @@ mod tests {
             "the submitter's own claim must be dropped: {out}"
         );
         assert!(out.contains("client=127.0.0.1"), "the socket wins: {out}");
+    }
+
+    // A door whose hook names every connection `p`.
+    fn naming_door() -> EdgeConfig {
+        let door: PrincipalFn = Arc::new(|_req: &HttpRequest| Some("p".to_string()));
+        EdgeConfig {
+            principal_fn: Some(door),
+            ..EdgeConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_write_carries_the_principal_the_door_authenticated() {
+        let addr = start_with(naming_door()).await;
+        let out = roundtrip(
+            addr,
+            "POST /test/provenance HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nhi",
+        )
+        .await;
+        assert!(
+            out.contains("principal=p"),
+            "the hook's answer should reach the endpoint: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delete_carries_the_principal_too() {
+        // Provenance is a rule over MUTATING verbs, not over Sink: a Delete is stamped exactly
+        // as a Sink is.
+        let addr = start_with(naming_door()).await;
+        let out = roundtrip(addr, "DELETE /test/provenance HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(
+            out.contains("principal=p") && out.contains("received=20"),
+            "a Delete is stamped like a Sink: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_carries_no_principal_so_the_cache_is_not_partitioned_by_identity() {
+        let addr = start_with(naming_door()).await;
+        let out = roundtrip(addr, "GET /test/provenance HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(
+            out.contains("principal=-"),
+            "a read must not carry the principal: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_door_without_a_principal_stamps_none() {
+        // Both absent hook and a hook that declines: the request is exactly today's.
+        let declining: PrincipalFn = Arc::new(|_req: &HttpRequest| None);
+        for config in [
+            EdgeConfig::default(),
+            EdgeConfig {
+                principal_fn: Some(declining),
+                ..EdgeConfig::default()
+            },
+        ] {
+            let addr = start_with(config).await;
+            let out = roundtrip(
+                addr,
+                "POST /test/provenance HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nhi",
+            )
+            .await;
+            assert!(
+                out.contains("client=127.0.0.1 principal=-"),
+                "no door, no principal: {out}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_principal_in_the_query_string_cannot_name_an_identity() {
+        // With a door: the connection's principal wins over the submitter's claim.
+        let addr = start_with(naming_door()).await;
+        let out = roundtrip(
+            addr,
+            "POST /test/provenance?principal=forged HTTP/1.1\r\nHost: x\r\n\
+             Content-Length: 2\r\n\r\nhi",
+        )
+        .await;
+        assert!(
+            out.contains("principal=p") && !out.contains("forged"),
+            "the door's answer wins over the submitter's claim: {out}"
+        );
+        // Without one: the claim is dropped and nothing replaces it. `principal` is reserved
+        // whether or not a door is wired — a submitter cannot name a principal that no door
+        // authenticated.
+        let addr = start().await;
+        let out = roundtrip(
+            addr,
+            "DELETE /test/provenance?principal=forged HTTP/1.1\r\nHost: x\r\n\r\n",
+        )
+        .await;
+        assert!(
+            out.contains("principal=-") && !out.contains("forged"),
+            "the claim is dropped even with no door: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_provenance_name_is_reserved_on_every_mutating_verb() {
+        for name in ["received", "client", "principal"] {
+            assert!(is_provenance(name), "{name} is provenance");
+        }
+        assert!(!is_provenance("slot"), "an ordinary input is not");
+        // The reservation is keyed on the VERB being mutating, not on Sink alone.
+        assert!(Verb::Sink.is_mutating() && Verb::Delete.is_mutating());
+        assert!(!Verb::Source.is_mutating());
     }
 
     #[tokio::test]
