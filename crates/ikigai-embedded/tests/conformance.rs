@@ -553,22 +553,24 @@ fn base() -> Suite {
         // happens to be. Bound on BOTH compositions, so they live in the base.
         // ★ THE SECOND REAL VOCABULARY GAP, in a repo that cannot fix it — `urn:host:health`
         // next door is the first. Declaring `urn:host:posture`'s `text/turtle` face brings
-        // it under VOCABULARY, which finds sixteen `ik:` terms `ikigai-vocab` does not
-        // define, at the pinned version or at HEAD. The fix is `vocabulary.ttl` in
+        // it under VOCABULARY, which finds fifteen `ik:` terms `ikigai-vocab` does not
+        // define, at the pinned version or at HEAD. (Sixteen until vocab 0.1.78 defined
+        // `ik:Mount` — for the TOPOLOGY, not for this graph; see the pinning test.) The fix is `vocabulary.ttl` in
         // ikigai-core plus a manual deploy of https://ikigai-rs.dev/ns; both belong to that
         // repo, so this waits and the need is reported up.
         //
         // ⚠ `opt_out_check`, never `opt_out`: the coarse lever would take ENFORCED,
         // CACHEABLE and SKOLEM-RDF down with it — on an endpoint whose whole point is a
         // capability gate and an uncacheable read. The exact set is pinned by hand in
-        // `the_posture_graph_uses_exactly_sixteen_undefined_terms`, so this goes red in both
+        // `the_posture_graph_uses_exactly_fifteen_undefined_terms`, so this goes red in both
         // directions, including the day the terms land.
         .opt_out_check(
             "host-posture",
             Check::Vocabulary,
-            "ik:Posture / ik:Mount / ik:TrustedClient and their properties are undefined in \
-             ikigai-vocab (at the pin AND at HEAD); the fix is vocabulary.ttl in ikigai-core \
-             plus a /ns deploy. The exact undefined set is pinned by hand below.",
+            "ik:Posture / ik:TrustedClient and their properties are undefined in ikigai-vocab \
+             (at the pin AND at HEAD), and ik:Mount is defined for a different thing; the \
+             fix is vocabulary.ttl in ikigai-core plus a /ns deploy. The exact undefined set \
+             is pinned by hand below.",
         )
         .opt_out("httpGet", None, "outbound HTTP over a real transport")
         .opt_out("httpHead", None, "outbound HTTP over a real transport")
@@ -1036,8 +1038,8 @@ fn the_http_door_serves_no_owner_only_resource() {
 /// ★ **The posture graph's undefined terms, as an EXACT list — that waiver's other half.**
 ///
 /// `opt_out_check("host-posture", Check::Vocabulary, …)` in [`base`] silences a rule this
-/// repo cannot satisfy: `urn:host:posture`'s `text/turtle` face names sixteen `ik:` terms no
-/// version of `ikigai-vocab` defines. A waiver alone would also waive the SEVENTEENTH term
+/// repo cannot satisfy: `urn:host:posture`'s `text/turtle` face names fifteen `ik:` terms no
+/// version of `ikigai-vocab` defines. A waiver alone would also waive the SIXTEENTH term
 /// somebody adds next, so the set is pinned here, reproducing `VOCABULARY` from the public
 /// [`rdf`] helpers. It fails in both directions: a new invented term, and the day
 /// `vocabulary.ttl` defines these.
@@ -1052,8 +1054,18 @@ fn the_http_door_serves_no_owner_only_resource() {
 /// id (`ik:target`, `ik:cap`, `ik:id`) carry an `rdfs:domain` of `ik:Route` or `ik:Endpoint`,
 /// so reusing them here would entail that a mount IS a route. A synonym is the lesser evil;
 /// widening those domains is the vocabulary change to argue for.
+///
+/// ⚠ **It was sixteen until vocab 0.1.78, and the one that left did not leave because it was
+/// FIXED.** 0.1.78 defines `ik:Mount` for `urn:kernel:topology`: `rdfs:subClassOf ik:Space`, "a
+/// prefix-guarded import … No rewrite". This graph's `ik:Mount` is a CONFIGURED mount — a posture
+/// record with `ik:mountPrefix`/`ik:mountTarget`, and for the alias kind it DOES rewrite
+/// (`MountedRemote` strips the prefix). So the term is now defined, the check is satisfied, and
+/// the triple entails that a posture record is a space that does not rewrite. That is a
+/// vocabulary collision, not a closed gap — reported up with the 0.1.29 arc rather than
+/// renamed here, because the right spelling (a posture-side class, or the topology node's IRI
+/// as the object) is the vocabulary's call.
 #[test]
-fn the_posture_graph_uses_exactly_sixteen_undefined_terms() {
+fn the_posture_graph_uses_exactly_fifteen_undefined_terms() {
     use ikigai_core::{Capability, Iri, Request, Verb};
 
     let kernel = root_kernel();
@@ -1077,7 +1089,6 @@ fn the_posture_graph_uses_exactly_sixteen_undefined_terms() {
     assert_eq!(
         undefined,
         vec![
-            "https://ikigai-rs.dev/ns#Mount",
             "https://ikigai-rs.dev/ns#Posture",
             "https://ikigai-rs.dev/ns#TrustedClient",
             "https://ikigai-rs.dev/ns#asOf",
