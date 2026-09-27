@@ -15,6 +15,10 @@ ikigai-resolve = { workspace = true }
 # rather than re-spelling `urn:plan:{id}:step:{n}` and drifting from the published terms.
 ikigai-vocab = { workspace = true }
 serde_json = { workspace = true }
+# Parsing the instant in `as-of=<instant>` (RFC 3339) and naming the corridor for it. Parse
+# and format only: no `clock` feature, so nothing here can read the wall clock — the corridor's
+# clock is DERIVED from the instant the caller wrote — and nothing wasm-hostile comes with it.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 # Reading a stored plan back — see `[features].plan-reader` below for why it is optional.
 # oxttl is the Turtle parser the rest of the ecosystem's RDF already sits on; oxrdf comes
 # with it, because oxttl yields `oxrdf::Triple` and re-exports none of those types, and

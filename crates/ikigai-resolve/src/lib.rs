@@ -945,6 +945,52 @@ pub trait Resolver: Send + Sync {
         self.issue_as_async(request, capability).await
     }
 
+    /// Resolve **in a resolution chain** ([`Scope`]): the corridors it injects are consulted
+    /// ahead of the root for this request and everything it gives rise to, and a temporal
+    /// corridor's clock is the one [`Invocation::now`] reads. `incoming` is an upstream pipe
+    /// stage's [`Provenance`], folded in exactly as
+    /// [`issue_as_async_with_incoming`](Resolver::issue_as_async_with_incoming) does.
+    ///
+    /// ★ **The default REFUSES a non-empty chain** — it never resolves one as though it were
+    /// empty. A chain is spaces and a clock held in this process; no transport carries either,
+    /// so a wire resolver asked for `as-of=` would otherwise answer with the peer's LIVE time
+    /// and nothing would say so. That is the failure an as-of resolution exists to rule out.
+    /// The empty chain delegates to the unscoped methods, so an implementor that predates
+    /// this is byte-identical for every request that carries no chain. The in-process kernel
+    /// overrides it ([`Kernel::issue_in`] / [`Kernel::issue_with_incoming_in`]).
+    async fn issue_as_async_in(
+        &self,
+        request: Request,
+        capability: &Capability,
+        incoming: Option<Provenance>,
+        scope: Scope,
+    ) -> Result<(Representation, CacheStatus), Error> {
+        if !scope.is_empty() {
+            return Err(Error::Endpoint(format!(
+                "cannot resolve in the chain `{scope}` over {}: a resolution chain is spaces \
+                 and a clock held in this process, and no transport carries either — resolve \
+                 against an in-process kernel",
+                self.transport()
+            )));
+        }
+        match incoming {
+            Some(provenance) => {
+                self.issue_as_async_with_incoming(request, capability, provenance)
+                    .await
+            }
+            None => self.issue_as_async(request, capability).await,
+        }
+    }
+
+    /// [`is_cached`](Resolver::is_cached) in a resolution chain — the cache is partitioned by
+    /// the chain's fingerprint, so "cached" is a claim about one chain. The default answers
+    /// `false` for any non-empty chain (it cannot resolve one, so nothing is cached in it) and
+    /// delegates for the empty chain; the in-process kernel overrides it
+    /// ([`Kernel::is_cached_in`]).
+    fn is_cached_in(&self, request: &Request, capability: &Capability, scope: &Scope) -> bool {
+        scope.is_empty() && self.is_cached(request, capability)
+    }
+
     /// Install an execution [`Tracer`] for the next resolution — the `trace` command
     /// records one real `source` to show which worker each node ran on. Default
     /// no-op: a wire resolver can't yet trace the remote kernel; the in-process
@@ -1052,6 +1098,30 @@ impl Resolver for Kernel {
         Ok((representation, status))
     }
 
+    async fn issue_as_async_in(
+        &self,
+        request: Request,
+        capability: &Capability,
+        incoming: Option<Provenance>,
+        scope: Scope,
+    ) -> Result<(Representation, CacheStatus), Error> {
+        // The probe keys on the chain too: an entry cached in one chain is not a hit in
+        // another, and the empty chain's probe is `is_cached` exactly.
+        let was_cached = Kernel::is_cached_in(self, &request, capability, &scope);
+        let representation = match incoming {
+            Some(provenance) => {
+                Kernel::issue_with_incoming_in(self, request, capability, provenance, scope).await?
+            }
+            None => Kernel::issue_in(self, request, capability, scope).await?,
+        };
+        let status = cache_status(was_cached, &representation);
+        Ok((representation, status))
+    }
+
+    fn is_cached_in(&self, request: &Request, capability: &Capability, scope: &Scope) -> bool {
+        Kernel::is_cached_in(self, request, capability, scope)
+    }
+
     fn set_tracer(&self, tracer: Arc<dyn Tracer>) {
         Kernel::set_tracer(self, tracer);
     }
@@ -1140,6 +1210,27 @@ impl<R: Resolver + ?Sized> Resolver for Arc<R> {
         (**self)
             .issue_as_async_with_incoming(request, capability, incoming)
             .await
+    }
+
+    // ⚠ Both chain methods are FORWARDED, for the reason `try_entries` below spells out: a
+    // defaulted method an `Arc` does not forward is silently REPLACED by the default. Here
+    // that default refuses every non-empty chain, and every engine holds its resolver as an
+    // `Arc` — so without these two lines `as-of=` would be refused on the in-process kernel
+    // that implements it.
+    async fn issue_as_async_in(
+        &self,
+        request: Request,
+        capability: &Capability,
+        incoming: Option<Provenance>,
+        scope: Scope,
+    ) -> Result<(Representation, CacheStatus), Error> {
+        (**self)
+            .issue_as_async_in(request, capability, incoming, scope)
+            .await
+    }
+
+    fn is_cached_in(&self, request: &Request, capability: &Capability, scope: &Scope) -> bool {
+        (**self).is_cached_in(request, capability, scope)
     }
 
     fn set_tracer(&self, tracer: Arc<dyn Tracer>) {
@@ -1540,5 +1631,76 @@ mod tests {
             Some("test://peer"),
             "the wire catalog names where a mounted binding resolves"
         );
+    }
+
+    // ---- Resolution chains (the engine's `as-of=`, ledger #532) ---------------------------
+
+    fn doc_corridor() -> Scope {
+        Scope::empty().with_named(
+            Iri::parse("urn:ctx:doc:7").unwrap(),
+            Arc::new(EndpointSpace::new().bind(
+                Exact::new("urn:open"),
+                FnEndpoint::new("in-the-corridor", |_inv| {
+                    Ok(
+                        Representation::new(ReprType::new("text/plain"), b"corridor".to_vec())
+                            .cacheable(),
+                    )
+                }),
+            )),
+        )
+    }
+
+    fn open() -> Request {
+        Request::new(Verb::Source, Iri::parse("urn:open").unwrap())
+    }
+
+    /// ★ A resolver that cannot carry a chain REFUSES one rather than resolving as if it were
+    /// empty — which for `as-of=` over a wire would be the peer's live answer, unmarked.
+    #[test]
+    fn a_resolver_that_cannot_carry_a_chain_refuses_one() {
+        let remote = FakeRemote {
+            entries: Vec::new(),
+            description: Description::new("fake"),
+        };
+        let cap = Capability::root();
+        let refused = block_on(remote.issue_as_async_in(open(), &cap, None, doc_corridor()))
+            .expect_err("a non-empty chain must not be dropped on the floor");
+        assert!(
+            refused.to_string().contains("urn:ctx:doc:7 root"),
+            "the refusal names the chain: {refused}"
+        );
+        assert!(!remote.is_cached_in(&open(), &cap, &doc_corridor()));
+        // The empty chain is the unscoped path, byte for byte.
+        let (repr, _) = block_on(remote.issue_as_async_in(open(), &cap, None, Scope::empty()))
+            .expect("the empty chain delegates");
+        assert_eq!(repr.bytes, b"ok");
+    }
+
+    /// The in-process kernel resolves in the chain, through an `Arc` AND through
+    /// `Arc<dyn Resolver>` — the shape every engine holds. A forwarding arm missing from the
+    /// `Arc` impl would silently fall to the refusing default, and this is where it shows.
+    #[test]
+    fn the_kernel_resolves_in_a_chain_through_every_arc() {
+        let kernel = Arc::new(kernel_with_a_gated_endpoint());
+        let cap = Capability::root();
+        let (root, _) =
+            block_on(kernel.issue_as_async_in(open(), &cap, None, Scope::empty())).expect("root");
+        assert_eq!(root.bytes, b"ok");
+        let (inside, first) =
+            block_on(kernel.issue_as_async_in(open(), &cap, None, doc_corridor()))
+                .expect("the corridor shadows the root's door");
+        assert_eq!(inside.bytes, b"corridor");
+        assert_eq!(first, CacheStatus::Miss);
+        assert!(kernel.is_cached_in(&open(), &cap, &doc_corridor()));
+        assert!(
+            !Resolver::is_cached(&*kernel, &open(), &cap),
+            "cached in the chain, not in the root"
+        );
+
+        let erased: Arc<dyn Resolver> = kernel;
+        let (again, second) =
+            block_on(erased.issue_as_async_in(open(), &cap, None, doc_corridor())).unwrap();
+        assert_eq!(again.bytes, b"corridor");
+        assert_eq!(second, CacheStatus::Hit);
     }
 }

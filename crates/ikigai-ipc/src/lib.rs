@@ -822,6 +822,54 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// ★ A LIMITED name crosses the wire exactly as an unbound one does (ledger #536). The
+    /// served surface carves `urn:personal:` out with a `Limit` (`ikigai-embedded`'s
+    /// `served_root`), and a boundary that reveals nothing in-process must reveal nothing on
+    /// the far side of a transport either: the same typed `Unresolved`, the same words — never
+    /// a `Denied`, never a different message a client could tell apart. The family is BOUND
+    /// just behind the limiter here, which is the case the indistinguishability is for.
+    #[test]
+    fn a_limited_name_is_unresolved_over_the_wire_byte_for_byte() {
+        use ikigai_core::{Fallback, Limit, Space};
+
+        let path = socket_path("limited");
+        let kernel = Kernel::new(Arc::new(Fallback::new(vec![
+            Arc::new(Limit::new("urn:personal:")) as Arc<dyn Space>,
+            Arc::new(
+                EndpointSpace::new()
+                    .bind(Exact::new("urn:test:upper"), builtins::to_upper())
+                    .bind(Exact::new("urn:personal:calendar"), builtins::to_upper()),
+            ),
+        ])));
+        let server = serve_one(&path, kernel);
+        let client = connect(&path).unwrap();
+        let source = |iri: &str| Request::new(Verb::Source, Iri::parse(iri).unwrap());
+
+        let limited = client
+            .issue(source("urn:personal:calendar"))
+            .expect_err("limited");
+        let unbound = client
+            .issue(source("urn:nowhere:calendar"))
+            .expect_err("unbound");
+        assert!(
+            matches!(limited, ikigai_core::Error::Unresolved(_)),
+            "{limited:?}"
+        );
+        assert_eq!(
+            limited
+                .to_string()
+                .replace("urn:personal:calendar", "urn:nowhere:calendar"),
+            unbound.to_string()
+        );
+        // The connection is healthy afterwards: the public door answers on it.
+        let (representation, _) = client.issue(upper("hi")).unwrap();
+        assert_eq!(representation.bytes, b"HI");
+
+        drop(client);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn a_traced_resolution_returns_the_remote_spans() {
         let path = socket_path("traced");
