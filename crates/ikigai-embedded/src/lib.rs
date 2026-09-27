@@ -15,8 +15,8 @@ use std::sync::{Arc, OnceLock};
 
 use ikigai_core::{
     ActionSpec, AliasTable, ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact,
-    Fallback, FnEndpoint, Invocation, Iri, Kernel, MetaRenderer, ReprType, Representation, Request,
-    Resolution, Result, Scope, Space, SpaceEntry, SystemClock, UriTemplate, Verb,
+    Fallback, FnEndpoint, Invocation, Iri, Kernel, Limit, MetaRenderer, ReprType, Representation,
+    Request, Resolution, Result, Scope, Space, SpaceEntry, SystemClock, UriTemplate, Verb,
 };
 /// The process scheduler and how it was configured — `--scheduler`, the config home's
 /// `scheduler` key, then the deprecated `IKIGAI_SCHEDULER`. Re-exported at the crate
@@ -1726,10 +1726,17 @@ pub fn kernel_for_with_eval(nature: &'static str) -> Kernel {
 /// connection ceiling the operator set (`--cap`), not by a separate switch: the
 /// GRANT DECIDES THE SURFACE, so a capability that could never be exercised
 /// doesn't put the endpoints on the wire in the first place.
+///
+/// Since 0.1.29 a face the grant does NOT open is also carved out by STRUCTURE: the served
+/// root puts a [`Limit`] over its family ahead of everything else (`served_root`), so no
+/// mount, alias or future binding can put it back on the wire. See `personal` and `llm`.
 #[derive(Clone, Copy, Default, Debug)]
 pub struct ServedSurface {
     /// A `urn:cap:personal:*` ceiling ⇒ the minimal calendar-only space instead
-    /// of the general served space.
+    /// of the general served space. Without one, `urn:personal:` is LIMITED on the served
+    /// root: every name in it answers `Unresolved`, byte-identical to a name bound nowhere,
+    /// and the catalog and `urn:kernel:actions` subtract it — including a family a `--mount`
+    /// would otherwise have brought in from a peer.
     pub personal: bool,
     /// `urn:cap:lisp` / `urn:cap:lisp:run` ⇒ the governed eval + signed-run door.
     pub wire_eval: bool,
@@ -1739,7 +1746,60 @@ pub struct ServedSurface {
     /// against the grant, so `--cap urn:cap:net:localhost` means "use my local
     /// models, nothing else". The general HTTP client stays embedded-only, so this
     /// grants no arbitrary outbound access. (`urn:llm:config` redacts API keys.)
+    ///
+    /// Without one, `urn:llm:` is LIMITED on the served root, like `urn:personal:` — AND the
+    /// llm space is still not constructed. Both halves, deliberately: the limiter is what
+    /// makes "no net grant, no inference" hold for a MOUNTED `urn:llm:` too (before 0.1.29 a
+    /// `--mount urn:llm:=peer` re-served a peer's inference on a surface that granted none);
+    /// the conditional construction is what keeps a surface that serves no inference from
+    /// reading `llm.json`, building the provider registry and logging its annotation overrides
+    /// at startup. A limiter subtracts what a space answers, never what it costs to build.
     pub llm: bool,
+}
+
+/// The served root's own name — the entry `urn:kernel:topology` shows first on a served
+/// surface, under the alias wrap.
+pub const SERVED_ROOT: &str = "urn:ikigai:space:served";
+/// The limiter over `urn:personal:` on a served surface whose grant opens no personal face.
+pub const SERVED_PERSONAL_LIMIT: &str = "urn:ikigai:space:served:limit:personal";
+/// The limiter over `urn:llm:` on a served surface whose grant opens no net face.
+pub const SERVED_LLM_LIMIT: &str = "urn:ikigai:space:served:limit:llm";
+
+/// The served root: `Fallback([Limit(urn:personal:)?, Limit(urn:llm:)?, inner])`, named, with a
+/// limiter for each family the surface's grant does NOT open (ledger #536).
+///
+/// ★ The switch from DECISION to STRUCTURE, and where it stops. Before core 0.1.76 the only way
+/// to keep `urn:personal:` off the wire was to build a space that did not bind it, and that is
+/// still how the surfaces differ — calendar-only vs host + fs is a construction choice, because
+/// collapsing `served_space` and `local_space` into one object would construct the owner's
+/// whole space (EventKit, Steel, the view derivation, the org files) inside an internet-facing
+/// process only to carve fifteen families back out of it. What the limiter adds is the part a
+/// construction choice cannot say: nothing composed INTO the root afterwards — a mount, an
+/// alias, a binding someone adds to `served_space` next year — reaches the family either.
+///
+/// Placed FIRST, so it is consulted before the eval door and every mount. The kernel's alias
+/// wrap sits OUTSIDE it (`with_aliases` wraps the root), so an alias rewrites before the
+/// limiter sees the name: an alias INTO the family is limited under its canonical name, and
+/// an alias OUT of it resolves. Both are pinned in this crate's tests.
+///
+/// Every layer is named, so `urn:kernel:topology` says `ik:Limit ik:family "urn:personal:"`
+/// about `<urn:ikigai:space:served:limit:personal>` rather than a skolem, and a trace's
+/// `answered-by` note names WHICH limiter carved a name out.
+fn served_root(surface: ServedSurface, inner: Arc<dyn Space>) -> Arc<dyn Space> {
+    let name = |iri: &str| Iri::parse(iri).expect("a served-surface space name is an IRI");
+    let mut layers: Vec<Arc<dyn Space>> = Vec::new();
+    if !surface.personal {
+        layers.push(Arc::new(
+            Limit::new("urn:personal:").named(name(SERVED_PERSONAL_LIMIT)),
+        ));
+    }
+    if !surface.llm {
+        layers.push(Arc::new(
+            Limit::new("urn:llm:").named(name(SERVED_LLM_LIMIT)),
+        ));
+    }
+    layers.push(inner);
+    Arc::new(Fallback::new(layers).named(name(SERVED_ROOT)))
 }
 
 /// Build the served kernel for `surface`. One composer instead of a kernel
@@ -1774,7 +1834,7 @@ pub fn served_kernel_with_mounts(
     } else {
         composed
     };
-    Kernel::with_meta_renderer(root, Arc::new(CliRenderer))
+    Kernel::with_meta_renderer(served_root(surface, root), Arc::new(CliRenderer))
         // ⚠ Same ordering caveat as `build_watched`: `with_aliases` wraps the ROOT and the
         // mounts were composed into it above, so a `--prefer urn:fn:=…` mount sits INSIDE
         // the alias and never sees a `urn:fn:` request again — the rewrite happens first.
@@ -7706,5 +7766,275 @@ mod tests {
             dropped.lock().unwrap().is_empty(),
             "nothing reached the reactor"
         );
+    }
+
+    // ---- The served surface's limiters (ledger #536) --------------------------------------
+
+    fn source_as_root(
+        kernel: &Kernel,
+        iri: &str,
+    ) -> std::result::Result<Representation, ikigai_core::Error> {
+        block_on(
+            kernel.issue(
+                Request::new(Verb::Source, Iri::parse(iri).unwrap())
+                    .with_arg("in", ArgRef::Inline(b"hi".to_vec())),
+                &Capability::root(),
+            ),
+        )
+    }
+
+    /// The manifold as a stranger reads it: every row `urn:kernel:actions` offers, by pattern.
+    fn offered(kernel: &Kernel) -> Vec<String> {
+        let root = Capability::root();
+        kernel
+            .select_actions(&ikigai_core::ActionQuery {
+                capability: Some(&root),
+                ..Default::default()
+            })
+            .into_iter()
+            .map(|m| m.endpoint)
+            .collect()
+    }
+
+    /// A peer that is UP, lists a personal resource, describes it and answers it — the thing a
+    /// `--mount urn:personal:=…` brings onto a served surface. Counts every call.
+    struct PersonalPeer {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ikigai_resolve::Resolver for PersonalPeer {
+        fn issue(
+            &self,
+            request: Request,
+        ) -> std::result::Result<(Representation, ikigai_resolve::CacheStatus), ikigai_core::Error>
+        {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let repr = if request.verb == Verb::Meta {
+                Representation::new(
+                    ReprType::new("application/json"),
+                    serde_json::to_vec(&Description::new("peer-contacts").verb(Verb::Source))
+                        .expect("a description serializes"),
+                )
+            } else {
+                Representation::new(ReprType::new("text/plain"), b"from the peer".to_vec())
+            };
+            Ok((repr, ikigai_resolve::CacheStatus::Uncacheable))
+        }
+
+        fn is_cached(&self, _request: &Request, _capability: &Capability) -> bool {
+            false
+        }
+
+        fn entries(&self) -> Option<Vec<SpaceEntry>> {
+            Some(vec![SpaceEntry::new(
+                "urn:personal:contacts",
+                "peer-contacts",
+            )])
+        }
+    }
+
+    fn personal_mount() -> (MountSpec, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (
+            MountSpec {
+                prefix: "urn:personal:".to_string(),
+                origin: "test://peer".to_string(),
+                resolver: Arc::new(PersonalPeer {
+                    calls: Arc::clone(&calls),
+                }),
+                kind: MountKind::Override,
+            },
+            calls,
+        )
+    }
+
+    /// ★ The limiter is STRUCTURE, so it closes what a construction choice could not: a
+    /// personal family MOUNTED from a peer. On a surface whose grant opens no personal face the
+    /// name is `Unresolved`, the peer is never consulted — not even by the manifold walk — and
+    /// neither the manifold nor the catalog offers it. The control is the SAME mount under a
+    /// personal surface, where it resolves and is offered — so the subtraction is the limiter,
+    /// not a walk that failed to reach the peer.
+    #[test]
+    fn a_surface_without_a_personal_grant_limits_a_mounted_personal_family() {
+        let (spec, calls) = personal_mount();
+        let kernel = served_kernel_with_mounts("Test (QUIC)", ServedSurface::default(), vec![spec]);
+        let err = source_as_root(&kernel, "urn:personal:contacts").expect_err("limited");
+        assert!(matches!(err, ikigai_core::Error::Unresolved(_)), "{err:?}");
+        let rows = offered(&kernel);
+        assert!(
+            !rows.iter().any(|row| row.starts_with("urn:personal:")),
+            "the manifold offers a limited family: {rows:?}"
+        );
+        let catalog = source_as_root(&kernel, "urn:kernel:catalog").expect("catalog");
+        assert!(!String::from_utf8_lossy(&catalog.bytes).contains("urn:personal:contacts"));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "nothing behind the limiter is consulted, by a request or by the walk"
+        );
+
+        let (spec, calls) = personal_mount();
+        let personal = ServedSurface {
+            personal: true,
+            ..ServedSurface::default()
+        };
+        let open = served_kernel_with_mounts("Test (QUIC)", personal, vec![spec]);
+        let answered = source_as_root(&open, "urn:personal:contacts").expect("not limited");
+        assert_eq!(answered.bytes, b"from the peer");
+        assert!(
+            offered(&open)
+                .iter()
+                .any(|row| row == "urn:personal:contacts"),
+            "the control: the same mount IS offered where the family is open"
+        );
+        assert!(calls.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    }
+
+    /// The boundary reveals nothing: a limited name's error is the one a name bound nowhere
+    /// gets, byte for byte (modulo the name itself), and it is never a `Denied`. The trace — the
+    /// operator's face — is where the fact shows, naming WHICH limiter answered.
+    #[test]
+    fn a_limited_name_answers_exactly_as_an_unbound_one_and_the_trace_names_the_limiter() {
+        #[derive(Default)]
+        struct Collect(std::sync::Mutex<Vec<ikigai_core::TraceEvent>>);
+        impl ikigai_core::Tracer for Collect {
+            fn record(&self, event: ikigai_core::TraceEvent) {
+                self.0.lock().unwrap().push(event);
+            }
+        }
+        let kernel = served_kernel("Test (QUIC)", ServedSurface::default());
+        let collect = Arc::new(Collect::default());
+        kernel.set_tracer(collect.clone());
+        let limited = source_as_root(&kernel, "urn:personal:calendar").expect_err("limited");
+        kernel.clear_tracer();
+        let unbound = source_as_root(&kernel, "urn:nowhere:calendar").expect_err("unbound");
+        assert!(
+            matches!(limited, ikigai_core::Error::Unresolved(_)),
+            "{limited:?}"
+        );
+        assert_eq!(
+            limited
+                .to_string()
+                .replace("urn:personal:calendar", "urn:nowhere:calendar"),
+            unbound.to_string()
+        );
+        let events = collect.0.lock().unwrap();
+        let note = |key: &str| {
+            events
+                .iter()
+                .flat_map(|e| e.notes.iter())
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(
+            note(ikigai_core::LIMITED_NOTE).as_deref(),
+            Some("urn:personal:calendar")
+        );
+        assert_eq!(
+            note(ikigai_core::ANSWERED_NOTE).as_deref(),
+            Some(SERVED_PERSONAL_LIMIT)
+        );
+    }
+
+    /// The two alias caveats, pinned on the real served root: `with_aliases` wraps the ROOT, so
+    /// the rewrite runs BEFORE the limiter. An alias INTO the family is limited (under its
+    /// canonical name); an alias OUT of it resolves. Both are wanted.
+    #[test]
+    fn an_alias_into_the_limited_family_is_limited_and_one_out_of_it_resolves() {
+        let root = served_root(
+            ServedSurface::default(),
+            Arc::new(base_space("Test (QUIC)")),
+        );
+        let kernel = Kernel::new(root).with_aliases(Arc::new(
+            AliasTable::new()
+                .exact("urn:cal:mine", "urn:personal:calendar")
+                .prefix("urn:personal:fn:", "urn:iki:fn:"),
+        ));
+        let into = source_as_root(&kernel, "urn:cal:mine").expect_err("into the family");
+        assert!(
+            matches!(into, ikigai_core::Error::Unresolved(_)),
+            "{into:?}"
+        );
+        let out = source_as_root(&kernel, "urn:personal:fn:toUpper").expect("out of the family");
+        assert_eq!(out.bytes, b"HI");
+    }
+
+    /// No net grant, no inference — for a MOUNTED `urn:llm:` too, which before 0.1.29 a served
+    /// surface re-served from a peer whatever its grant. The peer is never called.
+    #[test]
+    fn a_surface_without_a_net_grant_limits_a_mounted_llm_family() {
+        let (spec, calls) = mount(
+            "urn:llm:",
+            MountKind::Override,
+            ikigai_core::Error::Unavailable,
+        );
+        let kernel = served_kernel_with_mounts("Test (QUIC)", ServedSurface::default(), vec![spec]);
+        let err = source_as_root(&kernel, "urn:llm:ask").expect_err("limited");
+        assert!(matches!(err, ikigai_core::Error::Unresolved(_)), "{err:?}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// ★ The arrangement is a resource: `urn:kernel:topology` on the served surface names the
+    /// served root and puts the limiters FIRST on its layer list, ahead of everything that
+    /// could otherwise answer for the family — which is the property the paper's gatekeeper
+    /// check (Theorem 4(b)) reads off this graph.
+    #[test]
+    fn the_served_topology_names_its_limiters_ahead_of_everything_else() {
+        let kernel = served_kernel("Test (QUIC)", ServedSurface::default());
+        let turtle = source_as_root(&kernel, "urn:kernel:topology").expect("topology");
+        let turtle = String::from_utf8(turtle.bytes).expect("Turtle is UTF-8");
+        assert!(
+            turtle.contains(&format!(
+                "<{SERVED_PERSONAL_LIMIT}> a ik:Limit ;\n    ik:family \"urn:personal:\" ."
+            )),
+            "{turtle}"
+        );
+        assert!(
+            turtle.contains(&format!(
+                "<{SERVED_LLM_LIMIT}> a ik:Limit ;\n    ik:family \"urn:llm:\" ."
+            )),
+            "{turtle}"
+        );
+        assert!(
+            turtle.contains(&format!("<{SERVED_ROOT}> a ik:Fallback")),
+            "{turtle}"
+        );
+
+        // The order, structurally: chain → alias wrap → the named served root, whose first two
+        // layers are the limiters.
+        let topology = kernel.topology();
+        let alias = &topology.children[0];
+        let served = &alias.children[0];
+        assert_eq!(served.id.as_ref().map(Iri::as_str), Some(SERVED_ROOT));
+        let families: Vec<(Option<&str>, String)> = served
+            .children
+            .iter()
+            .take(2)
+            .map(|layer| match &layer.kind {
+                ikigai_core::SpaceKind::Limit { family } => {
+                    (layer.id.as_ref().map(Iri::as_str), family.clone())
+                }
+                other => panic!("a limiter must lead the served root, found {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            families,
+            vec![
+                (Some(SERVED_PERSONAL_LIMIT), "urn:personal:".to_string()),
+                (Some(SERVED_LLM_LIMIT), "urn:llm:".to_string()),
+            ]
+        );
+
+        // Where the grant opens a family, its limiter is not there to be listed.
+        let open = served_kernel(
+            "Test (QUIC)",
+            ServedSurface {
+                personal: true,
+                ..ServedSurface::default()
+            },
+        );
+        let turtle = source_as_root(&open, "urn:kernel:topology").expect("topology");
+        assert!(!String::from_utf8_lossy(&turtle.bytes).contains(SERVED_PERSONAL_LIMIT));
     }
 }
