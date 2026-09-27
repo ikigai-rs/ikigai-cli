@@ -16,7 +16,7 @@ use std::sync::{Arc, OnceLock};
 use ikigai_core::{
     ActionSpec, AliasTable, ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact,
     Fallback, FnEndpoint, Invocation, Iri, Kernel, MetaRenderer, ReprType, Representation, Request,
-    Resolution, Result, Scope, Space, SpaceEntry, SystemClock, Time, UriTemplate, Verb,
+    Resolution, Result, Scope, Space, SpaceEntry, SystemClock, UriTemplate, Verb,
 };
 /// The process scheduler and how it was configured — `--scheduler`, the config home's
 /// `scheduler` key, then the deprecated `IKIGAI_SCHEDULER`. Re-exported at the crate
@@ -606,13 +606,18 @@ fn greeter() -> FnEndpoint {
 /// is a cache HIT returning the same value — it only recomputes on the minute. Default
 /// is plain `HH:MM`; `html=true` wraps the colon in a span (the browser nav's blink).
 /// The same resource + demo as the web nav clock.
+///
+/// "Current" is the INVOCATION's time ([`ikigai_tz::read_now`]), so a temporal corridor
+/// (`as-of=`) pins it — and the pinned answer is `Never`, a pure function of the corridor's
+/// name. It read `chrono::Local::now()` directly until 0.1.29: the same hole as `urn:tz:now`
+/// (ledger #532), in the one clock every face displays.
 fn clock_now() -> FnEndpoint {
     FnEndpoint::new("clock-now", |inv: &Invocation<'_>| {
         use chrono::Timelike;
         let html = inv.inline_str("html").is_ok();
-        let now = chrono::Local::now();
+        let (instant, source) = ikigai_tz::read_now(inv)?;
+        let now = instant.with_timezone(&chrono::Local);
         let (h, m) = (now.hour(), now.minute());
-        let next_minute = ((now.timestamp_millis().max(0) as u64) / 60_000 + 1) * 60_000;
         let (body, media) = if html {
             (
                 format!("{h:02}<span class=\"ik-clock-colon\">:</span>{m:02}"),
@@ -621,18 +626,24 @@ fn clock_now() -> FnEndpoint {
         } else {
             (format!("{h:02}:{m:02}"), "text/plain")
         };
-        Ok(Representation::new(
-            ReprType::new(media).with_param("charset", "utf-8"),
-            body.into_bytes(),
-        )
-        .cacheable_until(Time::from_millis(next_minute)))
+        Ok(ikigai_tz::fresh(
+            Representation::new(
+                ReprType::new(media).with_param("charset", "utf-8"),
+                body.into_bytes(),
+            ),
+            instant,
+            source,
+        ))
     })
     .with_description(
         Description::new("clock-now")
             .title("Clock")
             .summary(
                 "The current local time (HH:MM), cacheable until the next minute boundary — \
-                 sourced every render tick but recomputes once a minute.",
+                 sourced every render tick but recomputes once a minute. \"Current\" is the \
+                 invocation's clock: a temporal corridor's pinned instant (as-of) when the \
+                 request carries one, and then cacheable for as long as the corridor's name; \
+                 only a kernel with no clock at all falls back to the OS clock.",
             )
             .verb(Verb::Source)
             .verb(Verb::Meta)
@@ -645,6 +656,27 @@ fn clock_now() -> FnEndpoint {
                     .optional(),
             )
             .output("text/plain;charset=utf-8"),
+    )
+}
+
+/// The doors a **temporal corridor** binds — what the engine's `as-of=<instant>` injects,
+/// under the name `urn:ctx:time:<instant>` and with the clock derived from that instant
+/// (`Scope::with_named_at`, ledger #517/#532): `urn:time:now` and `urn:tz:now`.
+///
+/// ★ The pairing core cannot verify ("the time this corridor binds is the time its clock
+/// reads") holds here BY CONSTRUCTION: both doors read [`ikigai_tz::read_now`], which reads
+/// the chain's clock — so the corridor's time and its clock are one reading, not two values
+/// that happen to agree. The same endpoints are bound in the root; the corridor rebinds them
+/// so a chain states its time doors explicitly and answers them even over a root that lacks
+/// them (a served surface, a test kernel).
+///
+/// Anonymous on purpose: a corridor's identity is its INSTANT, which the engine names it by.
+/// A self-named space here would be refused at injection (core 0.1.78's `check_claim`).
+pub fn time_doors() -> Arc<dyn Space> {
+    Arc::new(
+        EndpointSpace::new()
+            .bind(Exact::new("urn:time:now"), clock_now())
+            .bind(Exact::new("urn:tz:now"), ikigai_tz::now()),
     )
 }
 

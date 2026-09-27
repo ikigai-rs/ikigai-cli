@@ -1437,7 +1437,11 @@ fn build_engine(
                 with_profiles(
                     Engine::new(kernel)
                         .with_spawner(std::sync::Arc::new(ikigai_embedded::scheduler()))
-                        .with_width_routing(ikigai_embedded::width_routing()),
+                        .with_width_routing(ikigai_embedded::width_routing())
+                        // `as-of=<instant>`: this host's time doors, pinned per line (ledger
+                        // #532). Only the in-process kernel gets them — a `--connect` engine
+                        // has none and refuses `as-of=` rather than answering live.
+                        .with_as_of_doors(ikigai_embedded::time_doors()),
                 ),
                 topology,
             ))
@@ -3970,7 +3974,9 @@ mod adapter_gate_tests {
         let kernel = Arc::new(ikigai_embedded::kernel());
         let trace = Arc::new(Recorder::default());
         kernel.set_tracer(trace.clone() as Arc<dyn Tracer>);
-        let engine = with_profiles(Engine::new(Arc::clone(&kernel)));
+        let engine = with_profiles(
+            Engine::new(Arc::clone(&kernel)).with_as_of_doors(ikigai_embedded::time_doors()),
+        );
         Session {
             _lock: lock,
             root,
@@ -4147,5 +4153,36 @@ mod adapter_gate_tests {
             ),
             "the floor passed (a write grant IS held) and the endpoint's own rule refused"
         );
+    }
+
+    /// ★ **`as-of=` over the real composition** (ledger #532): the host's own time doors,
+    /// injected per line by the engine, pin BOTH clocks this host serves — `urn:tz:now` (which
+    /// read `Utc::now()` directly until 0.1.29) and `urn:time:now` — and the next line is live
+    /// again. The kernel here is `ikigai_embedded::kernel()`, which carries a `SystemClock`, so
+    /// "live" is the machine's clock and the pin is the only way the digits could match.
+    #[test]
+    fn as_of_pins_the_hosts_clocks_for_one_line() {
+        let s = session("as-of");
+        assert_eq!(
+            run(
+                &s.engine,
+                "source urn:tz:now zone=UTC as-of=2026-09-25T18:00Z"
+            ),
+            Ok("2026-09-25T18:00:00+00:00".to_string())
+        );
+        // Two different instants, two different corridors, two different answers — so the
+        // HH:MM clock is pinned too, whatever zone the machine running this is in.
+        let six = run(&s.engine, "source urn:time:now as-of=2026-09-25T18:00Z").unwrap();
+        let seven = run(&s.engine, "source urn:time:now as-of=2026-09-25T19:00Z").unwrap();
+        assert_ne!(six, seven);
+        assert_eq!(
+            run(&s.engine, "source urn:time:now as-of=2026-09-25T18:00Z"),
+            Ok(six),
+            "same instant, same corridor, same answer"
+        );
+        // The chain is per line: without `as-of=` the zoned clock is live again.
+        let live = run(&s.engine, "source urn:tz:now zone=UTC").unwrap();
+        assert!(!live.starts_with("2026-09-25T18:00:00"), "{live}");
+        let _ = std::fs::remove_dir_all(s.root.parent().expect("scratch"));
     }
 }

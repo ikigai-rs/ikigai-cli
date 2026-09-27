@@ -12,14 +12,19 @@
 //!   the host's local zone). A full *zoned* clock (date + time + offset), the companion
 //!   to `urn:time:now`'s bare `HH:MM`.
 //!
-//! Both are pure functions of their inputs (the tz database is static), so `convert`
-//! is cacheable and `now` is cacheable until the next minute. Open (no capability) —
-//! nothing sensitive, just arithmetic.
+//! `convert` is a pure function of its inputs (the tz database is static), so it is
+//! cacheable. `now` reads time **through the invocation** ([`read_now`]) — never the OS
+//! clock behind the caller's back — so a temporal corridor (`Scope::with_named_at`, the
+//! engine's `as-of=`) pins it like any other resolution: cacheable until the next minute
+//! under a live clock, [`Expiry::Never`](ikigai_core::Expiry) under a pinned one. Open (no
+//! capability) — nothing sensitive, just arithmetic.
 #![forbid(unsafe_code)]
 
 use chrono::offset::LocalResult;
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
+#[cfg(doc)]
+use ikigai_core::Expiry;
 use ikigai_core::{
     ArgSpec, Description, EndpointSpace, Error, Exact, FnEndpoint, Invocation, ReprType,
     Representation, Result, Time, Verb,
@@ -102,6 +107,75 @@ fn to_instant(s: &str, inv: &Invocation<'_>) -> Result<DateTime<Utc>> {
     }
 }
 
+/// Where a reading of "now" came from — and so how long anything computed from it may be
+/// cached. [`read_now`] answers it; [`fresh`] turns it into an expiry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NowSource {
+    /// A **temporal corridor** pinned the instant: the resolution chain carries the clock
+    /// its corridor derived at injection (`Scope::with_named_at` — the engine's `as-of=`).
+    /// The answer is a pure function of the corridor's NAME, which the cache already keys
+    /// on, so it is cacheable for as long as the name is: [`Expiry::Never`].
+    Pinned,
+    /// The kernel's own clock (`Kernel::with_clock`): live time, cacheable until the next
+    /// minute boundary.
+    Live,
+    /// Neither — a kernel built with no clock, so the OS clock is read directly. The one
+    /// fallback, declared in each description that uses it: nothing can pin this reading,
+    /// which is exactly why every other case goes through the invocation.
+    Ambient,
+}
+
+/// "Now" **as this invocation should see it**, and where that came from.
+///
+/// [`Invocation::now`] is the seam: it prefers a clock attached to the invocation, then the
+/// resolution chain's (a temporal corridor's), then the kernel's — so a pinned corridor pins
+/// this read the same way it pins every sub-request that resolves `urn:time:now`. Only when
+/// it answers `None` is the OS clock read, and that answer is [`NowSource::Ambient`].
+///
+/// `Pinned` is decided by the CHAIN carrying a clock, because that is the clock a corridor
+/// derived; a clock attached to the invocation itself (`Invocation::with_clock`) outranks it
+/// in `now()` and would be reported as pinned too — no endpoint in this workspace attaches one.
+pub fn read_now(inv: &Invocation<'_>) -> Result<(DateTime<Utc>, NowSource)> {
+    let Some(time) = inv.now() else {
+        return Ok((Utc::now(), NowSource::Ambient));
+    };
+    let source = if inv.scope().clock().is_some() {
+        NowSource::Pinned
+    } else {
+        NowSource::Live
+    };
+    // `timestamp_millis_opt`, not `DateTime::from_timestamp_millis`: the manifest pins chrono
+    // at "0.4", and the TimeZone method is the one every 0.4 release has.
+    let instant = i64::try_from(time.as_millis())
+        .ok()
+        .and_then(|millis| Utc.timestamp_millis_opt(millis).single())
+        .ok_or_else(|| {
+            Error::Endpoint(format!(
+                "the invocation's clock reads {} ms since the epoch, which is not a datetime",
+                time.as_millis()
+            ))
+        })?;
+    Ok((instant, source))
+}
+
+/// The expiry a reading of "now" earns: [`Expiry::Never`] under a pinned corridor, else the
+/// next minute boundary (both endpoints render to the minute or finer, and a minute is the
+/// resolution the REPL clock re-renders at).
+///
+/// ⚠ Under a pin, `cacheable_until(pinned + window)` would be WRONG, not merely short: the
+/// kernel judges every `At` deadline on its OWN clock (ledger #517), so a window computed from
+/// a pinned past is already expired and one from a pinned future outlives itself. Core's
+/// `Invocation::now` documents the wrinkle; as-of data declares `cacheable()`.
+pub fn fresh(repr: Representation, now: DateTime<Utc>, source: NowSource) -> Representation {
+    match source {
+        NowSource::Pinned => repr.cacheable(),
+        NowSource::Live | NowSource::Ambient => {
+            let next_minute = ((now.timestamp_millis().max(0) as u64) / 60_000 + 1) * 60_000;
+            repr.cacheable_until(Time::from_millis(next_minute))
+        }
+    }
+}
+
 /// `urn:tz:convert` — re-represent an instant in the `to=` zone. See the [module docs](crate).
 pub fn convert() -> FnEndpoint {
     FnEndpoint::new("tz-convert", |inv: &Invocation<'_>| {
@@ -149,17 +223,21 @@ pub fn convert() -> FnEndpoint {
 }
 
 /// `urn:tz:now` — the current instant as RFC 3339 in `zone=` (default: host local).
+///
+/// "Current" as the INVOCATION sees it ([`read_now`]): a temporal corridor's pinned instant,
+/// else the kernel's clock, else — only on a kernel with no clock at all — the OS clock. The
+/// description says so, because an endpoint whose answer a corridor cannot pin would make
+/// every as-of resolution that reaches it silently live.
 pub fn now() -> FnEndpoint {
     FnEndpoint::new("tz-now", |inv: &Invocation<'_>| {
-        let now = Utc::now();
+        let (now, source) = read_now(inv)?;
         let body = match inv.inline_str("zone") {
             Ok(z) => now
                 .with_timezone(&parse_zone(z.trim(), "zone")?)
                 .to_rfc3339(),
             Err(_) => now.with_timezone(&Local).to_rfc3339(),
         };
-        let next_minute = ((now.timestamp_millis().max(0) as u64) / 60_000 + 1) * 60_000;
-        Ok(text(body).cacheable_until(Time::from_millis(next_minute)))
+        Ok(fresh(text(body), now, source))
     })
     .with_description(
         Description::new("tz-now")
@@ -167,7 +245,11 @@ pub fn now() -> FnEndpoint {
             .summary(
                 "The current instant as RFC 3339 in zone=<IANA zone> (default: the host's local \
                  zone) — a full zoned clock (date + time + offset), the companion to \
-                 urn:time:now's HH:MM. Cacheable until the next minute.",
+                 urn:time:now's HH:MM. \"Current\" is the invocation's clock: a temporal \
+                 corridor's pinned instant (as-of) when the request carries one — then the \
+                 answer is cacheable for as long as the corridor's name — else the kernel's \
+                 clock, cacheable until the next minute. Only a kernel with no clock at all \
+                 falls back to reading the OS clock, which nothing can pin.",
             )
             .verb(Verb::Source)
             .verb(Verb::Meta)
@@ -185,7 +267,9 @@ pub fn now() -> FnEndpoint {
 mod tests {
     use super::*;
     use futures::executor::block_on;
-    use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request};
+    use ikigai_core::{
+        ArgRef, Capability, Endpoint, Expiry, FixedClock, Iri, Kernel, Request, Scope,
+    };
     use std::sync::Arc;
 
     /// Convert `input` with the given args through a real kernel; return the body text.
@@ -281,5 +365,96 @@ mod tests {
     #[test]
     fn a_naive_input_without_from_is_an_error() {
         assert!(convert_err("2026-07-21 12:00", &[("to", "UTC")]));
+    }
+
+    // ---- urn:tz:now reads the invocation (ledger #532) ------------------------------------
+
+    /// 2026-09-25T18:00:00Z — the instant a corridor pins.
+    const PINNED: u64 = 1_790_359_200_000;
+    /// 2026-09-27T12:34:56Z — the kernel's live clock.
+    const LIVE: u64 = 1_790_512_496_000;
+    /// The next minute boundary after [`LIVE`].
+    const LIVE_NEXT_MINUTE: u64 = 1_790_512_500_000;
+
+    fn now_in_utc() -> Request {
+        Request::new(Verb::Source, Iri::parse("urn:tz:now").unwrap())
+            .with_arg("zone", ArgRef::Inline(b"UTC".to_vec()))
+    }
+
+    fn open() -> Capability {
+        Capability::scoped(Vec::<String>::new())
+    }
+
+    /// The corridor the engine's `as-of=` injects: named for its instant, binding the same
+    /// door, carrying the clock derived from that instant.
+    fn pinned_at(millis: u64) -> Scope {
+        Scope::empty().with_named_at(
+            Iri::parse("urn:ctx:time:2026-09-25T18:00:00Z").unwrap(),
+            Arc::new(space()),
+            Arc::new(FixedClock::at(millis)),
+        )
+    }
+
+    #[test]
+    fn a_live_clock_reads_the_kernels_time_and_caches_to_the_minute() {
+        let kernel = Kernel::new(Arc::new(space())).with_clock(Arc::new(FixedClock::at(LIVE)));
+        let rep = block_on(kernel.issue(now_in_utc(), &open())).unwrap();
+        assert_eq!(rep.bytes, b"2026-09-27T12:34:56+00:00");
+        assert_eq!(rep.expiry, Expiry::At(Time::from_millis(LIVE_NEXT_MINUTE)));
+    }
+
+    /// ★ The point of the item: a corridor pins BOTH the answer and its cacheability. The
+    /// kernel's clock is live and says otherwise; the chain's clock wins for what the endpoint
+    /// computes, and the answer — a pure function of the corridor's name — is `Never`.
+    #[test]
+    fn a_temporal_corridor_pins_the_answer_and_makes_it_immutable() {
+        let kernel = Kernel::new(Arc::new(space())).with_clock(Arc::new(FixedClock::at(LIVE)));
+        let rep = block_on(kernel.issue_in(now_in_utc(), &open(), pinned_at(PINNED))).unwrap();
+        assert_eq!(rep.bytes, b"2026-09-25T18:00:00+00:00");
+        assert_eq!(rep.expiry, Expiry::Never);
+        assert!(kernel.is_cached_in(&now_in_utc(), &open(), &pinned_at(PINNED)));
+        // The pin is per chain: the root is still live and still to-the-minute.
+        let live = block_on(kernel.issue(now_in_utc(), &open())).unwrap();
+        assert_eq!(live.bytes, b"2026-09-27T12:34:56+00:00");
+        assert!(matches!(live.expiry, Expiry::At(_)));
+    }
+
+    /// A corridor pins a door the ROOT binds too: the corridor need not rebind it, because the
+    /// root's `urn:tz:now` reads the chain's clock through the invocation. (That is exactly
+    /// what calling `Utc::now()` directly made impossible.)
+    #[test]
+    fn a_corridor_that_binds_nothing_still_pins_the_roots_door() {
+        let kernel = Kernel::new(Arc::new(space())).with_clock(Arc::new(FixedClock::at(LIVE)));
+        let empty_corridor = Scope::empty().with_named_at(
+            Iri::parse("urn:ctx:time:2026-09-25T18:00:00Z").unwrap(),
+            Arc::new(EndpointSpace::new()),
+            Arc::new(FixedClock::at(PINNED)),
+        );
+        let rep = block_on(kernel.issue_in(now_in_utc(), &open(), empty_corridor)).unwrap();
+        assert_eq!(rep.bytes, b"2026-09-25T18:00:00+00:00");
+        assert_eq!(rep.expiry, Expiry::Never);
+    }
+
+    /// The declared fallback: a kernel with no clock reads the OS clock, and says it is live.
+    #[test]
+    fn a_kernel_without_a_clock_falls_back_to_the_os_clock() {
+        let before = Utc::now();
+        let rep = block_on(Kernel::new(Arc::new(space())).issue(now_in_utc(), &open())).unwrap();
+        let read = DateTime::parse_from_rfc3339(std::str::from_utf8(&rep.bytes).unwrap())
+            .unwrap()
+            .with_timezone(&Utc);
+        // RFC 3339 from chrono keeps sub-second digits, so the read is not before `before`
+        // truncated to the second.
+        assert!(read.timestamp() >= before.timestamp(), "{read} vs {before}");
+        assert!(matches!(rep.expiry, Expiry::At(_)));
+    }
+
+    /// The description states the fallback — the manifold must not claim a pinnable clock
+    /// that is secretly the OS's.
+    #[test]
+    fn the_description_declares_where_now_comes_from() {
+        let summary = now().describe().summary;
+        assert!(summary.contains("corridor"), "{summary}");
+        assert!(summary.contains("OS clock"), "{summary}");
     }
 }

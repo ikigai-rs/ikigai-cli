@@ -23,8 +23,8 @@ use std::sync::{Arc, Mutex};
 use futures::executor::block_on;
 use futures::future::join_all;
 use ikigai_core::{
-    ArgRef, BoxFuture, Capability, Description, Expiry, InputSource, Iri, Provenance,
-    Representation, Request, Spawner, Thread, TraceEvent, Tracer, Verb,
+    ArgRef, BoxFuture, Capability, Description, Expiry, FixedClock, InputSource, Iri, Provenance,
+    Representation, Request, Scope, Space, Spawner, Thread, TraceEvent, Tracer, Verb,
 };
 use ikigai_resolve::{CacheStatus, Resolver};
 
@@ -104,6 +104,9 @@ commands:
   source a [input] | b | c   pipeline: `|` pipes the whole output into the next stage
   source a [input] .. b      map: run `b` per newline-item of `a`'s output, rejoin
   source a | ( b ; c )       fork: fan the input to each branch, join their outputs
+  source … as-of=<instant>   resolve the whole line AS OF an RFC 3339 instant: a temporal
+                             corridor `urn:ctx:time:<instant>` pins every clock it reaches
+                             (also on `trace` and `cache`; in-process kernel only)
   plan <spec>                render a pipeline as an ik:Process graph (Turtle) instead of running it
   run <spec>                 resolve <spec> and RUN the ik:Process graph it returns
   sink <iri> [k=v …] <content>  SINK into a resource: leading k=v name declared args, the rest is content
@@ -142,6 +145,7 @@ try:
   source urn:demo:greet greeting=Hello name=World
   source urn:demo:greet Hello name=World
   source urn:iki:fn:toUpper hello | urn:iki:fn:toUpper
+  source urn:tz:now zone=UTC as-of=2026-09-25T18:00Z
   source urn:iki:fn:toUpper \"a | b\"
   source urn:demo:split \"a,b,c\" .. urn:iki:fn:toUpper
   source urn:demo:split \"a,b,c\" | ( urn:iki:fn:toUpper ; urn:iki:fn:reverseList )
@@ -282,6 +286,113 @@ pub struct Engine {
     /// its `content` — so a secret can be piped in and never touch the command line (argv/`ps`)
     /// or the shell history. `take`n on use, so it feeds exactly one write.
     piped_input: RefCell<Option<PipedInput>>,
+    /// The doors a temporal corridor binds when a line says `as-of=<instant>` — the HOST's to
+    /// supply ([`with_as_of_doors`](Self::with_as_of_doors)), because which time names a
+    /// corridor rebinds is a fact about the host's topology, not the grammar's. `None` ⇒
+    /// `as-of=` is refused, never ignored.
+    as_of_doors: Option<Arc<dyn Space>>,
+    /// The resolution chain the CURRENT line resolves in — every stage, fork branch, mapped
+    /// item, contract fetch and cache probe of the line reads it, so a pipeline runs inside
+    /// ONE chain (`Kernel::issue_with_incoming_in` per stage) rather than pinning its first
+    /// stage and resolving the rest live. The empty chain outside an `as-of=` line, and
+    /// restored after one, so nothing leaks into the next line: a per-request corridor needs
+    /// no session state, which is why this is not (yet) a `scope` command.
+    scope: RefCell<Scope>,
+}
+
+/// The name a temporal corridor is injected under: `urn:ctx:time:` + the instant in canonical
+/// RFC 3339 UTC (`2026-09-25T18:00:00Z`). The name IS the corridor's cache identity (core keys
+/// the chain by corridor names, never by the clock), so two spellings of one instant must name
+/// one corridor — hence the canonical form, not what the caller typed.
+pub const AS_OF_CORRIDOR_PREFIX: &str = "urn:ctx:time:";
+
+/// The reserved argument that pins a whole line to one instant. Reserved the way `as` is: it
+/// is peeled off every stage before argument routing, so it never reaches an endpoint and can
+/// never be mistaken for positional input.
+const AS_OF: &str = "as-of";
+
+/// An `as-of=` instant, parsed: its canonical spelling (the corridor's name) and the epoch
+/// milliseconds its derived clock reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AsOf {
+    canonical: String,
+    millis: u64,
+}
+
+/// Parse an `as-of=` value: RFC 3339, with the seconds optional (`2026-09-25T18:00Z` is how
+/// people write an instant, and how the design notes do). A pre-1970 instant is refused —
+/// the kernel's `Time` is unsigned milliseconds.
+fn parse_as_of(raw: &str) -> Result<AsOf, String> {
+    use chrono::{DateTime, SecondsFormat, Utc};
+    let with_seconds = |raw: &str| -> Option<String> {
+        let (date, time) = raw.split_once('T')?;
+        let offset_at_five = matches!(time.as_bytes().get(5), Some(b'Z' | b'z' | b'+' | b'-'));
+        (time.len() > 5 && offset_at_five)
+            .then(|| format!("{date}T{}:00{}", &time[..5], &time[5..]))
+    };
+    let parsed = DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .or_else(|| with_seconds(raw).and_then(|s| DateTime::parse_from_rfc3339(&s).ok()))
+        .ok_or_else(|| {
+            format!(
+                "`{AS_OF}={raw}` is not an instant — write RFC 3339 with an offset, e.g. \
+                 {AS_OF}=2026-09-25T18:00Z or {AS_OF}=2026-09-25T11:00:00-07:00"
+            )
+        })?
+        .with_timezone(&Utc);
+    let millis = u64::try_from(parsed.timestamp_millis()).map_err(|_| {
+        format!("`{AS_OF}={raw}` is before 1970; the kernel's clock cannot read it")
+    })?;
+    Ok(AsOf {
+        canonical: parsed.to_rfc3339_opts(SecondsFormat::AutoSi, true),
+        millis,
+    })
+}
+
+/// Peel every `as-of=` word out of a parsed line — from any stage, branch or sink terminal —
+/// and return the one instant they name. The line runs in ONE chain, so where the word sits
+/// does not change what it means; two words naming DIFFERENT instants are refused (two
+/// spellings of the same instant are one).
+fn take_as_of(pipeline: &mut Pipeline) -> Result<Option<AsOf>, String> {
+    fn words(words: &mut Vec<String>, found: &mut Option<AsOf>) -> Result<(), String> {
+        let mut error = None;
+        words.retain(|word| match word.split_once('=') {
+            Some((AS_OF, raw)) => {
+                match parse_as_of(raw) {
+                    Ok(as_of) => match found {
+                        Some(prior) if *prior != as_of => {
+                            error = Some(format!(
+                                "a line resolves as of ONE instant, and this one names two: \
+                                 {} and {}",
+                                prior.canonical, as_of.canonical
+                            ))
+                        }
+                        _ => *found = Some(as_of),
+                    },
+                    Err(e) => error = Some(e),
+                }
+                false
+            }
+            _ => true,
+        });
+        error.map_or(Ok(()), Err)
+    }
+    fn node(node: &mut Node, found: &mut Option<AsOf>) -> Result<(), String> {
+        match node {
+            Node::Source(w) | Node::Sink(w) => words(w, found),
+            Node::Fork(branches) => branches.iter_mut().try_for_each(|b| walk(b, found)),
+        }
+    }
+    fn walk(pipeline: &mut Pipeline, found: &mut Option<AsOf>) -> Result<(), String> {
+        node(&mut pipeline.first, found)?;
+        pipeline
+            .rest
+            .iter_mut()
+            .try_for_each(|step| node(&mut step.node, found))
+    }
+    let mut found = None;
+    walk(pipeline, &mut found)?;
+    Ok(found)
 }
 
 impl Engine {
@@ -305,7 +416,64 @@ impl Engine {
             fan_out: RefCell::new(None),
             lisp_buffer: RefCell::new(None),
             piped_input: RefCell::new(None),
+            as_of_doors: None,
+            scope: RefCell::new(Scope::empty()),
         }
+    }
+
+    /// Enable `as-of=<instant>`: the doors a temporal corridor binds. A line carrying
+    /// `as-of=` then resolves in `Scope::with_named_at(urn:ctx:time:<instant>, doors, clock)` —
+    /// the corridor AND the clock derived from its instant in one call (ledger #517), so an
+    /// endpoint sees the same pinned time whether it resolves `urn:time:now` or reads
+    /// `inv.now()`.
+    ///
+    /// The doors must not name themselves (`.named(iri)`): the corridor's identity is its
+    /// instant, and core refuses a self-named space injected under another name. Such doors
+    /// make every `as-of=` line an error rather than a panic.
+    pub fn with_as_of_doors(mut self, doors: Arc<dyn Space>) -> Self {
+        self.as_of_doors = Some(doors);
+        self
+    }
+
+    /// The chain an `as-of=` line resolves in, or the empty chain for a line without one.
+    fn as_of_scope(&self, as_of: Option<&AsOf>) -> Result<Scope, String> {
+        let Some(as_of) = as_of else {
+            return Ok(Scope::empty());
+        };
+        let doors = self.as_of_doors.as_ref().ok_or_else(|| {
+            format!(
+                "`{AS_OF}=` needs a host that supplies time doors, and this one does not — a \
+                 `--connect` session resolves on the far kernel, which owns its own topology"
+            )
+        })?;
+        if let Some(own) = doors.id() {
+            return Err(format!(
+                "`{AS_OF}=` cannot inject the host's time doors: they name themselves `{}`, and \
+                 a temporal corridor is named for its instant",
+                own.as_str()
+            ));
+        }
+        let name = Iri::parse(format!("{AS_OF_CORRIDOR_PREFIX}{}", as_of.canonical))
+            .map_err(|e| e.to_string())?;
+        Ok(Scope::empty().with_named_at(
+            name,
+            Arc::clone(doors),
+            Arc::new(FixedClock::at(as_of.millis)),
+        ))
+    }
+
+    /// Run `body` with `scope` as the line's chain, restoring the previous chain after — so a
+    /// nested run (a stored plan's pipeline) cannot leak its chain into the rest of the line.
+    async fn in_scope<T>(&self, scope: Scope, body: impl Future<Output = T>) -> T {
+        let previous = self.scope.replace(scope);
+        let out = body.await;
+        *self.scope.borrow_mut() = previous;
+        out
+    }
+
+    /// The chain the current line resolves in (cheap: an `Arc` clone, or nothing).
+    fn line_scope(&self) -> Scope {
+        self.scope.borrow().clone()
     }
 
     /// Provide a one-shot piped-stdin payload LAZILY: `read` runs only if a content-less
@@ -552,10 +720,14 @@ impl Engine {
     /// `source`, so routing, the binding-only error, and caching all come from
     /// [`run_source`](Self::run_source).
     pub(crate) async fn run_pipeline(&self, spec: &str) -> Result<String, String> {
-        let pipeline = parse_spec(spec)?;
-        self.run_pipeline_node(&pipeline, None, root_provenance())
-            .await?
-            .into_text()
+        let mut pipeline = parse_spec(spec)?;
+        let scope = self.as_of_scope(take_as_of(&mut pipeline)?.as_ref())?;
+        self.in_scope(
+            scope,
+            self.run_pipeline_node(&pipeline, None, root_provenance()),
+        )
+        .await?
+        .into_text()
     }
 
     /// Evaluate an s-expression as Lisp: issue `source urn:lisp:eval` with the
@@ -810,6 +982,8 @@ impl Engine {
         // must not happen on a spawned worker. Stringify on this thread, after the join.
         type Slot = Arc<Mutex<Option<Result<(Representation, CacheStatus), ikigai_core::Error>>>>;
         let capability = self.capability.borrow().clone();
+        // Every branch resolves in the line's chain — a fork under `as-of=` is as-of too.
+        let scope = self.line_scope();
         // The width this fan-out will actually reach: the request count bounded by how
         // many tasks the spawner carries at once, with an unknown width read as 1. The
         // default `single` scheduler answers 1 however many branches there are, and that
@@ -838,6 +1012,7 @@ impl Engine {
                 let resolver = Arc::clone(&self.resolver);
                 let capability = capability.clone();
                 let prov = prov.clone();
+                let scope = scope.clone();
                 let slot = Arc::clone(slot);
                 // `needs=` is a HARD filter and a no-match is a LOUD error, so an
                 // automatic term nothing satisfies must not break a pipeline that would
@@ -852,14 +1027,14 @@ impl Engine {
                 spawner.spawn(Box::pin(async move {
                     // Each fanned-out branch/item inherits the same upstream provenance.
                     let mut result = resolver
-                        .issue_as_async_with_incoming(request, &capability, prov.clone())
+                        .issue_as_async_in(request, &capability, Some(prov.clone()), scope.clone())
                         .await;
                     if let (Err(error), Some(term), Some(fallback)) = (&result, &hint, fallback) {
                         if fanout::is_hint_no_match(&error.to_string(), term) {
                             // Nothing declares a crossover at or below this width. Ask
                             // for what the caller actually asked for.
                             result = resolver
-                                .issue_as_async_with_incoming(fallback, &capability, prov)
+                                .issue_as_async_in(fallback, &capability, Some(prov), scope)
                                 .await;
                         }
                     }
@@ -1219,7 +1394,15 @@ impl Engine {
     /// through). Read-only except that naming arguments fetches the target's
     /// contract (a `Meta`), which is itself cacheable.
     async fn run_cache(&self, spec: &str) -> Result<String, String> {
-        let pipeline = parse_spec(spec)?;
+        let mut pipeline = parse_spec(spec)?;
+        // `cache … as-of=<instant>` probes the corridor's partition — the question "would this
+        // as-of read be served from the cache" — never the root's.
+        let scope = self.as_of_scope(take_as_of(&mut pipeline)?.as_ref())?;
+        self.in_scope(scope, self.probe_cache(pipeline)).await
+    }
+
+    /// [`run_cache`](Self::run_cache) inside the line's chain.
+    async fn probe_cache(&self, pipeline: Pipeline) -> Result<String, String> {
         let words = match pipeline {
             Pipeline {
                 first: Node::Source(words),
@@ -1231,8 +1414,12 @@ impl Engine {
         };
         let (target, args) = words.split_first().ok_or("expected an IRI")?;
         let request = self.source_request(target, args, None).await?;
+        let scope = self.line_scope();
         Ok(
-            if self.resolver.is_cached(&request, &self.capability.borrow()) {
+            if self
+                .resolver
+                .is_cached_in(&request, &self.capability.borrow(), &scope)
+            {
                 "cached".to_string()
             } else {
                 "not cached".to_string()
@@ -1296,7 +1483,13 @@ impl Engine {
     /// default. Trace `urn:iki:fn:compose src=<shape>` to see the fan-out, not the bare
     /// shape (sourcing the shape itself really is one resolution).
     async fn run_trace(&self, spec: &str) -> Result<String, String> {
-        let pipeline = parse_spec(spec)?;
+        let mut pipeline = parse_spec(spec)?;
+        let scope = self.as_of_scope(take_as_of(&mut pipeline)?.as_ref())?;
+        self.in_scope(scope, self.trace_line(pipeline)).await
+    }
+
+    /// [`run_trace`](Self::run_trace) inside the line's chain.
+    async fn trace_line(&self, pipeline: Pipeline) -> Result<String, String> {
         let words = match pipeline {
             Pipeline {
                 first: Node::Source(words),
@@ -1322,8 +1515,19 @@ impl Engine {
                 self.describe_capability()
             ),
             format!("  transport   {}", self.resolver.transport()),
-            String::new(),
         ];
+        // An as-of line says so in the header too: the chain it resolved in, and the instant
+        // its clock was pinned at. The kernel ALSO stamps both on every event (`scope=`,
+        // `scope-clock=` — `SCOPE_NOTE`, `SCOPE_CLOCK_NOTE`), which is where they show per node.
+        let scope = self.line_scope();
+        if !scope.is_empty() {
+            let pinned = scope
+                .now()
+                .map(|t| format!("  ·  clock pinned at {} ms", t.as_millis()))
+                .unwrap_or_default();
+            out.push(format!("  scope       {scope}{pinned}"));
+        }
+        out.push(String::new());
 
         // Record one real resolution: the kernel reports a TraceEvent per invocation
         // — the actual execution, including the branches `compose` fans out onto
@@ -1331,7 +1535,10 @@ impl Engine {
         // span. The resolution genuinely runs, so its cache effects are real too.
         let collector = Arc::new(TraceCollector::default());
         self.resolver.set_tracer(collector.clone());
-        let result = self.resolver.issue_as_async(request, &capability).await;
+        let result = self
+            .resolver
+            .issue_as_async_in(request, &capability, None, scope)
+            .await;
         self.resolver.clear_tracer();
 
         match result {
@@ -1467,9 +1674,11 @@ impl Engine {
         // the session capability, like any request. Clone the capability so no
         // `Ref` borrow is held across the `.await`.
         let capability = self.capability.borrow().clone();
+        // In the line's chain: a corridor may bind the target differently from the root, and
+        // the contract that routes arguments must be the one the resolution will reach.
         let (representation, _) = self
             .resolver
-            .issue_as_async(request, &capability)
+            .issue_as_async_in(request, &capability, None, self.line_scope())
             .await
             .ok()?;
         serde_json::from_slice(&representation.bytes).ok()
@@ -1495,18 +1704,13 @@ impl Engine {
         incoming: Option<Provenance>,
     ) -> Result<Staged, String> {
         let capability = self.capability.borrow().clone();
-        let (representation, status) = match incoming {
-            Some(prov) => self
-                .resolver
-                .issue_as_async_with_incoming(request, &capability, prov)
-                .await
-                .map_err(|e| describe(&*self.resolver, &e))?,
-            None => self
-                .resolver
-                .issue_as_async(request, &capability)
-                .await
-                .map_err(|e| describe(&*self.resolver, &e))?,
-        };
+        // The empty chain takes the unscoped path inside `issue_as_async_in` on every resolver,
+        // so a line without `as-of=` issues exactly what it issued before chains existed.
+        let (representation, status) = self
+            .resolver
+            .issue_as_async_in(request, &capability, incoming, self.line_scope())
+            .await
+            .map_err(|e| describe(&*self.resolver, &e))?;
         let mut stats = self.cache.get();
         stats.record(status);
         self.cache.set(stats);
@@ -4359,6 +4563,193 @@ mod tests {
         assert_eq!(
             endpoint_name(&entries, &Iri::parse("urn:org:agenda:week").unwrap()),
             "org-agenda"
+        );
+    }
+
+    // ---- `as-of=`: one temporal corridor per line (ledger #532) --------------------------
+
+    /// 2026-09-25T18:00:00Z, the instant the tests pin.
+    const PINNED: u64 = 1_790_359_200_000;
+    /// The kernel's live clock — a different day, so a leak is visible in the digits.
+    const LIVE: u64 = 1_790_512_496_000;
+
+    /// `urn:test:clock` reads the time THROUGH THE INVOCATION, the way `urn:tz:now` does after
+    /// this arc: pinned ⇒ immutable, live ⇒ uncacheable. `urn:test:stamp` appends the time to
+    /// its piped input, so a later pipeline stage shows which clock IT saw.
+    fn clock_endpoint() -> FnEndpoint {
+        FnEndpoint::new("clock", |inv: &Invocation<'_>| {
+            let now = inv.now().map(|t| t.as_millis()).unwrap_or(0);
+            let repr =
+                Representation::new(ReprType::new("text/plain"), now.to_string().into_bytes());
+            Ok(if inv.scope().clock().is_some() {
+                repr.cacheable()
+            } else {
+                repr
+            })
+        })
+        .with_description(Description::new("clock").verb(Verb::Source))
+    }
+
+    fn as_of_engine(doors: bool) -> Engine {
+        let stamp = FnEndpoint::new("stamp", |inv: &Invocation<'_>| {
+            let input = inv.inline_str("in").unwrap_or("");
+            let now = inv.now().map(|t| t.as_millis()).unwrap_or(0);
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("{input}|{now}").into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("stamp")
+                .verb(Verb::Source)
+                .input(ArgSpec::new("in").summary("the value to stamp")),
+        );
+        let kernel = Kernel::with_meta_renderer(
+            Arc::new(
+                EndpointSpace::new()
+                    .bind(Exact::new("urn:test:clock"), clock_endpoint())
+                    .bind(Exact::new("urn:test:stamp"), stamp),
+            ),
+            Arc::new(JsonRenderer),
+        )
+        .with_clock(Arc::new(FixedClock::at(LIVE)));
+        let engine = Engine::new(kernel);
+        if doors {
+            engine.with_as_of_doors(Arc::new(
+                EndpointSpace::new().bind(Exact::new("urn:test:clock"), clock_endpoint()),
+            ))
+        } else {
+            engine
+        }
+    }
+
+    #[test]
+    fn as_of_pins_every_stage_of_the_line_and_nothing_after_it() {
+        let engine = as_of_engine(true);
+        let pinned =
+            output(engine.eval("source urn:test:clock as-of=2026-09-25T18:00Z | urn:test:stamp"));
+        assert_eq!(
+            pinned,
+            Ok(format!("{PINNED}|{PINNED}")),
+            "both stages ran in the corridor"
+        );
+        // The chain is the LINE's: the next line is live again.
+        let live = output(engine.eval("source urn:test:clock | urn:test:stamp"));
+        assert_eq!(live, Ok(format!("{LIVE}|{LIVE}")));
+    }
+
+    /// Where the word sits does not change what it means — the whole line is one chain —
+    /// and two spellings of one instant are one instant, while two instants are refused.
+    #[test]
+    fn as_of_is_one_instant_per_line_wherever_it_is_written() {
+        let engine = as_of_engine(true);
+        assert_eq!(
+            output(
+                engine.eval("source urn:test:clock | urn:test:stamp as-of=2026-09-25T18:00:00Z")
+            ),
+            Ok(format!("{PINNED}|{PINNED}"))
+        );
+        assert_eq!(
+            output(engine.eval(
+                "source urn:test:clock as-of=2026-09-25T18:00Z | urn:test:stamp \
+                 as-of=2026-09-25T11:00:00-07:00"
+            )),
+            Ok(format!("{PINNED}|{PINNED}"))
+        );
+        let two = output(engine.eval(
+            "source urn:test:clock as-of=2026-09-25T18:00Z | urn:test:stamp as-of=2026-09-25T19:00Z",
+        ))
+        .unwrap_err();
+        assert!(two.contains("names two"), "{two}");
+    }
+
+    #[test]
+    fn a_fork_under_as_of_resolves_every_branch_in_the_corridor() {
+        for engine in [
+            as_of_engine(true),
+            as_of_engine(true).with_spawner(Arc::new(InlineSpawner)),
+        ] {
+            let forked = output(engine.eval(
+                "source urn:test:clock as-of=2026-09-25T18:00Z | ( urn:test:stamp ; urn:test:stamp )",
+            ));
+            assert_eq!(forked, Ok(format!("{PINNED}|{PINNED}\n{PINNED}|{PINNED}")));
+        }
+    }
+
+    /// `cache` probes the corridor's partition: the as-of read is cached THERE (it is a pure
+    /// function of the corridor's name) and the live read is not cached anywhere.
+    #[test]
+    fn cache_probes_the_corridors_partition() {
+        let engine = as_of_engine(true);
+        assert_eq!(
+            output(engine.eval("cache urn:test:clock as-of=2026-09-25T18:00Z")),
+            Ok("not cached".to_string())
+        );
+        output(engine.eval("source urn:test:clock as-of=2026-09-25T18:00Z")).unwrap();
+        assert_eq!(
+            output(engine.eval("cache urn:test:clock as-of=2026-09-25T18:00Z")),
+            Ok("cached".to_string())
+        );
+        assert_eq!(
+            output(engine.eval("cache urn:test:clock")),
+            Ok("not cached".to_string()),
+            "the root's partition never saw the as-of read"
+        );
+    }
+
+    /// `trace` names the chain and the pinned clock in its header, and the kernel's own
+    /// `SCOPE_NOTE` / `SCOPE_CLOCK_NOTE` ride on the node.
+    #[test]
+    fn trace_shows_the_corridor_and_its_clock() {
+        let engine = as_of_engine(true);
+        let traced = output(engine.eval("trace urn:test:clock as-of=2026-09-25T18:00Z")).unwrap();
+        assert!(
+            traced.contains("scope       urn:ctx:time:2026-09-25T18:00:00Z root"),
+            "{traced}"
+        );
+        assert!(
+            traced.contains(&format!(
+                "{}=urn:ctx:time:2026-09-25T18:00:00Z root",
+                ikigai_core::SCOPE_NOTE
+            )),
+            "{traced}"
+        );
+        assert!(
+            traced.contains(&format!("{}={PINNED}", ikigai_core::SCOPE_CLOCK_NOTE)),
+            "{traced}"
+        );
+        let plain = output(engine.eval("trace urn:test:clock")).unwrap();
+        assert!(!plain.contains("scope"), "{plain}");
+    }
+
+    /// Refused, never ignored: an engine without time doors (a `--connect` session, the
+    /// browser demo) must not answer an as-of line with the live time.
+    #[test]
+    fn as_of_without_time_doors_or_with_a_bad_instant_is_refused() {
+        let bare = as_of_engine(false);
+        let refused =
+            output(bare.eval("source urn:test:clock as-of=2026-09-25T18:00Z")).unwrap_err();
+        assert!(refused.contains("time doors"), "{refused}");
+        let engine = as_of_engine(true);
+        let bad = output(engine.eval("source urn:test:clock as-of=yesterday")).unwrap_err();
+        assert!(bad.contains("is not an instant"), "{bad}");
+        let early =
+            output(engine.eval("source urn:test:clock as-of=1969-07-20T20:17Z")).unwrap_err();
+        assert!(early.contains("before 1970"), "{early}");
+    }
+
+    #[test]
+    fn the_corridor_is_named_for_the_canonical_instant() {
+        assert_eq!(
+            parse_as_of("2026-09-25T11:00-07:00").unwrap(),
+            AsOf {
+                canonical: "2026-09-25T18:00:00Z".to_string(),
+                millis: PINNED
+            }
+        );
+        assert_eq!(
+            parse_as_of("2026-09-25T18:00:00.250Z").unwrap().canonical,
+            "2026-09-25T18:00:00.250Z"
         );
     }
 }

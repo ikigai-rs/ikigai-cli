@@ -3143,6 +3143,7 @@ dependencies = [
 name = "ikigai-engine"
 version = "0.1.29"
 dependencies = [
+ "chrono",
  "futures",
  "ikigai-core",
  "ikigai-fs",
