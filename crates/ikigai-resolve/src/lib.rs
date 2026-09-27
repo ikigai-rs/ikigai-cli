@@ -251,8 +251,15 @@ impl Space for RemoteSpace {
     fn resolve(&self, request: &Request, _scope: &Scope) -> Resolution {
         // Capture the whole request (target + verb + args) so the endpoint forwards
         // it verbatim; the caller's capability arrives via the Invocation on invoke.
-        Resolution::Hit(Resolved {
-            endpoint: Arc::new(ForwardingEndpoint {
+        // The constructor, not the literal: `Resolved` grows fields (`canonical` at
+        // core 0.1.64, `answered_by` at 0.1.78), and a literal in a PUBLISHED crate
+        // stops compiling for every lockless consumer the day core publishes one.
+        // `Resolved::new` reports no canonical — nothing is rewritten here, the
+        // request goes over the wire under the name it arrived with. (Even if it
+        // were, it would not be a canonical: see `MountedRemote::resolve` below for
+        // why a mount never reports one.)
+        Resolution::Hit(Resolved::new(
+            Arc::new(ForwardingEndpoint {
                 resolver: Arc::clone(&self.resolver),
                 name: self.names.name_for(&request.target),
                 // A bare `RemoteSpace` is mounted by a caller that holds the resolver;
@@ -263,12 +270,8 @@ impl Space for RemoteSpace {
                 health: None,
                 request: request.clone(),
             }),
-            bindings: Bindings::new(),
-            // Nothing is rewritten here — the request goes over the wire under the
-            // name it arrived with. (Even if it were, it would not be a canonical:
-            // see `MountedRemote::resolve` below for why a mount never reports one.)
-            canonical: None,
-        })
+            Bindings::new(),
+        ))
     }
 
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
@@ -775,15 +778,14 @@ impl Space for MountedRemote {
         // it must not sit inside a namespace the peer owns, where a real remote resource
         // could collide with it.
         if request.target.as_str() == mount_status_iri(&self.prefix) {
-            return Resolution::Hit(Resolved {
-                endpoint: Arc::new(MountUnavailable {
+            return Resolution::Hit(Resolved::new(
+                Arc::new(MountUnavailable {
                     prefix: self.prefix.clone(),
                     origin: self.origin.clone(),
                     reason: self.health.failing(),
                 }),
-                bindings: Bindings::new(),
-                canonical: None,
-            });
+                Bindings::new(),
+            ));
         }
         // Only our namespace.
         let Some(rest) = request.target.as_str().strip_prefix(&self.prefix) else {
@@ -800,32 +802,33 @@ impl Space for MountedRemote {
         // An OVERRIDE forwards the IRI verbatim — the remote serves this very
         // namespace, so there is nothing to rewrite. The name lookup happens on
         // the FORWARDED target, which is in the remote's namespace either way.
-        Resolution::Hit(Resolved {
-            endpoint: Arc::new(ForwardingEndpoint {
+        //
+        // ★ A MOUNT REWRITES AND STILL REPORTS NO CANONICAL — which is why this is
+        // the bare `Resolved::new` and not `.with_canonical(..)`. `Alias` mode just
+        // rewrote the target above (`urn:edge:foo` → `urn:foo`), so a mechanical
+        // sweep would forward that as `canonical` — and it would be wrong.
+        // `Resolved::canonical` means "the same resource under another name IN
+        // THIS KERNEL'S NAMESPACE": the kernel adopts it as the cache id and the
+        // golden-thread key. A mount's rewrite crosses a namespace boundary —
+        // `urn:foo` is meaningful in the REMOTE, and this kernel may serve an
+        // entirely unrelated local `urn:foo`. Reporting it would fuse two
+        // different resources into one cache entry and one thread. The stripped
+        // name is a wire address, not a local name, so it stays inside the
+        // forwarded request and never reaches the kernel's identity computation.
+        //
+        // If a mounted name and a local name should ever share identity, that
+        // needs a concept that carries ORIGIN alongside the name; `canonical`,
+        // which is a bare `Iri`, cannot express it.
+        Resolution::Hit(Resolved::new(
+            Arc::new(ForwardingEndpoint {
                 resolver: Arc::clone(&self.resolver),
                 name: self.names.name_for(&forwarded.target),
                 origin: Some(self.origin.clone()),
                 health: Some(Arc::clone(&self.health)),
                 request: forwarded,
             }),
-            bindings: Bindings::new(),
-            // ★ A MOUNT REWRITES AND STILL REPORTS NO CANONICAL. `Alias` mode just
-            // rewrote the target above (`urn:edge:foo` → `urn:foo`), so a mechanical
-            // sweep would forward that as `canonical` — and it would be wrong.
-            // `Resolved::canonical` means "the same resource under another name IN
-            // THIS KERNEL'S NAMESPACE": the kernel adopts it as the cache id and the
-            // golden-thread key. A mount's rewrite crosses a namespace boundary —
-            // `urn:foo` is meaningful in the REMOTE, and this kernel may serve an
-            // entirely unrelated local `urn:foo`. Reporting it would fuse two
-            // different resources into one cache entry and one thread. The stripped
-            // name is a wire address, not a local name, so it stays inside the
-            // forwarded request and never reaches the kernel's identity computation.
-            //
-            // If a mounted name and a local name should ever share identity, that
-            // needs a concept that carries ORIGIN alongside the name; `canonical`,
-            // which is a bare `Iri`, cannot express it.
-            canonical: None,
-        })
+            Bindings::new(),
+        ))
     }
 
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
