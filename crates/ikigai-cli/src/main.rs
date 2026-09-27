@@ -1519,12 +1519,16 @@ fn resolve_mounts(
 /// plist cannot say both. A plist is deployed from the repo and `git pull` would overwrite a
 /// machine's identity with another's; a config file is that machine's own.
 fn config_mounts() -> Result<Vec<Mount>, String> {
-    mounts_from_config_lines(ikigai_embedded::config::all("mount"))
+    mounts_from_config_lines(ikigai_embedded::config::all("mount"), &home_dir())
 }
 
-/// [`config_mounts`] over lines already read, so the line grammar is testable without a
-/// config home: the environment is process-global, and mutating it races the test harness.
-fn mounts_from_config_lines(lines: Vec<String>) -> Result<Vec<Mount>, String> {
+/// [`config_mounts`] over lines already read and a home already resolved, so the line
+/// grammar is testable without a config home OR a `$HOME`: the environment is
+/// process-global, and both mutating it and reading it race the test harness.
+fn mounts_from_config_lines(
+    lines: Vec<String>,
+    home: &std::path::Path,
+) -> Result<Vec<Mount>, String> {
     lines
         .into_iter()
         .map(|line| {
@@ -1550,7 +1554,7 @@ fn mounts_from_config_lines(lines: Vec<String>) -> Result<Vec<Mount>, String> {
             })?;
             let mut certs = Certs::default();
             if let Some(dir) = parts.next() {
-                certs.cert_dir = Some(shellexpand_home(dir));
+                certs.cert_dir = Some(shellexpand_home(dir, home));
             }
             Ok(Mount {
                 prefix: prefix.to_string(),
@@ -1562,15 +1566,25 @@ fn mounts_from_config_lines(lines: Vec<String>) -> Result<Vec<Mount>, String> {
         .collect()
 }
 
-/// `~/x` → `$HOME/x`. A config file is hand-written, and `~` is what a person types.
-fn shellexpand_home(path: &str) -> String {
+/// `~/x` → `<home>/x`. A config file is hand-written, and `~` is what a person types.
+///
+/// The home is a parameter, not a `$HOME` read: the environment is process-global, and a
+/// test elsewhere in this binary redirects `HOME` to a scratch dir under its own lock. A
+/// helper that read it here would race that test — and did (`tilde_spelling_matches_the_
+/// expanded_socket` failed once on a branch that touched neither). [`home_dir`] is the one
+/// place the read happens.
+fn shellexpand_home(path: &str, home: &std::path::Path) -> String {
     match path.strip_prefix("~/") {
-        Some(rest) => std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-            .join(rest)
-            .display()
-            .to_string(),
+        Some(rest) => home.join(rest).display().to_string(),
         None => path.to_string(),
     }
+}
+
+/// `$HOME`, read once at the top of a call chain and passed down. An unset `HOME` expands
+/// `~/x` to a relative `x`, as it always has.
+#[cfg(feature = "embedded")]
+fn home_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
 }
 
 /// Turn a parsed [`Mount`] into a [`MountSpec`](ikigai_embedded::MountSpec), connecting eagerly or lazily
@@ -2536,10 +2550,11 @@ fn serve_ipc(path: Option<String>, mounts: Mounts) -> ! {
     // socket would resolve through ourselves — at best a pointless hop, at worst a
     // recursive loop on every miss under the prefix — so it is skipped, with one
     // warning each, rather than dialed.
+    let home = home_dir();
     let mounts: Vec<Mount> = mounts
         .into_iter()
         .filter(|mount| {
-            let own = is_own_socket(&mount.target, &socket);
+            let own = is_own_socket(&mount.target, &socket, &home);
             if own {
                 eprintln!(
                     "ikigai: mount `{}={}` targets this process's own serve socket — \
@@ -2649,12 +2664,13 @@ fn is_own_quic_addr(target: &str, bind: std::net::SocketAddr, announced: Option<
 /// a symlinked spelling of the same socket is not caught, which errs on the
 /// side of mounting.
 #[cfg(all(feature = "embedded", feature = "ipc", unix))]
-fn is_own_socket(target: &str, socket: &std::path::Path) -> bool {
+fn is_own_socket(target: &str, socket: &std::path::Path, home: &std::path::Path) -> bool {
     if is_quic(target) || target.starts_with("peer:") {
         return false;
     }
     let absolute = |p: std::path::PathBuf| std::path::absolute(&p).unwrap_or(p);
-    absolute(std::path::PathBuf::from(shellexpand_home(target))) == absolute(socket.to_path_buf())
+    absolute(std::path::PathBuf::from(shellexpand_home(target, home)))
+        == absolute(socket.to_path_buf())
 }
 
 /// What `sockaddr_un`'s `sun_path` holds on this platform: 104 bytes on
@@ -3263,8 +3279,11 @@ mod mount_posture_tests {
         ] {
             assert_eq!(mount_mode(kind), word);
             // …and the grammar really parses it back.
-            let parsed = mounts_from_config_lines(vec![format!("{word} urn:x:=/tmp/x.sock")])
-                .expect("the mode word round-trips through the config grammar");
+            let parsed = mounts_from_config_lines(
+                vec![format!("{word} urn:x:=/tmp/x.sock")],
+                std::path::Path::new("/tmp/ikigai-test-home"),
+            )
+            .expect("the mode word round-trips through the config grammar");
             assert_eq!(parsed[0].kind, kind);
         }
     }
@@ -3274,22 +3293,22 @@ mod mount_posture_tests {
     /// is the one on plasma that started #410).
     #[test]
     fn a_config_home_mount_line_still_parses() {
-        let mounts = mounts_from_config_lines(vec![
-            "prefer urn:iki:store:=/Users/x/.ikigai/gonk.sock".to_string(),
-            "alias urn:cal:=quic://bug.local:4433 ~/.config/ikigai/quic-bug".to_string(),
-        ])
+        let mounts = mounts_from_config_lines(
+            vec![
+                "prefer urn:iki:store:=/Users/x/.ikigai/gonk.sock".to_string(),
+                "alias urn:cal:=quic://bug.local:4433 ~/.config/ikigai/quic-bug".to_string(),
+            ],
+            std::path::Path::new("/Users/x"),
+        )
         .expect("both lines parse");
         assert_eq!(mounts.len(), 2);
         assert_eq!(mounts[0].kind, ikigai_embedded::MountKind::Prefer);
         assert_eq!(mounts[0].prefix, "urn:iki:store:");
         assert_eq!(mounts[1].kind, ikigai_embedded::MountKind::Alias);
-        assert!(
-            mounts[1]
-                .certs
-                .cert_dir
-                .as_deref()
-                .is_some_and(|dir| !dir.starts_with('~')),
-            "a config line's `~` is expanded"
+        assert_eq!(
+            mounts[1].certs.cert_dir.as_deref(),
+            Some("/Users/x/.config/ikigai/quic-bug"),
+            "a config line's `~` is expanded against the home it was handed"
         );
     }
 }
@@ -3527,27 +3546,35 @@ mod own_socket_tests {
     use super::is_own_socket;
     use std::path::Path;
 
+    /// A fixed home: the guard's `~` expansion is against whatever home it is HANDED,
+    /// so the test needs no `$HOME` and cannot race the test that redirects it.
+    const HOME: &str = "/tmp/ikigai-test-home";
+
     /// The config home is shared machine-wide, so the serving process reads the very
     /// mount lines that point everyone ELSE at its socket — those must read as "own"
     /// however the path is spelled, while genuinely-remote targets must not.
     #[test]
     fn own_socket_is_detected_across_spellings() {
+        let home = Path::new(HOME);
         let socket = Path::new("/tmp/ikigai-test/serve.sock");
-        assert!(is_own_socket("/tmp/ikigai-test/serve.sock", socket));
+        assert!(is_own_socket("/tmp/ikigai-test/serve.sock", socket, home));
         // A lexically-different spelling of the same path.
-        assert!(is_own_socket("/tmp/ikigai-test/./serve.sock", socket));
-        assert!(!is_own_socket("/tmp/ikigai-test/other.sock", socket));
+        assert!(is_own_socket("/tmp/ikigai-test/./serve.sock", socket, home));
+        assert!(!is_own_socket("/tmp/ikigai-test/other.sock", socket, home));
         // Remote targets are never "own" — the IPC server's identity is a Unix path.
-        assert!(!is_own_socket("quic://plasma.local:4433", socket));
-        assert!(!is_own_socket("peer:plasma", socket));
+        assert!(!is_own_socket("quic://plasma.local:4433", socket, home));
+        assert!(!is_own_socket("peer:plasma", socket, home));
     }
 
-    /// `~` in a config line expands against $HOME before comparing.
+    /// `~` in a config line expands against the home the guard is handed before comparing.
     #[test]
     fn tilde_spelling_matches_the_expanded_socket() {
-        let home = std::env::var("HOME").expect("HOME set in test env");
-        let socket = std::path::PathBuf::from(home).join(".ikigai-test.sock");
-        assert!(is_own_socket("~/.ikigai-test.sock", &socket));
+        let home = Path::new(HOME);
+        let socket = home.join(".ikigai-test.sock");
+        assert!(is_own_socket("~/.ikigai-test.sock", &socket, home));
+        // …and only against that home: a socket under another home is not this one.
+        let elsewhere = Path::new("/tmp/ikigai-other-home").join(".ikigai-test.sock");
+        assert!(!is_own_socket("~/.ikigai-test.sock", &elsewhere, home));
     }
 }
 
