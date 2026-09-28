@@ -27,7 +27,7 @@
 //!
 //! App logic — scheduling, forms, policy — stays in resources, compositions, and
 //! capabilities *above* this transport, exactly as the other transports (quic/ipc/mcp) keep
-//! the kernel's behaviour out of the wire layer.
+//! the kernel's behavior out of the wire layer.
 #![forbid(unsafe_code)]
 
 use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request, Verb};
@@ -39,9 +39,17 @@ use tokio::net::{TcpListener, TcpStream};
 /// A parsed HTTP request — what the router and the capability function see.
 pub struct HttpRequest {
     pub method: String,
-    /// The decoded path, no query (e.g. `/account/id/alice`).
+    /// The path, no query, each segment percent-decoded ON ITS OWN after splitting
+    /// (e.g. `/account/id/alice`).
+    ///
+    /// ⚠ An encoded `%2F` is DATA inside its segment, never a separator (RFC 3986 §2.2): a
+    /// client cannot add a segment by encoding one. To keep that true of this one string, a
+    /// decoded `/` or `%` inside a segment stays escaped here (`%2F`, `%25`), so splitting
+    /// `path` on `/` always yields the request's own segments. Every other escape is
+    /// decoded, and `+` is a literal `+` — form encoding applies to the query only.
     pub path: String,
-    /// Query pairs (filters over a partition; the partition itself is in the path).
+    /// Query pairs (filters over a partition; the partition itself is in the path), decoded
+    /// as `application/x-www-form-urlencoded`: percent-escapes, and `+` as a space.
     pub query: Vec<(String, String)>,
     /// Header names are lowercased.
     pub headers: Vec<(String, String)>,
@@ -164,6 +172,30 @@ pub type PrincipalFn = Arc<dyn Fn(&HttpRequest) -> Option<String> + Send + Sync>
 /// generous fields cannot honestly approach this even fully percent-encoded.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 
+/// How long a client may take to send its request line and headers, from the moment the
+/// connection is accepted. A client that has not finished by then is answered `408` and
+/// dropped. Ten seconds is generous for any real client (a browser sends its headers in one
+/// write) and short enough that a slow-loris trickle holds a connection for seconds, not
+/// forever. [Overridable](EdgeConfig::header_timeout).
+pub const DEFAULT_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a client may take to deliver the body it declared, once the headers are in.
+/// Past it the request is answered `408`. Thirty seconds carries a full
+/// [`DEFAULT_MAX_BODY_BYTES`] at about 35 KB/s. [Overridable](EdgeConfig::body_timeout).
+pub const DEFAULT_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long writing the response may take. A client that stops reading would otherwise hold
+/// its connection (and its place under [`DEFAULT_MAX_CONNECTIONS`]) for as long as it
+/// liked. Past it the connection is dropped. [Overridable](EdgeConfig::write_timeout).
+pub const DEFAULT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How many connections are served at once. A connection past the cap is answered `503`
+/// with `Retry-After` straight away, without its request being handled. Every current door
+/// (gonk, ttt-host, a LAN `serve --http`) serves a handful of people, and one request per
+/// connection means a connection lives only as long as one request; 256 is far above any of
+/// them and far below what exhausts a process's descriptors. [Overridable](EdgeConfig::max_connections).
+pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
+
 /// Edge response policy: security headers, CORS, and whether to trust a fronting proxy's
 /// `X-Forwarded-*`. [`Default`] is a safe public-edge posture — strict security headers,
 /// CORS **closed**, proxy **not** trusted. (Per-route policy is a later slice; this is the
@@ -196,6 +228,15 @@ pub struct EdgeConfig {
     /// The principal hook — see [`PrincipalFn`] for the shape it stamps. `None` (the
     /// default) attaches no `principal` argument to anything.
     pub principal_fn: Option<PrincipalFn>,
+    /// The deadline for the request line and headers. Default [`DEFAULT_HEADER_TIMEOUT`].
+    pub header_timeout: std::time::Duration,
+    /// The deadline for the declared body. Default [`DEFAULT_BODY_TIMEOUT`].
+    pub body_timeout: std::time::Duration,
+    /// The deadline for writing the response. Default [`DEFAULT_WRITE_TIMEOUT`].
+    pub write_timeout: std::time::Duration,
+    /// Connections served at once; one past it is answered `503`. Default
+    /// [`DEFAULT_MAX_CONNECTIONS`]. `0` refuses every connection.
+    pub max_connections: usize,
 }
 
 /// A shared, swappable [`RouteTable`] for hot-reload. The server reads the current table per
@@ -227,6 +268,10 @@ impl Default for EdgeConfig {
             routes_only: false,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             principal_fn: None,
+            header_timeout: DEFAULT_HEADER_TIMEOUT,
+            body_timeout: DEFAULT_BODY_TIMEOUT,
+            write_timeout: DEFAULT_WRITE_TIMEOUT,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
         }
     }
 }
@@ -275,11 +320,7 @@ impl RouteTable {
     /// Match `path` against the routes in order; the first hit resolves the IRI template with
     /// the captured vars and returns it with the route's overrides. `None` → fall through.
     fn match_path(&self, path: &str) -> Option<Matched> {
-        let segs: Vec<&str> = path
-            .trim_matches('/')
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .collect();
+        let segs = path_segments(path);
         for route in &self.routes {
             let pat: Vec<&str> = route
                 .pattern
@@ -427,13 +468,63 @@ pub async fn serve_with_listener(
         routes,
         tombstones: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
+    // The connection cap. A permit is taken at accept and held until the connection's task
+    // ends, so the cap counts connections, not requests (the same thing here: one request
+    // per connection). `Semaphore::new` panics above `MAX_PERMITS`, hence the clamp.
+    let permits = Arc::new(tokio::sync::Semaphore::new(
+        shared
+            .config
+            .max_connections
+            .min(tokio::sync::Semaphore::MAX_PERMITS),
+    ));
     loop {
         let (sock, peer) = listener.accept().await?;
         let shared = Arc::clone(&shared);
-        tokio::spawn(async move {
-            let _ = handle(sock, peer.ip(), shared).await;
-        });
+        match Arc::clone(&permits).try_acquire_owned() {
+            Ok(permit) => {
+                tokio::spawn(async move {
+                    let _ = handle(sock, peer.ip(), shared).await;
+                    drop(permit);
+                });
+            }
+            // Over the cap: answer 503 without handling the request, on its own task so a
+            // client that will not take the answer cannot stall the accept loop.
+            Err(_) => {
+                tokio::spawn(async move { refuse_busy(sock, &shared.config).await });
+            }
+        }
     }
+}
+
+/// Answer a connection past the cap: `503` with `Retry-After`, then a LINGERING close.
+///
+/// The request is never parsed, but it has usually arrived, and closing a socket with unread
+/// bytes in its receive buffer sends a reset — which on most stacks destroys the `503` before
+/// the client reads it (measured: the first version of this test saw `ECONNRESET`, not a
+/// status). So: write, half-close, then drain what the client sent until it hangs up, bounded
+/// by the header deadline and 64 KiB. Holds no permit, so it is bounded by those two alone.
+async fn refuse_busy(mut sock: TcpStream, config: &EdgeConfig) {
+    let mut busy = Resp::text(503, "Service Unavailable", "too many connections");
+    busy.headers
+        .push(("Retry-After".to_string(), "1".to_string()));
+    if write_within(&mut sock, busy, config.write_timeout)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let _ = sock.shutdown().await;
+    let drain = async {
+        let mut tmp = [0u8; 1024];
+        let mut seen = 0usize;
+        while seen < 64 * 1024 {
+            match sock.read(&mut tmp).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => seen += n,
+            }
+        }
+    };
+    let _ = tokio::time::timeout(config.header_timeout, drain).await;
 }
 
 /// The response the adapter builds before writing it to the socket.
@@ -477,36 +568,59 @@ impl Resp {
     }
 }
 
-async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::io::Result<()> {
-    // Read up to the end of the headers (blank line).
-    let mut buf = Vec::new();
+/// How reading the request line and headers ended.
+enum Head {
+    /// The blank line arrived; the headers end at this offset in the buffer.
+    End(usize),
+    /// The client hung up first.
+    Closed,
+    /// The headers outgrew the bound before they ended.
+    TooLarge,
+}
+
+/// Read up to the end of the headers (the blank line), into `buf`.
+async fn read_head(sock: &mut TcpStream, buf: &mut Vec<u8>) -> std::io::Result<Head> {
     let mut tmp = [0u8; 1024];
-    let header_end = loop {
+    loop {
         if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos;
+            return Ok(Head::End(pos));
         }
         let n = sock.read(&mut tmp).await?;
         if n == 0 {
-            return Ok(());
+            return Ok(Head::Closed);
         }
         buf.extend_from_slice(&tmp[..n]);
         if buf.len() > 64 * 1024 {
-            return write(
-                &mut sock,
-                Resp::text(431, "Request Header Fields Too Large", ""),
-            )
-            .await;
+            return Ok(Head::TooLarge);
         }
-    };
-    let mut req = match parse_head(&String::from_utf8_lossy(&buf[..header_end])) {
-        Some(r) => r,
-        None => {
-            return write(
-                &mut sock,
-                Resp::text(400, "Bad Request", "malformed request"),
-            )
+    }
+}
+
+async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::io::Result<()> {
+    let wt = shared.config.write_timeout;
+    // THE HEADERS ARE READ UNDER A DEADLINE. Without one a client that sends a byte every few
+    // seconds (slow-loris) holds this connection, and its place under the cap, forever.
+    let mut buf = Vec::new();
+    let header_end =
+        match tokio::time::timeout(shared.config.header_timeout, read_head(&mut sock, &mut buf))
             .await
-        }
+        {
+            Err(_) => {
+                let resp = Resp::text(408, "Request Timeout", "request headers took too long");
+                return write_within(&mut sock, resp, wt).await;
+            }
+            Ok(read) => match read? {
+                Head::End(pos) => pos,
+                Head::Closed => return Ok(()),
+                Head::TooLarge => {
+                    let resp = Resp::text(431, "Request Header Fields Too Large", "");
+                    return write_within(&mut sock, resp, wt).await;
+                }
+            },
+        };
+    let mut req = match parse_head(&buf[..header_end]) {
+        Ok(r) => r,
+        Err(why) => return write_within(&mut sock, Resp::text(400, "Bad Request", why), wt).await,
     };
     // THE FRAMING IS SETTLED BEFORE A BODY BYTE IS READ. Everything here decides how much
     // an anonymous client may make this process hold and hand onward, and this door is
@@ -518,9 +632,10 @@ async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::
     // Content-Length" would both skip the bound below and hand the endpoint the raw chunk
     // framing as if it were the submission.
     if req.header("transfer-encoding").is_some() {
-        return write(
+        return write_within(
             &mut sock,
             Resp::text(501, "Not Implemented", "unsupported transfer-encoding"),
+            wt,
         )
         .await;
     }
@@ -533,9 +648,10 @@ async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::
         Some(raw) => match raw.parse() {
             Ok(n) => n,
             Err(_) => {
-                return write(
+                return write_within(
                     &mut sock,
                     Resp::text(400, "Bad Request", "malformed Content-Length"),
+                    wt,
                 )
                 .await
             }
@@ -550,9 +666,10 @@ async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::
     // the endpoint had no way to tell from a complete submission, and the submitter was
     // told nothing — mangled input accepted, rather than large input refused.
     if cl > max {
-        return write(
+        return write_within(
             &mut sock,
             Resp::text(413, "Payload Too Large", "request body too large"),
+            wt,
         )
         .await;
     }
@@ -560,30 +677,47 @@ async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::
     // but checked against `max` too so a deliberately small `max_body_bytes` still holds.
     let mut body = buf[header_end + 4..].to_vec();
     if body.len() > max {
-        return write(
+        return write_within(
             &mut sock,
             Resp::text(413, "Payload Too Large", "request body too large"),
+            wt,
         )
         .await;
     }
     // No second size check is needed in the loop: it stops at `cl`, and `cl <= max`. The
     // read may overshoot by one buffer, which is why the body is cut to the length the
     // client declared — those trailing bytes are the next pipelined request, not this body.
-    while body.len() < cl {
-        let n = sock.read(&mut tmp).await?;
-        if n == 0 {
-            break;
+    //
+    // The body is read under its own deadline, for the reason the headers are: a client that
+    // declares a length and then trickles it would otherwise hold the connection for as long
+    // as it cared to.
+    let read_body = async {
+        let mut tmp = [0u8; 1024];
+        while body.len() < cl {
+            let n = sock.read(&mut tmp).await?;
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&tmp[..n]);
         }
-        body.extend_from_slice(&tmp[..n]);
+        Ok::<(), std::io::Error>(())
+    };
+    match tokio::time::timeout(shared.config.body_timeout, read_body).await {
+        Err(_) => {
+            let resp = Resp::text(408, "Request Timeout", "request body took too long");
+            return write_within(&mut sock, resp, wt).await;
+        }
+        Ok(read) => read?,
     }
     // The other end of the same principle. A client that declares more than it sends and
     // then hangs up has produced a PARTIAL submission, and delivering it would put the
     // endpoint back in the position this whole block exists to get it out of: unable to
     // tell an incomplete body from a complete one.
     if body.len() < cl {
-        return write(
+        return write_within(
             &mut sock,
             Resp::text(400, "Bad Request", "incomplete request body"),
+            wt,
         )
         .await;
     }
@@ -602,7 +736,7 @@ async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::
     let matched = table.match_path(&req.path);
     let mut resp = respond(&shared, &req, matched.as_ref()).await;
     apply_edge_policy(&mut resp, &shared.config, &req, matched.as_ref());
-    write(&mut sock, resp).await
+    write_within(&mut sock, resp, wt).await
 }
 
 /// The core adapter: method → verb (gated by `describe().verbs`), path → iri,
@@ -759,7 +893,7 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
     }
 
     match kernel.issue(request, &cap).await {
-        // Reads project a strong ETag + Cache-Control and honour `If-None-Match` (→304).
+        // Reads project a strong ETag + Cache-Control and honor `If-None-Match` (→304).
         Ok(repr) if verb == Verb::Source => read_resp(&req.method, req, repr),
         Ok(repr) if verb == Verb::Delete => {
             record_tombstone(shared, &iri_str);
@@ -1298,13 +1432,7 @@ fn cors_allow_origin(cors: &CorsPolicy, origin: &str) -> Option<String> {
 
 /// `/account/id/alice` → `urn:account:id:alice` (singular noun, partition key baked in).
 fn iri_from_path(path: &str) -> String {
-    let joined = path
-        .trim_matches('/')
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join(":");
-    format!("urn:{joined}")
+    format!("urn:{}", path_segments(path).join(":"))
 }
 
 /// The faces a resource declares for one verb, read from its description the way the
@@ -1790,32 +1918,46 @@ fn xsd_to_json_type(class: &str) -> &'static str {
 }
 
 /// Parse the request line + headers (body is read separately). Header names are lowercased.
-fn parse_head(head: &str) -> Option<HttpRequest> {
-    let mut lines = head.split("\r\n");
-    let request_line = lines.next()?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next()?.to_string();
-    let target = parts.next()?;
-    let (raw_path, query_str) = match target.split_once('?') {
-        Some((p, q)) => (p, q),
-        None => (target, ""),
+///
+/// The request target is decoded from the RAW BYTES, never from a lossy string: a lossy
+/// conversion turns one invalid byte into a three-byte U+FFFD, and a decoder that then slices
+/// the string by byte offset splits that character and panics (ledger #80). The refusal
+/// names what was wrong; every refusal is a `400`.
+fn parse_head(head: &[u8]) -> Result<HttpRequest, &'static str> {
+    const MALFORMED: &str = "malformed request";
+    let line_end = head
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .unwrap_or(head.len());
+    let mut parts = head[..line_end]
+        .split(|b| b.is_ascii_whitespace())
+        .filter(|p| !p.is_empty());
+    let method = std::str::from_utf8(parts.next().ok_or(MALFORMED)?)
+        .map_err(|_| MALFORMED)?
+        .to_string();
+    let target = parts.next().ok_or(MALFORMED)?;
+    let (raw_path, query_str) = match target.iter().position(|b| *b == b'?') {
+        Some(q) => (&target[..q], &target[q + 1..]),
+        None => (target, &b""[..]),
     };
-    let path = urldecode(raw_path);
-    let query = query_str
-        .split('&')
-        .filter(|s| !s.is_empty())
-        .map(|kv| {
-            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
-            (urldecode(k), urldecode(v))
-        })
-        .collect();
-    let headers = lines
+    let path = decode_path(raw_path)?;
+    let mut query = Vec::new();
+    for kv in query_str.split(|b| *b == b'&').filter(|s| !s.is_empty()) {
+        let (k, v) = match kv.iter().position(|b| *b == b'=') {
+            Some(eq) => (&kv[..eq], &kv[eq + 1..]),
+            None => (kv, &b""[..]),
+        };
+        query.push((decode_form(k)?, decode_form(v)?));
+    }
+    let rest = head.get(line_end + 2..).unwrap_or_default();
+    let headers = String::from_utf8_lossy(rest)
+        .split("\r\n")
         .filter_map(|l| {
             l.split_once(':')
                 .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
         })
         .collect();
-    Some(HttpRequest {
+    Ok(HttpRequest {
         method,
         path,
         query,
@@ -1823,6 +1965,112 @@ fn parse_head(head: &str) -> Option<HttpRequest> {
         body: Vec::new(),
         peer: None,
     })
+}
+
+/// The value of one ASCII hex digit, or `None`. Deliberately not `u8::from_str_radix`, which
+/// accepts a leading sign and so decoded `%+1` as byte 1 (ledger #591).
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Percent-decode `raw` as BYTES. A `%` must be followed by exactly two hex digits; anything
+/// else (`%`, `%4`, `%zz`, `%+1`, `%` before a non-ASCII byte) is refused rather than passed
+/// through, since a server that guesses at a malformed escape and a proxy in front of it that
+/// guesses differently disagree about what was asked for. `plus_is_space` is form encoding,
+/// and only a query string is form-encoded.
+fn percent_decode(raw: &[u8], plus_is_space: bool) -> Result<Vec<u8>, &'static str> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        match raw[i] {
+            b'%' => {
+                let hi = raw.get(i + 1).copied().and_then(hex_digit);
+                let lo = raw.get(i + 2).copied().and_then(hex_digit);
+                match (hi, lo) {
+                    (Some(hi), Some(lo)) => out.push(hi << 4 | lo),
+                    _ => return Err("malformed percent-escape"),
+                }
+                i += 3;
+            }
+            b'+' if plus_is_space => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Percent-decode, then validate UTF-8 once, over the whole decoded value.
+fn decode_utf8(raw: &[u8], plus_is_space: bool) -> Result<String, &'static str> {
+    String::from_utf8(percent_decode(raw, plus_is_space)?).map_err(|_| "not UTF-8 once decoded")
+}
+
+/// A query key or value: `application/x-www-form-urlencoded`, so `+` is a space.
+fn decode_form(raw: &[u8]) -> Result<String, &'static str> {
+    decode_utf8(raw, true)
+}
+
+/// The path, split on `/` FIRST and each segment decoded on its own (RFC 3986 §2.2: an
+/// encoded delimiter is data). `+` stays `+`. The decoded segments are re-joined into the one
+/// string [`HttpRequest::path`] carries, with a `/` or `%` inside a segment kept escaped so
+/// [`path_segments`] can split it back without a client-encoded slash becoming a separator.
+fn decode_path(raw: &[u8]) -> Result<String, &'static str> {
+    let mut out = String::with_capacity(raw.len());
+    for (n, seg) in raw.split(|b| *b == b'/').enumerate() {
+        if n > 0 {
+            out.push('/');
+        }
+        for c in decode_utf8(seg, false)?.chars() {
+            match c {
+                '%' => out.push_str("%25"),
+                '/' => out.push_str("%2F"),
+                c => out.push(c),
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The decoded segments of an [`HttpRequest::path`] — the inverse of [`decode_path`]'s
+/// escaping. Empty segments (a leading, trailing or doubled `/`) are dropped, as they always
+/// were. Only the two escapes `decode_path` writes are undone; any other `%` is literal.
+fn path_segments(path: &str) -> Vec<String> {
+    path.split('/')
+        .filter(|s| !s.is_empty())
+        .map(|seg| {
+            let mut out = String::with_capacity(seg.len());
+            let mut rest = seg;
+            while let Some(at) = rest.find('%') {
+                out.push_str(&rest[..at]);
+                let tail = &rest[at..];
+                rest = if let Some(after) = tail
+                    .strip_prefix("%2F")
+                    .or_else(|| tail.strip_prefix("%2f"))
+                {
+                    out.push('/');
+                    after
+                } else if let Some(after) = tail.strip_prefix("%25") {
+                    out.push('%');
+                    after
+                } else {
+                    out.push('%');
+                    &tail[1..]
+                };
+            }
+            out.push_str(rest);
+            out
+        })
+        .collect()
 }
 
 /// The argument names the transport owns on a write. A request may carry them in its
@@ -1857,33 +2105,20 @@ fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-/// Minimal percent-decoding (`%XX` and `+`→space in query values).
-fn urldecode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                    out.push(b);
-                    i += 3;
-                } else {
-                    out.push(bytes[i]);
-                    i += 1;
-                }
-            }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            c => {
-                out.push(c);
-                i += 1;
-            }
-        }
+/// [`write`] under a deadline: a client that stops reading cannot hold the connection past
+/// `limit`. On expiry the connection is simply dropped — there is no one left to tell.
+async fn write_within(
+    sock: &mut TcpStream,
+    resp: Resp,
+    limit: std::time::Duration,
+) -> std::io::Result<()> {
+    match tokio::time::timeout(limit, write(sock, resp)).await {
+        Ok(done) => done,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "response write took too long",
+        )),
     }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Write the response and close the connection.
@@ -2170,7 +2405,26 @@ mod tests {
                     .input(ArgSpec::new("name").binding()),
             ),
         );
+        // The target IRI as the kernel saw it — how a test observes what a path decoded to.
+        let seg = FnEndpoint::new("seg", |inv: &Invocation<'_>| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                inv.request.target.as_str().as_bytes().to_vec(),
+            ))
+        })
+        .with_description(Description::new("seg").verb(Verb::Source));
+        // A representation far larger than any socket buffer, so a client that never reads
+        // it leaves the server's write blocked.
+        let big = FnEndpoint::new("big", |_inv: &Invocation<'_>| {
+            Ok(Representation::new(
+                ReprType::new("application/octet-stream"),
+                vec![0u8; 32 * 1024 * 1024],
+            ))
+        })
+        .with_description(Description::new("big").verb(Verb::Source));
         let space = EndpointSpace::new()
+            .bind(UriTemplate::parse("urn:test:seg:{key}").unwrap(), seg)
+            .bind(Exact::new("urn:test:big"), big)
             .bind(Exact::new("urn:test:sealed"), sealed)
             .bind(Exact::new("urn:test:split"), split)
             .bind(UriTemplate::parse("urn:test:tpl:{name}").unwrap(), tpl)
@@ -3757,5 +4011,306 @@ mod tests {
         // Faces are per verb: a Sink-only description declares none for Source.
         let desc = Description::new("z").verb(Verb::Sink).output("text/plain");
         assert!(Faces::declared(Some(&desc), Verb::Source).served.is_empty());
+    }
+
+    // ---- the request target's decoder (ledger #80, #591) ----
+
+    #[test]
+    fn the_decoder_refuses_every_malformed_escape() {
+        let cases: [&[u8]; 11] = [
+            b"%",
+            b"%4",
+            b"%zz",
+            b"%+1",
+            b"%-1",
+            b"%\xff",
+            b"%4\xff",
+            b"a%",
+            b"%%41",
+            b"%\xc3\xa9",
+            b"% 1",
+        ];
+        for bad in cases {
+            assert!(percent_decode(bad, false).is_err(), "path form: {bad:?}");
+            assert!(percent_decode(bad, true).is_err(), "form form: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_decoder_works_on_bytes_and_validates_utf8_once() {
+        assert_eq!(decode_utf8(b"caf%C3%A9", false).unwrap(), "caf\u{e9}");
+        // One character split between an escape and a raw byte is still one character: the
+        // UTF-8 check runs over the decoded whole, not per escape.
+        assert_eq!(decode_utf8(b"caf%C3\xa9", false).unwrap(), "caf\u{e9}");
+        assert_eq!(decode_utf8(b"caf\xc3\xa9", false).unwrap(), "caf\u{e9}");
+        assert!(decode_utf8(b"%FF", false).is_err());
+        assert!(decode_utf8(b"\xff", false).is_err());
+        assert!(decode_utf8(b"%C3", false).is_err(), "a truncated sequence");
+        assert_eq!(decode_utf8(b"%4a%4A", false).unwrap(), "JJ");
+        assert_eq!(decode_utf8(b"a+b", false).unwrap(), "a+b");
+        assert_eq!(decode_utf8(b"a+b", true).unwrap(), "a b");
+        assert_eq!(decode_utf8(b"a%2Bb", true).unwrap(), "a+b");
+    }
+
+    #[test]
+    fn plus_is_a_space_in_the_query_and_a_plus_in_the_path() {
+        let req = parse_head(b"GET /a+b/c?k+1=v+1&x=%2B HTTP/1.1\r\nHost: x").unwrap();
+        assert_eq!(req.path, "/a+b/c");
+        assert_eq!(
+            req.query,
+            vec![
+                ("k 1".to_string(), "v 1".to_string()),
+                ("x".to_string(), "+".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn an_encoded_slash_stays_inside_its_segment() {
+        let path = decode_path(b"/test/seg/a%2Fb").unwrap();
+        assert_eq!(path, "/test/seg/a%2Fb");
+        assert_eq!(path_segments(&path), ["test", "seg", "a/b"]);
+        assert_eq!(iri_from_path(&path), "urn:test:seg:a/b");
+        assert_eq!(path_segments(&decode_path(b"/a%2fb").unwrap()), ["a/b"]);
+        // A literal `%` round-trips, and an escaped escape is never decoded twice.
+        let path = decode_path(b"/x/100%25/a%252Fb").unwrap();
+        assert_eq!(path_segments(&path), ["x", "100%", "a%2Fb"]);
+        // Routing splits the same way: an encoded slash cannot add a segment. This is the
+        // link gonk's `percent` builds for a hostile ledger name.
+        let table = RouteTable::new(vec![plain_route(
+            "/l/{ledger}/item/{id}",
+            "urn:x:{ledger}:{id}",
+        )]);
+        let hit = table
+            .match_path(&decode_path(b"/l/..%2F..%2Fetc/item/244").unwrap())
+            .expect("four segments, so the route matches");
+        assert_eq!(hit.iri, "urn:x:../../etc:244");
+        assert!(table
+            .match_path(&decode_path(b"/l/a/b/item/1").unwrap())
+            .is_none());
+    }
+
+    /// Exhaustive over the two bytes after a `%`, in the path, a query key and a query value:
+    /// each of the 65,536 pairs either decodes to exactly its character or is refused, and
+    /// none panics. Before ledger #80 a raw non-ASCII byte here panicked the connection.
+    #[test]
+    fn every_byte_pair_after_a_percent_decodes_or_is_refused() {
+        for hi in 0..=255u8 {
+            for lo in 0..=255u8 {
+                let expect = match (hex_digit(hi), hex_digit(lo)) {
+                    (Some(h), Some(l)) if (h << 4 | l) < 0x80 => Some(char::from(h << 4 | l)),
+                    _ => None,
+                };
+                for place in 0..3 {
+                    let mut head = b"GET ".to_vec();
+                    head.extend_from_slice(match place {
+                        0 => &b"/p/"[..],
+                        1 => b"/p?",
+                        _ => b"/p?k=",
+                    });
+                    head.extend_from_slice(&[b'%', hi, lo]);
+                    head.extend_from_slice(b" HTTP/1.1\r\nHost: x");
+                    let got = parse_head(&head);
+                    match expect {
+                        None => assert!(got.is_err(), "{hi:#04x} {lo:#04x} at {place}"),
+                        Some(c) => {
+                            let req = got
+                                .unwrap_or_else(|e| panic!("{hi:#04x} {lo:#04x} at {place}: {e}"));
+                            let decoded = match place {
+                                0 => path_segments(&req.path)[1].clone(),
+                                1 => req.query[0].0.clone(),
+                                _ => req.query[0].1.clone(),
+                            };
+                            assert_eq!(decoded, c.to_string(), "{hi:#04x} {lo:#04x} at {place}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn roundtrip_bytes(addr: SocketAddr, raw: &[u8]) -> String {
+        let mut c = connect(addr).await;
+        c.write_all(raw).await.unwrap();
+        let mut out = Vec::new();
+        c.read_to_end(&mut out).await.unwrap();
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    #[tokio::test]
+    async fn a_malformed_target_is_400_over_the_socket_and_the_server_lives_on() {
+        let addr = start().await;
+        // (target, Some(body) for a 200 that echoes it, None for a 400)
+        let cases: [(&[u8], Option<&str>); 20] = [
+            (b"/test/echo?name=%", None),
+            (b"/test/echo?name=%4", None),
+            (b"/test/echo?name=%zz", None),
+            (b"/test/echo?name=%+1", None),
+            (b"/test/echo?name=%-1", None),
+            (b"/test/echo?name=%\xff", None),
+            (b"/test/echo?name=%FF", None),
+            (b"/test/echo?%zz=1", None),
+            (b"/test/echo?%\xc3\xa9=1", None),
+            (b"/test/%\xc3\xa9cho", None),
+            (b"/test/ech%", None),
+            (b"/test/%+1", None),
+            (b"/test/\xff", None),
+            (b"/test/echo?name=a+b", Some("a b")),
+            (b"/test/echo?name=a%2Bb", Some("a+b")),
+            (b"/test/echo?name=caf%C3%A9", Some("caf\u{e9}")),
+            (b"/test/echo?name=%26%3D", Some("&=")),
+            (b"/test/%65cho?name=x", Some("x")),
+            (b"/test/seg/a+b", Some("urn:test:seg:a+b")),
+            (b"/test/seg/a%2Fb", Some("urn:test:seg:a/b")),
+        ];
+        for (target, expect) in cases {
+            let mut raw = b"GET ".to_vec();
+            raw.extend_from_slice(target);
+            raw.extend_from_slice(b" HTTP/1.1\r\nHost: x\r\n\r\n");
+            let resp = roundtrip_bytes(addr, &raw).await;
+            let shown = String::from_utf8_lossy(target);
+            match expect {
+                None => assert!(resp.starts_with("HTTP/1.1 400 "), "{shown}: {resp}"),
+                Some(body) => {
+                    assert!(resp.starts_with("HTTP/1.1 200 "), "{shown}: {resp}");
+                    assert!(
+                        resp.ends_with(&format!("\r\n\r\n{body}")),
+                        "{shown}: {resp}"
+                    );
+                }
+            }
+        }
+        let alive = roundtrip(addr, "GET /test/id/hello HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(alive.starts_with("HTTP/1.1 200 OK"), "{alive}");
+    }
+
+    // ---- time and concurrency bounds (ledger #80) ----
+
+    #[test]
+    fn the_bounds_default_to_explicit_finite_values() {
+        let config = EdgeConfig::default();
+        assert_eq!(config.header_timeout, std::time::Duration::from_secs(10));
+        assert_eq!(config.body_timeout, std::time::Duration::from_secs(30));
+        assert_eq!(config.write_timeout, std::time::Duration::from_secs(30));
+        assert_eq!(config.max_connections, 256);
+    }
+
+    fn short(ms: u64) -> std::time::Duration {
+        std::time::Duration::from_millis(ms)
+    }
+
+    /// Read until the server hangs up, failing the test (instead of hanging it) if it never
+    /// does — the failure this whole section exists to prevent.
+    async fn read_until_closed(sock: &mut (impl AsyncReadExt + Unpin)) -> String {
+        let mut out = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            sock.read_to_end(&mut out),
+        )
+        .await
+        .expect("the server must hang up rather than wait on the client forever")
+        .unwrap();
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    #[tokio::test]
+    async fn a_slow_loris_header_trickle_is_cut_off_at_the_deadline_with_408() {
+        let addr = start_with(EdgeConfig {
+            header_timeout: short(300),
+            ..EdgeConfig::default()
+        })
+        .await;
+        let (mut rx, mut tx) = connect(addr).await.into_split();
+        // A byte every 50 ms, never the blank line: an IDLE timeout would never fire, so this
+        // proves the deadline is on the whole header read.
+        let trickle = tokio::spawn(async move {
+            let _ = tx.write_all(b"GET /test/id/hello HTTP/1.1\r\n").await;
+            for _ in 0..400 {
+                if tx.write_all(b"X").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(short(50)).await;
+            }
+        });
+        // The trickle outlasts `read_until_closed`'s own 10 s bound, so only a deadline on the
+        // whole read can make the server hang up in time.
+        let resp = read_until_closed(&mut rx).await;
+        assert!(resp.starts_with("HTTP/1.1 408 "), "{resp}");
+        trickle.abort();
+    }
+
+    #[tokio::test]
+    async fn a_body_that_never_arrives_is_408_at_the_body_deadline() {
+        let addr = start_with(EdgeConfig {
+            body_timeout: short(300),
+            ..EdgeConfig::default()
+        })
+        .await;
+        let mut c = connect(addr).await;
+        c.write_all(b"PUT /test/writable HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc")
+            .await
+            .unwrap();
+        let resp = read_until_closed(&mut c).await;
+        assert!(resp.starts_with("HTTP/1.1 408 "), "{resp}");
+    }
+
+    /// Retry a plain GET until it is served, proving a slot came back. Every answer before
+    /// that must be the cap's `503` — never a reset, which would mean the refusal was lost.
+    async fn served_eventually(addr: SocketAddr) -> String {
+        for _ in 0..250 {
+            let answer = roundtrip(addr, "GET /test/id/hello HTTP/1.1\r\nHost: x\r\n\r\n").await;
+            if answer.starts_with("HTTP/1.1 200 ") {
+                return answer;
+            }
+            assert!(answer.starts_with("HTTP/1.1 503 "), "{answer}");
+            tokio::time::sleep(short(40)).await;
+        }
+        panic!("the slot never came back");
+    }
+
+    #[tokio::test]
+    async fn a_connection_past_the_cap_is_503_and_the_slot_comes_back() {
+        let addr = start_with(EdgeConfig {
+            max_connections: 1,
+            ..EdgeConfig::default()
+        })
+        .await;
+        // The holder is accepted first (the accept loop is sequential and FIFO) and takes the
+        // one permit; half a request line keeps it inside the header read.
+        let mut holder = connect(addr).await;
+        holder.write_all(b"GET /test/id/hello").await.unwrap();
+        // The refused client sends a whole request, as a real one does. It is never handled,
+        // and the lingering close is what lets the 503 reach it instead of a reset.
+        let mut refused = connect(addr).await;
+        refused
+            .write_all(b"GET /test/id/hello HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let busy = read_until_closed(&mut refused).await;
+        assert!(busy.starts_with("HTTP/1.1 503 "), "{busy}");
+        assert!(busy.contains("Retry-After: 1\r\n"), "{busy}");
+        drop(holder);
+        let ok = served_eventually(addr).await;
+        assert!(ok.ends_with("hi"), "{ok}");
+    }
+
+    #[tokio::test]
+    async fn a_client_that_stops_reading_releases_its_slot_at_the_write_deadline() {
+        let addr = start_with(EdgeConfig {
+            max_connections: 1,
+            write_timeout: short(300),
+            ..EdgeConfig::default()
+        })
+        .await;
+        // Ask for 32 MiB and never read a byte of it: the write blocks on a full socket.
+        let mut stalled = connect(addr).await;
+        stalled
+            .write_all(b"GET /test/big HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        // Without the write deadline this slot is held for as long as `stalled` lives.
+        let ok = served_eventually(addr).await;
+        assert!(ok.ends_with("hi"), "{ok}");
+        drop(stalled);
     }
 }

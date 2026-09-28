@@ -137,6 +137,23 @@ an over-bound request is **refused rather than trimmed to fit**:
   submission; bytes past `Content-Length` are the next pipelined request and never
   join this one; and a `Transfer-Encoding` this server does not implement is a
   `501`, not an absent length.
+- **Time.** The request line and headers must arrive within `header_timeout`
+  (default 10 s), the declared body within `body_timeout` (default 30 s), both
+  answered `408` when missed; the response must be taken within `write_timeout`
+  (default 30 s) or the connection is dropped. These are deadlines on the whole
+  read, not idle timeouts, so a slow-loris trickle of one byte at a time is cut off
+  on schedule.
+- **Connections.** At most `max_connections` (default 256) are served at once. One
+  past the cap is answered `503` with `Retry-After: 1` without its request being
+  handled, then closed after draining what it sent, so the answer arrives instead of
+  a reset.
+- **The target is decoded as bytes, and a malformed escape is a `400`.** `%` must be
+  followed by two hex digits (`%`, `%4`, `%zz` and `%+1` are refused, never guessed
+  at), and the decoded bytes must be UTF-8. The **path** is split on `/` first and
+  each segment decoded on its own, so an encoded `%2F` is data inside its segment
+  and never a separator (RFC 3986): `/k/a%2Fb` is the IRI `urn:k:a/b`, and a client
+  cannot add a segment by encoding one. A `+` in the path is a `+`. Only the
+  **query** is form-encoded, so there `+` is a space.
 
 The point of refusing rather than trimming is that an endpoint cannot tell a
 truncated submission from a complete one — so a bound that silently shortens input
