@@ -1,6 +1,6 @@
-//! **SPIKE** — the ikigai wire protocol (v7) over libp2p, so a peer stays reachable when it
-//! is not on the LAN: through a circuit relay, upgrading to a direct connection by hole
-//! punching (DCUtR) where the networks allow it.
+//! **SPIKE** — the ikigai wire protocol (v8, and v7 for older peers) over libp2p, so a peer
+//! stays reachable when it is not on the LAN: through a circuit relay, upgrading to a direct
+//! connection by hole punching (DCUtR) where the networks allow it.
 //!
 //! Read `docs/design/p2p-mobility-design.md` first. The shape, in three rules:
 //!

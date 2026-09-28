@@ -62,9 +62,10 @@ identity model admits our key type, and quinn is shared. The cost is `aws-lc-sys
 
 ## Constraint 1: transport and reachability only
 
-A wire `Call` rides one request-response stream under `/ikigai/wire/7`. The version is
-`ikigai_wire::PROTOCOL_VERSION`, pinned by a test, so a mismatched peer fails protocol negotiation
-the way a mismatched ALPN fails the QUIC handshake. Framing is the stream itself, as on QUIC: the
+A wire `Call` rides one request-response stream under `/ikigai/wire/8`, or `/ikigai/wire/7` for
+a v7 peer (since wire v8 a node offers both, newest first, and the codec encodes each reply at the
+version its stream negotiated). The versions are `ikigai_wire`'s spoken range, pinned by a test, so
+a peer outside it fails protocol negotiation the way a mismatched ALPN fails the QUIC handshake. Framing is the stream itself, as on QUIC: the
 writer closes its half after one postcard message, and the reader reads to end under the same
 64 MiB bound. An oversized message is **refused**, never truncated.
 

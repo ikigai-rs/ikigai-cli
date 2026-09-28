@@ -76,7 +76,13 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 [workspace.dependencies]
 # The released kernel, consumed from crates.io. For local cross-repo development
 # against a sibling checkout, use .cargo/config.toml (see .cargo/config.toml.example).
-ikigai-core = "0.1.78" # 0.1.78 = `.named(iri)` on `Fallback`, `EndpointSpace` and `Limit`, and
+ikigai-core = "0.1.80" # 0.1.80 = `Error::Conflict`: the state refuses the request (HTTP 409,
+# permanent). `ikigai-wire` maps it to `WireError::Conflict` (wire v8) and back, and `ikigai-web`
+# answers it 409 — both NAME the variant, so below 0.1.80 the workspace does not compile. Before
+# this, core's `non_exhaustive` let a Conflict fall through both maps silently, as an untyped
+# `Endpoint` on the wire and a 500 at the edge (ledger #583).
+# Beneath it, and each called:
+# 0.1.78 = `.named(iri)` on `Fallback`, `EndpointSpace` and `Limit`, and
 # `urn:kernel:topology`: the served surface names its limiter and its root (`ikigai-embedded`,
 # `served_root`) so the topology graph says `ik:Limit ik:family "urn:personal:"` by NAME, and a
 # test sources it. That builder is the highest API this workspace calls, so it is the floor —

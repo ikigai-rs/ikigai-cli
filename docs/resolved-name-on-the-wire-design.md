@@ -81,7 +81,11 @@ two call sites, not a restructuring. The renderer then prefers `event.endpoint` 
 keeps `naming_entry` only for the no-events path (a resolver that doesn't trace).
 
 Cost: `TraceEvent` crosses the wire inside `Reply::ResolvedTraced`, so its postcard
-layout changes → **`PROTOCOL_VERSION` 7 → 8**. That is a documented, already-walked
+layout changes → a **`PROTOCOL_VERSION`** event. (This note said 7 → 8 when it was
+written; v8 has since gone to `WireError::Conflict`, so this would be v9. And v8 made the
+bump backward-compatible — a peer speaks a RANGE and downgrades per connection, see
+`wire-hello-design.md` — so a layout change here has to decide how a v8 peer is answered,
+not just bump the number.) That is a documented, already-walked
 path: `kernel.rs` carries the same note for `notes` (core 0.1.48 → protocol v5).
 
 Why first: it fixes the mislabeling *at the root*, for local traces as well as

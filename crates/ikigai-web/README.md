@@ -61,7 +61,10 @@ identity. The doctest on `PrincipalFn` pins the shape.
   capability, or a fixed `--cap` ceiling that narrows the edge; a per-user capability
   (magic-link / passkey) fills the same seam.
 - **Typed error → status:** `Denied` → 403, `NotFound` and `Unresolved` (no endpoint
-  bound to the path) → 404, invalid/missing arg → 400, transient → 503, else 500.
+  bound to the path) → 404, invalid/missing arg → 400, `Conflict` (the resource's
+  current state refuses the request) → 409, transient → 503, else 500. A failed
+  `If-Match` / `If-None-Match` stays 412: that is a precondition the caller stated, and
+  it is checked before the write reaches the endpoint.
 
 ## Content negotiation
 
