@@ -30,13 +30,32 @@ use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use tokio::runtime::{Handle, Runtime};
 
-/// The ALPN protocol ids — since v7, exactly one: `ikigai/{PROTOCOL_VERSION}`.
-/// The TLS handshake IS the version gate on this transport; a version-mismatched
-/// peer fails the handshake at connect (mDNS TXT advertises the version
-/// pre-connect, which is where the human-readable hint lives).
+/// The ALPN protocol ids, newest first — since v8, `ikigai/8` then `ikigai/7`
+/// ([`ikigai_wire::alpns`]). The TLS handshake IS the version gate on this transport,
+/// and there is no hello frame on it: the NEGOTIATED id is the connection's version.
+/// Both sides list 8 first, so a v8 pair speaks 8 and a v7 peer (which offers or
+/// accepts only `ikigai/7`) still finds 7. A peer outside the range fails the
+/// handshake at connect (mDNS TXT advertises the version pre-connect, which is where
+/// the human-readable hint lives).
 fn alpn_protocols() -> Vec<Vec<u8>> {
-    vec![ikigai_wire::alpn()]
+    ikigai_wire::alpns()
 }
+
+/// The wire version a connection negotiated, read from its ALPN id. `None` when no id
+/// was negotiated or it names a version this build does not speak — and both sides
+/// REFUSE such a connection rather than guess (a TLS stack that skips ALPN when the
+/// server configured none would otherwise hand us a connection with no version at all).
+fn negotiated_version(connection: &quinn::Connection) -> Option<u32> {
+    let data = connection.handshake_data()?;
+    let data = data
+        .downcast::<quinn::crypto::rustls::HandshakeData>()
+        .ok()?;
+    ikigai_wire::version_of_alpn(data.protocol.as_deref()?)
+}
+
+/// The QUIC application close code for a connection that negotiated no wire version
+/// this build speaks.
+const NO_VERSION: u32 = 2;
 
 /// The largest message accepted off a stream (guards `read_to_end`).
 const MAX_MESSAGE: usize = 64 * 1024 * 1024;
@@ -279,7 +298,17 @@ fn peer_cert_id(connection: &quinn::Connection) -> String {
 
 /// Answer calls on one connection until the peer closes it, every call resolved
 /// under the connection's [`Session`] (the authenticated principal).
+///
+/// Every reply is encoded AT THE VERSION THE CONNECTION NEGOTIATED ([`Reply::for_peer`]),
+/// so a v7 client never meets a variant it cannot decode.
 async fn serve_connection(kernel: &Kernel, connection: quinn::Connection, session: &Session) {
+    let Some(version) = negotiated_version(&connection) else {
+        connection.close(
+            NO_VERSION.into(),
+            b"no ikigai wire version was negotiated (ALPN)",
+        );
+        return;
+    };
     while let Ok((mut send, mut recv)) = connection.accept_bi().await {
         let bytes = match recv.read_to_end(MAX_MESSAGE).await {
             Ok(bytes) => bytes,
@@ -291,7 +320,7 @@ async fn serve_connection(kernel: &Kernel, connection: quinn::Connection, sessio
                 "malformed call: {e}"
             ))),
         };
-        if let Ok(out) = encode(&reply) {
+        if let Ok(out) = encode(&reply.for_peer(version)) {
             let _ = send.write_all(&out).await;
             let _ = send.finish();
         }
@@ -807,6 +836,17 @@ fn server_config(
     trusted_client_cert_pems: &[String],
     idle: std::time::Duration,
 ) -> io::Result<quinn::ServerConfig> {
+    server_config_accepting(identity, trusted_client_cert_pems, idle, alpn_protocols())
+}
+
+/// [`server_config`] accepting exactly `alpns` — the seam a test uses to stand up a
+/// v7-only server (`["ikigai/7"]`) or one that negotiates nothing (`[]`).
+fn server_config_accepting(
+    identity: &Identity,
+    trusted_client_cert_pems: &[String],
+    idle: std::time::Duration,
+    alpns: Vec<Vec<u8>>,
+) -> io::Result<quinn::ServerConfig> {
     let certs = trusted_client_cert_pems
         .iter()
         .map(|pem| load_cert(pem))
@@ -821,7 +861,7 @@ fn server_config(
             load_key(&identity.key_pem)?,
         )
         .map_err(other)?;
-    tls.alpn_protocols = alpn_protocols();
+    tls.alpn_protocols = alpns;
     let quic = quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(other)?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic));
     config.transport_config(Arc::new(transport(idle)?));
@@ -854,7 +894,20 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 async fn dial(endpoint: &quinn::Endpoint, addr: SocketAddr) -> io::Result<quinn::Connection> {
     let connecting = endpoint.connect(addr, "ikigai").map_err(other)?;
     match tokio::time::timeout(CONNECT_TIMEOUT, connecting).await {
-        Ok(result) => result.map_err(other),
+        Ok(Ok(connection)) if negotiated_version(&connection).is_some() => Ok(connection),
+        Ok(Ok(connection)) => {
+            connection.close(NO_VERSION.into(), b"no ikigai wire version was negotiated");
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "connect {addr}: the server negotiated no ikigai wire version this client \
+                     speaks (v{}..=v{}) — update the older side",
+                    ikigai_wire::MIN_PROTOCOL_VERSION,
+                    ikigai_wire::PROTOCOL_VERSION
+                ),
+            ))
+        }
+        Ok(Err(e)) => Err(other(e)),
         Err(_) => Err(io::Error::new(
             io::ErrorKind::TimedOut,
             format!(
@@ -870,6 +923,17 @@ fn client_config(
     trusted_server_cert_pem: &str,
     idle: std::time::Duration,
 ) -> io::Result<quinn::ClientConfig> {
+    client_config_offering(identity, trusted_server_cert_pem, idle, alpn_protocols())
+}
+
+/// [`client_config`] offering exactly `alpns` — the seam a test uses to stand up a
+/// v7-only client.
+fn client_config_offering(
+    identity: &Identity,
+    trusted_server_cert_pem: &str,
+    idle: std::time::Duration,
+    alpns: Vec<Vec<u8>>,
+) -> io::Result<quinn::ClientConfig> {
     let verifier = Arc::new(PinnedPeer::new(load_cert(trusted_server_cert_pem)?));
     let mut tls = rustls::ClientConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -881,7 +945,7 @@ fn client_config(
             load_key(&identity.key_pem)?,
         )
         .map_err(other)?;
-    tls.alpn_protocols = alpn_protocols();
+    tls.alpn_protocols = alpns;
     let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(other)?;
     // The idle timeout is OURS to set (see [`DEFAULT_IDLE_TIMEOUT`]): quinn's ~30s
     // default killed long-silent work (a 70B generating) mid-request. Keep-alive stays
@@ -1589,6 +1653,144 @@ mod tests {
 
         drop(client); // closes the connection → the handler loop ends
         server.join().unwrap();
+    }
+
+    // ---- wire v8 over QUIC: the ALPN is the version (ledger #583) ----
+
+    fn conflict_kernel() -> Kernel {
+        let taken = FnEndpoint::new("taken", |_inv: &Invocation<'_>| {
+            Err(Error::Conflict("x".into()))
+        });
+        Kernel::new(Arc::new(
+            EndpointSpace::new()
+                .bind(Exact::new("urn:test:upper"), builtins::to_upper())
+                .bind(Exact::new("urn:test:taken"), taken),
+        ))
+    }
+
+    fn taken() -> Request {
+        Request::new(Verb::Source, Iri::parse("urn:test:taken").unwrap())
+    }
+
+    /// Serve ONE connection of `conflict_kernel` on a server accepting `alpns`, returning
+    /// its address and a handle that yields the version the server saw negotiated.
+    fn serve_alpn(
+        server_id: &Identity,
+        client_id: &Identity,
+        alpns: Vec<Vec<u8>>,
+    ) -> (SocketAddr, thread::JoinHandle<Option<u32>>) {
+        let cfg = server_config_accepting(
+            server_id,
+            std::slice::from_ref(&client_id.cert_pem),
+            DEFAULT_IDLE_TIMEOUT,
+            alpns,
+        )
+        .unwrap();
+        let rt = Runtime::new().unwrap();
+        let endpoint = rt
+            .block_on(async { quinn::Endpoint::server(cfg, "127.0.0.1:0".parse().unwrap()) })
+            .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            rt.block_on(async move {
+                let incoming = endpoint.accept().await?;
+                let connection = incoming.await.ok()?;
+                let version = negotiated_version(&connection);
+                let session = Session {
+                    capability: Capability::root(),
+                    file_segment: String::new(),
+                };
+                serve_connection(&conflict_kernel(), connection, &session).await;
+                endpoint.wait_idle().await;
+                version
+            })
+        });
+        (addr, server)
+    }
+
+    /// A v8 server meeting a v7-ONLY client (offering just `ikigai/7`): the connection
+    /// negotiates 7, and a Conflict arrives as the untyped Endpoint a v7 peer always got.
+    #[test]
+    fn a_v7_only_client_negotiates_7_and_gets_the_downgraded_conflict() {
+        let (server_id, client_id) = (generate(), generate());
+        let (addr, server) = serve_alpn(&server_id, &client_id, alpn_protocols());
+        let rt = Runtime::new().unwrap();
+        let reply = rt.block_on(async {
+            let cfg = client_config_offering(
+                &client_id,
+                &server_id.cert_pem,
+                DEFAULT_IDLE_TIMEOUT,
+                vec![b"ikigai/7".to_vec()],
+            )
+            .unwrap();
+            let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            endpoint.set_default_client_config(cfg);
+            let connection = endpoint.connect(addr, "ikigai").unwrap().await.unwrap();
+            assert_eq!(negotiated_version(&connection), Some(7));
+            let (mut send, mut recv) = connection.open_bi().await.unwrap();
+            send.write_all(&encode(&Call::Issue(taken())).unwrap())
+                .await
+                .unwrap();
+            send.finish().unwrap();
+            let bytes = recv.read_to_end(MAX_MESSAGE).await.unwrap();
+            connection.close(0u32.into(), b"done");
+            decode::<Reply>(&bytes).unwrap()
+        });
+        assert_eq!(
+            reply,
+            Reply::ErrorTyped(ikigai_wire::WireError::Endpoint("conflict: x".into()))
+        );
+        assert_eq!(server.join().unwrap(), Some(7));
+    }
+
+    /// A v8 pair negotiates 8 — the server lists it first — and the Conflict crosses
+    /// TYPED and permanent.
+    #[test]
+    fn a_v8_pair_negotiates_8_and_the_conflict_crosses_typed() {
+        let (server_id, client_id) = (generate(), generate());
+        let (addr, server) = serve_alpn(&server_id, &client_id, alpn_protocols());
+        let client = connect(addr, &client_id, &server_id.cert_pem).unwrap();
+        let err = client.issue(taken()).unwrap_err();
+        assert!(matches!(err, Error::Conflict(ref m) if m == "x"), "{err:?}");
+        assert!(!err.is_transient());
+        drop(client);
+        assert_eq!(server.join().unwrap(), Some(8));
+    }
+
+    /// This build's client against a v7-only SERVER (accepting just `ikigai/7`): the
+    /// handshake settles on 7 and the connection is served.
+    #[test]
+    fn a_v8_client_negotiates_7_with_a_v7_only_server() {
+        let (server_id, client_id) = (generate(), generate());
+        let (addr, server) = serve_alpn(&server_id, &client_id, vec![b"ikigai/7".to_vec()]);
+        let client = connect(addr, &client_id, &server_id.cert_pem).unwrap();
+        let (representation, _) = client.issue(upper("hi")).unwrap();
+        assert_eq!(representation.bytes, b"HI");
+        drop(client);
+        assert_eq!(server.join().unwrap(), Some(7));
+    }
+
+    /// A server outside the spoken range — a v6 one (`ikigai/6`), or one configured with
+    /// no id at all — is refused AT THE HANDSHAKE: QUIC requires ALPN, so rustls aborts
+    /// with `no_application_protocol` before any connection exists. (Measured: the
+    /// no-version branch in `dial` is therefore defensive; this is the gate that fires.)
+    #[test]
+    fn a_server_outside_7_to_8_is_refused_at_the_handshake() {
+        for alpns in [
+            vec![b"ikigai/6".to_vec()],
+            vec![b"ikigai/9".to_vec()],
+            Vec::new(),
+        ] {
+            let (server_id, client_id) = (generate(), generate());
+            let shown = format!("{alpns:?}");
+            let (addr, server) = serve_alpn(&server_id, &client_id, alpns);
+            let message = match connect(addr, &client_id, &server_id.cert_pem) {
+                Err(err) => err.to_string(),
+                Ok(_) => panic!("a server accepting {shown} must be refused"),
+            };
+            assert!(message.contains("protocol"), "{shown}: {message}");
+            let _ = server.join();
+        }
     }
 
     #[test]

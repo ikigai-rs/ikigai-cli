@@ -20,7 +20,25 @@ pub use libp2p::{Multiaddr, PeerId};
 /// [`PROTOCOL_VERSION`](ikigai_wire::PROTOCOL_VERSION) — a mismatched peer fails protocol
 /// negotiation, just as a mismatched ALPN fails the QUIC handshake. (A `&'static str`
 /// because `StreamProtocol::new` wants one; a test pins it to the wire constant.)
-pub const WIRE_PROTOCOL: &str = "/ikigai/wire/7";
+pub const WIRE_PROTOCOL: &str = "/ikigai/wire/8";
+
+/// Every protocol id this node offers and accepts, NEWEST FIRST — the libp2p twin of
+/// QUIC's two-entry ALPN list. Since wire v8 a node also speaks v7, so a v7 peer still
+/// negotiates `/ikigai/wire/7`, and every reply on such a stream is encoded at 7 (see
+/// [`WireCodec`]). A test pins this list to the wire's spoken range.
+pub const WIRE_PROTOCOLS: [&str; 2] = [WIRE_PROTOCOL, "/ikigai/wire/7"];
+
+/// The wire version a negotiated protocol id names. Only ids from [`WIRE_PROTOCOLS`] are
+/// ever negotiated; anything else reads as the OLDEST spoken version, so a surprise can
+/// only ever make a reply less typed, never undecodable.
+fn version_of_protocol(protocol: &StreamProtocol) -> u32 {
+    protocol
+        .as_ref()
+        .strip_prefix("/ikigai/wire/")
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|v| ikigai_wire::speaks(*v))
+        .unwrap_or(ikigai_wire::MIN_PROTOCOL_VERSION)
+}
 
 /// The identify protocol version string both peers and the relay announce.
 const IDENTIFY_PROTOCOL: &str = "/ikigai/7";
@@ -45,7 +63,9 @@ pub type PeerMinter = Arc<dyn Fn(&PeerId) -> Option<Session> + Send + Sync>;
 // ── the codec ──────────────────────────────────────────────────────────────────────────
 
 /// Postcard [`Call`]/[`Reply`] framed by the stream itself, exactly as on QUIC: the writer
-/// closes its half after one message, so the reader reads to end.
+/// closes its half after one message, so the reader reads to end. A reply is encoded at
+/// the version its stream NEGOTIATED ([`Reply::for_peer`]) — the codec is handed the
+/// protocol, which makes it the one place on this door that knows it.
 #[derive(Clone, Default)]
 pub struct WireCodec;
 
@@ -96,13 +116,14 @@ impl request_response::Codec for WireCodec {
 
     async fn write_response<T>(
         &mut self,
-        _: &StreamProtocol,
+        protocol: &StreamProtocol,
         io: &mut T,
         reply: Reply,
     ) -> io::Result<()>
     where
         T: futures::AsyncWrite + Unpin + Send,
     {
+        let reply = reply.for_peer(version_of_protocol(protocol));
         io.write_all(&encode(&reply)?).await
     }
 }
@@ -475,7 +496,7 @@ pub fn spawn_peer(
             ping: ping::Behaviour::default(),
             dcutr: dcutr::Behaviour::new(key.public().to_peer_id()),
             wire: request_response::Behaviour::new(
-                [(StreamProtocol::new(WIRE_PROTOCOL), ProtocolSupport::Full)],
+                WIRE_PROTOCOLS.map(|id| (StreamProtocol::new(id), ProtocolSupport::Full)),
                 request_response::Config::default().with_request_timeout(REQUEST_TIMEOUT),
             ),
         })?
@@ -698,6 +719,44 @@ mod tests {
             WIRE_PROTOCOL,
             format!("/ikigai/wire/{}", ikigai_wire::PROTOCOL_VERSION)
         );
+    }
+
+    #[test]
+    fn the_protocol_list_is_the_spoken_range_newest_first() {
+        let spoken: Vec<String> = (ikigai_wire::MIN_PROTOCOL_VERSION
+            ..=ikigai_wire::PROTOCOL_VERSION)
+            .rev()
+            .map(|v| format!("/ikigai/wire/{v}"))
+            .collect();
+        assert_eq!(WIRE_PROTOCOLS.to_vec(), spoken);
+        for (id, version) in WIRE_PROTOCOLS.iter().zip([8, 7]) {
+            assert_eq!(version_of_protocol(&StreamProtocol::new(id)), version);
+        }
+    }
+
+    /// The codec encodes each reply at its stream's version: a Conflict on a v7 stream is
+    /// the untyped Endpoint a v7 peer has always received, typed on a v8 one.
+    #[test]
+    fn a_reply_is_encoded_at_the_version_its_stream_negotiated() {
+        use request_response::Codec;
+        let conflict = || Reply::ErrorTyped(WireError::Conflict("x".into()));
+        for (id, expected) in [
+            (WIRE_PROTOCOLS[1], WireError::Endpoint("conflict: x".into())),
+            (WIRE_PROTOCOLS[0], WireError::Conflict("x".into())),
+        ] {
+            let mut out = futures::io::Cursor::new(Vec::new());
+            futures::executor::block_on(WireCodec.write_response(
+                &StreamProtocol::new(id),
+                &mut out,
+                conflict(),
+            ))
+            .unwrap();
+            assert_eq!(
+                decode::<Reply>(out.get_ref()).unwrap(),
+                Reply::ErrorTyped(expected),
+                "{id}"
+            );
+        }
     }
 
     #[test]

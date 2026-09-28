@@ -25,8 +25,8 @@ use std::time::Duration;
 use ikigai_core::{Capability, Error, Kernel, Representation, Request, SpaceEntry, Tracer};
 use ikigai_resolve::{scoped_entries, CacheStatus, Resolver, SpanCollector};
 use ikigai_wire::{
-    decode_hello, read_frame, read_message, write_hello, write_message, Call, Hello, Reply,
-    TraceContext, WireError, PROTOCOL_VERSION,
+    answer_to, decode_hello, read_frame, read_message, speaks, write_hello, write_message, Call,
+    Hello, Reply, TraceContext, WireError, PROTOCOL_VERSION,
 };
 // Re-exported so consumers (the CLI's mount plumbing) can pass a mode without
 // depending on ikigai-wire directly.
@@ -110,10 +110,10 @@ pub fn connect_with_timeout(path: &Path, timeout: Option<Duration>) -> io::Resul
 }
 
 /// The full connect: dial, then exchange the version [`Hello`] — REQUIRED
-/// since v7 (the v6 legacy-reconnect tolerance is gone). A version mismatch
-/// from any hello-speaking peer errors naming BOTH versions; a peer that
-/// hangs up on the hello predates v6 entirely and is refused with that
-/// diagnosis.
+/// since v7 (the v6 legacy-reconnect tolerance is gone). A v7 server is met by
+/// redialing at 7 (see the private `handshake`). A peer outside the spoken
+/// range errors naming BOTH versions; a peer that hangs up on the hello
+/// predates v6 entirely and is refused with that diagnosis.
 pub fn connect_with(
     path: &Path,
     timeout: Option<Duration>,
@@ -135,26 +135,50 @@ pub fn connect_with(
 /// a broken connection renegotiates the hello too — the peer may have been
 /// upgraded across its bounce, and a redial that now speaks a different wire
 /// version must surface the normal version error, not a desynced hang.
+///
+/// ★ Since v8 the client may REDIAL once. A v7 server answers a v8 hello with 7 and
+/// then CLOSES (it cannot serve a version it does not speak, and says so by answering
+/// its own), so the downgrade cannot happen inside that connection. An answer LOWER
+/// than the offer that this build still [speaks] is therefore a request to come back
+/// at that version: dial again, offer it, and serve at it. That is per-connection
+/// negotiation, not a flag day — nothing on the next connection remembers it.
 fn handshake(path: &Path, timeout: Option<Duration>, mode: HelloMode) -> io::Result<UnixStream> {
+    match hello_at(path, timeout, mode, PROTOCOL_VERSION)? {
+        (stream, answer) if answer == PROTOCOL_VERSION => Ok(stream),
+        (_, answer) if answer < PROTOCOL_VERSION && speaks(answer) => {
+            match hello_at(path, timeout, mode, answer)? {
+                (stream, again) if again == answer => Ok(stream),
+                (_, again) => Err(version_mismatch(again, answer)),
+            }
+        }
+        (_, answer) => Err(version_mismatch(answer, PROTOCOL_VERSION)),
+    }
+}
+
+/// The error for a server that answered `theirs` to our offer of `ours`.
+fn version_mismatch(theirs: u32, ours: u32) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "the kernel server speaks wire v{theirs}, this client speaks v{ours} — update the older side"
+        ),
+    )
+}
+
+/// Dial `path`, offer wire `version`, and return the stream with the version the
+/// server answered. Whether that answer is acceptable is the caller's decision.
+fn hello_at(
+    path: &Path,
+    timeout: Option<Duration>,
+    mode: HelloMode,
+    version: u32,
+) -> io::Result<(UnixStream, u32)> {
     let stream = dial(path, timeout)?;
     let mut writer = &stream;
-    write_hello(
-        &mut writer,
-        &Hello {
-            version: PROTOCOL_VERSION,
-            mode,
-        },
-    )?;
+    write_hello(&mut writer, &Hello { version, mode })?;
     match read_frame(&mut &stream) {
         Ok(payload) => match decode_hello(&payload) {
-            Some(hello) if hello.version == PROTOCOL_VERSION => Ok(stream),
-            Some(hello) => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "the kernel server speaks wire v{}, this client speaks v{} — update the older side",
-                    hello.version, PROTOCOL_VERSION
-                ),
-            )),
+            Some(hello) => Ok((stream, hello.version)),
             None => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "the kernel server answered the version hello with something else entirely",
@@ -162,7 +186,12 @@ fn handshake(path: &Path, timeout: Option<Duration>, mode: HelloMode) -> io::Res
         },
         // Silence is a HANG (the server may be overloaded — do not misdiagnose
         // it as ancient); a hang-up (EOF/reset) is the pre-v6 signature.
-        Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
             Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "no answer to the version hello within the deadline (server hung or overloaded)",
@@ -620,32 +649,34 @@ impl Resolver for IpcResolver {
 /// Serve one connection: the version hello first, then calls until the peer
 /// hangs up (or a wire error).
 ///
-/// The FIRST frame decides the connection's era. A hello (magic-prefixed) is
-/// answered with our own hello — equal versions proceed, unequal versions get
-/// the answer (so the CLIENT can name both in its error) and a close. A frame
-/// WITHOUT the magic is a ≤v5 client's first `Call`: served, with a warning —
-/// the one-version tolerance the design doc removes at v7.
+/// The FIRST frame decides the connection's era. A hello (magic-prefixed) in the
+/// spoken range is answered with the CLIENT's version and served AT it — every
+/// reply passes through [`Reply::for_peer`], so a v7 client never meets a v8-only
+/// variant. A hello outside the range gets our own version (so the CLIENT can
+/// name both in its error) and a close. A frame WITHOUT the magic is a ≤v5
+/// client and is refused.
 fn handle_connection(kernel: &Kernel, stream: UnixStream) {
     let mut stream = &stream;
     let first = match read_frame(&mut stream) {
         Ok(payload) => payload,
         Err(_) => return,
     };
-    match decode_hello(&first) {
+    let peer_version = match decode_hello(&first) {
         Some(hello) => {
             // The mode is a hint for prefix-canonical peers; this server's
             // kernel speaks canonical IRIs either way, so it is read and
             // deliberately unused here.
             let answer = Hello {
-                version: PROTOCOL_VERSION,
+                version: answer_to(hello.version),
                 mode: HelloMode::Verbatim,
             };
             if write_hello(&mut stream, &answer).is_err() {
                 return;
             }
-            if hello.version != PROTOCOL_VERSION {
+            if !speaks(hello.version) {
                 return; // the client renders the mismatch; nothing more to say
             }
+            hello.version
         }
         None => {
             // v7: the hello is REQUIRED. A first frame without the magic is a
@@ -657,13 +688,14 @@ fn handle_connection(kernel: &Kernel, stream: UnixStream) {
             );
             return;
         }
-    }
+    };
     loop {
         let call: Call = match read_message(&mut stream) {
             Ok(call) => call,
             Err(_) => return, // EOF or a malformed frame ends the session
         };
-        if write_message(&mut stream, &dispatch(kernel, call)).is_err() {
+        let reply = dispatch(kernel, call).for_peer(peer_version);
+        if write_message(&mut stream, &reply).is_err() {
             return;
         }
     }
@@ -1179,6 +1211,174 @@ mod tests {
         );
 
         server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- wire v8: backward-compatible negotiation (ledger #583) ----
+
+    /// A kernel whose one endpoint refuses by STATE — core's `Error::Conflict`.
+    fn conflict_kernel() -> Kernel {
+        let taken = FnEndpoint::new("taken", |_inv: &ikigai_core::Invocation<'_>| {
+            Err(Error::Conflict("x".into()))
+        });
+        Kernel::new(Arc::new(
+            EndpointSpace::new()
+                .bind(Exact::new("urn:test:upper"), builtins::to_upper())
+                .bind(Exact::new("urn:test:taken"), taken),
+        ))
+    }
+
+    fn taken() -> Request {
+        Request::new(Verb::Source, Iri::parse("urn:test:taken").unwrap())
+    }
+
+    /// Open a raw connection, offer `version`, and return the stream with the answer.
+    fn raw_hello(path: &Path, version: u32) -> (UnixStream, u32) {
+        let stream = UnixStream::connect(path).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut s = &stream;
+        write_hello(
+            &mut s,
+            &Hello {
+                version,
+                mode: HelloMode::Verbatim,
+            },
+        )
+        .unwrap();
+        let answer = decode_hello(&read_frame(&mut s).unwrap()).expect("a hello");
+        (stream, answer.version)
+    }
+
+    /// ★ A v7 client — pinned here as raw bytes, not as this build's client — is
+    /// answered 7 (the v7 client refuses any other answer) and SERVED.
+    #[test]
+    fn a_v7_hello_is_answered_7_and_served() {
+        let path = socket_path("v7-hello");
+        let server = serve_one(&path, kernel());
+        let (stream, answer) = raw_hello(&path, 7);
+        assert_eq!(
+            answer, 7,
+            "an accepted hello is answered with the peer's version"
+        );
+        let mut s = &stream;
+        write_message(&mut s, &Call::Issue(upper("hi"))).unwrap();
+        match read_message::<_, Reply>(&mut s).unwrap() {
+            Reply::Resolved(representation, _) => assert_eq!(representation.bytes, b"HI"),
+            other => panic!("a v7 peer must be served: {other:?}"),
+        }
+        drop(stream);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A hello outside the spoken range (6 below, 9 above) gets OUR version, so the
+    /// client can name both, and the connection closes without serving.
+    #[test]
+    fn a_hello_outside_7_to_8_is_answered_8_and_refused() {
+        for (n, offered) in [6u32, 9].into_iter().enumerate() {
+            let path = socket_path(&format!("v-out-{n}"));
+            let server = serve_one(&path, kernel());
+            let (stream, answer) = raw_hello(&path, offered);
+            assert_eq!(answer, PROTOCOL_VERSION, "offered v{offered}");
+            let mut s = &stream;
+            let _ = write_message(&mut s, &Call::Issue(upper("hi")));
+            assert!(
+                read_message::<_, Reply>(&mut s).is_err(),
+                "a v{offered} peer must not be served"
+            );
+            drop(stream);
+            server.join().unwrap();
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// The downgrade: a Conflict reaches a v7 peer as EXACTLY the untyped Endpoint
+    /// error a v7 server always sent, and a v8 peer typed.
+    #[test]
+    fn a_conflict_is_downgraded_for_a_v7_peer_and_typed_for_a_v8_one() {
+        for (version, expected) in [
+            (7, WireError::Endpoint("conflict: x".into())),
+            (8, WireError::Conflict("x".into())),
+        ] {
+            let path = socket_path(&format!("conflict-v{version}"));
+            let server = serve_one(&path, conflict_kernel());
+            let (stream, answer) = raw_hello(&path, version);
+            assert_eq!(answer, version);
+            let mut s = &stream;
+            write_message(&mut s, &Call::Issue(taken())).unwrap();
+            assert_eq!(
+                read_message::<_, Reply>(&mut s).unwrap(),
+                Reply::ErrorTyped(expected),
+                "a v{version} peer"
+            );
+            drop(stream);
+            server.join().unwrap();
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// Through this build's own client the Conflict arrives typed and PERMANENT.
+    #[test]
+    fn a_conflict_crosses_to_a_v8_client_as_a_permanent_conflict() {
+        let path = socket_path("conflict-client");
+        let server = serve_one(&path, conflict_kernel());
+        let client = connect(&path).unwrap();
+        let err = client.issue(taken()).unwrap_err();
+        assert!(matches!(err, Error::Conflict(ref m) if m == "x"), "{err:?}");
+        assert!(!err.is_transient());
+        drop(client);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ★ A v7-only server answers a v8 hello with 7 and CLOSES — so the client
+    /// cannot downgrade inside that connection. It redials offering 7 and is served.
+    /// The fake server is exactly the v7 `handle_connection`: answer its own version,
+    /// close on a mismatch, serve on a match.
+    #[test]
+    fn a_v8_client_redials_a_v7_only_server_at_7() {
+        let path = socket_path("v7-server");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let mut offered = Vec::new();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let mut s = &stream;
+                let hello = decode_hello(&read_frame(&mut s).unwrap()).expect("a hello");
+                offered.push(hello.version);
+                write_hello(
+                    &mut s,
+                    &Hello {
+                        version: 7,
+                        mode: HelloMode::Verbatim,
+                    },
+                )
+                .unwrap();
+                if hello.version != 7 {
+                    continue; // the v7 server closes on a mismatch
+                }
+                let call: Call = read_message(&mut s).unwrap();
+                assert!(
+                    matches!(call, Call::IssueAs(..) | Call::Issue(..)),
+                    "{call:?}"
+                );
+                let reply = Reply::Resolved(
+                    Representation::new(ReprType::new("text/plain"), b"from v7".to_vec()),
+                    CacheStatus::Miss,
+                );
+                write_message(&mut s, &reply).unwrap();
+            }
+            offered
+        });
+
+        let client = connect(&path).unwrap();
+        let (representation, _) = client.issue(upper("hi")).unwrap();
+        assert_eq!(representation.bytes, b"from v7");
+        drop(client);
+        assert_eq!(server.join().unwrap(), vec![PROTOCOL_VERSION, 7]);
         let _ = std::fs::remove_file(&path);
     }
 

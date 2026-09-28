@@ -25,14 +25,91 @@ use serde::{Deserialize, Serialize};
 /// **removes the v6 tolerances**: the hello is REQUIRED and the legacy ALPN is
 /// gone. A v6 peer still fails CLEANLY (the hello exchange itself reports the
 /// mismatch naming both versions); only pre-v6 peers fail without explanation.
-pub const PROTOCOL_VERSION: u32 = 7;
+/// **v8 adds [`WireError::Conflict`]** (core's `Error::Conflict`: the state refuses
+/// the request) and is the first **backward-compatible** revision: a v8 peer also
+/// speaks v7 ([`MIN_PROTOCOL_VERSION`]), remembers which one each connection
+/// negotiated, and [downgrades](Reply::for_peer) a `Conflict` to the untyped
+/// `Endpoint("conflict: …")` a v7 peer has always received. Nothing else changed
+/// shape, so a v7 client, server or mount keeps working against a v8 one.
+pub const PROTOCOL_VERSION: u32 = 8;
 
-/// The ALPN protocol id for QUIC — `ikigai/{PROTOCOL_VERSION}`, the TLS
-/// handshake itself as the version gate. Since v7 it is the ONLY id offered
-/// and accepted: the v6 transition (offer/accept the version-blind `ikigai/0`
-/// beside it, warn on negotiation) is over.
+/// The oldest wire version this build still speaks. A hello (or ALPN id) in
+/// `MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION` is accepted and served AT THAT
+/// VERSION; anything outside it is refused naming both versions, as before.
+pub const MIN_PROTOCOL_VERSION: u32 = 7;
+
+/// The first version whose peers can decode [`WireError::Conflict`].
+const CONFLICT_SINCE: u32 = 8;
+
+/// Whether this build speaks wire `version`.
+///
+/// ```
+/// use ikigai_wire::{speaks, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
+/// assert!(speaks(7) && speaks(8));
+/// assert!(!speaks(6) && !speaks(9));
+/// assert!(speaks(MIN_PROTOCOL_VERSION) && speaks(PROTOCOL_VERSION));
+/// ```
+pub fn speaks(version: u32) -> bool {
+    (MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version)
+}
+
+/// The version a server answers a client's hello with. ★ An accepted hello is
+/// answered with the CLIENT's version, not ours: a v7 client refuses any answer
+/// that is not exactly 7, so answering 8 would make "a v8 server accepts v7"
+/// false in practice. A hello outside the spoken range gets our own version, so
+/// the client can name both in its error, and the server then closes.
+///
+/// ```
+/// use ikigai_wire::answer_to;
+/// assert_eq!(answer_to(7), 7);
+/// assert_eq!(answer_to(8), 8);
+/// assert_eq!(answer_to(6), 8);
+/// assert_eq!(answer_to(9), 8);
+/// ```
+pub fn answer_to(offered: u32) -> u32 {
+    if speaks(offered) {
+        offered
+    } else {
+        PROTOCOL_VERSION
+    }
+}
+
+/// The ALPN protocol id for QUIC at wire `version`: `ikigai/{version}`.
+pub fn alpn_for(version: u32) -> Vec<u8> {
+    format!("ikigai/{version}").into_bytes()
+}
+
+/// The ALPN protocol id for the current version — `ikigai/{PROTOCOL_VERSION}`.
 pub fn alpn() -> Vec<u8> {
-    format!("ikigai/{PROTOCOL_VERSION}").into_bytes()
+    alpn_for(PROTOCOL_VERSION)
+}
+
+/// Every ALPN id this build offers and accepts, NEWEST FIRST: the TLS handshake
+/// is the version gate on QUIC, and the preference order is what makes a v8
+/// pair choose 8 while a v7 peer still finds 7.
+///
+/// ```
+/// assert_eq!(ikigai_wire::alpns(), vec![b"ikigai/8".to_vec(), b"ikigai/7".to_vec()]);
+/// ```
+pub fn alpns() -> Vec<Vec<u8>> {
+    (MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION)
+        .rev()
+        .map(alpn_for)
+        .collect()
+}
+
+/// The wire version a negotiated ALPN id names, when it is one this build
+/// speaks. `None` for anything else, including no id at all — the caller
+/// refuses the connection rather than guess a version.
+pub fn version_of_alpn(id: &[u8]) -> Option<u32> {
+    let digits = id.strip_prefix(b"ikigai/")?;
+    // Digits only: `u32::from_str` accepts a leading `+`, and `ikigai/+8` is not an id
+    // anyone offers, so it must not be read as one.
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let version = std::str::from_utf8(digits).ok()?.parse::<u32>().ok()?;
+    speaks(version).then_some(version)
 }
 
 /// The magic prefix of a hello payload. A first frame that does NOT start with
@@ -182,6 +259,18 @@ pub enum Reply {
     ErrorTyped(WireError),
 }
 
+impl Reply {
+    /// This reply as a peer speaking wire `peer_version` must receive it — the
+    /// one place a server honors the version its peer negotiated. Every door
+    /// that encodes a reply for a peer passes it through here.
+    pub fn for_peer(self, peer_version: u32) -> Reply {
+        match self {
+            Reply::ErrorTyped(error) => Reply::ErrorTyped(error.for_peer(peer_version)),
+            other => other,
+        }
+    }
+}
+
 /// The error taxonomy on the wire — a field-for-field mirror of
 /// `ikigai_core::Error`, kept wire-local so a taxonomy addition is a WIRE
 /// version event (this codec is a public ABI with independent
@@ -205,6 +294,37 @@ pub enum WireError {
     Timeout(String),
     /// Transient.
     Unavailable(String),
+    /// Permanent: well-formed, authorized, the thing exists, and its CURRENT
+    /// STATE refuses the request (core's `Error::Conflict`; HTTP 409). Since v8 —
+    /// variant **8**, appended. A v7 peer never receives it: see
+    /// [`WireError::for_peer`].
+    Conflict(String),
+}
+
+impl WireError {
+    /// This error as a peer speaking wire `peer_version` must receive it. A
+    /// peer older than v8 cannot decode [`Conflict`](WireError::Conflict), so it
+    /// gets `Endpoint("conflict: {msg}")` — byte-identical to what a v7 server
+    /// sent for the same core error, because that is core's `Display` and v7 fell
+    /// back to it. Everything else passes through unchanged.
+    ///
+    /// ```
+    /// use ikigai_wire::WireError;
+    /// let conflict = WireError::Conflict("1,1 is taken".into());
+    /// assert_eq!(conflict.clone().for_peer(8), conflict);
+    /// assert_eq!(
+    ///     conflict.for_peer(7),
+    ///     WireError::Endpoint("conflict: 1,1 is taken".into())
+    /// );
+    /// ```
+    pub fn for_peer(self, peer_version: u32) -> WireError {
+        match self {
+            WireError::Conflict(message) if peer_version < CONFLICT_SINCE => {
+                WireError::Endpoint(format!("conflict: {message}"))
+            }
+            other => other,
+        }
+    }
 }
 
 impl From<&ikigai_core::Error> for WireError {
@@ -222,6 +342,7 @@ impl From<&ikigai_core::Error> for WireError {
             E::NotFound(message) => WireError::NotFound(message.clone()),
             E::Timeout(message) => WireError::Timeout(message.clone()),
             E::Unavailable(message) => WireError::Unavailable(message.clone()),
+            E::Conflict(message) => WireError::Conflict(message.clone()),
             // Core's Error is non_exhaustive: a variant newer than this wire
             // revision degrades to Endpoint (message preserved) until the wire
             // catches up — a taxonomy addition is a wire-version event, and an
@@ -248,6 +369,7 @@ impl From<WireError> for ikigai_core::Error {
             WireError::NotFound(message) => E::NotFound(message),
             WireError::Timeout(message) => E::Timeout(message),
             WireError::Unavailable(message) => E::Unavailable(message),
+            WireError::Conflict(message) => E::Conflict(message),
         }
     }
 }
@@ -441,6 +563,75 @@ mod tests {
         assert_eq!(alpn(), format!("ikigai/{PROTOCOL_VERSION}").into_bytes());
     }
 
+    #[test]
+    fn every_spoken_version_has_an_alpn_id_and_nothing_else_does() {
+        for version in MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION {
+            assert_eq!(version_of_alpn(&alpn_for(version)), Some(version));
+        }
+        assert_eq!(alpns().first(), Some(&alpn()), "newest first");
+        assert_eq!(version_of_alpn(b"ikigai/6"), None);
+        assert_eq!(version_of_alpn(b"ikigai/9"), None);
+        assert_eq!(version_of_alpn(b"ikigai/0"), None);
+        assert_eq!(version_of_alpn(b"ikigai/+8"), None);
+        assert_eq!(version_of_alpn(b"h3"), None);
+        assert_eq!(version_of_alpn(b""), None);
+    }
+
+    /// The v8 reference vector, pinned byte-exact beside the Denied one: the same
+    /// bytes are pinned in ikigai-python and ikigai-deno.
+    #[test]
+    fn conflict_is_wire_variant_8_and_encodes_as_05_08_01_78() {
+        let bytes = encode(&Reply::ErrorTyped(WireError::Conflict("x".into()))).unwrap();
+        assert_eq!(bytes, [0x05, 0x08, 0x01, 0x78]);
+        assert_eq!(
+            decode::<Reply>(&[0x05, 0x08, 0x01, 0x78]).unwrap(),
+            Reply::ErrorTyped(WireError::Conflict("x".into()))
+        );
+    }
+
+    /// What a v7 peer receives for a Conflict is EXACTLY what a v7 server sent for
+    /// the same core error: `Endpoint(Display)`, which is `05 03 0b "conflict: x"`.
+    #[test]
+    fn a_conflict_is_downgraded_byte_identically_for_a_v7_peer() {
+        let error = ikigai_core::Error::Conflict("x".into());
+        let for_v7 = Reply::ErrorTyped(WireError::from(&error)).for_peer(7);
+        let v7_would_send = Reply::ErrorTyped(WireError::Endpoint(error.to_string()));
+        assert_eq!(for_v7, v7_would_send);
+        let mut expected = vec![0x05, 0x03, 0x0b];
+        expected.extend_from_slice(b"conflict: x");
+        assert_eq!(encode(&for_v7).unwrap(), expected);
+        // A v8 peer gets it typed, and every other reply passes through for either.
+        assert_eq!(
+            Reply::ErrorTyped(WireError::from(&error)).for_peer(8),
+            Reply::ErrorTyped(WireError::Conflict("x".into()))
+        );
+        for version in [7, 8] {
+            assert_eq!(Reply::Cached(true).for_peer(version), Reply::Cached(true));
+            assert_eq!(
+                Reply::ErrorTyped(WireError::Denied("x".into())).for_peer(version),
+                Reply::ErrorTyped(WireError::Denied("x".into()))
+            );
+        }
+    }
+
+    /// A v8 client's decoder never RECONSTRUCTS a typed Conflict from a v7
+    /// server's text: guessing a type from a message prefix is not typing.
+    #[test]
+    fn a_v7_conflict_message_stays_an_untyped_endpoint_error() {
+        let rebuilt: ikigai_core::Error = WireError::Endpoint("conflict: x".into()).into();
+        assert!(
+            matches!(rebuilt, ikigai_core::Error::Endpoint(_)),
+            "{rebuilt:?}"
+        );
+    }
+
+    #[test]
+    fn a_conflict_is_permanent_across_the_wire() {
+        let rebuilt: ikigai_core::Error = WireError::Conflict("x".into()).into();
+        assert!(matches!(rebuilt, ikigai_core::Error::Conflict(_)));
+        assert!(!rebuilt.is_transient(), "a Retry overlay must not retry it");
+    }
+
     /// Every taxonomy variant crosses and comes back as the SAME core variant,
     /// with transience preserved — the property the reliability overlays and
     /// the HTTP faces depend on.
@@ -459,6 +650,7 @@ mod tests {
             E::NotFound("no such row".into()),
             E::Timeout("5s elapsed".into()),
             E::Unavailable("connection refused".into()),
+            E::Conflict("1,1 is taken".into()),
         ];
         for original in cases {
             let mut buf = Vec::new();

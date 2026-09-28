@@ -23,7 +23,8 @@
 //! - **`cap_of(request)` is the multi-tenant door** — every request resolves under a
 //!   capability derived from its identity. A public default (or a fixed `--cap` ceiling that
 //!   narrows the edge); a per-user capability (magic-link / passkey) fills the same seam later.
-//! - **typed error → status**: `Denied`→403, invalid/missing arg→400, transient→503, else 500.
+//! - **typed error → status**: `Denied`→403, `NotFound`/`Unresolved`→404, invalid/missing
+//!   arg→400, `Conflict`→409, transient→503, else 500.
 //!
 //! App logic — scheduling, forms, policy — stays in resources, compositions, and
 //! capabilities *above* this transport, exactly as the other transports (quic/ipc/mcp) keep
@@ -1304,12 +1305,19 @@ fn verb_for_method(method: &str) -> Option<Verb> {
 /// already a 403 and a missing one was already distinguishable (as a 500). A 404 here names
 /// no more than that already does. (`?description` once answered for any bound IRI without
 /// consulting the capability; it now answers an out-of-scope resource with this same 404.)
+///
+/// `Conflict` — the resource's CURRENT STATE refuses the request (a taken square, a move after
+/// the game is over) — is a **409**. It used to fall to 500, worse than the 400 a bad argument
+/// gets. Distinct from **412**, which stays the answer when a precondition the CALLER stated
+/// (`If-Match` / `If-None-Match`) fails; that is checked before the write is attempted, so a
+/// write carrying a failed precondition never reaches the endpoint to conflict at all.
 fn error_resp(e: &ikigai_core::Error) -> Resp {
     use ikigai_core::Error;
     let (status, reason) = match e {
         Error::Denied(_) => (403, "Forbidden"),
         Error::NotFound(_) | Error::Unresolved(_) => (404, "Not Found"),
         Error::MissingArgument(_) | Error::InvalidArgument { .. } => (400, "Bad Request"),
+        Error::Conflict(_) => (409, "Conflict"),
         _ if e.is_transient() => (503, "Service Unavailable"),
         _ => (500, "Internal Server Error"),
     };
@@ -2225,6 +2233,22 @@ mod tests {
             }
         })
         .with_description(Description::new("doc").verb(Verb::Source).verb(Verb::Sink));
+        // A resource whose STATE refuses a write: readable, but every Sink is a Conflict.
+        let board = FnEndpoint::new("board", |inv: &Invocation<'_>| {
+            if inv.request.verb == Verb::Source {
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    b"X..".to_vec(),
+                ))
+            } else {
+                Err(Error::Conflict("1,1 is taken".into()))
+            }
+        })
+        .with_description(
+            Description::new("board")
+                .verb(Verb::Source)
+                .verb(Verb::Sink),
+        );
         // An absent-but-writable resource: Source → NotFound, Sink → Ok (create).
         let newdoc = FnEndpoint::new("newdoc", |inv: &Invocation<'_>| {
             if inv.request.verb == Verb::Source {
@@ -2425,6 +2449,7 @@ mod tests {
         let space = EndpointSpace::new()
             .bind(UriTemplate::parse("urn:test:seg:{key}").unwrap(), seg)
             .bind(Exact::new("urn:test:big"), big)
+            .bind(Exact::new("urn:test:board"), board)
             .bind(Exact::new("urn:test:sealed"), sealed)
             .bind(Exact::new("urn:test:split"), split)
             .bind(UriTemplate::parse("urn:test:tpl:{name}").unwrap(), tpl)
@@ -2894,6 +2919,35 @@ mod tests {
         let resp = roundtrip(
             addr,
             "PUT /test/doc HTTP/1.1\r\nHost: x\r\nIf-Match: \"nope\"\r\nContent-Length: 2\r\n\r\nv2",
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 412 Precondition Failed"),
+            "got: {resp}"
+        );
+    }
+
+    /// ★ A Conflict (the state refuses the request) is 409 — ledger #583. It was a 500.
+    #[tokio::test]
+    async fn a_conflict_is_409() {
+        let addr = start().await;
+        let resp = roundtrip(
+            addr,
+            "PUT /test/board HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\n1,1",
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 409 Conflict\r\n"), "got: {resp}");
+        assert!(resp.ends_with("conflict: 1,1 is taken"), "got: {resp}");
+    }
+
+    /// …and a precondition the CALLER stated still answers 412 on the same resource: it is
+    /// checked before the write, so the endpoint never gets the chance to conflict.
+    #[tokio::test]
+    async fn a_failed_if_match_is_412_even_where_the_write_would_conflict() {
+        let addr = start().await;
+        let resp = roundtrip(
+            addr,
+            "PUT /test/board HTTP/1.1\r\nHost: x\r\nIf-Match: \"nope\"\r\nContent-Length: 3\r\n\r\n1,1",
         )
         .await;
         assert!(

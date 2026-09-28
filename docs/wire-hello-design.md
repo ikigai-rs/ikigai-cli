@@ -1,6 +1,7 @@
 # The wire hello: version (and mount mode) at connection open
 
-Status: v6, shipping. Companion change in ikigai-python.
+Status: v8, shipping (v6 introduced the hello; v7 and v8 are sections below). Companion
+changes in ikigai-python and ikigai-deno.
 
 ## The problem
 
@@ -99,6 +100,54 @@ are the pressure to get there.
   pre-v6 peers fail without explanation, and none remain in this fleet.
 - Deployment order: land Rust v7 on main → ship the Python and Deno v7
   mirrors → THEN install binaries and update bug + the edge together.
+
+## v8 (2026-09-28): Conflict, and the first backward-compatible bump
+
+Core 0.1.80 added `Error::Conflict(String)`: well-formed, authorized, the thing exists,
+and its CURRENT STATE refuses the request (HTTP 409; permanent). Under v7 it crossed the
+wire untyped, as `Endpoint("conflict: …")`, because core is `non_exhaustive` and the map
+fell back to `Display`.
+
+- **`WireError::Conflict(String)`, appended** after `Unavailable`, so it is variant
+  **8**. The reference vector, pinned byte-exact in all three suites beside Denied's
+  `05 04 01 78`: `Reply::ErrorTyped(WireError::Conflict("x"))` is **`05 08 01 78`**.
+- **`PROTOCOL_VERSION = 8`, `MIN_PROTOCOL_VERSION = 7`: not a flag day.** v7 was one.
+  v8 adds a single error variant, and a flag day would have stopped the plasma↔bug
+  federation, gonk, ttt-host and every installed Python/Deno client at once. So a v8
+  peer speaks both, and each connection remembers which one it negotiated.
+- **The downgrade.** A v8 peer never sends variant 8 to a v7 peer: `Reply::for_peer`
+  turns `Conflict(msg)` into `Endpoint("conflict: {msg}")`, byte-identical to what a v7
+  server sent (`05 03 0b "conflict: x"`). Every door that encodes a reply for a peer
+  goes through it: the IPC server, the QUIC server, and the p2p codec. A v8 CLIENT does
+  NOT reconstruct a typed Conflict from a v7 server's `"conflict: "` text; guessing a
+  type from a message prefix is not typing.
+
+Two negotiation rules the first draft did not state, found by the Python half and
+required for "accepts v7" to be true in practice:
+
+1. **UDS: a server answers an accepted hello with the PEER's version**, not its own. A
+   v7 client refuses any answer that is not exactly 7, so answering 8 would refuse
+   every installed v7 client. A hello outside 7..=8 is answered with our own version
+   (8) and the connection closes, so the client can still name both.
+2. **UDS: a v8 client REDIALS once at the server's lower answer.** A v7 server answers
+   a v8 hello with 7 and CLOSES — it cannot serve a version it does not speak — so the
+   downgrade cannot happen inside that connection. When the answer is lower than the
+   offer and still spoken, the client opens a new connection offering it. That is
+   per-connection negotiation; nothing persists to the next connection.
+
+**QUIC has no hello; the negotiated ALPN id IS the connection's version.** Both sides
+list `ikigai/8` then `ikigai/7`, so a v8 pair settles on 8 and a v7 peer still finds 7.
+The server encodes every reply at the negotiated version, and both sides refuse a
+connection whose negotiated id names no version they speak. (In practice rustls already
+refuses at the handshake with `no_application_protocol`, since QUIC requires ALPN; the
+check behind it is defensive. There is no separate hello to disagree with, so "the ALPN
+agrees with the hello" reduces to "the ALPN names a spoken version".)
+
+**p2p** offers `/ikigai/wire/8` then `/ikigai/wire/7`; libp2p hands the codec the
+negotiated protocol on every response, so the codec is where it downgrades.
+
+**Not changed:** the mDNS TXT `v` record advertises `PROTOCOL_VERSION` (now 8). It
+is a hint, as before; nothing in this workspace compares it for equality.
 
 ## What this deliberately does not do
 
