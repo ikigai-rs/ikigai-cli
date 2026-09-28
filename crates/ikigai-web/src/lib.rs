@@ -540,6 +540,11 @@ struct Resp {
     etag: Option<String>,
     /// `Cache-Control`, projected from the representation's [`Expiry`](ikigai_core::Expiry).
     cache_control: Option<String>,
+    /// The request headers that selected this answer, emitted as ONE `Vary` header (a
+    /// cache keys a stored response on these, so a missing name lets it hand one client's
+    /// answer to another). Kept apart from `headers` so the read path and the edge policy
+    /// can both contribute without writing `Vary` twice.
+    vary: Vec<&'static str>,
     /// Extra headers layered on by the edge policy (security headers, CORS).
     headers: Vec<(String, String)>,
 }
@@ -556,6 +561,7 @@ impl Resp {
             allow: None,
             etag: None,
             cache_control: None,
+            vary: Vec::new(),
             headers: Vec::new(),
         }
     }
@@ -895,7 +901,25 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
 
     match kernel.issue(request, &cap).await {
         // Reads project a strong ETag + Cache-Control and honor `If-None-Match` (→304).
-        Ok(repr) if verb == Verb::Source => read_resp(&req.method, req, repr),
+        Ok(repr) if verb == Verb::Source => {
+            let freshness = Freshness {
+                self_contained: self_contained(&repr, &iri, declared),
+                shared: !shaped_by_credentials(shared, req, matched, &cap),
+            };
+            let mut vary = Vec::new();
+            // `Accept` selected this face unless the client named it in the URL (`?as=`, which
+            // every cache keys on already) or the resource has exactly one face to give.
+            if explicit.is_none() && faces.served.len() != 1 {
+                vary.push("Accept");
+            }
+            // The headers a capability function reads identity from. The edge cannot see
+            // inside `cap_fn`, so it names them whenever `cap_fn` was consulted; a route that
+            // pins its capability makes the answer the same for every caller.
+            if matched.and_then(|m| m.cap.as_ref()).is_none() {
+                vary.extend(CREDENTIAL_HEADERS.iter().map(|(_, name)| *name));
+            }
+            read_resp(req, repr, freshness, vary)
+        }
         Ok(repr) if verb == Verb::Delete => {
             record_tombstone(shared, &iri_str);
             write_resp(verb, repr)
@@ -1170,27 +1194,43 @@ fn method_not_allowed(allow: String) -> Resp {
     }
 }
 
-/// A read response: 200 with the representation + a strong `ETag` and a projected
-/// `Cache-Control`; `304 Not Modified` (headers only) when `If-None-Match` matches;
-/// HEAD carries the same headers with no body.
-fn read_resp(method: &str, req: &HttpRequest, repr: ikigai_core::Representation) -> Resp {
+/// A read response: 200 with the representation + a strong `ETag`, the projected
+/// `Cache-Control` and the `Vary` that names what selected it; `304 Not Modified` (headers
+/// only, the SAME validator, `Cache-Control` and `Vary`, per RFC 9110 §15.4.5) when
+/// `If-None-Match` matches; HEAD carries the same headers with no body.
+fn read_resp(
+    req: &HttpRequest,
+    repr: ikigai_core::Representation,
+    freshness: Freshness,
+    vary: Vec<&'static str>,
+) -> Resp {
     let etag = etag_of(&repr);
-    let cc = cache_control_of(repr.expiry);
+    // Native-only: `ikigai-web` is the inbound HTTP transport (a tokio TcpListener), so it has
+    // no wasm build and no kernel handle to take an injected Clock from here. Wall-clock now
+    // is what turns an `Expiry::At` deadline into a `max-age` a remote cache counts down.
+    #[allow(clippy::disallowed_methods)]
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let cc = Some(cache_control_of(repr.expiry, freshness, now));
     if let Some(inm) = req.header("if-none-match") {
         if if_none_match_hit(inm, &etag) {
             return Resp {
                 etag: Some(etag),
                 cache_control: cc,
+                vary,
                 ..Resp::status(304, "Not Modified")
             };
         }
     }
-    let head_only = method == "HEAD";
+    let head_only = req.method == "HEAD";
     Resp {
         content_type: media_type_of(&repr),
         body: if head_only { Vec::new() } else { repr.bytes },
         etag: Some(etag),
         cache_control: cc,
+        vary,
         ..Resp::status(200, "OK")
     }
 }
@@ -1218,33 +1258,135 @@ fn etag_of(repr: &ikigai_core::Representation) -> String {
     format!("\"{}\"", h.finalize().to_hex())
 }
 
-/// `Cache-Control`, projected from the representation's cache validity:
-/// `Never` → long-lived immutable; `At(deadline)` → `max-age` until it (or revalidate
-/// if already past); `Always` (the volatile default) → `no-store`.
-fn cache_control_of(expiry: ikigai_core::Expiry) -> Option<String> {
+/// The request headers a capability function can read an identity from: `(lowercase name
+/// as parsed, name as written in `Vary`)`.
+const CREDENTIAL_HEADERS: [(&str, &str); 2] =
+    [("authorization", "Authorization"), ("cookie", "Cookie")];
+
+/// What the edge knows about a read answer beyond its [`Expiry`](ikigai_core::Expiry): the two
+/// facts [`cache_control_of`] needs and the representation does not carry on its own.
+#[derive(Clone, Copy, Debug)]
+struct Freshness {
+    /// Nothing but the passage of time can change this answer: every golden thread it hangs
+    /// from is its OWN target, and the resource declares verbs, none of them mutating — so no
+    /// write can cut it, here or through a sibling. See [`self_contained`].
+    self_contained: bool,
+    /// Any caller would have been handed this answer: the request's capability is the one it
+    /// would hold with its credentials removed. See [`shaped_by_credentials`].
+    shared: bool,
+}
+
+/// `Cache-Control` for a read, projected from the representation's cache validity. The two
+/// caching models do NOT line up one to one, so this is a translation, not a rename:
+///
+/// | kernel answer                            | `Cache-Control`                  |
+/// |------------------------------------------|----------------------------------|
+/// | `Always`                                 | `no-store`                       |
+/// | `Never`                                  | `no-cache`                       |
+/// | `At(t)`, t ahead, self-contained         | `max-age=<seconds until t>`      |
+/// | `At(t)`, t ahead, hangs from a thread    | `no-cache`                       |
+/// | `At(t)`, t passed                        | `no-cache`                       |
+///
+/// each cacheable one prefixed `public` when any caller would get the same answer and
+/// `private` when the request's credentials shaped it.
+///
+/// ★ **`Never` is `no-cache`, never `immutable`.** Kernel `Never` means "valid until a golden
+/// thread is cut, for as long as this kernel runs". HTTP `immutable` means "the bytes at this
+/// URL never change: do not revalidate, ever, across every restart and upgrade of the server".
+/// Three things in the kernel make the first strictly weaker than the second:
+/// - since core 0.1.73 every cacheable answer hangs from its own target's thread, so a
+///   `Never` answer with NO threads does not reach this function at all;
+/// - a restart empties the kernel's cache, and a resource that reads configuration or a
+///   crate version at startup (the standalone server's `urn:repo:style`) changes its bytes
+///   across one without any thread being cut — that server shipped `immutable` for `Never`
+///   and every correct change was invisible short of a hard reload;
+/// - threads do not cross a mount (`serde(skip)`), so an answer from a peer arrives looking
+///   independent of everything.
+///
+/// `no-cache` is not `no-store`: a cache keeps the bytes and revalidates before reuse, and
+/// against the strong [`etag_of`] validator that is a bodyless `304` for as long as nothing
+/// was cut — most of what `immutable` bought, honestly.
+///
+/// ★ **A deadline with threads is `no-cache`, not `max-age` + `must-revalidate`.** The kernel
+/// holds an `At` entry valid while BOTH the deadline is ahead AND its threads are uncut.
+/// `must-revalidate` only binds once the answer is stale, so inside `max-age` a cache would
+/// serve it without asking and a write in that window would go unseen. HTTP has no way to
+/// push a cut to a cache, so asking on every use is the only projection that keeps the
+/// second half of the condition.
+fn cache_control_of(expiry: ikigai_core::Expiry, freshness: Freshness, now_ms: u64) -> String {
     use ikigai_core::Expiry;
+    let scope = if freshness.shared {
+        "public"
+    } else {
+        "private"
+    };
     match expiry {
-        Expiry::Always => Some("no-store".to_string()),
-        Expiry::Never => Some("public, max-age=31536000, immutable".to_string()),
-        Expiry::At(deadline) => {
-            // Native-only: same inbound HTTP server. Turning an `Expiry::At` deadline into a
-            // `Cache-Control: max-age` needs wall-clock now, and this is a free function with
-            // no kernel handle to take an injected Clock from.
-            #[allow(clippy::disallowed_methods)]
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            if deadline.as_millis() > now {
-                Some(format!(
-                    "public, max-age={}",
-                    (deadline.as_millis() - now) / 1000
-                ))
-            } else {
-                Some("no-cache".to_string())
-            }
+        Expiry::Always => "no-store".to_string(),
+        Expiry::At(deadline) if freshness.self_contained && deadline.as_millis() > now_ms => {
+            format!(
+                "{scope}, max-age={}",
+                (deadline.as_millis() - now_ms) / 1000
+            )
         }
+        Expiry::Never | Expiry::At(_) => format!("{scope}, no-cache"),
     }
+}
+
+/// Whether nothing but time can change `repr` as the answer at `iri`: every thread it hangs
+/// from is `iri` itself, and the resource declares its verbs, none of them mutating.
+///
+/// Conservative in both directions it can fail. A thread under any other name (a store's
+/// write thread, a watched file) means some OTHER write cuts it. Its own thread is cut by a
+/// write to this very IRI, so a resource that declares Sink or Delete is out; one that
+/// declares nothing cannot be said not to. And the thread names the CANONICAL target, so an
+/// aliased name compares unequal and is treated as threaded — the safe way to be wrong.
+fn self_contained(repr: &ikigai_core::Representation, iri: &Iri, declared: &[Verb]) -> bool {
+    repr.threads().iter().all(|t| t.as_str() == iri.as_str())
+        && !declared.is_empty()
+        && !declared.iter().any(|v| v.is_mutating())
+}
+
+/// Whether the request's credentials SHAPED its capability — and so its answer, which the
+/// kernel itself keys on the capability — making it unfit for a shared cache.
+///
+/// ★ The edge cannot see inside the host's [`CapFn`], so it ASKS it: the same request with
+/// its credential headers (`Authorization`, `Cookie`) removed is what an anonymous caller in
+/// the same position would send, and if `cap_fn` grants that request the same capability, the
+/// answer is one anyone would be handed (`public`); if not, a credential chose it
+/// (`private`). This follows the capability, not the presence of a header: an expired
+/// session cookie, or any cookie at all on a door that grants one fixed ceiling, grants
+/// nothing beyond the anonymous capability and leaves the answer `public`. A route that pins
+/// its capability never consults `cap_fn`, so it is the same for every caller.
+///
+/// It costs one more `cap_fn` call per read, which for every door in the ecosystem is a
+/// lookup, not I/O.
+fn shaped_by_credentials(
+    shared: &Shared,
+    req: &HttpRequest,
+    matched: Option<&Matched>,
+    cap: &Capability,
+) -> bool {
+    if matched.and_then(|m| m.cap.as_ref()).is_some() {
+        return false;
+    }
+    let carries = |name: &str| CREDENTIAL_HEADERS.iter().any(|(h, _)| *h == name);
+    if !req.headers.iter().any(|(k, _)| carries(k)) {
+        return false;
+    }
+    let anonymous = HttpRequest {
+        method: req.method.clone(),
+        path: req.path.clone(),
+        query: req.query.clone(),
+        headers: req
+            .headers
+            .iter()
+            .filter(|(k, _)| !carries(k))
+            .cloned()
+            .collect(),
+        body: req.body.clone(),
+        peer: req.peer,
+    };
+    (shared.cap_fn)(&anonymous) != *cap
 }
 
 /// Whether an `If-None-Match` header matches the current ETag (`*` matches any existing
@@ -1361,6 +1503,15 @@ fn apply_edge_policy(
         }
     }
 
+    // A policy that allows ANY origin makes every answer depend on `Origin` — the same URL
+    // carries `Access-Control-Allow-Origin` for one caller and not for the next — so `Vary`
+    // names it on every response, not only the ones that echo an origin. Naming it only there
+    // let a cache store the answer to a same-origin request (no CORS headers) and hand it to
+    // a cross-origin one, which the browser then blocks.
+    if !cors.allowed_origins.is_empty() && !resp.vary.contains(&"Origin") {
+        resp.vary.push("Origin");
+    }
+
     // CORS: only when the request carries an Origin the (effective) policy allows.
     let Some(origin) = req.header("origin") else {
         return;
@@ -1370,8 +1521,6 @@ fn apply_edge_policy(
     };
     resp.headers
         .push(("Access-Control-Allow-Origin".to_string(), allow_origin));
-    resp.headers
-        .push(("Vary".to_string(), "Origin".to_string()));
     if cors.allow_credentials {
         resp.headers.push((
             "Access-Control-Allow-Credentials".to_string(),
@@ -2144,6 +2293,9 @@ async fn write(sock: &mut TcpStream, resp: Resp) -> std::io::Result<()> {
     if let Some(cc) = resp.cache_control {
         head.push_str(&format!("Cache-Control: {cc}\r\n"));
     }
+    if !resp.vary.is_empty() {
+        head.push_str(&format!("Vary: {}\r\n", resp.vary.join(", ")));
+    }
     for (name, value) in &resp.headers {
         head.push_str(&format!("{name}: {value}\r\n"));
     }
@@ -2876,8 +3028,10 @@ mod tests {
         let addr = start().await;
         let resp = roundtrip(addr, "GET /test/cacheable HTTP/1.1\r\nHost: x\r\n\r\n").await;
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
+        // `Never` revalidates against the ETag; it is never `immutable` (see
+        // `cache_control_of`, and `cache_control::` below for every row).
         assert!(
-            resp.contains("Cache-Control: public, max-age=31536000, immutable"),
+            resp.contains("Cache-Control: public, no-cache\r\n"),
             "got: {resp}"
         );
     }
@@ -3134,7 +3288,10 @@ mod tests {
             resp.contains("Access-Control-Allow-Origin: https://app.example"),
             "got: {resp}"
         );
-        assert!(resp.contains("Vary: Origin"), "got: {resp}");
+        assert!(
+            cache_control::vary_of(&resp).contains(&"Origin".to_string()),
+            "got: {resp}"
+        );
     }
 
     #[tokio::test]
@@ -4366,5 +4523,503 @@ mod tests {
         let ok = served_eventually(addr).await;
         assert!(ok.ends_with("hi"), "{ok}");
         drop(stalled);
+    }
+
+    /// `Cache-Control`, `Vary` and revalidation, over a real socket (ledger #604, and the cli
+    /// half of ledger #570). A kernel of its own, so every row of `cache_control_of`'s table
+    /// has exactly one resource standing for it.
+    mod cache_control {
+        use super::*;
+        use ikigai_core::{Expiry, Time};
+        use std::sync::Mutex;
+
+        /// Wall-clock now in milliseconds, which an `Expiry::At` deadline is measured against.
+        fn now_ms() -> u64 {
+            // Native-only test: a deadline relative to the wall clock the edge also reads.
+            #[allow(clippy::disallowed_methods)]
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            now
+        }
+
+        fn text(body: &[u8]) -> Representation {
+            Representation::new(ReprType::new("text/plain"), body.to_vec())
+        }
+
+        /// The kernel: one resource per row of the table, a ledger-shaped pair (a log a Sink
+        /// appends to, and a read that hangs from the log's thread), and a resource whose
+        /// answer depends on the capability.
+        fn kernel() -> Arc<Kernel> {
+            let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec!["one".to_string()]));
+            // `Never`, and nothing but its own target's thread (which the kernel adds).
+            let pure =
+                FnEndpoint::new(
+                    "pure",
+                    |_inv: &Invocation<'_>| Ok(text(b"pure").cacheable()),
+                )
+                .with_description(Description::new("pure").verb(Verb::Source));
+            // The ledger's shape: a cacheable read over state a DIFFERENT resource writes,
+            // hanging from that resource's thread, so a write there cuts it.
+            let items = {
+                let log = Arc::clone(&log);
+                FnEndpoint::new("items", move |_inv: &Invocation<'_>| {
+                    let body = log.lock().unwrap().join("\n");
+                    Ok(text(body.as_bytes())
+                        .cacheable()
+                        .depends_on("urn:test:c:append"))
+                })
+                .with_description(Description::new("items").verb(Verb::Source))
+            };
+            let append = {
+                let log = Arc::clone(&log);
+                FnEndpoint::new("append", move |inv: &Invocation<'_>| {
+                    let entry = inv.inline_str("content").unwrap_or("").to_string();
+                    log.lock().unwrap().push(entry);
+                    Ok(text(b""))
+                })
+                .with_description(Description::new("append").verb(Verb::Sink))
+            };
+            let in_two_minutes = || Expiry::At(Time::from_millis(now_ms() + 120_000));
+            // A deadline, and nothing a write could cut.
+            let deadline = FnEndpoint::new("deadline", move |_inv: &Invocation<'_>| {
+                Ok(text(b"deadline").with_expiry(in_two_minutes()))
+            })
+            .with_description(Description::new("deadline").verb(Verb::Source));
+            // A deadline AND a thread another resource's write cuts.
+            let deadline_threaded =
+                FnEndpoint::new("deadline-threaded", move |_inv: &Invocation<'_>| {
+                    Ok(text(b"deadline")
+                        .with_expiry(in_two_minutes())
+                        .depends_on("urn:test:c:append"))
+                })
+                .with_description(Description::new("deadline-threaded").verb(Verb::Source));
+            // A deadline on a resource that can be WRITTEN: its own thread is cut by a Sink.
+            let deadline_writable =
+                FnEndpoint::new("deadline-writable", move |_inv: &Invocation<'_>| {
+                    Ok(text(b"deadline").with_expiry(in_two_minutes()))
+                })
+                .with_description(
+                    Description::new("deadline-writable")
+                        .verb(Verb::Source)
+                        .verb(Verb::Sink),
+                );
+            // A deadline already behind us.
+            let lapsed = FnEndpoint::new("lapsed", |_inv: &Invocation<'_>| {
+                Ok(text(b"lapsed").with_expiry(Expiry::At(Time::from_millis(now_ms() - 1_000))))
+            })
+            .with_description(Description::new("lapsed").verb(Verb::Source));
+            // The default `Always`.
+            let volatile =
+                FnEndpoint::new("volatile", |_inv: &Invocation<'_>| Ok(text(b"volatile")))
+                    .with_description(Description::new("volatile").verb(Verb::Source));
+            // An answer the capability shapes, cacheable like everything the kernel keys on it.
+            let whoami = FnEndpoint::new("whoami", |inv: &Invocation<'_>| {
+                let who: &[u8] = if inv.capability.allows("urn:cap:member") {
+                    b"member"
+                } else {
+                    b"anonymous"
+                };
+                Ok(text(who).cacheable())
+            })
+            .with_description(Description::new("whoami").verb(Verb::Source));
+            // Two faces, so `Accept` chooses between them.
+            let faces = FnEndpoint::new("faces", |inv: &Invocation<'_>| {
+                Ok(text(inv.inline_str("as").unwrap_or("text/plain").as_bytes()).cacheable())
+            })
+            .with_description(
+                Description::new("faces").verb(Verb::Source).input(
+                    ArgSpec::new("as")
+                        .optional()
+                        .one_of(["text/plain", "text/turtle"])
+                        .default_value("text/plain"),
+                ),
+            );
+            // Exactly one face, so `Accept` chooses nothing.
+            let one_face = FnEndpoint::new("one-face", |_inv: &Invocation<'_>| {
+                Ok(text(b"one").cacheable())
+            })
+            .with_description(
+                Description::new("one-face")
+                    .verb(Verb::Source)
+                    .output("text/plain"),
+            );
+            let space = EndpointSpace::new()
+                .bind(Exact::new("urn:test:c:pure"), pure)
+                .bind(Exact::new("urn:test:c:items"), items)
+                .bind(Exact::new("urn:test:c:append"), append)
+                .bind(Exact::new("urn:test:c:deadline"), deadline)
+                .bind(
+                    Exact::new("urn:test:c:deadline-threaded"),
+                    deadline_threaded,
+                )
+                .bind(
+                    Exact::new("urn:test:c:deadline-writable"),
+                    deadline_writable,
+                )
+                .bind(Exact::new("urn:test:c:lapsed"), lapsed)
+                .bind(Exact::new("urn:test:c:volatile"), volatile)
+                .bind(Exact::new("urn:test:c:whoami"), whoami)
+                .bind(Exact::new("urn:test:c:faces"), faces)
+                .bind(Exact::new("urn:test:c:one-face"), one_face);
+            Arc::new(Kernel::new(Arc::new(space)))
+        }
+
+        /// A door that grants `urn:cap:member` to a request carrying the good session cookie
+        /// or the good bearer token, and nothing to anyone else.
+        fn door() -> CapFn {
+            Arc::new(|req: &HttpRequest| {
+                let cookie = req
+                    .header("cookie")
+                    .is_some_and(|c| c.contains("session=good"));
+                let bearer = req.header("authorization") == Some("Bearer good");
+                if cookie || bearer {
+                    Capability::scoped(vec!["urn:cap:member".to_string()])
+                } else {
+                    Capability::scoped(Vec::<String>::new())
+                }
+            })
+        }
+
+        async fn serve(config: EdgeConfig) -> SocketAddr {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let kernel = kernel();
+            tokio::spawn(async move {
+                let _ = serve_with_listener(kernel, door(), listener, config).await;
+            });
+            addr
+        }
+
+        async fn get(addr: SocketAddr, path: &str, extra: &str) -> String {
+            roundtrip(
+                addr,
+                &format!("GET {path} HTTP/1.1\r\nHost: x\r\n{extra}\r\n"),
+            )
+            .await
+        }
+
+        /// The one `Cache-Control` header of a raw response.
+        fn cache_control(resp: &str) -> String {
+            let found: Vec<&str> = resp
+                .lines()
+                .filter_map(|l| l.strip_prefix("Cache-Control: "))
+                .collect();
+            assert_eq!(found.len(), 1, "exactly one Cache-Control: {resp}");
+            found[0].to_string()
+        }
+
+        /// The names in the one `Vary` header of a raw response (none → empty).
+        pub(super) fn vary_of(resp: &str) -> Vec<String> {
+            let found: Vec<&str> = resp
+                .lines()
+                .filter_map(|l| l.strip_prefix("Vary: "))
+                .collect();
+            assert!(found.len() <= 1, "Vary is written once: {resp}");
+            found
+                .first()
+                .map(|v| v.split(',').map(|n| n.trim().to_string()).collect())
+                .unwrap_or_default()
+        }
+
+        fn etag(resp: &str) -> String {
+            resp.lines()
+                .find_map(|l| l.strip_prefix("ETag: "))
+                .unwrap_or_else(|| panic!("no ETag: {resp}"))
+                .to_string()
+        }
+
+        fn body(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // --- the table, row by row -------------------------------------------------------
+
+        #[tokio::test]
+        async fn always_is_no_store() {
+            let addr = serve(EdgeConfig::default()).await;
+            let resp = get(addr, "/test/c/volatile", "").await;
+            assert_eq!(cache_control(&resp), "no-store", "{resp}");
+        }
+
+        #[tokio::test]
+        async fn never_hanging_from_a_foreign_thread_is_no_cache() {
+            // The live defect: the ledger's `items` answered `public, max-age=31536000,
+            // immutable`, so a browser kept the list it first saw.
+            let addr = serve(EdgeConfig::default()).await;
+            let resp = get(addr, "/test/c/items", "").await;
+            assert_eq!(cache_control(&resp), "public, no-cache", "{resp}");
+        }
+
+        #[tokio::test]
+        async fn never_with_only_its_own_thread_is_still_no_cache_never_immutable() {
+            // The control the brief asked for, inverted on the evidence: a `Never` answer that
+            // no write can cut is as close to immutable as the kernel can say, and it is
+            // still not `immutable`, because the kernel's `Never` ends at a restart and HTTP's
+            // `immutable` does not. The standalone server's `urn:repo:style` is this shape.
+            let addr = serve(EdgeConfig::default()).await;
+            let resp = get(addr, "/test/c/pure", "").await;
+            assert_eq!(cache_control(&resp), "public, no-cache", "{resp}");
+            assert!(!resp.contains("immutable"), "{resp}");
+        }
+
+        #[tokio::test]
+        async fn a_deadline_nothing_can_cut_is_max_age_until_it() {
+            let addr = serve(EdgeConfig::default()).await;
+            let resp = get(addr, "/test/c/deadline", "").await;
+            let cc = cache_control(&resp);
+            let secs: u64 = cc
+                .strip_prefix("public, max-age=")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| panic!("expected public, max-age=N: {resp}"));
+            assert!((100..=120).contains(&secs), "about two minutes: {cc}");
+        }
+
+        #[tokio::test]
+        async fn a_deadline_with_a_thread_is_no_cache() {
+            let addr = serve(EdgeConfig::default()).await;
+            let resp = get(addr, "/test/c/deadline-threaded", "").await;
+            assert_eq!(cache_control(&resp), "public, no-cache", "{resp}");
+        }
+
+        #[tokio::test]
+        async fn a_deadline_on_a_writable_resource_is_no_cache() {
+            // Its only thread is its own, and a write to it cuts exactly that.
+            let addr = serve(EdgeConfig::default()).await;
+            let resp = get(addr, "/test/c/deadline-writable", "").await;
+            assert_eq!(cache_control(&resp), "public, no-cache", "{resp}");
+        }
+
+        #[tokio::test]
+        async fn a_lapsed_deadline_is_no_cache() {
+            let addr = serve(EdgeConfig::default()).await;
+            let resp = get(addr, "/test/c/lapsed", "").await;
+            assert_eq!(cache_control(&resp), "public, no-cache", "{resp}");
+        }
+
+        #[test]
+        fn the_projection_covers_every_row_for_both_audiences() {
+            let now = 1_000_000_000;
+            let later = Expiry::At(Time::from_millis(now + 60_000));
+            let earlier = Expiry::At(Time::from_millis(now - 1));
+            for (shared, scope) in [(true, "public"), (false, "private")] {
+                let contained = Freshness {
+                    self_contained: true,
+                    shared,
+                };
+                let threaded = Freshness {
+                    self_contained: false,
+                    shared,
+                };
+                assert_eq!(cache_control_of(Expiry::Always, contained, now), "no-store");
+                assert_eq!(
+                    cache_control_of(Expiry::Never, contained, now),
+                    format!("{scope}, no-cache")
+                );
+                assert_eq!(
+                    cache_control_of(Expiry::Never, threaded, now),
+                    format!("{scope}, no-cache")
+                );
+                assert_eq!(
+                    cache_control_of(later, contained, now),
+                    format!("{scope}, max-age=60")
+                );
+                assert_eq!(
+                    cache_control_of(later, threaded, now),
+                    format!("{scope}, no-cache")
+                );
+                assert_eq!(
+                    cache_control_of(earlier, contained, now),
+                    format!("{scope}, no-cache")
+                );
+            }
+        }
+
+        // --- who may share it ------------------------------------------------------------
+
+        #[tokio::test]
+        async fn an_anonymous_answer_is_public() {
+            let addr = serve(EdgeConfig::default()).await;
+            let resp = get(addr, "/test/c/whoami", "").await;
+            assert_eq!(body(&resp), "anonymous");
+            assert_eq!(cache_control(&resp), "public, no-cache", "{resp}");
+        }
+
+        #[tokio::test]
+        async fn a_session_cookie_that_grants_more_makes_it_private() {
+            let addr = serve(EdgeConfig::default()).await;
+            let resp = get(
+                addr,
+                "/test/c/whoami",
+                "Cookie: theme=dark; session=good\r\n",
+            )
+            .await;
+            assert_eq!(body(&resp), "member");
+            assert_eq!(cache_control(&resp), "private, no-cache", "{resp}");
+        }
+
+        #[tokio::test]
+        async fn a_bearer_token_that_grants_more_makes_it_private() {
+            let addr = serve(EdgeConfig::default()).await;
+            let resp = get(addr, "/test/c/whoami", "Authorization: Bearer good\r\n").await;
+            assert_eq!(body(&resp), "member");
+            assert_eq!(cache_control(&resp), "private, no-cache", "{resp}");
+        }
+
+        #[tokio::test]
+        async fn a_credential_that_grants_nothing_leaves_it_public() {
+            // It is the capability that decides, not the presence of a header: an expired or
+            // bogus session grants what an anonymous caller holds, so anyone may share it.
+            let addr = serve(EdgeConfig::default()).await;
+            let resp = get(addr, "/test/c/whoami", "Cookie: session=expired\r\n").await;
+            assert_eq!(body(&resp), "anonymous");
+            assert_eq!(cache_control(&resp), "public, no-cache", "{resp}");
+        }
+
+        #[tokio::test]
+        async fn a_route_that_pins_the_capability_is_public_and_does_not_vary_on_credentials() {
+            let addr = serve(EdgeConfig {
+                routes: RouteTable::new(vec![Route {
+                    pattern: "/members/whoami".to_string(),
+                    iri_template: "urn:test:c:whoami".to_string(),
+                    cap: Some(vec!["urn:cap:member".to_string()]),
+                    cors: None,
+                    csp: None,
+                }]),
+                ..EdgeConfig::default()
+            })
+            .await;
+            // Every caller holds the route's ceiling, so the good cookie changes nothing.
+            let resp = get(addr, "/members/whoami", "Cookie: session=good\r\n").await;
+            assert_eq!(body(&resp), "member");
+            assert_eq!(cache_control(&resp), "public, no-cache", "{resp}");
+            let vary = vary_of(&resp);
+            assert!(!vary.contains(&"Cookie".to_string()), "{resp}");
+            assert!(!vary.contains(&"Authorization".to_string()), "{resp}");
+        }
+
+        // --- Vary ------------------------------------------------------------------------
+
+        #[tokio::test]
+        async fn vary_names_accept_and_the_credential_headers_on_a_negotiated_read() {
+            let addr = serve(EdgeConfig::default()).await;
+            let resp = get(addr, "/test/c/faces", "Accept: text/turtle\r\n").await;
+            assert_eq!(body(&resp), "text/turtle");
+            assert_eq!(
+                vary_of(&resp),
+                ["Accept", "Authorization", "Cookie"],
+                "{resp}"
+            );
+        }
+
+        #[tokio::test]
+        async fn vary_leaves_out_accept_when_the_url_names_the_face() {
+            // `?as=` is in the URL, which every cache keys on already.
+            let addr = serve(EdgeConfig::default()).await;
+            let resp = get(
+                addr,
+                "/test/c/faces?as=text/turtle",
+                "Accept: text/plain\r\n",
+            )
+            .await;
+            assert_eq!(body(&resp), "text/turtle");
+            assert_eq!(vary_of(&resp), ["Authorization", "Cookie"], "{resp}");
+        }
+
+        #[tokio::test]
+        async fn vary_leaves_out_accept_when_there_is_one_face() {
+            let addr = serve(EdgeConfig::default()).await;
+            let resp = get(addr, "/test/c/one-face", "Accept: text/plain\r\n").await;
+            assert_eq!(vary_of(&resp), ["Authorization", "Cookie"], "{resp}");
+        }
+
+        #[tokio::test]
+        async fn vary_names_origin_whenever_cors_is_open_even_without_an_origin() {
+            // A same-origin answer carries no Access-Control-Allow-Origin; a cross-origin one
+            // does. Without `Origin` in Vary a cache hands the first to the second.
+            let addr = serve(EdgeConfig {
+                cors: CorsPolicy {
+                    allowed_origins: vec!["https://app.example".to_string()],
+                    ..Default::default()
+                },
+                ..EdgeConfig::default()
+            })
+            .await;
+            let plain = get(addr, "/test/c/faces", "").await;
+            assert_eq!(
+                vary_of(&plain),
+                ["Accept", "Authorization", "Cookie", "Origin"],
+                "{plain}"
+            );
+            let cross = get(addr, "/test/c/faces", "Origin: https://app.example\r\n").await;
+            assert_eq!(vary_of(&cross), vary_of(&plain), "{cross}");
+        }
+
+        #[tokio::test]
+        async fn vary_leaves_out_origin_when_cors_is_closed() {
+            let addr = serve(EdgeConfig::default()).await;
+            let resp = get(addr, "/test/c/faces", "Origin: https://app.example\r\n").await;
+            assert!(!vary_of(&resp).contains(&"Origin".to_string()), "{resp}");
+        }
+
+        // --- revalidation ----------------------------------------------------------------
+
+        #[tokio::test]
+        async fn a_thread_dependent_read_revalidates_to_304_until_a_sink_cuts_it() {
+            let addr = serve(EdgeConfig::default()).await;
+
+            // 200, and an instruction to come back and ask.
+            let first = get(addr, "/test/c/items", "").await;
+            assert!(first.starts_with("HTTP/1.1 200 OK"), "{first}");
+            assert_eq!(body(&first), "one");
+            let tag = etag(&first);
+
+            // Unchanged: a bodyless 304 carrying the same validator, Cache-Control and Vary.
+            let inm = format!("If-None-Match: {tag}\r\n");
+            let again = get(addr, "/test/c/items", &inm).await;
+            assert!(again.starts_with("HTTP/1.1 304 Not Modified"), "{again}");
+            assert_eq!(body(&again), "", "{again}");
+            assert_eq!(etag(&again), tag);
+            assert_eq!(cache_control(&again), cache_control(&first));
+            assert_eq!(vary_of(&again), vary_of(&first));
+
+            // A write to ANOTHER resource, whose thread the read hangs from.
+            let wrote = roundtrip(
+                addr,
+                "POST /test/c/append HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\ntwo",
+            )
+            .await;
+            assert!(wrote.starts_with("HTTP/1.1 204"), "{wrote}");
+
+            // The same conditional request now gets the new list and a new validator.
+            let after = get(addr, "/test/c/items", &inm).await;
+            assert!(after.starts_with("HTTP/1.1 200 OK"), "{after}");
+            assert_eq!(body(&after), "one\ntwo");
+            assert_ne!(etag(&after), tag, "{after}");
+
+            // …and the new validator revalidates in turn.
+            let settled = get(
+                addr,
+                "/test/c/items",
+                &format!("If-None-Match: {}\r\n", etag(&after)),
+            )
+            .await;
+            assert!(settled.starts_with("HTTP/1.1 304"), "{settled}");
+        }
+
+        #[tokio::test]
+        async fn head_carries_the_same_cache_headers_as_get() {
+            let addr = serve(EdgeConfig::default()).await;
+            let got = get(addr, "/test/c/whoami", "Cookie: session=good\r\n").await;
+            let head = roundtrip(
+                addr,
+                "HEAD /test/c/whoami HTTP/1.1\r\nHost: x\r\nCookie: session=good\r\n\r\n",
+            )
+            .await;
+            assert_eq!(cache_control(&head), cache_control(&got));
+            assert_eq!(vary_of(&head), vary_of(&got));
+            assert_eq!(body(&head), "");
+        }
     }
 }

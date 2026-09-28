@@ -99,8 +99,29 @@ for the verb: its `as` input's `one_of` when it has one, otherwise the verb's `o
 ## Conditional requests and caching
 
 Reads project a strong **`ETag`** (a content hash) and a **`Cache-Control`**
-derived from the representation's cache validity (`Never` → immutable, `At` →
-`max-age`, `Always` → `no-store`). `If-None-Match` on a read yields `304`. Writes
+derived from the representation's cache validity:
+
+| kernel answer | `Cache-Control` |
+|---|---|
+| `Always` | `no-store` |
+| `Never` | `no-cache` |
+| `At(t)`, nothing a write can cut | `max-age` until `t` |
+| `At(t)`, hangs from a golden thread (or the resource is writable) | `no-cache` |
+| `At(t)`, already passed | `no-cache` |
+
+A cacheable answer is `public` when any caller would have been handed it, and
+`private` when the request's credentials shaped its capability — the edge asks the
+host's capability function what the same request would get without its
+`Authorization` and `Cookie` headers. `Never` is **never** `immutable`: the kernel's
+`Never` means "valid until a thread is cut, while this kernel runs", which a restart,
+an upgrade or a mount breaks without cutting anything, and `no-cache` against the
+strong `ETag` costs a bodyless `304` while nothing changed.
+
+`Vary` names what selected the answer: `Accept` (unless `?as=` named the face or
+the resource has only one), `Authorization` and `Cookie` (unless a route pins the
+capability), and `Origin` whenever CORS allows any origin.
+
+`If-None-Match` on a read yields `304`, carrying the same `ETag`, `Cache-Control` and `Vary`. Writes
 are conditional: `If-Match` / `If-None-Match` are checked against the resource's
 current ETag before the mutation (optimistic concurrency → `412`; `If-None-Match: *`
 is create-only). `DELETE` is idempotent — a repeat delete of a resource we deleted
@@ -122,7 +143,8 @@ CORS closed, proxy not trusted**:
   HTTPS is inferred *only* from a trusted proxy's `X-Forwarded-Proto`, never from an
   untrusted client (`--trust-proxy` enables it).
 - **CORS** is closed unless you allow-list origins (`--cors-origin`, or per route).
-  Allowed origins are echoed with `Vary: Origin`; preflight (`OPTIONS` +
+  Allowed origins are echoed, and every response carries `Vary: Origin` while any
+  origin is allowed; preflight (`OPTIONS` +
   `Access-Control-Request-Method`) advertises methods from the resource's own
   `describe()` Allow.
 
