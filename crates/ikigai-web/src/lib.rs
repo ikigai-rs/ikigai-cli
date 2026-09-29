@@ -25,11 +25,17 @@
 //!   narrows the edge); a per-user capability (magic-link / passkey) fills the same seam later.
 //! - **typed error → status**: `Denied`→403, `NotFound`/`Unresolved`→404, invalid/missing
 //!   arg→400, `Conflict`→409, transient→503, else 500.
+//! - **server push**: with [`EdgeConfig::push`] set, one `GET` of the push path holds an
+//!   event stream open and tells the page when a golden thread its reads rest on is cut —
+//!   see [`push`].
 //!
 //! App logic — scheduling, forms, policy — stays in resources, compositions, and
 //! capabilities *above* this transport, exactly as the other transports (quic/ipc/mcp) keep
 //! the kernel's behavior out of the wire layer.
 #![forbid(unsafe_code)]
+
+pub mod push;
+pub use push::{PushConfig, DEFAULT_PUSH_PATH};
 
 use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request, Verb};
 use std::net::{IpAddr, SocketAddr};
@@ -238,6 +244,10 @@ pub struct EdgeConfig {
     /// Connections served at once; one past it is answered `503`. Default
     /// [`DEFAULT_MAX_CONNECTIONS`]. `0` refuses every connection.
     pub max_connections: usize,
+    /// Server push: an event stream at [`PushConfig::path`] that tells a page when a golden
+    /// thread its reads rest on is cut. `None` (the default) serves no stream, and the path is
+    /// routed like any other. See [`push`].
+    pub push: Option<PushConfig>,
 }
 
 /// A shared, swappable [`RouteTable`] for hot-reload. The server reads the current table per
@@ -273,6 +283,7 @@ impl Default for EdgeConfig {
             body_timeout: DEFAULT_BODY_TIMEOUT,
             write_timeout: DEFAULT_WRITE_TIMEOUT,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            push: None,
         }
     }
 }
@@ -740,6 +751,13 @@ async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::
         .read()
         .map(|g| Arc::clone(&g))
         .unwrap_or_else(|_| Arc::new(RouteTable::default()));
+    // The event stream is not a resource read: it holds the connection open and writes cut
+    // notices as they arrive, so it leaves the request/response path here, before routing.
+    if let Some(push) = shared.config.push.as_ref() {
+        if req.path == push.path {
+            return push::stream(sock, req, &shared, &table, push).await;
+        }
+    }
     let matched = table.match_path(&req.path);
     let mut resp = respond(&shared, &req, matched.as_ref()).await;
     apply_edge_policy(&mut resp, &shared.config, &req, matched.as_ref());
@@ -2280,17 +2298,28 @@ async fn write_within(
 
 /// Write the response and close the connection.
 async fn write(sock: &mut TcpStream, resp: Resp) -> std::io::Result<()> {
+    let head = head_of(&resp, Some(resp.body.len()));
+    sock.write_all(head.as_bytes()).await?;
+    sock.write_all(&resp.body).await?;
+    sock.flush().await
+}
+
+/// The status line and headers of `resp`, through the blank line. `content_length` is
+/// `None` only for a response whose body is delimited by the connection closing — the
+/// event stream ([`push`]), whose length is not known when its head is sent (RFC 9112
+/// §6.3, the last rule: no `Content-Length`, no transfer coding, `Connection: close`).
+fn head_of(resp: &Resp, content_length: Option<usize>) -> String {
     let mut head = format!("HTTP/1.1 {} {}\r\n", resp.status, resp.reason);
     if !resp.content_type.is_empty() {
         head.push_str(&format!("Content-Type: {}\r\n", resp.content_type));
     }
-    if let Some(allow) = resp.allow {
+    if let Some(allow) = &resp.allow {
         head.push_str(&format!("Allow: {allow}\r\n"));
     }
-    if let Some(etag) = resp.etag {
+    if let Some(etag) = &resp.etag {
         head.push_str(&format!("ETag: {etag}\r\n"));
     }
-    if let Some(cc) = resp.cache_control {
+    if let Some(cc) = &resp.cache_control {
         head.push_str(&format!("Cache-Control: {cc}\r\n"));
     }
     if !resp.vary.is_empty() {
@@ -2299,11 +2328,11 @@ async fn write(sock: &mut TcpStream, resp: Resp) -> std::io::Result<()> {
     for (name, value) in &resp.headers {
         head.push_str(&format!("{name}: {value}\r\n"));
     }
-    head.push_str(&format!("Content-Length: {}\r\n", resp.body.len()));
+    if let Some(length) = content_length {
+        head.push_str(&format!("Content-Length: {length}\r\n"));
+    }
     head.push_str("Connection: close\r\n\r\n");
-    sock.write_all(head.as_bytes()).await?;
-    sock.write_all(&resp.body).await?;
-    sock.flush().await
+    head
 }
 
 #[cfg(test)]
