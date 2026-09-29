@@ -93,7 +93,11 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 [workspace.dependencies]
 # The released kernel, consumed from crates.io. For local cross-repo development
 # against a sibling checkout, use .cargo/config.toml (see .cargo/config.toml.example).
-ikigai-core = "0.1.80" # 0.1.80 = `Error::Conflict`: the state refuses the request (HTTP 409,
+ikigai-core = "0.1.82" # 0.1.82 = cut listeners (`Kernel::listen`, `ListenSpec`, `CutListener`,
+# `CAP_LISTEN`): `ikigai-web`'s server push registers one per open event stream, so below 0.1.82
+# that crate does not compile (ledger #618).
+# Beneath it, and each called:
+# 0.1.80 = `Error::Conflict`: the state refuses the request (HTTP 409,
 # permanent). `ikigai-wire` maps it to `WireError::Conflict` (wire v8) and back, and `ikigai-web`
 # answers it 409 — both NAME the variant, so below 0.1.80 the workspace does not compile. Before
 # this, core's `non_exhaustive` let a Conflict fall through both maps silently, as an untyped

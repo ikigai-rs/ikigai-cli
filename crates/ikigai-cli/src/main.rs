@@ -53,7 +53,9 @@ usage:
                                [--trust-proxy: honor X-Forwarded-*; --cors-origin <o>: allow a CORS origin;
                                 --routes <iri>: load routes from an RDF or plain-JSON resource
                                 (a urn:file: route hot-reloads); --routes-only: un-routed → 404;
-                                --max-body <bytes>: largest accepted request body, default 1048576]
+                                --max-body <bytes>: largest accepted request body, default 1048576;
+                                --push: serve cut notices as an event stream at /_ikigai/push —
+                                needs --cap urn:cap:kernel:listen, or every stream is a 403]
   ikigai --daemon              headless: timers, the watcher, and the standing sync — for launchd
   ikigai --name <instance>     name this instance (scopes <name>.* config properties; defaults
                                repl / daemon / serve by mode)
@@ -169,6 +171,10 @@ enum Mode {
         /// it for a door that only takes forms — the public intake edge has no use for a
         /// megabyte.
         max_body: Option<usize>,
+        /// `--push`: serve an event stream of cut notices at `ikigai_web::DEFAULT_PUSH_PATH`.
+        /// A stream is heard under the door's capability, so it needs `--cap
+        /// urn:cap:kernel:listen` too; without it every stream is answered 403.
+        push: bool,
         /// `--announce`: advertise this kernel on the local network over mDNS, so clients
         /// can mount it by name instead of by an address that moves. Opt-in — broadcasting
         /// what a machine serves is a disclosure.
@@ -370,6 +376,7 @@ struct HttpDoor<'a> {
     routes: Option<&'a str>,
     routes_only: bool,
     max_body: Option<usize>,
+    push: bool,
     /// `--mount`/`--override`/`--prefer`, the machine's topology from the config home, or
     /// nothing at all under `--no-config-mounts`.
     mounts: Mounts,
@@ -553,6 +560,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
         let mut routes = None;
         let mut routes_only = false;
         let mut max_body = None;
+        let mut push = false;
         let mut announce = false;
         let mut mounts = Mounts::default();
         while let Some(arg) = argv.next() {
@@ -676,6 +684,10 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 routes_only = true;
                 continue;
             }
+            if arg == "--push" {
+                push = true;
+                continue;
+            }
             if arg == "--max-body" {
                 let raw = argv
                     .next()
@@ -713,6 +725,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
             routes,
             routes_only,
             max_body,
+            push,
             announce,
             mounts,
         }));
@@ -979,6 +992,7 @@ fn main() {
             routes,
             routes_only,
             max_body,
+            push,
         } => match (http, target.as_deref()) {
             // The inbound HTTP face takes precedence over IPC/QUIC when `--http` is given.
             (Some(bind), _) => serve_http(HttpDoor {
@@ -989,6 +1003,7 @@ fn main() {
                 routes: routes.as_deref(),
                 routes_only,
                 max_body,
+                push,
                 mounts,
             }),
             (None, Some(t)) if is_quic(t) => serve_quic(t, &certs, &caps, announce, mounts),
@@ -2733,6 +2748,7 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
         routes,
         routes_only,
         max_body,
+        push,
         mounts,
     } = door;
     use std::net::SocketAddr;
@@ -2822,6 +2838,10 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
         config.max_body_bytes = max;
     }
     config.cors.allowed_origins = cors_origins.to_vec();
+    // `--push` serves the event stream; what a stream hears is still the ceiling's business.
+    if push {
+        config.push = Some(ikigai_web::PushConfig::default());
+    }
     // Build the async runtime up front — route loading (a kernel SPARQL query) is async too.
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -2910,13 +2930,18 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
     } else {
         format!("CORS: {}", cors_origins.join(", "))
     };
+    let push_note = if push {
+        format!("push at {}; ", ikigai_web::DEFAULT_PUSH_PATH)
+    } else {
+        String::new()
+    };
     let proxy_note = if trust_proxy {
         "trusting X-Forwarded-*"
     } else {
         "no proxy trust"
     };
     eprintln!(
-        "ikigai: serving HTTP on {addr}  ({posture}; {route_note}; {cors_note}; {proxy_note}; terminate TLS at your proxy)  (Ctrl-C to stop)"
+        "ikigai: serving HTTP on {addr}  ({posture}; {route_note}; {cors_note}; {push_note}{proxy_note}; terminate TLS at your proxy)  (Ctrl-C to stop)"
     );
     // ★ The public door records its posture like any other — and `urn:host:posture` is
     // REACHABLE here (`GET /host/posture`) and REFUSED, because the public capability does

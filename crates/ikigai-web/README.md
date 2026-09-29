@@ -3,7 +3,7 @@
 The **inbound HTTP transport** for [ikigai](https://crates.io/crates/ikigai-core):
 serve a kernel over HTTP. A thin adapter, not an app — it maps the HTTP request
 onto a kernel `Request` and the `Representation` back onto an HTTP response, and
-leaves all behaviour (scheduling, forms, policy) in resources, compositions, and
+leaves all behavior (scheduling, forms, policy) in resources, compositions, and
 capabilities *above* it, exactly as [ikigai-quic](https://crates.io/crates/ikigai-quic)
 and [ikigai-mcp](https://crates.io/crates/ikigai-mcp) keep the kernel out of the
 wire layer.
@@ -131,6 +131,46 @@ returns `204`, while one that never existed is `404`.
 `Content-Type` selects a patch strategy (RFC 7386 JSON Merge Patch today) that
 transforms the current representation before it is Sunk. An unknown patch type is
 `415`.
+
+## Server push
+
+A page learns that something it shows changed by holding one **event stream** open instead of
+polling. Set `EdgeConfig::push` (`ikigai serve --http <port> --push` from the CLI) and a `GET`
+of `/_ikigai/push` answers `text/event-stream` and stays open, backed by one core cut listener
+(`Kernel::listen`, core 0.1.82) registered under the capability the door grants that request.
+
+```text
+GET /_ikigai/push?path=/l/default/item/5/card&path=/queue/rows
+
+event: cut
+id: 17
+data: {"thread":"urn:…","sequence":17,"invalidated":["urn:…"],"more":0,"paths":["/queue/rows"]}
+```
+
+- **Subscribe by what the page shows**: `path=` (repeatable) names a fragment by its URL, is
+  matched by what a cut INVALIDATED (so a composite hanging from a store's thread is heard), and
+  comes back in `paths`. `thread=` (exact) and `prefix=` name threads directly; no parameter
+  hears every cut the capability may hear. Anything else, or more than 64, is a `400`.
+- **Authority**: the capability must hold `urn:cap:kernel:listen` (else `403`), and a non-root
+  one hears only threads its OWN cached reads rest on, so an anonymous stream hears exactly what
+  anonymous reads would. The edge never adds the scope for you: that would be another cache
+  partition, and it would hear nothing. Only cached reads are heard; a `no-store` fragment
+  must still be polled.
+- **Losing history is said out loud**: an overflowing listener queue, or a reconnect carrying
+  `Last-Event-ID`, sends `event: resync`, and the page refreshes everything it shows.
+- **Expiry is not a cut**: a deadline passing sends nothing. Revalidating on a deadline is the
+  page's job, from the `max-age` its fragment was served with.
+- **Bounds**: a stream holds a slot under `max_connections`; every write is under
+  `write_timeout`; a heartbeat comment every 15 s; closed after 10 minutes with no event
+  (`EventSource` reconnects and resyncs).
+
+The page side is a few lines of plain `EventSource` that trigger htmx re-fetches; the event
+shape, the page script and the bounds are in the `push` module docs, where a doctest pins the
+shape over a real socket. Measured on an M-series laptop, release build
+(`examples/push_cost.rs`): an idle stream costs about 7 KiB of resident memory (both ends
+in-process); one write with 1000 streams open takes the writer about 0.45 ms (the cut
+queues on every listener on its stack, versus 2 µs with none), and the last of the 1000 clients
+has the event within about 4–6 ms.
 
 ## Edge policy
 
