@@ -614,13 +614,12 @@ impl SpaceReactor {
     /// ⚠ The consequence for operators: a `cap` file only ever does something if the reactor
     /// itself was wired with at least those scopes. A scope the reactor does not hold is
     /// silently dropped here — and the handler then fails with the kernel's own permission
-    /// error, which names the scope, in the tuple's `.err` note. `ikigai-embedded` wires this
-    /// reactor with the three tuplespace verbs only, so under that host a `cap` file can only
-    /// narrow to a subset of `{out, read, take}`. A handler wanting more (the bookings space's
-    /// `{lisp, personal:calendar:read:freebusy, llm, space:out}`) needs the HOST to grant it —
-    /// by widening the reactor's own ceiling or through the host seam — which is the point: a
-    /// grant of authority is now something the host did, not something a file in the drop tree
-    /// claimed.
+    /// error, which names the scope, in the tuple's `.err` note. A handler wanting more than
+    /// its reactor holds needs the HOST to grant it — by widening the reactor's own ceiling or
+    /// through the host seam — which is the point: a grant of authority is something the host
+    /// did, not something a file in the drop tree claimed. `ikigai-embedded` takes the seam
+    /// (ledger #638): it keeps one scope list per space under its config home, read with
+    /// [`parse_scopes`], so under that host this `cap` path is never taken at all.
     ///
     /// ⚠ Intersection here is EXACT string matching ([`Capability::attenuate`]); the trailing-`*`
     /// family form is a property of DECLARED scopes, not of held grants, so a held scope is
@@ -631,12 +630,7 @@ impl SpaceReactor {
         }
         match std::fs::read_to_string(self.root.join(name).join("cap")) {
             Ok(raw) => {
-                let scopes: Vec<String> = raw
-                    .lines()
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                    .map(String::from)
-                    .collect();
+                let scopes = parse_scopes(&raw);
                 if scopes.is_empty() {
                     self.capability.clone()
                 } else {
@@ -837,6 +831,29 @@ impl SpaceReactor {
             }
         });
     }
+}
+
+/// Parse a scope-list file: one capability scope IRI per line, surrounding whitespace
+/// trimmed, blank lines and `#` comment lines ignored. Order is kept; nothing is validated
+/// or deduplicated.
+///
+/// This is the format of a space's `cap` file, and it is public so a HOST that keeps the
+/// same lists somewhere else (`ikigai-embedded` keeps one file per space under its config
+/// home, installed through [`SpaceReactor::with_host_authority`]) reads them with the same
+/// rules. One parser means a file moves between the two places without being edited.
+///
+/// ```
+/// let scopes = ikigai_intray::parse_scopes(
+///     "# the bookings handler\nurn:cap:lisp\n\n  urn:cap:space:out  \n",
+/// );
+/// assert_eq!(scopes, vec!["urn:cap:lisp", "urn:cap:space:out"]);
+/// ```
+pub fn parse_scopes(raw: &str) -> Vec<String> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(String::from)
+        .collect()
 }
 
 /// Map a filesystem path to the `(space, tuple id)` it names, iff it is a tuple freshly in an
