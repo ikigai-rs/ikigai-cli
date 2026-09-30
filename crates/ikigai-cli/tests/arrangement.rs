@@ -212,3 +212,169 @@ fn the_flag_is_refused_where_no_local_root_is_built() {
     assert_eq!(out.status.code(), Some(2), "{stderr}");
     assert!(stderr.contains("does not build one"), "{stderr}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// The s-expression surface: an `.arrangement` file (ikigai-fs 0.1.7 types it
+// `text/x-ikigai-arrangement`; ikigai-sexpr 0.1.4 transrepts it to Turtle losslessly).
+// ---------------------------------------------------------------------------------------------
+
+/// One arrangement, written by hand as an `.arrangement` file: a NAMED fallback over two
+/// endpoint spaces, with a comment the round trip is allowed to drop.
+const GAME_ARRANGEMENT: &str = "\
+;; Two layers, consulted in order.
+(fallback :id \"urn:game:root\"
+  (endpoints (door \"urn:host:demo\" host-demo))
+  (endpoints (door \"urn:host:info\" host-info)))
+";
+
+/// The SAME arrangement, built independently through core's typed tree and rendered as Turtle
+/// — not derived from the file above, so agreement between the two is evidence.
+fn game_turtle() -> String {
+    let mut root = Topology::new(SpaceKind::Fallback)
+        .child(Topology::new(SpaceKind::EndpointSpace {
+            doors: vec![Door::new("urn:host:demo", MatchKind::Exact, "host-demo")],
+        }))
+        .child(Topology::new(SpaceKind::EndpointSpace {
+            doors: vec![Door::new("urn:host:info", MatchKind::Exact, "host-info")],
+        }));
+    root.id = Some(ikigai_core::Iri::parse("urn:game:root").unwrap());
+    root.to_turtle()
+}
+
+/// A document without its leading comment block and the blank line after it: the part of
+/// `urn:iki:host:arrangement`'s answer that is the arrangement, not where it came from.
+fn body(dump: &str) -> String {
+    dump.lines()
+        .skip_while(|line| line.starts_with('#') || line.starts_with(";;"))
+        .skip_while(|line| line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// ★ The same declaration as Turtle and as `.arrangement` starts the SAME host: the same doors
+/// answer, the same door the declaration left out does not, and the host answers the same
+/// arrangement back — in Turtle and as an s-expression.
+#[test]
+fn turtle_and_arrangement_files_start_identical_hosts() {
+    let home = scratch("sexpr-same");
+    std::fs::write(home.join("game.ttl"), game_turtle()).unwrap();
+    std::fs::write(home.join("game.arrangement"), GAME_ARRANGEMENT).unwrap();
+    let ask = |file: &str| {
+        let out = run(
+            &home,
+            &[
+                "--arrangement",
+                file,
+                "-c",
+                "source urn:host:demo",
+                "-c",
+                "source urn:host:info",
+                "-c",
+                "source urn:tz:now",
+            ],
+        );
+        (text(&out.stdout), text(&out.stderr), out.status.code())
+    };
+    let (ttl_out, ttl_err, _) = ask("game.ttl");
+    let (arr_out, arr_err, _) = ask("game.arrangement");
+    assert!(ttl_out.contains("demo off"), "{ttl_out}\n{ttl_err}");
+    assert!(
+        arr_out.contains("demo off") && arr_out.contains("ikigai"),
+        "both declared doors answer from the .arrangement: {arr_out}\n{arr_err}"
+    );
+    assert!(
+        arr_err.contains("no endpoint resolved for urn:tz:now")
+            && ttl_err.contains("no endpoint resolved for urn:tz:now"),
+        "a door neither declares is not answered:\n{ttl_err}\n{arr_err}"
+    );
+    assert!(
+        arr_err.contains("game.arrangement` (from the flag)"),
+        "{arr_err}"
+    );
+
+    let dump = |file: &str, face: &str| {
+        let out = run(
+            &home,
+            &[
+                "--arrangement",
+                file,
+                "-c",
+                &format!("source urn:iki:host:arrangement{face}"),
+            ],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        text(&out.stdout)
+    };
+    let (ttl_turtle, arr_turtle) = (dump("game.ttl", ""), dump("game.arrangement", ""));
+    assert_eq!(body(&ttl_turtle), body(&arr_turtle));
+    assert_eq!(
+        Topology::from_turtle(&arr_turtle).unwrap(),
+        Topology::from_turtle(&game_turtle()).unwrap()
+    );
+    let face = " as=text/x-ikigai-arrangement";
+    let (ttl_sexpr, arr_sexpr) = (dump("game.ttl", face), dump("game.arrangement", face));
+    assert_eq!(body(&ttl_sexpr), body(&arr_sexpr));
+    assert!(
+        arr_sexpr.starts_with(";; The arrangement this host built its local root from"),
+        "{arr_sexpr}"
+    );
+    // Printed back canonically: the source's comment is the one thing it does not keep.
+    assert!(
+        body(&arr_sexpr).starts_with("(fallback :id \"urn:game:root\""),
+        "{arr_sexpr}"
+    );
+    assert!(!arr_sexpr.contains("Two layers"), "{arr_sexpr}");
+    // And the s-expression the host prints starts the same host again.
+    std::fs::write(home.join("again.arrangement"), &arr_sexpr).unwrap();
+    assert_eq!(body(&dump("again.arrangement", "")), body(&arr_turtle));
+}
+
+/// A malformed `.arrangement` stops the start (exit 2), and ikigai-sexpr's refusal — which
+/// says WHERE — reaches the operator, naming the transreptor that refused.
+#[test]
+fn a_malformed_arrangement_file_stops_the_start_naming_where() {
+    let home = scratch("sexpr-bad");
+    std::fs::write(
+        home.join("game.arrangement"),
+        "(fallback\n  (endpoints (door \"urn:host:demo\" host-demo))\n  (endpoints (portal \"urn:x\" y)))\n",
+    )
+    .unwrap();
+    let out = run(
+        &home,
+        &[
+            "--arrangement",
+            "game.arrangement",
+            "-c",
+            "source urn:host:demo",
+        ],
+    );
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("game.arrangement")
+            && stderr.contains("<urn:sexpr:arrangement-to-rdf> refused it")
+            && stderr.contains("layer 2")
+            && stderr.contains("(portal …)"),
+        "{stderr}"
+    );
+    assert!(!text(&out.stdout).contains("demo off"), "nothing ran");
+
+    // Unbalanced text is refused by the reader, before any tree exists.
+    std::fs::write(
+        home.join("open.arrangement"),
+        "(endpoints (door \"urn:host:demo\" host-demo)\n",
+    )
+    .unwrap();
+    let out = run(
+        &home,
+        &[
+            "--arrangement",
+            "open.arrangement",
+            "-c",
+            "source urn:host:demo",
+        ],
+    );
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("missing `)`"), "{stderr}");
+}

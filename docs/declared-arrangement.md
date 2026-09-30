@@ -1,7 +1,9 @@
 # Run a declared arrangement
 
 **Status:** built (ledger [#637](http://localhost:1060/l/default/item/637), the host half of spaces as
-data, arc 1). Needs `ikigai-core` 0.1.83. Core's side is `ikigai-core/docs/design/space-declarations.md`.
+data, arc 1). Needs `ikigai-core` 0.1.83; the `.arrangement` form needs `ikigai-fs` 0.1.7 and
+`ikigai-sexpr` 0.1.4, and the picture needs `ikigai-diagram` 0.1.0. Core's side is
+`ikigai-core/docs/design/space-declarations.md`.
 
 The local kernel's root is an *arrangement*: which spaces are consulted, in what order, with which
 doors bound to which endpoints. By default the host composes it in Rust. You can run a different one
@@ -22,7 +24,44 @@ then start from it:
 ikigai --arrangement root.ttl                  # any mode that builds the local root
 ```
 
-or name it in the config home, where a relative path is taken against the config home:
+## Or write it as an s-expression
+
+The same arrangement reads as an `.arrangement` file — shorter to write by hand, and the host takes it
+exactly as it takes Turtle:
+
+```lisp
+;; game.arrangement: two layers, consulted in order.
+(fallback :id "urn:game:root"
+  (endpoints (door "urn:host:demo" host-demo))
+  (endpoints (door "urn:host:info" host-info)))
+```
+
+```bash
+ikigai --arrangement game.arrangement
+ikigai -c 'source urn:iki:host:arrangement as=text/x-ikigai-arrangement' > root.arrangement
+```
+
+`ikigai-fs` types a `*.arrangement` file as `text/x-ikigai-arrangement`, and `ikigai-sexpr`'s
+`urn:sexpr:arrangement-to-rdf` transrepts it to Turtle on the way in: **losslessly**, checked by
+reading its own output back, so a file that means one arrangement cannot start another. The one thing
+the round trip drops is presentation — comments, layout, and the choice between equivalent spellings.
+`urn:iki:host:arrangement` answers either face: Turtle by default, and the s-expression with
+`as=text/x-ikigai-arrangement`, each with its header as comments (`#` or `;;`), so either dump starts
+the same host. The grammar (`endpoints`, `fallback`, `mount`, `alias`, `limit`, `level`, `ref`, and
+`door` with an optional `:match` and `:confined`) is ikigai-sexpr's `arrangement` module.
+
+A malformed file stops the start with ikigai-sexpr's reason, which says where:
+
+```
+ikigai: the declared arrangement `/…/game.arrangement` cannot be read: it is
+`text/x-ikigai-arrangement`, and <urn:sexpr:arrangement-to-rdf> refused it: invalid argument
+`content`: urn:sexpr:arrangement-to-rdf: at root (fallback) › layer 2 (endpoints) › door 1:
+(endpoints …) holds only `(door "pattern" endpoint)` forms; found `(portal …)`
+```
+
+## Name it in the config home
+
+A relative path is taken against the config home:
 
 ```toml
 # ~/.config/ikigai/config.toml  ($XDG_CONFIG_HOME/ikigai/config.toml when set)
@@ -82,9 +121,39 @@ resolver), a closure `Rewrite`, and a door whose grammar core does not know (`ma
 are refused by core. A host with `browse.root` configured binds custom doors, so its dump does not
 start either.
 
-**Anything but Turtle, for now.** The file is read through a bootstrap kernel and transrepted to
-Turtle, so another surface arrives with no host change. N-Triples and JSON-LD work through the host's
-transreptors today; s-expressions need `ikigai-fs` to recognize their extension first.
+**A surface nothing here transrepts losslessly.** The file is read through a bootstrap kernel and
+transrepted to Turtle, so another surface arrives with no host change: Turtle, N-Triples, JSON-LD and
+`.arrangement` work today. A file whose type has no lossless path to Turtle is refused, naming it.
 
 **Changing it while running.** The declaration is read at start. Hot reload is ledger
 [#628](http://localhost:1060/l/default/item/628).
+
+## ⚠ A Turtle declaration is not bounded (ledger [#643](http://localhost:1060/l/default/item/643))
+
+Core's `Topology::from_turtle` walks the declaration recursively, with no depth bound, and expands a
+named node at every place it is referenced, with no memo. So a hostile Turtle declaration — a chain of
+spaces thousands deep, or a few lines of named spaces that reference each other ("billion laughs") —
+can overflow the stack and **abort the process** instead of refusing the file. The `.arrangement`
+path is guarded: ikigai-sexpr bounds the tree (48 spaces and doors deep, 65,536 in all, after `ref`s
+are expanded) before core ever reads it. The Turtle, N-Triples and JSON-LD paths go straight to core.
+
+Today the only input is the operator's own file, named by a flag or by the config home they control,
+so this is a hazard to an operator from themselves rather than an attack surface, and the host adds
+no parser of its own to paper over it: the fix is a bound in core's reader. Do not
+point `--arrangement` or `arrangement =` at a file you did not write until that lands.
+
+## See the arrangement
+
+`ikigai-diagram` draws an arrangement as an accessible SVG of nested boxes, and the local root binds
+it (the REPL, `-c`, `--daemon`, `mcp`, `serve <socket>`; never a served door):
+
+```bash
+ikigai -c 'source urn:diagram:kernel' > root.svg                                   # the arrangement you are in
+ikigai -c 'source urn:diagram:arrangement of=urn:file:game.arrangement' > game.svg # a declaration, by name
+```
+
+`urn:diagram:kernel` needs `urn:cap:kernel:inspect`, as `urn:kernel:topology` does, and declares it:
+a session without it is refused, and `ikigai mcp` projects the tool only where the capability holds.
+`urn:diagram:arrangement` declares nothing of its own: it reads `of` under the caller's capability,
+so a caller can draw only what it can already read. Both are cacheable and redrawn when what they
+read changes.

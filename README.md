@@ -434,9 +434,31 @@ and the demo runbook stay layered around the declared root. A declaration that i
 malformed or does not build **stops the start** with the reason, naming the node — never a quiet
 fall back to the default.
 
+The declaration can also be an **`.arrangement` file**, the same arrangement as an s-expression,
+converted to Turtle on the way in losslessly (`ikigai-fs` types the file, `ikigai-sexpr` transrepts
+it):
+
+```lisp
+;; game.arrangement
+(fallback :id "urn:game:root"
+  (endpoints (door "urn:host:demo" host-demo))
+  (endpoints (door "urn:host:info" host-info)))
+```
+
+```bash
+ikigai --arrangement game.arrangement
+ikigai -c 'source urn:iki:host:arrangement as=text/x-ikigai-arrangement'   # the running root, as one
+```
+
+And the arrangement can be **seen**: `urn:diagram:kernel` draws the one you are in as an accessible
+SVG (it needs `urn:cap:kernel:inspect`, like `urn:kernel:topology`), and `urn:diagram:arrangement
+of=<iri>` draws any declaration by name. Both are bound in the local root only.
+
 ⚠ The built-in root's own dump does not start as it stands: `file`, `meeting` and `org-agenda` (and
 the `llm-*` backends, with two or more providers) each name two different endpoints, so a door
-naming one cannot say which, and the host refuses it. The dump marks them in its header. See
+naming one cannot say which, and the host refuses it. The dump marks them in its header. ⚠ A Turtle
+declaration is read by core with no depth bound yet, so a hostile one can abort the process (ledger
+[#643](http://localhost:1060/l/default/item/643)); the `.arrangement` path is bounded. See
 [`docs/declared-arrangement.md`](docs/declared-arrangement.md).
 
 ## The consolidated calendar (the embedded host's standing job)

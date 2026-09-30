@@ -9,7 +9,7 @@
 //! | the host's endpoints | value | `harvest`: a [`Registry`] recovered from the SAME constructor list the built-in root is composed from, so there is one list, not two |
 //! | a declaration | resource | `--arrangement <path>` or `arrangement = "<path>"` in the config home, read THROUGH a bootstrap kernel as `text/turtle` ([`arm`]) |
 //! | the built root | value | `arrange`: core's `build` over the harvested registry |
-//! | the root as a declaration | resource | [`RESOURCE`] (`urn:iki:host:arrangement`): the arrangement the root was built from, as Turtle, ready to save, edit and start from |
+//! | the root as a declaration | resource | [`RESOURCE`] (`urn:iki:host:arrangement`): the arrangement the root was built from, as Turtle or (`as=text/x-ikigai-arrangement`) as an s-expression, ready to save, edit and start from |
 //!
 //! ## Why the registry is HARVESTED, not registered
 //!
@@ -55,9 +55,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use ikigai_core::{
-    build, ArgRef, Bindings, DeclarationError, Description, Door, Endpoint, EndpointSpace, Exact,
-    Fallback, Invocation, Iri, Kernel, MatchKind, Registry, ReprType, Representation, Request,
-    Resolution, Result, Scope, Space, SpaceKind, Topology, UriTemplate, Verb,
+    build, ArgRef, ArgSpec, Bindings, DeclarationError, Description, Door, Endpoint, EndpointSpace,
+    Error, Exact, Fallback, Invocation, Iri, Kernel, MatchKind, Registry, ReprType, Representation,
+    Request, Resolution, Result, Scope, Space, SpaceKind, Topology, UriTemplate, Verb,
 };
 
 /// The config-home key: `arrangement = "<path>"` in `config.toml`, instance-scoped as
@@ -200,9 +200,11 @@ fn config_relative(value: &str) -> PathBuf {
 /// and this host changes nothing when a surface is added. Lossless plans only: a surface that
 /// cannot carry the arrangement must say so, not drop part of it.
 ///
-/// ⚠ `ikigai-fs` decides the file's media type by extension, and it maps `.ttl`, `.nt` and
-/// `.jsonld` today — not an s-expression extension. That is where the s-expression surface
-/// has to land first.
+/// `ikigai-fs` decides the file's media type by extension: `.ttl`, `.nt`, `.jsonld`, and since
+/// 0.1.7 `.arrangement` (`text/x-ikigai-arrangement`), which ikigai-sexpr 0.1.4's
+/// `urn:sexpr:arrangement-to-rdf` transrepts to Turtle losslessly. That transreptor bounds
+/// the tree before core reads it; a Turtle declaration goes to `Topology::from_turtle` with
+/// no such bound (ledger #643, and `docs/declared-arrangement.md`).
 pub(crate) fn read_declaration(path: &Path) -> std::result::Result<String, String> {
     let dir = path
         .parent()
@@ -242,10 +244,15 @@ pub(crate) fn read_declaration(path: &Path) -> std::result::Result<String, Strin
             })?;
         for step in plan {
             let iri = Iri::parse(&step.endpoint).map_err(|e| e.to_string())?;
+            let endpoint = step.endpoint.clone();
             let request = Request::new(Verb::Source, iri)
                 .with_arg("content", ArgRef::Inline(current.bytes))
                 .with_arg("as", ArgRef::Inline(step.to.into_bytes()));
-            current = issue(request)?;
+            // The transreptor's refusal is the operator's answer — for an `.arrangement` file it
+            // is ikigai-sexpr's, and it says where (`at root (endpoints) › door 1: …`) — so it
+            // is passed through whole, after naming what refused.
+            current = issue(request)
+                .map_err(|e| format!("it is `{from}`, and <{endpoint}> refused it: {e}"))?;
         }
     }
     String::from_utf8(current.bytes).map_err(|_| format!("the {TURTLE} is not UTF-8"))
@@ -401,26 +408,71 @@ fn quoted(patterns: &[String]) -> String {
         .join(", ")
 }
 
-/// The arrangement's Turtle as [`RESOURCE`] answers it: a `#` header (comments are not
-/// triples, so the document still reads back) saying where the arrangement came from, what the
-/// host layers around it, and — when it binds an ambiguous name — that it cannot be declared
-/// back as it stands.
-pub(crate) fn dump(arrangement: &Topology, origin: &str, harvest: &Harvest) -> String {
-    let mut header = format!(
-        "# The arrangement this host built its local root from: {origin}.\n\
-         # Save it, edit it, and start from it: `ikigai {FLAG} <file>`, or\n\
-         # `{CONFIG_KEY} = \"<file>\"` in the config home's config.toml.\n\
-         # Layered around it, and not part of it: the alias table, config-home mounts, the demo\n\
-         # runbook (gated by urn:host:demo) and {RESOURCE} itself.\n"
-    );
+/// The media type of an arrangement written as an s-expression (an `*.arrangement` file), and
+/// the second face [`RESOURCE`] answers.
+pub const MEDIA_ARRANGEMENT: &str = ikigai_sexpr::arrangement::MEDIA_ARRANGEMENT;
+
+/// The media type [`RESOURCE`] answers by default, and the one core's `Topology` reads.
+const MEDIA_TURTLE: &str = "text/turtle";
+
+/// The arrangement as [`RESOURCE`] answers it: the tree, and a header saying where it came
+/// from, what the host layers around it, and — when it binds an ambiguous name — that it cannot
+/// be declared back as it stands. The header is written as COMMENTS in either face (`#` in
+/// Turtle, `;` in an s-expression): comments are not part of the arrangement, so the document
+/// still reads back.
+pub(crate) struct Dump {
+    header: Vec<String>,
+    topology: Topology,
+}
+
+impl Dump {
+    /// The Turtle face: the header as `#` comments, then core's rendering.
+    pub(crate) fn turtle(&self) -> String {
+        self.with_header("#", &self.topology.to_turtle())
+    }
+
+    /// The s-expression face (`text/x-ikigai-arrangement`): the header as `;` comments, then
+    /// `ikigai-sexpr`'s canonical printing of the same tree. `Err` when the tree is one the
+    /// s-expression grammar refuses (a kind core cannot build, or past its bounds), with
+    /// ikigai-sexpr's reason, which says where.
+    pub(crate) fn sexpr(&self) -> std::result::Result<String, String> {
+        ikigai_sexpr::topology_to_arrangement(&self.topology)
+            .map(|body| self.with_header(";;", &body))
+            .map_err(|e| e.to_string())
+    }
+
+    fn with_header(&self, comment: &str, body: &str) -> String {
+        let mut out = String::new();
+        for line in &self.header {
+            out.push_str(comment);
+            out.push(' ');
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push('\n');
+        out.push_str(body);
+        out
+    }
+}
+
+/// The arrangement as [`RESOURCE`] answers it (see [`Dump`]).
+pub(crate) fn dump(arrangement: &Topology, origin: &str, harvest: &Harvest) -> Dump {
+    let mut header = vec![
+        format!("The arrangement this host built its local root from: {origin}."),
+        format!("Save it, edit it, and start from it: `ikigai {FLAG} <file>`, or"),
+        format!("`{CONFIG_KEY} = \"<file>\"` in the config home's config.toml."),
+        "Layered around it, and not part of it: the alias table, config-home mounts, the demo"
+            .to_string(),
+        format!("runbook (gated by urn:host:demo) and {RESOURCE} itself."),
+    ];
     let mut used = Vec::new();
     collect_doors(arrangement, &mut used);
     let mut warned = std::collections::BTreeSet::new();
     for door in &used {
         if let Some(patterns) = harvest.ambiguous.get(&door.endpoint) {
             if warned.insert(door.endpoint.clone()) {
-                header.push_str(&format!(
-                    "# ⚠ Not declarable as it stands: `{}` names {} different endpoints here ({}).\n",
+                header.push(format!(
+                    "⚠ Not declarable as it stands: `{}` names {} different endpoints here ({}).",
                     door.endpoint,
                     patterns.len(),
                     quoted(patterns)
@@ -428,32 +480,60 @@ pub(crate) fn dump(arrangement: &Topology, origin: &str, harvest: &Harvest) -> S
             }
         }
     }
-    header.push('\n');
-    header.push_str(&arrangement.to_turtle());
-    header
+    Dump {
+        header,
+        topology: arrangement.clone(),
+    }
 }
 
-/// `urn:iki:host:arrangement` — the root's arrangement as a declaration (see [`dump`]).
-/// Computed once, when the root is built: the arrangement is fixed for the process's life
-/// (no hot reload, ledger #628), so the answer is cacheable.
+/// `urn:iki:host:arrangement` — the root's arrangement as a declaration (see [`Dump`]), as
+/// Turtle by default and as an s-expression with `as=text/x-ikigai-arrangement`.
+///
+/// ★ The s-expression face is answered HERE, not by the kernel transrepting on `as`: core
+/// transrepts on `as` for Meta only, and a Source endpoint serves its own faces. Nor does it
+/// compose `urn:sexpr:arrangement-from-rdf` over the Turtle: that transreptor is bound in the
+/// built-in root, and a DECLARED root need not bind it, so the face would work or fail by what
+/// the operator happened to declare. The library call is the same code with no such dependency.
+///
+/// Both faces are computed from a tree fixed when the root is built (no hot reload, ledger
+/// #628), so both are cacheable.
 pub(crate) struct ArrangementEndpoint {
-    turtle: Vec<u8>,
+    dump: Dump,
 }
 
 impl ArrangementEndpoint {
-    pub(crate) fn new(turtle: String) -> Self {
-        ArrangementEndpoint {
-            turtle: turtle.into_bytes(),
-        }
+    pub(crate) fn new(dump: Dump) -> Self {
+        ArrangementEndpoint { dump }
     }
 }
 
 #[async_trait::async_trait]
 impl Endpoint for ArrangementEndpoint {
-    async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let face = match inv.request.args.get("as") {
+            None => MEDIA_TURTLE.to_string(),
+            Some(_) => inv.inline_str("as")?.trim().to_string(),
+        };
+        let bytes = match face.as_str() {
+            MEDIA_TURTLE => self.dump.turtle(),
+            MEDIA_ARRANGEMENT => self.dump.sexpr().map_err(|detail| {
+                Error::Endpoint(format!(
+                    "this host's arrangement cannot be written as {MEDIA_ARRANGEMENT}: {detail}"
+                ))
+            })?,
+            other => {
+                return Err(Error::InvalidArgument {
+                    name: "as".to_string(),
+                    detail: format!(
+                        "`{other}` is not a face of {RESOURCE}; it answers {MEDIA_TURTLE} \
+                         (the default) or {MEDIA_ARRANGEMENT}"
+                    ),
+                })
+            }
+        };
         Ok(Representation::new(
-            ReprType::new("text/turtle").with_param("charset", "utf-8"),
-            self.turtle.clone(),
+            ReprType::new(face).with_param("charset", "utf-8"),
+            bytes.into_bytes(),
         )
         .cacheable())
     }
@@ -468,17 +548,30 @@ impl Endpoint for ArrangementEndpoint {
             .summary(
                 "The arrangement this host built its local root from, as a declaration: the \
                  root node of urn:kernel:topology without the layers the host adds around it. \
-                 Save it, edit it, and start a host from it with --arrangement <file>.",
+                 Save it, edit it, and start a host from it with --arrangement <file>. Turtle \
+                 by default; as=text/x-ikigai-arrangement writes it as an s-expression.",
             )
             .verb(Verb::Source)
             .verb(Verb::Meta)
+            .input(
+                ArgSpec::new("as")
+                    .summary("the face to answer: Turtle, or the s-expression an `.arrangement` file holds")
+                    .class(XSD_STRING)
+                    .one_of([MEDIA_TURTLE, MEDIA_ARRANGEMENT])
+                    .default_value(MEDIA_TURTLE)
+                    .optional(),
+            )
             .output("text/turtle;charset=utf-8")
+            .output("text/x-ikigai-arrangement;charset=utf-8")
     }
 }
 
+/// The datatype of `as`.
+const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+
 /// The host layer that answers [`RESOURCE`].
-pub(crate) fn dump_space(turtle: String) -> EndpointSpace {
-    EndpointSpace::new().bind(Exact::new(RESOURCE), ArrangementEndpoint::new(turtle))
+pub(crate) fn dump_space(dump: Dump) -> EndpointSpace {
+    EndpointSpace::new().bind(Exact::new(RESOURCE), ArrangementEndpoint::new(dump))
 }
 
 #[cfg(test)]
@@ -569,12 +662,39 @@ mod tests {
         ];
         let harvest = harvest(&members);
         let arrangement = Fallback::new(members).topology();
-        let turtle = dump(&arrangement, "the built-in default", &harvest);
+        let turtle = dump(&arrangement, "the built-in default", &harvest).turtle();
         assert!(
             turtle.contains("# ⚠ Not declarable as it stands: `same`"),
             "{turtle}"
         );
         assert_eq!(Topology::from_turtle(&turtle).unwrap(), arrangement);
+    }
+
+    /// The s-expression face is the same arrangement: its `;;` header is comments, and the body
+    /// reads back through ikigai-sexpr to the tree the Turtle face carries.
+    #[test]
+    fn the_dump_has_an_s_expression_face_that_reads_back() {
+        let members: Vec<Arc<dyn Space>> = vec![
+            Arc::new(EndpointSpace::new().bind_arc(Exact::new("urn:t:a"), endpoint("a"))),
+            Arc::new(EndpointSpace::new().bind_arc(Exact::new("urn:t:b"), endpoint("b"))),
+        ];
+        let harvest = harvest(&members);
+        let arrangement = Fallback::new(members).topology();
+        let dump = dump(&arrangement, "the built-in default", &harvest);
+        let sexpr = dump.sexpr().unwrap();
+        assert!(
+            sexpr.starts_with(";; The arrangement this host built its local root from"),
+            "{sexpr}"
+        );
+        assert!(sexpr.contains("(door \"urn:t:a\" a)"), "{sexpr}");
+        assert_eq!(
+            ikigai_sexpr::arrangement_to_topology(&sexpr).unwrap(),
+            arrangement
+        );
+        assert_eq!(
+            Topology::from_turtle(&dump.turtle()).unwrap(),
+            ikigai_sexpr::arrangement_to_topology(&sexpr).unwrap()
+        );
     }
 
     /// A declaration is read through the bootstrap kernel: Turtle as it is, and a missing file
@@ -616,6 +736,21 @@ mod tests {
         std::fs::write(&nt, triples.join("\n")).unwrap();
         let turtle = read_declaration(&nt).unwrap();
         assert_eq!(Topology::from_turtle(&turtle).unwrap(), leaf);
+        // An `.arrangement` file — ikigai-fs 0.1.7 types it, ikigai-sexpr 0.1.4 transrepts it —
+        // arrives as the Turtle of the same tree, comments and all dropped.
+        let file = dir.join("root.arrangement");
+        std::fs::write(&file, ";; one door\n(endpoints (door \"urn:t:a\" a))\n").unwrap();
+        let turtle = read_declaration(&file).unwrap();
+        assert_eq!(Topology::from_turtle(&turtle).unwrap(), leaf);
+        // And a malformed one is refused with ikigai-sexpr's reason, naming the transreptor.
+        std::fs::write(&file, "(endpoints (portal \"urn:t:a\" a))").unwrap();
+        let refused = read_declaration(&file).unwrap_err();
+        assert!(
+            refused.contains("<urn:sexpr:arrangement-to-rdf> refused it")
+                && refused.contains("door 1")
+                && refused.contains("(portal …)"),
+            "{refused}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
