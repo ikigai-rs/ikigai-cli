@@ -44,6 +44,10 @@ const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
 /// See [`XSD_STRING`].
 const XSD_BOOLEAN: &str = "http://www.w3.org/2001/XMLSchema#boolean";
 
+// The local root as a declared arrangement (`--arrangement`, ledger #637): the registry
+// harvested from the root's own constructor list, the declaration read through a bootstrap
+// kernel, and `urn:iki:host:arrangement`, the root's arrangement as a declaration.
+pub mod arrangement;
 mod browse;
 pub mod clients;
 pub mod config;
@@ -1296,18 +1300,22 @@ Authorized candidate actions:
 /// [`file_root`]. Omitted from [`base_space`] (the QUIC-served space) until remote
 /// auth + capability-on-the-wire land.
 fn local_space(nature: &'static str) -> EndpointSpace {
+    // ONE calendar and ONE availability endpoint, each bound at two doors (the exact name and
+    // the period grammar below). Two constructor calls built two endpoints that shared a name,
+    // and a declared arrangement binds a door BY NAME: a registry can hold one endpoint under
+    // `calendar`, never two (ledger #637). Same config, same behavior — one value, two doors.
+    let calendar: Arc<dyn Endpoint> = Arc::new(ikigai_personal::calendar(calendar_config()));
+    let availability: Arc<dyn Endpoint> =
+        Arc::new(ikigai_personal::availability(calendar_config()));
     base_space(nature)
         .bind(
             Exact::new("urn:personal:contacts"),
             ikigai_personal::contacts(),
         )
-        .bind(
-            Exact::new("urn:personal:calendar"),
-            ikigai_personal::calendar(calendar_config()),
-        )
-        .bind(
+        .bind_arc(Exact::new("urn:personal:calendar"), Arc::clone(&calendar))
+        .bind_arc(
             Exact::new("urn:personal:availability"),
-            ikigai_personal::availability(calendar_config()),
+            Arc::clone(&availability),
         )
         .bind(
             Exact::new("urn:personal:calendars"),
@@ -1342,13 +1350,13 @@ fn local_space(nature: &'static str) -> EndpointSpace {
         )
         // AFTER the exact binds: the period grammar must not shadow
         // urn:personal:calendar:config (first grammar match wins).
-        .bind(
+        .bind_arc(
             UriTemplate::parse("urn:personal:calendar:{period}").expect("valid template"),
-            ikigai_personal::calendar(calendar_config()),
+            calendar,
         )
-        .bind(
+        .bind_arc(
             UriTemplate::parse("urn:personal:availability:{period}").expect("valid template"),
-            ikigai_personal::availability(calendar_config()),
+            availability,
         )
         .bind(
             // The org files, jailed to the configured org_dir and read THROUGH
@@ -3974,7 +3982,87 @@ fn root_space() -> Arc<dyn Space> {
 /// — each tried after every local space, so a resource the local kernel lacks under
 /// `prefix` forwards to the remote, and the remote's catalog appears re-prefixed and
 /// tagged with `origin`.
+///
+/// ## The arrangement, and what the host layers around it (ledger #637)
+///
+/// The root is `[arrangement, urn:iki:host:arrangement, the demo runbook]` plus the mounts.
+/// The ARRANGEMENT is the built-in default — a [`Fallback`] over [`root_members`], in order —
+/// unless this process [armed](arrangement::arm) a declaration, in which case it is built
+/// from that declaration over the endpoints [harvested](arrangement::harvest) from the same
+/// members: one constructor list, two uses, no second list to drift. A declaration that does
+/// not build stops the process here, with core's message: never a silent fall back to the
+/// default. See [`arrangement`] for why the process EXITS rather than panics.
 fn root_space_with_mounts(mounts: Vec<MountSpec>) -> Arc<dyn Space> {
+    let members = root_members();
+    let harvest = arrangement::harvest(&members);
+    let (arranged, origin): (Arc<dyn Space>, String) = match arrangement::active() {
+        None => (
+            Arc::new(Fallback::new(members)),
+            "the built-in default".to_string(),
+        ),
+        Some(declared) => match arrangement::arrange(&harvest, &declared.topology) {
+            Ok(space) => {
+                let origin = format!(
+                    "`{}` (from the {})",
+                    declared.path.display(),
+                    declared.source.as_str()
+                );
+                // Said once per process, on stderr, and only once it is TRUE: the operator
+                // asked for a declaration, and this is the line that says they got it.
+                static ANNOUNCED: std::sync::Once = std::sync::Once::new();
+                ANNOUNCED.call_once(|| {
+                    eprintln!(
+                        "ikigai: local root arranged from {origin}; `source {}` shows it",
+                        arrangement::RESOURCE
+                    );
+                });
+                (space, origin)
+            }
+            // EXIT, not panic: a kernel may be built inside a runtime's task, where a panic
+            // is caught and the process carries on without the root it was asked to run.
+            Err(e) => {
+                eprintln!(
+                    "ikigai: the declared arrangement `{}` cannot be built: {e}",
+                    declared.path.display()
+                );
+                std::process::exit(2);
+            }
+        },
+    };
+    let dump = arrangement::dump(&arranged.topology(), &origin, &harvest);
+    compose_mounts(
+        vec![
+            arranged,
+            Arc::new(arrangement::dump_space(dump)) as Arc<dyn Space>,
+            demo_runbook(),
+        ],
+        mounts,
+    )
+}
+
+/// The interactive runbook (`urn:runbook:*`), **gated** by [`demo_flag`]: it resolves only
+/// while the demo is on. A host LAYER, not part of the arrangement: the gate is a runtime
+/// switch, which no declaration can state, and a core builder would rebuild the space without
+/// it. Nothing it binds overlaps a member of the root, so layering it after the arrangement
+/// (it used to sit among the members) changes no answer.
+fn demo_runbook() -> Arc<dyn Space> {
+    Arc::new(Gated {
+        // The shared runbook demos, plus a local Timer tab (urn:runbook:timer) — the
+        // native mirror of the browser demo's tab. The TUI's load_demos enumerates
+        // every urn:runbook:* here, so binding it locally is all it takes.
+        inner: ikigai_runbook::space()
+            .bind(Exact::new("urn:runbook:timer"), runbook_timer_demo())
+            .bind(Exact::new("urn:runbook:jury"), runbook_jury_demo())
+            .bind(Exact::new("urn:demo:jury"), jury_shape())
+            .bind(Exact::new("urn:demo:jury-gated"), jury_gated_shape())
+            .bind(Exact::new("urn:data:ollama-offline"), ollama_offline()),
+        on: demo_flag(),
+    })
+}
+
+/// The spaces the embedded root's built-in arrangement is composed of, in resolution order —
+/// and the ONE list the endpoint registry for a declared arrangement is harvested from.
+fn root_members() -> Vec<Arc<dyn Space>> {
     // The browse family (urn:repo:{root}:tree/file/state/hash/explain/… +
     // urn:iki:annotation:*), opt-in via `browse.root` config lines — see the
     // `browse` module for the grammar. Wired here, before the space list, so
@@ -4116,18 +4204,6 @@ fn root_space_with_mounts(mounts: Vec<MountSpec>) -> Arc<dyn Space> {
         // (id=) stops one, urn:time:jobs is the live readout (also the Control composite's
         // third marker). The registry's kernel handle is installed in watched_kernel().
         Arc::new(ikigai_time::space(time_registry())) as Arc<dyn Space>,
-        Arc::new(Gated {
-            // The shared runbook demos, plus a local Timer tab (urn:runbook:timer) — the
-            // native mirror of the browser demo's tab. The TUI's load_demos enumerates
-            // every urn:runbook:* here, so binding it locally is all it takes.
-            inner: ikigai_runbook::space()
-                .bind(Exact::new("urn:runbook:timer"), runbook_timer_demo())
-                .bind(Exact::new("urn:runbook:jury"), runbook_jury_demo())
-                .bind(Exact::new("urn:demo:jury"), jury_shape())
-                .bind(Exact::new("urn:demo:jury-gated"), jury_gated_shape())
-                .bind(Exact::new("urn:data:ollama-offline"), ollama_offline()),
-            on: demo_flag(),
-        }) as Arc<dyn Space>,
     ];
     // The browse family, when `browse.root` lines configured it (see above): repository
     // browsing (urn:repo:{root}:tree/file/state/hash), the persistent explanation
@@ -4279,7 +4355,7 @@ fn root_space_with_mounts(mounts: Vec<MountSpec>) -> Arc<dyn Space> {
                 ClientRegistry::new(file_root()),
             ),
     ) as Arc<dyn Space>);
-    compose_mounts(spaces, mounts)
+    spaces
 }
 
 /// Compose remote mounts around a list of local spaces — the shared tail of every
@@ -8217,19 +8293,22 @@ mod tests {
     /// could otherwise answer for the family — which is the property the paper's gatekeeper
     /// check (Theorem 4(b)) reads off this graph.
     #[test]
+    ///
+    /// Core 0.1.83 renders a limiter's `ik:matchKind` beside its family (`Limit::new` is a
+    /// PREFIX family; `Limit::matching` takes its grammar's kind), so the pinned text carries it.
     fn the_served_topology_names_its_limiters_ahead_of_everything_else() {
         let kernel = served_kernel("Test (QUIC)", ServedSurface::default());
         let turtle = source_as_root(&kernel, "urn:kernel:topology").expect("topology");
         let turtle = String::from_utf8(turtle.bytes).expect("Turtle is UTF-8");
         assert!(
             turtle.contains(&format!(
-                "<{SERVED_PERSONAL_LIMIT}> a ik:Limit ;\n    ik:family \"urn:personal:\" ."
+                "<{SERVED_PERSONAL_LIMIT}> a ik:Limit ;\n    ik:family \"urn:personal:\" ;\n    ik:matchKind \"prefix\" ."
             )),
             "{turtle}"
         );
         assert!(
             turtle.contains(&format!(
-                "<{SERVED_LLM_LIMIT}> a ik:Limit ;\n    ik:family \"urn:llm:\" ."
+                "<{SERVED_LLM_LIMIT}> a ik:Limit ;\n    ik:family \"urn:llm:\" ;\n    ik:matchKind \"prefix\" ."
             )),
             "{turtle}"
         );
@@ -8249,7 +8328,7 @@ mod tests {
             .iter()
             .take(2)
             .map(|layer| match &layer.kind {
-                ikigai_core::SpaceKind::Limit { family } => {
+                ikigai_core::SpaceKind::Limit { family, .. } => {
                     (layer.id.as_ref().map(Iri::as_str), family.clone())
                 }
                 other => panic!("a limiter must lead the served root, found {other:?}"),
@@ -8585,5 +8664,342 @@ mod dead_letter_tests {
             dead_letter_line("bookings", "ab12", "denied: no\n  lisp\n"),
             "ikigai: dead letter: space=bookings tuple=ab12 reason=denied: no lisp"
         );
+    }
+}
+
+/// The proving tests for a declared local root (ledger #637): the built-in arrangement dumped,
+/// read back and built over the host's harvested registry answers every name the way the
+/// built-in root does — and a declaration that reorders or drops something answers
+/// DIFFERENTLY, exactly there, so none of this can pass by ignoring the declaration.
+#[cfg(test)]
+mod arrangement_tests {
+    use super::*;
+    use futures::executor::block_on;
+    use ikigai_core::{Bindings, Capability, Door, SpaceKind, Topology};
+
+    /// The built-in arrangement, and the registry harvested from the SAME members.
+    fn default_root() -> (Arc<dyn Space>, arrangement::Harvest) {
+        let members = root_members();
+        let harvest = arrangement::harvest(&members);
+        (Arc::new(Fallback::new(members)), harvest)
+    }
+
+    /// The arrangement as an operator would get it: dumped as Turtle and read back.
+    fn dumped(root: &Arc<dyn Space>) -> Topology {
+        Topology::from_turtle(&root.topology().to_turtle()).expect("the dump reads back")
+    }
+
+    /// Keep only the doors `keep` accepts, everywhere in the tree.
+    fn retain_doors(node: &mut Topology, keep: &dyn Fn(&Door) -> bool) {
+        if let SpaceKind::EndpointSpace { doors } = &mut node.kind {
+            doors.retain(|door| keep(door));
+        }
+        for child in &mut node.children {
+            retain_doors(child, keep);
+        }
+    }
+
+    /// The dump without the doors whose names are ambiguous here — the part of the built-in
+    /// arrangement a declaration CAN state — and the concrete names those doors answered.
+    fn declarable(
+        root: &Arc<dyn Space>,
+        harvest: &arrangement::Harvest,
+    ) -> (Topology, Vec<String>) {
+        let mut declaration = dumped(root);
+        let mut dropped = Vec::new();
+        retain_doors(&mut declaration, &|door| {
+            !harvest.ambiguous.contains_key(&door.endpoint)
+        });
+        for patterns in harvest.ambiguous.values() {
+            dropped.extend(patterns.iter().filter_map(|p| concrete(p)));
+        }
+        (declaration, dropped)
+    }
+
+    /// A pattern as a name to ask for: an exact IRI as it is, a template expanded with the
+    /// harvest's own probe value.
+    fn concrete(pattern: &str) -> Option<String> {
+        let template = UriTemplate::parse(pattern).ok()?;
+        let mut bindings = Bindings::new();
+        let vars: Vec<String> = template.variables().map(str::to_string).collect();
+        for var in vars {
+            bindings.insert(var, arrangement::PROBE);
+        }
+        template.expand(&bindings)
+    }
+
+    /// Every name the root lists (what `urn:kernel:catalog` walks), plus names nothing binds.
+    fn names(root: &Arc<dyn Space>) -> Vec<String> {
+        let mut names: Vec<String> = root
+            .entries()
+            .expect("the arrangement enumerates")
+            .into_iter()
+            .filter_map(|entry| concrete(&entry.pattern))
+            .collect();
+        names.extend(["urn:nowhere:at:all".to_string(), "urn:host".to_string()]);
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// What one name resolves to in a space: WHICH endpoint (by identity, not by name), its
+    /// name, the bindings, and what the resolution reports about itself.
+    type Answer = Option<(
+        usize,
+        String,
+        Vec<(String, String)>,
+        Option<String>,
+        Option<String>,
+    )>;
+
+    fn answer(space: &dyn Space, name: &str) -> Answer {
+        let request = Request::new(Verb::Meta, Iri::parse(name).expect("a name"));
+        match space.resolve(&request, &Scope::empty()) {
+            Resolution::Hit(resolved) => Some((
+                Arc::as_ptr(&resolved.endpoint) as *const () as usize,
+                resolved.endpoint.name().to_string(),
+                resolved
+                    .bindings
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                resolved.canonical.as_ref().map(|c| c.as_str().to_string()),
+                resolved
+                    .answered_by
+                    .as_ref()
+                    .map(|a| a.as_str().to_string()),
+            )),
+            Resolution::Miss => None,
+        }
+    }
+
+    /// A description's bytes, or the kind of refusal.
+    type Said = std::result::Result<Vec<u8>, std::mem::Discriminant<Error>>;
+
+    /// What a kernel over `root` says about `name`: the description's bytes, or the KIND of
+    /// refusal. `Meta`, because it runs nothing — this root binds mail, exec and platform
+    /// endpoints, and describing them is the only call that is safe to make of every one.
+    fn told(root: &Arc<dyn Space>, names: &[String]) -> Vec<(String, Said)> {
+        let kernel = Kernel::with_meta_renderer(Arc::clone(root), Arc::new(CliRenderer));
+        names
+            .iter()
+            .map(|name| {
+                let request = Request::new(Verb::Meta, Iri::parse(name).expect("a name"));
+                let said = block_on(kernel.issue(request, &Capability::root()))
+                    .map(|representation| representation.bytes)
+                    .map_err(|e| std::mem::discriminant(&e));
+                (name.clone(), said)
+            })
+            .collect()
+    }
+
+    /// The first door in `node`'s tree with this pattern.
+    fn door(node: &Topology, pattern: &str) -> Option<Door> {
+        if let SpaceKind::EndpointSpace { doors } = &node.kind {
+            if let Some(door) = doors.iter().find(|d| d.pattern == pattern) {
+                return Some(door.clone());
+            }
+        }
+        node.children.iter().find_map(|child| door(child, pattern))
+    }
+
+    /// The names whose answers differ between two roots.
+    fn differing(a: &Arc<dyn Space>, b: &Arc<dyn Space>, names: &[String]) -> Vec<String> {
+        let mut differ: Vec<String> = names
+            .iter()
+            .filter(|name| answer(a.as_ref(), name) != answer(b.as_ref(), name))
+            .cloned()
+            .collect();
+        let said_a = told(a, names);
+        let said_b = told(b, names);
+        for ((name, x), (_, y)) in said_a.iter().zip(&said_b) {
+            if x != y && !differ.contains(name) {
+                differ.push(name.clone());
+            }
+        }
+        differ.sort();
+        differ
+    }
+
+    /// ★ The one-list property: every door of the built-in arrangement is either in the
+    /// registry or named as ambiguous — nothing unreached, nothing guessed — and the names
+    /// this host binds to two different endpoints are REPORTED, not renamed. `calendar` and
+    /// `availability` are one endpoint each, bound twice (they were two).
+    #[test]
+    fn the_registry_is_harvested_from_the_one_constructor_list() {
+        let (root, harvest) = default_root();
+        assert!(harvest.unreached.is_empty(), "{:?}", harvest.unreached);
+        let mut doors = Vec::new();
+        fn walk(node: &Topology, doors: &mut Vec<Door>) {
+            if let SpaceKind::EndpointSpace { doors: here } = &node.kind {
+                doors.extend(here.iter().cloned());
+            }
+            for child in &node.children {
+                walk(child, doors);
+            }
+        }
+        walk(&root.topology(), &mut doors);
+        for door in &doors {
+            let registered = harvest.registry.get(&door.endpoint).is_some();
+            let ambiguous = harvest.ambiguous.contains_key(&door.endpoint);
+            assert!(registered ^ ambiguous, "{door:?}");
+        }
+        // On every machine: two jails under `file`, and two clones each under `meeting` and
+        // `org-agenda`. (`llm-*` join them wherever llm.json declares a second provider.)
+        for name in ["file", "meeting", "org-agenda"] {
+            assert!(
+                harvest.ambiguous.contains_key(name),
+                "{name}: {:?}",
+                harvest.ambiguous
+            );
+        }
+        for name in ["calendar", "availability"] {
+            assert!(
+                harvest.registry.get(name).is_some(),
+                "{name} is one endpoint"
+            );
+        }
+    }
+
+    /// The dump as it stands names `file`, and the refusal says why in the host's words.
+    #[test]
+    fn the_whole_dump_is_refused_on_a_name_that_cannot_say_which() {
+        let (root, harvest) = default_root();
+        let Err(refused) = arrangement::arrange(&harvest, &dumped(&root)) else {
+            panic!("`file` names two endpoints; the dump must not build")
+        };
+        assert!(
+            refused.contains("different endpoints in this host"),
+            "{refused}"
+        );
+    }
+
+    /// ★ THE ROUND TRIP. The declarable part of the dumped arrangement, built over the harvested
+    /// registry, is a fixpoint of the topology and answers every listed name exactly as the
+    /// built-in root does — same endpoint (by identity), bindings, canonical, answerer, and the
+    /// same description or the same kind of refusal from a kernel — except the dropped doors,
+    /// which it no longer answers.
+    #[test]
+    fn the_dumped_root_answers_every_name_the_same() {
+        let (root, harvest) = default_root();
+        let (declaration, dropped) = declarable(&root, &harvest);
+        let built =
+            arrangement::arrange(&harvest, &declaration).expect("the declarable part builds");
+        assert_eq!(built.topology(), declaration, "a fixpoint");
+        let names = names(&root);
+        let mut expected: Vec<String> = dropped
+            .into_iter()
+            .filter(|name| names.contains(name))
+            .collect();
+        expected.sort();
+        expected.dedup();
+        assert!(!expected.is_empty());
+        assert_eq!(differing(&root, &built, &names), expected);
+        for name in &expected {
+            assert_eq!(
+                answer(built.as_ref(), name),
+                None,
+                "{name} is no longer bound"
+            );
+        }
+    }
+
+    /// A declaration that REORDERS two layers answers differently, where the layers overlap:
+    /// the calendar's period grammar ahead of its config door swallows `…:calendar:config`.
+    #[test]
+    fn reordering_two_layers_changes_the_answer() {
+        let (root, harvest) = default_root();
+        let (declaration, _) = declarable(&root, &harvest);
+        let period = vec![door(&declaration, "urn:personal:calendar:{period}").unwrap()];
+        let config = vec![door(&declaration, "urn:personal:calendar:config").unwrap()];
+        let layer = |doors: Vec<Door>| Topology::new(SpaceKind::EndpointSpace { doors });
+        let narrow_first = Topology::new(SpaceKind::Fallback)
+            .child(layer(config.clone()))
+            .child(layer(period.clone()));
+        let wide_first = Topology::new(SpaceKind::Fallback)
+            .child(layer(period))
+            .child(layer(config));
+        let narrow = arrangement::arrange(&harvest, &narrow_first).unwrap();
+        let wide = arrangement::arrange(&harvest, &wide_first).unwrap();
+        let name = "urn:personal:calendar:config";
+        let by = |space: &Arc<dyn Space>| answer(space.as_ref(), name).map(|a| (a.1, a.2));
+        assert_eq!(by(&narrow), Some(("calendar-config".to_string(), vec![])));
+        assert_eq!(
+            by(&wide),
+            Some((
+                "calendar".to_string(),
+                vec![("period".to_string(), "config".to_string())]
+            ))
+        );
+    }
+
+    /// The same overlap inside the dumped root: swap the two calendar doors in the declaration
+    /// and exactly one name, of every name the root lists, answers differently.
+    #[test]
+    fn reordering_two_doors_of_the_dump_changes_exactly_that_answer() {
+        let (root, harvest) = default_root();
+        let (mut declaration, _) = declarable(&root, &harvest);
+        fn swap(node: &mut Topology) -> bool {
+            if let SpaceKind::EndpointSpace { doors } = &mut node.kind {
+                let at = |p: &str| doors.iter().position(|d| d.pattern == p);
+                if let (Some(a), Some(b)) = (
+                    at("urn:personal:calendar:config"),
+                    at("urn:personal:calendar:{period}"),
+                ) {
+                    doors.swap(a, b);
+                    return true;
+                }
+            }
+            node.children.iter_mut().any(swap)
+        }
+        assert!(swap(&mut declaration));
+        let built = arrangement::arrange(&harvest, &declaration).unwrap();
+        let (unswapped, _) = declarable(&root, &harvest);
+        let baseline = arrangement::arrange(&harvest, &unswapped).unwrap();
+        assert_eq!(
+            differing(&baseline, &built, &names(&root)),
+            vec!["urn:personal:calendar:config".to_string()]
+        );
+    }
+
+    /// A declaration that DROPS a door answers everything else the same, and that name not at
+    /// all — the kernel refuses it as a name bound nowhere.
+    #[test]
+    fn dropping_a_door_unbinds_exactly_that_name() {
+        let (root, harvest) = default_root();
+        let (declaration, _) = declarable(&root, &harvest);
+        let mut without = declaration.clone();
+        retain_doors(&mut without, &|door| door.pattern != "urn:host:info");
+        let baseline = arrangement::arrange(&harvest, &declaration).unwrap();
+        let built = arrangement::arrange(&harvest, &without).unwrap();
+        assert_eq!(
+            differing(&baseline, &built, &names(&root)),
+            vec!["urn:host:info".to_string()]
+        );
+        let said = told(&built, &["urn:host:info".to_string()]);
+        assert_eq!(
+            said[0].1,
+            Err(std::mem::discriminant(&Error::Unresolved(
+                Iri::parse("urn:host:info").unwrap()
+            )))
+        );
+    }
+
+    /// `urn:iki:host:arrangement` answers, from a real kernel, the arrangement its root was
+    /// built from — and nothing the host layers around it.
+    #[test]
+    fn the_host_answers_its_arrangement_as_a_declaration() {
+        let kernel = kernel();
+        let request = Request::new(Verb::Source, Iri::parse(arrangement::RESOURCE).unwrap());
+        let turtle = block_on(kernel.issue(request, &Capability::root())).unwrap();
+        let turtle = String::from_utf8(turtle.bytes).unwrap();
+        let (root, _) = default_root();
+        assert_eq!(Topology::from_turtle(&turtle).unwrap(), root.topology());
+        assert!(turtle.contains("the built-in default"), "{turtle}");
+        // The host's own layers are around the arrangement, not in it.
+        let arranged = Topology::from_turtle(&turtle).unwrap();
+        for layer in [arrangement::RESOURCE, "urn:runbook:timer"] {
+            assert_eq!(door(&arranged, layer), None, "{layer} is a host layer");
+        }
     }
 }

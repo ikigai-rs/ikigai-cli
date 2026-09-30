@@ -29,7 +29,11 @@ default = []
 store = ["dep:ikigai-store", "dep:ikigai-ledger"]
 
 [dependencies]
-ikigai-core = { workspace = true }
+# `declare` = `Topology::from_turtle`: this host reads a declared arrangement for its local root
+# (`--arrangement`, `arrangement = …`; ledger #637). Enabled HERE only, in the native host crate
+# that reads one — a wasm face (`ikigai-engine`'s wasm job) never selects this crate, so it never
+# pulls the parser; one that did would need `--cfg getrandom_backend="wasm_js"` (see core's manifest).
+ikigai-core = { workspace = true, features = ["declare"] }
 # `clock_gettime` on the two clock pairs that measure machine sleep (see `HostSleepClock`).
 libc = { workspace = true }
 ikigai-vocab = { workspace = true }

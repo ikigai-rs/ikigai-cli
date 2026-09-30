@@ -409,6 +409,36 @@ $ ikigai -c 'source urn:test:items .. urn:llm:ask'
 and `urn:kernel:scheduler` carries `routing` (`by-width`/`off`) and `routing.by`
 (`flag`/`config`/`default`) beside the width itself.
 
+## The local root as a declared arrangement
+
+The local kernel's root — which spaces are consulted, in what order, with which doors bound to
+which endpoints — is an **arrangement**, and the host can run one from a file instead of the
+built-in one. The file is a **declaration**: the same `ik:` graph `urn:kernel:topology` writes,
+read back in. It arranges the endpoints the host already has, by name, and never creates one.
+
+```bash
+ikigai -c 'source urn:iki:host:arrangement' > root.ttl   # what the host runs today, as a declaration
+ikigai --arrangement root.ttl                           # edit it, then start from it
+```
+
+```toml
+# ~/.config/ikigai/config.toml
+arrangement = "root.ttl"                  # relative to the config home
+daemon.arrangement = "daemon-root.ttl"    # instance-scoped
+```
+
+**Precedence: flag > `<instance>.arrangement` > `arrangement` > the built-in arrangement.** It
+applies to the REPL, `-c`, `--daemon`, `mcp` and `serve <socket>`; the served doors (`serve
+quic://…`, `serve --http`) never read it, and refuse the flag. The alias table, config-home mounts
+and the demo runbook stay layered around the declared root. A declaration that is missing,
+malformed or does not build **stops the start** with the reason, naming the node — never a quiet
+fall back to the default.
+
+⚠ The built-in root's own dump does not start as it stands: `file`, `meeting` and `org-agenda` (and
+the `llm-*` backends, with two or more providers) each name two different endpoints, so a door
+naming one cannot say which, and the host refuses it. The dump marks them in its header. See
+[`docs/declared-arrangement.md`](docs/declared-arrangement.md).
+
 ## The consolidated calendar (the embedded host's standing job)
 
 The embedded host wires the [`ikigai-personal`](https://github.com/ikigai-rs/ikigai-personal)

@@ -3037,15 +3037,18 @@ dependencies = [
 
 [[package]]
 name = "ikigai-core"
-version = "0.1.82"
+version = "0.1.83"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a5e0a5fe4e7252dab57affab137b3bb19dd972c345ab18106d3dca8c9a6a09b"
+checksum = "fe678ab31895914e348e6163432905c239fb7bc23a6da12a6b0506a8f15008ce"
 dependencies = [
  "async-trait",
  "blake3",
  "futures-channel",
  "futures-util",
+ "getrandom 0.3.4",
  "oxiri 0.2.11",
+ "oxrdf",
+ "oxttl",
  "serde",
 ]
 
@@ -3571,9 +3574,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-vocab"
-version = "0.1.78"
+version = "0.1.83"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0167a6a14c5adce4a01cad23c2ce29fdc6b3617673886bff057cc8f6b9f8dfbd"
+checksum = "4227c61d509c568fe99cec3563b71e4b49314a98ca23cbff00ae0560d2e2a956"
 dependencies = [
  "ikigai-core",
  "serde_json",

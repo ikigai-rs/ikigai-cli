@@ -108,6 +108,7 @@ const OWN: &[(&str, &str)] = &[
     ("decisions", "ikigai-embedded"),
     ("foaf", "ikigai-embedded"),
     ("greeter", "ikigai-embedded"),
+    ("host-arrangement", "ikigai-embedded"),
     ("host-demo", "ikigai-embedded"),
     ("host-heartbeat", "ikigai-embedded"),
     ("host-history", "ikigai-embedded"),

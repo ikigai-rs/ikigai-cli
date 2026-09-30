@@ -101,7 +101,11 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 [workspace.dependencies]
 # The released kernel, consumed from crates.io. For local cross-repo development
 # against a sibling checkout, use .cargo/config.toml (see .cargo/config.toml.example).
-ikigai-core = "0.1.82" # 0.1.82 = cut listeners (`Kernel::listen`, `ListenSpec`, `CutListener`,
+ikigai-core = "0.1.83" # 0.1.83 = spaces as data: `build`, `Registry` and (feature `declare`)
+# `Topology::from_turtle`. `ikigai-embedded` builds the local root from a declaration with them, so
+# below 0.1.83 that crate does not compile (ledger #637).
+# Beneath it, and each called:
+# 0.1.82 = cut listeners (`Kernel::listen`, `ListenSpec`, `CutListener`,
 # `CAP_LISTEN`): `ikigai-web`'s server push registers one per open event stream, so below 0.1.82
 # that crate does not compile (ledger #618).
 # Beneath it, and each called:
@@ -145,7 +149,12 @@ ikigai-core = "0.1.82" # 0.1.82 = cut listeners (`Kernel::listen`, `ListenSpec`,
 # holds beneath it: below that a MOUNTED template row whose local name-guess collides with a
 # shorter sibling is dropped from the manifold, so `ikigai mcp` silently stops projecting
 # browse-pr-explain and browse-pr-review.
-ikigai-vocab = "0.1.78" # 0.1.78 = the TOPOLOGY terms (`ik:Limit`, `ik:family`, `ik:Mount`, …),
+ikigai-vocab = "0.1.83" # 0.1.83 = the DOOR terms (`ik:Door`, `ik:doors`, `ik:endpointName`,
+# `ik:matchKind`) that `urn:iki:host:arrangement` serves, since it answers the root's topology
+# as a declaration (ledger #637). `embedded/tests/conformance.rs` checks every served term
+# against this crate's vocabulary, so below 0.1.83 that resource reads as inventing four terms.
+# Beneath it, and each called:
+# 0.1.78 = the TOPOLOGY terms (`ik:Limit`, `ik:family`, `ik:Mount`, …),
 # and the floor for the same reason 0.1.70 was below: it is what this repo's tests validate
 # against. `embedded/tests/conformance.rs` pins the posture graph's undefined terms EXACTLY, and
 # 0.1.78 defining `ik:Mount` took that list from sixteen to fifteen — for a different meaning
