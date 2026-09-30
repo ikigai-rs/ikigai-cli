@@ -63,6 +63,13 @@ usage:
                                `scheduler = \"pool:N\"` in the config home (instance-scoped as
                                <name>.scheduler); IKIGAI_SCHEDULER still works, deprecated.
                                `source urn:kernel:scheduler` reports the width AND the channel
+  ikigai --arrangement <file>  build the LOCAL kernel's root from a declared arrangement (Turtle in
+                               the ik: vocabulary urn:kernel:topology writes) instead of the built-in
+                               one. Also `arrangement = \"<file>\"` in the config home (relative to it;
+                               instance-scoped as <name>.arrangement). `source urn:iki:host:arrangement`
+                               dumps the running one to start from. REPL, -c, --daemon, mcp and
+                               serve <socket>; refused by the served doors and --connect. A file that
+                               is missing, malformed or does not build stops the start
   ikigai --width-routing <on|off>
                                route a fan-out by the width it ACHIEVES: at 2+ concurrent
                                requests, append needs=batchAt<=W for targets that read it
@@ -456,6 +463,61 @@ fn width_routing_flag(arg: &str, argv: &mut impl Iterator<Item = String>) -> Res
     Ok(true)
 }
 
+/// If `arg` is `--arrangement`, consume its path and declare it for this process: the local
+/// kernel's root is then built from that declaration instead of the built-in arrangement
+/// (ledger #637). The file is not read here — [`arm_local_root`] reads it once a mode that
+/// builds a local root is known — so a door that builds none can refuse the flag by name
+/// instead of silently ignoring it.
+fn arrangement_flag(arg: &str, argv: &mut impl Iterator<Item = String>) -> Result<bool, String> {
+    if arg != "--arrangement" {
+        return Ok(false);
+    }
+    let path = argv
+        .next()
+        .ok_or_else(|| "--arrangement needs <path>".to_string())?;
+    #[cfg(feature = "embedded")]
+    ikigai_embedded::arrangement::set_arrangement_path(path);
+    #[cfg(not(feature = "embedded"))]
+    let _ = path;
+    Ok(true)
+}
+
+/// Read the declared arrangement for the local root, if `--arrangement` or the config home's
+/// `arrangement` key names one, before the first local kernel is built. **Fail loud**: a
+/// declaration that is named and cannot be read or parsed stops the start with its message —
+/// never a fall back to the built-in root, which an operator who asked for a declaration could
+/// not tell apart from the one they asked for. (A declaration that parses and does not BUILD
+/// stops the process where the root is built, with core's message naming the node.)
+#[cfg(feature = "embedded")]
+fn arm_local_root() {
+    // Success says nothing here: the root is not built yet, and the line that says it was
+    // arranged from the declaration is printed where it is (see `root_space_with_mounts`).
+    match ikigai_embedded::arrangement::arm() {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("ikigai: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Refuse `--arrangement` on a door that builds no local root: the served postures are
+/// minimal by design and a declaration must never widen one, and `--connect` resolves on
+/// another kernel. Ignoring the flag there would be the silent fall back [`arm_local_root`]
+/// exists to prevent. (The config home's `arrangement` key is simply not read by these doors:
+/// it names the local root, and they do not build one.)
+#[cfg(feature = "embedded")]
+fn refuse_arrangement_flag(door: &str) {
+    if let Some(path) = ikigai_embedded::arrangement::arrangement_flag() {
+        eprintln!(
+            "ikigai: --arrangement `{}` declares the LOCAL kernel's root, and {door} does not \
+             build one",
+            path.display()
+        );
+        std::process::exit(2);
+    }
+}
+
 /// `-V` / `--version` appearing anywhere in argv.
 ///
 /// The scan is exact-token and unconditional — it does not know which flags take a
@@ -573,7 +635,10 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 }
                 continue;
             }
-            if scheduler_flag(&arg, &mut argv)? || width_routing_flag(&arg, &mut argv)? {
+            if scheduler_flag(&arg, &mut argv)?
+                || width_routing_flag(&arg, &mut argv)?
+                || arrangement_flag(&arg, &mut argv)?
+            {
                 continue;
             }
             if arg == "--announce" {
@@ -767,7 +832,10 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 });
                 continue;
             }
-            if scheduler_flag(&arg, &mut argv)? || width_routing_flag(&arg, &mut argv)? {
+            if scheduler_flag(&arg, &mut argv)?
+                || width_routing_flag(&arg, &mut argv)?
+                || arrangement_flag(&arg, &mut argv)?
+            {
                 continue;
             }
             match arg.as_str() {
@@ -807,7 +875,10 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
         if cert_flag(&arg, &mut argv, cert_target)? {
             continue;
         }
-        if scheduler_flag(&arg, &mut argv)? || width_routing_flag(&arg, &mut argv)? {
+        if scheduler_flag(&arg, &mut argv)?
+            || width_routing_flag(&arg, &mut argv)?
+            || arrangement_flag(&arg, &mut argv)?
+        {
             continue;
         }
         match arg.as_str() {
@@ -968,12 +1039,18 @@ fn main() {
         // question "which build am I on?" is asked precisely when the host is
         // suspect, so answering it must not depend on the host working.
         Mode::Version => println!("{VERSION_LINE}"),
-        Mode::Daemon { mounts } => daemon(mounts),
+        Mode::Daemon { mounts } => {
+            arm_local_root();
+            daemon(mounts)
+        }
         Mode::Mcp {
             grants,
             scopes,
             mounts,
-        } => mcp(grants, scopes, mounts),
+        } => {
+            arm_local_root();
+            mcp(grants, scopes, mounts)
+        }
         Mode::CertGenerate { force, dir } => cert_generate(force, dir),
         Mode::CertAddClient {
             name,
@@ -995,29 +1072,45 @@ fn main() {
             push,
         } => match (http, target.as_deref()) {
             // The inbound HTTP face takes precedence over IPC/QUIC when `--http` is given.
-            (Some(bind), _) => serve_http(HttpDoor {
-                bind: &bind,
-                caps: &caps,
-                trust_proxy,
-                cors_origins: &cors_origins,
-                routes: routes.as_deref(),
-                routes_only,
-                max_body,
-                push,
-                mounts,
-            }),
-            (None, Some(t)) if is_quic(t) => serve_quic(t, &certs, &caps, announce, mounts),
+            (Some(bind), _) => {
+                refuse_arrangement_flag("the HTTP door (`serve --http`), a served posture,");
+                serve_http(HttpDoor {
+                    bind: &bind,
+                    caps: &caps,
+                    trust_proxy,
+                    cors_origins: &cors_origins,
+                    routes: routes.as_deref(),
+                    routes_only,
+                    max_body,
+                    push,
+                    mounts,
+                })
+            }
+            (None, Some(t)) if is_quic(t) => {
+                refuse_arrangement_flag("a QUIC door (`serve quic://…`), a served posture,");
+                serve_quic(t, &certs, &caps, announce, mounts)
+            }
             (None, _) if !caps.is_empty() => {
                 eprintln!("ikigai: --cap sets a per-connection ceiling and needs a quic:// target");
                 std::process::exit(2);
             }
-            (None, _) => serve_ipc(target, mounts),
+            // The trusted IPC surface IS the local root (`trusted_kernel_with_mounts`), so a
+            // declaration arranges it exactly as it arranges the REPL's.
+            (None, _) => {
+                arm_local_root();
+                serve_ipc(target, mounts)
+            }
         },
         Mode::Repl(args) => {
             // `--demo` seeds the runtime demo flag; `demo on`/`off` (→ urn:host:demo)
             // toggles it thereafter. The runbook is gated on it, off by default.
             if args.demo {
                 ikigai_embedded::demo_flag().store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            if args.connect.is_some() {
+                refuse_arrangement_flag("`--connect`, which resolves on another kernel,");
+            } else {
+                arm_local_root();
             }
             let (engine, topology) =
                 build_engine(args.connect, args.mounts, &args.certs, args.react).unwrap_or_else(
