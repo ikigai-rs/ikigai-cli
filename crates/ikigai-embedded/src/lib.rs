@@ -2882,6 +2882,12 @@ struct HealthContext {
     /// Whether the job registry could measure machine sleep. When it cannot, a late job
     /// may only have been asleep, and the report says so rather than implying it checked.
     sleep_measured: bool,
+    /// Every reactive space in the workspace with what sits in its `error/` stage. Any dead
+    /// letter makes the verdict FAILING (ledger #638: every booking dead-lettered for eight
+    /// days and the heartbeat said `ok` throughout).
+    dead_letters: Vec<ikigai_intray::SpaceDeadLetters>,
+    /// The wall clock the dead letters' ages are measured against.
+    wall: std::time::SystemTime,
 }
 
 impl HealthContext {
@@ -2889,8 +2895,97 @@ impl HealthContext {
         HealthContext {
             uptime: process_uptime(),
             sleep_measured: time_registry().measures_sleep(),
+            dead_letters: ikigai_intray::dead_letters(&file_root().join("spaces")),
+            wall: dead_letter_wall_clock(),
         }
     }
+
+    /// How many tuples are dead-lettered across every reactive space.
+    fn dead_letter_count(&self) -> usize {
+        self.dead_letters.iter().map(|s| s.count).sum()
+    }
+}
+
+// Native-only, like the rest of the heartbeat: a dead letter's age is measured against a
+// FILE's modification time, which is a `SystemTime` from the filesystem, so the comparable
+// clock is the wall clock rather than the injected kernel Clock (this context has no kernel).
+// A dedicated fn because the call is a trailing expression, and an attribute on an expression
+// is not stable.
+#[allow(clippy::disallowed_methods)]
+fn dead_letter_wall_clock() -> std::time::SystemTime {
+    std::time::SystemTime::now()
+}
+
+/// A health verdict's word: STALE outranks FAILING, and FAILING is any job failing
+/// [`STALE_CADENCES`] runs in a row OR any dead letter in a reactive space.
+fn health_verdict(stale: usize, failing: usize, dead_letters: usize) -> &'static str {
+    if stale > 0 {
+        "STALE"
+    } else if failing > 0 || dead_letters > 0 {
+        "FAILING"
+    } else {
+        "ok"
+    }
+}
+
+/// Collapse a reason onto one line: every run of whitespace, newlines included, becomes one
+/// space. A dead letter's `.err` note can span lines, and both the heartbeat and the daemon
+/// log are read a line at a time.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The daemon-log line for one dead letter, printed at the moment it happens:
+///
+/// ```text
+/// ikigai: dead letter: space=bookings tuple=<64 hex> reason=<the .err note, on one line>
+/// ```
+///
+/// (prefixed by the usual `YYYY-MM-DD HH:MM:SS` stamp). `space=` and `tuple=` never contain
+/// spaces, so everything after `reason=` is the reason.
+fn dead_letter_line(space: &str, tuple: &str, reason: &str) -> String {
+    format!(
+        "ikigai: dead letter: space={space} tuple={tuple} reason={}",
+        one_line(reason)
+    )
+}
+
+/// The heartbeat's reactive-spaces section: one status line per reactive space, and under a
+/// FAILING one a ten-space-indented line with the newest dead letter. Empty when the
+/// workspace has no reactive spaces.
+///
+/// The status line's shape is the job line's (`  STATUS  <IRI>  …`), so a watcher keys an
+/// episode on status + space IRI exactly as it keys a job on status + job IRI; the count sits
+/// after the IRI and the changing evidence (age, tuple, reason) on the continuation line.
+fn dead_letter_section(context: &HealthContext) -> String {
+    if context.dead_letters.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\nreactive spaces (a dead letter is a tuple its handler could not handle; any one counts against the verdict):\n",
+    );
+    for space in &context.dead_letters {
+        let status = if space.count > 0 { "FAILING" } else { "ok" };
+        out.push_str(&format!(
+            "  {:<7} {:<34} dead-letters {}\n",
+            status,
+            format!("urn:space:{}", space.space),
+            space.count
+        ));
+        if let Some(newest) = space.newest.as_ref().filter(|_| space.count > 0) {
+            let when = newest
+                .at
+                .and_then(|at| context.wall.duration_since(at).ok())
+                .map(|age| format!("{} ago", fmt_secs(age)))
+                .unwrap_or_else(|| "at an unknown time".to_string());
+            out.push_str(&format!(
+                "          newest {when}  ·  tuple {}  ·  {}\n",
+                newest.tuple,
+                one_line(&newest.reason)
+            ));
+        }
+    }
+    out
 }
 
 /// Is a recurring job overdue by more than [`STALE_CADENCES`] of its own interval, counted in
@@ -2949,18 +3044,20 @@ fn health_text(
         .count();
     // The verdict word leads the file, and `health-watch.sh` keys on `^STALE`: that word
     // keeps its meaning, and FAILING is only the verdict when nothing is stale.
-    let verdict = if stale > 0 {
-        "STALE"
-    } else if failing > 0 {
-        "FAILING"
-    } else {
-        "ok"
-    };
+    let dead = context.dead_letter_count();
+    let verdict = health_verdict(stale, failing, dead);
     let mut out = format!(
-        "{verdict}  ·  {} up  ·  {} job(s), {stale} stale, {failing} failing\n",
+        "{verdict}  ·  {} up  ·  {} job(s), {stale} stale, {failing} failing",
         fmt_secs(uptime),
         jobs.len(),
     );
+    if dead > 0 {
+        let spaces = context.dead_letters.iter().filter(|s| s.count > 0).count();
+        out.push_str(&format!(
+            "  ·  {dead} dead letter(s) in {spaces} reactive space(s)"
+        ));
+    }
+    out.push('\n');
     if !context.sleep_measured {
         out.push_str(
             "  (sleep not measurable here: lateness includes any time this machine was asleep)\n",
@@ -3004,6 +3101,7 @@ fn health_text(
             out.push_str(&format!("          {}\n", job.last_output));
         }
     }
+    out.push_str(&dead_letter_section(context));
     // Peers are INFORMATION. A travelling laptop is not a fault, so this section never
     // affects the verdict above.
     out.push_str("\npeers (not counted against health — an absent peer is normal):\n");
@@ -3040,13 +3138,10 @@ fn health_turtle(
     );
     out.push_str(&format!(
         "<urn:host:health> a ik:Health ;\n    ik:verdict \"{}\" ;\n    ik:uptimeSeconds {} ;\n    ik:staleJobs {stale} .\n\n",
-        if stale > 0 {
-            "stale"
-        } else if failing > 0 {
-            "failing"
-        } else {
-            "ok"
-        },
+        // The same verdict as the text face, dead letters included. The per-space counts are
+        // on the text face only: this node's undefined-term set is pinned by the conformance
+        // suite, and a new term belongs in the vocabulary first.
+        health_verdict(stale, failing, context.dead_letter_count()).to_lowercase(),
         uptime.as_secs()
     ));
     // Sleep evidence rides on each JOB (`ik:asleepSeconds`), never as a new term on this
@@ -4618,13 +4713,17 @@ fn space_reactor(
     resolver: Arc<dyn ikigai_resolve::Resolver>,
     authority_dir: Option<PathBuf>,
 ) -> ikigai_intray::SpaceReactor {
-    ikigai_intray::SpaceReactor::new(root, resolver, tuplespace_verbs()).with_host_authority(
-        move |space| {
+    ikigai_intray::SpaceReactor::new(root, resolver, tuplespace_verbs())
+        .with_host_authority(move |space| {
             authority_dir
                 .as_deref()
                 .and_then(|dir| host_space_authority(dir, space))
-        },
-    )
+        })
+        // Loud at the moment it happens, so the daemon log shows it (ledger #638). The
+        // heartbeat reports the standing count; this is the event.
+        .on_dead_letter(|space, tuple, reason| {
+            eprintln!("{} {}", stamp(), dead_letter_line(space, tuple, reason));
+        })
 }
 
 /// One start-up line per space whose `cap` file the host reactor will NOT read, naming the
@@ -6754,6 +6853,8 @@ mod tests {
         HealthContext {
             uptime: std::time::Duration::from_secs(uptime_secs),
             sleep_measured,
+            dead_letters: Vec::new(),
+            wall: std::time::SystemTime::UNIX_EPOCH,
         }
     }
 
@@ -8371,5 +8472,98 @@ mod space_authority_tests {
         std::fs::write(authority.join("jobs"), "urn:cap:lisp\n").unwrap();
         let lines = inert_cap_file_lines(&reactor, &spaces, Some(&authority));
         assert!(lines[0].contains("present"), "{}", lines[0]);
+    }
+}
+
+/// A dead letter is loud (ledger #638): the heartbeat reports each reactive space, and the
+/// verdict fails on any dead letter. The shapes here are what `health-watch.sh` parses.
+#[cfg(test)]
+mod dead_letter_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    fn context_with(spaces: Vec<ikigai_intray::SpaceDeadLetters>) -> HealthContext {
+        HealthContext {
+            uptime: Duration::from_secs(3600),
+            sleep_measured: true,
+            dead_letters: spaces,
+            wall: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000),
+        }
+    }
+
+    fn bookings(count: usize) -> ikigai_intray::SpaceDeadLetters {
+        ikigai_intray::SpaceDeadLetters {
+            space: "bookings".to_string(),
+            count,
+            newest: (count > 0).then(|| ikigai_intray::DeadLetter {
+                tuple: "ab12".to_string(),
+                reason: "denied: capability does not grant `urn:cap:lisp`\n(declared by `urn:booking:handle`)\n".to_string(),
+                at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 - 7_380)),
+            }),
+        }
+    }
+
+    fn quiet(name: &str) -> ikigai_intray::SpaceDeadLetters {
+        ikigai_intray::SpaceDeadLetters {
+            space: name.to_string(),
+            count: 0,
+            newest: None,
+        }
+    }
+
+    /// ★ The exact heartbeat lines, pinned: the verdict word, the summary tail, one status line
+    /// per reactive space, and the newest dead letter on a ten-space-indented continuation.
+    #[test]
+    fn a_dead_letter_makes_the_heartbeat_fail_and_names_the_space() {
+        let text = health_text(&[], &[], &context_with(vec![bookings(3), quiet("jobs")]));
+        let first = text.lines().next().unwrap();
+        assert!(first.starts_with("FAILING  ·  "), "{text}");
+        assert!(
+            first.ends_with("  ·  3 dead letter(s) in 1 reactive space(s)"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "\n  FAILING urn:space:bookings                 dead-letters 3\n          newest 2h03m ago  ·  tuple ab12  ·  denied: capability does not grant `urn:cap:lisp` (declared by `urn:booking:handle`)\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("\n  ok      urn:space:jobs                     dead-letters 0\n"),
+            "{text}"
+        );
+        let turtle = health_turtle(&[], &[], &context_with(vec![bookings(3)]));
+        assert!(turtle.contains("ik:verdict \"failing\""), "{turtle}");
+    }
+
+    /// Nothing dead-lettered: the verdict and its first line are exactly what they were
+    /// before dead letters were counted, and each reactive space still says so.
+    #[test]
+    fn no_dead_letters_leaves_the_verdict_alone() {
+        let text = health_text(&[], &[], &context_with(vec![bookings(0)]));
+        let first = text.lines().next().unwrap();
+        assert!(first.starts_with("ok  ·  "), "{text}");
+        assert!(!first.contains("dead letter"), "{text}");
+        assert!(text.contains("  ok      urn:space:bookings"), "{text}");
+        let none = health_text(&[], &[], &context_with(Vec::new()));
+        assert!(!none.contains("reactive spaces"), "{none}");
+    }
+
+    /// STALE keeps its meaning and outranks FAILING, as it does for jobs.
+    #[test]
+    fn stale_still_outranks_a_dead_letter() {
+        assert_eq!(health_verdict(1, 0, 3), "STALE");
+        assert_eq!(health_verdict(0, 0, 3), "FAILING");
+        assert_eq!(health_verdict(0, 1, 0), "FAILING");
+        assert_eq!(health_verdict(0, 0, 0), "ok");
+    }
+
+    /// The daemon-log line, pinned: one line whatever the note spans.
+    #[test]
+    fn the_dead_letter_log_line_is_one_line() {
+        assert_eq!(
+            dead_letter_line("bookings", "ab12", "denied: no\n  lisp\n"),
+            "ikigai: dead letter: space=bookings tuple=ab12 reason=denied: no lisp"
+        );
     }
 }
