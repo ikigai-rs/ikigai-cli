@@ -4441,17 +4441,11 @@ fn build_watched(mounts: Vec<MountSpec>, reactive: bool) -> Arc<Kernel> {
     registry.set_resolver(Arc::clone(&kernel) as Arc<dyn ikigai_resolve::Resolver>);
     // The reactive tuplespace: watch file_root/spaces and fire each reactive space's handler
     // on a drop (inbox → outbox/error). Like the scheduler, it holds the kernel as a Resolver
-    // installed now that the kernel exists. Handlers run under a SCOPED processing authority —
-    // the tuplespace verbs only, so a handler can compose within the fabric (drop results,
-    // read/take from spaces) but not touch fs/net/exec — NEVER root, NEVER the dropper's cap.
+    // installed now that the kernel exists. What each handler runs under is decided by the
+    // HOST, per space, from `<config home>/space-authority/<space>` — see [`space_reactor`]
+    // for the whole rule and ledger #638 for the outage that made it necessary. NEVER root,
+    // NEVER the dropper's cap, and never a file in the tree a dropper writes into.
     // A space with no `handler` file is left alone, so this is safe over the whole tree.
-    //
-    // These three scopes are the CEILING, not a default: a space's `cap` file ATTENUATES this
-    // capability and can never widen past it (ledger #445 — until 2026-09-19 that file minted
-    // authority instead, so anything able to drop a tuple could also choose what it ran under).
-    // Granting a handler more than the tuplespace verbs is therefore a decision made HERE, in
-    // the host, or through `SpaceReactor::with_host_authority` — never by a file sitting in the
-    // same directory as the inbox.
     //
     // ONLY when this process is the designated worker. Before that was true, EVERY entry
     // point that built a local kernel — a one-shot `ikigai -c`, an open REPL, an MCP
@@ -4462,16 +4456,20 @@ fn build_watched(mounts: Vec<MountSpec>, reactive: bool) -> Arc<Kernel> {
     // claiming meant the daemon — the one process that could have handled it — never saw
     // it. A read-only query destroyed a booking.
     if reactive {
-        let reactor = Arc::new(ikigai_intray::SpaceReactor::new(
+        let authority_dir = space_authority_dir();
+        let reactor = space_reactor(
             file_root().join("spaces"),
             Arc::clone(&kernel) as Arc<dyn ikigai_resolve::Resolver>,
-            ikigai_core::Capability::scoped(vec![
-                ikigai_intray::CAP_OUT.to_string(),
-                ikigai_intray::CAP_READ.to_string(),
-                ikigai_intray::CAP_TAKE.to_string(),
-            ]),
-        ));
-        reactor.watch();
+            authority_dir.clone(),
+        );
+        for line in inert_cap_file_lines(
+            &reactor,
+            &file_root().join("spaces"),
+            authority_dir.as_deref(),
+        ) {
+            eprintln!("{} {line}", stamp());
+        }
+        Arc::new(reactor).watch();
     }
     // ★ Every host job below NAMES the authority it fires under (ledger #79). A job fires
     // under exactly the capability passed here, so each one states what it resolves — see
@@ -4529,6 +4527,140 @@ fn build_watched(mounts: Vec<MountSpec>, reactive: bool) -> Arc<Kernel> {
         );
     }
     kernel
+}
+
+/// Where the host keeps each reactive space's handler authority:
+/// `<config home>/space-authority/`, one file per space, named for the space.
+///
+/// ★ In the CONFIG home, never the workspace. A space's own directory holds the `inbox` a
+/// dropper writes into, so anything stored beside it is only as trustworthy as the least
+/// trusted dropper (ledger #445); the config home is the operator's. `None` when there is no
+/// config home at all, and then every space runs under [`tuplespace_verbs`].
+fn space_authority_dir() -> Option<PathBuf> {
+    config::config_home().map(|home| home.join(SPACE_AUTHORITY_DIR))
+}
+
+/// The directory name under the config home that holds per-space handler authority.
+const SPACE_AUTHORITY_DIR: &str = "space-authority";
+
+/// The default handler authority: the three tuplespace verbs, so a handler can compose within
+/// the fabric (drop results, read and take from spaces) and touch nothing else.
+fn tuplespace_verbs() -> ikigai_core::Capability {
+    ikigai_core::Capability::scoped(vec![
+        ikigai_intray::CAP_OUT.to_string(),
+        ikigai_intray::CAP_READ.to_string(),
+        ikigai_intray::CAP_TAKE.to_string(),
+    ])
+}
+
+/// Is `name` usable as ONE path segment? The reactor hands the host a space name, and the
+/// host turns it into a filename under [`space_authority_dir`]; a name that could climb out
+/// of that directory must never get that far. Space names come from directory entries today,
+/// which already cannot contain `/`, but that is a property of the caller: this check makes
+/// the non-escalation hold whatever produced the name.
+fn is_single_segment(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+}
+
+/// The HOST's answer to "what does this space's handler run under?", read FRESH from
+/// `<dir>/<space>` on every call — so an edit takes effect on the next tuple with no restart,
+/// exactly as the old in-tree `cap` file did.
+///
+/// The file is the `cap` format ([`ikigai_intray::parse_scopes`]: one scope IRI per line,
+/// blank lines and `#` comments ignored), and its scopes are MINTED as they stand: the host
+/// is the authority, which is the point of keeping the file out of the drop tree. `None`
+/// (no file, a file listing no scopes, an unreadable file, or a name that is not a single
+/// path segment) means "no host grant": the reactor falls back to [`tuplespace_verbs`].
+fn host_space_authority(dir: &Path, space: &str) -> Option<ikigai_core::Capability> {
+    if !is_single_segment(space) {
+        return None;
+    }
+    let path = dir.join(space);
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => {
+            let scopes = ikigai_intray::parse_scopes(&raw);
+            (!scopes.is_empty()).then(|| ikigai_core::Capability::scoped(scopes))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        // Present but unreadable is an operator's mistake worth a line: the handler is about
+        // to be denied, and the `.err` note will name a scope, not this file.
+        Err(e) => {
+            eprintln!(
+                "{} ikigai: space authority: cannot read {} ({e}); space `{space}` runs under the tuplespace verbs only",
+                stamp(),
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// The host's space reactor over `root`, firing handlers through `resolver`.
+///
+/// Every space's handler authority comes from the HOST ([`host_space_authority`] over
+/// `authority_dir`), never from the space tree: the reactor is built with
+/// [`SpaceReactor::with_host_authority`](ikigai_intray::SpaceReactor::with_host_authority),
+/// so it never reads a space's `cap` file at all. A space the host has no file for runs under
+/// [`tuplespace_verbs`].
+///
+/// ★ Ledger #638: PR #347 (ledger #445) correctly stopped a `cap` file from MINTING authority
+/// and made it attenuate this reactor's ceiling instead — but the ceiling was the three
+/// tuplespace verbs and nothing widened it for any space, so every handler that needed more
+/// (the bookings handler needs lisp, calendar, mail, secrets, net) was denied before it
+/// started. Every web booking dead-lettered for eight days and nothing said so.
+fn space_reactor(
+    root: PathBuf,
+    resolver: Arc<dyn ikigai_resolve::Resolver>,
+    authority_dir: Option<PathBuf>,
+) -> ikigai_intray::SpaceReactor {
+    ikigai_intray::SpaceReactor::new(root, resolver, tuplespace_verbs()).with_host_authority(
+        move |space| {
+            authority_dir
+                .as_deref()
+                .and_then(|dir| host_space_authority(dir, space))
+        },
+    )
+}
+
+/// One start-up line per space whose `cap` file the host reactor will NOT read, naming the
+/// space, the inert file, and where its scopes belong now. Not a refusal: refusing to start
+/// would take the writer daemon down on the deploy that fixes it.
+fn inert_cap_file_lines(
+    reactor: &ikigai_intray::SpaceReactor,
+    root: &Path,
+    authority_dir: Option<&Path>,
+) -> Vec<String> {
+    reactor
+        .ignored_cap_files()
+        .into_iter()
+        .map(|space| {
+            let inert = root.join(&space).join("cap");
+            match authority_dir {
+                Some(dir) => {
+                    let home = dir.join(&space);
+                    let state = if home.is_file() {
+                        "present, and it is what the handler runs under"
+                    } else {
+                        "ABSENT, so the handler runs under the tuplespace verbs only"
+                    };
+                    format!(
+                        "ikigai: space `{space}`: {} is INERT (the host decides handler authority); its scopes belong in {} ({state})",
+                        inert.display(),
+                        home.display()
+                    )
+                }
+                None => format!(
+                    "ikigai: space `{space}`: {} is INERT (the host decides handler authority), and there is no config home to hold {SPACE_AUTHORITY_DIR}/{space}: the handler runs under the tuplespace verbs only",
+                    inert.display()
+                ),
+            }
+        })
+        .collect()
 }
 
 /// The persistent jobs this host registers on its own time registry.
@@ -8036,5 +8168,208 @@ mod tests {
         );
         let turtle = source_as_root(&open, "urn:kernel:topology").expect("topology");
         assert!(!String::from_utf8_lossy(&turtle.bytes).contains(SERVED_PERSONAL_LIMIT));
+    }
+}
+
+/// The host's per-space handler authority (ledger #638), exercised through a REAL kernel: the
+/// denial that dead-lettered every booking is the kernel's own pre-flight on a declared scope,
+/// so a mock resolver could not have seen it.
+#[cfg(test)]
+mod space_authority_tests {
+    use super::*;
+    use futures::executor::block_on;
+    use ikigai_core::{Capability, Kernel, Request};
+
+    /// The scope the handler declares — beyond the three tuplespace verbs, like every scope
+    /// the bookings handler needs.
+    const BEYOND: &str = "urn:cap:test:beyond";
+
+    /// A handler that declares [`BEYOND`] and answers `ran` when it is allowed to run.
+    struct Beyond;
+
+    #[async_trait::async_trait]
+    impl Endpoint for Beyond {
+        async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                b"ran".to_vec(),
+            ))
+        }
+        fn name(&self) -> &str {
+            "beyond"
+        }
+        fn describe(&self) -> Description {
+            Description::new("beyond")
+                .summary("a handler needing more than the tuplespace verbs")
+                .verb(Verb::Source)
+                .action(
+                    ActionSpec::new(Verb::Source)
+                        .summary("answers `ran`")
+                        .output("text/plain")
+                        .requires(BEYOND),
+                )
+        }
+    }
+
+    /// A fresh scratch tree: `<tmp>/<name>/{spaces,config/space-authority}`, with one reactive
+    /// space `jobs` whose handler is `urn:test:beyond`.
+    fn scratch(name: &str) -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!(
+            "ikigai-space-authority-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let spaces = base.join("spaces");
+        let authority = base.join("config").join(SPACE_AUTHORITY_DIR);
+        std::fs::create_dir_all(spaces.join("jobs")).unwrap();
+        std::fs::create_dir_all(&authority).unwrap();
+        std::fs::write(spaces.join("jobs").join("handler"), "urn:test:beyond\n").unwrap();
+        (spaces, authority)
+    }
+
+    fn kernel_over(spaces: &Path) -> Arc<Kernel> {
+        Arc::new(Kernel::new(Arc::new(
+            ikigai_intray::space(spaces.to_path_buf()).bind(Exact::new("urn:test:beyond"), Beyond),
+        )))
+    }
+
+    /// Drop a tuple the way a stranger does: holding `out` and nothing else.
+    fn drop_tuple(kernel: &Kernel, content: &[u8]) -> String {
+        let dropped = block_on(
+            kernel.issue(
+                Request::new(Verb::Sink, Iri::parse("urn:space:jobs").unwrap())
+                    .with_arg("content", ArgRef::Inline(content.to_vec())),
+                &Capability::scoped(vec![ikigai_intray::CAP_OUT.to_string()]),
+            ),
+        )
+        .expect("a dropper holding `out` can drop");
+        String::from_utf8(dropped.bytes).unwrap()
+    }
+
+    /// ★ The regression test that would have caught ledger #638. Without a host-authority
+    /// file the handler is denied by name and the tuple dead-letters (today's behavior,
+    /// pinned); a `cap` file in the workspace naming the scope changes NOTHING; and once the
+    /// host's file grants the scope — written after the reactor was built, because the file
+    /// is read fresh per tuple — the handler runs and the tuple reaches `outbox`.
+    #[test]
+    fn a_handler_beyond_the_tuplespace_verbs_runs_only_under_a_host_grant() {
+        let (spaces, authority) = scratch("grant");
+        let kernel = kernel_over(&spaces);
+        // The dropper-writable file asks for the scope. It must not be what grants it.
+        std::fs::write(spaces.join("jobs").join("cap"), format!("{BEYOND}\n")).unwrap();
+        let reactor = space_reactor(
+            spaces.clone(),
+            Arc::clone(&kernel) as Arc<dyn ikigai_resolve::Resolver>,
+            Some(authority.clone()),
+        );
+
+        let first = drop_tuple(&kernel, b"first");
+        match reactor.process("jobs", &first) {
+            ikigai_intray::Outcome::Errored(why) => assert!(
+                why.contains(&format!("does not grant `{BEYOND}`")),
+                "the denial names the scope, as bug's `.err` notes do: {why}"
+            ),
+            other => panic!("with no host file the handler must be denied, got {other:?}"),
+        }
+        assert!(spaces
+            .join("jobs")
+            .join("error")
+            .join(format!("{first}.tuple"))
+            .is_file());
+
+        // The host grants it — no restart, no rebuild of the reactor.
+        std::fs::write(
+            authority.join("jobs"),
+            format!("# what the jobs handler may reach\n{BEYOND}\n"),
+        )
+        .unwrap();
+        let second = drop_tuple(&kernel, b"second");
+        assert_eq!(
+            reactor.process("jobs", &second),
+            ikigai_intray::Outcome::Handled
+        );
+        let outbox = spaces.join("jobs").join("outbox");
+        assert!(outbox.join(format!("{second}.tuple")).is_file());
+        assert_eq!(
+            std::fs::read_to_string(outbox.join(format!("{second}.out"))).unwrap(),
+            "ran"
+        );
+    }
+
+    /// Non-escalation, pinned at the level the brief states it: a scope named only in the
+    /// workspace `cap` file is NOT granted, a scope in the host file IS, and the host file
+    /// MINTS (it is not clamped to the tuplespace verbs).
+    #[test]
+    fn only_the_host_file_grants_and_it_grants_exactly_what_it_lists() {
+        let (spaces, authority) = scratch("exact");
+        std::fs::write(spaces.join("jobs").join("cap"), "urn:cap:from-cap-file\n").unwrap();
+        assert_eq!(
+            host_space_authority(&authority, "jobs"),
+            None,
+            "no host file"
+        );
+
+        std::fs::write(authority.join("jobs"), "urn:cap:from-host\n\n# note\n").unwrap();
+        let granted = host_space_authority(&authority, "jobs").expect("the host file grants");
+        assert!(granted.allows("urn:cap:from-host"));
+        assert!(!granted.allows("urn:cap:from-cap-file"));
+        assert!(!granted.is_root());
+        assert_eq!(granted.scopes().map(|s| s.len()), Some(1));
+
+        // A file listing no scopes is no grant — the default applies, not an empty authority.
+        std::fs::write(authority.join("jobs"), "# nothing yet\n\n").unwrap();
+        assert_eq!(host_space_authority(&authority, "jobs"), None);
+    }
+
+    /// A name that is not a single path segment never becomes a filename, so nothing a
+    /// dropper can influence selects a host file outside the authority directory — even when
+    /// the file it would reach exists and grants.
+    #[test]
+    fn a_space_name_cannot_climb_out_of_the_authority_directory() {
+        let (_spaces, authority) = scratch("climb");
+        let config = authority.parent().unwrap();
+        std::fs::write(config.join("grants"), "urn:cap:escaped\n").unwrap();
+        std::fs::create_dir_all(authority.join("nested")).unwrap();
+        std::fs::write(authority.join("nested").join("x"), "urn:cap:escaped\n").unwrap();
+
+        for name in ["../grants", "nested/x", "..", ".", "", "a\0b", "..\\grants"] {
+            assert_eq!(
+                host_space_authority(&authority, name),
+                None,
+                "`{name}` must not select a host file"
+            );
+        }
+        assert!(is_single_segment("bookings"));
+        assert!(
+            is_single_segment("..bookings"),
+            "a leading dot pair inside a name is fine"
+        );
+    }
+
+    /// A `cap` file the host reactor ignores is NAMED at start-up, with where it belongs.
+    #[test]
+    fn an_inert_cap_file_is_named_with_its_new_home() {
+        let (spaces, authority) = scratch("inert");
+        let kernel = kernel_over(&spaces);
+        std::fs::write(spaces.join("jobs").join("cap"), "urn:cap:lisp\n").unwrap();
+        let reactor = space_reactor(
+            spaces.clone(),
+            kernel as Arc<dyn ikigai_resolve::Resolver>,
+            Some(authority.clone()),
+        );
+        let lines = inert_cap_file_lines(&reactor, &spaces, Some(&authority));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].starts_with("ikigai: space `jobs`: "),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[0].contains(&spaces.join("jobs").join("cap").display().to_string()));
+        assert!(lines[0].contains(&authority.join("jobs").display().to_string()));
+        assert!(lines[0].contains("ABSENT"), "{}", lines[0]);
+
+        std::fs::write(authority.join("jobs"), "urn:cap:lisp\n").unwrap();
+        let lines = inert_cap_file_lines(&reactor, &spaces, Some(&authority));
+        assert!(lines[0].contains("present"), "{}", lines[0]);
     }
 }
