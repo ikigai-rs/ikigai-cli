@@ -2679,14 +2679,23 @@ fn safe_elisp_param(name: &str) -> String {
 }
 
 fn first_line(text: &str) -> String {
-    // ESCAPE transclusion markers. An endpoint's summary can contain one literally —
-    // `urn:iki:fn:compose` documents itself with `$a{<iri>}` — and the moment that text lands
-    // in a generated comment, composing the prelude tries to expand the EXAMPLE inside its
-    // own documentation ("bad IRI in marker `<iri>`"). `$$a{…}` is compose's literal form.
+    // ESCAPE compose markers. An endpoint's summary can contain one literally —
+    // `urn:iki:fn:compose` documents itself with `$a{<iri>}`, `$r{<iri>}` and `$h{<iri>}` — and
+    // the moment that text lands in a generated comment, composing the prelude tries to expand
+    // the EXAMPLE inside its own documentation ("bad IRI in marker `<iri>`"). `$$a{…}` is
+    // compose's literal form.
     escape_markers(text.lines().next().unwrap_or("").trim())
 }
 
-/// Normalize any run of `$` before `a{` to exactly `$$a{` — compose's literal form.
+/// The letters that open a compose marker: `$a{…}` (transclude), and since ikigai-fn 0.3.0
+/// `$r{…}` (raw) and `$h{…}` (HTML-escaped). A marker letter compose learns later and this
+/// list does not is the failure this list exists for: fn 0.3.0 added two, compose's own
+/// summary spelled both, and the generated alias prelude stopped composing until they were
+/// added here.
+const MARKER_LETTERS: [char; 3] = ['a', 'r', 'h'];
+
+/// Normalize any run of `$` before a marker (`a{`, `r{`, `h{`) to exactly `$$` — compose's
+/// literal form.
 ///
 /// Idempotent on purpose. A plain `.replace("$a{", "$$a{")` also rewrites the ALREADY
 /// escaped `$$a{…}` that appears in the same sentence of compose's own summary, yielding
@@ -2702,7 +2711,9 @@ fn escape_markers(text: &str) -> String {
             while j < bytes.len() && bytes[j] == '$' {
                 j += 1;
             }
-            if bytes[j..].starts_with(&['a', '{']) {
+            if bytes.get(j + 1) == Some(&'{')
+                && bytes.get(j).is_some_and(|c| MARKER_LETTERS.contains(c))
+            {
                 out.push_str("$$");
                 i = j;
                 continue;
@@ -4170,6 +4181,12 @@ fn root_members() -> Vec<Arc<dyn Space>> {
         // application/sparql-query): pipe an s-expr query in, feed the emitted SPARQL to
         // urn:sparql:select. A pure transreptor (no lisp engine); safe in the shared space.
         Arc::new(ikigai_sexpr::space()) as Arc<dyn Space>,
+        // A kernel's arrangement as a picture (urn:diagram:kernel — needs
+        // `urn:cap:kernel:inspect`, as urn:kernel:topology does — and urn:diagram:arrangement
+        // of=<iri>, under the caller's own capability). LOCAL root only, never in a served
+        // posture: the served kernels are minimal by design, and the picture of this host's
+        // arrangement is the local operator's business, as `urn:iki:host:arrangement` is.
+        Arc::new(ikigai_diagram::space()) as Arc<dyn Space>,
         // Signing + verification (urn:sign:sign — cap-gated `urn:cap:sign` — and
         // urn:sign:verify): sign any representation, verify it later; a signature is
         // an RDF graph, keys are kernel-resolved resources (urn:file:*, urn:secret:*).
@@ -6643,6 +6660,14 @@ mod tests {
         assert_eq!(escape_markers("literal is $$a{…}"), "literal is $$a{…}");
         assert_eq!(escape_markers("$$$a{x}"), "$$a{x}");
         assert_eq!(escape_markers("a $5 cost"), "a $5 cost");
+        // ikigai-fn 0.3.0's two new marker letters, as its own summary spells them.
+        assert_eq!(
+            escape_markers("`$r{<iri>}` raw, `$h{<iri> || <fallback>}` escaped"),
+            "`$$r{<iri>}` raw, `$$h{<iri> || <fallback>}` escaped"
+        );
+        assert_eq!(escape_markers("$$h{x} and $$$r{y}"), "$$h{x} and $$r{y}");
+        // Not a marker letter, and a `$` at the very end.
+        assert_eq!(escape_markers("$b{x} costs $"), "$b{x} costs $");
     }
 
     fn candidate(id: &str, iri: &str, verb: &str) -> SelectCandidate {
@@ -7694,6 +7719,25 @@ mod tests {
         assert!(text.contains("Hi, World"));
         // the escaped marker survives unexpanded
         assert!(text.contains("$a{urn:iki:fn:toUpper?in=x}"));
+    }
+
+    /// The alias demo composes: its `$a{urn:lisp:aliases}` splices a prelude whose comments
+    /// carry every endpoint's summary, compose's own among them — and compose's summary SPELLS
+    /// its markers. ikigai-fn 0.3.0 added `$r{…}` and `$h{…}` to that sentence, and with only
+    /// `$a{` escaped the prelude stopped composing ("bad IRI in marker `<iri>`"), so the
+    /// runbook's Lisp tab failed. This is the end-to-end check `escape_markers`' unit test is
+    /// not: it follows whatever compose's summary says next.
+    #[test]
+    fn the_alias_demo_composes_over_compose_documenting_itself() {
+        let kernel = kernel();
+        let request = Request::new(Verb::Source, Iri::parse("urn:iki:fn:compose").unwrap())
+            .with_arg("src", ArgRef::Inline(b"urn:data:alias-demo".to_vec()));
+        let representation = block_on(kernel.issue(request, &Capability::root()))
+            .expect("the alias prelude composes");
+        let text = String::from_utf8(representation.bytes).unwrap();
+        assert!(text.contains("(define (fn-toUpper"), "{text}");
+        // Compose's own documentation arrives as text, with its markers literal.
+        assert!(text.contains("`$h{<iri>}`"), "{text}");
     }
 
     #[test]
@@ -9001,5 +9045,54 @@ mod arrangement_tests {
         for layer in [arrangement::RESOURCE, "urn:runbook:timer"] {
             assert_eq!(door(&arranged, layer), None, "{layer} is a host layer");
         }
+        // The same arrangement as an s-expression, which is what an `.arrangement` file holds.
+        let request = Request::new(Verb::Source, Iri::parse(arrangement::RESOURCE).unwrap())
+            .with_arg(
+                "as",
+                ArgRef::Inline(arrangement::MEDIA_ARRANGEMENT.as_bytes().to_vec()),
+            );
+        let sexpr = block_on(kernel.issue(request, &Capability::root())).unwrap();
+        assert_eq!(sexpr.repr_type.media_type, arrangement::MEDIA_ARRANGEMENT);
+        let sexpr = String::from_utf8(sexpr.bytes).unwrap();
+        assert!(
+            sexpr.contains(";; The arrangement this host built"),
+            "{sexpr}"
+        );
+        assert_eq!(
+            ikigai_sexpr::arrangement_to_topology(&sexpr).unwrap(),
+            root.topology()
+        );
+        // A face it does not have is refused, naming the two it does.
+        let request = Request::new(Verb::Source, Iri::parse(arrangement::RESOURCE).unwrap())
+            .with_arg("as", ArgRef::Inline(b"text/html".to_vec()));
+        let refused = block_on(kernel.issue(request, &Capability::root())).unwrap_err();
+        assert!(
+            refused.to_string().contains("text/x-ikigai-arrangement"),
+            "{refused}"
+        );
+    }
+
+    /// `urn:diagram:*` is bound in the LOCAL root: `urn:diagram:kernel` draws the arrangement
+    /// as SVG under root, and is refused under a capability without `urn:cap:kernel:inspect`
+    /// — declared by the endpoint, so the manifold under that capability does not offer it.
+    #[test]
+    fn the_diagram_is_bound_in_the_local_root_behind_inspect() {
+        let kernel = kernel();
+        let request = Request::new(Verb::Source, Iri::parse("urn:diagram:kernel").unwrap());
+        let svg = block_on(kernel.issue(request.clone(), &Capability::root())).unwrap();
+        assert_eq!(svg.repr_type.media_type, "image/svg+xml");
+        let svg = String::from_utf8(svg.bytes).unwrap();
+        assert!(
+            svg.starts_with("<svg") && svg.contains("urn:diagram:kernel"),
+            "{svg}"
+        );
+        let narrow = Capability::scoped(["urn:cap:net:example.org"]);
+        let refused = block_on(kernel.issue(request.clone(), &narrow)).unwrap_err();
+        assert!(
+            refused.to_string().contains("urn:cap:kernel:inspect"),
+            "{refused}"
+        );
+        let inspect = Capability::scoped(["urn:cap:kernel:inspect"]);
+        assert!(block_on(kernel.issue(request, &inspect)).is_ok());
     }
 }

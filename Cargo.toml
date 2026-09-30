@@ -208,7 +208,21 @@ ikigai-vocab = "0.1.83" # 0.1.83 = the DOOR terms (`ik:Door`, `ik:doors`, `ik:en
 # CEILING. The lock alone was holding `ikigai-fn` at 0.2.0 and shipping a manifold that
 # contradicted itself. Refresh the lock when you touch these, and diff the lock FILE.
 # The reusable function library, linked in as a published module crate.
-ikigai-fn = "0.2.2" # 0.2.2 REMOVED `urn:iki:fn:compose`'s `.output("text/html")`. The
+ikigai-fn = "0.3.0" # 0.3.0 = compose is a view TEMPLATE LANGUAGE: `$h{…}` (HTML-escaped) and
+# `$r{…}` (raw) splice without re-expanding, `{name}` in a marker is a template argument, and
+# `$h{<iri> || <fallback>}` covers a failed part. This host serves `urn:iki:fn:compose`, so the
+# language IS its output, and the floor is the language rather than any Rust item (the host
+# calls only `ikigai_fn::space()`). Under 0.x a caret is a range: `^0.2.2` was `<0.3.0`, a
+# CEILING that kept this host serving the old language after 0.3.0 shipped. Read as breaking,
+# and checked site by site: the demo shapes (`urn:data:page`, `:about`, `:control`,
+# `urn:demo:jury`, `:jury-gated`) render byte-identically, and the one thing that broke was
+# the generated alias prelude, whose comments carried compose's own summary with the NEW
+# `$r{<iri>}` and `$h{<iri>}` spelled literally — `escape_markers` now escapes all three
+# letters. 0.3.1 (what the lock resolves) adds only `ComposeOver::named`; `space()` binds no
+# `composeOver`, and an unnamed one describes itself byte for byte as 0.3.0's, so 0.3.1 is
+# not a floor here. fn's own core floor is 0.1.73, below this workspace's.
+#
+# Beneath it, still true: 0.2.2 REMOVED `urn:iki:fn:compose`'s `.output("text/html")`. The
 # declaration was a guess and it was false — compose serves the SOURCE's media type, which
 # is what its own summary said all along, so the manifold this host publishes contradicted
 # itself on one endpoint. Held out for two releases purely by the committed lock: the caret
@@ -225,7 +239,12 @@ ikigai-fn = "0.2.2" # 0.2.2 REMOVED `urn:iki:fn:compose`'s `.output("text/html")
 # Personal contexts (urn:personal:*), macOS-backed, linked as a published module.
 ikigai-personal = "0.7.1" # 0.7.1 = multi-day events block every spanned day (free/busy + booking); notes/URL/attendees on the graph face + description= Sink (detail preservation)
 # Capability-gated file/store module, linked as a published module crate.
-ikigai-fs = "0.1.6" # 0.1.6 joins the Exists answer to the READ's golden thread inside
+ikigai-fs = "0.1.7" # 0.1.7 types `*.arrangement` files as `text/x-ikigai-arrangement`, which is
+# how `--arrangement game.arrangement` reaches `ikigai-sexpr`'s lossless transreptor in the
+# bootstrap kernel (`arrangement::read_declaration`). Below it the file reads as
+# `application/octet-stream`, nothing transrepts that to Turtle, and the start stops (exit 2):
+# a behavioral floor with one named site and a test (`tests/arrangement.rs`).
+# Beneath it: 0.1.6 joins the Exists answer to the READ's golden thread inside
 # `cacheable_space` — one Sink or Delete now cuts every representation of the file rather
 # than the bytes only, so a cached Exists cannot outlive the file it answered about. A floor
 # with two named sites in this workspace, both of them `ikigai_fs::cacheable_space`:
@@ -271,7 +290,13 @@ ikigai-sniff = "0.1.9" # 0.1.9 sniffs a leading `<urn:…>` subject as text/turt
 # `source <urn: graph> | urn:rdf:transrept` and `urn:transrept:auto` — both bound here.
 # 0.1.9 also declares `urn:transrept:auto`'s own text/turtle face and refuses an unknown `as=`.
 # Neutral s-expr foundation: Sexpr datum + urn:sparql:from-sexpr transreptor (text/x-sexpr → SPARQL).
-ikigai-sexpr = "0.1.3" # 0.1.3 bounds the reader and the code-graph encoder at
+ikigai-sexpr = "0.1.4" # 0.1.4 = arrangements as s-expressions: `urn:sexpr:arrangement-to-rdf` /
+# `-from-rdf`, lossless both ways (each reads its own output back and refuses to answer
+# otherwise). The bootstrap kernel's transreptor selection finds the first one for an
+# `.arrangement` file, and `urn:iki:host:arrangement as=text/x-ikigai-arrangement` calls
+# `topology_to_arrangement` for its s-expression face. Both bound in `space()`, so this is an
+# API floor with two named sites. Its core floor is 0.1.83, the same as this workspace's.
+# Beneath it: 0.1.3 bounds the reader and the code-graph encoder at
 # MAX_READ_DEPTH 512 and answers a clean parse error. Below it, hostile input (`"("` a
 # hundred thousand times, or a long flat list) aborted the WHOLE PROCESS on a stack
 # overflow — and it got there through CAPABILITY-FREE transreptors, so no grant stood in
@@ -279,6 +304,12 @@ ikigai-sexpr = "0.1.3" # 0.1.3 bounds the reader and the code-graph encoder at
 # reachable path to it. A hard floor for a host that serves untrusted bytes.
 # 0.1.1/0.1.2 added `urn:rdf:from-sexpr` and the lossless code-as-graph codec
 # (`urn:sexpr:to-rdf`/`from-rdf`), both of which this host binds.
+# A kernel's arrangement as a picture: `urn:diagram:kernel` (declares and needs
+# `urn:cap:kernel:inspect`, because `urn:kernel:topology` does) and `urn:diagram:arrangement
+# of=<iri>`, both `image/svg+xml`. Bound in the LOCAL root only (`root_members`), never in a
+# served posture. 0.1.0 is the first release and the one API called (`space()`); its core
+# floor is 0.1.83, the same as this workspace's, so the host links one `ikigai-core`.
+ikigai-diagram = "0.1.0"
 # Signing + verification: urn:sign:sign (cap-gated) / urn:sign:verify (open), Ed25519.
 ikigai-sign = "0.2.2" # 0.2.2 fixed the key ArgSpec summaries, which had said Ed25519-only
 # since ES256 shipped in 0.2.0 — a manifold this host publishes describing an argument it

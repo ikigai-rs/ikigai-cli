@@ -148,6 +148,8 @@ const OWN: &[(&str, &str)] = &[
 const INHERITED: &[(&str, &str)] = &[
     ("bookmarks", "ikigai-cms"),
     ("compose", "ikigai-fn"),
+    ("diagram-arrangement", "ikigai-diagram"),
+    ("diagram-kernel", "ikigai-diagram"),
     ("conditional", "ikigai-fn"),
     ("echo", "ikigai-fn"),
     ("greet", "ikigai-fn"),
@@ -195,6 +197,8 @@ const INHERITED: &[(&str, &str)] = &[
     ("repo-pr-view", "ikigai-repo"),
     ("repo-status", "ikigai-repo"),
     ("system-exec", "ikigai-repo"),
+    ("sexpr-arrangement-from-rdf", "ikigai-sexpr"),
+    ("sexpr-arrangement-to-rdf", "ikigai-sexpr"),
     ("sexpr-from-rdf", "ikigai-sexpr"),
     ("sexpr-to-rdf", "ikigai-sexpr"),
     ("shacl-validate", "ikigai-shacl"),
@@ -246,6 +250,10 @@ const OWNER_ONLY: &[&str] = &[
     "urn:meeting:zoom:schedule",
     "client-issue",
     "peer-list",
+    // The picture of THIS host's arrangement: local root only (ikigai-diagram), like
+    // `host-arrangement`, which says the same thing as a declaration.
+    "diagram-arrangement",
+    "diagram-kernel",
 ];
 
 // ---------------------------------------------------------------------------
@@ -413,6 +421,25 @@ const JSON_LD: &str = r#"{"@context":{"title":"http://purl.org/dc/terms/title"},
 /// the round trip has something to shorten. A bare context value; the module also accepts a
 /// `{"@context": …}` document.
 const JSON_LD_CONTEXT: &str = r#"{"title":"http://purl.org/dc/terms/title"}"#;
+
+/// One endpoint space with one door, as an `.arrangement` file holds it.
+const ARRANGEMENT_SEXPR: &str = "(endpoints (door \"urn:demo:a\" demo))\n";
+
+/// The same arrangement as the Turtle core writes for it (`Topology::to_turtle`), so the two
+/// `sexpr-arrangement-*` transreptors each get a document they accept.
+const ARRANGEMENT_TURTLE: &str = "\
+@prefix ik: <https://ikigai-rs.dev/ns#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+<urn:ikigai:space:_:1> a ik:EndpointSpace ;
+    ik:pattern \"urn:demo:a\" ;
+    ik:doors <urn:ikigai:space:_:1:doors:1> .
+<urn:ikigai:space:_:1:doors:1> rdf:first <urn:ikigai:space:_:1:door:1> ;
+    rdf:rest rdf:nil .
+<urn:ikigai:space:_:1:door:1> a ik:Door ;
+    ik:pattern \"urn:demo:a\" ;
+    ik:matchKind \"exact\" ;
+    ik:endpointName \"demo\" .
+";
 
 /// An identity stylesheet — enough for `xslt-transform` to have a real transform to run.
 const XSL: &str = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="xml"/><xsl:template match="/"><ok/></xsl:template></xsl:stylesheet>"#;
@@ -603,6 +630,28 @@ fn root_suite() -> Suite {
         // An address, because the endpoint refuses anything that is not one before it mints.
         .fixture(
             Fixture::new("contactblock-link", Verb::Source).arg("email", "someone@example.org"),
+        )
+        // The arrangement surfaces (ikigai-sexpr 0.1.4, ikigai-diagram 0.1.0): one real
+        // arrangement each way, and a picture of this host's own declaration BY NAME — `of`
+        // names a resource, and piping Turtle into it is refused by design.
+        //
+        // ⚠ NOT `of=urn:kernel:topology`, though that is the README's example: the walk fires
+        // under no grants, the sub-read of the topology is refused for want of
+        // `urn:cap:kernel:inspect`, and ENFORCED reports `diagram-arrangement` as enforcing a
+        // scope it does not declare. It enforces nothing — `of` is read under the caller's
+        // capability, whatever that read needs — and the suite cannot tell a pass-through
+        // denial from an undeclared gate. `urn:iki:host:arrangement` needs no grant.
+        .fixture(
+            Fixture::new("sexpr-arrangement-to-rdf", Verb::Source)
+                .arg("content", ARRANGEMENT_SEXPR),
+        )
+        .fixture(
+            Fixture::new("sexpr-arrangement-from-rdf", Verb::Source)
+                .arg("content", ARRANGEMENT_TURTLE),
+        )
+        .fixture(
+            Fixture::new("diagram-arrangement", Verb::Source)
+                .arg("of", "urn:iki:host:arrangement"),
         )
         // ---- waived, per check, with the exception pinned by hand -----------------
         // ★ A REAL VOCABULARY GAP, in a repo that cannot fix it. Declaring `urn:host:health`'s
