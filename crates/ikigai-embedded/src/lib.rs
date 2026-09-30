@@ -4742,7 +4742,11 @@ fn inert_cap_file_lines(
             match authority_dir {
                 Some(dir) => {
                     let home = dir.join(&space);
-                    let state = if home.is_file() {
+                    // A space with a `cap` file and no `handler` (bug's `contacts`, today) is
+                    // named too — the file is still inert — but must not claim a handler runs.
+                    let state = if !root.join(&space).join("handler").is_file() {
+                        "the space has no handler, so nothing runs under either file today"
+                    } else if home.is_file() {
                         "present, and it is what the handler runs under"
                     } else {
                         "ABSENT, so the handler runs under the tuplespace verbs only"
@@ -8472,6 +8476,22 @@ mod space_authority_tests {
         std::fs::write(authority.join("jobs"), "urn:cap:lisp\n").unwrap();
         let lines = inert_cap_file_lines(&reactor, &spaces, Some(&authority));
         assert!(lines[0].contains("present"), "{}", lines[0]);
+
+        // A space with a `cap` file and no handler is named, without claiming a handler runs.
+        std::fs::create_dir_all(spaces.join("contacts")).unwrap();
+        std::fs::write(
+            spaces.join("contacts").join("cap"),
+            "urn:cap:people:write\n",
+        )
+        .unwrap();
+        let lines = inert_cap_file_lines(&reactor, &spaces, Some(&authority));
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].starts_with("ikigai: space `contacts`: "),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[0].contains("has no handler"), "{}", lines[0]);
     }
 }
 
