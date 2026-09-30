@@ -517,7 +517,19 @@ pub struct SpaceReactor {
     // reactor's own capability). `Some` = the HOST decides and the file is never read; see
     // `with_host_authority` for why a host may want the file out of the loop entirely.
     host_authority: Option<HostAuthority>,
+    // Told about every tuple that settles as `Errored` — the host's way to make a dead letter
+    // LOUD at the moment it happens. `None` = silent, which is what the `.err` note alone was.
+    on_dead_letter: Option<DeadLetterHook>,
 }
+
+/// Called with `(space, tuple id, reason)` for every claimed tuple that settles as
+/// [`Outcome::Errored`], installed with [`SpaceReactor::on_dead_letter`].
+///
+/// Ledger #638: for eight days every booking dead-lettered into `error/` with a perfectly
+/// good `.err` note, and nothing anywhere said so — the requester had already been told
+/// their request was received. A note nobody reads is not an alarm; this is the seam a host
+/// uses to raise one (a log line, a counter, a mail).
+pub type DeadLetterHook = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
 
 /// A host's own answer to "what authority does this space's handler run under?", installed
 /// with [`SpaceReactor::with_host_authority`]. `None` from the closure means "no opinion —
@@ -545,7 +557,19 @@ impl SpaceReactor {
             resolver,
             capability,
             host_authority: None,
+            on_dead_letter: None,
         }
+    }
+
+    /// Tell the host about every dead letter as it happens: `hook(space, tuple id, reason)`
+    /// runs for each claimed tuple that settles as [`Outcome::Errored`], after its `.err`
+    /// note is written. See [`DeadLetterHook`].
+    pub fn on_dead_letter<F>(mut self, hook: F) -> Self
+    where
+        F: Fn(&str, &str, &str) + Send + Sync + 'static,
+    {
+        self.on_dead_letter = Some(Arc::new(hook));
+        self
     }
 
     /// Take a space's handler authority from the HOST instead of from the space tree.
@@ -711,8 +735,24 @@ impl SpaceReactor {
     }
 
     /// Move a claimed tuple to its terminal stage: `outbox` on Ok, `error` (+ an `.err` note)
-    /// on failure. Returns the matching [`Outcome`].
+    /// on failure, and tell the [`DeadLetterHook`] about any `Errored` outcome. Returns the
+    /// matching [`Outcome`].
     fn settle(
+        &self,
+        name: &str,
+        id: &str,
+        claimed: &Path,
+        result: std::result::Result<String, String>,
+    ) -> Outcome {
+        let outcome = self.move_to_stage(name, id, claimed, result);
+        if let (Outcome::Errored(reason), Some(hook)) = (&outcome, &self.on_dead_letter) {
+            hook(name, id, reason);
+        }
+        outcome
+    }
+
+    /// [`settle`](SpaceReactor::settle) without the hook: the moves and the notes.
+    fn move_to_stage(
         &self,
         name: &str,
         id: &str,
@@ -723,12 +763,17 @@ impl SpaceReactor {
             Ok(_) => ("outbox", Outcome::Handled),
             Err(e) => ("error", Outcome::Errored(e.clone())),
         };
+        // A failure to MOVE must not lose why the handler failed in the first place.
+        let failed = |what: String| match &result {
+            Err(why) => Outcome::Errored(format!("{why} (and then {what})")),
+            Ok(_) => Outcome::Errored(what),
+        };
         let dir = self.root.join(name).join(stage);
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            return Outcome::Errored(format!("create `{stage}`: {e}"));
+            return failed(format!("create `{stage}`: {e}"));
         }
         if let Err(e) = std::fs::rename(claimed, dir.join(format!("{id}.tuple"))) {
-            return Outcome::Errored(format!("move to `{stage}`: {e}"));
+            return failed(format!("move to `{stage}`: {e}"));
         }
         match &result {
             // A dead-letter note alongside the tuple, so a failure is inspectable via
@@ -831,6 +876,83 @@ impl SpaceReactor {
             }
         });
     }
+}
+
+/// One reactive space's dead letters: what [`dead_letters`] reports per space.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpaceDeadLetters {
+    /// The space's name (`bookings` for `urn:space:bookings`).
+    pub space: String,
+    /// How many tuples sit in its `error/` stage.
+    pub count: usize,
+    /// The most recent of them, when `count > 0`.
+    pub newest: Option<DeadLetter>,
+}
+
+/// One dead-lettered tuple and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeadLetter {
+    /// The tuple id (its content hash).
+    pub tuple: String,
+    /// The `.err` note's text, verbatim — or a statement that there is none.
+    pub reason: String,
+    /// When it was dead-lettered: the `.err` note's modification time (the tuple's own mtime
+    /// is its DROP time, since a rename keeps it), or the tuple's when there is no note.
+    pub at: Option<std::time::SystemTime>,
+}
+
+/// Every REACTIVE space under `root` (a space with a non-empty `handler` file), sorted by
+/// name, with the count of tuples in its `error/` stage and the newest one's reason.
+///
+/// Reactive spaces with nothing dead-lettered are included with `count: 0`, so a reader can
+/// tell "no dead letters" from "not looked at". Read straight off the tree, so any process
+/// sharing the workspace reports the same facts.
+pub fn dead_letters(root: &Path) -> Vec<SpaceDeadLetters> {
+    let mut spaces: Vec<String> = match std::fs::read_dir(root) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().to_str().map(String::from))
+            .filter(|name| {
+                std::fs::read_to_string(root.join(name).join("handler"))
+                    .map(|raw| !raw.trim().is_empty())
+                    .unwrap_or(false)
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    spaces.sort();
+    spaces
+        .into_iter()
+        .map(|space| {
+            let error = root.join(&space).join("error");
+            let ids = SpaceEndpoint::list_ids(&error);
+            let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+            let newest = ids
+                .iter()
+                .map(|id| {
+                    let note = error.join(format!("{id}.err"));
+                    match std::fs::read_to_string(&note) {
+                        Ok(reason) => DeadLetter {
+                            tuple: id.clone(),
+                            reason,
+                            at: modified(&note),
+                        },
+                        Err(_) => DeadLetter {
+                            tuple: id.clone(),
+                            reason: "(no .err note)".to_string(),
+                            at: modified(&error.join(format!("{id}.tuple"))),
+                        },
+                    }
+                })
+                .max_by(|a, b| a.at.cmp(&b.at).then_with(|| a.tuple.cmp(&b.tuple)));
+            SpaceDeadLetters {
+                space,
+                count: ids.len(),
+                newest,
+            }
+        })
+        .collect()
 }
 
 /// Parse a scope-list file: one capability scope IRI per line, surrounding whitespace
@@ -1650,6 +1772,89 @@ mod tests {
         let mock = Arc::new(MockResolver::new(true));
         let reactor = SpaceReactor::new(root, mock, Capability::root());
         assert!(reactor.ignored_cap_files().is_empty());
+    }
+
+    /// A dead letter is LOUD at the moment it happens: the hook hears the space, the tuple
+    /// and the reason the `.err` note carries — and a handled tuple says nothing.
+    #[test]
+    fn the_dead_letter_hook_hears_every_errored_tuple() {
+        let root = reactive_root("react-hook", "jobs", "urn:test:handler");
+        let k = Kernel::new(Arc::new(space(root.clone())));
+        let cap = Capability::scoped(vec![CAP_OUT.to_string()]);
+        let id = out(&k, &cap, "urn:space:jobs", b"work");
+
+        let heard: Arc<Mutex<Vec<(String, String, String)>>> = Arc::default();
+        let sink = Arc::clone(&heard);
+        let failing = SpaceReactor::new(
+            root.clone(),
+            Arc::new(MockResolver::new(false)),
+            Capability::scoped(vec!["urn:cap:demo".to_string()]),
+        )
+        .on_dead_letter(move |space, tuple, reason| {
+            sink.lock()
+                .unwrap()
+                .push((space.to_string(), tuple.to_string(), reason.to_string()));
+        });
+        assert!(matches!(failing.process("jobs", &id), Outcome::Errored(_)));
+        let heard_now = heard.lock().unwrap().clone();
+        assert_eq!(heard_now.len(), 1);
+        assert_eq!(heard_now[0].0, "jobs");
+        assert_eq!(heard_now[0].1, id);
+        let note =
+            std::fs::read_to_string(root.join("jobs").join("error").join(format!("{id}.err")))
+                .unwrap();
+        assert_eq!(heard_now[0].2, note, "the hook hears what the note says");
+
+        let quiet = Arc::clone(&heard);
+        let working = SpaceReactor::new(
+            root,
+            Arc::new(MockResolver::new(true)),
+            Capability::scoped(vec!["urn:cap:demo".to_string()]),
+        )
+        .on_dead_letter(move |_, _, _| quiet.lock().unwrap().push(Default::default()));
+        let second = out(&k, &cap, "urn:space:jobs", b"more work");
+        assert_eq!(working.process("jobs", &second), Outcome::Handled);
+        assert_eq!(
+            heard.lock().unwrap().len(),
+            1,
+            "a handled tuple is not a dead letter"
+        );
+    }
+
+    /// The dead-letter report: every reactive space, its `error/` count, and the newest
+    /// tuple's reason. A non-reactive space is not reported; a reactive one with nothing
+    /// dead-lettered is, with a zero.
+    #[test]
+    fn dead_letters_counts_each_reactive_space_and_names_the_newest() {
+        let root = reactive_root("react-deadletters", "jobs", "urn:test:handler");
+        std::fs::create_dir_all(root.join("quiet")).unwrap();
+        std::fs::write(root.join("quiet").join("handler"), "urn:test:handler").unwrap();
+        std::fs::create_dir_all(root.join("passive").join("error")).unwrap();
+        std::fs::write(root.join("passive").join("error").join("x.tuple"), "x").unwrap();
+
+        let error = root.join("jobs").join("error");
+        std::fs::create_dir_all(&error).unwrap();
+        std::fs::write(error.join("aaa.tuple"), "a").unwrap();
+        std::fs::write(error.join("aaa.err"), "older reason").unwrap();
+        // Make the second note measurably newer than the first.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(error.join("bbb.tuple"), "b").unwrap();
+        std::fs::write(error.join("bbb.err"), "denied: newest reason").unwrap();
+        // A note whose tuple was retried away is not a dead letter.
+        std::fs::write(error.join("ccc.err"), "stale note").unwrap();
+
+        let report = dead_letters(&root);
+        assert_eq!(
+            report.iter().map(|s| s.space.as_str()).collect::<Vec<_>>(),
+            vec!["jobs", "quiet"],
+            "reactive spaces only, sorted: {report:?}"
+        );
+        assert_eq!(report[0].count, 2);
+        let newest = report[0].newest.as_ref().expect("a newest dead letter");
+        assert_eq!(newest.tuple, "bbb");
+        assert_eq!(newest.reason, "denied: newest reason");
+        assert_eq!(report[1].count, 0);
+        assert_eq!(report[1].newest, None);
     }
 
     #[test]
