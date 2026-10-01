@@ -203,8 +203,10 @@ fn config_relative(value: &str) -> PathBuf {
 /// `ikigai-fs` decides the file's media type by extension: `.ttl`, `.nt`, `.jsonld`, and since
 /// 0.1.7 `.arrangement` (`text/x-ikigai-arrangement`), which ikigai-sexpr 0.1.4's
 /// `urn:sexpr:arrangement-to-rdf` transrepts to Turtle losslessly. That transreptor bounds
-/// the tree before core reads it; a Turtle declaration goes to `Topology::from_turtle` with
-/// no such bound (ledger #643, and `docs/declared-arrangement.md`).
+/// the tree before core reads it, and core bounds every declaration again as it reads it:
+/// since 0.1.84 `Topology::from_turtle` refuses one past `MAX_DECLARATION_DEPTH`,
+/// `MAX_DECLARATION_NODES` or `MAX_DECLARATION_TEXT` as `DeclarationError::TooLarge`, naming the
+/// bound (ledger #643, and `docs/declared-arrangement.md`).
 pub(crate) fn read_declaration(path: &Path) -> std::result::Result<String, String> {
     let dir = path
         .parent()
@@ -426,9 +428,16 @@ pub(crate) struct Dump {
 }
 
 impl Dump {
-    /// The Turtle face: the header as `#` comments, then core's rendering.
-    pub(crate) fn turtle(&self) -> String {
-        self.with_header("#", &self.topology.to_turtle())
+    /// The Turtle face: the header as `#` comments, then core's rendering. `Err` for a tree in
+    /// which two DIFFERENT spaces claim one name: core's `to_turtle` renders a named node once,
+    /// so it would write the first alone and the document would read back as another
+    /// arrangement. `try_to_turtle` (core 0.1.84) refuses it with `build`'s own reason, which
+    /// names the node — the same refusal `urn:kernel:topology` answers as a `Conflict`.
+    pub(crate) fn turtle(&self) -> std::result::Result<String, String> {
+        self.topology
+            .try_to_turtle()
+            .map(|body| self.with_header("#", &body))
+            .map_err(|e| e.to_string())
     }
 
     /// The s-expression face (`text/x-ikigai-arrangement`): the header as `;` comments, then
@@ -515,7 +524,11 @@ impl Endpoint for ArrangementEndpoint {
             Some(_) => inv.inline_str("as")?.trim().to_string(),
         };
         let bytes = match face.as_str() {
-            MEDIA_TURTLE => self.dump.turtle(),
+            MEDIA_TURTLE => self.dump.turtle().map_err(|detail| {
+                Error::Conflict(format!(
+                    "this host's arrangement cannot be written as a declaration: {detail}"
+                ))
+            })?,
             MEDIA_ARRANGEMENT => self.dump.sexpr().map_err(|detail| {
                 Error::Endpoint(format!(
                     "this host's arrangement cannot be written as {MEDIA_ARRANGEMENT}: {detail}"
@@ -662,7 +675,9 @@ mod tests {
         ];
         let harvest = harvest(&members);
         let arrangement = Fallback::new(members).topology();
-        let turtle = dump(&arrangement, "the built-in default", &harvest).turtle();
+        let turtle = dump(&arrangement, "the built-in default", &harvest)
+            .turtle()
+            .unwrap();
         assert!(
             turtle.contains("# ⚠ Not declarable as it stands: `same`"),
             "{turtle}"
@@ -692,7 +707,7 @@ mod tests {
             arrangement
         );
         assert_eq!(
-            Topology::from_turtle(&dump.turtle()).unwrap(),
+            Topology::from_turtle(&dump.turtle().unwrap()).unwrap(),
             ikigai_sexpr::arrangement_to_topology(&sexpr).unwrap()
         );
     }

@@ -456,9 +456,10 @@ of=<iri>` draws any declaration by name. Both are bound in the local root only.
 
 ⚠ The built-in root's own dump does not start as it stands: `file`, `meeting` and `org-agenda` (and
 the `llm-*` backends, with two or more providers) each name two different endpoints, so a door
-naming one cannot say which, and the host refuses it. The dump marks them in its header. ⚠ A Turtle
-declaration is read by core with no depth bound yet, so a hostile one can abort the process (ledger
-[#643](http://localhost:1060/l/default/item/643)); the `.arrangement` path is bounded. See
+naming one cannot say which, and the host refuses it. The dump marks them in its header. Every
+declaration, in any surface, is bounded — 48 spaces deep, 65,536 nodes and 16 MiB of text once every
+reference is expanded — and one past a bound stops the start with exit 2 and a message naming the bound,
+never an abort (core 0.1.84, ledger [#643](http://localhost:1060/l/default/item/643)). See
 [`docs/declared-arrangement.md`](docs/declared-arrangement.md).
 
 ## The consolidated calendar (the embedded host's standing job)

@@ -191,6 +191,136 @@ fn the_dumped_default_is_refused_on_an_ambiguous_name() {
     );
 }
 
+// ---------------------------------------------------------------------------------------------
+// The bounds (ledger #643, core 0.1.84): a declaration is operator input, so the host refuses one
+// past a bound — exit 2 with core's `TooLarge` message, naming the bound — and never aborts.
+// Before 0.1.84 the `--arrangement` Turtle path recursed without bound: a deep enough file
+// overflowed the stack (an ABORT, which nothing catches), and a few KB of billion-laughs Turtle
+// expanded exponentially.
+// ---------------------------------------------------------------------------------------------
+
+const PREFIXES: &str = "@prefix ik: <https://ikigai-rs.dev/ns#> .\n\
+                        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n";
+
+/// A leaf at `me` with the one door `urn:host:demo` → the host's own `host-demo` endpoint.
+fn leaf_at(me: &str) -> String {
+    format!(
+        "<{me}> a ik:EndpointSpace ; ik:pattern \"urn:host:demo\" ; ik:doors <{me}:doors:1> .\n\
+         <{me}:doors:1> rdf:first <{me}:door:1> ; rdf:rest rdf:nil .\n\
+         <{me}:door:1> a ik:Door ; ik:pattern \"urn:host:demo\" ; ik:matchKind \"exact\" ; \
+         ik:endpointName \"host-demo\" .\n"
+    )
+}
+
+/// `depth` spaces deep, as hand-written Turtle: `depth - 1` fallbacks, each over the next, ending
+/// in the leaf at `urn:t:deep:{depth}`.
+fn fallback_chain(depth: usize) -> String {
+    let at = |i: usize| format!("urn:t:deep:{i}");
+    let mut turtle = PREFIXES.to_string();
+    for i in 1..depth {
+        let (me, next) = (at(i), at(i + 1));
+        turtle += &format!(
+            "<{me}> a ik:Fallback ; ik:layers <{me}:layers:1> .\n\
+             <{me}:layers:1> rdf:first <{next}> ; rdf:rest rdf:nil .\n"
+        );
+    }
+    turtle + &leaf_at(&at(depth))
+}
+
+/// Start the host from `turtle` and ask it for `urn:host:demo`.
+fn start_from(case: &str, turtle: &str) -> (Option<i32>, String, String) {
+    let home = scratch(case);
+    std::fs::write(home.join("root.ttl"), turtle).unwrap();
+    let out = run(
+        &home,
+        &["--arrangement", "root.ttl", "-c", "source urn:host:demo"],
+    );
+    (out.status.code(), text(&out.stdout), text(&out.stderr))
+}
+
+/// ★ The depth bound, end to end: a declaration AT `MAX_DECLARATION_DEPTH` (48) starts the host
+/// and its one door answers; one space deeper is refused before anything runs, with core's
+/// message naming the bound and the node that passed it.
+#[test]
+fn a_declaration_past_the_depth_bound_stops_the_start() {
+    let limit = ikigai_core::MAX_DECLARATION_DEPTH;
+    assert_eq!(limit, 48, "the bound this test and the docs state");
+
+    let (code, stdout, stderr) = start_from("depth-at", &fallback_chain(limit));
+    assert_eq!(code, Some(0), "at the bound the host starts: {stderr}");
+    assert!(stdout.contains("demo off"), "{stdout}\n{stderr}");
+
+    let (code, stdout, stderr) = start_from("depth-past", &fallback_chain(limit + 1));
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("root.ttl`: ")
+            && stderr
+                .contains("<urn:t:deep:49> nests deeper than 48 spaces (MAX_DECLARATION_DEPTH)"),
+        "{stderr}"
+    );
+    assert!(!stdout.contains("demo off"), "nothing ran: {stdout}");
+}
+
+/// Far past the depth bound — deep enough that an unbounded recursive read would overflow the
+/// stack — the start is still REFUSED with exit 2, never killed by a signal: core checks the
+/// bound before each descent, so the read stops at 49 however deep the file goes.
+#[test]
+fn a_very_deep_declaration_is_refused_never_aborted() {
+    let (code, stdout, stderr) = start_from("depth-far", &fallback_chain(20_000));
+    assert_eq!(
+        code,
+        Some(2),
+        "exit 2, not an abort (a signal has no exit code): {stderr}"
+    );
+    assert!(
+        stderr.contains("<urn:t:deep:49> nests deeper than 48 spaces (MAX_DECLARATION_DEPTH)"),
+        "{stderr}"
+    );
+    assert!(!stdout.contains("demo off"), "nothing ran: {stdout}");
+}
+
+/// ★ A billion laughs: twenty named fallbacks, each listing the next four times — a few KB of
+/// Turtle that expands to 4^20 leaves, well inside the depth bound. The host refuses it on the
+/// NODE bound, promptly, rather than expanding it.
+#[test]
+fn a_billion_laughs_declaration_stops_the_start() {
+    let levels = 20;
+    let mut turtle = PREFIXES.to_string();
+    for i in 0..levels {
+        let me = format!("urn:t:lol:{i}");
+        let next = format!("urn:t:lol:{}", i + 1);
+        turtle += &format!("<{me}> a ik:Fallback ; ik:layers <{me}:layer:1> .\n");
+        for cell in 1..=4 {
+            let rest = if cell == 4 {
+                "rdf:nil".to_string()
+            } else {
+                format!("<{me}:layer:{}>", cell + 1)
+            };
+            turtle += &format!("<{me}:layer:{cell}> rdf:first <{next}> ; rdf:rest {rest} .\n");
+        }
+    }
+    turtle += &leaf_at(&format!("urn:t:lol:{levels}"));
+    assert!(turtle.len() < 8 * 1024, "{} bytes", turtle.len());
+
+    // A native-only integration test timing a child process; no wasm build reaches it.
+    #[allow(clippy::disallowed_methods)]
+    let started = std::time::Instant::now();
+    let (code, stdout, stderr) = start_from("laughs", &turtle);
+    let took = started.elapsed();
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("root.ttl`: ")
+            && stderr.contains("passes its node bound of 65536 (MAX_DECLARATION_NODES)"),
+        "{stderr}"
+    );
+    assert!(!stdout.contains("demo off"), "nothing ran: {stdout}");
+    // Loose enough for a debug binary on a slow runner; the expansion it stops would not finish.
+    assert!(
+        took < std::time::Duration::from_secs(30),
+        "refused in {took:?}"
+    );
+}
+
 /// `--connect` resolves on another kernel, so it builds no local root to arrange: the flag is
 /// refused there rather than ignored.
 #[test]

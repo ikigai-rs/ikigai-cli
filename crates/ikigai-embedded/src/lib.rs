@@ -8361,10 +8361,10 @@ mod tests {
             "{turtle}"
         );
 
-        // The order, structurally: chain → alias wrap → the named served root, whose first two
-        // layers are the limiters.
-        let topology = kernel.topology();
-        let alias = &topology.children[0];
+        // The order, structurally: the root (the alias wrap; core 0.1.84's `root_topology`, not
+        // the chain unwrapped by hand) → the named served root, whose first two layers are the
+        // limiters.
+        let alias = kernel.root_topology();
         let served = &alias.children[0];
         assert_eq!(served.id.as_ref().map(Iri::as_str), Some(SERVED_ROOT));
         let families: Vec<(Option<&str>, String)> = served
@@ -8396,6 +8396,64 @@ mod tests {
         );
         let turtle = source_as_root(&open, "urn:kernel:topology").expect("topology");
         assert!(!String::from_utf8_lossy(&turtle.bytes).contains(SERVED_PERSONAL_LIMIT));
+    }
+
+    /// ★ Every posture this host builds renders its arrangement (core 0.1.84). Since 0.1.84
+    /// `urn:kernel:topology` answers `Conflict` for a kernel in which two DIFFERENT spaces claim
+    /// one name — the graph would state only the first — so a posture that names two spaces
+    /// alike would lose its topology, its `urn:diagram:kernel`, and `urn:iki:host:arrangement`'s
+    /// dump with it. Sourced through the kernel, as an operator would, on each constructor that
+    /// builds a different root: the local root, the trusted IPC kernel (wire-eval over the whole
+    /// root), the HTTP door's kernel, the served QUIC surface in every combination of its three
+    /// grant-decided faces, and the calendar server with and without wire-eval.
+    /// (`watched_kernel*` / `reactive_kernel_with_mounts` build the same `root_space` as
+    /// `kernel()` and are not constructed: they start watchers and the reactor.)
+    #[test]
+    fn every_posture_renders_its_topology_without_a_name_clash() {
+        let mut postures: Vec<(String, Kernel)> = vec![
+            ("kernel".into(), kernel()),
+            (
+                "trusted_kernel_for".into(),
+                trusted_kernel_for("Test (IPC)"),
+            ),
+            ("kernel_for".into(), kernel_for("Test (HTTP)")),
+            (
+                "kernel_for_with_eval".into(),
+                kernel_for_with_eval("Test (QUIC)"),
+            ),
+            ("calendar_server_kernel".into(), calendar_server_kernel()),
+            (
+                "calendar_server_kernel_with_eval".into(),
+                calendar_server_kernel_with_eval(),
+            ),
+        ];
+        for personal in [false, true] {
+            for wire_eval in [false, true] {
+                for llm in [false, true] {
+                    let surface = ServedSurface {
+                        personal,
+                        wire_eval,
+                        llm,
+                    };
+                    postures.push((
+                        format!("served_kernel {surface:?}"),
+                        served_kernel("Test (QUIC)", surface),
+                    ));
+                }
+            }
+        }
+        for (label, kernel) in &postures {
+            let turtle = source_as_root(kernel, "urn:kernel:topology")
+                .unwrap_or_else(|e| panic!("{label}: urn:kernel:topology refused: {e}"));
+            let turtle = String::from_utf8(turtle.bytes).expect("Turtle is UTF-8");
+            assert!(turtle.contains("ik:Chain"), "{label}: {turtle}");
+            // The same check from the API side, on the tree a declaration of this kernel
+            // states: core's `try_to_turtle` is what the resource renders through.
+            kernel
+                .root_topology()
+                .try_to_turtle()
+                .unwrap_or_else(|e| panic!("{label}: the root's arrangement: {e}"));
+        }
     }
 }
 
