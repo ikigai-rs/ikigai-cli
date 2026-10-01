@@ -1,7 +1,7 @@
 # Run a declared arrangement
 
 **Status:** built (ledger [#637](http://localhost:1060/l/default/item/637), the host half of spaces as
-data, arc 1). Needs `ikigai-core` 0.1.83; the `.arrangement` form needs `ikigai-fs` 0.1.7 and
+data, arc 1). Needs `ikigai-core` 0.1.84 (0.1.83 builds it; 0.1.84 bounds it); the `.arrangement` form needs `ikigai-fs` 0.1.7 and
 `ikigai-sexpr` 0.1.4, and the picture needs `ikigai-diagram` 0.1.0. Core's side is
 `ikigai-core/docs/design/space-declarations.md`.
 
@@ -128,19 +128,36 @@ transrepted to Turtle, so another surface arrives with no host change: Turtle, N
 **Changing it while running.** The declaration is read at start. Hot reload is ledger
 [#628](http://localhost:1060/l/default/item/628).
 
-## ⚠ A Turtle declaration is not bounded (ledger [#643](http://localhost:1060/l/default/item/643))
+## A declaration is bounded (ledger [#643](http://localhost:1060/l/default/item/643))
 
-Core's `Topology::from_turtle` walks the declaration recursively, with no depth bound, and expands a
-named node at every place it is referenced, with no memo. So a hostile Turtle declaration — a chain of
-spaces thousands deep, or a few lines of named spaces that reference each other ("billion laughs") —
-can overflow the stack and **abort the process** instead of refusing the file. The `.arrangement`
-path is guarded: ikigai-sexpr bounds the tree (48 spaces and doors deep, 65,536 in all, after `ref`s
-are expanded) before core ever reads it. The Turtle, N-Triples and JSON-LD paths go straight to core.
+A declaration is operator input, so core (0.1.84 and later) reads and builds it within three bounds,
+and refuses one past any of them whole — never reads it partway, never crashes on it:
 
-Today the only input is the operator's own file, named by a flag or by the config home they control,
-so this is a hazard to an operator from themselves rather than an attack surface, and the host adds
-no parser of its own to paper over it: the fix is a bound in core's reader. Do not
-point `--arrangement` or `arrangement =` at a file you did not write until that lands.
+| bound | limit | what it counts |
+|---|---|---|
+| `MAX_DECLARATION_DEPTH` | 48 | spaces nested in spaces, checked before each descent |
+| `MAX_DECLARATION_NODES` | 65,536 | nodes once every reference is expanded |
+| `MAX_DECLARATION_TEXT` | 16 MiB | the text those nodes carry, expanded the same way |
+
+A named node is expanded at every place it is used (core's `Topology` is a tree of values), so the
+node and text bounds are what stop a few lines of named spaces that reference each other several times
+("billion laughs") from growing exponentially: the read is refused once it passes the bound, not after
+the expansion. The depth bound is what stops a chain of spaces thousands deep from overflowing the
+stack. Every surface reaches the same bounds, because every surface reaches core as Turtle; the
+`.arrangement` reader in ikigai-sexpr also bounds its own tree (48 deep, 65,536 in all) before it
+transrepts.
+
+Past a bound the start stops with exit 2 and core's message, which names the bound, its limit and
+the node that passed it:
+
+```text
+ikigai: the declared arrangement `/path/to/root.ttl`: <urn:t:deep:49> nests deeper than 48 spaces (MAX_DECLARATION_DEPTH): a declaration past a bound is refused whole, never read partway
+```
+
+`crates/ikigai-cli/tests/arrangement.rs` pins it through the binary: a chain at the depth bound
+starts, one space deeper is refused, one 20,000 deep is refused the same way (exit 2, not an abort),
+and a few-KB billion-laughs file is refused on the node bound. Below core 0.1.84 none of this held —
+the Turtle path recursed without a bound — which is why the workspace pins 0.1.84 as a floor.
 
 ## See the arrangement
 

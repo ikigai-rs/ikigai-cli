@@ -110,7 +110,19 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 [workspace.dependencies]
 # The released kernel, consumed from crates.io. For local cross-repo development
 # against a sibling checkout, use .cargo/config.toml (see .cargo/config.toml.example).
-ikigai-core = "0.1.83" # 0.1.83 = spaces as data: `build`, `Registry` and (feature `declare`)
+ikigai-core = "0.1.84" # 0.1.84 = declarations are BOUNDED (ledger #643): `Topology::from_turtle`
+# and `build` refuse a tree past `MAX_DECLARATION_DEPTH` (48), `MAX_DECLARATION_NODES` (65,536) or
+# `MAX_DECLARATION_TEXT` (16 MiB) as `DeclarationError::TooLarge`, where 0.1.83 recursed without
+# bound — a deep `--arrangement` file aborted the process on a stack overflow, and a few KB of
+# billion-laughs Turtle expanded exponentially. A BEHAVIORAL floor: `--arrangement` reads operator
+# input straight into `from_turtle`, and below 0.1.84 it compiles and is unguarded
+# (`tests/arrangement.rs` pins the refusals). It is also the API floor: `Kernel::root_topology()`
+# (the tests stop unwrapping the chain by hand) and `Topology::try_to_turtle` (the host's
+# arrangement dump refuses a tree it cannot render faithfully). And one behavior change the host
+# was checked against: `urn:kernel:topology` answers `Conflict` for a kernel where two different
+# spaces claim one name — no posture here does (`posture_topologies_render`).
+# Beneath it, and each called:
+# 0.1.83 = spaces as data: `build`, `Registry` and (feature `declare`)
 # `Topology::from_turtle`. `ikigai-embedded` builds the local root from a declaration with them, so
 # below 0.1.83 that crate does not compile (ledger #637).
 # Beneath it, and each called:
@@ -158,7 +170,11 @@ ikigai-core = "0.1.83" # 0.1.83 = spaces as data: `build`, `Registry` and (featu
 # holds beneath it: below that a MOUNTED template row whose local name-guess collides with a
 # shorter sibling is dropped from the manifold, so `ikigai mcp` silently stops projecting
 # browse-pr-explain and browse-pr-review.
-ikigai-vocab = "0.1.83" # 0.1.83 = the DOOR terms (`ik:Door`, `ik:doors`, `ik:endpointName`,
+ikigai-vocab = "0.1.84" # 0.1.84 = core 0.1.84's lockstep release, and NOT an API floor: the
+# vocabulary is unchanged but for its `owl:versionInfo`. Raised with core because this repo's tests
+# validate against the vocabulary the lock resolves, and that is the version they now run against.
+# Beneath it, and each called:
+# 0.1.83 = the DOOR terms (`ik:Door`, `ik:doors`, `ik:endpointName`,
 # `ik:matchKind`) that `urn:iki:host:arrangement` serves, since it answers the root's topology
 # as a declaration (ledger #637). `embedded/tests/conformance.rs` checks every served term
 # against this crate's vocabulary, so below 0.1.83 that resource reads as inventing four terms.
@@ -304,7 +320,8 @@ ikigai-sexpr = "0.1.4" # 0.1.4 = arrangements as s-expressions: `urn:sexpr:arran
 # otherwise). The bootstrap kernel's transreptor selection finds the first one for an
 # `.arrangement` file, and `urn:iki:host:arrangement as=text/x-ikigai-arrangement` calls
 # `topology_to_arrangement` for its s-expression face. Both bound in `space()`, so this is an
-# API floor with two named sites. Its core floor is 0.1.83, the same as this workspace's.
+# API floor with two named sites. Its core floor is 0.1.83, beneath this workspace's 0.1.84,
+# so the host still links one `ikigai-core`.
 # Beneath it: 0.1.3 bounds the reader and the code-graph encoder at
 # MAX_READ_DEPTH 512 and answers a clean parse error. Below it, hostile input (`"("` a
 # hundred thousand times, or a long flat list) aborted the WHOLE PROCESS on a stack
@@ -317,7 +334,7 @@ ikigai-sexpr = "0.1.4" # 0.1.4 = arrangements as s-expressions: `urn:sexpr:arran
 # `urn:cap:kernel:inspect`, because `urn:kernel:topology` does) and `urn:diagram:arrangement
 # of=<iri>`, both `image/svg+xml`. Bound in the LOCAL root only (`root_members`), never in a
 # served posture. 0.1.0 is the first release and the one API called (`space()`); its core
-# floor is 0.1.83, the same as this workspace's, so the host links one `ikigai-core`.
+# floor is 0.1.83, beneath this workspace's 0.1.84, so the host still links one `ikigai-core`.
 ikigai-diagram = "0.1.0"
 # Signing + verification: urn:sign:sign (cap-gated) / urn:sign:verify (open), Ed25519.
 ikigai-sign = "0.2.2" # 0.2.2 fixed the key ArgSpec summaries, which had said Ed25519-only

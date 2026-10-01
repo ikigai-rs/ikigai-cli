@@ -634,7 +634,7 @@ pub fn validate_arguments(
     let mut violations: Vec<(String, Option<String>)> = Vec::new();
     for input in &action.inputs {
         let node = format!("{input_ns}{}", input.name);
-        let value = args.get(&input.name).and_then(&scalar);
+        let value = args.get(&input.name).and_then(scalar);
         if input.required && input.source != InputSource::Binding && value.is_none() {
             violations.push((
                 format!("required input `{}` is missing", input.name),
