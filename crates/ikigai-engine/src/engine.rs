@@ -2418,11 +2418,16 @@ fn take_named_arg<'a>(tail: &'a str, declared: &[String]) -> Option<(&'a str, St
         let mut chars = quoted.char_indices();
         while let Some((i, c)) = chars.next() {
             match c {
-                '\\' => {
-                    if let Some((_, escaped)) = chars.next() {
-                        value.push(escaped);
+                // The tokenizer's rule: only `\"` and `\\` escape; any other backslash
+                // is literal. A trailing backslash ends the loop: unterminated.
+                '\\' => match chars.next() {
+                    Some((_, e @ ('"' | '\\'))) => value.push(e),
+                    Some((_, other)) => {
+                        value.push('\\');
+                        value.push(other);
                     }
-                }
+                    None => return None,
+                },
                 '"' => return Some((key, value, quoted[i + 1..].trim_start())),
                 ch => value.push(ch),
             }
@@ -4028,6 +4033,28 @@ mod tests {
         assert!(take_named_arg("nope=1 x", &declared).is_none());
         // an unterminated quote falls through to content
         assert!(take_named_arg("title=\"oops", &declared).is_none());
+    }
+
+    /// The quoting rule is ONE rule: `\"` and `\\` are the only escapes, and any other
+    /// backslash is literal. A named sink argument must read a quoted value exactly as the
+    /// tokenizer reads it for `source`, or `title="C:\dir"` is `C:\dir` on one verb and
+    /// `C:dir` on the other, and a regex like `\d+` silently loses its backslash.
+    #[test]
+    fn a_named_arg_keeps_an_unknown_escape_literal_like_the_tokenizer() {
+        let declared = vec!["title".to_string()];
+        for quoted in [r#""C:\dir""#, r#""\d+ \"x\" \\ end""#, r#""a\nb""#] {
+            let (_, value, _) = take_named_arg(&format!("title={quoted} rest"), &declared)
+                .unwrap_or_else(|| panic!("{quoted} is a terminated quote"));
+            assert_eq!(
+                vec![w(&value)],
+                tokenize(quoted).unwrap(),
+                "a sink's named arg and the tokenizer disagree on {quoted}"
+            );
+        }
+        // A backslash that escapes the closing quote, or ends the text, leaves the quote
+        // unterminated: the words fall through to content rather than become an argument.
+        assert!(take_named_arg(r#"title="abc\" rest"#, &declared).is_none());
+        assert!(take_named_arg(r#"title="abc\"#, &declared).is_none());
     }
 
     #[test]
