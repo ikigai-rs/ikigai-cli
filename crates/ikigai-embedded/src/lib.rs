@@ -2778,7 +2778,7 @@ impl Endpoint for HostHeartbeat {
         let jobs = time_registry().health();
         let peers = BROWSER
             .get()
-            .and_then(|browser| browser.as_ref())
+            .and_then(|browser| browser.as_ref().ok())
             .map(|browser| browser.peers())
             .unwrap_or_default();
         let report = health_text(&jobs, &peers, &HealthContext::now());
@@ -2856,7 +2856,7 @@ impl Endpoint for KernelHealth {
         // honest answer is "not watching" rather than a 1.2s wait for silence.
         let peers = BROWSER
             .get()
-            .and_then(|browser| browser.as_ref())
+            .and_then(|browser| browser.as_ref().ok())
             .map(|browser| browser.peers())
             .unwrap_or_default();
 
@@ -3259,7 +3259,31 @@ const CAP_NET_DISCOVER: &str = "urn:cap:net:discover";
 /// process that builds a kernel silently starts one" is the pattern removed from the
 /// reactor. Resolving `urn:peer:*` IS the request for it, so starting it there is the
 /// honest trigger.
-static BROWSER: std::sync::OnceLock<Option<ikigai_discovery::Browser>> = std::sync::OnceLock::new();
+static BROWSER: BrowseSlot = std::sync::OnceLock::new();
+
+/// A browse slot: the started browser, or WHY it could not start. A failure is kept like a
+/// success (one start attempt per process), so its cause has to be kept with it, or every
+/// later listing can only say that the browse is not running.
+type BrowseSlot = std::sync::OnceLock<std::result::Result<ikigai_discovery::Browser, String>>;
+
+/// The browse in `slot`, started with `start` on first use; `true` beside it when THIS call
+/// started it (the caller then waits [`FIRST_LISTEN`] for announcements).
+fn browse_in(
+    slot: &BrowseSlot,
+    start: impl FnOnce() -> std::io::Result<ikigai_discovery::Browser>,
+) -> Result<(&ikigai_discovery::Browser, bool)> {
+    let mut fresh = false;
+    let started = slot.get_or_init(|| {
+        fresh = true;
+        start().map_err(|e| e.to_string())
+    });
+    match started {
+        Ok(browser) => Ok((browser, fresh)),
+        Err(cause) => Err(Error::Endpoint(format!(
+            "could not start an mDNS browse on this machine: {cause}"
+        ))),
+    }
+}
 
 /// How long the FIRST listing waits for announcements to arrive. Multicast replies are not
 /// instant, so a browse started microseconds ago legitimately knows nothing; without this a
@@ -3296,16 +3320,7 @@ impl Endpoint for PeerList {
                 "listing peers requires `{CAP_NET_DISCOVER}`"
             )));
         }
-        let mut fresh = false;
-        let browser = BROWSER
-            .get_or_init(|| {
-                fresh = true;
-                ikigai_discovery::Browser::start().ok()
-            })
-            .as_ref()
-            .ok_or_else(|| {
-                Error::Endpoint("could not start an mDNS browse on this machine".to_string())
-            })?;
+        let (browser, fresh) = browse_in(&BROWSER, ikigai_discovery::Browser::start)?;
         if fresh {
             std::thread::sleep(FIRST_LISTEN);
         }
@@ -8493,6 +8508,26 @@ mod tests {
                 .try_to_turtle()
                 .unwrap_or_else(|e| panic!("{label}: the root's arrangement: {e}"));
         }
+    }
+
+    /// A browse that failed to start says WHY, on the call that started it and on every call
+    /// after (the failure is kept, like a success). `Browser::start().ok()` threw the cause
+    /// away, so `urn:peer:list` could only ever say that the browse had not started.
+    #[test]
+    fn a_failed_browse_start_keeps_its_cause() {
+        let slot = BrowseSlot::new();
+        let refused = |result: Result<(&ikigai_discovery::Browser, bool)>| match result {
+            Err(Error::Endpoint(message)) => message,
+            Err(other) => panic!("not an Endpoint error: {other:?}"),
+            Ok(_) => panic!("a failed start must not answer a browser"),
+        };
+        let first = refused(browse_in(&slot, || {
+            Err(std::io::Error::other("no multicast route to host"))
+        }));
+        assert!(first.contains("could not start an mDNS browse"), "{first}");
+        assert!(first.contains("no multicast route to host"), "{first}");
+        let again = refused(browse_in(&slot, || panic!("a kept failure is not retried")));
+        assert_eq!(again, first);
     }
 }
 
