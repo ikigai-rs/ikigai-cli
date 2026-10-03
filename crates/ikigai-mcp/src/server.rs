@@ -255,6 +255,28 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
     let shape = crate::collapse(&patterns, &declared);
     let empty = serde_json::Map::new();
     let args_map = arguments.as_object().unwrap_or(&empty);
+    // Every reader below takes an argument through `scalar`, which answers `None` for an
+    // array or an object exactly as it does for an absent key. So refuse a non-scalar
+    // value by name HERE, before anything reads it as missing: as a selector it was
+    // misreported as "required", and as an optional binding it was dropped and the call
+    // answered another resource. `null` stays what a JSON client means by it: not given.
+    let named = action
+        .inputs
+        .iter()
+        .map(|i| i.name.as_str())
+        .chain(shape.synthesized.iter().map(|a| a.name.as_str()));
+    for arg in named {
+        if let Some(value @ (Value::Array(_) | Value::Object(_))) = args_map.get(arg) {
+            let kind = if value.is_array() {
+                "an array"
+            } else {
+                "an object"
+            };
+            return tool_error(format!(
+                "`{arg}` takes one value (a string, number or boolean), not {kind}"
+            ));
+        }
+    }
     let supplied: std::collections::BTreeSet<String> = action
         .inputs
         .iter()
@@ -758,6 +780,48 @@ mod tests {
             let text = resp["content"][0]["text"].as_str().unwrap();
             assert!(text.contains("`repo` is required"), "{text}");
         }
+    }
+
+    /// An argument the caller DID pass, as a JSON array or object, is refused by name —
+    /// never read as absent. Read as absent, a non-scalar selector was reported as
+    /// "`repo` is required" (a misdiagnosis: it was supplied), and a non-scalar optional
+    /// binding was dropped, so the call answered a different resource than the one asked
+    /// for (`urn:repo:alpha:tree` for a `path` the caller gave).
+    #[test]
+    fn a_non_scalar_argument_is_refused_by_name_not_read_as_absent() {
+        let k = per_root_kernel();
+        let cap = Capability::root();
+        let call = |args: Value| {
+            handle(
+                &k,
+                &cap,
+                &ToolFilter::default(),
+                &json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params": { "name": "tree__source", "arguments": args }
+                }),
+            )
+            .unwrap()["result"]
+                .clone()
+        };
+        for (args, name) in [
+            (json!({ "repo": ["beta"] }), "repo"),
+            (json!({ "repo": { "name": "beta" } }), "repo"),
+            (json!({ "repo": "alpha", "path": ["src"] }), "path"),
+        ] {
+            let resp = call(args.clone());
+            assert_eq!(resp["isError"], true, "{args}: {resp}");
+            let text = resp["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.contains(&format!("`{name}` takes one value")),
+                "{args}: {text}"
+            );
+            assert!(!text.contains("is required"), "{args}: {text}");
+        }
+        // `null` is how a JSON client says "not given": still absent, not refused.
+        let resp = call(json!({ "repo": "beta", "path": null }));
+        assert_eq!(resp["isError"], false, "{resp}");
+        assert_eq!(resp["content"][0]["text"], "urn:repo:beta:tree");
     }
 
     /// A declared optional binding whose rows have no `{var}` for it (the
