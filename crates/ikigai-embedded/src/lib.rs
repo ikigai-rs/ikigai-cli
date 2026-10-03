@@ -559,16 +559,10 @@ fn host_history() -> FnEndpoint {
 /// from the invocation capability (the capability *is* the identity). Over QUIC this is
 /// the principal minted from the client certificate, so a connected peer can `source
 /// urn:host:identity` to see the `ws/<id>` segment its cert scoped it to — capability-on-
-/// the-wire, made observable. Anonymous (root) resolves report `root`.
+/// the-wire, made observable. Only the ROOT capability reports `root`; see [`identity_of`].
 fn host_identity() -> FnEndpoint {
     FnEndpoint::new("host-identity", move |inv: &Invocation<'_>| {
-        let who = inv
-            .capability
-            .scopes()
-            .and_then(|s| s.iter().find_map(|sc| sc.strip_prefix("urn:cap:fs:read:")))
-            .and_then(|path| path.rsplit(['/', '\\']).next())
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| "root (full authority)".to_string());
+        let who = identity_of(inv.capability);
         Ok(Representation::new(
             ReprType::new("text/plain").with_param("charset", "utf-8"),
             format!("identity {who}\n").into_bytes(),
@@ -582,6 +576,31 @@ fn host_identity() -> FnEndpoint {
             .verb(Verb::Meta)
             .output("text/plain;charset=utf-8"),
     )
+}
+
+/// The words `urn:host:identity` reports for a capability.
+///
+/// `root` is said ONLY of the root capability. An anonymous caller (the public HTTP door's
+/// empty capability) holds nothing and is told so; it used to be told `root (full
+/// authority)`, because "no workspace segment" and "root" took the same fallback. A scoped
+/// session with no workspace segment reports its scope count rather than a name it does
+/// not have.
+fn identity_of(capability: &ikigai_core::Capability) -> String {
+    let Some(scopes) = capability.scopes() else {
+        return "root (full authority)".to_string();
+    };
+    if let Some(id) = scopes
+        .iter()
+        .find_map(|sc| sc.strip_prefix("urn:cap:fs:read:"))
+        .and_then(|path| path.rsplit(['/', '\\']).next())
+    {
+        return id.to_string();
+    }
+    match scopes.len() {
+        0 => "anonymous (no authority)".to_string(),
+        1 => "scoped (1 scope, no workspace)".to_string(),
+        n => format!("scoped ({n} scopes, no workspace)"),
+    }
 }
 
 /// `urn:style:catalog` — a **text-output** XSLT (a resource) that renders the catalog
@@ -8268,6 +8287,39 @@ mod tests {
         }
         assert_eq!(demo_flag().load(Ordering::SeqCst), demo_before);
         assert_eq!(history_flag().load(Ordering::SeqCst), history_before);
+    }
+
+    /// `urn:host:identity` says `root` only of the root capability. The public HTTP door's
+    /// anonymous (empty) capability was told `root (full authority)` (ledger #733, H1).
+    #[test]
+    fn host_identity_calls_only_root_root() {
+        let kernel = served_kernel("Test (QUIC)", ServedSurface::default());
+        let identity = |cap: &Capability| {
+            let repr = block_on(kernel.issue(
+                Request::new(Verb::Source, Iri::parse("urn:host:identity").unwrap()),
+                cap,
+            ))
+            .expect("identity is readable by anyone");
+            String::from_utf8(repr.bytes).unwrap()
+        };
+        assert_eq!(
+            identity(&Capability::root()),
+            "identity root (full authority)\n"
+        );
+        let anonymous = identity(&Capability::scoped(Vec::<String>::new()));
+        assert!(!anonymous.contains("root"), "{anonymous}");
+        assert_eq!(anonymous, "identity anonymous (no authority)\n");
+        assert_eq!(
+            identity(&Capability::scoped(["urn:cap:fs:read:/srv/ws/alice"])),
+            "identity alice\n"
+        );
+        assert_eq!(
+            identity(&Capability::scoped([
+                "urn:cap:net:discover",
+                "urn:cap:sign"
+            ])),
+            "identity scoped (2 scopes, no workspace)\n"
+        );
     }
 
     /// Declared = enforced: the manifold says what the Sink needs, and the read needs nothing.
