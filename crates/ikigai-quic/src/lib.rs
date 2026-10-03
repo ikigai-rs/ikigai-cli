@@ -662,10 +662,9 @@ impl QuicResolver {
                         Ok(reply) => reply,
                         Err(_) => Err(io::Error::new(
                             io::ErrorKind::TimedOut,
-                            format!(
-                                "the peer did not describe itself within {}s",
-                                deadline.as_secs()
-                            ),
+                            // `Debug` keeps the unit (`300ms`, `30s`); `as_secs()` would
+                            // report a sub-second bound as `0s`.
+                            format!("the peer did not describe itself within {deadline:?}"),
                         )),
                     }
                 }
@@ -2185,5 +2184,8 @@ mod describe_timeout {
         // difference when it decides whether real resources are missing from its catalog.
         assert!(matches!(error, Error::Timeout(_)), "{error:?}");
         assert!(error.is_transient(), "{error:?}");
+        // The message names the bound that fired. `as_secs()` truncated it, so this 300ms
+        // deadline was reported as "within 0s": a bound the operator never set.
+        assert!(error.to_string().contains("within 300ms"), "{error}");
     }
 }
