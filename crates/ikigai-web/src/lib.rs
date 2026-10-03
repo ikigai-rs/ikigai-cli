@@ -1558,7 +1558,10 @@ fn apply_edge_policy(
             resp.headers
                 .push(("Access-Control-Allow-Methods".to_string(), methods));
         }
-        let headers = if config.cors.allowed_headers.is_empty() {
+        // The EFFECTIVE policy's list (the route's, else the server's) — reading the
+        // server-wide one here echoed any requested header past a route that names an
+        // allow-list (ledger #733, finding W2).
+        let headers = if cors.allowed_headers.is_empty() {
             req.header("access-control-request-headers")
                 .unwrap_or("")
                 .to_string()
@@ -3347,6 +3350,45 @@ mod tests {
         assert!(
             resp.contains("Access-Control-Allow-Methods:"),
             "preflight should advertise methods, got: {resp}"
+        );
+    }
+
+    /// A route's CORS header allow-list governs its preflight; the server-wide default (empty,
+    /// which echoes) must not override it.
+    #[tokio::test]
+    async fn a_routes_cors_header_allow_list_governs_its_preflight() {
+        let route = Route {
+            pattern: "/doc".to_string(),
+            iri_template: "urn:test:doc".to_string(),
+            cap: None,
+            cors: Some(CorsPolicy {
+                allowed_origins: vec!["https://a.example".to_string()],
+                allowed_headers: vec!["x-ok".to_string()],
+                ..Default::default()
+            }),
+            csp: None,
+        };
+        let addr = start_with(EdgeConfig {
+            routes: RouteTable::new(vec![route]),
+            ..Default::default()
+        })
+        .await;
+        let resp = roundtrip(
+            addr,
+            "OPTIONS /doc HTTP/1.1\r\nHost: x\r\nOrigin: https://a.example\r\nAccess-Control-Request-Method: GET\r\nAccess-Control-Request-Headers: x-evil\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.contains("Access-Control-Allow-Origin: https://a.example"),
+            "got: {resp}"
+        );
+        assert!(
+            resp.contains("Access-Control-Allow-Headers: x-ok"),
+            "the route's list is advertised, got: {resp}"
+        );
+        assert!(
+            !resp.contains("x-evil"),
+            "a header outside the route's list is not echoed, got: {resp}"
         );
     }
 
