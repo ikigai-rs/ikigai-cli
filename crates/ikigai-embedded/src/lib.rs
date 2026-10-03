@@ -1060,6 +1060,34 @@ fn parse_action_matches(turtle: &str) -> Vec<SelectCandidate> {
     candidates
 }
 
+/// The 1-based number the residual chose, read from its reply.
+///
+/// The declared form ("CHOICE: 5 — …") is parsed first: a model that ignores it and emits
+/// list formatting ("1. Action 5 …") would otherwise have its FORMATTING read as its choice.
+/// And the form counts only where the number FOLLOWS the word, separated by nothing but
+/// whitespace and punctuation (`CHOICE: 3`, `**CHOICE:** 3`): reading the first number
+/// anywhere after "choice" took "choices 1 and 3 fit; CHOICE: 3" as 1.
+fn parse_choice(text: &str) -> Option<usize> {
+    let number = |t: &str| -> Option<usize> {
+        t.chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .ok()
+    };
+    let upper = text.to_ascii_uppercase();
+    upper
+        .match_indices("CHOICE")
+        .find_map(|(i, word)| {
+            number(
+                upper[i + word.len()..]
+                    .trim_start_matches(|c: char| c.is_whitespace() || c.is_ascii_punctuation()),
+            )
+        })
+        // No declared form: the first number anywhere, as before.
+        .or_else(|| number(text.trim_start_matches(|c: char| !c.is_ascii_digit())))
+}
+
 /// Render candidates back out as the selection graph. The chosen one (if any)
 /// leads and carries the rationale as `rdfs:comment`; the rest follow, marked
 /// considered. (Proper ik:selected/ik:rationale terms can join the vocabulary
@@ -1208,23 +1236,7 @@ Authorized candidate actions:
         let outcome: std::result::Result<(usize, String), String> = match inv.issue(ask).await {
             Ok(reply) => {
                 let text = String::from_utf8_lossy(&reply.bytes).to_string();
-                // Parse the declared form first ("CHOICE: 5 — …"): a model that
-                // ignores it and emits list formatting ("1. Action 5 …") would
-                // otherwise have its FORMATTING read as its choice.
-                let digits = |t: &str| -> Option<usize> {
-                    t.chars()
-                        .skip_while(|ch| !ch.is_ascii_digit())
-                        .take_while(char::is_ascii_digit)
-                        .collect::<String>()
-                        .parse()
-                        .ok()
-                };
-                let number = text
-                    .to_ascii_uppercase()
-                    .find("CHOICE")
-                    .and_then(|i| digits(&text[i..]))
-                    .or_else(|| digits(&text));
-                number
+                parse_choice(&text)
                     .and_then(|n| n.checked_sub(1))
                     .filter(|i| *i < candidates.len())
                     .map(|index| (index, format!("goal: {goal} — {}", text.trim())))
@@ -7814,6 +7826,33 @@ mod tests {
         assert!(reparsed
             .iter()
             .any(|c| c.template && c.endpoint == "urn:demo:echo/{message}"));
+    }
+
+    /// The residual's pick is the number AFTER the declared `CHOICE`, not the first number
+    /// after any word that contains "choice". A reply that discusses its options before
+    /// answering in the declared form ("choices 1 and 3 …; CHOICE: 3") was read as 1: a
+    /// different authorized action from the one the model chose, with the model's own
+    /// rationale for 3 attached to it.
+    #[test]
+    fn parse_choice_reads_the_declared_form_not_the_word_in_prose() {
+        assert_eq!(
+            parse_choice("Both choices 1 and 3 fit; CHOICE: 3 — it reads the calendar."),
+            Some(3)
+        );
+        assert_eq!(
+            parse_choice("My choice is 2.\nCHOICE: 4 — narrower."),
+            Some(4)
+        );
+        // The declared form, in the spellings models actually emit.
+        assert_eq!(parse_choice("CHOICE: 5 — the only writer"), Some(5));
+        assert_eq!(parse_choice("choice:2"), Some(2));
+        assert_eq!(parse_choice("**CHOICE:** 3 — markdown"), Some(3));
+        // A reply that ignores the form still falls back to its first number.
+        assert_eq!(
+            parse_choice("I would pick 2, because it is cheaper."),
+            Some(2)
+        );
+        assert_eq!(parse_choice("no number here"), None);
     }
 
     #[test]
