@@ -1213,20 +1213,49 @@ fn daemon(_mounts: Mounts) {
 }
 
 /// Build the session capability from the union of named grants + explicit
-/// scopes. Empty ⇒ root (unrestricted). The grant is the ceiling.
+/// scopes. The grant is the ceiling.
+///
+/// Root (unrestricted) ONLY when neither `--grant` nor `--scope` was given — that is
+/// the operator's stated choice, and the banner says so. A named grant that resolves to
+/// no scopes (misspelled, deleted, empty, or `grants.json` missing or unparseable) is
+/// an `Err` naming it: an unknown grant is "undecided", never "unrestricted", the same
+/// rule the served door's per-identity grants follow (`clients::authority`).
 #[cfg(feature = "embedded")]
-fn mcp_capability(grants: &[String], scopes: &[String]) -> ikigai_core::Capability {
+fn mcp_capability(grants: &[String], scopes: &[String]) -> Result<ikigai_core::Capability, String> {
+    mcp_capability_in(grants, scopes, ikigai_embedded::grant_scopes)
+}
+
+/// [`mcp_capability`] over an explicit grant lookup, so the policy is testable without
+/// a grants file.
+#[cfg(feature = "embedded")]
+fn mcp_capability_in(
+    grants: &[String],
+    scopes: &[String],
+    scopes_of: impl Fn(&str) -> Vec<String>,
+) -> Result<ikigai_core::Capability, String> {
+    if grants.is_empty() && scopes.is_empty() {
+        return Ok(ikigai_core::Capability::root());
+    }
     let mut union: Vec<String> = scopes.to_vec();
+    let mut undecided = Vec::new();
     for name in grants {
-        union.extend(ikigai_embedded::grant_scopes(name));
+        let granted = scopes_of(name);
+        if granted.is_empty() {
+            undecided.push(format!("`{name}`"));
+        }
+        union.extend(granted);
+    }
+    if !undecided.is_empty() {
+        return Err(format!(
+            "grant {} is unknown or grants no scopes (check {})",
+            undecided.join(", "),
+            ikigai_embedded::grants_path()
+                .map_or_else(|| "grants.json".to_string(), |p| p.display().to_string())
+        ));
     }
     union.sort();
     union.dedup();
-    if union.is_empty() {
-        ikigai_core::Capability::root()
-    } else {
-        ikigai_core::Capability::scoped(union)
-    }
+    Ok(ikigai_core::Capability::scoped(union))
 }
 
 /// Build the tool-visibility filter from the named grants — the union of their
@@ -1256,7 +1285,15 @@ fn mcp(grants: Vec<String>, scopes: Vec<String>, mounts: Mounts) {
     use std::io::{BufRead, Write};
     use std::sync::{Arc, Mutex, RwLock};
 
-    let capability = Arc::new(RwLock::new(mcp_capability(&grants, &scopes)));
+    // A grant that names nothing refuses to start: running it would either be root (the
+    // old fail-open) or a session with no authority the operator did not ask for.
+    let capability = match mcp_capability(&grants, &scopes) {
+        Ok(capability) => Arc::new(RwLock::new(capability)),
+        Err(e) => {
+            eprintln!("ikigai mcp: refusing to start: {e}");
+            std::process::exit(2);
+        }
+    };
     let filter = Arc::new(RwLock::new(mcp_filter(&grants)));
     match capability.read().expect("cap lock").scopes() {
         None => eprintln!("ikigai mcp: no --grant/--scope — running UNRESTRICTED (root)"),
@@ -1376,7 +1413,20 @@ fn mcp(grants: Vec<String>, scopes: Vec<String>, mounts: Mounts) {
                     last = now;
                     // A grant edit can change authority (scopes) and/or visibility
                     // (show/hide) — either reshapes the tool list, so re-emit on both.
-                    let fresh_cap = mcp_capability(&grants, &scopes);
+                    // Fail CLOSED mid-session: a grant that stops resolving (deleted,
+                    // renamed, or the file left unparseable) drops the session to NO
+                    // authority until the file names it again. Keeping the last good grant
+                    // instead would make deleting a grant a revocation that does not revoke.
+                    let fresh_cap = match mcp_capability(&grants, &scopes) {
+                        Ok(cap) => cap,
+                        Err(e) => {
+                            eprintln!(
+                                "ikigai mcp: {e} — the session now holds NO authority until \
+                                 the grant resolves again"
+                            );
+                            ikigai_core::Capability::scoped(Vec::<String>::new())
+                        }
+                    };
                     let fresh_filter = mcp_filter(&grants);
                     let cap_changed =
                         fresh_cap.scopes() != capability.read().expect("cap lock").scopes();
