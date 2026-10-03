@@ -363,12 +363,7 @@ impl Space for Gated {
 fn host_demo() -> FnEndpoint {
     FnEndpoint::new("host-demo", move |inv: &Invocation<'_>| {
         let flag = demo_flag();
-        // A Sink carries the new state as `content`; a Source just reports it.
-        if let Ok(value) = inv.inline_str("content") {
-            let on = matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "on" | "true" | "enable" | "enabled" | "yes" | "1"
-            );
+        if let Some(on) = toggle_write(inv, CAP_HOST_WRITE_DEMO)? {
             flag.store(on, Ordering::SeqCst);
         }
         let state = if flag.load(Ordering::SeqCst) {
@@ -381,17 +376,72 @@ fn host_demo() -> FnEndpoint {
             format!("demo {state}\n").into_bytes(),
         ))
     })
-    .with_description(
-        Description::new("host-demo")
-            .title("Demo toggle")
-            .summary(
-                "The interactive runbook on/off — source reports it, `sink … on|off` flips it.",
-            )
-            .verb(Verb::Source)
-            .verb(Verb::Sink)
-            .verb(Verb::Meta)
-            .output("text/plain;charset=utf-8"),
-    )
+    .with_description(toggle_description(
+        "host-demo",
+        "Demo toggle",
+        "The interactive runbook on/off — source reports it, `sink … on|off` flips it.",
+        CAP_HOST_WRITE_DEMO,
+    ))
+}
+
+/// The capability that flips `urn:host:demo` (a Sink). The flag is PROCESS-global and `base_space` is
+/// bound into every served kernel, so without it an anonymous HTTP or QUIC client could
+/// mount the runbook (and its timer) inside the server.
+pub const CAP_HOST_WRITE_DEMO: &str = "urn:cap:host:write:demo";
+
+/// The capability that flips `urn:host:history` (a Sink). Flipping it writes or removes a marker in
+/// the SERVING user's `~/.ikigai`, so it is never anonymous.
+pub const CAP_HOST_WRITE_HISTORY: &str = "urn:cap:host:write:history";
+
+/// The new state a toggle's Sink carries, or `None` for a read.
+///
+/// Only a SINK mutates: a Source that happens to carry `content` (a GET with `?content=on`)
+/// reports, it never flips. And the Sink is checked against `cap` here as well as by the
+/// kernel's pre-dispatch check on the declared `requires` (declared = enforced).
+fn toggle_write(inv: &Invocation<'_>, cap: &str) -> ikigai_core::Result<Option<bool>> {
+    if inv.request.verb != Verb::Sink {
+        return Ok(None);
+    }
+    if !inv.capability.allows(cap) {
+        return Err(Error::Denied(format!(
+            "changing this host's setting requires `{cap}`"
+        )));
+    }
+    let value = inv.inline_str("content")?;
+    Ok(Some(matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "on" | "true" | "enable" | "enabled" | "yes" | "1"
+    )))
+}
+
+/// The contract shared by the host's on/off toggles: reading is open, writing requires
+/// `cap`. Per-verb `ActionSpec`s, because the two verbs differ in authority.
+fn toggle_description(
+    id: &'static str,
+    title: &'static str,
+    summary: &'static str,
+    cap: &'static str,
+) -> Description {
+    Description::new(id)
+        .title(title)
+        .summary(summary)
+        .verb(Verb::Meta)
+        .action(
+            ActionSpec::new(Verb::Source)
+                .summary("report the setting: `on` or `off`")
+                .output("text/plain;charset=utf-8"),
+        )
+        .action(
+            ActionSpec::new(Verb::Sink)
+                .summary("turn the setting on or off")
+                .requires(cap)
+                .input(
+                    ArgSpec::new("content")
+                        .class(crate::XSD_STRING)
+                        .summary("on|off (also true/false, enable/disable, yes/no, 1/0)"),
+                )
+                .output("text/plain;charset=utf-8"),
+        )
 }
 
 /// `$HOME/.ikigai`, created — the ikigai-owned config/state directory. ([`file_root`]
@@ -484,12 +534,7 @@ pub fn set_history(on: bool) {
 /// `history` command is sugar over these.
 fn host_history() -> FnEndpoint {
     FnEndpoint::new("host-history", move |inv: &Invocation<'_>| {
-        // A Sink carries the new state as `content`; a Source just reports it.
-        if let Ok(value) = inv.inline_str("content") {
-            let on = matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "on" | "true" | "enable" | "enabled" | "yes" | "1"
-            );
+        if let Some(on) = toggle_write(inv, CAP_HOST_WRITE_HISTORY)? {
             set_history(on);
         }
         let body = if history_flag().load(Ordering::SeqCst) {
@@ -502,17 +547,12 @@ fn host_history() -> FnEndpoint {
             body.into_bytes(),
         ))
     })
-    .with_description(
-        Description::new("host-history")
-            .title("History toggle")
-            .summary(
-                "Persist command history across runs — source reports it, `sink … on|off` flips it.",
-            )
-            .verb(Verb::Source)
-            .verb(Verb::Sink)
-            .verb(Verb::Meta)
-            .output("text/plain;charset=utf-8"),
-    )
+    .with_description(toggle_description(
+        "host-history",
+        "History toggle",
+        "Persist command history across runs — source reports it, `sink … on|off` flips it.",
+        CAP_HOST_WRITE_HISTORY,
+    ))
 }
 
 /// `urn:host:identity` — reports the identity the current session resolves under, read
@@ -8192,6 +8232,62 @@ mod tests {
                 &Capability::root(),
             ),
         )
+    }
+
+    /// `urn:host:demo` and `urn:host:history` are bound into EVERY served kernel and their
+    /// flags are process-global, so an anonymous client (the HTTP door's public cap, a QUIC
+    /// client whose grant names neither) must not flip them (ledger #733, finding H3). The
+    /// read stays open. Only the refusals are exercised: a positive write would flip a flag
+    /// other tests in this process read, and history's writes `$HOME/.ikigai`.
+    #[test]
+    fn an_anonymous_caller_cannot_flip_the_host_toggles() {
+        let kernel = served_kernel("Test (QUIC)", ServedSurface::default());
+        let anonymous = Capability::scoped(Vec::<String>::new());
+        let demo_before = demo_flag().load(Ordering::SeqCst);
+        let history_before = history_flag().load(Ordering::SeqCst);
+        for (iri, cap) in [
+            ("urn:host:demo", CAP_HOST_WRITE_DEMO),
+            ("urn:host:history", CAP_HOST_WRITE_HISTORY),
+        ] {
+            let flip = |verb| {
+                block_on(
+                    kernel.issue(
+                        Request::new(verb, Iri::parse(iri).unwrap())
+                            .with_arg("content", ArgRef::Inline(b"on".to_vec())),
+                        &anonymous,
+                    ),
+                )
+            };
+            let sink = flip(Verb::Sink).expect_err("an anonymous Sink is refused");
+            assert!(
+                matches!(&sink, ikigai_core::Error::Denied(m) if m.contains(cap)),
+                "{iri}: {sink:?}"
+            );
+            // A Source carrying `content` (an HTTP GET with `?content=on`) only reports.
+            flip(Verb::Source).expect("reading the toggle stays open");
+        }
+        assert_eq!(demo_flag().load(Ordering::SeqCst), demo_before);
+        assert_eq!(history_flag().load(Ordering::SeqCst), history_before);
+    }
+
+    /// Declared = enforced: the manifold says what the Sink needs, and the read needs nothing.
+    #[test]
+    fn the_host_toggles_declare_the_capability_their_sink_enforces() {
+        for (endpoint, cap) in [
+            (host_demo(), CAP_HOST_WRITE_DEMO),
+            (host_history(), CAP_HOST_WRITE_HISTORY),
+        ] {
+            let actions = endpoint.describe().action_specs();
+            let requires = |verb| {
+                actions
+                    .iter()
+                    .find(|a| a.verb == verb)
+                    .map(|a| a.requires.clone())
+                    .unwrap_or_else(|| panic!("{verb:?} is declared"))
+            };
+            assert_eq!(requires(Verb::Sink), vec![cap.to_string()]);
+            assert!(requires(Verb::Source).is_empty());
+        }
     }
 
     /// The manifold as a stranger reads it: every row `urn:kernel:actions` offers, by pattern.
