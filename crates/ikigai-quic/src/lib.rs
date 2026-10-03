@@ -572,25 +572,39 @@ impl Wire {
     /// survives the reconnect (the peer is genuinely down) surfaces as normal, for the
     /// reliability overlays to treat as the transient [`Unavailable`](Error::Unavailable)
     /// it is.
-    async fn round_trip(&self, request: Vec<u8>) -> io::Result<Reply> {
+    ///
+    /// ★ What may be REPLAYED is the IPC transport's discipline (`replay_may_follow`
+    /// there): a call that never reached the peer is always safe to send again, but once
+    /// the request was handed over whole, the peer may have run it and only the reply was
+    /// lost. Then only a `replayable` call (a read) is sent again; a Sink or Delete
+    /// surfaces the transient for its CALLER to decide, because running it twice is not
+    /// the transport's choice to make (ledger #733, finding Q2). The connection still
+    /// heals: the next call's stream fails to open on the dead one and reconnects.
+    async fn round_trip(&self, request: Vec<u8>, replayable: bool) -> io::Result<Reply> {
         match self.attempt(&request).await {
             Ok(reply) => Ok(reply),
+            Err(Attempt::Sent(error)) if !replayable => Err(error),
             Err(_) => {
                 self.reconnect().await?;
-                self.attempt(&request).await
+                self.attempt(&request).await.map_err(Attempt::into_error)
             }
         }
     }
 
     /// One attempt on the current connection. Cloning the connection out of the lock
     /// (cheap — it is an `Arc` inside) keeps the guard from being held across an await.
-    async fn attempt(&self, request: &[u8]) -> io::Result<Reply> {
+    async fn attempt(&self, request: &[u8]) -> Result<Reply, Attempt> {
         let connection = { self.connection().clone() };
-        let (mut send, mut recv) = connection.open_bi().await.map_err(other)?;
-        send.write_all(request).await.map_err(other)?;
-        send.finish().map_err(other)?;
-        let bytes = recv.read_to_end(MAX_MESSAGE).await.map_err(other)?;
-        decode(&bytes)
+        // The peer runs a call only once it reads the stream to its end, so until
+        // `finish` succeeds nothing can have run: a failure here is `Unsent`.
+        let (mut send, mut recv) = connection.open_bi().await.map_err(Attempt::unsent)?;
+        send.write_all(request).await.map_err(Attempt::unsent)?;
+        send.finish().map_err(Attempt::unsent)?;
+        let bytes = recv
+            .read_to_end(MAX_MESSAGE)
+            .await
+            .map_err(|e| Attempt::Sent(other(e)))?;
+        decode(&bytes).map_err(Attempt::Sent)
     }
 
     /// Re-establish the connection through the surviving endpoint, reusing the same pinned
@@ -609,6 +623,41 @@ impl Wire {
         self.connection
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// How an [`attempt`](Wire::attempt) failed, as far as replaying it is concerned.
+enum Attempt {
+    /// The request never reached the peer whole, so it cannot have run.
+    Unsent(io::Error),
+    /// The request was handed over; the peer may have run it and the reply been lost.
+    Sent(io::Error),
+}
+
+impl Attempt {
+    fn unsent<E: std::fmt::Display>(error: E) -> Self {
+        Attempt::Unsent(other(error))
+    }
+
+    fn into_error(self) -> io::Error {
+        match self {
+            Attempt::Unsent(error) | Attempt::Sent(error) => error,
+        }
+    }
+}
+
+/// Whether `call` may be sent again after a failure that may have reached the peer: the
+/// enumeration, the cache probe, and the read verbs. A Sink or Delete may not — the same
+/// line `ikigai_ipc` draws in its `replay_may_follow`.
+fn replay_may_follow(call: &Call) -> bool {
+    match call {
+        Call::Entries | Call::IsCached(_) => true,
+        Call::Issue(request) | Call::IssueAs(request, _) | Call::IssueTraced(request, _, _) => {
+            matches!(
+                request.verb,
+                ikigai_core::Verb::Source | ikigai_core::Verb::Exists | ikigai_core::Verb::Meta
+            )
+        }
     }
 }
 
@@ -651,14 +700,16 @@ impl QuicResolver {
         let deadline = is_describe(&call)
             .then_some(self.describe_timeout)
             .flatten();
+        let replayable = replay_may_follow(&call);
         drive(self.runtime(), async move {
             match deadline {
-                None => wire.round_trip(request).await,
+                None => wire.round_trip(request, replayable).await,
                 // ★ This bounds the WHOLE exchange — the reconnect-and-retry inside
                 // `Wire::round_trip` included. Bounding each attempt separately would let
                 // a peer that accepts and never answers cost two deadlines per call.
                 Some(deadline) => {
-                    match tokio::time::timeout(deadline, wire.round_trip(request)).await {
+                    match tokio::time::timeout(deadline, wire.round_trip(request, replayable)).await
+                    {
                         Ok(reply) => reply,
                         Err(_) => Err(io::Error::new(
                             io::ErrorKind::TimedOut,
