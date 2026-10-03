@@ -1159,11 +1159,6 @@ fn selection_turtle(
     let mut ttl = String::from(
         "@prefix ik: <https://ikigai-rs.dev/ns#> .\n@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n",
     );
-    let escape = |s: &str| {
-        s.replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', " ")
-    };
     let order: Vec<usize> = match chosen {
         Some(i) => std::iter::once(i)
             .chain((0..candidates.len()).filter(|j| *j != i))
@@ -1175,7 +1170,7 @@ fn selection_turtle(
         // A template pattern is not a legal IRI — round-trip it as the
         // ik:template literal it arrived as, never as `ik:endpoint <…>`.
         let named = if c.template {
-            format!("ik:template \"{}\"", escape(&c.endpoint))
+            format!("ik:template {}", turtle_string(&c.endpoint))
         } else {
             format!("ik:endpoint <{}>", c.endpoint)
         };
@@ -1199,8 +1194,8 @@ fn selection_turtle(
                 .to_string(),
         };
         ttl.push_str(&format!(
-            " ;\n    rdfs:comment \"{}\" .\n",
-            escape(&comment)
+            " ;\n    rdfs:comment {} .\n",
+            turtle_string(&comment)
         ));
     }
     ttl
@@ -3262,12 +3257,32 @@ fn health_turtle(
         out.push_str(" .\n\n");
     }
     for peer in peers {
+        // The name was announced on the LAN: escaped, like `peers_turtle`.
         out.push_str(&format!(
-            "<urn:peer:{}> a ik:Peer ;\n    ik:peerName \"{}\" ;\n    ik:heard \"true\"^^xsd:boolean .\n\n",
-            peer.name, peer.name
+            "<{}> a ik:Peer ;\n    ik:peerName {} ;\n    ik:heard \"true\"^^xsd:boolean .\n\n",
+            peer_iri(&peer.name),
+            turtle_string(&peer.name)
         ));
     }
     out
+}
+
+/// `s` as a complete Turtle string literal, quotes included, with every character Turtle
+/// requires escaped (`"`, `\\`, and the line breaks). The one helper for text that did not
+/// come from this process — an mDNS announcement, a mounted peer's catalog — because a
+/// hand-rolled `"{}"` around such text lets it close the literal and write its own triples.
+/// The exact output is pinned by `turtle_string_escapes_what_turtle_forbids_raw`.
+fn turtle_string(s: &str) -> String {
+    // oxrdf's N-Triples serialization of a simple literal is valid Turtle and escapes
+    // exactly what the grammar requires.
+    oxrdf::Literal::new_simple_literal(s).to_string()
+}
+
+/// The skolem IRI `urn:peer:{name}` for an ANNOUNCED peer name, with every byte outside
+/// the RFC 3986 unreserved set percent-encoded, so a name carrying `>` or a space cannot
+/// end the IRI. An ordinary name (`plasma`, `bug-2`) is unchanged.
+fn peer_iri(name: &str) -> String {
+    format!("urn:peer:{}", urlencode(name))
 }
 
 /// How long this process has been up — the denominator for "has a job that never ran had
@@ -3483,16 +3498,28 @@ fn peers_turtle(peers: &[ikigai_discovery::Peer]) -> String {
     );
     for p in peers {
         // Skolemized, per the house rule: a stable IRI per peer name, never a blank node.
-        out.push_str(&format!("<urn:peer:{}> a ik:Peer ;\n", p.name));
-        out.push_str(&format!("    ik:peerName \"{}\" ;\n", p.name));
+        // ⚠ Every string below except `trusted` was ANNOUNCED by whatever is on the LAN, so
+        // each one goes through `turtle_string`/`peer_iri` — unescaped, a `"` in a TXT
+        // record closed the literal and asserted any triple it liked (ledger #733, H5).
+        out.push_str(&format!("<{}> a ik:Peer ;\n", peer_iri(&p.name)));
+        out.push_str(&format!("    ik:peerName {} ;\n", turtle_string(&p.name)));
         if let Some(addr) = p.socket_addr() {
-            out.push_str(&format!("    ik:peerAddress \"{addr}\" ;\n"));
+            out.push_str(&format!(
+                "    ik:peerAddress {} ;\n",
+                turtle_string(&addr.to_string())
+            ));
         }
         if let Some(surface) = &p.surface {
-            out.push_str(&format!("    ik:peerSurface \"{surface}\" ;\n"));
+            out.push_str(&format!(
+                "    ik:peerSurface {} ;\n",
+                turtle_string(surface)
+            ));
         }
         if let Some(ceiling) = &p.ceiling {
-            out.push_str(&format!("    ik:peerCeiling \"{ceiling}\" ;\n"));
+            out.push_str(&format!(
+                "    ik:peerCeiling {} ;\n",
+                turtle_string(ceiling)
+            ));
         }
         // `trusted` is OURS, not the peer's: whether this machine holds a cert for it. An
         // announcement can claim anything; only the pinned cert decides who it is.
@@ -7038,6 +7065,80 @@ mod tests {
             with_none.contains("none heard"),
             "an absent peer is reported, not escalated: {with_none}"
         );
+    }
+
+    /// A peer as the LAN announced it: every string field hostile.
+    fn hostile_peer() -> ikigai_discovery::Peer {
+        let forge = "x\" ; ik:pinnedHere \"true\"^^xsd:boolean ; ik:peerSurface \"y";
+        ikigai_discovery::Peer {
+            name: format!("mallory> a ik:Peer ; ik:pinnedHere true . <urn:x:{forge}"),
+            addrs: vec![],
+            port: 1,
+            surface: Some(forge.to_string()),
+            ceiling: Some(format!("{forge}\n\r\\")),
+            version: None,
+            trusted: false,
+        }
+    }
+
+    fn parse_turtle(ttl: &str) -> Vec<oxrdf::Quad> {
+        oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle)
+            .for_slice(ttl.as_bytes())
+            .collect::<std::result::Result<_, _>>()
+            .unwrap_or_else(|e| panic!("the graph parses ({e}):\n{ttl}"))
+    }
+
+    /// An mDNS announcement cannot write triples: its strings are escaped into literals and
+    /// its name into the skolem IRI, so `ik:pinnedHere` stays the one value THIS machine
+    /// decided (ledger #733, finding H5) — in both graphs that carry announced names.
+    #[test]
+    fn an_announced_peer_cannot_forge_triples() {
+        let peer = hostile_peer();
+        let peers = parse_turtle(&peers_turtle(std::slice::from_ref(&peer)));
+        let pinned: Vec<_> = peers
+            .iter()
+            .filter(|q| q.predicate.as_str().ends_with("#pinnedHere"))
+            .collect();
+        assert_eq!(pinned.len(), 1, "exactly one pinnedHere: {pinned:?}");
+        assert!(matches!(&pinned[0].object, oxrdf::Term::Literal(l) if l.value() == "false"));
+        let surface = peers
+            .iter()
+            .find(|q| q.predicate.as_str().ends_with("#peerSurface"))
+            .expect("the surface is carried");
+        assert!(
+            matches!(&surface.object, oxrdf::Term::Literal(l) if Some(l.value()) == peer.surface.as_deref()),
+            "the surface round-trips verbatim: {surface:?}"
+        );
+        let subjects: std::collections::BTreeSet<_> =
+            peers.iter().map(|q| q.subject.to_string()).collect();
+        assert_eq!(subjects.len(), 1, "one peer, one node: {subjects:?}");
+
+        let health = parse_turtle(&health_turtle(
+            &[],
+            std::slice::from_ref(&peer),
+            &context(60, false),
+        ));
+        let names: Vec<_> = health
+            .iter()
+            .filter(|q| q.predicate.as_str().ends_with("#peerName"))
+            .collect();
+        assert_eq!(names.len(), 1);
+        assert!(matches!(&names[0].object, oxrdf::Term::Literal(l) if l.value() == peer.name));
+    }
+
+    /// The shape of the helper's output, pinned: quotes included, and `"`, `\`, LF and CR
+    /// escaped (Turtle's STRING_LITERAL_QUOTE forbids all four raw).
+    #[test]
+    fn turtle_string_escapes_what_turtle_forbids_raw() {
+        assert_eq!(turtle_string("plain"), "\"plain\"");
+        assert_eq!(turtle_string("a\"b\\c\nd\re"), "\"a\\\"b\\\\c\\nd\\re\"");
+    }
+
+    /// An ordinary peer name keeps the IRI it always had.
+    #[test]
+    fn an_ordinary_peer_name_keeps_its_iri() {
+        assert_eq!(peer_iri("plasma"), "urn:peer:plasma");
+        assert_eq!(peer_iri("bug-2.local"), "urn:peer:bug-2.local");
     }
 
     fn context(uptime_secs: u64, sleep_measured: bool) -> HealthContext {
