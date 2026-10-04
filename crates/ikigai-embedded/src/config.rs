@@ -68,6 +68,47 @@ pub fn config_path() -> PathBuf {
         .join("config.toml")
 }
 
+/// The per-peer certificate directory `<config home>/quic-<name>/` (plasma holds
+/// `quic-bug`, bug holds `quic-plasma`), or `None` when there is no config home or `name`
+/// cannot name one directory. See [`peer_cert_dir_in`].
+pub fn peer_cert_dir(name: &str) -> Option<PathBuf> {
+    peer_cert_dir_in(&config_home()?, name)
+}
+
+/// `<home>/quic-<name>/`, or `None` when `name` is not a single path segment.
+///
+/// THE spelling of the per-peer directory: the peer listing's "do I hold a pinned
+/// certificate?" oracle and the CLI's `peer:<name>` dialer both resolve through here, so
+/// they cannot disagree about where a peer's certificate lives.
+///
+/// ⚠ `name` is usually what the LAN ANNOUNCED over mDNS, and a DNS-SD instance name may
+/// carry any byte. Joined raw, `plasma/../quic-plasma` resolved to the real `quic-plasma`
+/// directory, so a stranger's announcement was listed as trusted with `ik:pinnedHere true`
+/// (ledger #741). A name with a path separator (`/` or `\`), a NUL, or nothing at all
+/// names no directory; it is refused here, before any path is built, rather than
+/// normalized, because a normalized name would be a DIFFERENT peer's name.
+///
+/// ```
+/// use std::path::{Path, PathBuf};
+/// use ikigai_embedded::config::peer_cert_dir_in;
+///
+/// let home = Path::new("/home/b/.config/ikigai");
+/// assert_eq!(peer_cert_dir_in(home, "plasma"), Some(PathBuf::from("/home/b/.config/ikigai/quic-plasma")));
+/// assert_eq!(peer_cert_dir_in(home, "plasma/../quic-bug"), None);
+/// assert_eq!(peer_cert_dir_in(home, ""), None);
+/// ```
+pub fn peer_cert_dir_in(home: &Path, name: &str) -> Option<PathBuf> {
+    is_single_segment(name).then(|| home.join(format!("quic-{name}")))
+}
+
+/// Whether `name` stays ONE directory entry once prefixed with `quic-`. Separators of
+/// either platform are refused on every platform: a name that is one segment on macOS
+/// and three on Windows is not a name to build a path from. `.` and `..` need no case of
+/// their own, because the `quic-` prefix makes them ordinary entries.
+fn is_single_segment(name: &str) -> bool {
+    !name.is_empty() && !name.contains(['/', '\\', '\0'])
+}
+
 /// The value of `key` in the host config, or `None` if the file or the key is absent.
 pub fn get(key: &str) -> Option<String> {
     value_for(&std::fs::read_to_string(config_path()).ok()?, key)
@@ -151,7 +192,8 @@ fn value_for(text: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        config_home, config_home_from, config_path, scoping_instances_in, value_for, values_for,
+        config_home, config_home_from, config_path, peer_cert_dir_in, scoping_instances_in,
+        value_for, values_for,
     };
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
@@ -279,5 +321,32 @@ mod tests {
         assert_eq!(value_for("mail.host = localhost", "mail.from"), None);
         // A commented line is not the key.
         assert_eq!(value_for("# mail.from = x@y.example", "mail.from"), None);
+    }
+
+    /// The per-peer directory is one entry under the config home, or nothing (ledger #741):
+    /// a name that would add segments is refused, never normalized into another peer's.
+    #[test]
+    fn a_peer_cert_dir_is_one_segment_or_none() {
+        let home = Path::new("/c/ikigai");
+        assert_eq!(
+            peer_cert_dir_in(home, "plasma"),
+            Some(PathBuf::from("/c/ikigai/quic-plasma"))
+        );
+        // Names an announcement may legitimately carry are kept as they are.
+        for ok in ["bug-2", "plasma (2)", "..", ".", "plasma.local"] {
+            let dir = peer_cert_dir_in(home, ok).unwrap_or_else(|| panic!("{ok:?} is one segment"));
+            assert_eq!(
+                dir.parent(),
+                Some(home),
+                "{ok:?} stays directly under the home"
+            );
+        }
+        for bad in ["", "plasma/../quic-bug", "/etc", "a/b", "a\\b", "a\0b"] {
+            assert_eq!(
+                peer_cert_dir_in(home, bad),
+                None,
+                "{bad:?} must name no directory"
+            );
+        }
     }
 }

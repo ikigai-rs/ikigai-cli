@@ -1990,6 +1990,11 @@ const PEER_DISCOVERY_WAIT: std::time::Duration = std::time::Duration::from_milli
 /// no address and no `--cert-dir`.
 #[cfg(all(feature = "embedded", feature = "quic"))]
 fn resolve_peer(name: &str, certs: &Certs) -> Result<(String, Certs), String> {
+    // Settled BEFORE the browse: a name that can name no certificate directory is refused
+    // without making the operator wait out a discovery window first.
+    let conventional = (certs.cert_dir.is_none() && certs.server_cert.is_none())
+        .then(|| peer_cert_dir(name))
+        .transpose()?;
     let browser = ikigai_discovery::Browser::start()
         .map_err(|e| format!("peer:{name}: could not browse this network: {e}"))?;
     std::thread::sleep(PEER_DISCOVERY_WAIT);
@@ -2004,8 +2009,7 @@ fn resolve_peer(name: &str, certs: &Certs) -> Result<(String, Certs), String> {
         .ok_or_else(|| format!("peer:{name}: announced no usable address"))?;
 
     let mut certs = certs.clone();
-    if certs.cert_dir.is_none() && certs.server_cert.is_none() {
-        let dir = peer_cert_dir(name);
+    if let Some(dir) = conventional {
         if !dir.join("server.crt").exists() {
             return Err(format!(
                 "peer:{name}: found it at {addr}, but this machine holds no pinned \
@@ -2023,15 +2027,24 @@ fn resolve_peer(name: &str, certs: &Certs) -> Result<(String, Certs), String> {
 /// The conventional per-peer certificate directory: `<config home>/quic-<name>/`.
 /// plasma holds `quic-bug`, bug holds `quic-plasma`.
 ///
-/// Resolved through the SAME config home as [`quic::dir`](crate::quic) and as
-/// `holds_cert_for`'s oracle in the embedded host — this used to hardcode
+/// Resolved through the SAME config home as [`quic::dir`](crate::quic) and through the same
+/// spelling as `holds_cert_for`'s oracle in the embedded host
+/// ([`ikigai_embedded::config::peer_cert_dir_in`]) — this used to hardcode
 /// `$HOME/.config/ikigai` while `quic::dir` honoured `XDG_CONFIG_HOME`, so setting that
 /// variable pointed the dialer at one directory and the certificate writer at another.
+///
+/// A name that is not one path segment is refused rather than joined (ledger #741): the
+/// name is matched against what the LAN announced, and `plasma/../quic-plasma` must not
+/// borrow plasma's pinned certificate directory.
 #[cfg(all(feature = "embedded", feature = "quic"))]
-fn peer_cert_dir(name: &str) -> std::path::PathBuf {
-    ikigai_embedded::config::config_home()
-        .unwrap_or_default()
-        .join(format!("quic-{name}"))
+fn peer_cert_dir(name: &str) -> Result<std::path::PathBuf, String> {
+    let home = ikigai_embedded::config::config_home().unwrap_or_default();
+    ikigai_embedded::config::peer_cert_dir_in(&home, name).ok_or_else(|| {
+        format!(
+            "peer:{name}: not a single path segment, so it names no certificate directory \
+             (a peer name may not be empty or contain `/`, `\\` or NUL)"
+        )
+    })
 }
 
 /// Without the `quic` feature there is nothing to dial a discovered peer with.
@@ -3146,6 +3159,25 @@ fn main() {
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(1);
+}
+
+/// `peer:<name>` is matched against what the LAN announced, and the conventional
+/// certificate directory is built from it, so a name that is not one path segment is
+/// refused BEFORE any browse (ledger #741). Hermetic for exactly that reason: the refusal
+/// returns before a multicast socket exists.
+#[cfg(all(test, feature = "embedded", feature = "quic"))]
+mod peer_name_tests {
+    use super::*;
+
+    #[test]
+    fn a_peer_name_with_path_segments_is_refused_before_browsing() {
+        for bad in ["plasma/../quic-plasma", "a\\b", ""] {
+            match resolve_peer(bad, &Certs::default()) {
+                Err(err) => assert!(err.contains("not a single path segment"), "{bad:?}: {err}"),
+                Ok((addr, _)) => panic!("{bad:?} resolved to {addr}"),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
