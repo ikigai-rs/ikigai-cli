@@ -794,10 +794,19 @@ impl Resolver for QuicResolver {
         }
     }
 
-    /// QUIC carries the caller's authority in the client cert (the server's
-    /// session), so an untraced resolution goes as plain `Call::Issue`. When a
-    /// tracer is installed, send `Call::IssueTraced` and forward the returned
-    /// spans — so a `--connect` QUIC trace shows the remote execution tree.
+    /// Resolve under `capability`, CARRIED on every call: `Call::IssueAs`, or
+    /// `Call::IssueTraced` when a tracer is installed (its returned spans are forwarded,
+    /// so a `--connect` QUIC trace shows the remote execution tree). The client cert
+    /// names the connection's CEILING (the server's session); the carried capability is
+    /// the caller's own, and the server answers at the NARROWER of the two
+    /// (`Capability::clamp`) — never wider than either. Root carried clamps to the
+    /// ceiling, so a root caller is answered exactly as before.
+    ///
+    /// ⚠ Until ledger #734 the untraced path sent plain `Call::Issue`, which resolves at
+    /// the full session authority: a `cap`-narrowed `--connect` session, or a mount
+    /// forwarding an agent's attenuated grant, was not narrowed at all. IPC has always
+    /// carried it. Every v7+ server answers `IssueAs` with the same clamp (it has since
+    /// wire v2), so no peer this build can handshake with is new to it.
     fn issue_as(
         &self,
         request: Request,
@@ -814,7 +823,7 @@ impl Resolver for QuicResolver {
                 },
             )
         } else {
-            Call::Issue(request)
+            Call::IssueAs(request, capability.clone())
         };
         match self.round_trip(call).map_err(quic_error)? {
             Reply::Resolved(representation, status) => Ok((representation, status)),
@@ -1183,6 +1192,13 @@ mod tests {
     /// pinned client, and return what it resolved — the projection reveals the authority
     /// the connection resolved under.
     fn cal_over_quic(capability: Capability) -> String {
+        cal_over_quic_as(capability, None)
+    }
+
+    /// [`cal_over_quic`], with the client resolving through `Resolver::issue_as` under
+    /// `caller` when one is given (plain `issue` otherwise).
+    fn cal_over_quic_as(capability: Capability, caller: Option<Capability>) -> String {
+        use ikigai_resolve::Resolver;
         let server_id = generate();
         let client_id = generate();
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -1211,7 +1227,10 @@ mod tests {
         });
         let client = connect(server_addr, &client_id, &server_id.cert_pem).unwrap();
         let cal = Request::new(Verb::Source, Iri::parse("urn:demo:cal").unwrap());
-        let (representation, _) = client.issue(cal).unwrap();
+        let (representation, _) = match caller {
+            Some(caller) => Resolver::issue_as(&client, cal, &caller).unwrap(),
+            None => client.issue(cal).unwrap(),
+        };
         drop(client);
         server.join().unwrap();
         String::from_utf8(representation.bytes).unwrap()
@@ -1227,6 +1246,31 @@ mod tests {
         // server-side for every call on the connection.
         let scoped = Capability::root().attenuate(["urn:cap:demo:other".to_string()]);
         assert_eq!(cal_over_quic(scoped), "freebusy");
+    }
+
+    /// ledger #734 (q1): the caller's narrowed capability CROSSES the wire on an untraced
+    /// call, and the server answers at the narrower of it and the connection's session.
+    /// Before, `issue_as` sent plain `Call::Issue` and a freebusy caller on a root
+    /// connection was answered DETAIL.
+    #[test]
+    fn issue_as_answers_at_the_narrower_of_the_caller_and_the_connection() {
+        let freebusy = || Capability::scoped(["urn:cap:demo:freebusy".to_string()]);
+        let detail = || Capability::scoped(["urn:cap:demo:detail".to_string()]);
+        assert_eq!(
+            cal_over_quic_as(Capability::root(), Some(freebusy())),
+            "freebusy",
+            "a caller narrowed to freebusy was answered at the connection's full authority"
+        );
+        // A root caller is answered at the connection's authority, exactly as before.
+        assert_eq!(
+            cal_over_quic_as(Capability::root(), Some(Capability::root())),
+            "DETAIL"
+        );
+        // The carried capability never WIDENS the connection: a detail-carrying caller on
+        // a freebusy connection gets freebusy.
+        assert_eq!(cal_over_quic_as(freebusy(), Some(detail())), "freebusy");
+        // Both grant detail: the narrower of the two is still detail.
+        assert_eq!(cal_over_quic_as(detail(), Some(detail())), "DETAIL");
     }
 
     /// Serve `gated_kernel` under a fixed `server_ceiling` (as `serve --cap` mints per
@@ -1300,6 +1344,25 @@ mod tests {
             cal_through_mount(detail, Capability::root()),
             "DETAIL",
             "a detail-granting ceiling lets the mounted client see detail"
+        );
+    }
+
+    /// ledger #734 (q1b): the other direction through a mount. A ROOT connection, and a
+    /// local caller ATTENUATED to freebusy (an MCP agent's grant, a `cap`-narrowed
+    /// session): the attenuation survives the hop and the peer answers freebusy. Before,
+    /// the mount forwarded the capability to `issue_as`, which dropped it on the wire.
+    #[test]
+    fn a_mount_carries_the_local_callers_attenuation_to_the_peer() {
+        let freebusy = Capability::scoped(["urn:cap:demo:freebusy".to_string()]);
+        assert_eq!(
+            cal_through_mount(Capability::root(), freebusy),
+            "freebusy",
+            "attenuation lost across the QUIC mount"
+        );
+        assert_eq!(
+            cal_through_mount(Capability::root(), Capability::root()),
+            "DETAIL",
+            "a root caller through a root connection is unchanged"
         );
     }
 
