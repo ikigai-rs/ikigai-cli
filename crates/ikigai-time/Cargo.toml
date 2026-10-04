@@ -33,7 +33,7 @@ description = "The time transport: originates kernel resource-requests on a time
 # ceiling instead of setting the fire authority, and the three `urn:time:*` actions declare
 # `urn:cap:time:{schedule,cancel,read}`, which the kernel enforces. Source-breaking for every
 # caller of `schedule`, and behavior-breaking for any attenuated caller of `urn:time:*`.
-version = "0.4.0"
+version = "0.4.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
