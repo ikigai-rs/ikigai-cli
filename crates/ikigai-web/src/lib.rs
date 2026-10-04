@@ -1153,14 +1153,14 @@ async fn check_write_precondition(
     // If-Match: the resource must exist and (for a list) match. `*` = must exist.
     if let Some(im) = req.header("if-match") {
         match &current {
-            Some(etag) if im.trim() == "*" || etag_list_contains(im, etag) => {}
+            Some(etag) if im.trim() == "*" || etag_list_contains(im, etag, Compare::Strong) => {}
             _ => return failed("if-match precondition failed"),
         }
     }
     // If-None-Match: `*` = must NOT exist (create-only); a list must NOT match.
     if let Some(inm) = req.header("if-none-match") {
         let hit = match &current {
-            Some(etag) => inm.trim() == "*" || etag_list_contains(inm, etag),
+            Some(etag) => inm.trim() == "*" || etag_list_contains(inm, etag, Compare::Weak),
             None => false,
         };
         if hit {
@@ -1170,13 +1170,27 @@ async fn check_write_precondition(
     None
 }
 
-/// Whether a comma-separated ETag list contains the given (strong) validator, ignoring
-/// any `W/` weakness prefix (we only mint strong tags).
-fn etag_list_contains(header: &str, etag: &str) -> bool {
+/// The two entity-tag comparisons of RFC 9110 §8.8.3.2.
+#[derive(Clone, Copy)]
+enum Compare {
+    /// Both tags strong and identical — what `If-Match` requires (§13.1.1).
+    Strong,
+    /// Identical once any `W/` is set aside — what `If-None-Match` uses (§13.1.2).
+    Weak,
+}
+
+/// Whether a comma-separated ETag list contains our validator under `compare`. We only
+/// mint strong tags, so under [`Compare::Strong`] a listed `W/` tag never matches: a weak
+/// validator does not promise the bytes a lost-update guard protects.
+fn etag_list_contains(header: &str, etag: &str, compare: Compare) -> bool {
     let bare = etag.trim_start_matches("W/");
-    header
-        .split(',')
-        .any(|tok| tok.trim().trim_start_matches("W/") == bare)
+    header.split(',').any(|tok| {
+        let tok = tok.trim();
+        match compare {
+            Compare::Strong => !tok.starts_with("W/") && tok == bare,
+            Compare::Weak => tok.trim_start_matches("W/") == bare,
+        }
+    })
 }
 
 /// Record that we deleted `iri`, so a repeat DELETE is idempotent for a bounded window.
@@ -3097,6 +3111,38 @@ mod tests {
         .await;
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
         assert!(resp.ends_with("v2"), "got: {resp}");
+    }
+
+    /// `If-Match` uses the STRONG comparison (RFC 9110 §13.1.1): a weak validator never
+    /// satisfies it, because a weak tag does not promise the bytes the lost-update guard is
+    /// protecting (ledger #733, finding W5). `If-None-Match` stays weak (§13.1.2).
+    #[tokio::test]
+    async fn if_match_refuses_a_weak_validator() {
+        let addr = start().await;
+        let etag =
+            etag_of_response(&roundtrip(addr, "GET /test/doc HTTP/1.1\r\nHost: x\r\n\r\n").await);
+        let resp = roundtrip(
+            addr,
+            &format!(
+                "PUT /test/doc HTTP/1.1\r\nHost: x\r\nIf-Match: W/{etag}\r\nContent-Length: 2\r\n\r\nv2"
+            ),
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 412 Precondition Failed"),
+            "got: {resp}"
+        );
+        let resp = roundtrip(
+            addr,
+            &format!(
+                "PUT /test/doc HTTP/1.1\r\nHost: x\r\nIf-None-Match: W/{etag}\r\nContent-Length: 2\r\n\r\nv2"
+            ),
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 412 Precondition Failed"),
+            "If-None-Match compares weakly, so a weak tag still matches: {resp}"
+        );
     }
 
     #[tokio::test]
