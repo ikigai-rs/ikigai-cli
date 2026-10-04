@@ -695,7 +695,7 @@ pub fn validate_arguments(
     let escape = |s: &str| {
         s.replace('\\', "\\\\")
             .replace('"', "\\\"")
-            .replace('\n', " ")
+            .replace(['\n', '\r'], " ")
     };
     let mut ttl = String::from("@prefix sh: <http://www.w3.org/ns/shacl#> .\n\n");
     ttl.push_str("<urn:ikigai:validation:report> a sh:ValidationReport ;\n    sh:conforms false");
@@ -746,6 +746,20 @@ mod tests {
         // Unknown argument.
         let report = validate_arguments(&d, action, &json!({ "bogus": "x" })).unwrap();
         assert!(report.contains("unknown argument `bogus`"), "{report}");
+    }
+
+    /// The report is Turtle, and Turtle's STRING_LITERAL_QUOTE forbids a raw CR as well as a
+    /// raw LF. A value carrying one is echoed into `sh:resultMessage`, so it is flattened
+    /// like the LF already was (ledger #733, finding P1).
+    #[test]
+    fn a_carriage_return_in_a_value_does_not_reach_the_report_raw() {
+        use serde_json::json;
+        let d = Description::new("counter")
+            .verb(Verb::Source)
+            .input(ArgSpec::new("n").class("http://www.w3.org/2001/XMLSchema#integer"));
+        let action = &d.action_specs()[0];
+        let report = validate_arguments(&d, action, &json!({ "n": "1\r2" })).expect("a violation");
+        assert!(!report.contains('\r'), "raw CR in the report: {report:?}");
     }
 
     #[test]
