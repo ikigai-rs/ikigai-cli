@@ -58,6 +58,22 @@ pub const CAP_READ: &str = "urn:cap:space:read";
 /// so a reader can observe the space without being able to consume from it.
 pub const CAP_TAKE: &str = "urn:cap:space:take";
 
+/// Where a [`SpaceReactor`] stages a tuple it has claimed for a pass:
+/// `<root>/<space>/.processing/<id>.tuple`, renamed to `outbox` or `error` when the pass
+/// settles. `rd state=processing` reads it.
+///
+/// Public because it is a stage of the queue like the other three, and anything that
+/// COUNTS a space's queue must count it: a tuple here is neither waiting nor done, and a
+/// depth that omits it reads as an empty queue while work is in flight — or stranded
+/// (ledger #738). See [`SpaceReactor::recover_interrupted`] for what happens to one a
+/// stopped reactor left behind.
+pub const PROCESSING_DIR: &str = ".processing";
+
+/// The lease every live reactor over a root holds on `<root>/.reactor.lock`: SHARED while
+/// it works, EXCLUSIVE only for the moment it recovers interrupted tuples. See
+/// [`SpaceReactor::recover_interrupted`].
+const LEASE_FILE: &str = ".reactor.lock";
+
 /// Mount the tuplespace at `urn:space:{name}`, backed by a directory under `root`
 /// (`<root>/<name>/inbox/`). A host links this into its kernel.
 pub fn space(root: PathBuf) -> EndpointSpace {
@@ -83,15 +99,17 @@ impl SpaceEndpoint {
         self.root.join(name).join("inbox")
     }
 
-    /// A named stage of the space's state machine: `inbox` (live drops), `outbox`
+    /// A named stage of the space's state machine: `inbox` (live drops), `processing`
+    /// (claimed by a reactor pass that has not settled yet — [`PROCESSING_DIR`]), `outbox`
     /// (handled by the reactor), or `error` (dead-letter). Any other name is rejected —
     /// the stage names are a fixed, inspectable set, not a path.
     fn state_dir(&self, name: &str, state: &str) -> Result<PathBuf> {
         match state {
             "inbox" | "outbox" | "error" => Ok(self.root.join(name).join(state)),
+            "processing" => Ok(self.root.join(name).join(PROCESSING_DIR)),
             other => Err(Error::InvalidArgument {
                 name: "state".to_string(),
-                detail: format!("`{other}` is not a stage (inbox | outbox | error)"),
+                detail: format!("`{other}` is not a stage (inbox | processing | outbox | error)"),
             }),
         }
     }
@@ -415,8 +433,11 @@ impl Endpoint for SpaceEndpoint {
                         ArgSpec::new("state")
                             .optional()
                             .class(XSD_STRING)
-                            .one_of(["inbox", "outbox", "error"])
-                            .summary("which stage to read (default inbox): inbox | outbox | error"),
+                            .one_of(["inbox", "processing", "outbox", "error"])
+                            .summary(
+                                "which stage to read (default inbox): inbox | processing \
+                                 (claimed by a reactor pass, not yet settled) | outbox | error",
+                            ),
                     )
                     // TWO faces, because `tuple=` changes what a read IS: listing or matching
                     // answers ids (a newline list, the `..` map convention), reading one
@@ -492,6 +513,60 @@ pub enum Outcome {
     Skipped(&'static str),
 }
 
+/// What a reactor does with a tuple it finds INTERRUPTED — claimed into
+/// [`PROCESSING_DIR`] by a reactor that stopped before the pass settled (a restart, a
+/// crash, a kill mid-handler). Chosen with [`SpaceReactor::on_interrupted`].
+///
+/// The handler of an interrupted tuple may have run not at all, in part, or in full
+/// (it can have acted and died before its answer was recorded), and the reactor cannot
+/// tell which. So the choice is between at-most-once and at-least-once, and only the HOST
+/// knows which its handlers can bear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Interrupted {
+    /// Dead-letter it into `error/` with an `.err` note saying it was interrupted, and fire
+    /// the [`DeadLetterHook`]. The handler is NOT run again; `retry=<id>` on the space's
+    /// Sink runs it again when a person (or a host) decides that is safe.
+    ///
+    /// The default, because the reactor's promise is that a handler fires once: a
+    /// booking handler that sent its mail and died before settling must not send it
+    /// twice. Dead-lettering keeps the tuple, says why, and is loud.
+    #[default]
+    DeadLetter,
+    /// Move it back to `inbox/`, so the catch-up runs it again. For hosts whose handlers
+    /// are idempotent (re-running a review pass costs a model call and harms nothing):
+    /// at-least-once, with no person in the loop.
+    Requeue,
+}
+
+/// One interrupted tuple a reactor recovered at startup — see
+/// [`SpaceReactor::recover_interrupted`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recovered {
+    /// The space it was claimed from.
+    pub space: String,
+    /// The tuple id.
+    pub tuple: String,
+    /// Where it went (`Ok` names the policy applied), or why it could not be moved, in
+    /// which case it is still in [`PROCESSING_DIR`].
+    pub outcome: std::result::Result<Interrupted, String>,
+}
+
+/// The once-per-reactor recovery: the lease it holds for its life, and what it found.
+struct Recovery {
+    // Held, never read: dropping it releases the lease.
+    _lease: Option<std::fs::File>,
+    report: std::result::Result<Vec<Recovered>, String>,
+}
+
+/// The note an interrupted tuple is dead-lettered with.
+fn interrupted_note(space: &str, id: &str) -> String {
+    format!(
+        "interrupted: a reactor claimed this tuple for its handler and stopped before the \
+         pass settled (a restart or crash mid-pass). The handler may have run in part or in \
+         full, so it was not run again. `sink urn:space:{space} retry={id}` runs it again."
+    )
+}
+
 /// The reactive engine over a directory of spaces. A dropped tuple is CLAIMED (the same
 /// atomic rename-CAS as `take`, so it fires exactly once even under duplicate events), the
 /// space's handler is fired with the tuple as `content`, and the tuple moves to `outbox`
@@ -520,6 +595,10 @@ pub struct SpaceReactor {
     // Told about every tuple that settles as `Errored` — the host's way to make a dead letter
     // LOUD at the moment it happens. `None` = silent, which is what the `.err` note alone was.
     on_dead_letter: Option<DeadLetterHook>,
+    // What to do with a tuple a stopped reactor left in `.processing/` (ledger #738).
+    interrupted: Interrupted,
+    // Run once, before this reactor's first claim; holds the lease for the reactor's life.
+    recovery: std::sync::OnceLock<Recovery>,
 }
 
 /// Called with `(space, tuple id, reason)` for every claimed tuple that settles as
@@ -558,7 +637,136 @@ impl SpaceReactor {
             capability,
             host_authority: None,
             on_dead_letter: None,
+            interrupted: Interrupted::default(),
+            recovery: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Choose what happens to a tuple a stopped reactor left claimed but unsettled — see
+    /// [`Interrupted`]. Default: [`Interrupted::DeadLetter`].
+    pub fn on_interrupted(mut self, policy: Interrupted) -> Self {
+        self.interrupted = policy;
+        self
+    }
+
+    /// Recover the tuples a STOPPED reactor left in [`PROCESSING_DIR`], in every space
+    /// under the root, according to [`on_interrupted`](SpaceReactor::on_interrupted).
+    ///
+    /// Runs ONCE per reactor, before its first claim: [`drain`](SpaceReactor::drain) and
+    /// [`process`](SpaceReactor::process) both call it first, so the startup catch-up in
+    /// [`watch`](SpaceReactor::watch) sees a requeued tuple. Later calls return the same
+    /// report. Before this, a tuple claimed by a pass that never settled stayed in
+    /// `.processing/` forever: the catch-up lists only `inbox/`, so it was neither run again
+    /// nor dead-lettered, and every count of the queue read empty (ledger #738).
+    ///
+    /// ⚠ A tuple in `.processing/` is only interrupted if NO live reactor is working on it.
+    /// So every reactor holds a lease on `<root>/.reactor.lock` for its whole life — shared
+    /// while it works — and recovery needs it EXCLUSIVELY, which it gets only when no other
+    /// live reactor (in this process or another) shares the root. A lock dies with its
+    /// process, so a crashed reactor never blocks recovery. `Err` says why recovery was
+    /// skipped (another live reactor, or a filesystem that cannot lock); nothing was moved.
+    /// ⚠ Reactors from before this lease existed hold no lock and are not seen by it.
+    pub fn recover_interrupted(&self) -> std::result::Result<&[Recovered], &str> {
+        let recovery = self.recovery.get_or_init(|| self.recover());
+        recovery.report.as_deref().map_err(String::as_str)
+    }
+
+    /// Take the lease and, when it is exclusively ours, recover. See
+    /// [`recover_interrupted`](SpaceReactor::recover_interrupted).
+    fn recover(&self) -> Recovery {
+        let lease = match self.open_lease() {
+            Ok(file) => file,
+            Err(why) => {
+                return Recovery {
+                    _lease: None,
+                    report: Err(why),
+                }
+            }
+        };
+        let report = match lease.try_lock() {
+            Ok(()) => {
+                let recovered = self.recover_spaces();
+                // Downgrade to SHARED for the rest of this reactor's life. Between the two
+                // calls another reactor could take it exclusively and recover — harmless,
+                // because this reactor has claimed nothing yet.
+                let _ = lease.unlock();
+                Ok(recovered)
+            }
+            Err(std::fs::TryLockError::WouldBlock) => Err(format!(
+                "another live reactor shares {}, so a tuple in its `{PROCESSING_DIR}/` may \
+                 be in flight there; nothing was recovered",
+                self.root.display()
+            )),
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Recovery {
+                    _lease: None,
+                    report: Err(format!(
+                        "cannot lock {}: {e}; nothing was recovered",
+                        self.root.join(LEASE_FILE).display()
+                    )),
+                }
+            }
+        };
+        // Blocks only while another reactor holds it exclusively, i.e. while it recovers.
+        let lease = match lease.lock_shared() {
+            Ok(()) => Some(lease),
+            Err(_) => None,
+        };
+        Recovery {
+            _lease: lease,
+            report,
+        }
+    }
+
+    fn open_lease(&self) -> std::result::Result<std::fs::File, String> {
+        std::fs::create_dir_all(&self.root)
+            .map_err(|e| format!("cannot create {}: {e}", self.root.display()))?;
+        let path = self.root.join(LEASE_FILE);
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(|e| format!("cannot open {}: {e}; nothing was recovered", path.display()))
+    }
+
+    /// Apply the [`Interrupted`] policy to every tuple in every space's `.processing/`.
+    /// Called only under the exclusive lease.
+    fn recover_spaces(&self) -> Vec<Recovered> {
+        let mut names = self.space_names();
+        names.sort();
+        let mut recovered = Vec::new();
+        for name in names {
+            let staging = self.root.join(&name).join(PROCESSING_DIR);
+            for id in SpaceEndpoint::list_ids(&staging) {
+                let claimed = staging.join(format!("{id}.tuple"));
+                let outcome = match self.interrupted {
+                    Interrupted::DeadLetter => {
+                        let note = interrupted_note(&name, &id);
+                        match self.settle(&name, &id, &claimed, Err(note.clone())) {
+                            Outcome::Errored(said) if said == note => Ok(Interrupted::DeadLetter),
+                            Outcome::Errored(said) => Err(said),
+                            other => Err(format!("unexpected outcome {other:?}")),
+                        }
+                    }
+                    Interrupted::Requeue => {
+                        let inbox = self.root.join(&name).join("inbox");
+                        std::fs::create_dir_all(&inbox)
+                            .and_then(|()| {
+                                std::fs::rename(&claimed, inbox.join(format!("{id}.tuple")))
+                            })
+                            .map(|()| Interrupted::Requeue)
+                            .map_err(|e| format!("move back to `inbox`: {e}"))
+                    }
+                };
+                recovered.push(Recovered {
+                    space: name.clone(),
+                    tuple: id,
+                    outcome,
+                });
+            }
+        }
+        recovered
     }
 
     /// Tell the host about every dead letter as it happens: `hook(space, tuple id, reason)`
@@ -672,6 +880,8 @@ impl SpaceReactor {
     /// deterministic entry the live watcher and the tests both drive. Returns each
     /// `(tuple id, outcome)`.
     pub fn drain(&self, name: &str) -> Vec<(String, Outcome)> {
+        // Before listing, so a REQUEUED interrupted tuple is in the list.
+        let _ = self.recover_interrupted();
         SpaceEndpoint::list_ids(&self.root.join(name).join("inbox"))
             .into_iter()
             .map(|id| {
@@ -683,6 +893,8 @@ impl SpaceReactor {
 
     /// Process ONE tuple: claim it, fire the handler, move it to `outbox`/`error`.
     pub fn process(&self, name: &str, id: &str) -> Outcome {
+        // Before this reactor's first claim, whichever entry point makes it.
+        let _ = self.recover_interrupted();
         let Some(handler) = self.handler_uri(name) else {
             return Outcome::Skipped("no handler (not a reactive space)");
         };
@@ -801,7 +1013,7 @@ impl SpaceReactor {
             .join(name)
             .join("inbox")
             .join(format!("{id}.tuple"));
-        let staging = self.root.join(name).join(".processing");
+        let staging = self.root.join(name).join(PROCESSING_DIR);
         std::fs::create_dir_all(&staging).map_err(|e| format!("staging: {e}"))?;
         let staged = staging.join(format!("{id}.tuple"));
         match std::fs::rename(&src, &staged) {
@@ -1526,6 +1738,163 @@ mod tests {
             .join("error")
             .join(format!("{id}.err"))
             .exists());
+    }
+
+    /// Leave `id` exactly as a reactor killed mid-pass leaves it: claimed into
+    /// `.processing/` by `claim`'s own rename, and never settled.
+    fn interrupt(root: &Path, space_name: &str, id: &str) -> PathBuf {
+        let staging = root.join(space_name).join(".processing");
+        std::fs::create_dir_all(&staging).unwrap();
+        let staged = staging.join(format!("{id}.tuple"));
+        std::fs::rename(
+            root.join(space_name)
+                .join("inbox")
+                .join(format!("{id}.tuple")),
+            &staged,
+        )
+        .unwrap();
+        staged
+    }
+
+    /// A tuple in flight when the reactor stopped is ACCOUNTED FOR by the next reactor's
+    /// catch-up, never stranded (ledger #738; gonk's restart scenario, ported). The
+    /// default is at-most-once: the handler may already have acted, so it is dead-lettered
+    /// with a note that says so and that `retry=` runs it again, and it is NOT re-fired.
+    #[test]
+    fn a_tuple_in_flight_at_restart_is_dead_lettered_not_stranded() {
+        let root = reactive_root("react-interrupted", "jobs", "urn:test:handler");
+        let k = Kernel::new(Arc::new(space(root.clone())));
+        let cap = Capability::scoped(vec![CAP_OUT.to_string(), CAP_READ.to_string()]);
+        let id = out(&k, &cap, "urn:space:jobs", b"work");
+        let staged = interrupt(&root, "jobs", &id);
+
+        let heard: Arc<Mutex<Vec<String>>> = Arc::default();
+        let sink = Arc::clone(&heard);
+        let mock = Arc::new(MockResolver::new(true));
+        let restarted = SpaceReactor::new(root.clone(), mock.clone(), Capability::root())
+            .on_dead_letter(move |_, tuple, _| sink.lock().unwrap().push(tuple.to_string()));
+        let drained = restarted.drain("jobs");
+
+        assert!(
+            !staged.exists(),
+            "the interrupted tuple is still stranded in .processing after the catch-up \
+             (drained {drained:?})"
+        );
+        let errored = root.join("jobs").join("error");
+        assert!(
+            errored.join(format!("{id}.tuple")).exists(),
+            "dead-lettered"
+        );
+        let note = std::fs::read_to_string(errored.join(format!("{id}.err"))).unwrap();
+        assert!(note.contains("interrupted"), "{note}");
+        assert!(note.contains(&format!("retry={id}")), "{note}");
+        assert!(
+            mock.calls().is_empty(),
+            "NOT re-fired: the handler may already have acted"
+        );
+        assert_eq!(*heard.lock().unwrap(), vec![id.clone()], "and it is loud");
+    }
+
+    /// A host whose handlers are idempotent opts into at-least-once: the interrupted tuple
+    /// goes back to the inbox and the SAME catch-up runs it.
+    #[test]
+    fn an_interrupted_tuple_is_requeued_and_rerun_when_the_host_says_so() {
+        let root = reactive_root("react-interrupted-requeue", "jobs", "urn:test:handler");
+        let k = Kernel::new(Arc::new(space(root.clone())));
+        let cap = Capability::scoped(vec![CAP_OUT.to_string()]);
+        let id = out(&k, &cap, "urn:space:jobs", b"work");
+        interrupt(&root, "jobs", &id);
+
+        let mock = Arc::new(MockResolver::new(true));
+        let restarted = SpaceReactor::new(root.clone(), mock.clone(), Capability::root())
+            .on_interrupted(Interrupted::Requeue);
+        assert_eq!(
+            restarted.drain("jobs"),
+            vec![(id.clone(), Outcome::Handled)]
+        );
+        assert_eq!(mock.calls().len(), 1, "run again, once");
+        assert_eq!(
+            restarted.recover_interrupted(),
+            Ok(&[Recovered {
+                space: "jobs".to_string(),
+                tuple: id,
+                outcome: Ok(Interrupted::Requeue),
+            }][..]),
+            "the report says what was recovered, and a second call returns the same one"
+        );
+    }
+
+    /// A tuple in `.processing/` is only interrupted if no LIVE reactor is working on it. A
+    /// second reactor sharing the root (a `--react` session beside the daemon) must not
+    /// steal the first one's in-flight tuple; once the first is gone, the next one recovers.
+    #[test]
+    fn a_live_reactors_in_flight_tuple_is_not_recovered_out_from_under_it() {
+        let root = reactive_root("react-interrupted-live", "jobs", "urn:test:handler");
+        let k = Kernel::new(Arc::new(space(root.clone())));
+        let cap = Capability::scoped(vec![CAP_OUT.to_string()]);
+        let id = out(&k, &cap, "urn:space:jobs", b"work");
+
+        let live = SpaceReactor::new(
+            root.clone(),
+            Arc::new(MockResolver::new(true)),
+            Capability::root(),
+        );
+        assert_eq!(
+            live.recover_interrupted(),
+            Ok(&[][..]),
+            "nothing to recover yet"
+        );
+        // `live` is now mid-pass on the tuple.
+        let staged = interrupt(&root, "jobs", &id);
+
+        let mock = Arc::new(MockResolver::new(true));
+        let beside = SpaceReactor::new(root.clone(), mock.clone(), Capability::root());
+        assert!(beside.drain("jobs").is_empty());
+        let skipped = beside
+            .recover_interrupted()
+            .expect_err("a live reactor shares the root");
+        assert!(skipped.contains("another live reactor"), "{skipped}");
+        assert!(
+            staged.exists(),
+            "the live reactor's tuple is left where it is"
+        );
+        assert!(mock.calls().is_empty());
+
+        // Both gone (the in-flight pass died with them): the next reactor recovers it.
+        drop(live);
+        drop(beside);
+        let next = SpaceReactor::new(
+            root.clone(),
+            Arc::new(MockResolver::new(true)),
+            Capability::root(),
+        );
+        assert_eq!(next.recover_interrupted().map(<[Recovered]>::len), Ok(1));
+        assert!(!staged.exists());
+        assert!(root
+            .join("jobs")
+            .join("error")
+            .join(format!("{id}.tuple"))
+            .exists());
+    }
+
+    /// The in-flight stage is readable like the other three, so a reader counting the
+    /// queue can count it (ledger #738).
+    #[test]
+    fn rd_reads_the_processing_stage() {
+        let root = reactive_root("react-processing-rd", "jobs", "urn:test:handler");
+        let k = Kernel::new(Arc::new(space(root.clone())));
+        let cap = Capability::scoped(vec![CAP_OUT.to_string(), CAP_READ.to_string()]);
+        let id = out(&k, &cap, "urn:space:jobs", b"work");
+        interrupt(&root, "jobs", &id);
+        let processing = block_on(
+            k.issue(
+                Request::new(Verb::Source, iri("urn:space:jobs"))
+                    .with_arg("state", ArgRef::Inline(b"processing".to_vec())),
+                &cap,
+            ),
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(processing.bytes).unwrap(), id);
     }
 
     #[test]

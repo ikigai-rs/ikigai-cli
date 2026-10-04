@@ -4780,6 +4780,15 @@ fn build_watched(mounts: Vec<MountSpec>, reactive: bool) -> Arc<Kernel> {
         ) {
             eprintln!("{} {line}", stamp());
         }
+        // A tuple a stopped writer left mid-pass is dead-lettered by the first drain, and the
+        // dead-letter hook says so; what that hook cannot say is that recovery was SKIPPED
+        // (another live reactor shares the tree), which leaves such a tuple where it is.
+        if let Err(why) = reactor.recover_interrupted() {
+            eprintln!(
+                "{} ikigai: interrupted tuples not recovered: {why}",
+                stamp()
+            );
+        }
         Arc::new(reactor).watch();
     }
     // ★ Every host job below NAMES the authority it fires under (ledger #79). A job fires
