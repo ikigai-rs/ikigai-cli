@@ -4667,9 +4667,10 @@ fn subclass_axioms() -> Vec<(String, String)> {
 ///
 /// Build the **local** embedded kernel (nature `Embedded (Native)`), including
 /// the personal space and the HTTP-client module. The running user *is* the owner,
-/// so it resolves under their identity — the engine's default root capability — and
-/// the REPL's `cap` command lets them voluntarily attenuate it before handing work
-/// to an agent.
+/// so it resolves under their identity — the engine's default root capability. The
+/// REPL's `cap` command attenuates it reversibly (`cap reset` widens back); before
+/// handing the session to an agent, `cap seal` makes the narrowing the session's floor,
+/// so the agent cannot widen it again.
 ///
 /// A [`SystemClock`] is injected so the HTTP module's `Cache-Control: max-age`
 /// deadlines (`Expiry::At`) are honoured; without a clock those reads would stay

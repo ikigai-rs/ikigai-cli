@@ -118,9 +118,13 @@ commands:
   :load <uri> [cap=<scope>]  read a script resource and evaluate it as Lisp (cap= narrows first)
   cache <iri> [args]         report whether resolving it would hit the cache (no resolve)
   cap [scope…]               show the session capability, narrow it to `scope`s, or `cap reset`
-                             (`net-<host>` is shorthand for the `urn:cap:net:<host>` scope)
-  login [scope…] / logout    set the session identity to the minted `scope`s (the floor `cap
-                             reset` returns to), or drop to anonymous — auth-scheme-agnostic
+                             (`net-<host>` is shorthand for the `urn:cap:net:<host>` scope);
+                             narrowing is REVERSIBLE: `cap reset` widens back to the identity
+  cap seal [scope…]          hand-off: narrow to `scope`s (or keep the current capability) and
+                             make it the session's FLOOR, one-way — `cap reset`, `logout` and
+                             `login` never rise above it again
+  login [scope…] / logout    set the session identity to the minted `scope`s (the identity `cap
+                             reset` returns to), or drop to the floor — auth-scheme-agnostic
                              (also `sink urn:host:login <scope…>` / `sink urn:host:logout`)
   trace <iri> [args]         resolve a resource and show its path: client, transport, endpoint
   config [key=value]         show settings, or save one (e.g. config keybindings=emacs)
@@ -247,16 +251,25 @@ pub struct Engine {
     /// Interior-mutable so the `&self` resolution path can tally without
     /// threading an accumulator through every stage; the REPL is single-threaded.
     cache: Cell<CacheStats>,
-    /// The session's current authority — every request resolves under it. It
-    /// starts at `identity` and the `cap` command can only ever *narrow* it.
+    /// The session's current authority — every request resolves under it. It starts at
+    /// `identity`, and the `cap` command narrows it. ⚠ Narrowing is REVERSIBLE: `cap
+    /// reset`, `login` and `logout` widen it again, up to [`floor`](Self::floor). That is
+    /// what the runbook, the tutorial and the web demo rely on (narrow, show a refusal,
+    /// reset). To hand a session to someone who must NOT widen it back, seal it
+    /// (`cap seal`, [`seal`](Self::seal)), which lowers the floor itself.
     capability: RefCell<Capability>,
-    /// The authority this session was opened with (the host's identity). `cap
-    /// reset` returns here — the owner-only move; a holder of a narrowed
-    /// capability has no identity to widen back to. Interior-mutable so a host can
-    /// swap the identity at runtime via [`login`](Self::login)/[`logout`](Self::logout)
-    /// (e.g. a browser passkey establishing a per-client identity) — `cap reset` then
-    /// returns to the *logged-in* identity, not the process default.
+    /// The identity `cap reset` returns to: the authority the session was opened with, or
+    /// the one a [`login`](Self::login) established (e.g. a browser passkey's per-client
+    /// identity). Never above `floor`. Interior-mutable so a host can swap it at runtime.
     identity: RefCell<Capability>,
+    /// The most authority this session can ever hold again — what `logout` returns to and
+    /// what `login` is clamped to. It starts at the identity the engine was built with
+    /// (root for [`new`](Self::new), the scoped identity for
+    /// [`with_identity`](Self::with_identity)) and only ever LOWERS, by `cap seal`.
+    floor: RefCell<Capability>,
+    /// Whether `cap seal` has lowered the floor. Reported by `cap`, `login` and the other
+    /// identity replies, so a sealed session says so.
+    sealed: Cell<bool>,
     /// Named capability profiles a host registers (e.g. `freebusy` → a set of
     /// `urn:cap:` scopes), so `cap <name>` reads friendlier than a scope list.
     profiles: RefCell<HashMap<String, Vec<String>>>,
@@ -403,12 +416,16 @@ impl Engine {
     }
 
     /// An engine whose session authority is derived from a caller's identity.
-    /// The session starts at `identity`, and `cap reset` returns to it.
+    /// The session starts at `identity`, `cap reset` returns to it, and it is also the
+    /// session's [`floor`](Self::floor): `logout` returns to it (not root), and `login`
+    /// cannot rise above it.
     pub fn with_identity(resolver: impl Resolver + 'static, identity: Capability) -> Self {
         Self {
             resolver: Arc::new(resolver),
             cache: Cell::new(CacheStats::default()),
             capability: RefCell::new(identity.clone()),
+            floor: RefCell::new(identity.clone()),
+            sealed: Cell::new(false),
             identity: RefCell::new(identity),
             profiles: RefCell::new(HashMap::new()),
             spawner: None,
@@ -571,21 +588,52 @@ impl Engine {
         self.identity.borrow().clone()
     }
 
+    /// The most authority this session can ever regain: what `logout` returns to and
+    /// what `login` is clamped to. Root for an engine built with [`new`](Self::new) and
+    /// never sealed.
+    pub fn floor(&self) -> Capability {
+        self.floor.borrow().clone()
+    }
+
+    /// Whether the session has been sealed ([`seal`](Self::seal), `cap seal`).
+    pub fn is_sealed(&self) -> bool {
+        self.sealed.get()
+    }
+
     /// Establish a new session identity, replacing both the identity (the `cap reset`
     /// target) and the current capability. A signed-in session therefore resolves
     /// under — and resets back to — its scoped identity, not the process default. The
     /// browser passkey flow mints a per-client identity this way; the same hook serves
     /// the future CLI browser-handoff. Attenuation (`cap`) and `logout` still apply on
     /// top of it.
+    ///
+    /// The identity is CLAMPED to the session's [`floor`](Self::floor) — it keeps only
+    /// what the floor grants, and root becomes the floor itself. Under a root floor (an
+    /// engine built with [`new`](Self::new) and never sealed) that is the identity as
+    /// given, exactly as before.
     pub fn login(&self, identity: Capability) {
+        let identity = self.floor.borrow().clamp(&identity);
         *self.identity.borrow_mut() = identity.clone();
         *self.capability.borrow_mut() = identity;
     }
 
-    /// Drop the session back to the process default (root) identity — the anonymous
-    /// state before any `login`.
+    /// Drop the session back to its [`floor`](Self::floor) — the anonymous state before
+    /// any `login`. Root for an engine built with [`new`](Self::new) and never sealed;
+    /// the scoped identity for one built with [`with_identity`](Self::with_identity); the
+    /// sealed floor after `cap seal`.
     pub fn logout(&self) {
-        self.login(Capability::root());
+        self.login(self.floor());
+    }
+
+    /// Seal the session at its CURRENT capability: it becomes the [`floor`](Self::floor)
+    /// and the identity, so `cap reset`, `logout` and `login` can never rise above it
+    /// again. One-way for this engine — a later seal can only lower the floor further.
+    /// This is the hand-off: narrow (`cap …`), then seal, then give the session away.
+    pub fn seal(&self) {
+        let capability = self.capability();
+        *self.floor.borrow_mut() = capability.clone();
+        *self.identity.borrow_mut() = capability;
+        self.sealed.set(true);
     }
 
     /// Register a named capability profile — `cap <name>` then attenuates to its
@@ -1144,18 +1192,36 @@ impl Engine {
     /// returns to. The scopes ARE the minted authority; *who* computes them is the
     /// auth scheme (the browser's passkey flow, a QUIC server's client cert, …) — so
     /// login is auth-scheme-agnostic. Bare `login` reports the current identity.
+    ///
+    /// The minted identity is clamped to the session's [`floor`](Self::floor), and a
+    /// scope the floor does not grant is NAMED in the reply rather than dropped silently.
+    /// Under a root floor nothing is dropped and the reply is unchanged.
     fn run_login(&self, rest: &str) -> Result<String, String> {
         let rest = rest.trim();
         if rest.is_empty() {
             return Ok(self.describe_capability());
         }
         let scopes: Vec<String> = rest.split_whitespace().map(expand_cap_shorthand).collect();
-        self.login(Capability::root().attenuate(scopes));
-        Ok(format!("logged in — {}", self.describe_capability()))
+        self.login(Capability::root().attenuate(scopes.clone()));
+        let granted = self.identity();
+        let refused: Vec<String> = scopes
+            .into_iter()
+            .filter(|scope| !granted.allows(scope))
+            .collect();
+        let refused = if refused.is_empty() {
+            String::new()
+        } else {
+            format!(" — not granted, above the floor: {}", refused.join(", "))
+        };
+        Ok(format!(
+            "logged in — {}{refused}",
+            self.describe_capability()
+        ))
     }
 
-    /// `logout` / `sink urn:host:logout` — drop the session back to the anonymous
-    /// (root) identity, the state before any `login`.
+    /// `logout` / `sink urn:host:logout` — drop the session back to its
+    /// [`floor`](Self::floor): root for a fresh unsealed session (the state before any
+    /// `login`), the starting identity of a scoped one, the sealed floor after `cap seal`.
     fn run_logout(&self) -> Result<String, String> {
         self.logout();
         Ok(format!("logged out — {}", self.describe_capability()))
@@ -1427,12 +1493,15 @@ impl Engine {
         )
     }
 
-    /// `cap` command: show, narrow, or reset the session capability.
+    /// `cap` command: show, narrow, reset, or seal the session capability.
     ///
     /// `cap` shows the current authority; `cap <scope>…` narrows it to the given
-    /// `urn:cap:` scopes (intersected with what's already held — it can only ever
-    /// shrink); `cap reset` returns to the session's identity. This is how the
-    /// owner voluntarily gives up authority before handing work to an agent.
+    /// `urn:cap:` scopes (intersected with what's already held); `cap reset` returns to
+    /// the session's identity. Narrowing is REVERSIBLE — `cap reset`, `login` and `logout`
+    /// widen it again — so it is how the owner steps down for a while (the runbook's and
+    /// the tutorial's narrow-then-reset). `cap seal [scope…]` is the hand-off: it narrows
+    /// (when given scopes) and then makes the result the session's floor, one-way, so the
+    /// holder can never widen back.
     fn run_cap(&self, rest: &str) -> Result<String, String> {
         let rest = rest.trim();
         if rest.is_empty() {
@@ -1445,30 +1514,45 @@ impl Engine {
                 self.describe_capability()
             ));
         }
-        // A registered profile name expands to its scopes; otherwise each word is
-        // a scope, with a `net-<host>` shorthand for `urn:cap:net:<host>` so a
-        // session can be narrowed to one host without typing the full scope (e.g.
-        // `cap net-example.com` before handing outbound HTTP to an agent).
-        let scopes: Vec<String> = match self.profiles.borrow().get(rest) {
-            Some(scopes) => scopes.clone(),
-            None => rest.split_whitespace().map(expand_cap_shorthand).collect(),
-        };
-        let narrowed = self.capability.borrow().attenuate(scopes);
-        *self.capability.borrow_mut() = narrowed;
+        let (word, scopes) = split_first_word(rest);
+        if word == "seal" {
+            let scopes = scopes.trim();
+            if !scopes.is_empty() {
+                self.narrow(scopes);
+            }
+            self.seal();
+            return Ok(format!("sealed — {}", self.describe_capability()));
+        }
+        self.narrow(rest);
         Ok(format!("narrowed — {}", self.describe_capability()))
     }
 
-    /// A one-line summary of the session capability.
+    /// Narrow the session capability to `words`: a registered profile name expands to its
+    /// scopes; otherwise each word is a scope, with a `net-<host>` shorthand for
+    /// `urn:cap:net:<host>` so a session can be narrowed to one host without typing the
+    /// full scope (e.g. `cap seal net-example.com` before handing outbound HTTP to an
+    /// agent).
+    fn narrow(&self, words: &str) {
+        let scopes: Vec<String> = match self.profiles.borrow().get(words) {
+            Some(scopes) => scopes.clone(),
+            None => words.split_whitespace().map(expand_cap_shorthand).collect(),
+        };
+        let narrowed = self.capability.borrow().attenuate(scopes);
+        *self.capability.borrow_mut() = narrowed;
+    }
+
+    /// A one-line summary of the session capability — and, once sealed, of its floor.
     fn describe_capability(&self) -> String {
-        match self.capability.borrow().scopes() {
-            None => "capability: root (full authority)".to_string(),
-            Some(scopes) if scopes.is_empty() => {
-                "capability: empty (no scopes granted)".to_string()
-            }
-            Some(scopes) => format!(
-                "capability: {}",
-                scopes.iter().cloned().collect::<Vec<_>>().join(", ")
-            ),
+        let capability = self.capability.borrow().clone();
+        let summary = format!("capability: {}", summarize(&capability));
+        if !self.sealed.get() {
+            return summary;
+        }
+        let floor = self.floor.borrow().clone();
+        if floor == capability {
+            format!("{summary} · sealed (this is the floor: `cap reset`, `logout` and `login` cannot rise above it)")
+        } else {
+            format!("{summary} · sealed at {}", summarize(&floor))
         }
     }
 
@@ -2450,6 +2534,16 @@ fn split_first_word(s: &str) -> (&str, &str) {
 /// `urn:cap:net:<host>` network scope; anything else is taken verbatim (so a full
 /// `urn:cap:…` scope still works). Lets `cap net-example.com` narrow a session to
 /// one host without typing the whole scope.
+/// A capability in words: `root (full authority)`, `empty (no scopes granted)`, or its
+/// scopes joined by `, `.
+fn summarize(capability: &Capability) -> String {
+    match capability.scopes() {
+        None => "root (full authority)".to_string(),
+        Some(scopes) if scopes.is_empty() => "empty (no scopes granted)".to_string(),
+        Some(scopes) => scopes.iter().cloned().collect::<Vec<_>>().join(", "),
+    }
+}
+
 fn expand_cap_shorthand(word: &str) -> String {
     match word.strip_prefix("net-") {
         Some(host) if !host.is_empty() => format!("urn:cap:net:{host}"),
@@ -3752,6 +3846,277 @@ mod tests {
             output(engine.eval("source urn:demo:cal")).unwrap(),
             "DETAIL"
         );
+    }
+
+    /// A kernel whose `urn:demo:cal` projects on the session capability (DETAIL only to a
+    /// holder of `urn:cap:demo:cal:read:detail`), for the seal and identity-floor tests.
+    fn cal_engine(identity: Capability) -> Engine {
+        let cal = FnEndpoint::new("cal", |inv: &Invocation<'_>| {
+            let body = if inv.capability.allows("urn:cap:demo:cal:read:detail") {
+                "DETAIL"
+            } else {
+                "freebusy"
+            };
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                body.as_bytes().to_vec(),
+            ))
+        });
+        let space = EndpointSpace::new().bind(Exact::new("urn:demo:cal"), cal);
+        Engine::with_identity(
+            Kernel::with_meta_renderer(Arc::new(space), Arc::new(JsonRenderer)),
+            identity,
+        )
+    }
+
+    /// ledger #734 (e1): an engine STARTED scoped logs out to that identity, not root.
+    #[test]
+    fn a_scoped_identity_logs_out_to_itself_not_root() {
+        let scoped = Capability::scoped(["urn:cap:demo:cal:read:freebusy".to_string()]);
+        let engine = cal_engine(scoped.clone());
+        assert_eq!(engine.floor(), scoped);
+        engine.eval("logout");
+        assert_eq!(
+            engine.capability(),
+            scoped,
+            "`logout` widened a scoped session"
+        );
+        assert_eq!(engine.identity(), scoped);
+        engine.eval("sink urn:host:logout");
+        assert_eq!(engine.capability(), scoped);
+        engine.logout();
+        assert_eq!(engine.capability(), scoped);
+        assert_eq!(
+            output(engine.eval("source urn:demo:cal")).unwrap(),
+            "freebusy"
+        );
+        assert!(!engine.is_sealed(), "a scoped start is bounded, not sealed");
+    }
+
+    /// ledger #734 (e1b): `login` on a scoped engine cannot mint a scope the engine never
+    /// held, and the reply NAMES what it refused rather than dropping it silently.
+    #[test]
+    fn a_scoped_identity_cannot_log_in_above_itself() {
+        let engine = cal_engine(Capability::scoped([
+            "urn:cap:demo:read".to_string(),
+            "urn:cap:demo:cal:read:freebusy".to_string(),
+        ]));
+        let reply = output(engine.eval("login urn:cap:demo:read urn:cap:secret:read")).unwrap();
+        assert!(
+            !engine.capability().allows("urn:cap:secret:read"),
+            "a scoped session minted a scope it never held by typing `login`"
+        );
+        assert_eq!(
+            reply,
+            "logged in — capability: urn:cap:demo:read — not granted, above the floor: \
+             urn:cap:secret:read"
+        );
+        // The Rust API is clamped the same way: root becomes the floor itself.
+        engine.login(Capability::root());
+        assert_eq!(engine.capability(), engine.floor());
+    }
+
+    /// ledger #734 (e1c), answered by sealing: a SEALED root session cannot widen with
+    /// `logout`, `login` or `cap reset`, and every identity reply says it is sealed.
+    #[test]
+    fn a_sealed_session_cannot_widen_by_any_verb() {
+        let engine = cal_engine(Capability::root());
+        assert_eq!(
+            output(engine.eval("cap net-example.com")).unwrap(),
+            "narrowed — capability: urn:cap:net:example.com"
+        );
+        let sealed = output(engine.eval("cap seal")).unwrap();
+        assert_eq!(
+            sealed,
+            "sealed — capability: urn:cap:net:example.com · sealed (this is the floor: \
+             `cap reset`, `logout` and `login` cannot rise above it)"
+        );
+        assert!(engine.is_sealed());
+        let floor = Capability::scoped(["urn:cap:net:example.com".to_string()]);
+        assert_eq!(engine.floor(), floor);
+
+        engine.eval("logout");
+        assert_eq!(
+            engine.capability(),
+            floor,
+            "a sealed session widened via `logout`"
+        );
+        engine.eval("sink urn:host:logout");
+        assert_eq!(engine.capability(), floor);
+
+        engine.eval("cap reset");
+        assert_eq!(
+            engine.capability(),
+            floor,
+            "a sealed session widened via `cap reset`"
+        );
+
+        let login = output(engine.eval("login urn:cap:demo:cal:read:detail")).unwrap();
+        assert!(!engine.capability().allows("urn:cap:demo:cal:read:detail"));
+        assert!(
+            login.contains("not granted, above the floor: urn:cap:demo:cal:read:detail"),
+            "{login}"
+        );
+        assert_eq!(
+            output(engine.eval("source urn:demo:cal")).unwrap(),
+            "freebusy"
+        );
+        engine.eval("sink urn:host:login urn:cap:demo:cal:read:detail");
+        assert_eq!(
+            output(engine.eval("source urn:demo:cal")).unwrap(),
+            "freebusy"
+        );
+
+        // A narrower `cap` under the seal is still reversible, but only back to the floor.
+        engine.eval("logout");
+        assert_eq!(
+            output(engine.eval("cap urn:cap:other")).unwrap(),
+            "narrowed — capability: empty (no scopes granted) · sealed at urn:cap:net:example.com"
+        );
+        engine.eval("cap reset");
+        assert_eq!(engine.capability(), floor);
+
+        // Sealing again can only lower the floor.
+        engine.eval("cap seal urn:cap:other");
+        assert_eq!(engine.floor(), Capability::scoped(Vec::<String>::new()));
+        engine.eval("logout");
+        assert_eq!(
+            engine.capability(),
+            Capability::scoped(Vec::<String>::new())
+        );
+    }
+
+    /// `cap seal <scopes|profile>` narrows and seals in one line; the profile form reads
+    /// the host's registered profiles exactly as `cap` does.
+    #[test]
+    fn cap_seal_with_scopes_or_a_profile_narrows_then_seals() {
+        let engine = cal_engine(Capability::root());
+        engine.define_cap_profile("freebusy", ["urn:cap:demo:cal:read:freebusy"]);
+        output(engine.eval("cap seal freebusy")).unwrap();
+        let freebusy = Capability::scoped(["urn:cap:demo:cal:read:freebusy".to_string()]);
+        assert_eq!(engine.capability(), freebusy);
+        assert_eq!(engine.floor(), freebusy);
+        engine.eval("logout");
+        assert_eq!(
+            output(engine.eval("source urn:demo:cal")).unwrap(),
+            "freebusy"
+        );
+
+        let other = cal_engine(Capability::root());
+        output(other.eval("cap seal net-example.com")).unwrap();
+        assert_eq!(
+            other.floor(),
+            Capability::scoped(["urn:cap:net:example.com".to_string()])
+        );
+        assert_eq!(
+            output(other.eval("cap")).unwrap(),
+            "capability: urn:cap:net:example.com · sealed (this is the floor: `cap reset`, \
+             `logout` and `login` cannot rise above it)"
+        );
+    }
+
+    /// The other half of e1c, pinned because the demos depend on it: an UNSEALED root
+    /// session's narrowing is reversible by `logout`, `login` and `cap reset`, and the
+    /// replies are byte-identical to before the seal existed.
+    #[test]
+    fn an_unsealed_root_session_narrows_reversibly() {
+        let engine = cal_engine(Capability::root());
+        engine.eval("cap net-example.com");
+        assert_eq!(
+            output(engine.eval("logout")).unwrap(),
+            "logged out — capability: root (full authority)"
+        );
+        assert!(engine.capability().is_root());
+        engine.eval("cap net-example.com");
+        assert_eq!(
+            output(engine.eval("login urn:cap:demo:cal:read:detail")).unwrap(),
+            "logged in — capability: urn:cap:demo:cal:read:detail"
+        );
+        assert_eq!(
+            output(engine.eval("source urn:demo:cal")).unwrap(),
+            "DETAIL"
+        );
+        engine.eval("logout");
+        engine.eval("cap net-example.com");
+        assert_eq!(
+            output(engine.eval("cap reset")).unwrap(),
+            "reset to identity — capability: root (full authority)"
+        );
+        assert!(!engine.is_sealed());
+        assert!(engine.floor().is_root());
+    }
+
+    /// The runbook's two narrow/reset sequences (ikigai-runbook `src/lib.rs`, the
+    /// capability demo: `cap read-only` → `cap reset`, then `cap urn:cap:net:httpbin.org`
+    /// → `cap reset`), replayed with their replies — unchanged by the seal.
+    #[test]
+    fn the_runbook_narrow_reset_sequences_replay_unchanged() {
+        let engine = cal_engine(Capability::root());
+        engine.define_cap_profile("read-only", ["urn:cap:fs:read:/ws"]);
+        let replies: Vec<String> = [
+            "cap read-only",
+            "cap reset",
+            "cap urn:cap:net:httpbin.org",
+            "cap reset",
+        ]
+        .iter()
+        .map(|line| output(engine.eval(line)).unwrap())
+        .collect();
+        assert_eq!(
+            replies,
+            [
+                "narrowed — capability: urn:cap:fs:read:/ws",
+                "reset to identity — capability: root (full authority)",
+                "narrowed — capability: urn:cap:net:httpbin.org",
+                "reset to identity — capability: root (full authority)",
+            ]
+        );
+        assert!(engine.capability().is_root());
+    }
+
+    /// The tutorial's `cap reset` ("back to the session's identity"): the grammar
+    /// chapter's narrow/reset, and the spreadsheet chapter's narrow to a scenario and back.
+    #[test]
+    fn the_tutorial_cap_reset_examples_replay_unchanged() {
+        let engine = cal_engine(Capability::root());
+        assert_eq!(
+            output(engine.eval("cap urn:cap:iki:tutorial:sheet:scenario:bob")).unwrap(),
+            "narrowed — capability: urn:cap:iki:tutorial:sheet:scenario:bob"
+        );
+        assert_eq!(
+            output(engine.eval("cap reset")).unwrap(),
+            "reset to identity — capability: root (full authority)"
+        );
+        assert_eq!(
+            output(engine.eval("cap urn:cap:kernel:listen")).unwrap(),
+            "narrowed — capability: urn:cap:kernel:listen"
+        );
+        assert_eq!(
+            output(engine.eval("cap reset")).unwrap(),
+            "reset to identity — capability: root (full authority)"
+        );
+    }
+
+    /// The web demo's sign-in and sign-out on its ROOT engine (`Engine::new`): the page
+    /// sinks `urn:host:login` with the passkey's three workspace scopes, then
+    /// `urn:host:logout` — unchanged by the seal.
+    #[test]
+    fn the_web_demo_sign_in_and_out_replays_unchanged() {
+        let engine = cal_engine(Capability::root());
+        assert_eq!(
+            output(engine.eval(
+                "sink urn:host:login urn:cap:fs:read:ws/abc urn:cap:fs:write:ws/abc \
+                 urn:cap:fs:delete:ws/abc"
+            ))
+            .unwrap(),
+            "logged in — capability: urn:cap:fs:delete:ws/abc, urn:cap:fs:read:ws/abc, \
+             urn:cap:fs:write:ws/abc"
+        );
+        assert_eq!(
+            output(engine.eval("sink urn:host:logout")).unwrap(),
+            "logged out — capability: root (full authority)"
+        );
+        assert!(engine.capability().is_root());
     }
 
     #[test]
