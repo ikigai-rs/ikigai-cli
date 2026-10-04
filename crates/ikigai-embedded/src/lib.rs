@@ -3383,10 +3383,17 @@ struct PeerList;
 /// This ORACLE and the writer must agree on where the directory is. They did not: the
 /// CLI's `quic::dir` resolved the config home through the XDG-honouring spelling while
 /// this one hardcoded `$HOME/.config/ikigai`, so on a machine setting `XDG_CONFIG_HOME`
-/// a peer whose certificate had just been written still reported as unheld.
+/// a peer whose certificate had just been written still reported as unheld. Both now
+/// resolve through [`config::peer_cert_dir_in`](crate::config::peer_cert_dir_in), which
+/// also refuses an announced name that is not one path segment (ledger #741).
 fn holds_cert_for(name: &str) -> bool {
-    crate::config::config_home()
-        .is_some_and(|dir| dir.join(format!("quic-{name}")).join("server.crt").exists())
+    crate::config::config_home().is_some_and(|dir| holds_cert_for_in(&dir, name))
+}
+
+/// [`holds_cert_for`] under an explicit config home, so it is testable without touching
+/// the process environment.
+fn holds_cert_for_in(home: &std::path::Path, name: &str) -> bool {
+    crate::config::peer_cert_dir_in(home, name).is_some_and(|dir| dir.join("server.crt").exists())
 }
 
 #[async_trait::async_trait]
@@ -7081,6 +7088,39 @@ mod tests {
             with_none.contains("none heard"),
             "an absent peer is reported, not escalated: {with_none}"
         );
+    }
+
+    /// An announced name cannot borrow another peer's pinned certificate (ledger #741).
+    /// `quic-{name}` is built from what the LAN SAID, so a name carrying path segments
+    /// resolved to a real peer's directory and the listing reported a stranger as trusted.
+    #[test]
+    fn an_announced_name_cannot_reach_another_peers_certificate() {
+        let home = std::env::temp_dir().join(format!("ikigai-certpath-{}", std::process::id()));
+        let plasma = home.join("quic-plasma");
+        std::fs::create_dir_all(&plasma).unwrap();
+        std::fs::write(plasma.join("server.crt"), "pinned").unwrap();
+
+        assert!(
+            holds_cert_for_in(&home, "plasma"),
+            "the enrolled peer is trusted"
+        );
+        // Climbing out of the config home and back in by name works too.
+        let climbed = format!(
+            "x/../../{}/quic-plasma",
+            home.file_name().unwrap().to_string_lossy()
+        );
+        for forged in [
+            "plasma/../quic-plasma",
+            climbed.as_str(),
+            "plasma/.",
+            "plasma\\..\\quic-plasma",
+        ] {
+            assert!(
+                !holds_cert_for_in(&home, forged),
+                "an announced name with path segments must not be trusted: {forged:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// A peer as the LAN announced it: every string field hostile.
