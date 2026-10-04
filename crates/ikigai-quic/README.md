@@ -35,6 +35,12 @@ per-connection `Session` from it:
 - **`capability`** bounds every call on the connection; a carried `IssueAs`
   capability is clamped to the session (a peer can only narrow its own authority,
   never widen past the authenticated principal).
+- The client CARRIES the caller's capability on every resolution (`IssueAs`, or
+  `IssueTraced` when tracing), so the server answers at the NARROWER of the
+  connection's session and the caller's own authority — a `cap`-narrowed `--connect`
+  session, or a mount forwarding an agent's attenuated grant, stays narrowed across
+  the hop. A root caller clamps to the session, exactly as an uncarried call did.
+  Every v7+ server has answered `IssueAs` this way since wire v2.
 - **`file_segment`** transparently roots the connection's `urn:file:` namespace at
   `<segment>/…`, so each tenant addresses files as if its segment were the root and
   never sees another's.
