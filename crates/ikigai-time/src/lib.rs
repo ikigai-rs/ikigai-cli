@@ -130,11 +130,19 @@ fn parse_duration(s: &str) -> std::result::Result<Duration, String> {
     let n: u64 = num
         .parse()
         .map_err(|_| format!("invalid duration '{s}' (expected e.g. 1s, 10s, 1m)"))?;
+    // A caller-supplied count times a unit must not overflow: unchecked, a debug build
+    // panicked the whole CLI on `every=307445734561825861m` and a release build WRAPPED it
+    // into a 44-second interval (ledger #733, finding T1). Too long is refused instead.
+    let secs = |per: u64| {
+        n.checked_mul(per)
+            .map(Duration::from_secs)
+            .ok_or_else(|| format!("duration '{s}' is too long"))
+    };
     let d = match unit.trim() {
         "ms" => Duration::from_millis(n),
         "s" | "" => Duration::from_secs(n),
-        "m" => Duration::from_secs(n * 60),
-        "h" => Duration::from_secs(n * 3600),
+        "m" => secs(60)?,
+        "h" => secs(3600)?,
         other => return Err(format!("unknown time unit '{other}' (use ms, s, m, h)")),
     };
     if d.is_zero() {
@@ -999,6 +1007,31 @@ mod tests {
     use ikigai_core::{SpaceEntry, SystemClock};
     use ikigai_resolve::CacheStatus;
     use std::sync::atomic::AtomicU64;
+
+    /// A count times a unit that overflows `u64` seconds is REFUSED: unchecked, a debug
+    /// build panicked (killing the CLI on a caller-supplied `every=`) and a release build
+    /// wrapped `307445734561825861m` into a 44-second interval (ledger #733, finding T1).
+    #[test]
+    fn a_duration_too_long_to_represent_is_refused() {
+        for s in [
+            "307445734561825861m",
+            "18446744073709551615h",
+            "5124095576030432h",
+        ] {
+            let parsed = std::panic::catch_unwind(|| parse_schedule(s));
+            match parsed {
+                Err(_) => panic!("parse_schedule({s:?}) panicked"),
+                Ok(Ok(schedule)) => panic!("parse_schedule({s:?}) accepted {schedule:?}"),
+                Ok(Err(message)) => assert!(message.contains("too long"), "{s}: {message}"),
+            }
+        }
+        // The largest that fits still parses, and to the right value.
+        let most = u64::MAX / 3600;
+        assert_eq!(
+            parse_duration(&format!("{most}h")).unwrap(),
+            Duration::from_secs(most * 3600)
+        );
+    }
 
     #[test]
     fn parses_durations() {

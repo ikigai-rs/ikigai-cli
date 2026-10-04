@@ -3091,7 +3091,10 @@ fn job_is_stale(job: &ikigai_time::JobHealth, uptime: std::time::Duration) -> bo
     if !job.recurring {
         return false;
     }
-    let limit = job.interval * STALE_CADENCES;
+    // Saturating: `Duration * u32` PANICS on overflow in every profile, and an interval
+    // parsing cleanly (`every=5000000000000000h`) made `urn:host:health` panic on every
+    // read (ledger #733, finding H4). A limit past `Duration::MAX` is never reached anyway.
+    let limit = job.interval.saturating_mul(STALE_CADENCES);
     match job.since_last {
         Some(age) => age.saturating_sub(job.asleep_since_last.unwrap_or_default()) > limit,
         None => uptime > limit,
@@ -7011,6 +7014,19 @@ mod tests {
         // 30s drain: fine at 60s, stale at 120s.
         assert!(!job_is_stale(&job(30, Some(60), true), up));
         assert!(job_is_stale(&job(30, Some(120), true), up));
+    }
+
+    /// An interval so long that three cadences overflow `Duration` must not panic health:
+    /// `every=5000000000000000h` parses, and `Duration * u32` panics in every profile, so
+    /// `urn:host:health` failed on every read for as long as the job existed (ledger #733,
+    /// finding H4). Such a job is simply never stale.
+    #[test]
+    fn a_job_with_an_enormous_interval_does_not_panic_health() {
+        let up = std::time::Duration::from_secs(86_400);
+        let enormous = job(5_000_000_000_000_000 * 3600, Some(60), true);
+        assert!(!job_is_stale(&enormous, up));
+        let never_ran = job(u64::MAX, None, true);
+        assert!(!job_is_stale(&never_ran, up));
     }
 
     /// A job that has NEVER run is not automatically broken — it may simply be younger
