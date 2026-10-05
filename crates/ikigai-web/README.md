@@ -249,7 +249,7 @@ transrept to the same graph. Turtle:
 
 <urn:web:route:scheduler> a ik:Route ;
     ik:order  10 ;
-    ik:match  "/book/{host}" ;         # {var} captures one path segment
+    ik:match  "/book/{host}" ;         # {var} captures one path segment (strict, below)
     ik:target "urn:schedule:{host}" ;  # …substituted into the IRI template
     ik:cap    "urn:cap:personal:calendar:read:freebusy" ;   # per-route ceiling
     ik:csp    "default-src 'self'; frame-ancestors 'none'" ;
@@ -286,12 +286,51 @@ routes:
     cors: { origin: [https://sletten.com], maxAge: 600 }
 ```
 
+### Route variables: strict `{var}`, raw `{+var}`
+
+A route variable captures exactly one path segment, decoded. It has two spellings,
+after RFC 6570's simple and reserved expansion:
+
+| spelling | its decoded value may carry `:` `/` `?` `#` `[` `]` `@` | use it for |
+|---|---|---|
+| `{var}` | **no** — the request is refused `400`, naming the variable | a name, an id, a key: anything that is one piece of an IRI |
+| `{+var}` | yes, substituted as it is | a variable that IS an IRI or a path |
+
+Those seven are RFC 3986's gen-delims: they are what give an IRI its structure. If
+`/u/{name}` → `urn:user:{name}` passed them, `/u/alice:private` would address
+`urn:user:alice:private` — a deeper resource than the route names, and under
+`--routes-only` one that no route serves at all. Percent-encoding does not get a
+delimiter past the check: `/u/alice%3Aprivate` and `/u/a%2Fb` are refused too, because
+the check reads the value after decoding.
+
+```turtle
+<urn:web:route:user> a ik:Route ;
+    ik:match  "/u/{name}" ;            # /u/alice → urn:user:alice; /u/alice:private → 400
+    ik:target "urn:user:{name}" .
+
+<urn:web:route:browse> a ik:Route ;
+    ik:match  "/browse/{+iri}" ;       # /browse/urn:repo:x:file:src%2Flib.rs →
+    ik:target "urn:page:browse:{+iri}" .  #   urn:page:browse:urn:repo:x:file:src/lib.rs
+```
+
+- **A refusal is final.** The route whose shape (segment count and literals) fits the
+  path claims it; a strict refusal does not fall through to a later route or to the
+  mechanical default, because either could resolve the value to some other resource.
+- **Spell `{+var}` in both places.** A variable is raw only when the pattern AND the
+  template say `{+var}`; a disagreement is strict.
+- **`{+var}` still captures ONE segment** — an encoded `%2F` is data inside it, a raw `/`
+  is a separator. It opts out of the guard above, so give it to a route only where any
+  value is a resource the route means to expose (under that route's `ik:cap`).
+- The template is expanded in one pass, so a captured value that reads `{other}` is data.
+
 ### Guarding the templates (injection / IDOR)
 
 A route splices a client-controlled path segment into a resource IRI, so two
 concerns need care — **IRI injection** (a capture containing `:` reaching a sibling
-namespace) and **IDOR** (addressing another principal's object). The vocabulary
-makes the defenses declarative, and they compose with the capability model:
+namespace) and **IDOR** (addressing another principal's object). A strict `{var}`
+closes the structural half of injection by itself (above); a `{+var}`, and anything
+finer than "no delimiters", needs the declarative defenses, which compose with the
+capability model:
 
 - **`ik:bind`** sources a template variable from the authenticated principal instead
   of the path, so an identity-owned id is never client-supplied — `/account/me` →
