@@ -27,5 +27,10 @@ serde_json = { workspace = true }
 # no zone database needed here (the edge always stamps UTC).
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
+# The accept loop classifies its errors by errno (EMFILE, ENFILE, ECONNABORTED, …), which
+# `io::ErrorKind` does not name: `EMFILE` has no kind of its own (ledger #720).
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 futures = { workspace = true }

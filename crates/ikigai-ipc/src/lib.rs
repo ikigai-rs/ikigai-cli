@@ -14,6 +14,8 @@
 //! Unix only — the module is empty elsewhere.
 #![cfg(unix)]
 
+mod accept;
+
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
@@ -32,25 +34,46 @@ use ikigai_wire::{
 // depending on ikigai-wire directly.
 pub use ikigai_wire::HelloMode;
 
-/// Run `kernel` as a server on `path` until an unrecoverable accept error: bind
+/// Run `kernel` as a server on `path` until the listener itself fails: bind
 /// the socket (replacing a stale one), restrict it to `0600`, and serve each
 /// same-user connection on its own thread. Connections from another UID are
 /// refused — defense in depth over the `0700` directory.
+///
+/// Returns only on a dead listener (`EBADF`, `EINVAL`, …). One connection's accept
+/// error is skipped, and running out of descriptors or threads is backed off and
+/// retried with the episode logged once (ledger #720; see the private `accept`
+/// module) — so a host's socket door does not exit on a transient `EMFILE`.
 pub fn serve(kernel: Kernel, path: &Path) -> io::Result<()> {
     let kernel = Arc::new(kernel);
     let _ = std::fs::remove_file(path); // a leftover socket would fail the bind
     let listener = UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     let me = own_uid();
-    for stream in listener.incoming() {
-        let stream = stream?;
+    let mut backoff = accept::Backoff::default();
+    loop {
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(e) => match accept::classify(&e) {
+                accept::Fault::Skip => continue,
+                accept::Fault::BackOff => {
+                    std::thread::sleep(backoff.failed(&e));
+                    continue;
+                }
+                accept::Fault::Fatal => return Err(e),
+            },
+        };
         if peer_uid(&stream) != Some(me) {
             continue; // not our user — drop it
         }
         let kernel = Arc::clone(&kernel);
-        std::thread::spawn(move || handle_connection(&kernel, stream));
+        match std::thread::Builder::new().spawn(move || handle_connection(&kernel, stream)) {
+            Ok(_) => backoff.succeeded(),
+            // Out of threads (`EAGAIN`). The stream went down with the closure, so the client
+            // sees a hang-up and redials; `thread::spawn` would have PANICKED here instead,
+            // taking the whole accept loop with it.
+            Err(e) => std::thread::sleep(backoff.failed(&e)),
+        }
     }
-    Ok(())
 }
 
 /// The default socket read/write deadline. Without it, a hung or vanished server
