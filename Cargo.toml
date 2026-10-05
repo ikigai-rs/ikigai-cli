@@ -98,6 +98,9 @@ members = ["crates/*"]
 # explicit: an engine has a FLOOR (root for `Engine::new`, the starting identity for
 # `with_identity`) that `cap reset`, `login` and `logout` cannot rise above, lowered only by a seal.
 # Plain `cap` stays reversible, so the runbook's, tutorial's and web-demo's narrow/reset are unchanged.
+# And ikigai-web route variables are STRICT (ledger #740): `{var}` refuses a value carrying
+# `: / ? # [ ] @` (raw or percent-encoded) with a final 400, so `/u/alice:private` can no longer
+# reach an unrouted IRI under `routes_only`; `{+var}` opts in to raw values (gonk's browse door).
 #
 # 0.1.36 was THE SECURITY RELEASE from the review-value experiment (ledger #723, #733, #741, #738).
 #
