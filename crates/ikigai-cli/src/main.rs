@@ -52,7 +52,9 @@ usage:
   ikigai serve --http <port>   serve the inbound HTTP face (loopback; front with TLS at your proxy)
                                [--trust-proxy: honor X-Forwarded-*; --cors-origin <o>: allow a CORS origin;
                                 --routes <iri>: load routes from an RDF or plain-JSON resource
-                                (a urn:file: route hot-reloads); --routes-only: un-routed → 404;
+                                (a urn:file: route hot-reloads; a route's {var} refuses a value
+                                carrying : / ? # [ ] @ with a 400, {+var} passes it raw);
+                                --routes-only: un-routed → 404;
                                 --max-body <bytes>: largest accepted request body, default 1048576;
                                 --push: serve cut notices as an event stream at /_ikigai/push —
                                 needs --cap urn:cap:kernel:listen, or every stream is a 403]
@@ -168,7 +170,9 @@ enum Mode {
         /// Empty = CORS closed (the safe default).
         cors_origins: Vec<String>,
         /// `--routes <iri>`: load the route table from this RDF resource (`ik:Route` graph),
-        /// e.g. `urn:web:routes` or a watched `urn:file:web/routes.ttl`.
+        /// e.g. `urn:web:routes` or a watched `urn:file:web/routes.ttl`. A route's `{var}` is
+        /// strict (a value carrying `:` `/` `?` `#` `[` `]` `@` is a `400`); `{+var}` is raw —
+        /// see `ikigai_web::Route`.
         routes: Option<String>,
         /// `--routes-only`: an un-routed path 404s instead of falling through to the mechanical
         /// default — the route table becomes an exhaustive allow-list (the public-edge posture).

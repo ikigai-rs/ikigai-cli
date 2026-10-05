@@ -13,7 +13,10 @@
 //!   declared `describe().verbs` — an endpoint that declares no verbs isn't pre-empted.
 //! - **path ↔ iri**: `/account/id/alice` → `urn:account:id:alice` (singular noun, partition
 //!   key baked in) is the mechanical default; a [`RouteTable`] carries the *variations* —
-//!   path patterns → IRI templates with optional per-route capability / CORS / CSP.
+//!   path patterns → IRI templates with optional per-route capability / CORS / CSP. A
+//!   route's `{var}` is STRICT — its value may not carry `:` `/` `?` `#` `[` `]` `@`, so one
+//!   segment cannot address a deeper resource than the route names (`400` instead) — and
+//!   `{+var}` opts a variable into carrying them raw. See [`Route`].
 //! - **Accept ↔ conneg**: the `Accept` header drives the `as=` transreptor selection.
 //! - **query + body → inputs**: query params become inspectable request args; a write's body
 //!   is the piped `content`, with the request Content-Type surfaced as `content-type`.
@@ -289,12 +292,44 @@ impl Default for EdgeConfig {
 }
 
 /// A single route: a path pattern → an IRI template, with optional per-route overrides. The
-/// pattern and template share `{var}` capture names (`/book/{host}` → `urn:schedule:{host}`).
+/// pattern and template share capture names (`/book/{host}` → `urn:schedule:{host}`).
+///
+/// **Two spellings of a variable** (RFC 6570's simple and reserved expansion):
+///
+/// - `{var}` is **strict**: it captures one path segment whose DECODED value carries none of
+///   RFC 3986's gen-delims `:` `/` `?` `#` `[` `]` `@`. A value that does (`/u/alice:private`,
+///   or `/u/a%2Fb` once `%2F` is decoded) does not fill the variable, and the request is
+///   refused `400 Bad Request` naming it — never re-tried against a later route or the
+///   mechanical default, either of which could resolve it to some other resource. This is the
+///   default because an IRI's structure IS those delimiters: a raw `:` in `urn:user:{name}`
+///   turns `alice:private` into a different, deeper resource than the route names, which
+///   under [`EdgeConfig::routes_only`] is a resource no route serves.
+/// - `{+var}` is **raw**: it still captures exactly one segment, but its decoded value is
+///   substituted as it is, delimiters and all — for a route whose variable IS an IRI or a
+///   path (`/browse/{+iri}` → `urn:page:browse:{+iri}`). It opts out of the guard above, so
+///   use it only where any value is a resource the route means to expose.
+///
+/// A variable is raw only when EVERY spelling of it, in the pattern and the template, is
+/// `{+var}`; a pattern and template that disagree are strict. Substitution is one pass over
+/// the template, so a captured value containing `{…}` is never itself expanded.
+///
+/// ```
+/// use ikigai_web::{Route, RouteTable};
+/// let route = |pattern: &str, iri: &str| Route {
+///     pattern: pattern.into(), iri_template: iri.into(), cap: None, cors: None, csp: None,
+/// };
+/// // `/u/alice` → `urn:user:alice`; `/u/alice:private` → 400, the variable refuses `:`.
+/// let strict = route("/u/{name}", "urn:user:{name}");
+/// // `/browse/urn:repo:x:file:src%2Flib.rs` → `urn:page:browse:urn:repo:x:file:src/lib.rs`.
+/// let raw = route("/browse/{+iri}", "urn:page:browse:{+iri}");
+/// let _ = RouteTable::new(vec![strict, raw]);
+/// ```
 #[derive(Clone)]
 pub struct Route {
-    /// Path pattern; `{var}` captures exactly one segment, a literal must match exactly.
+    /// Path pattern; a `{var}` or `{+var}` segment captures exactly one path segment, a
+    /// literal segment must match exactly.
     pub pattern: String,
-    /// IRI template; each `{var}` from the pattern is substituted in.
+    /// IRI template; each variable the pattern captured is substituted in.
     pub iri_template: String,
     /// Per-route capability ceiling (scopes). `None` → the server's `cap_fn` applies.
     pub cap: Option<Vec<String>>,
@@ -317,10 +352,50 @@ pub struct RouteTable {
 /// threads cleanly through the async request path).
 #[derive(Clone)]
 struct Matched {
-    iri: String,
+    /// The expanded IRI template, or — when a strict `{var}` refused its value — the `400`
+    /// body naming the variable. A refusal still MATCHED: the route's shape claimed the path,
+    /// so no later route and no mechanical default may answer it instead.
+    iri: Result<String, String>,
     cap: Option<Vec<String>>,
     cors: Option<CorsPolicy>,
     csp: Option<String>,
+}
+
+/// RFC 3986 §2.2's gen-delims — the characters that give an IRI its structure, and so the
+/// ones a strict `{var}` refuses to carry into one.
+const GEN_DELIMS: [char; 7] = [':', '/', '?', '#', '[', ']', '@'];
+
+/// The variable a `{name}` / `{+name}` token names, and whether it is the raw `+` spelling.
+/// `None` for anything that is not one whole placeholder.
+fn placeholder(token: &str) -> Option<(&str, bool)> {
+    let inner = token.strip_prefix('{')?.strip_suffix('}')?;
+    Some(match inner.strip_prefix('+') {
+        Some(name) => (name, true),
+        None => (inner, false),
+    })
+}
+
+/// Expand `template` in ONE pass: each `{name}` or `{+name}` whose name is bound is replaced
+/// by its value, and anything else (an unbound name, a stray brace) is kept as written. One
+/// pass, so a value that itself reads `{other}` is data, never a second placeholder.
+fn expand(template: &str, binds: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let from = &rest[open..];
+        let Some(close) = from.find('}') else {
+            break;
+        };
+        let token = &from[..=close];
+        match placeholder(token).and_then(|(name, _)| binds.iter().find(|(v, _)| *v == name)) {
+            Some((_, value)) => out.push_str(value),
+            None => out.push_str(token),
+        }
+        rest = &from[close + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 impl RouteTable {
@@ -329,8 +404,10 @@ impl RouteTable {
         RouteTable { routes }
     }
 
-    /// Match `path` against the routes in order; the first hit resolves the IRI template with
-    /// the captured vars and returns it with the route's overrides. `None` → fall through.
+    /// Match `path` against the routes in order. The first route whose SHAPE fits (segment
+    /// count and literals) wins: its captures are checked — a strict `{var}` refuses a value
+    /// carrying a gen-delim, see [`Route`] — and expanded into the IRI template. `None` →
+    /// no route's shape fits; fall through.
     fn match_path(&self, path: &str) -> Option<Matched> {
         let segs = path_segments(path);
         for route in &self.routes {
@@ -343,11 +420,12 @@ impl RouteTable {
             if pat.len() != segs.len() {
                 continue;
             }
-            let mut binds: Vec<(&str, &str)> = Vec::new();
+            // (name, value, raw in the pattern)
+            let mut binds: Vec<(&str, &str, bool)> = Vec::new();
             let mut matched = true;
             for (p, s) in pat.iter().zip(&segs) {
-                if let Some(var) = p.strip_prefix('{').and_then(|v| v.strip_suffix('}')) {
-                    binds.push((var, s));
+                if let Some((var, raw)) = placeholder(p) {
+                    binds.push((var, s, raw));
                 } else if p != s {
                     matched = false;
                     break;
@@ -356,10 +434,24 @@ impl RouteTable {
             if !matched {
                 continue;
             }
-            let mut iri = route.iri_template.clone();
-            for (var, val) in &binds {
-                iri = iri.replace(&format!("{{{var}}}"), val);
-            }
+            let refusal = binds.iter().find_map(|(var, val, raw)| {
+                // Raw only when the template agrees: a `{var}` spelling there is strict.
+                if *raw && !route.iri_template.contains(&format!("{{{var}}}")) {
+                    return None;
+                }
+                let delim = val.chars().find(|c| GEN_DELIMS.contains(c))?;
+                Some(format!(
+                    "route variable {{{var}}} cannot carry '{delim}': a strict {{var}} refuses \
+                     : / ? # [ ] @"
+                ))
+            });
+            let iri = match refusal {
+                Some(why) => Err(why),
+                None => {
+                    let pairs: Vec<(&str, &str)> = binds.iter().map(|(n, v, _)| (*n, *v)).collect();
+                    Ok(expand(&route.iri_template, &pairs))
+                }
+            };
             return Some(Matched {
                 iri,
                 cap: route.cap.clone(),
@@ -775,8 +867,10 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
     let kernel = &shared.kernel;
     // A matched route supplies the target IRI (from its template); otherwise the mechanical
     // `/noun/partition/key` → `urn:` default.
-    let iri_str = match matched {
-        Some(m) => m.iri.clone(),
+    let iri_str = match matched.map(|m| &m.iri) {
+        Some(Ok(iri)) => iri.clone(),
+        // A strict `{var}` refused its value: the route claimed the path, so nothing else may.
+        Some(Err(why)) => return Resp::text(400, "Bad Request", why),
         None => iri_from_path(&req.path),
     };
     let iri = match Iri::parse(&iri_str) {
@@ -3476,6 +3570,151 @@ mod tests {
         );
     }
 
+    /// W1 (ledger #740): a route variable used to be substituted into its IRI template RAW,
+    /// so one path segment carrying `:` addressed a DIFFERENT resource than the route names —
+    /// under `routes_only`, the exhaustive allow-list, an un-routed one. `/u/{name}` →
+    /// `urn:test:{name}` routes `urn:test:<one name>`; `/u/id:hello` must not reach
+    /// `urn:test:id:hello`, which no route serves.
+    #[tokio::test]
+    async fn a_strict_variable_cannot_escape_its_route_under_routes_only() {
+        let addr = start_with(EdgeConfig {
+            routes: RouteTable::new(vec![plain_route("/u/{name}", "urn:test:{name}")]),
+            routes_only: true,
+            ..Default::default()
+        })
+        .await;
+        let ok = roundtrip(addr, "GET /u/echo HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(ok.starts_with("HTTP/1.1 200 OK"), "got: {ok}");
+        for escape in ["/u/id:hello", "/u/id%3Ahello", "/u/id%3ahello"] {
+            let resp = roundtrip(addr, &format!("GET {escape} HTTP/1.1\r\nHost: x\r\n\r\n")).await;
+            assert!(
+                resp.starts_with("HTTP/1.1 400 Bad Request"),
+                "{escape} must be refused, got: {resp}"
+            );
+            assert!(
+                !resp.ends_with("hi"),
+                "{escape} reached urn:test:id:hello: {resp}"
+            );
+            assert!(
+                resp.contains("{name}"),
+                "the refusal names the variable: {resp}"
+            );
+        }
+    }
+
+    /// Every gen-delim, raw where HTTP lets it stand in a path segment and percent-encoded
+    /// always (in both hex cases): a strict `{var}` refuses each, and `{+var}` carries each
+    /// into the IRI as decoded. `?` and `#` cannot appear raw in a path — they end it — and a
+    /// raw `/` is a separator, so those three are tested encoded only.
+    #[test]
+    fn a_strict_variable_refuses_every_gen_delim_and_a_raw_one_carries_it() {
+        let strict = RouteTable::new(vec![plain_route("/s/{key}", "urn:test:seg:{key}")]);
+        let raw = RouteTable::new(vec![plain_route("/s/{+key}", "urn:test:seg:{+key}")]);
+        let mut cases: Vec<(String, char)> = vec![
+            ("a:b".into(), ':'),
+            ("a[b".into(), '['),
+            ("a]b".into(), ']'),
+            ("a@b".into(), '@'),
+        ];
+        for delim in GEN_DELIMS {
+            let hex = format!("{:02X}", delim as u32);
+            cases.push((format!("a%{hex}b"), delim));
+            cases.push((format!("a%{}b", hex.to_lowercase()), delim));
+        }
+        for (seg, delim) in cases {
+            let path = decode_path(format!("/s/{seg}").as_bytes()).unwrap();
+            let refused = strict
+                .match_path(&path)
+                .expect("one segment, so it matches");
+            let why = refused.iri.expect_err("strict refuses");
+            assert!(
+                why.contains("{key}") && why.contains(&format!("'{delim}'")),
+                "{seg}: {why}"
+            );
+            let carried = raw.match_path(&path).expect("matches").iri;
+            assert_eq!(carried, Ok(format!("urn:test:seg:a{delim}b")), "{seg}");
+        }
+        // A value with no delimiter fills either spelling, and the two agree.
+        let plain = decode_path(b"/s/alice").unwrap();
+        assert_eq!(
+            strict.match_path(&plain).unwrap().iri.as_deref(),
+            Ok("urn:test:seg:alice")
+        );
+        assert_eq!(
+            raw.match_path(&plain).unwrap().iri.as_deref(),
+            Ok("urn:test:seg:alice")
+        );
+    }
+
+    /// `{+var}` is raw only when EVERY spelling of the variable says so: a pattern and a
+    /// template that disagree are strict, whichever side carries the `+`.
+    #[test]
+    fn a_pattern_and_template_that_disagree_are_strict() {
+        let path = decode_path(b"/s/a:b").unwrap();
+        for (pattern, template) in [
+            ("/s/{+key}", "urn:test:seg:{key}"),
+            ("/s/{key}", "urn:test:seg:{+key}"),
+            ("/s/{+key}", "urn:test:seg:{+key}:{key}"),
+        ] {
+            let table = RouteTable::new(vec![plain_route(pattern, template)]);
+            assert!(
+                table.match_path(&path).expect("matches").iri.is_err(),
+                "{pattern} -> {template} must be strict"
+            );
+        }
+    }
+
+    /// The template is expanded in ONE pass: a captured value that reads like another
+    /// placeholder is data. (Sequential `replace` used to expand `{b}` inside `a`'s value.)
+    #[test]
+    fn a_captured_value_is_never_expanded_as_a_placeholder() {
+        let table = RouteTable::new(vec![plain_route("/p/{a}/{b}", "urn:test:{a}:{b}")]);
+        let hit = table
+            .match_path(&decode_path(b"/p/%7Bb%7D/x").unwrap())
+            .unwrap();
+        assert_eq!(hit.iri.as_deref(), Ok("urn:test:{b}:x"));
+        // An unbound placeholder stays as written, as it always did.
+        let table = RouteTable::new(vec![plain_route("/q/{a}", "urn:test:{a}:{other}")]);
+        let hit = table.match_path(&decode_path(b"/q/x").unwrap()).unwrap();
+        assert_eq!(hit.iri.as_deref(), Ok("urn:test:x:{other}"));
+    }
+
+    /// A strict refusal is final: the route's shape claimed the path, so neither a later
+    /// route nor the mechanical default answers it — either could name another resource.
+    #[tokio::test]
+    async fn a_strict_refusal_does_not_fall_through() {
+        let addr = start_with(EdgeConfig {
+            routes: RouteTable::new(vec![
+                plain_route("/test/{who}/hello", "urn:test:{who}:hello"),
+                plain_route("/test/{+who}/hello", "urn:test:id:hello"),
+            ]),
+            ..Default::default()
+        })
+        .await;
+        // Without the route, `/test/id:x/hello` would be the mechanical `urn:test:id:x:hello`;
+        // with only the second route it would be `urn:test:id:hello` ("hi").
+        let resp = roundtrip(addr, "GET /test/id:x/hello HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(resp.starts_with("HTTP/1.1 400 Bad Request"), "got: {resp}");
+        assert!(resp.contains("{who}"), "got: {resp}");
+        // `{+var}` end to end: the decoded `/` and `:` reach the endpoint as written.
+        let addr = start_with(EdgeConfig {
+            routes: RouteTable::new(vec![plain_route("/b/{+iri}", "urn:test:seg:{+iri}")]),
+            routes_only: true,
+            ..Default::default()
+        })
+        .await;
+        let resp = roundtrip(
+            addr,
+            "GET /b/urn:repo:x:file:src%2Flib.rs HTTP/1.1\r\nHost: x\r\n\r\n",
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
+        assert!(
+            resp.ends_with("urn:test:seg:urn:repo:x:file:src/lib.rs"),
+            "got: {resp}"
+        );
+    }
+
     #[tokio::test]
     async fn an_unmatched_path_falls_through_to_the_default() {
         let addr = start_with(EdgeConfig {
@@ -4404,16 +4643,33 @@ mod tests {
         let path = decode_path(b"/x/100%25/a%252Fb").unwrap();
         assert_eq!(path_segments(&path), ["x", "100%", "a%2Fb"]);
         // Routing splits the same way: an encoded slash cannot add a segment. This is the
-        // link gonk's `percent` builds for a hostile ledger name.
-        let table = RouteTable::new(vec![plain_route(
+        // link gonk's `percent` builds for a hostile ledger name. The route still MATCHES
+        // (four segments), and a strict `{ledger}` then refuses the decoded `/`; a raw
+        // `{+ledger}` carries it, still as one segment.
+        let hostile = decode_path(b"/l/..%2F..%2Fetc/item/244").unwrap();
+        let strict = RouteTable::new(vec![plain_route(
             "/l/{ledger}/item/{id}",
             "urn:x:{ledger}:{id}",
         )]);
-        let hit = table
-            .match_path(&decode_path(b"/l/..%2F..%2Fetc/item/244").unwrap())
+        let hit = strict
+            .match_path(&hostile)
             .expect("four segments, so the route matches");
-        assert_eq!(hit.iri, "urn:x:../../etc:244");
-        assert!(table
+        let why = hit
+            .iri
+            .expect_err("a strict {ledger} refuses a decoded '/'");
+        assert!(why.contains("{ledger}") && why.contains("'/'"), "{why}");
+        let raw = RouteTable::new(vec![plain_route(
+            "/l/{+ledger}/item/{id}",
+            "urn:x:{+ledger}:{id}",
+        )]);
+        assert_eq!(
+            raw.match_path(&hostile).expect("matches").iri.as_deref(),
+            Ok("urn:x:../../etc:244")
+        );
+        assert!(strict
+            .match_path(&decode_path(b"/l/a/b/item/1").unwrap())
+            .is_none());
+        assert!(raw
             .match_path(&decode_path(b"/l/a/b/item/1").unwrap())
             .is_none());
     }

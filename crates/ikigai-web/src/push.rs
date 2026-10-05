@@ -302,7 +302,7 @@ impl Subscriptions {
                 }
                 "path" => {
                     let iri = match table.match_path(value) {
-                        Some(matched) => matched.iri,
+                        Some(matched) => matched.iri?,
                         None if config.routes_only => {
                             return Err(format!("no route serves `{value}`"))
                         }
@@ -928,6 +928,34 @@ mod tests {
         .await;
         assert!(post.starts_with("HTTP/1.1 405 "), "{post}");
         assert!(post.contains("Allow: GET, OPTIONS\r\n"), "{post}");
+    }
+
+    /// A `path=` subscription is routed exactly as a request is, so a strict route variable
+    /// refuses a delimiter here too — a stream must not listen on a resource the same path
+    /// could not read (ledger #740).
+    #[tokio::test]
+    async fn a_path_subscription_obeys_a_strict_route_variable() {
+        let (addr, _kernel) = serve(EdgeConfig {
+            routes: crate::RouteTable::new(vec![crate::Route {
+                pattern: "/c/{name}".to_string(),
+                iri_template: "urn:test:cell:{name}".to_string(),
+                cap: None,
+                cors: None,
+                csp: None,
+            }]),
+            routes_only: true,
+            ..pushing(PushConfig::default())
+        })
+        .await;
+        let escaped = roundtrip(
+            addr,
+            "GET /_ikigai/push?path=/c/a%3Ab HTTP/1.1\r\nHost: x\r\n\r\n",
+        )
+        .await;
+        assert!(escaped.starts_with("HTTP/1.1 400 "), "{escaped}");
+        assert!(escaped.contains("{name}"), "{escaped}");
+        let fine = Stream::open(addr, "?path=/c/a", "").await;
+        assert!(fine.seen.starts_with("HTTP/1.1 200 "), "{}", fine.seen);
     }
 
     #[tokio::test]

@@ -103,6 +103,8 @@ fn looks_like_json(bytes: &[u8]) -> bool {
 /// ```
 ///
 /// Extra keys (e.g. a friendly `"id"`) are ignored; `order` sorts (first-match-wins).
+/// Patterns and templates pass through as written, so a raw `{+var}` (see
+/// [`ikigai_web::Route`]) needs no loader support.
 pub fn parse_json_routes(bytes: &[u8]) -> Result<RouteTable, String> {
     let v: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|e| format!("route JSON: {e}"))?;

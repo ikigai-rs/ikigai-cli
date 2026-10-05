@@ -251,7 +251,10 @@ endpoints there.
 
 `ikigai serve --http <port> --routes <file> --routes-only --cap <scope>…` serves the
 kernel over plain HTTP behind a reverse proxy (`crates/ikigai-web`): a route maps a
-path to a resource, `Accept` becomes the `as=` face, query parameters become named
+path to a resource (a `{var}` in it refuses a value carrying `:` `/` `?` `#` `[` `]` `@`,
+so one segment cannot reach a deeper resource; `{+var}` opts into carrying them — see
+[the route table](crates/ikigai-web/README.md#route-variables-strict-var-raw-var)),
+`Accept` becomes the `as=` face, query parameters become named
 arguments, and every request resolves under the `--cap` ceiling. Besides the public
 intakes (`urn:contact:submit`, `urn:booking:submit` — validated forms that drop a
 tuple into a space), the emailed decision links and the passkey ceremony, it carries
