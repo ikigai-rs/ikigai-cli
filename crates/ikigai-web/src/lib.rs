@@ -37,6 +37,7 @@
 //! the kernel's behavior out of the wire layer.
 #![forbid(unsafe_code)]
 
+mod accept;
 pub mod push;
 pub use push::{PushConfig, DEFAULT_PUSH_PATH};
 
@@ -537,7 +538,9 @@ pub async fn serve(kernel: Arc<Kernel>, cap_fn: CapFn, addr: SocketAddr) -> std:
 
 /// Serve `kernel` over HTTP on `addr`, resolving each request under `cap_fn(request)` and
 /// applying `config` (security headers, CORS, proxy trust). One request per connection
-/// (`Connection: close`). Runs until the listener errors.
+/// (`Connection: close`). Runs until the listener itself fails: a per-connection accept error
+/// is skipped and descriptor exhaustion is backed off and retried (see the private `accept`
+/// module), so only a dead listener (`EBADF`, `EINVAL`, …) returns.
 pub async fn serve_with(
     kernel: Arc<Kernel>,
     cap_fn: CapFn,
@@ -581,8 +584,24 @@ pub async fn serve_with_listener(
             .max_connections
             .min(tokio::sync::Semaphore::MAX_PERMITS),
     ));
+    // An accept error ends this loop only when the listener itself is dead; one connection's
+    // failure is skipped and running out of descriptors is waited out (ledger #720, `accept`).
+    let mut backoff = accept::Backoff::default();
     loop {
-        let (sock, peer) = listener.accept().await?;
+        let (sock, peer) = match listener.accept().await {
+            Ok(accepted) => {
+                backoff.succeeded();
+                accepted
+            }
+            Err(e) => match accept::classify(&e) {
+                accept::Fault::Skip => continue,
+                accept::Fault::BackOff => {
+                    tokio::time::sleep(backoff.failed(&e)).await;
+                    continue;
+                }
+                accept::Fault::Fatal => return Err(e),
+            },
+        };
         let shared = Arc::clone(&shared);
         match Arc::clone(&permits).try_acquire_owned() {
             Ok(permit) => {

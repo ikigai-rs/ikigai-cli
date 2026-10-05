@@ -10,7 +10,7 @@ embedded one.
 
 ```rust
 // server
-ikigai_ipc::serve(kernel, &path)?;        // runs until an unrecoverable accept error
+ikigai_ipc::serve(kernel, &path)?;        // runs until the listener itself dies (EMFILE is waited out)
 
 // client — an IpcResolver the engine drives like any other Resolver
 let resolver = ikigai_ipc::connect(&path)?;
