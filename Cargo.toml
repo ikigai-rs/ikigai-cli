@@ -122,7 +122,19 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 [workspace.dependencies]
 # The released kernel, consumed from crates.io. For local cross-repo development
 # against a sibling checkout, use .cargo/config.toml (see .cargo/config.toml.example).
-ikigai-core = "0.1.84" # 0.1.84 = declarations are BOUNDED (ledger #643): `Topology::from_turtle`
+ikigai-core = "0.1.85" # 0.1.85 = THE CAPABILITY FLOOR COVERS EVERY VERB (ledger #750, A2/A3), a
+# BEHAVIORAL floor and the reason for the pin: through 0.1.84 a verb an endpoint did not declare
+# skipped the floor, and a dozen of this host's own endpoints run the same code whatever verb
+# arrives. Most also check their own capability inside `invoke`; the `urn:time:*` trio does not,
+# so under a narrowed capability a `Delete` on the Source-only `urn:time:schedule` registered a
+# job. 0.1.85 gates an undeclared verb by what the endpoint does declare; `ikigai-embedded`'s
+# `an_undeclared_verb_on_a_gated_host_endpoint_is_refused_at_the_floor` pins it and is red below
+# 0.1.85. Every one is ACCEPTED as refused (no caller here uses an undeclared verb), none was
+# given a second verb. No API change reaches this workspace: `Issuer::record_subtree` gained a
+# trace scope, but nothing here implements `Issuer` (`ikigai-resolve` calls
+# `Invocation::record_subtree`, unchanged).
+# Beneath it, and each called:
+# 0.1.84 = declarations are BOUNDED (ledger #643): `Topology::from_turtle`
 # and `build` refuse a tree past `MAX_DECLARATION_DEPTH` (48), `MAX_DECLARATION_NODES` (65,536) or
 # `MAX_DECLARATION_TEXT` (16 MiB) as `DeclarationError::TooLarge`, where 0.1.83 recursed without
 # bound — a deep `--arrangement` file aborted the process on a stack overflow, and a few KB of
@@ -182,7 +194,11 @@ ikigai-core = "0.1.84" # 0.1.84 = declarations are BOUNDED (ledger #643): `Topol
 # holds beneath it: below that a MOUNTED template row whose local name-guess collides with a
 # shorter sibling is dropped from the manifold, so `ikigai mcp` silently stops projecting
 # browse-pr-explain and browse-pr-review.
-ikigai-vocab = "0.1.84" # 0.1.84 = core 0.1.84's lockstep release, and NOT an API floor: the
+ikigai-vocab = "0.1.85" # 0.1.85 = core 0.1.85's lockstep release, and NOT an API floor: no new
+# terms (the `ik:Alias` comment now says sorted precedence). Raised with core for the reason
+# 0.1.84 was: this repo's tests validate against the vocabulary the lock resolves.
+# Beneath it, and each called:
+# 0.1.84 = core 0.1.84's lockstep release, and NOT an API floor: the
 # vocabulary is unchanged but for its `owl:versionInfo`. Raised with core because this repo's tests
 # validate against the vocabulary the lock resolves, and that is the version they now run against.
 # Beneath it, and each called:
@@ -589,7 +605,14 @@ ikigai-meeting = "0.1.1" # 0.1.1 runs the module's OWN rules — both Zoom hosts
 # `oxrdf/rdf-12`, so `Term::Triple` exists and the match is non-exhaustive. The store's own
 # CI passes `features: "persistent"` and never sees it. A floor of 0.2.2 would be a floor
 # on a version no consumer of this workspace can build.
-ikigai-store = { version = "0.2.3", features = ["persistent"] }
+# ⚠ …and 0.2.6 (the audit release, ledger #751), a SECURITY floor: through 0.2.5 an update
+# with a WHERE ran under the write grant alone, so a write-only caller could read a graph through
+# an escaping `INSERT … WHERE` and through the refusal text. 0.2.6 needs the READ grant on every
+# graph a WHERE reads — which is why `store::grants_for(…, Purge)` now carries the graveyard's
+# read token (ledger #760): `ikigai-ledger`'s purge reads the graveyard. The one other behavior
+# a host can see is "two live spaces over one store forfeit coverage"; this host binds ONE space
+# per process (`STORE_SPACE`), so nothing here meets it. API: additive only.
+ikigai-store = { version = "0.2.6", features = ["persistent"] }
 # The work ledger (`urn:iki:ledger:*`): items, comments, labels, links, claims and
 # `next`, as RDF in the store above. It owns no bytes — every read is a scoped SPARQL
 # query at `urn:iki:store:graph-select` and every write a scoped UPDATE at
@@ -605,7 +628,16 @@ ikigai-store = { version = "0.2.3", features = ["persistent"] }
 # reading one item back. The floor states the behaviour the composition depends on, which
 # is what `tests/ledger.rs::the_narrow_per_graph_grants_work_and_the_broad_store_key_does_not`
 # now exercises end to end.
-ikigai-ledger = "0.2.1"
+# ⚠ 0.4.0, and `"0.4.0"` is a RANGE `>=0.4.0, <0.5.0`. 0.3.0 is the behavior this host's grant
+# list is now written against: unique ids, purge READS the graveyard (so it needs the graveyard's
+# read token, which `store::grants_for(…, Purge)` carries and `tests/ledger.rs::
+# the_purge_grant_list_purges_a_deleted_item` exercises — red on 0.2.1's list), `Exists` errors
+# on a denial, a held claim is `Error::Conflict`. 0.4.0 adds a keyed append and a JSON face,
+# and makes `Item`/`Filter` `#[non_exhaustive]`; nothing here constructs either, so it compiles
+# unchanged. Taken at 0.4.0 rather than 0.3.0 so this host is not born ceilinged below the
+# current release (rule 5's second half); `ikigai-gonk` sits on 0.3.0 as this is written, and
+# the difference is additive in behavior (every 0.3.0 request answers the same bytes).
+ikigai-ledger = "0.4.0"
 # ── Intra-workspace siblings: LOCKSTEP pins, not floors ───────────────────────
 # The seventeen members that take `version.workspace = true` are released TOGETHER, at one
 # version, always. So every sibling pin below states the CURRENT workspace version rather

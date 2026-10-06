@@ -142,6 +142,13 @@ futures = { workspace = true }
 # 0.2.0, not 0.1: DECLARATIONS audits the suite's OWN declarations, and a composing host is
 # where that matters most — ONE `Suite` over TWO manifolds carried declarations that could
 # not apply to whichever kernel was being walked. `tests/conformance.rs` is three suites now.
+#
+# ⚠ `"0.2.0"` is a RANGE `<0.3.0`, so this suite is CEILINGED below 0.3.0's AUTHORITY check and
+# 0.5.0's purity rule. 0.5.1 was tried on 2026-10-06 (with core 0.1.85) and reports three
+# findings on endpoints this crate owns — `host-arrangement` CACHEABLE (cached with no thread
+# but its own name), and `calendar-request` / `contact-block` AUTHORITY on the HTTP door (a
+# Sink declaring no `requires` that resolved under no grants). Each needs a decision, not a
+# pin edit, so the move waits for the arc that makes them.
 ikigai-conformance = "0.2.0"
 # The conformance fixture SEEDS the two edge verifying keys and one signing key, so the
 # decision faces are walked over real state instead of reporting "did not resolve". Same
