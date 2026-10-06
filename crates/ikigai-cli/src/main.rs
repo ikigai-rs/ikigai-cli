@@ -57,7 +57,11 @@ usage:
                                 --routes-only: un-routed → 404;
                                 --max-body <bytes>: largest accepted request body, default 1048576;
                                 --push: serve cut notices as an event stream at /_ikigai/push —
-                                needs --cap urn:cap:kernel:listen, or every stream is a 403]
+                                needs --cap urn:cap:kernel:listen, or every stream is a 403;
+                                --passkey-rp-id <domain> [--passkey-origin <url>]: the WebAuthn
+                                relying party the passkey endpoints serve (origin defaults to
+                                https://<domain>). No default: without it nothing can enroll, and
+                                an edge with a passkey enrolled refuses every gated decision]
   ikigai --daemon              headless: timers, the watcher, and the standing sync — for launchd
   ikigai --name <instance>     name this instance (scopes <name>.* config properties; defaults
                                repl / daemon / serve by mode)
@@ -629,6 +633,8 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
         let mut push = false;
         let mut announce = false;
         let mut mounts = Mounts::default();
+        let mut passkey_rp_id: Option<String> = None;
+        let mut passkey_origin: Option<String> = None;
         while let Some(arg) = argv.next() {
             if cert_flag(&arg, &mut argv, &mut certs)? {
                 // A cert flag FOLLOWING a mount belongs to that mount (the REPL's rule),
@@ -735,6 +741,21 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 trust_proxy = true;
                 continue;
             }
+            // The passkey relying party (see `ikigai_embedded::passkey::RelyingParty`). A flag,
+            // not an environment variable: an env var leaks across every edge on a host, and a
+            // forgotten one used to default silently to the production hostname.
+            if arg == "--passkey-rp-id" {
+                passkey_rp_id = Some(argv.next().ok_or_else(|| {
+                    "--passkey-rp-id needs a domain (e.g. ikigai-rs.dev)".to_string()
+                })?);
+                continue;
+            }
+            if arg == "--passkey-origin" {
+                passkey_origin = Some(argv.next().ok_or_else(|| {
+                    "--passkey-origin needs an origin (e.g. https://ikigai-rs.dev)".to_string()
+                })?);
+                continue;
+            }
             if arg == "--cors-origin" {
                 cors_origins.push(
                     argv.next()
@@ -777,6 +798,22 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
         }
         // Both postures at once is a startup error, not a precedence rule (see `Mounts`).
         mounts.refuse_conflict()?;
+        // The passkey relying party, validated at startup so a typo is a refusal to start
+        // rather than a page that fails at the first tap.
+        match (passkey_rp_id, passkey_origin) {
+            (Some(rp_id), origin) => {
+                #[cfg(feature = "embedded")]
+                ikigai_embedded::passkey::set_relying_party(
+                    ikigai_embedded::passkey::RelyingParty::new(&rp_id, origin.as_deref())?,
+                );
+                #[cfg(not(feature = "embedded"))]
+                let _ = (rp_id, origin);
+            }
+            (None, Some(_)) => {
+                return Err("--passkey-origin needs --passkey-rp-id beside it".to_string());
+            }
+            (None, None) => {}
+        }
         // Declare the code-signing trust set for whichever serve mode follows:
         // process-global, like the instance name, and read by the kernel
         // builders. Empty ⇒ urn:lisp:run is never bound.
@@ -4388,5 +4425,39 @@ mod adapter_gate_tests {
         let live = run(&s.engine, "source urn:tz:now zone=UTC").unwrap();
         assert!(!live.starts_with("2026-09-25T18:00:00"), "{live}");
         let _ = std::fs::remove_dir_all(s.root.parent().expect("scratch"));
+    }
+}
+
+#[cfg(all(test, feature = "embedded"))]
+mod passkey_flag_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Option<Mode>, String> {
+        parse_argv(args.iter().map(|s| s.to_string()))
+    }
+
+    /// The relying party is validated at startup: a malformed one refuses to serve rather than
+    /// serving a page that fails at the first tap, and an origin with no id is refused.
+    #[test]
+    fn the_passkey_relying_party_flags_are_validated_at_startup() {
+        assert!(parse(&["serve", "--http", "8099", "--passkey-rp-id", "edge.test"]).is_ok());
+        assert!(parse(&[
+            "serve",
+            "--http",
+            "8099",
+            "--passkey-rp-id",
+            "edge.test",
+            "--passkey-origin",
+            "https://login.edge.test",
+        ])
+        .is_ok());
+        let err = parse(&["serve", "--passkey-rp-id", "https://edge.test"]).err();
+        assert!(err.is_some_and(|e| e.contains("bare domain")));
+        let err = parse(&["serve", "--passkey-origin", "https://edge.test"]).err();
+        assert!(err.is_some_and(|e| e.contains("--passkey-rp-id")));
+        assert!(
+            parse(&["serve", "--passkey-rp-id"]).is_err(),
+            "needs a value"
+        );
     }
 }
