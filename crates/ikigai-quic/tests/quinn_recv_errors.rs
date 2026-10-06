@@ -40,15 +40,15 @@ use quinn::{AsyncUdpSocket, Runtime, TokioRuntime, UdpPoller};
 /// the same socket. Sending through either makes the kernel queue an ICMP
 /// port-unreachable as the socket's pending error, so its next receive fails with
 /// `ECONNREFUSED` — a real receive error, provoked without touching any network
-/// configuration.
-fn refused_socket() -> (UdpSocket, UdpSocket) {
+/// configuration. Also returns the dead address, for a test that needs to re-bind it.
+fn refused_socket() -> (UdpSocket, UdpSocket, SocketAddr) {
     let dead = UdpSocket::bind("127.0.0.1:0").unwrap();
     let dead_addr = dead.local_addr().unwrap();
     drop(dead);
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     socket.connect(dead_addr).unwrap();
     let twin = socket.try_clone().unwrap();
-    (socket, twin)
+    (socket, twin, dead_addr)
 }
 
 /// Receive on a nonblocking socket until it reports something other than `WouldBlock`,
@@ -71,7 +71,7 @@ fn first_receive_error(socket: &UdpSocket, mut polls: u32) -> io::Error {
 /// The control: without it, the tripwire could pass because no error was ever raised.
 #[test]
 fn the_os_reports_a_receive_error_on_a_socket_connected_to_a_dead_port() {
-    let (socket, twin) = refused_socket();
+    let (socket, twin, _) = refused_socket();
     twin.send(b"x").unwrap();
     let error = first_receive_error(&socket, 200);
     assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused, "{error:?}");
@@ -85,7 +85,7 @@ fn the_os_reports_a_receive_error_on_a_socket_connected_to_a_dead_port() {
 fn a_receive_error_on_the_production_socket_does_not_end_the_driver() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
-        let (socket, twin) = refused_socket();
+        let (socket, twin, dead_addr) = refused_socket();
         socket.set_nonblocking(true).unwrap();
         let endpoint = quinn::Endpoint::new(
             quinn::EndpointConfig::default(),
@@ -97,6 +97,13 @@ fn a_receive_error_on_the_production_socket_does_not_end_the_driver() {
         // Raise the error only once the driver is polling the socket.
         tokio::time::sleep(Duration::from_millis(100)).await;
         twin.send(b"x").unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // A pending socket error wakes a READABLE waiter on macOS (kqueue) but not on Linux
+        // (epoll reports EPOLLERR, which tokio keeps apart from READABLE). So follow the
+        // error with a datagram from the dead port, now re-bound: the socket turns
+        // readable on both, and Linux's recvmsg reports the pending error BEFORE the data.
+        let wake = UdpSocket::bind(dead_addr).expect("re-bind the dead port");
+        wake.send_to(b"wake", twin.local_addr().unwrap()).unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         let accepted = tokio::time::timeout(Duration::from_secs(1), endpoint.accept()).await;
