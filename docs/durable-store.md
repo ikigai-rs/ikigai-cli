@@ -255,10 +255,16 @@ halves** — the ledger's own grant and the store's token for that ledger's grap
 | read | `urn:cap:ledger:read:L` | `urn:cap:store:read:graph:urn:iki:ledger:graph:L` |
 | write | `urn:cap:ledger:write:L` | the above **and** `urn:cap:store:write:graph:urn:iki:ledger:graph:L` |
 | delete | `urn:cap:ledger:delete:L` | both of those **and** `urn:cap:store:write:graph:urn:iki:ledger:graph:L:deleted` |
-| purge | `urn:cap:ledger:purge:L` | the same three as delete |
+| purge | `urn:cap:ledger:purge:L` | the same three as delete **and** `urn:cap:store:read:graph:urn:iki:ledger:graph:L:deleted` |
 
 ⚠ **Delete and purge need write authority over TWO graphs**: the graveyard is a second
 graph and a scoped write cannot reach across. That is the row an operator gets wrong.
+
+⚠ **And purge needs the graveyard's READ grant as well** (ledger #760): since
+`ikigai-ledger` 0.3.0 a purge finds a deleted item through its tombstone and clears what the
+delete archived, and since `ikigai-store` 0.2.6 an update whose WHERE reads a graph needs the
+read grant on it. Without the token purge refuses before touching anything and names it. A
+delete only writes into the graveyard, so it does not need it.
 
 ⚠ **The name goes LAST in the token** — `urn:cap:ledger:write:acme`, never
 `urn:cap:ledger:acme:write`. The kernel matches a wildcard only as a trailing `*`, so a

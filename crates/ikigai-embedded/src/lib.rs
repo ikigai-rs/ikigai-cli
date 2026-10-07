@@ -9542,4 +9542,52 @@ mod arrangement_tests {
         let inspect = Capability::scoped(["urn:cap:kernel:inspect"]);
         assert!(block_on(kernel.issue(request, &inspect)).is_ok());
     }
+
+    /// ★ **An undeclared verb is refused at the floor, never dispatched** (core 0.1.85, the
+    /// A2 fix from ledger #750).
+    ///
+    /// Every endpoint below runs the same code whatever verb arrives: none of them reads
+    /// `request.verb`, and several CHANGE STATE when they run (`urn:time:cancel` cancels,
+    /// `urn:time:schedule` registers a job, `urn:host:heartbeat` writes its file,
+    /// `urn:passkey:enroll-open` opens the enrollment window). Through core 0.1.84 a verb the
+    /// endpoint did not declare skipped the capability floor. Most of these also check their
+    /// own capability inside `invoke`, so for them the floor is the second lock; the three
+    /// `urn:time:*` endpoints check nothing themselves, so a `Delete` on the Source-only
+    /// `urn:time:schedule` registered a job under a capability holding no grants. Each is
+    /// ACCEPTED as refused rather than given a second verb: no caller in this workspace uses
+    /// one of them through a verb it does not declare.
+    ///
+    /// The assertion is on the KERNEL's wording (`declared by`), so an endpoint's own
+    /// in-`invoke` refusal cannot stand in for the floor. ⚠ If this goes red the floor has
+    /// regressed and the endpoint was ENTERED under a capability holding no grants.
+    #[test]
+    fn an_undeclared_verb_on_a_gated_host_endpoint_is_refused_at_the_floor() {
+        let kernel = kernel();
+        let nobody = Capability::scoped(Vec::<String>::new());
+        for (verb, iri, needs) in [
+            (Verb::Sink, "urn:time:cancel", "urn:cap:time:cancel"),
+            (Verb::Delete, "urn:time:schedule", "urn:cap:time:schedule"),
+            (Verb::Exists, "urn:time:jobs", "urn:cap:time:read"),
+            (Verb::Sink, "urn:host:heartbeat", "urn:cap:kernel:inspect"),
+            (Verb::Exists, "urn:host:health", "urn:cap:kernel:inspect"),
+            (
+                Verb::Source,
+                "urn:passkey:enroll-open",
+                "urn:cap:passkey:enroll",
+            ),
+            (Verb::Sink, "urn:decide:link", "urn:cap:decide:mint"),
+            (Verb::Source, "urn:decide:accept", "urn:cap:decide:accept"),
+        ] {
+            let request = Request::new(verb, Iri::parse(iri).unwrap());
+            match block_on(kernel.issue(request, &nobody)) {
+                Err(Error::Denied(message)) => assert!(
+                    message.contains(&format!("does not grant `{needs}` (declared by `{iri}`)")),
+                    "{verb:?} {iri} is refused AT THE FLOOR naming {needs}: {message}"
+                ),
+                other => {
+                    panic!("{verb:?} {iri} under no grants must be Denied at the floor: {other:?}")
+                }
+            }
+        }
+    }
 }

@@ -1346,7 +1346,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -3037,9 +3037,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-core"
-version = "0.1.84"
+version = "0.1.85"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "904d0b3703e28aaf76c9a235413a432512a7eede5c12fe605d67fa56173edd9a"
+checksum = "85fec7c6fafd2694a9e3d63a45f98273af6875c765b7626b0cba2444c84a1430"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3250,9 +3250,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-ledger"
-version = "0.2.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e4b140e9f7cbbaa6eb47b6f0a285c9201a45d3d104205e66e7a7e29c57d3e60"
+checksum = "be5719cf137cd1a07fc3c5645f437af03ad6e40645e3e342b5516129df78b977"
 dependencies = [
  "async-trait",
  "ikigai-core",
@@ -3518,9 +3518,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-store"
-version = "0.2.3"
+version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d44c538b5b7d94dcb01f97bcd0dcb3bb659cc6b44b5c1077768fd772f70e65f"
+checksum = "cff2466f0bf1dd5aa7b4cf659688049b4dce8533a1df6d53d985a4d2ff4b25ac"
 dependencies = [
  "async-trait",
  "ikigai-core",
@@ -3584,9 +3584,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-vocab"
-version = "0.1.84"
+version = "0.1.85"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0cdcae2932101c63402a593eba7d12e16a14656ec3aea90b40b5d0e5ac310d31"
+checksum = "925d54f684fff1552ec5feb13606196c8a1bcd8a3efec17d6e2c7b702aa3f36a"
 dependencies = [
  "ikigai-core",
  "serde_json",
@@ -8109,7 +8109,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

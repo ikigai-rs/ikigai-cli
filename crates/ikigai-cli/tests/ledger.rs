@@ -251,6 +251,44 @@ fn the_narrow_per_graph_grants_work_and_the_broad_store_key_does_not() {
     );
 }
 
+/// ★ **The PURGE grant list, exercised: a session holding exactly `grants_for(…, Purge)`
+/// purges an item that was already deleted** (ledger #760).
+///
+/// Since `ikigai-ledger` 0.3.0 a purge finds a deleted item through its tombstone and clears
+/// what the delete archived, so it READS the graveyard; since `ikigai-store` 0.2.6 an update
+/// with a WHERE needs the read grant on every graph its WHERE reads. A purge list carrying
+/// only the graveyard's WRITE token is refused before anything changes, so this is the line
+/// that makes the graveyard's read token in `grants_for` a checked claim rather than a
+/// comment: drop it and the `delete` below is denied, naming the token.
+#[test]
+fn the_purge_grant_list_purges_a_deleted_item() {
+    use ikigai_embedded::store::{grants_for, Authority};
+
+    let session = engine();
+    let grants = grants_for("shred", Authority::Purge).expect("a valid ledger name");
+    line(&session, &format!("cap {}", grants.join(" ")));
+    let filed = line(
+        &session,
+        "sink urn:iki:ledger:shred:append A token pasted by mistake",
+    );
+    assert!(filed.starts_with("shred#1 "), "{filed}");
+
+    // Delete first, so the content sits in the graveyard and only a purge that can READ the
+    // graveyard can reach it — the case the read token exists for.
+    line(
+        &session,
+        "delete urn:iki:ledger:shred:item:1 reason=oops author=brian",
+    );
+    let purged = line(
+        &session,
+        "delete urn:iki:ledger:shred:purge reason=a-secret author=brian shred#1",
+    );
+    assert!(
+        purged.contains("archived quad(s) destroyed"),
+        "the purge reached the graveyard under exactly the published grants: {purged}"
+    );
+}
+
 /// The ledger's resources are in the composed catalog under the names the manifold
 /// advertises, so `urn:kernel:actions` offers them and the engine can route named
 /// arguments to them — which is what every line in the first test depends on.

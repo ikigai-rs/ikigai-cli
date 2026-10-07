@@ -183,7 +183,8 @@ pub enum Authority {
     Write,
     /// …plus `Delete` on an item, which moves its quads to that ledger's graveyard.
     Delete,
-    /// …plus `purge`, which destroys the content in both graphs.
+    /// …plus `purge`, which destroys the content in both graphs — and so also READS the
+    /// graveyard, which is the one store token a delete does not carry.
     Purge,
 }
 
@@ -241,9 +242,15 @@ pub fn grants_for(ledger: &str, authority: Authority) -> Result<Vec<String>, Err
     if authority == Authority::Delete {
         return Ok(grants);
     }
-    // A purge clears the graveyard and the live graph — the same two store tokens as a
-    // delete, plus its own ledger grant, which is the whole difference in authority.
+    // A purge clears the graveyard and the live graph — the same two store write tokens as a
+    // delete, plus its own ledger grant…
     grants.push(ledger.cap_purge());
+    // ★ …and the graveyard's READ token (ledger #760). Since `ikigai-ledger` 0.3.0 a purge
+    // finds a deleted item through its tombstone and clears what the delete archived, so it
+    // reads the graveyard; since `ikigai-store` 0.2.6 an update with a WHERE needs the read
+    // grant on every graph its WHERE reads. A plain delete only INSERTs there, so the read
+    // token is purge's alone — the same split `ikigai-gonk`'s `grants_for` makes.
+    grants.push(ikigai_store::cap_read_graph(&ledger.deleted_graph()));
     Ok(grants)
 }
 
@@ -493,13 +500,37 @@ mod tests {
             ),
             "the graveyard is a second graph and therefore a second token: {grants:?}"
         );
-        // Purge adds its own ledger grant and no further store scope — the same two
-        // graphs, a different authority over them.
-        let purge = grants_for("acme", Authority::Purge).expect("a valid ledger name");
-        assert_eq!(purge.len(), grants.len() + 1, "{purge:?}");
+        // A delete only INSERTs into the graveyard, so it never needs to READ it.
         assert!(
-            purge.contains(&"urn:cap:ledger:purge:acme".to_string()),
-            "{purge:?}"
+            !grants.contains(
+                &"urn:cap:store:read:graph:urn:iki:ledger:graph:acme:deleted".to_string()
+            ),
+            "the graveyard's read token is purge's alone: {grants:?}"
+        );
+    }
+
+    /// ★ The PURGE list, spelled out as literals for the same reason as the write list
+    /// above: these eight strings are what an operator's grant file carries.
+    ///
+    /// The last one is ledger #760. `ikigai-ledger` 0.3.0+ purges a deleted item by reading
+    /// the graveyard, and `ikigai-store` 0.2.6+ refuses an update whose WHERE reads a graph
+    /// the caller cannot read — so a purge list without the graveyard's READ token is
+    /// refused before anything changes. `ikigai-cli/tests/ledger.rs::
+    /// the_purge_grant_list_purges_a_deleted_item` exercises the list end to end.
+    #[test]
+    fn the_purge_grant_reads_the_graveyard_too() {
+        assert_eq!(
+            grants_for("acme", Authority::Purge).expect("a valid ledger name"),
+            vec![
+                "urn:cap:ledger:read:acme",
+                "urn:cap:store:read:graph:urn:iki:ledger:graph:acme",
+                "urn:cap:ledger:write:acme",
+                "urn:cap:store:write:graph:urn:iki:ledger:graph:acme",
+                "urn:cap:ledger:delete:acme",
+                "urn:cap:store:write:graph:urn:iki:ledger:graph:acme:deleted",
+                "urn:cap:ledger:purge:acme",
+                "urn:cap:store:read:graph:urn:iki:ledger:graph:acme:deleted",
+            ]
         );
     }
 
