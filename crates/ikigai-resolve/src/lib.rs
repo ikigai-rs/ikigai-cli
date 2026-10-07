@@ -899,25 +899,68 @@ pub trait Resolver: Send + Sync {
 
     /// Resolve `request` under an explicit `capability`.
     ///
-    /// The default ignores the capability and delegates to [`issue`](Resolver::issue)
-    /// — correct for a resolver that can't yet carry authority (a wire resolver,
-    /// until capability-on-the-wire lands; the server resolves under its own
-    /// default). The in-process kernel overrides this to enforce the capability,
-    /// which is what lets the REPL's `cap` command attenuate a local session.
+    /// Every resolver that can carry authority overrides this: the in-process kernel
+    /// enforces the capability (which is what lets the REPL's `cap` command attenuate a
+    /// local session), and both wire resolvers send it (`Call::IssueAs`), where the server
+    /// clamps it to the principal the channel authenticated. A WRAPPER (a lazy dial, an
+    /// off-thread hop, a test double) overrides it by forwarding the capability it is
+    /// handed to the resolver it wraps.
+    ///
+    /// ★ **The default FAILS CLOSED** (ledger #849). It serves the root capability through
+    /// [`issue`](Resolver::issue), and refuses any other with a typed
+    /// [`Denied`](Error::Denied) naming the implementing type. It used to ignore the
+    /// capability and call `issue` for every capability, on the reasoning that a wire
+    /// resolver could not carry one yet. That stopped being true when capability-on-the-wire
+    /// shipped, and the default went on silently PROMOTING the caller to the peer's own
+    /// default authority: `ikigai-web`'s prefer-mount wrapper overrode only `issue`, so
+    /// every scope a peer checks at runtime (gonk's per-graph SPARQL union, a browse root,
+    /// a store graph) saw root. Root is served because `issue` IS root's resolution, so
+    /// nothing is widened by it.
+    ///
+    /// ```
+    /// use ikigai_core::{Capability, Error, Iri, Representation, Request, SpaceEntry, Verb};
+    /// use ikigai_resolve::{CacheStatus, Resolver};
+    ///
+    /// /// Overrides `issue` only, so it says nothing about what it does with a capability.
+    /// struct IssueOnly;
+    /// impl Resolver for IssueOnly {
+    ///     fn issue(&self, _: Request) -> Result<(Representation, CacheStatus), Error> {
+    ///         Err(Error::Endpoint("never reached under a narrowed capability".into()))
+    ///     }
+    ///     fn is_cached(&self, _: &Request, _: &Capability) -> bool { false }
+    ///     fn entries(&self) -> Option<Vec<SpaceEntry>> { None }
+    /// }
+    ///
+    /// let read = Request::new(Verb::Source, Iri::parse("urn:x").unwrap());
+    /// let narrowed = Capability::scoped(["urn:cap:x"]);
+    /// match IssueOnly.issue_as(read, &narrowed) {
+    ///     Err(Error::Denied(message)) => assert!(message.contains("IssueOnly")),
+    ///     other => panic!("a resolver that cannot carry a capability refuses it: {other:?}"),
+    /// }
+    /// ```
     fn issue_as(
         &self,
         request: Request,
         capability: &Capability,
     ) -> Result<(Representation, CacheStatus), Error> {
-        let _ = capability;
-        self.issue(request)
+        if capability.is_root() {
+            return self.issue(request);
+        }
+        Err(Error::Denied(format!(
+            "{} cannot carry a narrowed capability: it does not override \
+             `Resolver::issue_as`, and resolving through `issue` would answer under the \
+             peer's own authority instead of the caller's. Forward the capability in an \
+             `issue_as` override",
+            std::any::type_name::<Self>()
+        )))
     }
 
     /// Async resolution under an explicit `capability` — what the engine `await`s
     /// when it drives a stage on the scheduler, so a *spawned* branch (fork/map)
     /// parks rather than blocking a worker thread. The default runs the synchronous
     /// [`issue_as`](Resolver::issue_as) (correct for a resolver that hides a
-    /// `block_on`/wire round-trip); the in-process kernel overrides it to await its
+    /// `block_on`/wire round-trip), so it inherits that method's refusal of a capability
+    /// the resolver cannot carry; the in-process kernel overrides it to await its
     /// own async issue with no `block_on`, which is what makes concurrent fan-out
     /// deadlock-free under a bounded pool.
     async fn issue_as_async(
@@ -1702,5 +1745,149 @@ mod tests {
             block_on(erased.issue_as_async_in(open(), &cap, None, doc_corridor())).unwrap();
         assert_eq!(again.bytes, b"corridor");
         assert_eq!(second, CacheStatus::Hit);
+    }
+
+    /// The scope a [`peer_checking_at_runtime`] endpoint demands.
+    const SECRET: &str = "urn:cap:secret";
+
+    /// A PEER kernel whose one endpoint checks its scope AT RUNTIME, the way gonk's per-graph
+    /// SPARQL union, a browse root and a store graph do: it declares no `requires`, so no
+    /// kernel on the path refuses it from the contract, and the only thing standing between a
+    /// narrowed caller and the answer is the capability the peer actually receives. It answers
+    /// with that capability's scopes, so a test can see exactly what crossed.
+    fn peer_checking_at_runtime() -> Arc<Kernel> {
+        let space = EndpointSpace::new().bind(
+            Exact::new("urn:peer:scoped"),
+            FnEndpoint::new("scoped", |inv| {
+                if !inv.capability.allows(SECRET) {
+                    return Err(Error::Denied(format!("the peer wants {SECRET}")));
+                }
+                let seen = match inv.capability.scopes() {
+                    None => "root".to_string(),
+                    Some(scopes) => scopes.iter().cloned().collect::<Vec<_>>().join(" "),
+                };
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    seen.into_bytes(),
+                ))
+            })
+            .with_description(Description::new("scoped").verb(Verb::Source)),
+        );
+        Arc::new(Kernel::new(Arc::new(space)))
+    }
+
+    /// Run `work` on a thread of its own, as a wire resolver's round trip effectively is: the
+    /// peer kernel's synchronous `Resolver` methods `block_on`, which panics when entered from
+    /// the local kernel's own `block_on` further up this stack.
+    fn as_if_over_a_wire<T: Send>(work: impl FnOnce() -> T + Send) -> T {
+        std::thread::scope(|scope| scope.spawn(work).join().expect("the peer call"))
+    }
+
+    /// A wrapper that forwards `issue` and NOTHING ELSE: the shape of `ikigai-web`'s
+    /// `LazyIpcResolver` before ikigai-rs/ikigai-web PR 19, which every `prefer` mount went
+    /// through. Its `issue` reaches the peer under the peer's default authority, root.
+    struct IssueOnly(Arc<Kernel>);
+
+    impl Resolver for IssueOnly {
+        fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), Error> {
+            as_if_over_a_wire(|| Resolver::issue(&*self.0, request))
+        }
+
+        fn is_cached(&self, _request: &Request, _capability: &Capability) -> bool {
+            false
+        }
+
+        fn entries(&self) -> Option<Vec<SpaceEntry>> {
+            Resolver::entries(&*self.0)
+        }
+    }
+
+    /// The same wrapper done right: it forwards the capability it is handed.
+    struct Forwarding(Arc<Kernel>);
+
+    impl Resolver for Forwarding {
+        fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), Error> {
+            self.issue_as(request, &Capability::root())
+        }
+
+        fn issue_as(
+            &self,
+            request: Request,
+            capability: &Capability,
+        ) -> Result<(Representation, CacheStatus), Error> {
+            as_if_over_a_wire(|| Resolver::issue_as(&*self.0, request, capability))
+        }
+
+        fn is_cached(&self, request: &Request, capability: &Capability) -> bool {
+            Resolver::is_cached(&*self.0, request, capability)
+        }
+
+        fn entries(&self) -> Option<Vec<SpaceEntry>> {
+            Resolver::entries(&*self.0)
+        }
+    }
+
+    /// A local kernel with `resolver` mounted over `urn:peer:` — an override mount, which
+    /// forwards the IRI unchanged.
+    fn mounting(resolver: Arc<dyn Resolver>) -> Kernel {
+        Kernel::new(Arc::new(MountedRemote::overriding(
+            resolver,
+            "urn:peer:",
+            "test://peer",
+        )))
+    }
+
+    fn scoped_read() -> Request {
+        Request::new(
+            Verb::Source,
+            ikigai_core::Iri::parse("urn:peer:scoped").unwrap(),
+        )
+    }
+
+    /// ★ Ledger #849. A resolver that does not say what it does with a capability must not
+    /// be taken to have honored it. Before the fix the trait's `issue_as` default dropped the
+    /// capability and called `issue`, so a caller narrowed to `urn:cap:other` read a resource
+    /// the peer reserves for `urn:cap:secret`, because the peer was asked as root.
+    #[test]
+    fn a_resolver_that_forgets_the_capability_refuses_rather_than_resolving_as_root() {
+        let local = mounting(Arc::new(IssueOnly(peer_checking_at_runtime())));
+        let narrowed = Capability::scoped(["urn:cap:other"]);
+        let refused = Resolver::issue_as(&local, scoped_read(), &narrowed)
+            .expect_err("a narrowed read through an issue-only wrapper must not succeed");
+        assert!(
+            matches!(&refused, Error::Denied(message) if message.contains("IssueOnly")),
+            "a typed Denied naming the resolver that dropped the capability: {refused:?}"
+        );
+        // Even a capability that WOULD satisfy the peer is refused: the wrapper cannot carry
+        // it, and carrying root instead is the widening this rule exists to stop.
+        let sufficient = Capability::scoped([SECRET]);
+        assert!(matches!(
+            Resolver::issue_as(&local, scoped_read(), &sufficient),
+            Err(Error::Denied(_))
+        ));
+        // Root needs no carrying, so a wrapper that only knows `issue` still serves it.
+        let (answer, _) = Resolver::issue_as(&local, scoped_read(), &Capability::root())
+            .expect("root through an issue-only wrapper");
+        assert_eq!(answer.bytes, b"root");
+    }
+
+    /// The check that would have caught #849: drive a mount with a narrowed capability and
+    /// assert the PEER saw exactly that capability, not merely that the read succeeded.
+    #[test]
+    fn a_mount_carries_a_narrowed_capability_to_its_peer() {
+        let local = mounting(Arc::new(Forwarding(peer_checking_at_runtime())));
+        let narrowed = Capability::scoped([SECRET]);
+        let (answer, _) = Resolver::issue_as(&local, scoped_read(), &narrowed)
+            .expect("a sufficient narrowed capability crosses the mount");
+        assert_eq!(
+            String::from_utf8_lossy(&answer.bytes),
+            SECRET,
+            "the peer saw the caller's capability, not root"
+        );
+        let refused = Resolver::issue_as(&local, scoped_read(), &Capability::scoped(["urn:x"]));
+        assert!(
+            matches!(&refused, Err(Error::Denied(message)) if message.contains("the peer wants")),
+            "an insufficient one is refused BY THE PEER: {refused:?}"
+        );
     }
 }

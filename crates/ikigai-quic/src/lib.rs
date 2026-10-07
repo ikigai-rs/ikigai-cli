@@ -859,8 +859,14 @@ impl Resolver for QuicResolver {
     }
 
     fn is_cached(&self, request: &Request, capability: &Capability) -> bool {
-        // Resolves under the server's authority; the wire doesn't carry the caller's
-        // capability yet (capability-on-the-wire is a TODO), so it's accepted but not sent.
+        // ⚠ NOT CARRIED, and it cannot be without a wire change: `Call::IsCached` has no
+        // capability field (resolutions do — `Call::IssueAs`), so the server answers under
+        // the SESSION's capability, the one the client certificate authenticated. That
+        // cannot LEAK: the session principal may already resolve anything that capability
+        // grants, so the probe reveals nothing beyond its own authority. What it can be is
+        // WRONG for a caller narrower than its session — the cache is namespaced by
+        // capability, so "cached" is a claim about the session's namespace. Carrying it is
+        // a new appended `Call` variant, a wire version event (ledger #849).
         let _ = capability;
         matches!(
             self.round_trip(Call::IsCached(request.clone())),
