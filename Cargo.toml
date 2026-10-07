@@ -359,7 +359,9 @@ ikigai-fn = "0.3.0" # 0.3.0 = compose is a view TEMPLATE LANGUAGE: `$h{…}` (HT
 # Personal contexts (urn:personal:*), macOS-backed, linked as a published module.
 ikigai-personal = "0.7.1" # 0.7.1 = multi-day events block every spanned day (free/busy + booking); notes/URL/attendees on the graph face + description= Sink (detail preservation)
 # Capability-gated file/store module, linked as a published module crate.
-ikigai-fs = "0.1.7" # 0.1.7 types `*.arrangement` files as `text/x-ikigai-arrangement`, which is
+ikigai-fs = "0.1.8" # 0.1.8 is a SECURITY floor (audit round 3, ledger #856): the jail authorizes the
+# file it actually opens (no symlinks, canonical spellings, fails closed on a missing root).
+# 0.1.7 types `*.arrangement` files as `text/x-ikigai-arrangement`, which is
 # how `--arrangement game.arrangement` reaches `ikigai-sexpr`'s lossless transreptor in the
 # bootstrap kernel (`arrangement::read_declaration`). Below it the file reads as
 # `application/octet-stream`, nothing transrepts that to Turtle, and the start stops (exit 2):
@@ -432,7 +434,8 @@ ikigai-sexpr = "0.1.4" # 0.1.4 = arrangements as s-expressions: `urn:sexpr:arran
 # floor is 0.1.83, beneath this workspace's 0.1.84, so the host still links one `ikigai-core`.
 ikigai-diagram = "0.1.0"
 # Signing + verification: urn:sign:sign (cap-gated) / urn:sign:verify (open), Ed25519.
-ikigai-sign = "0.2.2" # 0.2.2 fixed the key ArgSpec summaries, which had said Ed25519-only
+ikigai-sign = "0.2.3" # 0.2.3 is a SECURITY floor (ledger #857): ES256 verify refuses high-S, so
+# one (message, key) mints one node; one sig:Signature per graph. 0.2.2 fixed the key ArgSpec summaries, which had said Ed25519-only
 # since ES256 shipped in 0.2.0 — a manifold this host publishes describing an argument it
 # does not have, and the same family of defect as the `ikigai-fn` one above. It also makes a
 # signature as cacheable as its KEY, so over a key served under a thread a rotation's cut
@@ -444,13 +447,15 @@ ikigai-sign = "0.2.2" # 0.2.2 fixed the key ArgSpec summaries, which had said Ed
 # does not match after this bump.
 # Public-key encryption (urn:encrypt:encrypt/decrypt, age/X25519) — the dual of sign.
 # Keys resolved through the kernel (urn:secret:<id>.enc). Embedded-only (off the wire).
-ikigai-encrypt = "0.1.1" # 0.1.1 stops declaring `urn:encrypt:encrypt` cacheable. age mints
+ikigai-encrypt = "0.1.2" # 0.1.2 is a SECURITY floor (ledger #853): a low-order recipient no longer
+# PANICS the host (any caller, no capability needed); input is read as bytes. 0.1.1 stops declaring `urn:encrypt:encrypt` cacheable. age mints
 # a FRESH ephemeral key on every call, so the result is not a function of its inputs and a
 # cached ciphertext is a cached answer to a question nobody asked twice; `decrypt` is as
 # cacheable as its key, which is the correct claim. This host served the cached one.
 # Secrets custody: urn:secret:{name} (cap-gated read) + urn:secret:generate/unlock
 # (Ed25519 keygen + Touch ID), macOS Keychain backend. Owner-only, not served.
-ikigai-secret = "0.1.6" # 0.1.6 gives `urn:secret:{name}` per-verb ActionSpecs — Source under
+ikigai-secret = "0.1.7" # 0.1.7 is a SECURITY floor (ledger #854): the file store maps names
+# injectively, writes 0600 atomically, and generate needs write authority. 0.1.6 gives `urn:secret:{name}` per-verb ActionSpecs — Source under
 # `urn:cap:secret:read:*`, Sink under `urn:cap:secret:write:*` with a required, typed
 # `content`. The Sink shipped in 0.1.5 with NO `describe()` line at all, so the write face
 # existed and was undrivable from `urn:kernel:actions` and from this host's MCP projection:
