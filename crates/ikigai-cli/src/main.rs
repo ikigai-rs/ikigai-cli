@@ -2960,6 +2960,17 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
             }
         }
     };
+    // The passkey store, checked the way the gate checks it (ledger #828): a file someone else
+    // could have written refuses to start this door, naming the file and the `chmod`, rather
+    // than serving pages whose every passkey-gated decision then refuses at the first tap. A
+    // file others can only read is tightened to 0600 here. This is the door the browser
+    // ceremony runs through; the gate itself checks again on every load, whatever the door.
+    if let Err(detail) = ikigai_embedded::passkey::preflight() {
+        eprintln!(
+            "ikigai: refusing to serve: the passkey credential store is not trusted: {detail}"
+        );
+        std::process::exit(2);
+    }
     // Flags are POSTURE and win wholesale when given; otherwise the machine's own topology
     // from the config home — the same rule as serve_ipc and serve_quic. Until 2026-09-16
     // this door had none of it: `Mode::Serve` destructured `mounts`, handed them to the

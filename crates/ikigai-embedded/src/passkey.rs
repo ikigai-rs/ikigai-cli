@@ -249,6 +249,12 @@ fn consume_challenge_at(challenge: &str, now: Instant) -> bool {
 //   file or the new one, never half of one.
 // - load → verify → save runs under ONE process-wide lock, so two concurrent assertions cannot
 //   each write back the copy they loaded and lower the stored signature counter.
+// - The file is trusted only if nobody else could have WRITTEN it (ledger #828): write access is
+//   the power to enroll a credential. Group/world-writable, or owned by another user, refuses
+//   like an unparsable file; only group/world-READABLE is tightened to 0600 and logged. Checked
+//   on the open handle, under the lock, before a byte is parsed. Saves were already 0600, but a
+//   file enrolled before 0.1.39 is rewritten only when a counter advances, and a platform
+//   passkey's counter stays 0, so without this check a loose file stayed loose for good.
 // =====================================================================================
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -271,19 +277,137 @@ fn credential_lock() -> MutexGuard<'static, ()> {
 }
 
 /// The registered credentials. `Ok(empty)` only when the file is ABSENT; a file that is present
-/// but cannot be read or parsed is an `Err` naming it, which every caller treats as "refuse".
-fn load_credentials() -> std::result::Result<Vec<StoredCredential>, String> {
+/// but cannot be read or parsed, or that someone other than this process's user could have
+/// written, is an `Err` naming it, which every caller treats as "refuse".
+///
+/// Takes the [`credential_lock`] guard so that every load provably runs under the lock: the
+/// permission check (which may tighten the file) and the parse see one state of the file.
+fn load_credentials(
+    _held: &MutexGuard<'static, ()>,
+) -> std::result::Result<Vec<StoredCredential>, String> {
+    use std::io::Read;
     let path = credentials_path();
-    match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
-            format!(
-                "{} is present but not a credential list: {e}",
-                path.display()
-            )
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(e) => Err(format!("{} is present but unreadable: {e}", path.display())),
+    let unreadable =
+        |e: std::io::Error| format!("{} is present but unreadable: {e}", path.display());
+    let mut file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(unreadable(e)),
+    };
+    // On the handle, not the path: what is judged is exactly what is then read.
+    guard_permissions(&path, &file)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(unreadable)?;
+    serde_json::from_slice(&bytes).map_err(|e| {
+        format!(
+            "{} is present but not a credential list: {e}",
+            path.display()
+        )
+    })
+}
+
+/// What the credential file's permission bits and owner allow.
+#[derive(Debug, PartialEq, Eq)]
+enum Permission {
+    /// Owner-only, owned by this process's user.
+    Private,
+    /// Others can read it but not write it: nothing is at stake but disclosure of public keys,
+    /// so it is tightened to 0600 rather than taking the gate down for a cosmetic reason.
+    Tighten,
+    /// Someone else could have written it, so its contents (which credentials are enrolled) are
+    /// not trusted. Tightening it now would trust whatever they wrote; a person checks it.
+    Refuse(String),
+}
+
+/// Judge a file `mode` owned by uid `owner`, read by a process running as uid `me`. Pure, so
+/// every branch is testable, including the foreign-owner one a test cannot stage without root.
+fn judge_permissions(mode: u32, owner: u32, me: u32) -> Permission {
+    if owner != me {
+        return Permission::Refuse(format!(
+            "is owned by uid {owner}, not by this process's uid {me}, so its owner could have \
+             enrolled a credential"
+        ));
     }
+    if mode & 0o022 != 0 {
+        return Permission::Refuse(format!(
+            "is writable by its group or by everyone (mode {:04o}), so anyone who can write it \
+             could have enrolled a credential",
+            mode & 0o7777
+        ));
+    }
+    if mode & 0o044 != 0 {
+        return Permission::Tighten;
+    }
+    Permission::Private
+}
+
+/// Refuse a credential file someone else could have written; tighten one others can only read.
+/// The `chmod` in the refusal is the exact command, after the person at the box has checked
+/// that every entry in the file is theirs.
+#[cfg(unix)]
+fn guard_permissions(
+    path: &std::path::Path,
+    file: &std::fs::File,
+) -> std::result::Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("{} is present but cannot be inspected: {e}", path.display()))?;
+    // SAFETY: `geteuid` takes no arguments, has no preconditions, and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    match judge_permissions(meta.mode(), meta.uid(), me) {
+        Permission::Private => Ok(()),
+        Permission::Tighten => {
+            // fchmod on the open handle; owning the file is all it needs.
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| {
+                    format!(
+                        "{} is readable by others (mode {:04o}) and could not be tightened: {e}; \
+                         fix it at the box with `chmod 600 {}`",
+                        path.display(),
+                        meta.mode() & 0o7777,
+                        path.display()
+                    )
+                })?;
+            // Logged once: the file is 0600 from here on, so the next load is silent.
+            eprintln!(
+                "ikigai passkey: {} was readable by others (mode {:04o}); tightened it to 0600.",
+                path.display(),
+                meta.mode() & 0o7777
+            );
+            Ok(())
+        }
+        Permission::Refuse(why) => {
+            let p = path.display();
+            let fix = if meta.uid() == me {
+                format!("`chmod 600 {p}`")
+            } else {
+                format!("`chown {me} {p}` (as root), then `chmod 600 {p}`")
+            };
+            Err(format!(
+                "{p} {why}; check that every entry in it is yours, then fix it at the box with \
+                 {fix}"
+            ))
+        }
+    }
+}
+
+/// No Unix permission bits to judge: a non-Unix host (none is deployed; the edge is Linux and the
+/// desk macOS) trusts the platform's ACLs, as it did before this check existed.
+#[cfg(not(unix))]
+fn guard_permissions(
+    _path: &std::path::Path,
+    _file: &std::fs::File,
+) -> std::result::Result<(), String> {
+    Ok(())
+}
+
+/// Check the credential store the way the gate will, at startup, so a store the gate would
+/// refuse stops a serving door from coming up rather than surfacing at the first decision
+/// someone taps. Absent is fine (not enrolled); a group/world-readable file is tightened here.
+pub fn preflight() -> std::result::Result<(), String> {
+    let held = credential_lock();
+    load_credentials(&held).map(|_| ())
 }
 
 /// The loud half of failing closed: one line on stderr per refused request, naming the file.
@@ -341,7 +465,8 @@ fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 /// Whether the gate is armed. True when a credential is registered — and ALSO when the store is
 /// present but unreadable, because then the gate refuses everything (it fails closed).
 pub fn is_enrolled() -> bool {
-    load_credentials().map_or(true, |c| !c.is_empty())
+    let held = credential_lock();
+    load_credentials(&held).map_or(true, |c| !c.is_empty())
 }
 
 // =====================================================================================
@@ -486,8 +611,8 @@ pub fn require_passkey(inv: &Invocation<'_>) -> Result<()> {
     let denied = || Error::Denied("this action needs your passkey".to_string());
 
     // One lock from load to save, so a concurrent assertion cannot write back a stale copy.
-    let _held = credential_lock();
-    let creds = match load_credentials() {
+    let held = credential_lock();
+    let creds = match load_credentials(&held) {
         Ok(creds) => creds,
         Err(detail) => {
             store_unreadable(&detail);
@@ -595,7 +720,13 @@ impl Endpoint for PasskeyChallenge {
         // with credentials enrolled is an error the page shows, not "nothing enrolled" (which
         // would tell the page to submit token-only into a gate that will refuse it anyway).
         let unavailable = || Error::Endpoint("passkey sign-in is unavailable on this edge".into());
-        let creds = load_credentials().map_err(|detail| {
+        // Under the lock like every load, so the permission check sees one state of the file. A
+        // block, so the (non-`Send`) guard is gone before anything else in this future runs.
+        let loaded = {
+            let held = credential_lock();
+            load_credentials(&held)
+        };
+        let creds = loaded.map_err(|detail| {
             store_unreadable(&detail);
             unavailable()
         })?;
@@ -758,10 +889,11 @@ impl Endpoint for PasskeyRegister {
                         detail: format!("not a usable public key: {e}"),
                     })?;
 
-                let _held = credential_lock();
-                // A store that is present but unreadable is not overwritten from the public
-                // face: the person at the box repairs or removes it, then enrolls again.
-                let mut creds = load_credentials().map_err(|detail| {
+                let held = credential_lock();
+                // A store that is present but unreadable (or that someone else could have
+                // written) is not overwritten from the public face: the person at the box
+                // repairs or removes it, then enrolls again.
+                let mut creds = load_credentials(&held).map_err(|detail| {
                     store_unreadable(&detail);
                     Error::Endpoint(
                         "the passkey store on this edge is unreadable; repair or remove it at \
@@ -1076,6 +1208,165 @@ mod tests {
             .filter(|n| n != "passkey-credentials.json")
             .collect();
         assert!(leftovers.is_empty(), "stray files: {leftovers:?}");
+    }
+
+    #[cfg(unix)]
+    fn set_mode(mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(credentials_path(), std::fs::Permissions::from_mode(mode))
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn mode() -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(credentials_path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    /// Ledger #828, the reproduction: a file enrolled under 0.1.38 (`fs::write`, umask 002) is
+    /// 0664, and a platform passkey keeps its counter at 0, so the 0600 atomic save never runs.
+    /// Before the fix the gate trusted that file and left it 0664 for good; this test asserted
+    /// exactly that against 0.1.39 and passed, then failed once the check landed.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_writable_store_refuses_every_face_and_is_left_for_a_person_to_check() {
+        isolate("loose-writable");
+        let d = Device::new();
+        d.register();
+        set_mode(0o664);
+        let challenge = issue_challenge().unwrap();
+        let body = d.assert_fields(&challenge, 0x05, 0); // a platform passkey: counter stays 0
+        assert!(
+            run_gate(&body).is_err(),
+            "a store others could have written is not trusted, even with a valid assertion"
+        );
+        assert!(
+            call(
+                "urn:passkey:challenge",
+                PasskeyChallenge,
+                Verb::Source,
+                None
+            )
+            .is_err(),
+            "the challenge refuses too"
+        );
+        open_window();
+        let reg = format!(
+            "id={}&spki={}",
+            b64().encode(b"cred-2"),
+            Device::new().spki_b64()
+        );
+        assert!(
+            call(
+                "urn:passkey:register",
+                PasskeyRegister,
+                Verb::Sink,
+                Some(&reg)
+            )
+            .is_err(),
+            "registration does not launder a store someone else could have written"
+        );
+        assert!(is_enrolled(), "an untrusted store counts as armed");
+        assert!(preflight().is_err(), "and a serving door refuses to start");
+        // Not silently fixed: tightening would trust whatever someone else wrote.
+        assert_eq!(mode(), 0o664);
+        let detail = {
+            let held = credential_lock();
+            load_credentials(&held).err().unwrap()
+        };
+        let path = credentials_path();
+        assert!(
+            detail.contains(&format!("`chmod 600 {}`", path.display())),
+            "the refusal names the exact fix: {detail}"
+        );
+        assert!(detail.contains("0664"), "and the mode it found: {detail}");
+
+        // World-writable alone is refused the same way.
+        set_mode(0o602);
+        assert!(preflight().is_err());
+
+        // Once the person at the box has fixed it, the very same assertion's successor passes.
+        set_mode(0o600);
+        let challenge = issue_challenge().unwrap();
+        assert!(run_gate(&d.assert_fields(&challenge, 0x05, 0)).is_ok());
+        assert!(preflight().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_store_others_can_only_read_is_tightened_on_load() {
+        isolate("loose-readable");
+        let d = Device::new();
+        d.register();
+        set_mode(0o644);
+        let challenge = issue_challenge().unwrap();
+        assert!(
+            run_gate(&d.assert_fields(&challenge, 0x05, 0)).is_ok(),
+            "readable-only discloses public keys and nothing else: the gate keeps working"
+        );
+        assert_eq!(mode(), 0o600, "a counter-0 sign-in tightened it");
+
+        // Every other load path tightens as well.
+        set_mode(0o640);
+        assert!(call(
+            "urn:passkey:challenge",
+            PasskeyChallenge,
+            Verb::Source,
+            None
+        )
+        .is_ok());
+        assert_eq!(mode(), 0o600, "the challenge tightened it");
+        set_mode(0o604);
+        assert!(preflight().is_ok());
+        assert_eq!(mode(), 0o600, "startup tightened it");
+        set_mode(0o644);
+        assert!(is_enrolled());
+        assert_eq!(mode(), 0o600, "is_enrolled tightened it");
+    }
+
+    #[test]
+    fn permissions_are_judged_on_writers_first_then_readers() {
+        let me = 501;
+        assert_eq!(judge_permissions(0o100600, me, me), Permission::Private);
+        assert_eq!(judge_permissions(0o100400, me, me), Permission::Private);
+        // Owner execute or setuid-style bits are not about who else can write.
+        assert_eq!(judge_permissions(0o100700, me, me), Permission::Private);
+        for readable in [0o100640, 0o100604, 0o100644, 0o100440] {
+            assert_eq!(
+                judge_permissions(readable, me, me),
+                Permission::Tighten,
+                "{readable:o}"
+            );
+        }
+        for writable in [0o100620, 0o100602, 0o100664, 0o100666, 0o100622] {
+            assert!(
+                matches!(judge_permissions(writable, me, me), Permission::Refuse(_)),
+                "{writable:o}"
+            );
+        }
+        // Another user's file is refused even at 0600: its owner can write it, and only a
+        // swap through a writable directory (or a hand edit) puts one there.
+        match judge_permissions(0o100600, 0, me) {
+            Permission::Refuse(why) => assert!(why.contains("uid 0"), "{why}"),
+            other => panic!("a foreign owner must refuse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_absent_store_passes_preflight() {
+        isolate("preflight-absent");
+        assert!(
+            preflight().is_ok(),
+            "not enrolled is not a reason to refuse to start"
+        );
+        assert!(
+            !credentials_path().exists(),
+            "and preflight creates nothing"
+        );
     }
 
     #[test]

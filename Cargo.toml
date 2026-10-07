@@ -91,6 +91,23 @@ members = ["crates/*"]
 # whose tree version is ahead of crates.io. ⚠ So this comment names NO crate as
 # behind or ahead — that was a snapshot of the registry, true for one afternoon
 # and wrong the next, in the most authoritative place in the tree. Ask the gate.
+# NEXT RELEASE (unreleased, on top of 0.1.39):
+# - The passkey store is trusted only if nobody else could have written it (ledger #828; write
+#   access to it is the power to enroll a credential). A credentials file enrolled before 0.1.39
+#   is 0664 under umask 002, and 0.1.39's 0600 save never rewrites it for a platform passkey
+#   (its counter stays 0). Now every load (the gate, `urn:passkey:challenge`,
+#   `urn:passkey:register`, `is_enrolled`) checks the open file under the credential lock:
+#   group/world-WRITABLE, or owned by another user, refuses exactly like an unparsable file;
+#   group/world-READABLE only is tightened to 0600 and logged once. Unix only (no mode bits
+#   elsewhere). `serve --http` runs the same check at startup.
+# ⚠ DEPLOY NOTE: an edge whose `passkey-credentials.json` is group- or world-writable REFUSES TO
+#   START `serve --http` (exit 2, the file and `chmod 600 <path>` on stderr) until a person at the
+#   box checks the entries are theirs and runs that chmod. The QUIC and IPC doors still start,
+#   and their passkey-gated decisions refuse until it is fixed. A readable-only file is fixed
+#   silently but for one log line. ⚠ The startup check is the WHOLE load, so a corrupt or
+#   unreadable store now also stops `serve --http` from starting (0.1.39 started and refused
+#   every decision). Check the edge's file mode BEFORE installing:
+#   `ls -l ~/.ikigai/workspace/passkey-credentials.json`.
 # 0.1.39: THE PASSKEY GATE FAILS CLOSED; core 0.1.85, store 0.2.6, ledger 0.4.0.
 # ⚠ DEPLOY STEP (ledger #794): install 0.1.39 on the edge and, IN THE SAME DEPLOY, add
 # `--passkey-rp-id ikigai-rs.dev` to `ikigai-edge-http`'s ExecStart
