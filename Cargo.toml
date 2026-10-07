@@ -115,6 +115,23 @@ members = ["crates/*"]
 #   unreadable store now also stops `serve --http` from starting (0.1.39 started and refused
 #   every decision). Check the edge's file mode BEFORE installing:
 #   `ls -l ~/.ikigai/workspace/passkey-credentials.json`.
+# - The enrollment window and the workspace are judged like the store (ledger #850).
+#   `urn:passkey:enroll-open` wrote `passkey-enroll.open` with `fs::write` (0664 under umask 002),
+#   a window that expires unused stays on disk, and `enrollment_open()` read it with no mode or
+#   owner check, so anyone who could write it could put a future timestamp in it and register a
+#   credential through the public face without `urn:cap:passkey:enroll`. Now the window is written
+#   0600 (atomic), and a window file that is group/world-writable or owned by another user keeps
+#   enrollment CLOSED (logged with `rm <path>`; never chmod it, the timestamp is not yours);
+#   readable-only is tightened. The workspace DIRECTORY is judged first on every passkey load: a
+#   directory others can write (or owned by another user) refuses every passkey-gated decision,
+#   enrollment and `serve --http` startup, ABSENT store included, because deleting the store is
+#   how someone with write access to the directory would disarm the gate.
+# ⚠ DEPLOY NOTE: an edge whose workspace (`$IKIGAI_FILES`, else `~/.ikigai/workspace`) is group- or
+#   world-writable REFUSES TO START `serve --http` (exit 2, the directory and `chmod go-w <dir>` on
+#   stderr), WHETHER OR NOT a passkey is enrolled, until a person at the box checks the passkey
+#   files in it are theirs and runs that chmod. Check BEFORE installing:
+#   `ls -ld ~/.ikigai/workspace ~/.ikigai/workspace/passkey-*` (want `drwxr-xr-x` or tighter and the
+#   service user as owner; a leftover `passkey-enroll.open` can simply be removed).
 # 0.1.39: THE PASSKEY GATE FAILS CLOSED; core 0.1.85, store 0.2.6, ledger 0.4.0.
 # ⚠ DEPLOY STEP (ledger #794): install 0.1.39 on the edge and, IN THE SAME DEPLOY, add
 # `--passkey-rp-id ikigai-rs.dev` to `ikigai-edge-http`'s ExecStart

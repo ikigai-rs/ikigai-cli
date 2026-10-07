@@ -286,6 +286,10 @@ fn load_credentials(
     _held: &MutexGuard<'static, ()>,
 ) -> std::result::Result<Vec<StoredCredential>, String> {
     use std::io::Read;
+    // The directory first, and whether or not the file is there: in a directory others can
+    // write, ABSENT is not evidence of "not enrolled" (deleting the file is how they would
+    // disarm the gate), and a present file may be one they put there.
+    guard_directory(&store_root())?;
     let path = credentials_path();
     let unreadable =
         |e: std::io::Error| format!("{} is present but unreadable: {e}", path.display());
@@ -295,7 +299,7 @@ fn load_credentials(
         Err(e) => return Err(unreadable(e)),
     };
     // On the handle, not the path: what is judged is exactly what is then read.
-    guard_permissions(&path, &file)?;
+    guard_permissions(&path, &file, Remedy::CheckThenChmod)?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).map_err(unreadable)?;
     serde_json::from_slice(&bytes).map_err(|e| {
@@ -341,13 +345,25 @@ fn judge_permissions(mode: u32, owner: u32, me: u32) -> Permission {
     Permission::Private
 }
 
-/// Refuse a credential file someone else could have written; tighten one others can only read.
-/// The `chmod` in the refusal is the exact command, after the person at the box has checked
-/// that every entry in the file is theirs.
+/// What a person at the box does about a passkey file someone else could have written.
+#[derive(Clone, Copy)]
+enum Remedy {
+    /// The credential store: check every entry is theirs, then take the file back.
+    CheckThenChmod,
+    /// The enrollment window (ledger #850): remove it. Its timestamp is not theirs to vouch
+    /// for, and a new window is one command away.
+    Remove,
+}
+
+/// Refuse a passkey file someone else could have written; tighten one others can only read.
+/// The command in the refusal is the exact fix: for the credential store, the `chmod` after the
+/// person at the box has checked that every entry in the file is theirs; for the enrollment
+/// window, removing it.
 #[cfg(unix)]
 fn guard_permissions(
     path: &std::path::Path,
     file: &std::fs::File,
+    remedy: Remedy,
 ) -> std::result::Result<(), String> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let meta = file
@@ -379,6 +395,13 @@ fn guard_permissions(
         }
         Permission::Refuse(why) => {
             let p = path.display();
+            if let Remedy::Remove = remedy {
+                let who = if meta.uid() == me { "" } else { " (as root)" };
+                return Err(format!(
+                    "{p} {why}, so the window it describes is not trusted; remove it at the box \
+                     with `rm {p}`{who} and open a new one with `sink urn:passkey:enroll-open`"
+                ));
+            }
             let fix = if meta.uid() == me {
                 format!("`chmod 600 {p}`")
             } else {
@@ -398,13 +421,68 @@ fn guard_permissions(
 fn guard_permissions(
     _path: &std::path::Path,
     _file: &std::fs::File,
+    _remedy: Remedy,
 ) -> std::result::Result<(), String> {
+    Ok(())
+}
+
+/// Judge the DIRECTORY the passkey files live in (ledger #850): `Some(why)` when someone other
+/// than this process's user could create, delete, rename or replace entries in it. Then nothing
+/// in it is trusted, whatever its own mode says: they could plant an enrollment window, swap in
+/// a symlink or hard link to a file of ours that happens to parse, or delete the credential file
+/// and so disarm the gate. Readable by others is fine for a directory (0755 is ordinary); the
+/// files in it are judged on their own. Pure, so the foreign-owner branch is testable.
+fn judge_directory(mode: u32, owner: u32, me: u32) -> Option<String> {
+    if owner != me {
+        return Some(format!(
+            "is owned by uid {owner}, not by this process's uid {me}"
+        ));
+    }
+    if mode & 0o022 != 0 {
+        return Some(format!(
+            "is writable by its group or by everyone (mode {:04o})",
+            mode & 0o7777
+        ));
+    }
+    None
+}
+
+/// Refuse to trust anything in a passkey directory others could write. The fix in the refusal
+/// is the exact command, after the person at the box has checked the files in it are theirs.
+#[cfg(unix)]
+fn guard_directory(dir: &std::path::Path) -> std::result::Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let d = dir.display();
+    let meta = std::fs::metadata(dir)
+        .map_err(|e| format!("the passkey workspace {d} cannot be inspected: {e}"))?;
+    // SAFETY: `geteuid` takes no arguments, has no preconditions, and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    let Some(why) = judge_directory(meta.mode(), meta.uid(), me) else {
+        return Ok(());
+    };
+    let fix = if meta.uid() == me {
+        format!("`chmod go-w {d}`")
+    } else {
+        format!("`chown {me} {d}` (as root), then `chmod go-w {d}`")
+    };
+    Err(format!(
+        "the passkey workspace {d} {why}, so anyone who can write it could have enrolled a \
+         credential, opened enrollment or removed the credential store, and nothing in it is \
+         trusted; check that the passkey files in it are yours, then fix it at the box with {fix}"
+    ))
+}
+
+/// No Unix permission bits to judge (see the non-Unix [`guard_permissions`]).
+#[cfg(not(unix))]
+fn guard_directory(_dir: &std::path::Path) -> std::result::Result<(), String> {
     Ok(())
 }
 
 /// Check the credential store the way the gate will, at startup, so a store the gate would
 /// refuse stops a serving door from coming up rather than surfacing at the first decision
 /// someone taps. Absent is fine (not enrolled); a group/world-readable file is tightened here.
+/// The workspace DIRECTORY is judged first (ledger #850): one others could write refuses,
+/// naming it, whether or not a credential file is in it.
 pub fn preflight() -> std::result::Result<(), String> {
     let held = credential_lock();
     load_credentials(&held).map(|_| ())
@@ -788,7 +866,9 @@ impl Endpoint for PasskeyEnrollOpen {
             )));
         }
         let until = now_secs() + ENROLL_WINDOW_SECONDS;
-        std::fs::write(enroll_window_path(), until.to_string())
+        // Owner-only and whole (ledger #850): `fs::write` left it 0664 under umask 002, and a
+        // window that expires unused stays on disk, where anyone who can write it reopens it.
+        write_atomic(&enroll_window_path(), until.to_string().as_bytes())
             .map_err(|e| Error::Endpoint(format!("cannot open the enrollment window: {e}")))?;
         Ok(Representation::new(
             ReprType::new("text/plain").with_param("charset", "utf-8"),
@@ -813,15 +893,39 @@ impl Endpoint for PasskeyEnrollOpen {
     }
 }
 
+/// Whether an enrollment window opened at the box is live. Fails CLOSED (ledger #850): the
+/// window file is judged with the credential store's rule, and its directory with
+/// [`guard_directory`], so a file someone else could have written or a workspace others can
+/// write keeps enrollment closed (said once per check on stderr), never open.
 fn enrollment_open() -> bool {
-    match std::fs::read_to_string(enroll_window_path()) {
-        Ok(s) => s
-            .trim()
-            .parse::<i64>()
-            .map(|u| u > now_secs())
-            .unwrap_or(false),
-        Err(_) => false,
+    match enroll_window() {
+        Ok(until) => until.is_some_and(|u| u > now_secs()),
+        Err(detail) => {
+            eprintln!("ikigai passkey: enrollment stays CLOSED: {detail}");
+            false
+        }
     }
+}
+
+/// The window's closing time, `Ok(None)` when no window file exists (or it does not parse, which
+/// is a closed window, as before), and `Err` naming the file or directory when it is not trusted.
+fn enroll_window() -> std::result::Result<Option<i64>, String> {
+    use std::io::Read;
+    let path = enroll_window_path();
+    let p = path.display();
+    let mut file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{p} is present but unreadable: {e}")),
+    };
+    guard_directory(&store_root())?;
+    // On the handle: what is judged is what is read. Readable-only is tightened; a file someone
+    // else could have written is refused and left as it is, because its timestamp is theirs.
+    guard_permissions(&path, &file, Remedy::Remove)?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|e| format!("{p} is present but unreadable: {e}"))?;
+    Ok(text.trim().parse::<i64>().ok())
 }
 
 fn close_enrollment() {
@@ -985,6 +1089,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ikigai-passkey-ep-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        // Private whatever the umask: a workspace others can write is refused (ledger #850).
+        #[cfg(unix)]
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
         TEST_ROOT.with(|r| *r.borrow_mut() = Some(dir));
         TEST_RP.with(|r| *r.borrow_mut() = Some(test_relying_party()));
     }
@@ -1428,7 +1536,11 @@ mod tests {
     }
 
     fn open_window() {
-        std::fs::write(enroll_window_path(), (now_secs() + 60).to_string()).unwrap();
+        write_atomic(
+            &enroll_window_path(),
+            (now_secs() + 60).to_string().as_bytes(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1581,5 +1693,151 @@ mod tests {
         );
         assert!(open(&Capability::root()).is_ok(), "root opens it");
         assert!(enrollment_open(), "now open");
+    }
+
+    #[cfg(unix)]
+    fn chmod(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// Whether a registration through the PUBLIC face (no enroll capability) stored anything.
+    fn public_registration_succeeds() -> bool {
+        let reg = format!(
+            "id={}&spki={}",
+            b64().encode(b"intruder"),
+            Device::new().spki_b64()
+        );
+        call(
+            "urn:passkey:register",
+            PasskeyRegister,
+            Verb::Sink,
+            Some(&reg),
+        )
+        .is_ok()
+    }
+
+    /// ★ Ledger #850, the reproduction. `urn:passkey:enroll-open` wrote the window file with
+    /// `fs::write`, so under umask 002 it is 0664, and a window that expires unused leaves it
+    /// behind. Anyone in the group can then write a future timestamp into it and register a
+    /// credential through the public face, without `urn:cap:passkey:enroll`. On main this test
+    /// failed at its first assertion: `enrollment_open()` read the file with no mode check.
+    #[cfg(unix)]
+    #[test]
+    fn an_enroll_file_others_could_have_written_keeps_enrollment_closed() {
+        isolate("enroll-writable");
+        for loose in [0o664, 0o602, 0o620] {
+            open_window();
+            chmod(&enroll_window_path(), loose);
+            assert!(
+                !enrollment_open(),
+                "a window file others could have written is not a window ({loose:o})"
+            );
+            assert!(
+                !public_registration_succeeds(),
+                "nothing registers through it ({loose:o})"
+            );
+            assert!(!is_enrolled(), "and nothing was stored ({loose:o})");
+            // Not silently fixed: tightening it would trust a timestamp someone else wrote.
+            assert_eq!(mode_of(&enroll_window_path()), loose);
+        }
+        let refusal = enroll_window().expect_err("an untrusted window is an error, not absence");
+        assert!(
+            refusal.contains(&format!("`rm {}`", enroll_window_path().display())),
+            "the refusal says to remove it, never to chmod a planted timestamp: {refusal}"
+        );
+        // Once fixed at the box, the same file is a window again.
+        chmod(&enroll_window_path(), 0o600);
+        assert!(enrollment_open());
+    }
+
+    #[test]
+    fn the_workspace_directory_is_judged_on_writers_and_its_owner() {
+        let me = 501;
+        for private in [0o40700, 0o40755, 0o40750, 0o40711] {
+            assert_eq!(judge_directory(private, me, me), None, "{private:o}");
+        }
+        for writable in [0o40775, 0o40770, 0o40757, 0o41777, 0o40730] {
+            assert!(judge_directory(writable, me, me).is_some(), "{writable:o}");
+        }
+        let why = judge_directory(0o40700, 0, me).expect("a foreign owner refuses");
+        assert!(why.contains("uid 0"), "{why}");
+    }
+
+    /// The other half of #850: a workspace DIRECTORY others can write lets them create or swap
+    /// any file in it, so nothing in it is trusted: not the window, not the credential store.
+    #[cfg(unix)]
+    #[test]
+    fn a_workspace_others_can_write_trusts_nothing_in_it() {
+        isolate("workspace-writable");
+        let root = test_root().unwrap();
+        let d = Device::new();
+        d.register();
+        open_window();
+        chmod(&root, 0o775);
+        assert!(!enrollment_open(), "the window is not trusted");
+        assert!(!public_registration_succeeds(), "so nothing registers");
+        let challenge = issue_challenge().unwrap();
+        assert!(
+            run_gate(&d.assert_fields(&challenge, 0x05, 0)).is_err(),
+            "the store in it is not trusted either, even with a valid assertion"
+        );
+        assert!(is_enrolled(), "an untrusted store counts as armed");
+        let refusal = preflight().expect_err("a serving door refuses to start");
+        assert!(
+            refusal.contains(&root.display().to_string()) && refusal.contains("0775"),
+            "the refusal names the directory and its mode: {refusal}"
+        );
+        assert!(
+            refusal.contains(&format!("`chmod go-w {}`", root.display())),
+            "and the exact fix: {refusal}"
+        );
+        // World-writable, sticky or not, is refused the same way.
+        chmod(&root, 0o1777);
+        assert!(preflight().is_err());
+        assert!(!enrollment_open());
+
+        // Once a person at the box has fixed the directory, everything in it is trusted again.
+        chmod(&root, 0o755);
+        assert!(preflight().is_ok());
+        assert!(enrollment_open());
+        let challenge = issue_challenge().unwrap();
+        assert!(run_gate(&d.assert_fields(&challenge, 0x05, 0)).is_ok());
+    }
+
+    /// A window file others can only read discloses a timestamp: it is tightened, not refused.
+    #[cfg(unix)]
+    #[test]
+    fn an_enroll_file_others_can_only_read_is_tightened() {
+        isolate("enroll-readable");
+        open_window();
+        chmod(&enroll_window_path(), 0o644);
+        assert!(enrollment_open());
+        assert_eq!(mode_of(&enroll_window_path()), 0o600);
+    }
+
+    /// Opening a window writes it owner-only, whatever the umask, so a window that expires
+    /// unused never leaves behind a file others could reopen.
+    #[cfg(unix)]
+    #[test]
+    fn opening_a_window_writes_it_owner_only() {
+        isolate("enroll-mode");
+        let kernel = Kernel::new(std::sync::Arc::new(ikigai_core::EndpointSpace::new().bind(
+            ikigai_core::Exact::new("urn:passkey:enroll-open"),
+            PasskeyEnrollOpen,
+        )));
+        futures::executor::block_on(kernel.issue(
+            Request::new(Verb::Sink, Iri::parse("urn:passkey:enroll-open").unwrap()),
+            &Capability::root(),
+        ))
+        .unwrap();
+        assert_eq!(mode_of(&enroll_window_path()), 0o600);
+        assert!(enrollment_open());
     }
 }
