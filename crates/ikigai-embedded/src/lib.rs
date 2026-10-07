@@ -5993,11 +5993,20 @@ mod tests {
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         FILE_ROOT.with(|cell| {
             cell.get_or_init(|| {
-                std::env::temp_dir().join(format!(
+                let root = std::env::temp_dir().join(format!(
                     "ikigai-embedded-test-{}-{}",
                     std::process::id(),
                     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                ))
+                ));
+                // Private whatever the developer's umask: the passkey gate refuses a workspace
+                // others can write (ledger #850), and a test of something else must not trip it.
+                let _ = std::fs::create_dir_all(&root);
+                #[cfg(unix)]
+                let _ = std::fs::set_permissions(
+                    &root,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o700),
+                );
+                root
             })
             .clone()
         })

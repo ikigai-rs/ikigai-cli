@@ -2963,12 +2963,13 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
     // The passkey store, checked the way the gate checks it (ledger #828): a file someone else
     // could have written refuses to start this door, naming the file and the `chmod`, rather
     // than serving pages whose every passkey-gated decision then refuses at the first tap. A
-    // file others can only read is tightened to 0600 here. This is the door the browser
-    // ceremony runs through; the gate itself checks again on every load, whatever the door.
+    // file others can only read is tightened to 0600 here. The workspace DIRECTORY is judged
+    // first (ledger #850): one others can write refuses too, naming it and the `chmod go-w`,
+    // because whoever can write it can plant an enrollment window or delete the store. This is
+    // the door the browser ceremony runs through; the gate itself checks again on every load,
+    // whatever the door.
     if let Err(detail) = ikigai_embedded::passkey::preflight() {
-        eprintln!(
-            "ikigai: refusing to serve: the passkey credential store is not trusted: {detail}"
-        );
+        eprintln!("ikigai: refusing to serve: the passkey store is not trusted: {detail}");
         std::process::exit(2);
     }
     // Flags are POSTURE and win wholesale when given; otherwise the machine's own topology
