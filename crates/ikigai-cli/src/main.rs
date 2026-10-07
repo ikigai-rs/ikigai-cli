@@ -3676,9 +3676,13 @@ mod mount_cert_tests {
         std::thread::spawn(move || {
             let _ = ikigai_ipc::serve(kernel, &served);
         });
-        // Give the listener a beat to bind.
-        for _ in 0..50 {
-            if path.exists() {
+        // Give the listener a beat to bind — and wait for it to be CONNECTABLE, not merely
+        // for the path to exist: `bind(2)` creates the path before `listen(2)` runs, and a
+        // dial in that window is refused. That window failed this test under a loaded
+        // `--all-features` run (twice in a row, 2026-10-07), once a second test in this
+        // binary started serving a socket alongside it.
+        for _ in 0..250 {
+            if std::os::unix::net::UnixStream::connect(&path).is_ok() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -4470,5 +4474,89 @@ mod passkey_flag_tests {
             parse(&["serve", "--passkey-rp-id"]).is_err(),
             "needs a value"
         );
+    }
+}
+
+/// ★ Ledger #849, at the wrapper that is this binary's copy of the bug's shape: a `--prefer`
+/// mount goes through [`LazyResolver`], which is exactly what `ikigai-web`'s `LazyIpcResolver`
+/// was when it dropped every caller's capability at the wire. Driven over a REAL socket to a
+/// peer that checks its scope at runtime, so what is asserted is what the PEER saw.
+#[cfg(all(test, unix, feature = "embedded", feature = "ipc"))]
+mod prefer_mount_capability_tests {
+    use super::*;
+    use ikigai_core::{
+        Capability, Description, EndpointSpace, Error, Exact, FnEndpoint, Iri, Kernel, ReprType,
+        Representation, Request, Verb,
+    };
+    use ikigai_resolve::Resolver;
+    use std::sync::Arc;
+
+    const SECRET: &str = "urn:cap:secret";
+
+    /// A peer whose one endpoint declares nothing and checks `SECRET` itself, answering with
+    /// the scopes it received.
+    fn peer() -> Kernel {
+        Kernel::new(Arc::new(
+            EndpointSpace::new().bind(
+                Exact::new("urn:peer:scoped"),
+                FnEndpoint::new("scoped", |inv| {
+                    if !inv.capability.allows(SECRET) {
+                        return Err(Error::Denied(format!("the peer wants {SECRET}")));
+                    }
+                    let seen = inv.capability.scopes().map_or("root".to_string(), |s| {
+                        s.iter().cloned().collect::<Vec<_>>().join(" ")
+                    });
+                    Ok(Representation::new(
+                        ReprType::new("text/plain"),
+                        seen.into_bytes(),
+                    ))
+                })
+                .with_description(Description::new("scoped").verb(Verb::Source)),
+            ),
+        ))
+    }
+
+    #[test]
+    fn a_prefer_mount_carries_a_narrowed_capability_to_its_peer() {
+        let path = std::env::temp_dir().join(format!("ikc-{}-prefer.sock", std::process::id()));
+        let served = path.clone();
+        // The listener runs for the life of the test process; `serve` only returns on a dead
+        // listener, and nothing here kills it.
+        std::thread::spawn(move || ikigai_ipc::serve(peer(), &served));
+        // Wait for a CONNECTABLE socket, not merely an existing path (up to 5s).
+        let mut tries = 0;
+        while std::os::unix::net::UnixStream::connect(&path).is_err() {
+            tries += 1;
+            assert!(tries < 500, "the peer never bound");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let spec = resolve_mount(Mount {
+            prefix: "urn:peer:".to_string(),
+            target: path.display().to_string(),
+            certs: Certs::default(),
+            kind: ikigai_embedded::MountKind::Prefer,
+        })
+        .expect("a prefer mount never dials at startup");
+        let local = Kernel::new(Arc::new(ikigai_resolve::MountedRemote::overriding(
+            spec.resolver,
+            "urn:peer:",
+            "test://prefer",
+        )));
+        let read = Request::new(Verb::Source, Iri::parse("urn:peer:scoped").unwrap());
+
+        let (answer, _) = Resolver::issue_as(&local, read.clone(), &Capability::scoped([SECRET]))
+            .expect("a sufficient narrowed capability crosses the prefer mount");
+        assert_eq!(
+            String::from_utf8_lossy(&answer.bytes),
+            SECRET,
+            "the peer saw the caller's capability, not root"
+        );
+        let refused = Resolver::issue_as(&local, read, &Capability::scoped(["urn:cap:other"]));
+        assert!(
+            matches!(&refused, Err(Error::Denied(m)) if m.contains("the peer wants")),
+            "an insufficient capability is refused BY THE PEER: {refused:?}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

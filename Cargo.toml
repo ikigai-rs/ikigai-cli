@@ -92,6 +92,13 @@ members = ["crates/*"]
 # behind or ahead — that was a snapshot of the registry, true for one afternoon
 # and wrong the next, in the most authoritative place in the tree. Ask the gate.
 # NEXT RELEASE (unreleased, on top of 0.1.39):
+# - A resolver that cannot carry a capability REFUSES it (ledger #849). `Resolver::issue_as`
+#   defaulted to dropping the capability and calling `issue`, so a wrapper overriding only `issue`
+#   resolved its callers as the peer's default authority, root (ikigai-web's prefer mount did,
+#   fixed in ikigai-rs/ikigai-web PR 19). The default now serves root through `issue` and refuses
+#   any other capability with a typed `Denied` naming the type. Downstream: a `Resolver` impl
+#   that overrides only `issue` and is driven under a narrowed capability (a mount wrapper, a test
+#   double, a scheduler resolver) now gets `Denied` and must forward the capability in `issue_as`.
 # - The passkey store is trusted only if nobody else could have written it (ledger #828; write
 #   access to it is the power to enroll a credential). A credentials file enrolled before 0.1.39
 #   is 0664 under umask 002, and 0.1.39's 0600 save never rewrites it for a platform passkey

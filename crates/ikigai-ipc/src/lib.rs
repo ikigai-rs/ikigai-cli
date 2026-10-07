@@ -639,9 +639,14 @@ impl Resolver for IpcResolver {
     }
 
     fn is_cached(&self, request: &Request, capability: &Capability) -> bool {
-        // The probe resolves under the server's own authority; the wire protocol
-        // doesn't carry the caller's capability yet (capability-on-the-wire is a TODO),
-        // so it's accepted but not forwarded.
+        // ⚠ NOT CARRIED, and it cannot be without a wire change: `Call::IsCached` has no
+        // capability field (resolutions do — `Call::IssueAs`), so the server answers for
+        // its peercred-verified owner, root. That cannot LEAK: the owner may already
+        // resolve anything as root over this socket, so a probe tells it nothing its own
+        // authority does not. What it can be is WRONG for a narrowed caller — the cache
+        // is namespaced by capability, so "cached" means cached for root, and the same
+        // read under the narrowed capability may still miss. Carrying it is a new
+        // appended `Call` variant, a wire version event (ledger #849).
         let _ = capability;
         matches!(
             self.round_trip(Call::IsCached(request.clone())),
