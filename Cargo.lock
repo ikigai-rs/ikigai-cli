@@ -3143,13 +3143,15 @@ dependencies = [
 
 [[package]]
 name = "ikigai-encrypt"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2f75c7f31e0f9397f80263ccaf1162de58fb5314e7ea408d54c344126b19aed"
+checksum = "1f48ba180c520cd41ed5eb00377124177dd1b287a928fabbeb8eed6b99a18591"
 dependencies = [
  "age",
  "async-trait",
+ "bech32",
  "ikigai-core",
+ "x25519-dalek",
 ]
 
 [[package]]
@@ -3181,12 +3183,13 @@ dependencies = [
 
 [[package]]
 name = "ikigai-fs"
-version = "0.1.7"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9dd0472ead1c2409e5b2846c1b402d683e0f3620ed5a635553a9f5913192272"
+checksum = "51e42d9424a0deba8cdaccdeeee88f35156ed4be77d4ae93647d58b73dafa491"
 dependencies = [
  "async-trait",
  "ikigai-core",
+ "rustix",
  "web-sys",
 ]
 
@@ -3433,14 +3436,15 @@ dependencies = [
 
 [[package]]
 name = "ikigai-secret"
-version = "0.1.6"
+version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f3dd5c42c87e05698be328ed7f5583de1296d62fde2bd93c6984f62e404e794"
+checksum = "4abde5d4a9d4c930e83afd777c14038da183dd9b74f86193e898c263b33bade9"
 dependencies = [
  "age",
  "async-trait",
  "ed25519-dalek 2.2.0",
  "ikigai-core",
+ "libc",
  "rand_core 0.6.4",
  "robius-authentication",
  "security-framework",
@@ -3478,9 +3482,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-sign"
-version = "0.2.2"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19f5e89190aeeb5abf5989be86b221c0d2c641b044940f510e7f8dba9d226aa7"
+checksum = "a70bf9bb2a1501cc206a905646953ec343b1de467038eec06e23d3e73c6e4d23"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3491,6 +3495,7 @@ dependencies = [
  "oxrdf",
  "oxrdfio",
  "p256",
+ "sec1",
  "sha2 0.10.9",
 ]
 
