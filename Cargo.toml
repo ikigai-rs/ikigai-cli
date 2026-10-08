@@ -143,6 +143,14 @@ members = ["crates/*"]
 #   clears a stale `outbox/` entry, and a pass that answers nothing removes an earlier `.out`.
 #   Operator-visible: stderr lines prefixed `ikigai-intray:` from the edge's and the daemon's
 #   reactors; a re-dropped tuple that once failed and now succeeds leaves `error/`.
+# - ikigai-intray: `SpaceReactor::with_host_handler` (additive; Hermes audit, ledger #877, the
+#   class of ledger #445). A space's `handler` file sits in the drop tree, so whoever can write the
+#   tree chooses which IRI every tuple fires at, under the reactor's host-granted authority, even
+#   with `with_host_authority` installed. The seam hands the host the space and the file's target;
+#   the host fires its own IRI, passes an allowed one through, or refuses (the tuple is
+#   dead-lettered with a note naming the target, and the dead-letter hook fires). ⚠ Not installed
+#   by default and NOT yet wired into ikigai-embedded (that needs a decision on where a host keeps
+#   per-space handler targets); until a host installs it the file decides, as before.
 # 0.1.40: SECURITY FLOORS FROM AUDIT ROUND 3, A RESOLVER THAT FAILS CLOSED, AND A PASSKEY STORE
 # ONLY ITS OWNER COULD HAVE WRITTEN.
 # - Security floors (PR #408): ikigai-fs 0.1.8 (the jail authorizes the file it opens: no
