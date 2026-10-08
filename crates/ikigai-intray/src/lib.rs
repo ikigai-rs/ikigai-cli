@@ -1730,7 +1730,7 @@ pub struct DeadLetter {
 /// tell "no dead letters" from "not looked at". Read straight off the tree, so any process
 /// sharing the workspace reports the same facts.
 pub fn dead_letters(root: &Path) -> Vec<SpaceDeadLetters> {
-    let mut spaces: Vec<String> = match std::fs::read_dir(root) {
+    let spaces: Vec<String> = match std::fs::read_dir(root) {
         Ok(entries) => entries
             .filter_map(|e| e.ok())
             .filter(|e| e.path().is_dir())
@@ -1743,7 +1743,25 @@ pub fn dead_letters(root: &Path) -> Vec<SpaceDeadLetters> {
             .collect(),
         Err(_) => Vec::new(),
     };
+    dead_letters_of(root, spaces)
+}
+
+/// [`dead_letters`] for the spaces the CALLER names, sorted and deduplicated — for a host that
+/// decides which spaces are reactive itself
+/// ([`with_host_handler`](SpaceReactor::with_host_handler)), so a space it fires with no
+/// `handler` file on disk is still counted. A name that is not a single path segment is skipped.
+pub fn dead_letters_of(
+    root: &Path,
+    spaces: impl IntoIterator<Item = String>,
+) -> Vec<SpaceDeadLetters> {
+    let mut spaces: Vec<String> = spaces
+        .into_iter()
+        .filter(|name| {
+            !name.is_empty() && !name.contains(['/', '\\']) && name != "." && name != ".."
+        })
+        .collect();
     spaces.sort();
+    spaces.dedup();
     spaces
         .into_iter()
         .map(|space| {
@@ -2891,6 +2909,27 @@ mod tests {
         assert_eq!(newest.reason, "denied: newest reason");
         assert_eq!(report[1].count, 0);
         assert_eq!(report[1].newest, None);
+
+        // The caller-named form: a space the HOST fires (no `handler` file) is counted, the
+        // list comes back sorted and deduplicated, and a name that is not one segment is not
+        // read at all.
+        let named = dead_letters_of(
+            &root,
+            [
+                "passive".to_string(),
+                "jobs".to_string(),
+                "passive".to_string(),
+                "../jobs".to_string(),
+                "..".to_string(),
+            ],
+        );
+        assert_eq!(
+            named
+                .iter()
+                .map(|s| (s.space.as_str(), s.count))
+                .collect::<Vec<_>>(),
+            vec![("jobs", 2), ("passive", 1)]
+        );
     }
 
     #[test]

@@ -38,6 +38,51 @@ watcher and the engine share one `Arc<Kernel>`, they share one cache.
 
 Builds for both native and wasm (the browser frontend mounts the same space).
 
+## Reactive spaces: the host decides what fires, and under what
+
+`reactive_kernel_with_mounts` (the `--daemon` writer, or `--react`) runs the
+[ikigai-intray](https://crates.io/crates/ikigai-intray) reactor over
+`<workspace>/spaces/`: a tuple dropped into `urn:space:<name>` fires that space's
+handler. Everything in a space's own directory sits beside the `inbox` a dropper
+writes into, so the host keeps both halves of a handler's configuration in the
+**config home** (`$XDG_CONFIG_HOME/ikigai/`, or `~/.config/ikigai/`), one file per
+space, named for the space, read fresh on every tuple:
+
+| file | holds | when it is absent |
+|------|-------|-------------------|
+| `space-authority/<space>` | the scopes the handler runs under, one IRI per line (`#` comments allowed) | the three tuplespace verbs only |
+| `space-handler/<space>` | the ONE IRI the space's tuples fire at (`#` comments and blank lines allowed) | the migration fallback below |
+
+What fires, given the host entry and the space's `<workspace>/spaces/<space>/handler` file:
+
+| `space-handler/<space>` | `handler` file | fires |
+|-------------------------|----------------|-------|
+| names `H` | absent, or names `H` | `H` |
+| names `H` | names something else | nothing: each tuple is dead-lettered with a note naming the file's target |
+| names nothing, several IRIs, a non-IRI, or is unreadable | any | nothing (refused, dead-lettered when there is a file) |
+| absent | names `F` | `F`, the **migration fallback** |
+| absent | absent | nothing: not a reactive space |
+
+A refused tuple is loud: it lands in `error/`, the dead-letter line is logged, and
+the heartbeat goes FAILING. Once the two agree, `sink urn:space:<space> retry=<id>`
+runs it again.
+
+### Migrating a space
+
+The fallback keeps a deployed writer handling bookings while its spaces are unpinned,
+and says so. At start-up the writer prints one line per space that is not the host's
+decision alone, for example:
+
+```text
+ikigai: space `bookings`: fires `urn:booking:handle` from /…/spaces/bookings/handler, a file in the drop tree anyone who can write the workspace can retarget, because the host entry /…/space-handler/bookings is ABSENT (the migration fallback, ledger #887). If `urn:booking:handle` is right, pin it: mkdir -p '/…/space-handler' && cp '/…/spaces/bookings/handler' '/…/space-handler/bookings'
+```
+
+Check the IRI, run the command, and the line goes away on the next start; nothing
+needs a restart to take effect, since the entry is read per tuple. The first tuple a
+space fires under the fallback is logged too, so a space created (or retargeted) after
+start-up is not silent. A pinned space no longer needs its `handler` file, and the
+heartbeat still counts its dead letters.
+
 ## License
 
 MIT OR Apache-2.0.
