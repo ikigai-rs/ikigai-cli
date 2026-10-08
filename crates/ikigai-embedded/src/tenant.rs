@@ -350,6 +350,49 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// ledger #874 (the cli part of ledger #858): a tenant's EXCLUSION survives narrowing. A grant of the
+    /// whole workspace minus `other`, rooted as the minter roots it, is narrowed two ways a
+    /// served connection actually narrows: `attenuate` to the allow alone (a delegate that
+    /// asks for less) and `clamp` against a carried capability holding only the allow (the
+    /// QUIC door's `session.clamp(&carried)`). Through core 0.1.85 both dropped the deny
+    /// scope, because it was intersected like a grant, and the narrowed capability READ the
+    /// excluded file: narrowing widened. Core 0.1.86 keeps every exclusion either side holds.
+    #[test]
+    fn a_localized_tenant_deny_survives_attenuate_and_clamp() {
+        let root = jail();
+        let tenant = tenant_root(&root, SEG);
+        let session = root_fs_scopes(
+            &Capability::scoped([
+                "urn:cap:fs:read:.".to_string(),
+                "urn:cap:fs:read:-other".to_string(),
+            ]),
+            &tenant,
+        );
+        let allow = format!("urn:cap:fs:read:{}", tenant.display());
+        let deny = format!("urn:cap:fs:read:-{}", tenant.join("other").display());
+        assert_eq!(scopes_of(&session), vec![deny.clone(), allow.clone()]);
+
+        let attenuated = session.attenuate([allow.clone()]);
+        let clamped = session.clamp(&Capability::scoped([allow.clone()]));
+        for (how, capability) in [
+            ("as minted", &session),
+            ("attenuated to the allow", &attenuated),
+            ("clamped by a carried allow", &clamped),
+        ] {
+            source(&root, &localized(SEG, "notes/todo.txt"), capability)
+                .unwrap_or_else(|e| panic!("{how}: the allow still reaches notes: {e}"));
+            assert!(
+                matches!(
+                    source(&root, &localized(SEG, "other/secret.txt"), capability),
+                    Err(Error::Denied(_))
+                ),
+                "{how}: the exclusion was dropped and `other` became readable ({:?})",
+                capability.scopes()
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// The other half of the reported bug, end to end: an absolute grant outside the
     /// jail authorizes nothing, whatever the client asks for. `serve` refuses to start
     /// on one rather than run it — this is what it is refusing on behalf of.
