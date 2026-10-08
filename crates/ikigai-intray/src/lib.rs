@@ -953,6 +953,9 @@ fn interrupted_note(space: &str, id: &str) -> String {
 /// that is STRUCTURAL: the only per-space adjustment is [`Capability::attenuate`], which can
 /// subtract scopes and never add one (ledger #445); a host that wants authority out of the
 /// space tree entirely uses [`with_host_authority`](SpaceReactor::with_host_authority).
+/// WHAT fires is the space's `handler` file unless the host decides it with
+/// [`with_host_handler`](SpaceReactor::with_host_handler) — install it, because the file is in
+/// the drop tree too.
 ///
 /// This is the deterministic core (`drain`/`process`); the live filesystem watcher that calls
 /// `process` on each drop is a thin wrapper the host installs (Slice 3b).
@@ -966,6 +969,9 @@ pub struct SpaceReactor {
     // reactor's own capability). `Some` = the HOST decides and the file is never read; see
     // `with_host_authority` for why a host may want the file out of the loop entirely.
     host_authority: Option<HostAuthority>,
+    // `None` = the `handler` file decides what fires. `Some` = the HOST decides, given what the
+    // file names; see `with_host_handler` for why the file alone is not to be trusted.
+    host_handler: Option<HostHandler>,
     // Told about every tuple that settles as `Errored` — the host's way to make a dead letter
     // LOUD at the moment it happens. `None` = silent, which is what the `.err` note alone was.
     on_dead_letter: Option<DeadLetterHook>,
@@ -998,6 +1004,20 @@ pub type DeadLetterHook = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
 /// `cap` file, which lives in the tree droppers write into — can only ever attenuate.
 pub type HostAuthority = Arc<dyn Fn(&str) -> Option<Capability> + Send + Sync>;
 
+/// A host's answer to "what does this space's handler fire?", given what the space's `handler`
+/// file names, installed with [`SpaceReactor::with_host_handler`].
+pub type HostHandler = Arc<dyn Fn(&str, Option<&str>) -> Option<String> + Send + Sync>;
+
+/// What [`SpaceReactor::process`] fires for a space.
+enum Target {
+    /// This IRI.
+    Fire(String),
+    /// Nothing: the `handler` file names this IRI and the host refused it.
+    Refused(String),
+    /// Nothing: the space is not reactive.
+    None,
+}
+
 impl SpaceReactor {
     /// Build a reactor over `root` (the same tree the spaces live in), firing handlers
     /// through `resolver` under `capability`.
@@ -1014,6 +1034,7 @@ impl SpaceReactor {
             resolver,
             capability,
             host_authority: None,
+            host_handler: None,
             on_dead_letter: None,
             interrupted: Interrupted::default(),
             recovery: std::sync::OnceLock::new(),
@@ -1261,6 +1282,51 @@ impl SpaceReactor {
         (!uri.is_empty()).then(|| uri.to_string())
     }
 
+    /// What a dropped tuple in this space is fired at: the `handler` file's target, or —
+    /// with [`with_host_handler`](SpaceReactor::with_host_handler) installed — whatever the
+    /// host decides given that target.
+    fn handler_target(&self, name: &str) -> Target {
+        let file = self.handler_uri(name);
+        match &self.host_handler {
+            None => file.map_or(Target::None, Target::Fire),
+            Some(decide) => match (decide(name, file.as_deref()), file) {
+                (Some(uri), _) => Target::Fire(uri),
+                (None, Some(refused)) => Target::Refused(refused),
+                (None, None) => Target::None,
+            },
+        }
+    }
+
+    /// Let the HOST decide what each space's handler is, instead of the `handler` file alone.
+    ///
+    /// ★ Why (the Hermes audit's `handler-retarget`, ledger #877; the same class as #445): the
+    /// `handler` file sits in `<root>/<name>/`, the directory a dropper writes into, so anyone
+    /// who can write the tree chooses WHICH IRI every tuple is fired at — under the reactor's
+    /// own host-granted authority, even with [`with_host_authority`] deciding that authority.
+    /// #445 made the `cap` file attenuate-only; this is the handler's equivalent.
+    ///
+    /// The closure gets the space name and the file's target (`None` when there is no file)
+    /// and answers what to fire:
+    /// - `Some(uri)` fires `uri` — the file's target when the host allows it (an allow-list),
+    ///   or the host's own (host config, with the file ignored);
+    /// - `None` with a file present REFUSES it: the tuple is claimed and dead-lettered with a
+    ///   note naming the target, and the [`DeadLetterHook`] hears about it — loud, where
+    ///   leaving it in the inbox would be silent;
+    /// - `None` with no file means the space is not reactive.
+    ///
+    /// Without this the file decides, exactly as before, and whoever can write the tree can
+    /// retarget the handler. A host that grants its reactor anything worth stealing should
+    /// install it.
+    ///
+    /// [`with_host_authority`]: SpaceReactor::with_host_authority
+    pub fn with_host_handler<F>(mut self, decide: F) -> Self
+    where
+        F: Fn(&str, Option<&str>) -> Option<String> + Send + Sync + 'static,
+    {
+        self.host_handler = Some(Arc::new(decide));
+        self
+    }
+
     /// The capability a space's handler runs under.
     ///
     /// With a host seam installed ([`with_host_authority`](SpaceReactor::with_host_authority))
@@ -1337,8 +1403,15 @@ impl SpaceReactor {
     pub fn process(&self, name: &str, id: &str) -> Outcome {
         // Before this reactor's first claim, whichever entry point makes it.
         let _ = self.recover_interrupted();
-        let Some(handler) = self.handler_uri(name) else {
-            return Outcome::Skipped("no handler (not a reactive space)");
+        let handler = match self.handler_target(name) {
+            Target::Fire(uri) => Ok(uri),
+            // Claimed and dead-lettered below, never fired: a refusal is loud (`error/`, the
+            // dead-letter hook), where leaving it in the inbox would be silent.
+            Target::Refused(uri) => Err(format!(
+                "refused: this space's `handler` file names `{uri}`, which the host does not \
+                 allow (`with_host_handler`); the handler was not run"
+            )),
+            Target::None => return Outcome::Skipped("no handler (not a reactive space)"),
         };
         // One pass at a time per reactor, held from the claim to the settle.
         let _pass = self.pass.lock().unwrap_or_else(|p| p.into_inner());
@@ -1354,6 +1427,10 @@ impl SpaceReactor {
             // Never fire a handler on bytes that are not the tuple that was dropped.
             Ok(_) => return self.settle(name, id, &claimed, Err(corrupt_note(id))),
             Err(e) => return self.settle(name, id, &claimed, Err(format!("read tuple: {e}"))),
+        };
+        let handler = match handler {
+            Ok(uri) => uri,
+            Err(refused) => return self.settle(name, id, &claimed, Err(refused)),
         };
         // Fire the handler under the reactor's OWN authority, passing the tuple as content
         // plus the space/tuple ids (transport dumb, resource smart). A malformed handler URI
