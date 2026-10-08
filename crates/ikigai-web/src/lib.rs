@@ -112,7 +112,7 @@ pub fn fixed_cap(scopes: Vec<String>) -> CapFn {
 /// **`principal`**, beside `received` and `client`; a **read** carries none (an argument is
 /// part of the cache key, and a per-principal key on every GET would partition the
 /// representation cache by identity); and `?principal=…` in the query string is **dropped**
-/// on a write, so a submitter cannot name their own principal.
+/// on every verb, so a submitter cannot name their own principal, and a read names nobody.
 ///
 /// ```
 /// use ikigai_core::{
@@ -168,6 +168,94 @@ pub fn fixed_cap(scopes: Vec<String>) -> CapFn {
 /// # }
 /// ```
 pub type PrincipalFn = Arc<dyn Fn(&HttpRequest) -> Option<String> + Send + Sync>;
+
+/// A door's answer to a request it will not serve at all: the status and the sentence the
+/// refused client is told. Returned by an [`AdmitFn`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    /// One of `400`, `403`, `404`, `421` or `429`; any other value is answered `403`, so a
+    /// typo cannot turn a refusal into a success.
+    pub status: u16,
+    /// The body of the refusal, as `text/plain`.
+    pub reason: String,
+}
+
+/// Decide, from the request alone and BEFORE anything else answers it, whether the door
+/// serves it at all. `Some` refuses: no route is matched, no endpoint is described or invoked,
+/// and the client gets the [`Refusal`] (with the edge's security headers and CORS policy).
+///
+/// ★ **Why it exists beside [`CapFn`].** A capability decides what a request may DO, and a
+/// host can refuse one by handing it a capability no resource satisfies, which an overlay in
+/// the kernel then answers. But three answers never reach the kernel: `OPTIONS` (the declared
+/// verbs), the `?description` face (the contract of every action the capability is offered,
+/// which for an empty capability is the capability-free ones) and the push stream. A refusal
+/// computed as a capability therefore still disclosed those (ledger #879, from gonk's foreign
+/// `Host` and cross-site refusals). This hook runs ahead of all of them. `None` (the default
+/// [`EdgeConfig::admit_fn`]) admits everything, exactly as before the hook existed.
+///
+/// ```
+/// use ikigai_core::{EndpointSpace, Exact, FnEndpoint, Description, Kernel, ReprType, Representation, Verb};
+/// use ikigai_web::{AdmitFn, EdgeConfig, HttpRequest, Refusal};
+/// use std::sync::Arc;
+/// use tokio::io::{AsyncReadExt, AsyncWriteExt};
+///
+/// # #[tokio::main]
+/// # async fn main() {
+/// let page = FnEndpoint::new("page", |_inv: &ikigai_core::Invocation<'_>| {
+///     Ok(Representation::new(ReprType::new("text/plain"), b"hello".to_vec()))
+/// })
+/// .with_description(Description::new("page").verb(Verb::Source));
+/// let kernel = Arc::new(Kernel::new(Arc::new(
+///     EndpointSpace::new().bind(Exact::new("urn:test:page"), page),
+/// )));
+/// // Serve only requests addressed to this server's own name.
+/// let admit: AdmitFn = Arc::new(|req: &HttpRequest| {
+///     (req.header("host") != Some("localhost")).then(|| Refusal {
+///         status: 421,
+///         reason: "this server answers only to localhost".to_string(),
+///     })
+/// });
+/// let config = EdgeConfig { admit_fn: Some(admit), ..EdgeConfig::default() };
+/// let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+/// let addr = listener.local_addr().unwrap();
+/// tokio::spawn(async move {
+///     let _ = ikigai_web::serve_with_listener(kernel, ikigai_web::public_cap(), listener, config).await;
+/// });
+/// async fn send(addr: std::net::SocketAddr, raw: &str) -> String {
+///     let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+///     c.write_all(raw.as_bytes()).await.unwrap();
+///     let mut out = Vec::new();
+///     c.read_to_end(&mut out).await.unwrap();
+///     String::from_utf8_lossy(&out).into_owned()
+/// }
+/// let ok = send(addr, "GET /test/page HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+/// assert!(ok.starts_with("HTTP/1.1 200") && ok.ends_with("hello"), "{ok}");
+/// // Refused before anything answers: the page, its OPTIONS and its description alike.
+/// for raw in [
+///     "GET /test/page HTTP/1.1\r\nHost: evil.example\r\n\r\n",
+///     "OPTIONS /test/page HTTP/1.1\r\nHost: evil.example\r\n\r\n",
+///     "GET /test/page?description HTTP/1.1\r\nHost: evil.example\r\n\r\n",
+/// ] {
+///     let refused = send(addr, raw).await;
+///     assert!(refused.starts_with("HTTP/1.1 421 Misdirected Request"), "{refused}");
+///     assert!(refused.ends_with("this server answers only to localhost"), "{refused}");
+/// }
+/// # }
+/// ```
+pub type AdmitFn = Arc<dyn Fn(&HttpRequest) -> Option<Refusal> + Send + Sync>;
+
+/// The response a [`Refusal`] is answered with. The reason phrase is a `&'static str` in
+/// [`Resp`], so the status is mapped from a closed list rather than taken on trust.
+fn refusal_resp(refusal: &Refusal) -> Resp {
+    let (status, phrase) = match refusal.status {
+        400 => (400, "Bad Request"),
+        404 => (404, "Not Found"),
+        421 => (421, "Misdirected Request"),
+        429 => (429, "Too Many Requests"),
+        _ => (403, "Forbidden"),
+    };
+    Resp::text(status, phrase, &refusal.reason)
+}
 
 /// The largest request body accepted from a client, in bytes.
 ///
@@ -239,6 +327,8 @@ pub struct EdgeConfig {
     /// The principal hook — see [`PrincipalFn`] for the shape it stamps. `None` (the
     /// default) attaches no `principal` argument to anything.
     pub principal_fn: Option<PrincipalFn>,
+    /// The admission hook — see [`AdmitFn`]. `None` (the default) admits every request.
+    pub admit_fn: Option<AdmitFn>,
     /// The deadline for the request line and headers. Default [`DEFAULT_HEADER_TIMEOUT`].
     pub header_timeout: std::time::Duration,
     /// The deadline for the declared body. Default [`DEFAULT_BODY_TIMEOUT`].
@@ -283,6 +373,7 @@ impl Default for EdgeConfig {
             routes_only: false,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             principal_fn: None,
+            admit_fn: None,
             header_timeout: DEFAULT_HEADER_TIMEOUT,
             body_timeout: DEFAULT_BODY_TIMEOUT,
             write_timeout: DEFAULT_WRITE_TIMEOUT,
@@ -862,6 +953,14 @@ async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::
         .read()
         .map(|g| Arc::clone(&g))
         .unwrap_or_else(|_| Arc::new(RouteTable::default()));
+    // ADMISSION, ahead of every answer this door gives: the push stream, OPTIONS, the
+    // `?description` face and dispatch alike (ledger #879). Nothing below has run, so a
+    // refused request learns nothing about what is behind the door.
+    if let Some(refusal) = shared.config.admit_fn.as_ref().and_then(|f| f(&req)) {
+        let mut resp = refusal_resp(&refusal);
+        apply_edge_policy(&mut resp, &shared.config, &req, None);
+        return write_within(&mut sock, resp, wt).await;
+    }
     // The event stream is not a resource read: it holds the connection open and writes cut
     // notices as they arrive, so it leaves the request/response path here, before routing.
     if let Some(push) = shared.config.push.as_ref() {
@@ -978,7 +1077,13 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
         // are the provenance names (`received`, `client`, `principal`): the transport
         // supplies them below, and a submitter must not be able to forge an origin by
         // appending `?client=…` to the URL, nor an identity by appending `?principal=…`.
-        let reserved = k == "as" || k == "content" || (verb.is_mutating() && is_provenance(k));
+        // `principal` is reserved on a READ as well (ledger #879): a read carries none, and
+        // a host that reads the stamped principal off a request must never find a
+        // submitter's there.
+        let reserved = k == "as"
+            || k == "content"
+            || k == "principal"
+            || (verb.is_mutating() && is_provenance(k));
         if !reserved {
             request = request.with_arg(k.clone(), ArgRef::Inline(v.clone().into_bytes()));
         }
@@ -2973,6 +3078,100 @@ mod tests {
             out.contains("principal=-") && !out.contains("forged"),
             "the claim is dropped even with no door: {out}"
         );
+    }
+
+    /// ledger #879 (3), R6's library half: a READ cannot name a principal either. The
+    /// reservation was keyed on mutating verbs only, so `GET …?principal=forged` reached the
+    /// endpoint as `principal=forged`, and a host reading its stamped principal off any
+    /// request (gonk's access log, its author rule) had to know to ignore reads.
+    #[tokio::test]
+    async fn a_principal_in_a_read_query_string_is_dropped_too() {
+        for config in [naming_door(), EdgeConfig::default()] {
+            let addr = start_with(config).await;
+            let out = roundtrip(
+                addr,
+                "GET /test/provenance?principal=forged HTTP/1.1\r\nHost: x\r\n\r\n",
+            )
+            .await;
+            assert!(
+                out.contains("principal=-") && !out.contains("forged"),
+                "a read carries no principal, and never the submitter's: {out}"
+            );
+        }
+    }
+
+    /// A door that refuses every request whose `Host` is not `localhost`, with `status`.
+    fn admitting(status: u16) -> EdgeConfig {
+        let admit: AdmitFn = Arc::new(move |req: &HttpRequest| {
+            (req.header("host") != Some("localhost")).then(|| Refusal {
+                status,
+                reason: "refused at the door".to_string(),
+            })
+        });
+        EdgeConfig {
+            admit_fn: Some(admit),
+            push: Some(crate::push::PushConfig::default()),
+            ..EdgeConfig::default()
+        }
+    }
+
+    /// ledger #879 (1): admission runs before EVERY answer the door gives, including the
+    /// three that never reach the kernel (OPTIONS, `?description`, the push stream), so a
+    /// host overlay in the kernel could not refuse them.
+    #[tokio::test]
+    async fn admission_refuses_before_options_description_push_and_dispatch() {
+        let addr = start_with(admitting(403)).await;
+        let push = crate::push::PushConfig::default().path;
+        for raw in [
+            "GET /test/id/hello HTTP/1.1\r\nHost: evil\r\n\r\n".to_string(),
+            "OPTIONS /test/writable HTTP/1.1\r\nHost: evil\r\n\r\n".to_string(),
+            "GET /test/booking?description HTTP/1.1\r\nHost: evil\r\n\r\n".to_string(),
+            "POST /test/provenance HTTP/1.1\r\nHost: evil\r\nContent-Length: 2\r\n\r\nhi"
+                .to_string(),
+            format!("GET {push} HTTP/1.1\r\nHost: evil\r\n\r\n"),
+        ] {
+            let out = roundtrip(addr, &raw).await;
+            assert!(
+                out.starts_with("HTTP/1.1 403 Forbidden") && out.ends_with("refused at the door"),
+                "{raw:?} answered before admission: {out}"
+            );
+            assert!(
+                !out.contains("Allow:") && !out.contains("openapi") && !out.contains("received="),
+                "a refusal discloses nothing behind the door: {out}"
+            );
+        }
+        // An admitted request is served exactly as before.
+        let out = roundtrip(
+            addr,
+            "GET /test/id/hello HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(
+            out.starts_with("HTTP/1.1 200") && out.ends_with("hi"),
+            "{out}"
+        );
+        let out = roundtrip(
+            addr,
+            "OPTIONS /test/writable HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(out.contains("Allow: POST, PUT, PATCH, OPTIONS"), "{out}");
+    }
+
+    /// A refusal's status comes from a closed list; anything else is a 403, so a typo in a
+    /// host's hook can never turn a refusal into a success.
+    #[tokio::test]
+    async fn a_refusal_status_outside_the_list_is_answered_403() {
+        for (asked, line) in [
+            (421, "HTTP/1.1 421 Misdirected Request"),
+            (429, "HTTP/1.1 429 Too Many Requests"),
+            (200, "HTTP/1.1 403 Forbidden"),
+            (302, "HTTP/1.1 403 Forbidden"),
+        ] {
+            let addr = start_with(admitting(asked)).await;
+            let out = roundtrip(addr, "GET /test/id/hello HTTP/1.1\r\nHost: evil\r\n\r\n").await;
+            assert!(out.starts_with(line), "{asked} -> {out}");
+        }
     }
 
     #[tokio::test]

@@ -164,6 +164,17 @@ members = ["crates/*"]
 #   Committed locks shield both until they move. The cli's own `serve quic://` minters name no
 #   principal yet (`None`). ⚠ An argument is part of the cache key, so two clients reading one
 #   resource under one capability through a principal-naming door no longer share a cached answer.
+# - ikigai-web: an ADMISSION hook ahead of every answer (ledger #879, item 1). `EdgeConfig.admit_fn`
+#   (`AdmitFn`, `Refusal`) sees each request before the push stream, `OPTIONS`, the `?description`
+#   face and dispatch, and may refuse it (400/403/404/421/429; any other status is a 403). Those
+#   three answers never reach the kernel, so a refusal computed as an empty capability and answered
+#   by a kernel overlay (gonk's foreign `Host` and cross-site refusals) still disclosed the declared
+#   verbs and the capability-free contracts. Additive: every known consumer builds `EdgeConfig`
+#   with `..EdgeConfig::default()`, and `None` admits everything.
+# - ikigai-web: `?principal=` is dropped on EVERY verb (ledger #879, item 3; R6's library half). It
+#   was reserved on mutating verbs only, so a GET reached the endpoint carrying the submitter's
+#   `principal`. Operator-visible: a read endpoint that took a `principal` query argument no
+#   longer gets it (none is known).
 # 0.1.40: SECURITY FLOORS FROM AUDIT ROUND 3, A RESOLVER THAT FAILS CLOSED, AND A PASSKEY STORE
 # ONLY ITS OWNER COULD HAVE WRITTEN.
 # - Security floors (PR #408): ikigai-fs 0.1.8 (the jail authorizes the file it opens: no

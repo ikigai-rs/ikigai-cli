@@ -38,7 +38,17 @@ request as (a stable IRI, a label; the transport does not interpret it). A princ
 **not authority**: the capability from `cap_fn` alone decides what the request may do.
 Reads carry none of the three (an argument is part of the cache key), and all three are
 dropped from the query string on a write, so a submitter cannot name their own origin or
-identity. The doctest on `PrincipalFn` pins the shape.
+identity; `principal` is dropped from a read's query string too, so a read names nobody.
+The doctest on `PrincipalFn` pins the shape.
+
+### Admission before anything answers
+
+`EdgeConfig::admit_fn` (an `AdmitFn`) sees each request before ANY answer the door gives
+and may refuse it with a `Refusal` (`400`, `403`, `404`, `421` or `429`; any other status
+is a `403`). That matters because three answers never reach the kernel, so a host overlay
+there cannot refuse them: `OPTIONS`, the `?description` face and the push stream. A door
+that refused by handing a request an empty capability still disclosed those. `None` (the
+default) admits everything. The doctest on `AdmitFn` pins the behavior.
 
 ## The mapping
 
