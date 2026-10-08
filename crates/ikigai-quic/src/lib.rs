@@ -84,10 +84,58 @@ pub fn generate() -> Identity {
 /// certificate. `capability` bounds every call on the connection; `file_segment`
 /// transparently roots its `urn:file:` namespace at `<file_segment>/…`, so a tenant
 /// addresses files as if its segment were the root and never sees another's.
+///
+/// ★ **`principal` is WHO, never WHAT.** It names the client the minter recognized (an IRI
+/// the host derives from the certificate, such as `urn:iki:gonk:client:<fingerprint>`), and
+/// [`dispatch`] stamps it on every request of the connection as the inline argument
+/// [`PRINCIPAL_ARG`], replacing anything a client sent under that name. It is not authority:
+/// what a call may do is `capability` alone, clamped by whatever capability the client
+/// carries. Keeping the two apart is the point: a name carried INSIDE the capability (as a
+/// scope no resource requires) is intersected away the moment a client carries a narrower
+/// capability of its own, so the request arrives anonymous (ledger #879). `None` stamps
+/// nothing, and a client-sent `principal` is still removed.
 pub struct Session {
     pub capability: Capability,
     pub file_segment: String,
+    pub principal: Option<String>,
 }
+
+/// The inline argument a [`Session`]'s principal arrives under, on every request the
+/// connection carries: the same name `ikigai-web` stamps on a write, so a host reads one
+/// argument whichever door a request came through.
+///
+/// ```
+/// use ikigai_core::{ArgRef, Capability, Iri, Kernel, EndpointSpace, Request, Verb};
+/// use ikigai_quic::{dispatch, Session, PRINCIPAL_ARG};
+/// use ikigai_wire::{Call, Reply};
+/// use std::sync::Arc;
+///
+/// assert_eq!(PRINCIPAL_ARG, "principal");
+/// // An endpoint that answers with the principal it was handed, or `-` for none.
+/// let whoami = ikigai_core::FnEndpoint::new("whoami", |inv: &ikigai_core::Invocation<'_>| {
+///     let who = inv.inline_str(PRINCIPAL_ARG).unwrap_or("-").to_string();
+///     Ok(ikigai_core::Representation::new(
+///         ikigai_core::ReprType::new("text/plain"),
+///         who.into_bytes(),
+///     ))
+/// });
+/// let kernel = Kernel::new(Arc::new(
+///     EndpointSpace::new().bind(ikigai_core::Exact::new("urn:test:whoami"), whoami),
+/// ));
+/// let session = Session {
+///     capability: Capability::root(),
+///     file_segment: String::new(),
+///     principal: Some("urn:example:alice".to_string()),
+/// };
+/// // The client names someone else; the connection's principal wins.
+/// let forged = Request::new(Verb::Source, Iri::parse("urn:test:whoami").unwrap())
+///     .with_arg(PRINCIPAL_ARG, ArgRef::Inline(b"urn:example:mallory".to_vec()));
+/// match dispatch(&kernel, Call::Issue(forged), &session) {
+///     Reply::Resolved(answer, _) => assert_eq!(answer.bytes, b"urn:example:alice"),
+///     other => panic!("{other:?}"),
+/// }
+/// ```
+pub const PRINCIPAL_ARG: &str = "principal";
 
 /// Who the mTLS handshake authenticated, in the two spellings a host needs.
 ///
@@ -327,6 +375,32 @@ async fn serve_connection(kernel: &Kernel, connection: quinn::Connection, sessio
     }
 }
 
+/// Put the connection's principal on `request` under [`PRINCIPAL_ARG`], removing whatever
+/// the client sent there first (in any form, inline or by reference), so the only principal
+/// an endpoint can see is the one the minter named. On EVERY verb, unlike `ikigai-web`, which
+/// stamps writes only: an HTTP read has no authenticated connection behind it in general,
+/// while every call on a QUIC connection does, and a host's access log wants who READ as
+/// much as who wrote. The cost is the one `ikigai-web` avoids: an argument is part of the
+/// cache key, so two clients reading the same resource under the same capability no longer
+/// share a cached answer. On a QUIC door they rarely did, since each enrolled client
+/// normally holds its own grant.
+fn stamp_principal(request: &mut Request, principal: Option<&str>) {
+    request.args.remove(PRINCIPAL_ARG);
+    if let Some(principal) = principal {
+        request.args.insert(
+            PRINCIPAL_ARG.to_string(),
+            ikigai_core::ArgRef::Inline(principal.as_bytes().to_vec()),
+        );
+    }
+}
+
+/// Everything the door does to a request before it resolves: the file namespace rooted at
+/// the session's segment ([`localize`]) and the principal stamped ([`stamp_principal`]).
+fn admit(request: &mut Request, session: &Session) {
+    localize(request, &session.file_segment);
+    stamp_principal(request, session.principal.as_deref());
+}
+
 /// Transparently root the connection's `urn:file:` namespace at its segment: rewrite
 /// `urn:file:<rel>` → `urn:file:<segment>/<rel>` so a tenant addresses files as if its
 /// own segment were the root (and the session capability — scoped to that segment —
@@ -387,7 +461,7 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 
 fn dispatch_call(kernel: &Kernel, call: Call, session: &Session) -> Reply {
     let issue = |mut request: Request, capability: &Capability| {
-        localize(&mut request, &session.file_segment);
+        admit(&mut request, session);
         match Resolver::issue_as(kernel, request, capability) {
             Ok((representation, status)) => Reply::Resolved(representation, status),
             Err(error) => Reply::ErrorTyped(ikigai_wire::WireError::from(&error)),
@@ -400,8 +474,10 @@ fn dispatch_call(kernel: &Kernel, call: Call, session: &Session) -> Reply {
         // authority, so clamp it to the session before resolving (never widen past
         // the authenticated principal).
         Call::IssueAs(request, carried) => issue(request, &session.capability.clamp(&carried)),
+        // Admitted exactly as an issue is, or the answer would name a cache key no issue
+        // on this connection ever uses.
         Call::IsCached(mut request) => {
-            localize(&mut request, &session.file_segment);
+            admit(&mut request, session);
             Reply::Cached(Resolver::is_cached(kernel, &request, &session.capability))
         }
         // List the manifold the client's authenticated capability actually permits —
@@ -416,7 +492,7 @@ fn dispatch_call(kernel: &Kernel, call: Call, session: &Session) -> Reply {
         // tenant's IRIs and cap scopes). `_ctx.parent_span` is for a future
         // mount-stitch.
         Call::IssueTraced(mut request, carried, _ctx) => {
-            localize(&mut request, &session.file_segment);
+            admit(&mut request, session);
             let capability = session.capability.clamp(&carried);
             let collector = Arc::new(SpanCollector::default());
             match ikigai_resolve::issue_traced_as(kernel, request, &capability, collector.clone()) {
@@ -1223,6 +1299,7 @@ mod tests {
         let session = Session {
             capability,
             file_segment: String::new(),
+            principal: None,
         };
         let server = thread::spawn(move || {
             rt.block_on(async move {
@@ -1306,6 +1383,7 @@ mod tests {
         let session = Session {
             capability: server_ceiling,
             file_segment: String::new(),
+            principal: None,
         };
         let server = thread::spawn(move || {
             rt.block_on(async move {
@@ -1442,6 +1520,7 @@ mod tests {
         let session = |seg: &str| Session {
             capability: Capability::root().attenuate([format!("urn:cap:fs:read:{seg}")]),
             file_segment: seg.to_string(),
+            principal: None,
         };
         // Each tenant addresses `urn:file:notes.txt` as if rooted at its own segment — it
         // resolves to `<segment>/notes.txt`, so the SAME name is a different file per
@@ -1504,6 +1583,7 @@ mod tests {
         let session = Session {
             capability: Capability::root(),
             file_segment: String::new(),
+            principal: None,
         };
         // A real accept loop: the impatient client's RETRY (round_trip reconnects once
         // after a failure) dials a second connection while the first is still being
@@ -1521,6 +1601,7 @@ mod tests {
                         let session = Session {
                             capability: Capability::root(),
                             file_segment: String::new(),
+                            principal: None,
                         };
                         serve_connection(&kernel, connection, &session).await;
                     });
@@ -1683,9 +1764,257 @@ mod tests {
             Some(Session {
                 capability: Capability::root(),
                 file_segment: peer.segment_id.clone(),
+                principal: None,
             })
         });
         assert_eq!(dials_under(grant, 1), vec![Ok("DETAIL".to_string())]);
+    }
+
+    /// What `urn:test:whoami` reports: the `principal` argument it was handed (`-` for
+    /// none), whether the capability it ran under still holds the scope a host could have
+    /// used to TAG the connection with its identity (`tagged`/`untagged`, the channel gonk
+    /// used before ledger #879), and which projection that capability reached.
+    fn whoami_kernel() -> Kernel {
+        let whoami = FnEndpoint::new("whoami", |inv: &Invocation<'_>| {
+            let who = inv.inline_str(PRINCIPAL_ARG).unwrap_or("-").to_string();
+            let tagged = inv
+                .capability
+                .scopes()
+                .is_some_and(|held| held.iter().any(|scope| scope == WHOAMI_TAG));
+            let reach = if inv.capability.allows("urn:cap:demo:detail") {
+                "DETAIL"
+            } else {
+                "freebusy"
+            };
+            let tag = if tagged { "tagged" } else { "untagged" };
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("{who} {tag} {reach}").into_bytes(),
+            ))
+        })
+        .with_description(
+            ikigai_core::Description::new("whoami")
+                .verb(Verb::Source)
+                .verb(Verb::Sink),
+        );
+        Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:test:whoami"), whoami),
+        ))
+    }
+
+    /// The identity scope a host could hide inside a session capability.
+    const WHOAMI_TAG: &str = "urn:example:client:tag";
+
+    /// Run the real accept loop over [`whoami_kernel`] under `minter`, dial once, and
+    /// answer each request in `calls` with what the endpoint saw. `traced` installs a
+    /// tracer first, so a capability-carrying call goes out as `Call::IssueTraced`.
+    fn whoami_over(minter: Minter, calls: Vec<WhoamiCall>) -> Vec<String> {
+        use ikigai_resolve::Resolver;
+        let server_id = generate();
+        let client_id = generate();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server_cfg = server_config(
+            &server_id,
+            std::slice::from_ref(&client_id.cert_pem),
+            DEFAULT_IDLE_TIMEOUT,
+        )
+        .unwrap();
+        let rt = Runtime::new().unwrap();
+        let endpoint = rt
+            .block_on(async { quinn::Endpoint::server(server_cfg, addr) })
+            .unwrap();
+        let server_addr = endpoint.local_addr().unwrap();
+        let kernel = Arc::new(whoami_kernel());
+        let _server = thread::spawn(move || {
+            rt.block_on(async move {
+                while let Some(incoming) = endpoint.accept().await {
+                    let kernel = Arc::clone(&kernel);
+                    let minter = Arc::clone(&minter);
+                    tokio::spawn(async move {
+                        let Ok(connection) = incoming.await else {
+                            return;
+                        };
+                        match minter(&PeerIdentity::of(&connection)) {
+                            Some(session) => serve_connection(&kernel, connection, &session).await,
+                            None => connection.close(UNAUTHORIZED.into(), b"unauthorized"),
+                        }
+                    });
+                }
+            });
+        });
+        let client = connect(server_addr, &client_id, &server_id.cert_pem).unwrap();
+        let answers = calls
+            .into_iter()
+            .map(|call| {
+                if call.traced {
+                    client.set_tracer(Arc::new(SpanCollector::default()));
+                } else {
+                    client.clear_tracer();
+                }
+                let mut request = Request::new(call.verb, Iri::parse("urn:test:whoami").unwrap());
+                if let Some(forged) = call.forged {
+                    request = request.with_arg(PRINCIPAL_ARG, ArgRef::Inline(forged.into()));
+                }
+                let answer = match call.carried {
+                    Some(carried) => Resolver::issue_as(&client, request, &carried),
+                    None => client.issue(request),
+                };
+                String::from_utf8(answer.expect("whoami resolves").0.bytes).unwrap()
+            })
+            .collect();
+        drop(client);
+        answers
+    }
+
+    struct WhoamiCall {
+        verb: Verb,
+        carried: Option<Capability>,
+        forged: Option<&'static str>,
+        traced: bool,
+    }
+
+    fn whoami(verb: Verb, carried: Option<Capability>) -> WhoamiCall {
+        WhoamiCall {
+            verb,
+            carried,
+            forged: None,
+            traced: false,
+        }
+    }
+
+    /// A minter that grants `detail` and `other`, hides [`WHOAMI_TAG`] in the capability the
+    /// way gonk did, and names the client's principal from its certificate.
+    fn naming_minter() -> Minter {
+        Arc::new(|peer: &PeerIdentity| {
+            Some(Session {
+                capability: Capability::scoped([
+                    "urn:cap:demo:detail".to_string(),
+                    "urn:cap:demo:other".to_string(),
+                    WHOAMI_TAG.to_string(),
+                ]),
+                file_segment: peer.segment_id.clone(),
+                principal: Some(format!("urn:example:client:{}", &peer.fingerprint[..8])),
+            })
+        })
+    }
+
+    /// ledger #879: the principal is not a capability. A client that carries root and a
+    /// client that carries a capability NARROWER than its session both reach the endpoint
+    /// with the principal the minter named, on a read and on a write, traced or not.
+    ///
+    /// The `untagged` column is the defect reproduced: the identity a host hid inside the
+    /// session capability survives a root carry and is intersected away by a narrowed one
+    /// (`ikigai mcp --grant hermes` against gonk, 2026-10-07), so a host reading it there
+    /// saw nobody. The stamped principal does not travel through the capability at all.
+    #[test]
+    fn the_session_principal_survives_any_capability_the_client_carries() {
+        let narrowed = || Some(Capability::scoped(["urn:cap:demo:other".to_string()]));
+        let answers = whoami_over(
+            naming_minter(),
+            vec![
+                whoami(Verb::Source, None),
+                whoami(Verb::Source, Some(Capability::root())),
+                whoami(Verb::Source, narrowed()),
+                whoami(Verb::Sink, narrowed()),
+                WhoamiCall {
+                    traced: true,
+                    ..whoami(Verb::Source, narrowed())
+                },
+            ],
+        );
+        let principal = answers[0].split(' ').next().unwrap().to_string();
+        assert!(
+            principal.starts_with("urn:example:client:") && principal.len() == 27,
+            "the minter's principal reached the endpoint: {answers:?}"
+        );
+        assert_eq!(
+            answers,
+            vec![
+                format!("{principal} tagged DETAIL"),
+                format!("{principal} tagged DETAIL"),
+                format!("{principal} untagged freebusy"),
+                format!("{principal} untagged freebusy"),
+                format!("{principal} untagged freebusy"),
+            ]
+        );
+    }
+
+    /// A client cannot name a principal: one it sends is replaced by the minter's, under
+    /// any capability and on any verb, and removed when the minter names none.
+    #[test]
+    fn a_forged_principal_argument_never_wins() {
+        let forged = |verb, carried| WhoamiCall {
+            forged: Some("urn:example:mallory"),
+            ..whoami(verb, carried)
+        };
+        let narrowed = || Some(Capability::scoped(["urn:cap:demo:other".to_string()]));
+        let named = whoami_over(
+            naming_minter(),
+            vec![
+                forged(Verb::Source, None),
+                forged(Verb::Source, narrowed()),
+                forged(Verb::Sink, Some(Capability::root())),
+                WhoamiCall {
+                    traced: true,
+                    ..forged(Verb::Sink, narrowed())
+                },
+            ],
+        );
+        for answer in &named {
+            assert!(
+                answer.starts_with("urn:example:client:") && !answer.contains("mallory"),
+                "the connection's principal wins: {named:?}"
+            );
+        }
+        let anonymous: Minter = Arc::new(|peer: &PeerIdentity| {
+            Some(Session {
+                capability: Capability::root(),
+                file_segment: peer.segment_id.clone(),
+                principal: None,
+            })
+        });
+        let unnamed = whoami_over(
+            anonymous,
+            vec![
+                forged(Verb::Source, None),
+                forged(Verb::Sink, Some(Capability::root())),
+            ],
+        );
+        assert_eq!(
+            unnamed,
+            vec!["- untagged DETAIL", "- untagged DETAIL"],
+            "a session with no principal stamps none, and a client's is removed"
+        );
+    }
+
+    /// `IsCached` is admitted exactly as an issue is, so it asks about the key the issue
+    /// stored: a principal-stamped read is reported cached after it resolves.
+    #[test]
+    fn is_cached_asks_about_the_key_the_stamped_issue_stored() {
+        let kernel = Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),
+        ));
+        let session = Session {
+            capability: Capability::root(),
+            file_segment: String::new(),
+            principal: Some("urn:example:alice".to_string()),
+        };
+        let upper = || {
+            Request::new(Verb::Source, Iri::parse("urn:test:upper").unwrap())
+                .with_arg("in", ArgRef::Inline(b"hi".to_vec()))
+        };
+        assert!(matches!(
+            dispatch(&kernel, Call::IsCached(upper()), &session),
+            Reply::Cached(false)
+        ));
+        assert!(matches!(
+            dispatch(&kernel, Call::Issue(upper()), &session),
+            Reply::Resolved(..)
+        ));
+        assert!(matches!(
+            dispatch(&kernel, Call::IsCached(upper()), &session),
+            Reply::Cached(true)
+        ));
     }
 
     /// REVOCATION BY EDITING A FILE. Authority is minted per connection and never
@@ -1701,6 +2030,7 @@ mod tests {
                 Some(Session {
                     capability,
                     file_segment: peer.segment_id.clone(),
+                    principal: None,
                 })
             };
             match nth.fetch_add(1, Ordering::SeqCst) {
@@ -1745,6 +2075,7 @@ mod tests {
         let session = Session {
             capability: Capability::root(),
             file_segment: String::new(),
+            principal: None,
         };
         let server = {
             let kernel = Arc::clone(&kernel);
@@ -1818,6 +2149,7 @@ mod tests {
                 let session = Session {
                     capability: Capability::root(),
                     file_segment: String::new(),
+                    principal: None,
                 };
                 serve_connection(&conflict_kernel(), connection, &session).await;
                 endpoint.wait_idle().await;
@@ -1968,6 +2300,7 @@ mod reconnect_tests {
                 let session = Session {
                     capability: Capability::root(),
                     file_segment: String::new(),
+                    principal: None,
                 };
                 let kernel = Arc::new(Kernel::new(Arc::new(
                     ikigai_core::EndpointSpace::new().bind(
@@ -2131,6 +2464,7 @@ mod runtime_reentrancy {
         let session = Session {
             capability: Capability::root(),
             file_segment: String::new(),
+            principal: None,
         };
         let server = thread::spawn(move || {
             rt.block_on(async move {

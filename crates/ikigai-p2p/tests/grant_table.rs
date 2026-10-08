@@ -51,6 +51,7 @@ fn host_minter() -> PeerMinter {
             .map(|(_, capability)| Session {
                 capability,
                 file_segment: String::new(),
+                principal: None,
             })
     })
 }

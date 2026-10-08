@@ -151,6 +151,19 @@ members = ["crates/*"]
 #   dead-lettered with a note naming the target, and the dead-letter hook fires). ⚠ Not installed
 #   by default and NOT yet wired into ikigai-embedded (that needs a decision on where a host keeps
 #   per-space handler targets); until a host installs it the file decides, as before.
+# - ikigai-quic: a QUIC session carries a PRINCIPAL, stamped on every request (ledger #879).
+#   `Session` gains `principal: Option<String>`, an IRI the minter derives from the peer
+#   certificate; `dispatch` puts it on every call (Issue, IssueAs, IssueTraced and IsCached, every
+#   verb) as the inline argument `principal` (`ikigai_quic::PRINCIPAL_ARG`), the name ikigai-web
+#   stamps on a write, and removes whatever a client sent under that name first. It is never
+#   authority, so it survives any capability the client carries; a name a host hid INSIDE the
+#   session capability (gonk's `urn:iki:gonk:client:<fp>` scope) is intersected away by a
+#   narrower carried capability, which is why `ikigai mcp --grant hermes` writes reached gonk
+#   anonymous. ⚠ SOURCE-BREAKING for a `Session { .. }` struct literal (gonk's minter, the
+#   tutorial's two-hosts): add `principal: None` to keep today's behavior, or name the client.
+#   Committed locks shield both until they move. The cli's own `serve quic://` minters name no
+#   principal yet (`None`). ⚠ An argument is part of the cache key, so two clients reading one
+#   resource under one capability through a principal-naming door no longer share a cached answer.
 # 0.1.40: SECURITY FLOORS FROM AUDIT ROUND 3, A RESOLVER THAT FAILS CLOSED, AND A PASSKEY STORE
 # ONLY ITS OWNER COULD HAVE WRITTEN.
 # - Security floors (PR #408): ikigai-fs 0.1.8 (the jail authorizes the file it opens: no

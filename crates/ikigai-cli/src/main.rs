@@ -2496,6 +2496,7 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, moun
                         Some(ikigai_quic::Session {
                             capability,
                             file_segment: peer.segment_id.clone(),
+                            principal: None,
                         })
                     }
                     // The FULL fingerprint, so debugging a denied client is a copy-paste
@@ -2524,6 +2525,7 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, moun
                         format!("urn:cap:fs:delete:{seg}"),
                     ]),
                     file_segment: peer.segment_id.clone(),
+                    principal: None,
                 })
             })
         } else {
@@ -2539,6 +2541,7 @@ fn serve_quic(target: &str, certs: &Certs, caps: &[String], announce: bool, moun
                         &ikigai_embedded::tenant::tenant_root(&root, &peer.segment_id),
                     ),
                     file_segment: peer.segment_id.clone(),
+                    principal: None,
                 })
             })
         };
