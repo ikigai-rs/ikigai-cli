@@ -17,6 +17,8 @@
 //! matches iff the ASK holds when its Turtle is the default graph. This is strictly more
 //! than Linda's positional match — the whole graph-pattern language, not field equality —
 //! and a non-RDF tuple simply never matches a template (take it by id or FIFO instead).
+//! The one part of SPARQL a template may NOT use is `SERVICE`: a match is a question about a
+//! tuple's own graph and never leaves the host (see `parse_match`).
 //!
 //! The space is *physical and inspectable* — tuples are files under a jailed root, moving
 //! through an **inbox → outbox → error** state machine. The [`SpaceReactor`] makes a space
@@ -35,7 +37,7 @@ use ikigai_core::{
 };
 use notify::{RecursiveMode, Watcher};
 use oxigraph::io::{RdfFormat, RdfParser};
-use oxigraph::sparql::{QueryResults, SparqlEvaluator};
+use oxigraph::sparql::{DefaultServiceHandler, QueryResults, QuerySolutionIter, SparqlEvaluator};
 use oxigraph::store::Store;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -163,34 +165,169 @@ impl SpaceEndpoint {
     }
 }
 
-/// Validate that a `match=` argument is a syntactically valid **ASK** query (so a mistaken
-/// SELECT fails loudly rather than silently matching nothing). Runs it once against an empty
-/// store — cheap, and the only way to confirm the query's result shape is Boolean.
-fn validate_ask(query: &str) -> Result<()> {
-    let store = Store::new().map_err(|e| Error::Endpoint(format!("match: store init: {e}")))?;
-    let prepared =
-        SparqlEvaluator::new()
-            .parse_query(query)
-            .map_err(|e| Error::InvalidArgument {
-                name: "match".to_string(),
-                detail: format!("SPARQL syntax error: {e}"),
-            })?;
-    match prepared
-        .on_store(&store)
-        .execute()
-        .map_err(|e| Error::Endpoint(format!("match: evaluation: {e}")))?
-    {
-        QueryResults::Boolean(_) => Ok(()),
-        _ => Err(Error::InvalidArgument {
-            name: "match".to_string(),
-            detail: "an associative match must be an ASK query".to_string(),
-        }),
+/// Parse a `match=` argument into the template every tuple is tested against.
+///
+/// Refused with a typed `InvalidArgument` (on `match`), before any tuple is read:
+/// - a SPARQL syntax error;
+/// - anything but an **ASK** (so a mistaken SELECT fails loudly rather than matching nothing);
+/// - a **`SERVICE`** clause ANYWHERE in the query (audit round 5, ledger #877).
+///
+/// ★ Why `SERVICE` is refused rather than merely not evaluated: a match is a question about ONE
+/// tuple's graph, and federated query is a network call. oxigraph answers `SERVICE` with an HTTP
+/// request when its `http-client` feature is on — and in the host build it is, by feature
+/// unification through rudof — so a caller holding only `urn:cap:space:read` (or `take`) could
+/// make the host connect to an address of its choosing, and through `take` ship a tuple's own
+/// triples there, with no `urn:cap:net:*` held or declared. The refusal is decided on the
+/// ALGEBRA, so a `SERVICE` in a `FILTER EXISTS`, an `OPTIONAL`, a `MINUS` or a sub-select is
+/// found, and the word in a literal or a comment is not mistaken for one. [`tuple_matches`]
+/// ALSO evaluates with a service handler that refuses every call, so the guarantee holds even
+/// if this walk ever missed a construct, whatever features the build carries.
+fn parse_match(query: &str) -> Result<spargebra::Query> {
+    let invalid = |detail: String| Error::InvalidArgument {
+        name: "match".to_string(),
+        detail,
+    };
+    let parsed = spargebra::SparqlParser::new()
+        .parse_query(query)
+        .map_err(|e| invalid(format!("SPARQL syntax error: {e}")))?;
+    let spargebra::Query::Ask { pattern, .. } = &parsed else {
+        return Err(invalid(
+            "an associative match must be an ASK query".to_string(),
+        ));
+    };
+    if pattern_reaches_service(pattern) {
+        return Err(invalid(
+            "`SERVICE` is not allowed in an associative match: a match is evaluated against \
+             one tuple's graph and never leaves this host"
+                .to_string(),
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Does any part of this graph pattern — including the patterns inside its expressions
+/// (`EXISTS`/`NOT EXISTS`) — contain a `SERVICE`? Exhaustive on purpose (no `_` arm): a
+/// variant a later spargebra adds fails the BUILD here instead of being waved through.
+fn pattern_reaches_service(pattern: &spargebra::algebra::GraphPattern) -> bool {
+    use spargebra::algebra::{AggregateExpression, GraphPattern as P, OrderExpression};
+    match pattern {
+        P::Service { .. } => true,
+        P::Bgp { .. } | P::Path { .. } | P::Values { .. } => false,
+        P::Join { left, right }
+        | P::Union { left, right }
+        | P::Minus { left, right }
+        | P::Lateral { left, right } => {
+            pattern_reaches_service(left) || pattern_reaches_service(right)
+        }
+        P::LeftJoin {
+            left,
+            right,
+            expression,
+        } => {
+            pattern_reaches_service(left)
+                || pattern_reaches_service(right)
+                || expression.as_ref().is_some_and(expression_reaches_service)
+        }
+        P::Filter { expr, inner } => {
+            expression_reaches_service(expr) || pattern_reaches_service(inner)
+        }
+        P::Extend {
+            inner, expression, ..
+        } => pattern_reaches_service(inner) || expression_reaches_service(expression),
+        P::OrderBy { inner, expression } => {
+            pattern_reaches_service(inner)
+                || expression.iter().any(|order| match order {
+                    OrderExpression::Asc(e) | OrderExpression::Desc(e) => {
+                        expression_reaches_service(e)
+                    }
+                })
+        }
+        P::Group {
+            inner, aggregates, ..
+        } => {
+            pattern_reaches_service(inner)
+                || aggregates.iter().any(|(_, aggregate)| match aggregate {
+                    AggregateExpression::CountSolutions { .. } => false,
+                    AggregateExpression::FunctionCall { expr, .. } => {
+                        expression_reaches_service(expr)
+                    }
+                })
+        }
+        P::Graph { inner, .. }
+        | P::Project { inner, .. }
+        | P::Distinct { inner }
+        | P::Reduced { inner }
+        | P::Slice { inner, .. } => pattern_reaches_service(inner),
     }
 }
 
-/// Does a tuple's graph satisfy the ASK? The tuple is parsed as Turtle into the default
-/// graph; a tuple that isn't valid RDF simply never matches a SPARQL template.
-fn tuple_matches(query: &str, bytes: &[u8]) -> Result<bool> {
+/// The expression half of [`pattern_reaches_service`]: only `EXISTS` holds a pattern, but it
+/// can sit under any operator, so every operand is walked.
+fn expression_reaches_service(expression: &spargebra::algebra::Expression) -> bool {
+    use spargebra::algebra::Expression as E;
+    match expression {
+        E::Exists(pattern) => pattern_reaches_service(pattern),
+        E::NamedNode(_) | E::Literal(_) | E::Variable(_) | E::Bound(_) => false,
+        E::Or(a, b)
+        | E::And(a, b)
+        | E::Equal(a, b)
+        | E::SameTerm(a, b)
+        | E::Greater(a, b)
+        | E::GreaterOrEqual(a, b)
+        | E::Less(a, b)
+        | E::LessOrEqual(a, b)
+        | E::Add(a, b)
+        | E::Subtract(a, b)
+        | E::Multiply(a, b)
+        | E::Divide(a, b) => expression_reaches_service(a) || expression_reaches_service(b),
+        E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => expression_reaches_service(a),
+        E::In(a, list) => {
+            expression_reaches_service(a) || list.iter().any(expression_reaches_service)
+        }
+        E::If(a, b, c) => {
+            expression_reaches_service(a)
+                || expression_reaches_service(b)
+                || expression_reaches_service(c)
+        }
+        E::Coalesce(list) | E::FunctionCall(_, list) => list.iter().any(expression_reaches_service),
+    }
+}
+
+/// The `SERVICE` handler every match is evaluated with: it refuses every call. Installed as
+/// oxigraph's DEFAULT handler, which replaces its HTTP one when the `http-client` feature is
+/// on and fills the empty slot when it is off, so the outcome does not depend on the build's
+/// feature set. [`parse_match`] already refuses a template with a `SERVICE`; this is the floor
+/// under it.
+struct NoService;
+
+/// What [`NoService`] answers.
+#[derive(Debug)]
+struct ServiceRefused;
+
+impl std::fmt::Display for ServiceRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SERVICE is not available to an associative match")
+    }
+}
+
+impl std::error::Error for ServiceRefused {}
+
+impl DefaultServiceHandler for NoService {
+    type Error = ServiceRefused;
+
+    fn handle(
+        &self,
+        _service_name: &oxigraph::model::NamedNode,
+        _pattern: &spargebra::algebra::GraphPattern,
+        _base_iri: Option<&oxiri::Iri<String>>,
+    ) -> std::result::Result<QuerySolutionIter<'static>, ServiceRefused> {
+        Err(ServiceRefused)
+    }
+}
+
+/// Does a tuple's graph satisfy the template (from [`parse_match`])? The tuple is parsed as
+/// Turtle into the default graph; a tuple that isn't valid RDF simply never matches.
+fn tuple_matches(template: &spargebra::Query, bytes: &[u8]) -> Result<bool> {
     let store = Store::new().map_err(|e| Error::Endpoint(format!("match: store init: {e}")))?;
     if store
         .load_from_slice(RdfParser::from_format(RdfFormat::Turtle), bytes)
@@ -198,14 +335,9 @@ fn tuple_matches(query: &str, bytes: &[u8]) -> Result<bool> {
     {
         return Ok(false); // non-RDF tuple: no template matches it
     }
-    let prepared =
-        SparqlEvaluator::new()
-            .parse_query(query)
-            .map_err(|e| Error::InvalidArgument {
-                name: "match".to_string(),
-                detail: format!("SPARQL syntax error: {e}"),
-            })?;
-    match prepared
+    match SparqlEvaluator::new()
+        .with_default_service_handler(NoService)
+        .for_query(template.clone())
         .on_store(&store)
         .execute()
         .map_err(|e| Error::Endpoint(format!("match: evaluation: {e}")))?
@@ -318,11 +450,11 @@ impl Endpoint for SpaceEndpoint {
                     ))
                 } else if let Ok(query) = inv.inline_str("match") {
                     // Associative rd: the ids of tuples whose graph satisfies the ASK.
-                    validate_ask(query)?;
+                    let template = parse_match(query)?;
                     let mut hits = Vec::new();
                     for id in Self::list_ids(&dir) {
                         if let Ok(bytes) = std::fs::read(dir.join(format!("{id}.tuple"))) {
-                            if tuple_matches(query, &bytes)? {
+                            if tuple_matches(&template, &bytes)? {
                                 hits.push(id);
                             }
                         }
@@ -361,14 +493,11 @@ impl Endpoint for SpaceEndpoint {
                 // Otherwise take the first tuple matching the template (or any). We scan
                 // deterministically and claim the first that both matches and we win the
                 // race for; a lost claim just moves to the next candidate.
-                let matcher = inv.inline_str("match").ok();
-                if let Some(query) = matcher {
-                    validate_ask(query)?;
-                }
+                let matcher = inv.inline_str("match").ok().map(parse_match).transpose()?;
                 for id in Self::list_ids(&inbox) {
-                    if let Some(query) = matcher {
+                    if let Some(template) = &matcher {
                         match std::fs::read(inbox.join(format!("{id}.tuple"))) {
-                            Ok(bytes) if !tuple_matches(query, &bytes)? => continue,
+                            Ok(bytes) if !tuple_matches(template, &bytes)? => continue,
                             Ok(_) => {}
                             Err(_) => continue, // vanished between listing and read
                         }
@@ -427,7 +556,7 @@ impl Endpoint for SpaceEndpoint {
                             // datatype for "a query in a query language". `xsd:string` is
                             // what the wire carries, not a claim about the syntax.
                             .class(XSD_STRING)
-                            .summary("a SPARQL ASK; list only the tuple ids whose graph satisfies it"),
+                            .summary("a SPARQL ASK (no `SERVICE`); list only the tuple ids whose graph satisfies it"),
                     )
                     .input(
                         ArgSpec::new("state")
@@ -488,7 +617,7 @@ impl Endpoint for SpaceEndpoint {
                         ArgSpec::new("match")
                             .optional()
                             .class(XSD_STRING)
-                            .summary("a SPARQL ASK; take the first tuple whose graph satisfies it"),
+                            .summary("a SPARQL ASK (no `SERVICE`); take the first tuple whose graph satisfies it"),
                     )
                     // The taken tuple itself, uninterpreted.
                     .output("application/octet-stream")
@@ -1445,6 +1574,63 @@ mod tests {
         assert!(
             matches!(bad, Err(Error::InvalidArgument { ref name, .. }) if name == "match"),
             "got: {bad:?}"
+        );
+    }
+
+    /// The floor under `parse_match`'s refusal: even a template that got past it (here built
+    /// straight from the parser) is evaluated with a service handler that refuses, so no
+    /// connection is attempted. This crate's tests build oxigraph WITH its HTTP client (see
+    /// the dev-dependency), so without the handler this connects. The listener ANSWERS each
+    /// connection (an empty result set), so a regression fails this test instead of hanging
+    /// it on a request nobody replies to.
+    #[test]
+    fn evaluation_refuses_service_even_past_the_parse_check() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = {
+            let (hits, stop) = (Arc::clone(&hits), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let Ok((mut conn, _)) = listener.accept() else {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    };
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let _ = conn.set_nonblocking(false);
+                    let _ = conn.set_read_timeout(Some(std::time::Duration::from_millis(300)));
+                    let _ = conn.read(&mut [0u8; 4096]);
+                    let body = r#"{"head":{"vars":[]},"results":{"bindings":[]}}"#;
+                    let _ = write!(
+                        conn,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/sparql-results+json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                }
+            })
+        };
+        let template = spargebra::SparqlParser::new()
+            .parse_query(&format!(
+                "ASK {{ ?s ?p ?o . SERVICE <http://127.0.0.1:{port}/sparql> {{ ?x ?y ?o }} }}"
+            ))
+            .unwrap();
+        let r = tuple_matches(&template, b"<urn:a> <urn:b> \"c\" .");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "evaluation connected to the SERVICE endpoint ({r:?})"
+        );
+        assert!(
+            matches!(r, Err(Error::Endpoint(ref e)) if e.contains("SERVICE")),
+            "the refusal is an evaluation error naming SERVICE: {r:?}"
         );
     }
 

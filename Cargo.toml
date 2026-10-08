@@ -91,6 +91,18 @@ members = ["crates/*"]
 # whose tree version is ahead of crates.io. ⚠ So this comment names NO crate as
 # behind or ahead — that was a snapshot of the registry, true for one afternoon
 # and wrong the next, in the most authoritative place in the tree. Ask the gate.
+# NEXT RELEASE (unreleased, on top of 0.1.40):
+# - ikigai-intray: a `match=` template may not contain `SERVICE` (audit round 5, ledger #877). A
+#   SPARQL ASK carrying `SERVICE <http://…>` made the host open an outbound connection to an
+#   address of the caller's choosing under nothing but `urn:cap:space:read` (rd) or
+#   `urn:cap:space:take` (take, which could ship the tuple's own triples there) — oxigraph's HTTP
+#   client is on in the host build by feature unification through rudof. Reach: the edge QUIC
+#   door grants enrolled peers space:read/take, and every reactive handler holds both. Now the
+#   template is parsed to algebra and a `SERVICE` anywhere in it (including `FILTER EXISTS`,
+#   `OPTIONAL`, sub-selects) is a typed `InvalidArgument` on `match`, and evaluation runs with a
+#   service handler that refuses every call whatever features the build has. A `match=` is also
+#   no longer executed once against an empty store to check its shape; the shape is read off
+#   the parse. Operator-visible: a template that used `SERVICE` (none is known) now fails.
 # 0.1.40: SECURITY FLOORS FROM AUDIT ROUND 3, A RESOLVER THAT FAILS CLOSED, AND A PASSKEY STORE
 # ONLY ITS OWNER COULD HAVE WRITTEN.
 # - Security floors (PR #408): ikigai-fs 0.1.8 (the jail authorizes the file it opens: no
