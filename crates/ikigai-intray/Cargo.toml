@@ -25,6 +25,22 @@ blake3 = "1"
 # the wire — so the heavy Oxigraph dependency is acceptable here. (The crate itself has been
 # published since 0.1.14; it was `publish = false` until #296.)
 oxigraph = "0.5"
+# The `match=` template is parsed to ALGEBRA so a `SERVICE` clause can be refused wherever it
+# hides (a `FILTER EXISTS`, an `OPTIONAL`, a sub-select) rather than by scanning text (audit
+# round 5, ledger #877). The same version oxigraph pins exactly (it re-exports none of these
+# types), so this adds no crate to the graph. `sep-0006` is named HERE because it adds the
+# `Lateral` variant the walk must cover: oxigraph enables it today, and a variant whose
+# existence depended on someone else's feature list would make the walk's exhaustiveness theirs.
+spargebra = { version = "0.4", features = ["sep-0006"] }
+# Only to NAME the type in oxigraph's `DefaultServiceHandler::handle` signature, which the
+# match evaluator implements to refuse every `SERVICE` call whatever features the build has.
+oxiri = "0.2.11"
 
 [dev-dependencies]
 futures = { workspace = true }
+# oxigraph's HTTP `SERVICE` client, ON for this crate's tests. The host build already has it
+# by feature unification (rudof, through ikigai-shacl, enables `http-client-rustls-native`), so
+# a test built without it would guard a quieter configuration than the one that ships: a
+# `SERVICE` clause in `match=` simply fails there and no connection is ever attempted
+# (audit round 5, ledger #877).
+oxigraph = { version = "0.5", features = ["http-client"] }
