@@ -520,6 +520,11 @@ fn base() -> Suite {
         // (conformance PENDING #2): one binding per template variable is all the walk reads.
         .fixture(Fixture::new("file", Verb::Source).binding("path", "conformance.txt"))
         .fixture(Fixture::new("space", Verb::Source).binding("name", "conformance"))
+        // Take reads `content` as the id to take since ledger #877 (the engine puts the value
+        // of `delete urn:space:q <id>` there), so the walk's sample `x` now names a tuple that
+        // does not exist. An EMPTY `content` is what the engine sends on a bare delete: the
+        // work-queue pop, which is exactly what this walk exercised before ledger #877.
+        .fixture(Fixture::new("space", Verb::Delete).arg("content", ""))
         .fixture(Fixture::new("client", Verb::Source).binding("token", "conformance"))
         // ★ The two public intake Sinks, FIRED — and the reason a fixture is right here
         // rather than a waiver. `content` is a urlencoded submission, so the walk's sample

@@ -44,3 +44,9 @@ futures = { workspace = true }
 # `SERVICE` clause in `match=` simply fails there and no connection is ever attempted
 # (audit round 5, ledger #877).
 oxigraph = { version = "0.5", features = ["http-client"] }
+# The REAL engine, for the take-by-content tests: `delete urn:space:q <id>` is built by the
+# engine's write path, and a hand-built request would only restate what we believe it sends.
+# serde_json renders the Meta the engine reads to route named arguments (without a JSON Meta
+# renderer the engine fails open and a routing defect is invisible — field guide).
+ikigai-engine = { path = "../ikigai-engine", version = "0.1.40" }
+serde_json = { workspace = true }
