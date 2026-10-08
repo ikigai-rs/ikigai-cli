@@ -123,6 +123,26 @@ members = ["crates/*"]
 #   the inbox at the space's next rd or take; before, nothing showed or recovered it.
 #   Operator-visible: `.dropping/` and `.taking/` file names change shape; a tuple placed in an
 #   inbox by hand under a name that is not its blake3 hash is now dead-lettered, not delivered.
+# - ikigai-intray's reactor (ledger #877). `watch()` establishes the watch BEFORE the startup
+#   catch-up, so a tuple dropped during the catch-up (a handler composing a follow-up) is handled
+#   rather than left until the next restart; on main `watch()` returned before the watch even
+#   existed. It creates the root before canonicalizing it (a watch over a root that did not exist
+#   yet never fired on macOS). A watch that cannot start, a watch error, and a watcher that stops
+#   are LOGGED to stderr instead of ending a thread silently, and `try_watch()` returns the reason
+#   for a host that would rather refuse to start. Every 60 s without an event (`SWEEP_EVERY`) the
+#   loop re-runs recovery and the catch-up. Passes are serialized per reactor.
+#   Recovery (Hermes audit): `recover_interrupted` ran once per reactor, so a tuple a crashed
+#   sibling left in `.processing/` stranded while any other reactor lived; now `drain` and the
+#   watch loop also sweep (`sweep_interrupted()`), recovering when this reactor is the only live
+#   one over the root. ⚠ With three or more reactors a crashed one's tuples still wait until one
+#   is left (per-claim ownership is reported up).
+#   Re-drop semantics, decided and documented: an identical drop while pending is a no-op; after
+#   the tuple has settled it is a NEW request and fires again (gonk's review queue relies on it).
+#   A tuple's record is now its LAST pass: a success clears a stale `error/` entry (so
+#   `dead_letters` and the heartbeat's FAILING line stop reporting a handled tuple), a failure
+#   clears a stale `outbox/` entry, and a pass that answers nothing removes an earlier `.out`.
+#   Operator-visible: stderr lines prefixed `ikigai-intray:` from the edge's and the daemon's
+#   reactors; a re-dropped tuple that once failed and now succeeds leaves `error/`.
 # 0.1.40: SECURITY FLOORS FROM AUDIT ROUND 3, A RESOLVER THAT FAILS CLOSED, AND A PASSKEY STORE
 # ONLY ITS OWNER COULD HAVE WRITTEN.
 # - Security floors (PR #408): ikigai-fs 0.1.8 (the jail authorizes the file it opens: no

@@ -5,7 +5,8 @@
 //! decoupled in space and time. `urn:space:{name}` is that space on the ikigai substrate:
 //!
 //! - **`out`** — **Sink** a tuple into the space. Content-addressed (blake3), so an
-//!   identical drop is idempotent.
+//!   identical drop is idempotent while the tuple is pending; once a reactor has settled it,
+//!   the same bytes dropped again are a new request and fire again.
 //! - **`rd`** — **Source** the space: list the tuple ids, read one with `tuple=<id>`, or
 //!   list the ids of tuples matching a `match=<ASK>` template. Non-destructive.
 //! - **`take`** — **Delete** a tuple, *returning its content*: claim a specific tuple
@@ -563,7 +564,12 @@ impl Endpoint for SpaceEndpoint {
         let inbox = self.inbox(name);
 
         match inv.request.verb {
-            // out: drop a tuple. Content-addressed → an identical drop is a no-op.
+            // out: drop a tuple. Content-addressed → an identical drop while the tuple is still
+            // PENDING is a no-op (one file, one id). Once a reactor has settled it, the same
+            // bytes dropped again are a NEW request and fire the handler again: that is the
+            // defined re-drop semantics (ledger #877), and a consumer depends on it — gonk's
+            // review queue drops one byte-identical tuple per file on every commit and expects
+            // each drop after a pass to mean "review the file as it is now".
             Verb::Sink => {
                 if !inv.capability.allows(CAP_OUT) {
                     return Err(Error::Denied(format!(
@@ -917,10 +923,12 @@ pub struct Recovered {
     pub outcome: std::result::Result<Interrupted, String>,
 }
 
-/// The once-per-reactor recovery: the lease it holds for its life, and what it found.
+/// The reactor's startup recovery: the lease it holds for its life, and what it found.
 struct Recovery {
-    // Held, never read: dropping it releases the lease.
-    _lease: Option<std::fs::File>,
+    // Held for the reactor's life (dropping it releases the lease). Behind a lock because a
+    // later sweep ([`SpaceReactor::sweep_interrupted`]) briefly trades it for the exclusive
+    // lock and back.
+    lease: std::sync::Mutex<Option<std::fs::File>>,
     report: std::result::Result<Vec<Recovered>, String>,
 }
 
@@ -965,6 +973,10 @@ pub struct SpaceReactor {
     interrupted: Interrupted,
     // Run once, before this reactor's first claim; holds the lease for the reactor's life.
     recovery: std::sync::OnceLock<Recovery>,
+    // Held for every pass (claim → handler → settle) and every later recovery sweep, so a
+    // sweep never sees one of THIS reactor's own tuples in `.processing/` mid-pass, and the
+    // startup catch-up and the watcher never run a pass at the same time.
+    pass: std::sync::Mutex<()>,
 }
 
 /// Called with `(space, tuple id, reason)` for every claimed tuple that settles as
@@ -1005,6 +1017,7 @@ impl SpaceReactor {
             on_dead_letter: None,
             interrupted: Interrupted::default(),
             recovery: std::sync::OnceLock::new(),
+            pass: std::sync::Mutex::new(()),
         }
     }
 
@@ -1044,7 +1057,7 @@ impl SpaceReactor {
             Ok(file) => file,
             Err(why) => {
                 return Recovery {
-                    _lease: None,
+                    lease: std::sync::Mutex::new(None),
                     report: Err(why),
                 }
             }
@@ -1065,7 +1078,7 @@ impl SpaceReactor {
             )),
             Err(std::fs::TryLockError::Error(e)) => {
                 return Recovery {
-                    _lease: None,
+                    lease: std::sync::Mutex::new(None),
                     report: Err(format!(
                         "cannot lock {}: {e}; nothing was recovered",
                         self.root.join(LEASE_FILE).display()
@@ -1079,9 +1092,64 @@ impl SpaceReactor {
             Err(_) => None,
         };
         Recovery {
-            _lease: lease,
+            lease: std::sync::Mutex::new(lease),
             report,
         }
+    }
+
+    /// Recover interrupted tuples AGAIN, now, if this reactor is the only live one over the
+    /// root — and report what moved. [`drain`](SpaceReactor::drain) calls it, and so does the
+    /// [`watch`](SpaceReactor::watch) loop every [`SWEEP_EVERY`].
+    ///
+    /// ★ Why a second chance is needed (the Hermes audit's `once-only-recovery`, ledger #877):
+    /// [`recover_interrupted`](SpaceReactor::recover_interrupted) runs once, at startup, and
+    /// only when it gets the lease EXCLUSIVELY. With two live reactors over one root, a tuple
+    /// the second one claimed and never settled (it crashed mid-pass) sat in `.processing/`
+    /// until the first one exited, because nothing ever looked again. Now the survivor looks
+    /// on every sweep: it sets its own shared lease down, tries for the exclusive lock, and
+    /// recovers when it gets it, i.e. when no OTHER live reactor shares the root. That is safe
+    /// because the sweep holds this reactor's pass lock, so none of its own tuples is in flight.
+    ///
+    /// ⚠ The bound: recovery still needs every other reactor over the root to be gone, so with
+    /// three reactors a crashed one's tuples wait until only one is left. Telling a dead
+    /// reactor's claims from a live one's while both have siblings needs per-claim ownership,
+    /// which is reported up rather than built here.
+    ///
+    /// Empty when there was nothing to move, when another live reactor shares the root, or
+    /// when the lease could never be opened (the startup report says why).
+    pub fn sweep_interrupted(&self) -> Vec<Recovered> {
+        let Some(recovery) = self.recovery.get() else {
+            // The first sweep IS the startup recovery.
+            return self
+                .recover_interrupted()
+                .map(<[_]>::to_vec)
+                .unwrap_or_default();
+        };
+        let _pass = self.pass.lock().unwrap_or_else(|p| p.into_inner());
+        let mut lease = recovery.lease.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(file) = lease.as_ref() else {
+            return Vec::new();
+        };
+        let _ = file.unlock();
+        let recovered = match file.try_lock() {
+            Ok(()) => {
+                let recovered = self.recover_spaces();
+                let _ = file.unlock();
+                recovered
+            }
+            Err(_) => Vec::new(),
+        };
+        // Back to SHARED. Blocks only while another reactor holds it exclusively (its own
+        // startup recovery). If it fails this reactor holds no lease, and says so once.
+        if let Err(e) = file.lock_shared() {
+            eprintln!(
+                "ikigai-intray: reactor over {} lost its lease ({e}); another reactor's \
+                 recovery could now move this one's in-flight tuples",
+                self.root.display()
+            );
+            *lease = None;
+        }
+        recovered
     }
 
     fn open_lease(&self) -> std::result::Result<std::fs::File, String> {
@@ -1246,8 +1314,16 @@ impl SpaceReactor {
     /// deterministic entry the live watcher and the tests both drive. Returns each
     /// `(tuple id, outcome)`.
     pub fn drain(&self, name: &str) -> Vec<(String, Outcome)> {
-        // Before listing, so a REQUEUED interrupted tuple is in the list.
-        let _ = self.recover_interrupted();
+        // Before listing, so a REQUEUED interrupted tuple is in the list. The first call is
+        // the startup recovery; later ones recover what a crashed SIBLING left, once it is
+        // the only reactor left over the root.
+        let _ = self.sweep_interrupted();
+        self.drain_inbox(name)
+    }
+
+    /// [`drain`](SpaceReactor::drain) without the recovery sweep, for a caller that has just
+    /// swept once for every space.
+    fn drain_inbox(&self, name: &str) -> Vec<(String, Outcome)> {
         SpaceEndpoint::list_ids(&self.root.join(name).join("inbox"))
             .into_iter()
             .map(|id| {
@@ -1264,6 +1340,8 @@ impl SpaceReactor {
         let Some(handler) = self.handler_uri(name) else {
             return Outcome::Skipped("no handler (not a reactive space)");
         };
+        // One pass at a time per reactor, held from the claim to the settle.
+        let _pass = self.pass.lock().unwrap_or_else(|p| p.into_inner());
         // Claim atomically — rename out of the inbox into a private processing dir. If the
         // rename finds nothing, another pass already took this tuple: fire exactly once.
         let claimed = match self.claim(name, id) {
@@ -1367,8 +1445,25 @@ impl SpaceReactor {
             Ok(said) if !said.trim().is_empty() => {
                 let _ = std::fs::write(dir.join(format!("{id}.out")), said);
             }
-            Ok(_) => {}
+            // Said nothing THIS pass: an answer left by an earlier pass must not stand in
+            // for it.
+            Ok(_) => {
+                let _ = std::fs::remove_file(dir.join(format!("{id}.out")));
+            }
         }
+        // ★ A tuple's record describes its LAST pass, so it is in exactly one terminal stage.
+        // The same bytes can be handled more than once — an identical drop after a pass has
+        // settled is a NEW request (see the Sink arm) — and before this a success left the
+        // failure it superseded in `error/`, so `dead_letters` (the heartbeat's FAILING line)
+        // went on reporting a tuple that had since been handled (audit round 5, 3b, ledger
+        // #877); a failure likewise leaves no stale success in `outbox/` beside it.
+        let (other, note) = match stage {
+            "outbox" => ("error", "err"),
+            _ => ("outbox", "out"),
+        };
+        let other = self.root.join(name).join(other);
+        let _ = std::fs::remove_file(other.join(format!("{id}.tuple")));
+        let _ = std::fs::remove_file(other.join(format!("{id}.{note}")));
         outcome
     }
 
@@ -1403,12 +1498,48 @@ impl SpaceReactor {
         }
     }
 
-    /// Go live: drain what's already pending (startup catch-up), then watch the spaces root
-    /// and `process` each tuple as it lands. Returns immediately; the watch runs on a
+    /// Go live: watch the spaces root, catch up on what is already pending, then `process`
+    /// each tuple as it lands. Returns once the catch-up is done; the watch runs on a
     /// background thread for the life of the process (the `Arc<Self>` keeps the reactor alive).
     /// A non-reactive space (no `handler` file) is simply skipped — this is safe to call over
     /// the whole tree.
+    ///
+    /// A watch that cannot start is LOGGED to stderr (it used to end its thread silently, and
+    /// a reactor that is not reacting looked exactly like a quiet one); use
+    /// [`try_watch`](SpaceReactor::try_watch) to get the reason and refuse to start instead.
     pub fn watch(self: Arc<Self>) {
+        let root = self.root.clone();
+        if let Err(why) = self.try_watch() {
+            eprintln!(
+                "ikigai-intray: the reactor over {} is NOT watching: {why}; tuples dropped \
+                 from now on wait for a restart",
+                root.display()
+            );
+        }
+    }
+
+    /// [`watch`](SpaceReactor::watch), saying why when the watch could not be established.
+    /// The catch-up does not run then: the caller decides whether to drain without a watch.
+    ///
+    /// ★ ORDER (audit round 5, ledger #877). The watch is established FIRST and the catch-up
+    /// drain runs after. It used to be the other way round: a tuple landing after a space was
+    /// listed and before the watch existed was in neither, so it waited in the inbox until the
+    /// next restart — and a handler that composes, dropping a follow-up tuple while the
+    /// catch-up runs it, hit that gap every time. Now events from the moment the watch is live
+    /// queue in the channel while the catch-up runs and are served after it, and a tuple both
+    /// paths see is claimed once (the second claim finds nothing: `Skipped`).
+    ///
+    /// The root is created before it is canonicalized: canonicalizing a root that did not
+    /// exist yet failed, the raw path was kept, `notify` then reported canonical paths (macOS:
+    /// `/tmp` → `/private/tmp`) that never matched it, and no drop was ever processed.
+    ///
+    /// Every [`SWEEP_EVERY`] without an event the loop also re-runs recovery
+    /// ([`sweep_interrupted`](SpaceReactor::sweep_interrupted)) and the catch-up, so a tuple a
+    /// crashed sibling reactor left claimed, or one whose event was missed, is not stranded
+    /// for the life of the process.
+    pub fn try_watch(self: Arc<Self>) -> std::result::Result<(), String> {
+        std::fs::create_dir_all(&self.root)
+            .map_err(|e| format!("cannot create {}: {e}", self.root.display()))?;
         // Make every known space's inbox exist BEFORE the watch is established.
         //
         // A recursive watch only covers directories that are there when it starts; one
@@ -1420,43 +1551,77 @@ impl SpaceReactor {
         for name in self.space_names() {
             let _ = std::fs::create_dir_all(self.root.join(&name).join("inbox"));
         }
-        // Anything already waiting (including tuples missed while this was not running).
-        for name in self.space_names() {
-            let _ = self.drain(&name);
-        }
         // Canonicalize so the paths `notify` reports (it resolves symlinks — macOS maps
         // /var → /private/var) line up with `root` when we strip the prefix.
         let root = self
             .root
             .canonicalize()
-            .unwrap_or_else(|_| self.root.clone());
-        std::fs::create_dir_all(&root).ok();
+            .map_err(|e| format!("cannot resolve {}: {e}", self.root.display()))?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = notify::recommended_watcher(move |res| {
+            let _ = tx.send(res);
+        })
+        .map_err(|e| format!("cannot create a filesystem watcher: {e}"))?;
+        watcher
+            .watch(&root, RecursiveMode::Recursive)
+            .map_err(|e| format!("cannot watch {}: {e}", root.display()))?;
+        // The watch is live: anything that lands from here on queues in `rx`. Catch up on
+        // what was already waiting (including tuples missed while this was not running).
+        let _ = self.sweep_interrupted();
+        for name in self.space_names() {
+            let _ = self.drain_inbox(&name);
+        }
         std::thread::spawn(move || {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let mut watcher = match notify::recommended_watcher(move |res| {
-                let _ = tx.send(res);
-            }) {
-                Ok(w) => w,
-                Err(_) => return,
-            };
-            if watcher.watch(&root, RecursiveMode::Recursive).is_err() {
-                return;
-            }
-            // `watcher` is held to the end of this scope, keeping the watch alive; the loop
-            // blocks until the process exits.
-            for event in rx.iter().flatten() {
-                if event.kind.is_access() {
-                    continue; // a read doesn't add a tuple
-                }
-                for path in &event.paths {
-                    if let Some((name, id)) = inbox_tuple(&root, path) {
-                        self.process(&name, &id);
+            // Held to the end of this scope, keeping the watch alive; the loop runs until
+            // the process exits.
+            let _watcher = watcher;
+            loop {
+                match rx.recv_timeout(SWEEP_EVERY) {
+                    Ok(Ok(event)) => {
+                        if event.kind.is_access() {
+                            continue; // a read doesn't add a tuple
+                        }
+                        for path in &event.paths {
+                            if let Some((name, id)) = inbox_tuple(&root, path) {
+                                self.process(&name, &id);
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => eprintln!(
+                        "ikigai-intray: watch error under {}: {e}; a drop may have been \
+                         missed (the next sweep catches up)",
+                        root.display()
+                    ),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        for r in self.sweep_interrupted() {
+                            eprintln!(
+                                "ikigai-intray: recovered interrupted tuple {} in space `{}`: \
+                                 {:?}",
+                                r.tuple, r.space, r.outcome
+                            );
+                        }
+                        for name in self.space_names() {
+                            let _ = self.drain_inbox(&name);
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        eprintln!(
+                            "ikigai-intray: the watcher over {} stopped; tuples dropped from \
+                             now on wait for a restart",
+                            root.display()
+                        );
+                        return;
                     }
                 }
             }
         });
+        Ok(())
     }
 }
+
+/// How long a live reactor's watch loop waits without an event before it re-runs recovery
+/// and the catch-up (see [`SpaceReactor::try_watch`]).
+pub const SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// One reactive space's dead letters: what [`dead_letters`] reports per space.
 #[derive(Debug, Clone, PartialEq, Eq)]
