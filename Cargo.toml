@@ -108,6 +108,22 @@ members = ["crates/*"]
 #   file.
 # - ikigai-intray: `dead_letters_of(root, spaces)` (additive): the dead-letter report for the
 #   spaces a host names, for a host that decides reactivity itself.
+# - ⚠ ikigai-intray: `retry=` needs `urn:cap:space:retry` (new `CAP_RETRY`) beside
+#   `urn:cap:space:out` (ledger #887 item 4). It needed only `out`, the authority a stranger
+#   drops under, so anyone who could drop could re-arm a dead letter the reactor parked ON
+#   PURPOSE: an interrupted pass the default policy refused to run twice (a booking whose mail may
+#   have gone), or a handler the host refused. Reproduced on 0.1.41 (an `out`-only `retry`
+#   succeeded). Checked before the tree is read, so a denied caller learns nothing about which
+#   ids are dead letters. The Sink's declared `requires` stays `out` (a plain drop must not need
+#   the new scope; core has no per-input `requires`), so the `retry` input's summary names it.
+#   Operator-visible: a non-root caller that used `retry=` now needs the grant; the REPL's root
+#   capability holds it, and no reactive handler does by default.
+# - ikigai-intray: the dead-letter hook runs AFTER the reactor releases its own locks (ledger
+#   #887 item 6). It ran under the pass lock in every `process`, in the periodic recovery sweep,
+#   and inside the startup recovery's `OnceLock` initializer, so a hook that drove the same
+#   reactor (`drain`, `process`, `sweep_interrupted`) deadlocked; all three paths reproduced
+#   (bounded tests, `tests/hook_reentry.rs`). No host's hook did that yet. Hook order and
+#   arguments are unchanged; it still runs synchronously on the settling thread.
 #
 # 0.1.41: THE INTRAY AUDIT FIXES, A QUIC PRINCIPAL THAT SURVIVES NARROWING, AND ikigai-llm 0.13.
 # - ikigai-llm 0.13.0 (ledger #884, a MINOR: llm.json entries and requests 0.12 accepted are now
