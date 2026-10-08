@@ -111,6 +111,18 @@ members = ["crates/*"]
 #   tuples is refused. And every selector (`tuple=`, `match=`, `state=`, `retry=`) that is present
 #   but not UTF-8 is a typed `InvalidArgument` rather than read as absent: a non-UTF-8 `tuple=` on
 #   take was likewise a pop, and a non-UTF-8 `state=` silently read the inbox.
+# - ikigai-intray: one staging file per writer, and no reader trusts a tuple it has not hashed
+#   (ledger #877). Every drop of a tuple staged through `.dropping/<id>.tuple` and every take
+#   through `.taking/<id>.tuple`, so identical concurrent drops failed spuriously and could
+#   publish a TORN tuple (a later O_TRUNC write into the inode being renamed), and a take that won
+#   its claim could fail its read and lose the tuple. Staging names are now unique per writer
+#   (`<id>.<millis>.<pid>.<n>.drop|claim`); rd, match, take and the reactor check the blake3 id
+#   before trusting bytes, and a file that fails it is dead-lettered into `error/` with a
+#   `corrupt:` note (rd by id refuses it and leaves it). A take whose read fails puts the tuple
+#   back. A claim abandoned in `.taking/` for 5 minutes (a taker that died mid-take) goes back to
+#   the inbox at the space's next rd or take; before, nothing showed or recovered it.
+#   Operator-visible: `.dropping/` and `.taking/` file names change shape; a tuple placed in an
+#   inbox by hand under a name that is not its blake3 hash is now dead-lettered, not delivered.
 # 0.1.40: SECURITY FLOORS FROM AUDIT ROUND 3, A RESOLVER THAT FAILS CLOSED, AND A PASSKEY STORE
 # ONLY ITS OWNER COULD HAVE WRITTEN.
 # - Security floors (PR #408): ikigai-fs 0.1.8 (the jail authorizes the file it opens: no

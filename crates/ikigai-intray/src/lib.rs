@@ -136,11 +136,22 @@ impl SpaceEndpoint {
         ids
     }
 
-    /// Atomically claim a tuple by id: rename it out of the inbox into a private staging
-    /// dir, read it, and remove it. **This is the compare-and-swap the whole tier turns on.**
-    /// `rename` is atomic on POSIX, so if two takers race the same id exactly one rename
-    /// finds the source present; the loser gets `NotFound` → `Ok(None)` and moves on.
-    fn claim(&self, name: &str, id: &str) -> Result<Option<Vec<u8>>> {
+    /// Atomically claim a tuple by id: rename it out of the inbox into a staging file of
+    /// this taker's OWN, read it, check it, and remove it. **This is the compare-and-swap the
+    /// whole tier turns on.** `rename` is atomic on POSIX, so if two takers race the same id
+    /// exactly one rename finds the source present; the loser gets [`Claim::Gone`].
+    ///
+    /// ★ The staging name is unique per claim ([`staging_name`]). It used to be
+    /// `.taking/<id>.tuple`, shared by every taker of that id, so with an identical re-drop in
+    /// between, a second taker's rename replaced the first one's staged file, the first read
+    /// and removed it, and the second — which had WON its claim — failed its read: a tuple
+    /// consumed and delivered to nobody (audit round 5, 2c, ledger #877).
+    ///
+    /// A claim whose read fails is put back in the inbox (best effort) before the error
+    /// returns, so a failed take is a failed take, never a lost tuple. A claim left behind by
+    /// a taker that died between the rename and the read is requeued by
+    /// [`requeue_stale_claims`](SpaceEndpoint::requeue_stale_claims).
+    fn claim(&self, name: &str, id: &str) -> Result<Claim> {
         if id.is_empty() || id.contains(['/', '\\', '.']) {
             return Err(Error::InvalidArgument {
                 name: "tuple".to_string(),
@@ -148,21 +159,158 @@ impl SpaceEndpoint {
             });
         }
         let src = self.inbox(name).join(format!("{id}.tuple"));
-        let staging = self.root.join(name).join(".taking");
+        let staging = self.root.join(name).join(TAKING_DIR);
         std::fs::create_dir_all(&staging)
             .map_err(|e| Error::Endpoint(format!("space `{name}`: staging: {e}")))?;
-        let staged = staging.join(format!("{id}.tuple"));
+        let staged = staging.join(staging_name(id, "claim"));
         match std::fs::rename(&src, &staged) {
-            Ok(()) => {
-                let bytes = std::fs::read(&staged)
-                    .map_err(|e| Error::Endpoint(format!("space `{name}`: take read: {e}")))?;
-                let _ = std::fs::remove_file(&staged);
-                Ok(Some(bytes))
-            }
+            Ok(()) => {}
             // The source is gone — someone else claimed it first (or it never existed).
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(Error::Endpoint(format!("space `{name}`: take: {e}"))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Claim::Gone),
+            Err(e) => return Err(Error::Endpoint(format!("space `{name}`: take: {e}"))),
         }
+        let bytes = match std::fs::read(&staged) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let _ = std::fs::rename(&staged, &src);
+                return Err(Error::Endpoint(format!("space `{name}`: take read: {e}")));
+            }
+        };
+        if !hashes_to(&bytes, id) {
+            let why = quarantine(&self.root.join(name), id, &staged);
+            return Ok(Claim::Corrupt(why));
+        }
+        let _ = std::fs::remove_file(&staged);
+        Ok(Claim::Taken(bytes))
+    }
+
+    /// Put back every claim in a space's `.taking/` that is older than [`STALE_CLAIM`]: a
+    /// taker died between its rename and its read, and the tuple was never delivered, so it
+    /// goes back to the inbox (Hermes audit, ledger #877: such a tuple was invisible to every
+    /// `rd state=` and no recovery looked at `.taking/`). Run at the start of every rd and
+    /// take in the space. A live take holds its claim for one read, so the age bound only
+    /// has to exceed that by a wide margin.
+    fn requeue_stale_claims(&self, name: &str) {
+        let staging = self.root.join(name).join(TAKING_DIR);
+        let Ok(entries) = std::fs::read_dir(&staging) else {
+            return; // nothing has ever been taken here
+        };
+        let now = wall_clock();
+        for entry in entries.filter_map(|e| e.ok()) {
+            let Some(file) = entry.file_name().to_str().map(String::from) else {
+                continue;
+            };
+            let Some((id, claimed_at)) = parse_staging_name(&file, "claim").or_else(|| {
+                // A claim from before unique staging names (`<id>.tuple`): no claim time in
+                // the name, and its mtime is the DROP time (rename keeps it), so it is judged
+                // by that, which is never younger than the claim.
+                let id = file.strip_suffix(".tuple")?;
+                let at = entry.metadata().and_then(|m| m.modified()).ok()?;
+                Some((id.to_string(), at))
+            }) else {
+                continue;
+            };
+            if now.duration_since(claimed_at).unwrap_or_default() < STALE_CLAIM {
+                continue;
+            }
+            let inbox = self.inbox(name);
+            let _ = std::fs::create_dir_all(&inbox);
+            let _ = std::fs::rename(entry.path(), inbox.join(format!("{id}.tuple")));
+        }
+    }
+}
+
+/// Where a take stages the tuple it claimed: `<root>/<space>/.taking/`.
+const TAKING_DIR: &str = ".taking";
+
+/// How old a claim in [`TAKING_DIR`] must be before it counts as abandoned. A live take holds
+/// its claim for one file read; five minutes is several orders of magnitude past that.
+const STALE_CLAIM: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// What a take's claim found.
+enum Claim {
+    /// The tuple, now removed from the space.
+    Taken(Vec<u8>),
+    /// Not in the inbox: another taker won it, or it was never there.
+    Gone,
+    /// Its bytes do not hash to its id, so it was moved to `error/` (the reason says where)
+    /// rather than delivered.
+    Corrupt(String),
+}
+
+/// A staging file name no other writer can produce: `<id>.<millis>.<pid>.<n>.<suffix>`, where
+/// `millis` is when it was made, `pid` this process and `n` a per-process counter. Two writers
+/// of the same id — two identical drops, two takers — therefore never share an inode, and a
+/// stale claim can be judged by the time in its own name.
+///
+/// ★ This replaced `<id>.tuple` for both drops and takes. Shared, an identical concurrent drop
+/// re-truncated (`fs::write` is O_TRUNC) the very inode another drop was renaming into the
+/// inbox, so a reader could see a tuple whose bytes did not hash to its id, and the losing
+/// drops failed their rename (audit round 5, ledger #877).
+fn staging_name(id: &str, suffix: &str) -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let millis = wall_clock()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("{id}.{millis}.{}.{n}.{suffix}", std::process::id())
+}
+
+/// The filesystem's notion of now, for staging names and their age. Not the kernel's injected
+/// `Clock`: a claim's age is compared with the same machine's file times and has to survive a
+/// process restart, so it is wall time by definition.
+#[allow(clippy::disallowed_methods)] // native-only crate (notify, std::fs); never built for wasm
+fn wall_clock() -> std::time::SystemTime {
+    std::time::SystemTime::now()
+}
+
+/// The id and creation time of a name [`staging_name`] made, or `None` for any other name.
+fn parse_staging_name(file: &str, suffix: &str) -> Option<(String, std::time::SystemTime)> {
+    let stem = file.strip_suffix(suffix)?.strip_suffix('.')?;
+    let mut parts = stem.split('.');
+    let (id, millis) = (parts.next()?, parts.next()?.parse::<u64>().ok()?);
+    let (_pid, _n) = (parts.next()?, parts.next()?);
+    if parts.next().is_some() || id.is_empty() {
+        return None;
+    }
+    Some((
+        id.to_string(),
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis),
+    ))
+}
+
+/// Do these bytes hash to this tuple id? Every reader checks before it trusts a tuple: the id
+/// IS the content hash, so a mismatch means the file is not the tuple it claims to be (torn,
+/// truncated, or written by something other than this crate).
+fn hashes_to(bytes: &[u8], id: &str) -> bool {
+    blake3::hash(bytes).to_hex().as_str() == id
+}
+
+/// The note a tuple that fails [`hashes_to`] is dead-lettered with.
+fn corrupt_note(id: &str) -> String {
+    format!(
+        "corrupt: this file's content does not hash to its id `{id}`, so it is not the tuple \
+         that was dropped (torn, truncated, or written outside the space) and was not delivered"
+    )
+}
+
+/// Move a claimed file that failed [`hashes_to`] into the space's `error/` stage beside a
+/// note saying why, and return a reason naming where it went (or why it could not).
+fn quarantine(space_dir: &Path, id: &str, claimed: &Path) -> String {
+    let error = space_dir.join("error");
+    let moved = std::fs::create_dir_all(&error)
+        .and_then(|()| std::fs::rename(claimed, error.join(format!("{id}.tuple"))));
+    match moved {
+        Ok(()) => {
+            let _ = std::fs::write(error.join(format!("{id}.err")), corrupt_note(id));
+            format!("tuple `{id}` does not hash to its id; it was moved to `error/`")
+        }
+        Err(e) => format!(
+            "tuple `{id}` does not hash to its id, and moving it to `error/` failed: {e} \
+             (it is at {})",
+            claimed.display()
+        ),
     }
 }
 
@@ -462,15 +610,25 @@ impl Endpoint for SpaceEndpoint {
                     .map_err(|e| Error::Endpoint(format!("space `{name}`: create inbox: {e}")))?;
                 // Atomic appearance: write to a staging file, then rename it into the inbox.
                 // rename is atomic on POSIX, so a reactor's watcher never observes a
-                // half-written tuple — it sees the whole tuple or nothing.
+                // half-written tuple — it sees the whole tuple or nothing. The staging file is
+                // this drop's OWN ([`staging_name`]): two identical drops at once each write
+                // their own inode, and the second rename replaces the first with identical
+                // bytes, so both succeed and no reader sees a torn tuple (ledger #877).
                 let staging = self.root.join(name).join(".dropping");
                 std::fs::create_dir_all(&staging)
                     .map_err(|e| Error::Endpoint(format!("space `{name}`: staging: {e}")))?;
-                let tmp = staging.join(format!("{id}.tuple"));
-                std::fs::write(&tmp, content)
-                    .map_err(|e| Error::Endpoint(format!("space `{name}`: out: {e}")))?;
-                std::fs::rename(&tmp, inbox.join(format!("{id}.tuple")))
-                    .map_err(|e| Error::Endpoint(format!("space `{name}`: out publish: {e}")))?;
+                let tmp = staging.join(staging_name(&id, "drop"));
+                let published = std::fs::write(&tmp, content)
+                    .map_err(|e| Error::Endpoint(format!("space `{name}`: out: {e}")))
+                    .and_then(|()| {
+                        std::fs::rename(&tmp, inbox.join(format!("{id}.tuple"))).map_err(|e| {
+                            Error::Endpoint(format!("space `{name}`: out publish: {e}"))
+                        })
+                    });
+                if published.is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+                published?;
                 Ok(Representation::new(
                     ReprType::new("text/plain").with_param("charset", "utf-8"),
                     id.into_bytes(),
@@ -482,6 +640,7 @@ impl Endpoint for SpaceEndpoint {
                 if !inv.capability.allows(CAP_READ) {
                     return Err(Error::Denied(format!("reading a space needs `{CAP_READ}`")));
                 }
+                self.requeue_stale_claims(name);
                 // `state=` selects which stage of the machine to read: the live `inbox`
                 // (default), or the reactor's `outbox` (handled) / `error` (dead-letter).
                 let dir = self.state_dir(name, opt_str(inv, "state")?.unwrap_or("inbox"))?;
@@ -495,6 +654,14 @@ impl Endpoint for SpaceEndpoint {
                     let bytes = std::fs::read(dir.join(format!("{id}.tuple"))).map_err(|_| {
                         Error::NotFound(format!("no tuple `{id}` in space `{name}`"))
                     })?;
+                    if !hashes_to(&bytes, id) {
+                        // rd is non-destructive (and holds only read), so it reports the file
+                        // rather than moving it; a take or a reactor pass dead-letters it.
+                        return Err(Error::Endpoint(format!(
+                            "space `{name}`: {}",
+                            corrupt_note(id)
+                        )));
+                    }
                     Ok(Representation::new(
                         ReprType::new("application/octet-stream"),
                         bytes,
@@ -505,7 +672,8 @@ impl Endpoint for SpaceEndpoint {
                     let mut hits = Vec::new();
                     for id in Self::list_ids(&dir) {
                         if let Ok(bytes) = std::fs::read(dir.join(format!("{id}.tuple"))) {
-                            if tuple_matches(&template, &bytes)? {
+                            // A file that is not the tuple its name says never matches.
+                            if hashes_to(&bytes, &id) && tuple_matches(&template, &bytes)? {
                                 hits.push(id);
                             }
                         }
@@ -529,16 +697,20 @@ impl Endpoint for SpaceEndpoint {
                         "taking from a space needs `{CAP_TAKE}`"
                     )));
                 }
+                self.requeue_stale_claims(name);
                 // A specific tuple by id: claim it, or NotFound if already taken/absent.
                 if let Some(id) = take_id(inv)? {
                     return match self.claim(name, id)? {
-                        Some(bytes) => Ok(Representation::new(
+                        Claim::Taken(bytes) => Ok(Representation::new(
                             ReprType::new("application/octet-stream"),
                             bytes,
                         )),
-                        None => Err(Error::NotFound(format!(
+                        Claim::Gone => Err(Error::NotFound(format!(
                             "no tuple `{id}` to take in space `{name}`"
                         ))),
+                        Claim::Corrupt(why) => {
+                            Err(Error::Endpoint(format!("space `{name}`: {why}")))
+                        }
                     };
                 }
                 // Otherwise take the first tuple matching the template (or any). We scan
@@ -553,7 +725,8 @@ impl Endpoint for SpaceEndpoint {
                             Err(_) => continue, // vanished between listing and read
                         }
                     }
-                    if let Some(bytes) = self.claim(name, &id)? {
+                    // Lost the race, or a file that is not its tuple (now in `error/`): next.
+                    if let Claim::Taken(bytes) = self.claim(name, &id)? {
                         return Ok(Representation::new(
                             ReprType::new("application/octet-stream"),
                             bytes,
@@ -1099,7 +1272,9 @@ impl SpaceReactor {
             Err(e) => return Outcome::Errored(e),
         };
         let bytes = match std::fs::read(&claimed) {
-            Ok(b) => b,
+            Ok(b) if hashes_to(&b, id) => b,
+            // Never fire a handler on bytes that are not the tuple that was dropped.
+            Ok(_) => return self.settle(name, id, &claimed, Err(corrupt_note(id))),
             Err(e) => return self.settle(name, id, &claimed, Err(format!("read tuple: {e}"))),
         };
         // Fire the handler under the reactor's OWN authority, passing the tuple as content
