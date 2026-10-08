@@ -9,7 +9,8 @@
 //! - **`rd`** — **Source** the space: list the tuple ids, read one with `tuple=<id>`, or
 //!   list the ids of tuples matching a `match=<ASK>` template. Non-destructive.
 //! - **`take`** — **Delete** a tuple, *returning its content*: claim a specific tuple
-//!   (`tuple=<id>`), the first tuple matching a `match=<ASK>` template, or any tuple
+//!   (`tuple=<id>`, or the id as the piped/trailing `content`: `delete urn:space:q <id>`),
+//!   the first tuple matching a `match=<ASK>` template, or any tuple
 //!   (no selector = a work-queue pop). Destructive and **atomic** — a rename-based
 //!   compare-and-swap means two racers never both claim the same tuple.
 //!
@@ -162,6 +163,56 @@ impl SpaceEndpoint {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(Error::Endpoint(format!("space `{name}`: take: {e}"))),
         }
+    }
+}
+
+/// An optional inline string argument: `None` when it is absent, an error when it is present
+/// but unusable (not inline, or not UTF-8).
+///
+/// ⚠ Every selector goes through this rather than `inline_str(..).ok()`, because folding
+/// "present but unreadable" into "absent" changes what a request MEANS: a `tuple=` that is not
+/// UTF-8 read as no `tuple=`, and on take that is the no-selector work-queue pop, so a caller
+/// naming one tuple consumed another; a non-UTF-8 `state=` silently read the inbox (audit
+/// round 5, ledger #877).
+fn opt_str<'a>(inv: &'a Invocation<'_>, name: &str) -> Result<Option<&'a str>> {
+    match inv.inline_str(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(Error::MissingArgument(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The tuple a take names, from `tuple=` or from `content` — or `None` for a take by
+/// `match=` or a work-queue pop.
+///
+/// ★ `content` is read because the engine PUTS the value there: `delete urn:space:q <id>`, and
+/// a value piped into a delete, both arrive as `content` (the field guide's pipeline rule for
+/// Sink and Delete). Before this, take neither declared nor read it, so that request fell
+/// through to the no-selector pop and consumed the FIRST tuple in id order instead of the one
+/// named (audit round 5, ledger #877). An engine `delete` ALWAYS carries `content`, empty when
+/// nothing followed the IRI, so empty (or only whitespace) means "not given", and surrounding
+/// whitespace is trimmed because a piped value keeps its trailing newline. Both forms naming
+/// DIFFERENT tuples is refused rather than resolved by picking one.
+fn take_id<'a>(inv: &'a Invocation<'_>) -> Result<Option<&'a str>> {
+    let named = opt_str(inv, "tuple")?;
+    let piped = match inv.inline_arg("content") {
+        Ok(bytes) => {
+            let text = std::str::from_utf8(bytes).map_err(|_| Error::InvalidArgument {
+                name: "content".to_string(),
+                detail: "a tuple id to take is not valid UTF-8".to_string(),
+            })?;
+            Some(text.trim()).filter(|id| !id.is_empty())
+        }
+        Err(Error::MissingArgument(_)) => None,
+        Err(e) => return Err(e),
+    };
+    match (named, piped) {
+        (Some(a), Some(b)) if a != b => Err(Error::InvalidArgument {
+            name: "content".to_string(),
+            detail: format!("names tuple `{b}` but `tuple=` names `{a}`; give the id once"),
+        }),
+        (Some(id), _) | (None, Some(id)) => Ok(Some(id)),
+        (None, None) => Ok(None),
     }
 }
 
@@ -377,7 +428,7 @@ impl Endpoint for SpaceEndpoint {
                 // lapsed — which says "not now", not "this tuple is poison". Before this,
                 // recovery meant knowing the on-disk layout and doing it by hand with `mv`,
                 // which is not something a system should ask of the person it just failed.
-                if let Ok(id) = inv.inline_str("retry") {
+                if let Some(id) = opt_str(inv, "retry")? {
                     if id.is_empty() || id.contains(['/', '\\', '.']) {
                         return Err(Error::InvalidArgument {
                             name: "retry".to_string(),
@@ -433,8 +484,8 @@ impl Endpoint for SpaceEndpoint {
                 }
                 // `state=` selects which stage of the machine to read: the live `inbox`
                 // (default), or the reactor's `outbox` (handled) / `error` (dead-letter).
-                let dir = self.state_dir(name, inv.inline_str("state").unwrap_or("inbox"))?;
-                if let Ok(id) = inv.inline_str("tuple") {
+                let dir = self.state_dir(name, opt_str(inv, "state")?.unwrap_or("inbox"))?;
+                if let Some(id) = opt_str(inv, "tuple")? {
                     if id.is_empty() || id.contains(['/', '\\', '.']) {
                         return Err(Error::InvalidArgument {
                             name: "tuple".to_string(),
@@ -448,7 +499,7 @@ impl Endpoint for SpaceEndpoint {
                         ReprType::new("application/octet-stream"),
                         bytes,
                     ))
-                } else if let Ok(query) = inv.inline_str("match") {
+                } else if let Some(query) = opt_str(inv, "match")? {
                     // Associative rd: the ids of tuples whose graph satisfies the ASK.
                     let template = parse_match(query)?;
                     let mut hits = Vec::new();
@@ -479,7 +530,7 @@ impl Endpoint for SpaceEndpoint {
                     )));
                 }
                 // A specific tuple by id: claim it, or NotFound if already taken/absent.
-                if let Ok(id) = inv.inline_str("tuple") {
+                if let Some(id) = take_id(inv)? {
                     return match self.claim(name, id)? {
                         Some(bytes) => Ok(Representation::new(
                             ReprType::new("application/octet-stream"),
@@ -493,7 +544,7 @@ impl Endpoint for SpaceEndpoint {
                 // Otherwise take the first tuple matching the template (or any). We scan
                 // deterministically and claim the first that both matches and we win the
                 // race for; a lost claim just moves to the next candidate.
-                let matcher = inv.inline_str("match").ok().map(parse_match).transpose()?;
+                let matcher = opt_str(inv, "match")?.map(parse_match).transpose()?;
                 for id in Self::list_ids(&inbox) {
                     if let Some(template) = &matcher {
                         match std::fs::read(inbox.join(format!("{id}.tuple"))) {
@@ -618,6 +669,19 @@ impl Endpoint for SpaceEndpoint {
                             .optional()
                             .class(XSD_STRING)
                             .summary("a SPARQL ASK (no `SERVICE`); take the first tuple whose graph satisfies it"),
+                    )
+                    // Declared because a mutating verb's piped or trailing value lands in
+                    // `content` BY CONTRACT (`delete urn:space:q <id>`), and take reads it as
+                    // the id to take. Undeclared, the id was ignored and the request popped the
+                    // first tuple instead (ledger #877).
+                    .input(
+                        ArgSpec::new("content")
+                            .optional()
+                            .class(XSD_STRING)
+                            .summary(
+                                "the tuple id to take, as the piped or trailing value (the same \
+                                 as `tuple=`; empty = not given)",
+                            ),
                     )
                     // The taken tuple itself, uninterpreted.
                     .output("application/octet-stream")

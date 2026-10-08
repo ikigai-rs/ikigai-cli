@@ -103,6 +103,14 @@ members = ["crates/*"]
 #   service handler that refuses every call whatever features the build has. A `match=` is also
 #   no longer executed once against an empty store to check its shape; the shape is read off
 #   the parse. Operator-visible: a template that used `SERVICE` (none is known) now fails.
+# - ikigai-intray: `delete urn:space:q <id>` takes THAT tuple (ledger #877). The engine puts a
+#   delete's trailing or piped value in `content`, which take neither declared nor read, so the
+#   request fell through to the work-queue pop and consumed the first tuple in id order instead.
+#   Take now declares `content` and reads it as the id (trimmed; empty = not given, since the
+#   engine sends an empty `content` on every bare delete); `tuple=` and `content` naming different
+#   tuples is refused. And every selector (`tuple=`, `match=`, `state=`, `retry=`) that is present
+#   but not UTF-8 is a typed `InvalidArgument` rather than read as absent: a non-UTF-8 `tuple=` on
+#   take was likewise a pop, and a non-UTF-8 `state=` silently read the inbox.
 # 0.1.40: SECURITY FLOORS FROM AUDIT ROUND 3, A RESOLVER THAT FAILS CLOSED, AND A PASSKEY STORE
 # ONLY ITS OWNER COULD HAVE WRITTEN.
 # - Security floors (PR #408): ikigai-fs 0.1.8 (the jail authorizes the file it opens: no
