@@ -191,6 +191,12 @@ members = ["crates/*"]
 #   so a tenant grant of the workspace minus a directory, narrowed by a delegate or clamped by a
 #   carried capability at the QUIC door, read the excluded directory.
 #   `a_localized_tenant_deny_survives_attenuate_and_clamp` (ikigai-embedded) is red on 0.1.85.
+# - ikigai-embedded: a NEW workspace is created 0700 (ledger #868). `file_root()` used
+#   `create_dir_all`, which follows the umask, so a fresh install under `umask 002` got a 0775
+#   `~/.ikigai/workspace` (or `$IKIGAI_FILES`) and the passkey directory check (ledger #850) refused
+#   it at `serve --http` startup. The leaf is now created with mode 0700 and set to exactly that;
+#   an EXISTING directory is untouched (the #850 check judges it and names the fix). Missing
+#   parents still follow the umask. Operator-visible: only on a first run.
 # 0.1.40: SECURITY FLOORS FROM AUDIT ROUND 3, A RESOLVER THAT FAILS CLOSED, AND A PASSKEY STORE
 # ONLY ITS OWNER COULD HAVE WRITTEN.
 # - Security floors (PR #408): ikigai-fs 0.1.8 (the jail authorizes the file it opens: no

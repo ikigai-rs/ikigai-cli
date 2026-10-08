@@ -822,7 +822,7 @@ fn base_space(nature: &'static str) -> EndpointSpace {
 }
 
 /// The directory the local file module is jailed to: `$IKIGAI_FILES`, else
-/// `$HOME/.ikigai/workspace`. Created if missing.
+/// `$HOME/.ikigai/workspace`. Created `0700` if missing (see `create_workspace`).
 ///
 /// Deliberately a dedicated, ikigai-owned sandbox — *not* the user's home or
 /// documents — so the owner's root capability grants files only within this tree.
@@ -842,7 +842,7 @@ fn base_space(nature: &'static str) -> EndpointSpace {
 /// here rather than in each test because the call sites are what make it invisible.
 pub fn file_root() -> PathBuf {
     if let Some(root) = FILE_ROOT_OVERRIDE.lock().expect("file root lock").clone() {
-        let _ = std::fs::create_dir_all(&root);
+        create_workspace(&root);
         return root;
     }
     #[cfg(test)]
@@ -854,8 +854,38 @@ pub fn file_root() -> PathBuf {
             let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
             home.join(".ikigai").join("workspace")
         });
-    let _ = std::fs::create_dir_all(&root);
+    create_workspace(&root);
     root
+}
+
+/// Create the workspace directory PRIVATE (`0700`) if it does not exist yet, whatever the
+/// umask (ledger #868).
+///
+/// `create_dir_all` follows the umask, so under `umask 002` a new install got a `0775`
+/// workspace, and the passkey store's directory check (`judge_directory`, ledger #850)
+/// refused it at `serve --http` startup. The leaf is created with mode `0700` and then
+/// set to exactly that, since a umask can also strip owner bits. An EXISTING directory is
+/// left as it is: it is the operator's, and the passkey check judges it (and says how to
+/// fix it) rather than this function rewriting it silently. Missing parents are created
+/// as before, following the umask. Errors are ignored here as they always were: the
+/// endpoints that use the root report a missing or unusable directory themselves.
+fn create_workspace(root: &std::path::Path) {
+    if let Some(parent) = root.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        // Non-recursive on purpose: `Ok` means THIS call created the leaf, so the
+        // tightening below can never reach a directory someone else made.
+        if std::fs::DirBuilder::new().mode(0o700).create(root).is_ok() {
+            let _ = std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::create_dir(root);
+    }
 }
 
 static FILE_ROOT_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
