@@ -185,6 +185,12 @@ members = ["crates/*"]
 #   argument stays optional, as the contract declares). Surveyed: the optional bindings in the
 #   ecosystem are ledger `{ledger}` (default `default`), browse annotation `{id}` (bare = mint),
 #   a11y `{app}` and browse `{path}` (a concrete row or the bare spelling serves the omission).
+# - ikigai-core 0.1.86 (ledger #874, the cli part of ledger #858): the workspace pin rises to
+#   "0.1.86" as a SAFETY floor, and the lock moves 0.1.85 -> 0.1.86 (one package; the other 47
+#   lock edges are the same core pointer). Through 0.1.85 `attenuate`/`clamp` dropped a deny scope,
+#   so a tenant grant of the workspace minus a directory, narrowed by a delegate or clamped by a
+#   carried capability at the QUIC door, read the excluded directory.
+#   `a_localized_tenant_deny_survives_attenuate_and_clamp` (ikigai-embedded) is red on 0.1.85.
 # 0.1.40: SECURITY FLOORS FROM AUDIT ROUND 3, A RESOLVER THAT FAILS CLOSED, AND A PASSKEY STORE
 # ONLY ITS OWNER COULD HAVE WRITTEN.
 # - Security floors (PR #408): ikigai-fs 0.1.8 (the jail authorizes the file it opens: no
@@ -290,8 +296,18 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 [workspace.dependencies]
 # The released kernel, consumed from crates.io. For local cross-repo development
 # against a sibling checkout, use .cargo/config.toml (see .cargo/config.toml.example).
-ikigai-core = "0.1.85" # 0.1.85 = THE CAPABILITY FLOOR COVERS EVERY VERB (ledger #750, A2/A3), a
-# BEHAVIORAL floor and the reason for the pin: through 0.1.84 a verb an endpoint did not declare
+ikigai-core = "0.1.86" # 0.1.86 = EXCLUSIONS ARE STICKY (ledger #858, #874), a SAFETY floor and
+# the reason for the pin: through 0.1.85 `attenuate` and `clamp` intersected a deny-shaped scope
+# (`urn:cap:fs:read:-<path>`) like a grant, so narrowing a capability DROPPED the exclusion and
+# widened what it reached. A tenant grant of the workspace minus `other`, narrowed to the allow
+# (a delegate) or clamped by a carried allow (the QUIC door), read `other`. 0.1.86 keeps every
+# exclusion either side holds; `ikigai-embedded`'s
+# `a_localized_tenant_deny_survives_attenuate_and_clamp` pins it and is red below 0.1.86. No API
+# this workspace uses changed shape (`is_deny_scope` is new; nothing here names a scope with a
+# leading `-` in the reserved positions except the tenant fs deny rules, which are meant to be
+# exclusions). ⚠ `^0.1.86` is also a ceiling below 0.2.0.
+# 0.1.85 = THE CAPABILITY FLOOR COVERS EVERY VERB (ledger #750, A2/A3), a
+# BEHAVIORAL floor: through 0.1.84 a verb an endpoint did not declare
 # skipped the floor, and a dozen of this host's own endpoints run the same code whatever verb
 # arrives. Most also check their own capability inside `invoke`; the `urn:time:*` trio does not,
 # so under a narrowed capability a `Delete` on the Source-only `urn:time:schedule` registered a
