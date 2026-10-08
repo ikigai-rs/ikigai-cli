@@ -220,6 +220,43 @@ fn pattern_vars(pattern: &str) -> BTreeSet<String> {
     vars
 }
 
+/// `target` with the template variable `{var}` removed together with ONE adjacent `:`
+/// separator, or `None` when that is not a spelling the URN grammar can mean.
+///
+/// This is the bare-form convention two modules bind by (ledger #886): `ikigai-ledger`'s
+/// `urn:iki:ledger:{ledger}:append` is also `urn:iki:ledger:append` (the `default` ledger),
+/// and `ikigai-browse`'s `urn:iki:annotation:{id}` is also `urn:iki:annotation` (Sink mints
+/// an id). Only a variable that is a WHOLE `:`-delimited segment, appearing once, can go;
+/// one inside a segment (`urn:demo:echo/{message}`, `urn:x:pre{v}`) cannot. The caller must
+/// still check that the shorter IRI reaches the same endpoint, since a grammar that does
+/// not match the bare spelling leaves it free for another binding.
+///
+/// ```text
+/// urn:iki:ledger:{ledger}:append  →  urn:iki:ledger:append
+/// urn:iki:annotation:{id}         →  urn:iki:annotation
+/// urn:demo:echo/{message}         →  (none)
+/// ```
+pub(crate) fn drop_segment(target: &str, var: &str) -> Option<String> {
+    let token = format!("{{{var}}}");
+    if target.matches(&token).count() != 1 {
+        return None;
+    }
+    let at = target.find(&token)?;
+    let after = at + token.len();
+    if !target[..at].ends_with(':') {
+        return None;
+    }
+    if after == target.len() {
+        // The last segment: drop it and the separator before it.
+        return Some(target[..at - 1].to_string());
+    }
+    if target[after..].starts_with(':') {
+        // A middle segment: drop it and the separator after it.
+        return Some(format!("{}{}", &target[..at], &target[after + 1..]));
+    }
+    None
+}
+
 /// One collapsed literal dimension of a subgroup: its patterns agree on every
 /// `:`-separated segment except one, and that segment is a literal in each row
 /// (`urn:repo:ikigai-cli:tree` / `urn:repo:ikigai-browse:tree`). The argument
@@ -429,7 +466,8 @@ impl GroupShape {
         // Prefer a fully-answered shape (every variable supplied), the most
         // specific on a tie; otherwise the first candidate in selection order
         // (its unanswered variables are optional bindings the endpoint mints —
-        // the annotation Sink's `{id}` — so partial substitution stands).
+        // the annotation Sink's `{id}` — so partial substitution stands here, and the
+        // caller fills or drops each one from the contract before issuing: ledger #886).
         let mut full: Vec<&Subgroup> = candidates
             .iter()
             .copied()
@@ -980,6 +1018,32 @@ mod tests {
             shape.route("annotation__sink", &BTreeSet::new(), &Map::new()),
             Ok("urn:iki:annotation:{id}")
         );
+    }
+
+    #[test]
+    fn only_a_whole_segment_variable_can_be_dropped() {
+        assert_eq!(
+            drop_segment("urn:iki:ledger:{ledger}:append", "ledger").as_deref(),
+            Some("urn:iki:ledger:append")
+        );
+        assert_eq!(
+            drop_segment("urn:iki:annotation:{id}", "id").as_deref(),
+            Some("urn:iki:annotation")
+        );
+        assert_eq!(
+            drop_segment("urn:iki:ledger:{ledger}:item:{id}", "ledger").as_deref(),
+            Some("urn:iki:ledger:item:{id}")
+        );
+        for (pattern, var) in [
+            ("urn:demo:echo/{message}", "message"),
+            ("urn:x:pre{v}", "v"),
+            ("urn:x:{v}suffix", "v"),
+            ("{v}:x", "v"),
+            ("urn:x:{v}:{v}", "v"),
+            ("urn:x:{w}", "v"),
+        ] {
+            assert_eq!(drop_segment(pattern, var), None, "{pattern}");
+        }
     }
 
     #[test]

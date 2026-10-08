@@ -319,10 +319,53 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
         return tool_error(format!("arguments failed validation:\n{report}"));
     }
 
+    // An OMITTED optional binding leaves its `{var}` in the row's pattern, and the literal
+    // template is no IRI (ledger #886: `urn:iki:ledger:{ledger}:append` reached Hermes as "not
+    // a valid IRI"). The contract says what omission means: a declared default is filled in;
+    // without one, the variable's whole `:`-segment is dropped (the bare spelling a
+    // ledger or an annotation binds by), and the shorter IRI must still reach THIS endpoint;
+    // anything else is refused by name rather than issued.
+    let pattern = target.clone();
+    let mut dropped: Vec<&str> = Vec::new();
+    for input in &action.inputs {
+        let token = format!("{{{}}}", input.name);
+        if input.source != ikigai_core::InputSource::Binding || !target.contains(&token) {
+            continue;
+        }
+        if let Some(default) = &input.default {
+            target = target.replace(&token, default);
+        } else if let Some(shorter) = crate::drop_segment(&target, &input.name) {
+            target = shorter;
+            dropped.push(&input.name);
+        } else {
+            return tool_error(format!(
+                "`{}` was omitted, and `{pattern}` has no spelling without it: give `{}`",
+                input.name, input.name
+            ));
+        }
+    }
+
     // Invoke.
     let Ok(target_iri) = Iri::parse(&target) else {
         return tool_error(format!("target `{target}` is not a valid IRI"));
     };
+    if !dropped.is_empty() {
+        let reached = kernel.describe(&target_iri).map(|d| d.id);
+        if reached.as_deref() != Some(description.id.as_str()) {
+            let names = dropped
+                .iter()
+                .map(|n| format!("`{n}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return tool_error(format!(
+                "{names} omitted: without it `{pattern}` becomes `{target}`, which {}; give {names}",
+                match reached {
+                    Some(other) => format!("names a different endpoint (`{other}`)"),
+                    None => "names nothing".to_string(),
+                }
+            ));
+        }
+    }
     let mut request = Request::new(verb, target_iri);
     for (k, v) in req_args {
         request = request.with_arg(k, ArgRef::Inline(v.into_bytes()));
@@ -989,5 +1032,180 @@ mod tests {
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("not in the manifold"), "{text}");
         assert!(!text.contains("capability"), "{text}");
+    }
+
+    // ------------------------------------------------- ledger #886: omitted optional bindings
+
+    /// A grammar for `{prefix}:{var}:{tail}` (or `{prefix}:{var}` when `tail` is empty) that
+    /// ALSO matches the bare spelling with the variable's segment absent, the way
+    /// `ikigai-ledger` (`urn:iki:ledger:append` = the `default` ledger) and `ikigai-browse`
+    /// (`urn:iki:annotation` = mint an id) bind theirs. Advertises the template.
+    struct BareOrNamed {
+        prefix: &'static str,
+        var: &'static str,
+        tail: &'static str,
+        bare_value: Option<&'static str>,
+    }
+
+    impl ikigai_core::Grammar for BareOrNamed {
+        fn match_iri(&self, iri: &Iri) -> Option<ikigai_core::Bindings> {
+            let rest = iri.as_str().strip_prefix(self.prefix)?;
+            let mut bindings = ikigai_core::Bindings::new();
+            let bare = if self.tail.is_empty() {
+                rest.is_empty()
+            } else {
+                rest == format!(":{}", self.tail)
+            };
+            if bare {
+                if let Some(value) = self.bare_value {
+                    bindings.insert(self.var, value);
+                }
+                return Some(bindings);
+            }
+            let rest = rest.strip_prefix(':')?;
+            let value = if self.tail.is_empty() {
+                rest
+            } else {
+                rest.strip_suffix(&format!(":{}", self.tail))?
+            };
+            if value.is_empty() || value.contains(':') {
+                return None;
+            }
+            bindings.insert(self.var, value);
+            Some(bindings)
+        }
+
+        fn pattern(&self) -> String {
+            if self.tail.is_empty() {
+                format!("{}:{{{}}}", self.prefix, self.var)
+            } else {
+                format!("{}:{{{}}}:{}", self.prefix, self.var, self.tail)
+            }
+        }
+    }
+
+    /// An endpoint that answers with its target and the binding `var` it was handed.
+    fn reporting(id: &str, var: &'static str, input: ArgSpec) -> FnEndpoint {
+        FnEndpoint::new(id, move |inv| {
+            let bound = inv.bindings.get(var).unwrap_or("-").to_string();
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("{} {var}={bound}", inv.request.target.as_str()).into_bytes(),
+            ))
+        })
+        .with_description(Description::new(id).verb(Verb::Sink).input(input))
+    }
+
+    fn call_tool(k: &Kernel, name: &str, arguments: serde_json::Value) -> serde_json::Value {
+        handle(
+            k,
+            &Capability::root(),
+            &ToolFilter::default(),
+            &json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params": { "name": name, "arguments": arguments }
+            }),
+        )
+        .unwrap()["result"]
+            .clone()
+    }
+
+    /// ledger #886, the ledger shape: `{ledger}` is an optional binding with a DEFAULT, and
+    /// the projection issued `urn:iki:ledger:{ledger}:append` literally when it was omitted
+    /// ("not a valid IRI"). An omitted binding with a declared default is filled with it.
+    #[test]
+    fn an_omitted_binding_with_a_default_is_filled_with_it() {
+        let ledger = ArgSpec::new("ledger")
+            .binding()
+            .optional()
+            .default_value("default");
+        let append = reporting("ledger-append", "ledger", ledger);
+        let space = EndpointSpace::new().bind(
+            BareOrNamed {
+                prefix: "urn:demo:ledger",
+                var: "ledger",
+                tail: "append",
+                bare_value: Some("default"),
+            },
+            append,
+        );
+        let k = Kernel::new(Arc::new(space));
+        let omitted = call_tool(&k, "ledger-append__sink", json!({}));
+        assert_eq!(omitted["isError"], false, "{omitted}");
+        assert_eq!(
+            omitted["content"][0]["text"],
+            "urn:demo:ledger:default:append ledger=default"
+        );
+        let named = call_tool(&k, "ledger-append__sink", json!({ "ledger": "work" }));
+        assert_eq!(
+            named["content"][0]["text"],
+            "urn:demo:ledger:work:append ledger=work"
+        );
+    }
+
+    /// ledger #886, the annotation shape: `{id}` is optional with NO default, and the bare
+    /// spelling (`urn:iki:annotation`) is what mints one. An omitted binding without a
+    /// default drops its `:`-delimited segment, and the call reaches the same endpoint.
+    #[test]
+    fn an_omitted_binding_without_a_default_drops_its_segment() {
+        let id = ArgSpec::new("id").binding().optional();
+        let note = reporting("note", "id", id);
+        let space = EndpointSpace::new().bind(
+            BareOrNamed {
+                prefix: "urn:demo:note",
+                var: "id",
+                tail: "",
+                bare_value: None,
+            },
+            note,
+        );
+        let k = Kernel::new(Arc::new(space));
+        let omitted = call_tool(&k, "note__sink", json!({}));
+        assert_eq!(omitted["isError"], false, "{omitted}");
+        assert_eq!(omitted["content"][0]["text"], "urn:demo:note id=-");
+        let named = call_tool(&k, "note__sink", json!({ "id": "n1" }));
+        assert_eq!(named["content"][0]["text"], "urn:demo:note:n1 id=n1");
+    }
+
+    /// The guard on dropping a segment: when the shorter IRI belongs to ANOTHER endpoint,
+    /// the call is refused naming the variable, never answered by a resource the caller did
+    /// not name.
+    #[test]
+    fn a_dropped_segment_that_reaches_another_endpoint_is_refused() {
+        let v = ArgSpec::new("v").binding().optional();
+        let named_only = reporting("named-only", "v", v);
+        let other = reporting("other", "v", ArgSpec::new("unused").optional());
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:demo:x"), other)
+            .bind(
+                ikigai_core::UriTemplate::parse("urn:demo:x:{v}").unwrap(),
+                named_only,
+            );
+        let k = Kernel::new(Arc::new(space));
+        let resp = call_tool(&k, "named-only__sink", json!({}));
+        assert_eq!(resp["isError"], true, "{resp}");
+        let text = resp["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("`v`"), "{text}");
+        assert!(
+            !text.contains("v=-"),
+            "never answered by another endpoint: {text}"
+        );
+    }
+
+    /// A variable that is not a whole `:`-segment cannot be dropped: refused by name.
+    #[test]
+    fn an_omitted_binding_inside_a_segment_is_refused_by_name() {
+        let message = ArgSpec::new("message").binding().optional();
+        let echo = reporting("slash-echo", "message", message);
+        let space = EndpointSpace::new().bind(
+            ikigai_core::UriTemplate::parse("urn:demo:echo/{message}").unwrap(),
+            echo,
+        );
+        let k = Kernel::new(Arc::new(space));
+        let resp = call_tool(&k, "slash-echo__sink", json!({}));
+        assert_eq!(resp["isError"], true, "{resp}");
+        let text = resp["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("`message`"), "{text}");
+        assert!(!text.contains("not a valid IRI"), "{text}");
     }
 }
