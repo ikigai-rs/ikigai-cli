@@ -91,6 +91,24 @@ members = ["crates/*"]
 # whose tree version is ahead of crates.io. ⚠ So this comment names NO crate as
 # behind or ahead — that was a snapshot of the registry, true for one afternoon
 # and wrong the next, in the most authoritative place in the tree. Ask the gate.
+# NEXT (unreleased):
+# - ikigai-embedded: the HOST decides what each reactive space fires (ledger #887, the wiring
+#   the 0.1.41 `with_host_handler` seam left open). A space's `handler` file sits in the drop
+#   tree, so whoever could write the workspace chose which bound IRI every tuple fired at, under
+#   the authority the host granted that space; reproduced on 0.1.41 with a real kernel (the
+#   retargeted IRI ran and its answer landed in `outbox/`). The writer now reads
+#   `<config home>/space-handler/<space>` (one IRI; `#` comments allowed), beside
+#   `space-authority/<space>`, per tuple. Host entry present: it fires, and a `handler` file
+#   naming something else is REFUSED (dead-lettered, loud). Host entry invalid (no IRI, several,
+#   not an IRI, unreadable): nothing fires. Host entry absent and a `handler` file present: the
+#   MIGRATION FALLBACK, today's behavior, named at start-up with the exact `cp` that pins it and
+#   logged on the first tuple each such space fires. Operator-visible: new start-up lines
+#   `ikigai: space `<s>`: fires … ABSENT …` / `… REFUSED …`; until a space is pinned its file
+#   still decides. The heartbeat counts a pinned space's dead letters even with no `handler`
+#   file.
+# - ikigai-intray: `dead_letters_of(root, spaces)` (additive): the dead-letter report for the
+#   spaces a host names, for a host that decides reactivity itself.
+#
 # 0.1.41: THE INTRAY AUDIT FIXES, A QUIC PRINCIPAL THAT SURVIVES NARROWING, AND ikigai-llm 0.13.
 # - ikigai-llm 0.13.0 (ledger #884, a MINOR: llm.json entries and requests 0.12 accepted are now
 #   refused, and this host falls back to its built-in registry when llm.json fails to parse, so

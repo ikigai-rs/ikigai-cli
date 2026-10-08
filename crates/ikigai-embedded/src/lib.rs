@@ -3010,7 +3010,13 @@ impl HealthContext {
         HealthContext {
             uptime: process_uptime(),
             sleep_measured: time_registry().measures_sleep(),
-            dead_letters: ikigai_intray::dead_letters(&file_root().join("spaces")),
+            dead_letters: {
+                let root = file_root().join("spaces");
+                ikigai_intray::dead_letters_of(
+                    &root,
+                    reported_spaces(&root, space_handler_dir().as_deref()),
+                )
+            },
             wall: dead_letter_wall_clock(),
         }
     }
@@ -4802,13 +4808,21 @@ fn build_watched(mounts: Vec<MountSpec>, reactive: bool) -> Arc<Kernel> {
         let reactor = space_reactor(
             file_root().join("spaces"),
             Arc::clone(&kernel) as Arc<dyn ikigai_resolve::Resolver>,
-            authority_dir.clone(),
+            config::config_home(),
         );
         for line in inert_cap_file_lines(
             &reactor,
             &file_root().join("spaces"),
             authority_dir.as_deref(),
         ) {
+            eprintln!("{} {line}", stamp());
+        }
+        // What each space fires, wherever it is not yet the host's decision alone: a space
+        // still firing its drop-tree `handler` file (with the exact command that pins it), a
+        // host entry the file disagrees with, and a host entry that names no usable handler
+        // (ledger #887). The hub migrates live machines from these lines.
+        for line in space_handler_lines(&file_root().join("spaces"), space_handler_dir().as_deref())
+        {
             eprintln!("{} {line}", stamp());
         }
         // A tuple a stopped writer left mid-pass is dead-lettered by the first drain, and the
@@ -4894,6 +4908,219 @@ fn space_authority_dir() -> Option<PathBuf> {
 /// The directory name under the config home that holds per-space handler authority.
 const SPACE_AUTHORITY_DIR: &str = "space-authority";
 
+/// Where the host keeps each reactive space's handler TARGET, beside the authority it runs
+/// under: `<config home>/space-handler/`, one file per space, named for the space, holding the
+/// one IRI that space's tuples fire at (ledger #887).
+///
+/// ★ Same reason as [`space_authority_dir`]: the space's own `handler` file sits beside the
+/// `inbox` a dropper writes into, so anyone who can write the workspace could point every tuple
+/// at any bound IRI, under the authority the host granted that space. The config home is the
+/// operator's. See [`decide_space_handler`] for the whole rule.
+fn space_handler_dir() -> Option<PathBuf> {
+    config::config_home().map(|home| home.join(SPACE_HANDLER_DIR))
+}
+
+/// The directory name under the config home that holds per-space handler targets.
+const SPACE_HANDLER_DIR: &str = "space-handler";
+
+/// What the host's `space-handler/<space>` entry says, read FRESH per tuple (an edit takes
+/// effect on the next tuple, like the authority file).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HostHandlerEntry {
+    /// No entry: the host has not decided this space yet (see [`decide_space_handler`]).
+    Absent,
+    /// The entry names exactly this one IRI.
+    Names(String),
+    /// An entry exists and names no usable handler: none, several, one that is not an IRI, or
+    /// a file that cannot be read. Says why.
+    Invalid(String),
+}
+
+/// Read the host's handler entry for `space` under `dir`.
+///
+/// The format is the `handler` file's own (one IRI), plus `#` comment lines and blank lines, so
+/// migrating a space is a copy of its `handler` file. Anything but exactly one IRI is
+/// [`HostHandlerEntry::Invalid`], never [`Absent`](HostHandlerEntry::Absent): an operator who
+/// wrote an entry meant to decide, and falling back to the drop tree on a typo would undo the
+/// pin silently.
+fn host_space_handler(dir: &Path, space: &str) -> HostHandlerEntry {
+    if !is_single_segment(space) {
+        return HostHandlerEntry::Invalid(format!(
+            "`{space}` is not a single path segment, so it has no entry"
+        ));
+    }
+    let path = dir.join(space);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HostHandlerEntry::Absent,
+        Err(e) => return HostHandlerEntry::Invalid(format!("cannot read {}: {e}", path.display())),
+    };
+    let named: Vec<&str> = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    match named.as_slice() {
+        [one] => match Iri::parse(*one) {
+            Ok(_) => HostHandlerEntry::Names((*one).to_string()),
+            Err(e) => HostHandlerEntry::Invalid(format!(
+                "{} names `{one}`, which is not an IRI: {e}",
+                path.display()
+            )),
+        },
+        [] => HostHandlerEntry::Invalid(format!("{} names no handler", path.display())),
+        many => HostHandlerEntry::Invalid(format!(
+            "{} names {} handlers; it must name exactly one",
+            path.display(),
+            many.len()
+        )),
+    }
+}
+
+/// What a space's tuple fires, decided by the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HandlerDecision {
+    /// The host's entry names it (and the `handler` file, if any, agrees).
+    Fire(String),
+    /// MIGRATION: no host entry, so the drop-tree `handler` file still decides — today's
+    /// behavior, said out loud at start-up and on the first tuple (see
+    /// [`space_handler_lines`]).
+    Fallback(String),
+    /// Nothing fires; a tuple is dead-lettered when the space has a `handler` file (the
+    /// reactor's refusal), and left alone when it has none. Says why.
+    Refuse(String),
+    /// Neither a host entry nor a `handler` file: not a reactive space.
+    NotReactive,
+}
+
+/// ★ The rule for what a space fires (ledger #887), given the host's entry and the target the
+/// space's `handler` file names:
+///
+/// | host entry       | `handler` file    | fires                                         |
+/// |------------------|-------------------|-----------------------------------------------|
+/// | names `H`        | absent, or `H`    | `H`                                           |
+/// | names `H`        | names `F` ≠ `H`   | nothing: REFUSED, dead-lettered with a note naming `F` |
+/// | invalid          | any               | nothing (refused when there is a file)        |
+/// | absent           | names `F`         | `F`: the MIGRATION fallback, named at start-up |
+/// | absent           | absent            | nothing: not reactive                         |
+///
+/// A disagreement is refused rather than resolved in the host's favor because a file that no
+/// longer matches its pin means the drop tree was rewritten, or the operator changed one and
+/// not the other — either way somebody should look, and a dead letter is the loud place (the
+/// hook logs it, the heartbeat fails on it, `retry=` re-runs it once the two agree).
+///
+/// The fallback, rather than refusing an unpinned space: the writer runs live booking and
+/// contact spaces off `handler` files, and refusing would dead-letter every booking from the
+/// deploy until someone migrated — ledger #638's eight silent days, made loud but not avoided.
+/// Instead start-up names every unpinned space with the exact command that pins it, and the
+/// first tuple each one fires under the fallback is logged too (a space created after start-up,
+/// or retargeted, is said out loud). ⚠ Until a space is pinned the file still decides, so the
+/// hole stays open on that space; pinning closes it.
+fn decide_space_handler(entry: &HostHandlerEntry, file: Option<&str>) -> HandlerDecision {
+    match (entry, file) {
+        (HostHandlerEntry::Names(host), None) => HandlerDecision::Fire(host.clone()),
+        (HostHandlerEntry::Names(host), Some(file)) if file == host => {
+            HandlerDecision::Fire(host.clone())
+        }
+        (HostHandlerEntry::Names(host), Some(file)) => HandlerDecision::Refuse(format!(
+            "its `handler` file names `{file}` but the host's entry names `{host}`"
+        )),
+        (HostHandlerEntry::Invalid(why), _) => HandlerDecision::Refuse(why.clone()),
+        (HostHandlerEntry::Absent, Some(file)) => HandlerDecision::Fallback(file.to_string()),
+        (HostHandlerEntry::Absent, None) => HandlerDecision::NotReactive,
+    }
+}
+
+/// The host entry for `space`, or [`HostHandlerEntry::Absent`] when there is no config home.
+fn host_handler_entry(handler_dir: Option<&Path>, space: &str) -> HostHandlerEntry {
+    handler_dir.map_or(HostHandlerEntry::Absent, |dir| {
+        host_space_handler(dir, space)
+    })
+}
+
+/// A path quoted for a POSIX shell, so a printed command survives a space in a path.
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+/// The start-up lines for [`decide_space_handler`]: one per space whose target is NOT the
+/// host's decision alone — every space on the migration fallback (with the command that pins
+/// it), every space whose file disagrees with its pin, and every invalid entry. A space the host
+/// has pinned and whose file agrees (or is absent) says nothing. Sorted by space.
+fn space_handler_lines(root: &Path, handler_dir: Option<&Path>) -> Vec<String> {
+    let mut lines = Vec::new();
+    for space in space_dirs(root) {
+        let file_path = root.join(&space).join("handler");
+        let file = read_handler_file(&file_path);
+        let entry = host_handler_entry(handler_dir, &space);
+        match decide_space_handler(&entry, file.as_deref()) {
+            HandlerDecision::Fallback(target) => lines.push(match handler_dir {
+                Some(dir) => format!(
+                    "ikigai: space `{space}`: fires `{target}` from {}, a file in the drop tree \
+                     anyone who can write the workspace can retarget, because the host entry {} \
+                     is ABSENT (the migration fallback, ledger #887). If `{target}` is right, pin \
+                     it: mkdir -p {} && cp {} {}",
+                    file_path.display(),
+                    dir.join(&space).display(),
+                    shell_quote(dir),
+                    shell_quote(&file_path),
+                    shell_quote(&dir.join(&space)),
+                ),
+                None => format!(
+                    "ikigai: space `{space}`: fires `{target}` from {}, a file in the drop tree, \
+                     and there is no config home to hold {SPACE_HANDLER_DIR}/{space} (the \
+                     migration fallback, ledger #887)",
+                    file_path.display()
+                ),
+            }),
+            HandlerDecision::Refuse(why) => lines.push(format!(
+                "ikigai: space `{space}`: REFUSED, nothing fires: {why}; {}",
+                if file.is_some() {
+                    "each tuple is dead-lettered until the host entry and the `handler` file agree"
+                } else {
+                    "its tuples wait in the inbox"
+                }
+            )),
+            HandlerDecision::Fire(_) | HandlerDecision::NotReactive => {}
+        }
+    }
+    lines
+}
+
+/// The space directories under `root`, sorted.
+fn space_dirs(root: &Path) -> Vec<String> {
+    let mut names: Vec<String> = match std::fs::read_dir(root) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().to_str().map(String::from))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    names.sort();
+    names
+}
+
+/// A space's `handler` file's target, read the way the reactor reads it (trimmed; empty = none).
+fn read_handler_file(path: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let uri = raw.trim();
+    (!uri.is_empty()).then(|| uri.to_string())
+}
+
+/// The spaces the heartbeat reports: every space with a `handler` file (as
+/// [`ikigai_intray::dead_letters`] counts them) AND every space the host has an entry for, so
+/// a pinned space whose `handler` file was removed still has its dead letters counted.
+fn reported_spaces(root: &Path, handler_dir: Option<&Path>) -> Vec<String> {
+    space_dirs(root)
+        .into_iter()
+        .filter(|space| {
+            read_handler_file(&root.join(space).join("handler")).is_some()
+                || host_handler_entry(handler_dir, space) != HostHandlerEntry::Absent
+        })
+        .collect()
+}
+
 /// The default handler authority: the three tuplespace verbs, so a handler can compose within
 /// the fabric (drop results, read and take from spaces) and touch nothing else.
 fn tuplespace_verbs() -> ikigai_core::Capability {
@@ -4964,16 +5191,56 @@ fn host_space_authority(dir: &Path, space: &str) -> Option<ikigai_core::Capabili
 /// tuplespace verbs and nothing widened it for any space, so every handler that needed more
 /// (the bookings handler needs lisp, calendar, mail, secrets, net) was denied before it
 /// started. Every web booking dead-lettered for eight days and nothing said so.
+///
+/// WHAT each space fires is the host's too (ledger #887): the reactor is built with
+/// [`SpaceReactor::with_host_handler`](ikigai_intray::SpaceReactor::with_host_handler) over
+/// `<config home>/space-handler/`, by the rule in [`decide_space_handler`].
 fn space_reactor(
     root: PathBuf,
     resolver: Arc<dyn ikigai_resolve::Resolver>,
-    authority_dir: Option<PathBuf>,
+    config_home: Option<PathBuf>,
 ) -> ikigai_intray::SpaceReactor {
+    let authority_dir = config_home
+        .as_ref()
+        .map(|home| home.join(SPACE_AUTHORITY_DIR));
+    let handler_dir = config_home.map(|home| home.join(SPACE_HANDLER_DIR));
+    // Each (space, line) is said once per process: the first tuple a space fires under the
+    // fallback, or the first one refused for a given reason. Per-tuple refusals are already
+    // loud through the dead-letter hook.
+    let said = std::sync::Mutex::new(std::collections::HashSet::<String>::new());
     ikigai_intray::SpaceReactor::new(root, resolver, tuplespace_verbs())
         .with_host_authority(move |space| {
             authority_dir
                 .as_deref()
                 .and_then(|dir| host_space_authority(dir, space))
+        })
+        .with_host_handler(move |space, file| {
+            let entry = host_handler_entry(handler_dir.as_deref(), space);
+            let (fire, line) = match decide_space_handler(&entry, file) {
+                HandlerDecision::Fire(uri) => (Some(uri), None),
+                HandlerDecision::Fallback(uri) => {
+                    let line = format!(
+                        "ikigai: space `{space}`: firing `{uri}` from its drop-tree `handler` \
+                         file, because the host has no {SPACE_HANDLER_DIR}/{space} entry (the \
+                         migration fallback, ledger #887)"
+                    );
+                    (Some(uri), Some(line))
+                }
+                HandlerDecision::Refuse(why) => (
+                    None,
+                    Some(format!(
+                        "ikigai: space `{space}`: REFUSED, nothing fires: {why}"
+                    )),
+                ),
+                HandlerDecision::NotReactive => (None, None),
+            };
+            if let Some(line) = line {
+                let mut said = said.lock().unwrap_or_else(|p| p.into_inner());
+                if said.insert(line.clone()) {
+                    eprintln!("{} {line}", stamp());
+                }
+            }
+            fire
         })
         // Loud at the moment it happens, so the daemon log shows it (ledger #638). The
         // heartbeat reports the standing count; this is the event.
@@ -8974,7 +9241,7 @@ mod space_authority_tests {
         let reactor = space_reactor(
             spaces.clone(),
             Arc::clone(&kernel) as Arc<dyn ikigai_resolve::Resolver>,
-            Some(authority.clone()),
+            Some(authority.parent().unwrap().to_path_buf()),
         );
 
         let first = drop_tuple(&kernel, b"first");
@@ -9060,6 +9327,312 @@ mod space_authority_tests {
         );
     }
 
+    /// A second bound handler, the one a retargeted `handler` file points at.
+    struct Other;
+
+    #[async_trait::async_trait]
+    impl Endpoint for Other {
+        async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                b"other ran".to_vec(),
+            ))
+        }
+        fn name(&self) -> &str {
+            "other"
+        }
+        fn describe(&self) -> Description {
+            Description::new("other")
+                .summary("a bound handler nobody configured for `jobs`")
+                .verb(Verb::Source)
+                .action(
+                    ActionSpec::new(Verb::Source)
+                        .summary("answers `other ran`")
+                        .output("text/plain"),
+                )
+        }
+    }
+
+    /// ★ The reproduction for ledger #887 item 1: the host pins `jobs` to `urn:test:beyond` in
+    /// its config home, a writer of the drop tree rewrites `spaces/jobs/handler` to another
+    /// BOUND IRI, and the next tuple must not fire it. On main (0.1.41) it did: the tuple was
+    /// `Handled` and its `.out` said `other ran`, under the authority the host granted `jobs`.
+    #[test]
+    fn a_retargeted_handler_file_does_not_choose_what_fires() {
+        let (spaces, authority) = scratch("retarget");
+        let config = authority.parent().unwrap().to_path_buf();
+        let kernel = Arc::new(Kernel::new(Arc::new(
+            ikigai_intray::space(spaces.clone())
+                .bind(Exact::new("urn:test:beyond"), Beyond)
+                .bind(Exact::new("urn:test:other"), Other),
+        )));
+        std::fs::write(authority.join("jobs"), format!("{BEYOND}\n")).unwrap();
+        std::fs::create_dir_all(config.join("space-handler")).unwrap();
+        std::fs::write(
+            config.join("space-handler").join("jobs"),
+            "urn:test:beyond\n",
+        )
+        .unwrap();
+        let reactor = space_reactor(
+            spaces.clone(),
+            Arc::clone(&kernel) as Arc<dyn ikigai_resolve::Resolver>,
+            Some(config.clone()),
+        );
+
+        // The pinned target fires.
+        let first = drop_tuple(&kernel, b"first");
+        assert_eq!(
+            reactor.process("jobs", &first),
+            ikigai_intray::Outcome::Handled
+        );
+
+        // A writer of the drop tree retargets the handler.
+        std::fs::write(spaces.join("jobs").join("handler"), "urn:test:other\n").unwrap();
+        let second = drop_tuple(&kernel, b"second");
+        let outcome = reactor.process("jobs", &second);
+        let out = spaces
+            .join("jobs")
+            .join("outbox")
+            .join(format!("{second}.out"));
+        assert!(
+            !std::fs::read_to_string(&out).is_ok_and(|said| said == "other ran"),
+            "the retargeted IRI fired: {outcome:?}"
+        );
+        match outcome {
+            ikigai_intray::Outcome::Errored(why) => {
+                assert!(why.contains("urn:test:other"), "{why}");
+            }
+            other => panic!("a disagreeing handler file is refused, loud: {other:?}"),
+        }
+        assert!(spaces
+            .join("jobs")
+            .join("error")
+            .join(format!("{second}.tuple"))
+            .is_file());
+    }
+
+    /// The kernel the handler tests drive: `jobs`'s legitimate handler and a second bound one.
+    fn kernel_with_other(spaces: &Path) -> Arc<Kernel> {
+        Arc::new(Kernel::new(Arc::new(
+            ikigai_intray::space(spaces.to_path_buf())
+                .bind(Exact::new("urn:test:beyond"), Beyond)
+                .bind(Exact::new("urn:test:other"), Other),
+        )))
+    }
+
+    /// The rule in [`decide_space_handler`], row by row.
+    #[test]
+    fn the_host_entry_decides_and_the_file_only_falls_back_when_there_is_none() {
+        use HandlerDecision::*;
+        use HostHandlerEntry::*;
+        let h = || Names("urn:h".to_string());
+        assert_eq!(decide_space_handler(&h(), None), Fire("urn:h".to_string()));
+        assert_eq!(
+            decide_space_handler(&h(), Some("urn:h")),
+            Fire("urn:h".to_string())
+        );
+        assert!(matches!(
+            decide_space_handler(&h(), Some("urn:f")),
+            Refuse(why) if why.contains("`urn:f`") && why.contains("`urn:h`")
+        ));
+        let bad = Invalid("names no handler".to_string());
+        assert_eq!(
+            decide_space_handler(&bad, Some("urn:f")),
+            Refuse("names no handler".to_string())
+        );
+        assert_eq!(
+            decide_space_handler(&bad, None),
+            Refuse("names no handler".to_string())
+        );
+        assert_eq!(
+            decide_space_handler(&Absent, Some("urn:f")),
+            Fallback("urn:f".to_string())
+        );
+        assert_eq!(decide_space_handler(&Absent, None), NotReactive);
+    }
+
+    /// The entry's format: the `handler` file's one IRI, plus comments and blank lines; anything
+    /// else is INVALID (never absent), and a name that is not one segment selects no file.
+    #[test]
+    fn a_host_handler_entry_names_exactly_one_iri() {
+        let (_spaces, authority) = scratch("entry");
+        let dir = authority.parent().unwrap().join(SPACE_HANDLER_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(host_space_handler(&dir, "jobs"), HostHandlerEntry::Absent);
+
+        // A copied `handler` file is a valid entry.
+        std::fs::write(dir.join("jobs"), "urn:test:beyond\n").unwrap();
+        assert_eq!(
+            host_space_handler(&dir, "jobs"),
+            HostHandlerEntry::Names("urn:test:beyond".to_string())
+        );
+        std::fs::write(
+            dir.join("jobs"),
+            "# the jobs handler\n\n  urn:test:beyond  \n",
+        )
+        .unwrap();
+        assert_eq!(
+            host_space_handler(&dir, "jobs"),
+            HostHandlerEntry::Names("urn:test:beyond".to_string())
+        );
+        for (raw, says) in [
+            ("# nothing yet\n", "names no handler"),
+            ("", "names no handler"),
+            ("urn:a\nurn:b\n", "names 2 handlers"),
+            ("not an iri\n", "not an IRI"),
+        ] {
+            std::fs::write(dir.join("jobs"), raw).unwrap();
+            match host_space_handler(&dir, "jobs") {
+                HostHandlerEntry::Invalid(why) => assert!(why.contains(says), "{raw:?}: {why}"),
+                other => panic!("{raw:?} must be invalid, got {other:?}"),
+            }
+        }
+        std::fs::write(dir.parent().unwrap().join("escaped"), "urn:test:other\n").unwrap();
+        assert!(matches!(
+            host_space_handler(&dir, "../escaped"),
+            HostHandlerEntry::Invalid(_)
+        ));
+    }
+
+    /// MIGRATION, pinned: a space with a `handler` file and no host entry fires the file's
+    /// target exactly as before this change, so the deploy does not dead-letter live bookings.
+    #[test]
+    fn an_unpinned_space_falls_back_to_its_handler_file() {
+        let (spaces, authority) = scratch("fallback");
+        let kernel = kernel_with_other(&spaces);
+        std::fs::write(authority.join("jobs"), format!("{BEYOND}\n")).unwrap();
+        let reactor = space_reactor(
+            spaces.clone(),
+            Arc::clone(&kernel) as Arc<dyn ikigai_resolve::Resolver>,
+            Some(authority.parent().unwrap().to_path_buf()),
+        );
+        let id = drop_tuple(&kernel, b"work");
+        assert_eq!(
+            reactor.process("jobs", &id),
+            ikigai_intray::Outcome::Handled
+        );
+    }
+
+    /// A pinned space needs no `handler` file, and an invalid entry refuses the file's target
+    /// rather than falling back to it.
+    #[test]
+    fn a_pinned_space_needs_no_file_and_an_invalid_pin_never_falls_back() {
+        let (spaces, authority) = scratch("pinned");
+        let config = authority.parent().unwrap().to_path_buf();
+        let kernel = kernel_with_other(&spaces);
+        std::fs::write(authority.join("jobs"), format!("{BEYOND}\n")).unwrap();
+        std::fs::create_dir_all(config.join(SPACE_HANDLER_DIR)).unwrap();
+        std::fs::write(
+            config.join(SPACE_HANDLER_DIR).join("jobs"),
+            "urn:test:beyond\n",
+        )
+        .unwrap();
+        std::fs::remove_file(spaces.join("jobs").join("handler")).unwrap();
+        let reactor = space_reactor(
+            spaces.clone(),
+            Arc::clone(&kernel) as Arc<dyn ikigai_resolve::Resolver>,
+            Some(config.clone()),
+        );
+        let id = drop_tuple(&kernel, b"no file");
+        assert_eq!(
+            reactor.process("jobs", &id),
+            ikigai_intray::Outcome::Handled
+        );
+
+        // An entry that names nothing usable: the file's target is refused, loud.
+        std::fs::write(spaces.join("jobs").join("handler"), "urn:test:other\n").unwrap();
+        std::fs::write(config.join(SPACE_HANDLER_DIR).join("jobs"), "# off\n").unwrap();
+        let id = drop_tuple(&kernel, b"invalid pin");
+        assert!(matches!(
+            reactor.process("jobs", &id),
+            ikigai_intray::Outcome::Errored(why) if why.contains("urn:test:other")
+        ));
+    }
+
+    /// Start-up names every space that is not the host's decision alone, with the command that
+    /// pins an unpinned one, and says nothing about a space that is pinned and agrees.
+    #[test]
+    fn start_up_names_every_space_the_host_has_not_pinned() {
+        let (spaces, authority) = scratch("lines");
+        let config = authority.parent().unwrap().to_path_buf();
+        let dir = config.join(SPACE_HANDLER_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        // `jobs` (from `scratch`) is unpinned; `pinned` agrees; `moved` disagrees; `broken` is
+        // invalid with no file; `plain` is not reactive.
+        for (space, file, entry) in [
+            ("pinned", Some("urn:p"), Some("urn:p\n")),
+            ("moved", Some("urn:evil"), Some("urn:m\n")),
+            ("broken", None, Some("")),
+            ("plain", None, None),
+        ] {
+            std::fs::create_dir_all(spaces.join(space)).unwrap();
+            if let Some(file) = file {
+                std::fs::write(spaces.join(space).join("handler"), file).unwrap();
+            }
+            if let Some(entry) = entry {
+                std::fs::write(dir.join(space), entry).unwrap();
+            }
+        }
+        let lines = space_handler_lines(&spaces, Some(&dir));
+        assert_eq!(lines.len(), 3, "{lines:#?}");
+        assert!(
+            lines[0].starts_with("ikigai: space `broken`: REFUSED"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[0].contains("wait in the inbox"), "{}", lines[0]);
+        let jobs = &lines[1];
+        assert!(
+            jobs.starts_with("ikigai: space `jobs`: fires `urn:test:beyond`"),
+            "{jobs}"
+        );
+        assert!(jobs.contains("ABSENT"), "{jobs}");
+        assert!(
+            jobs.contains(&format!(
+                "mkdir -p '{}' && cp '{}' '{}'",
+                dir.display(),
+                spaces.join("jobs").join("handler").display(),
+                dir.join("jobs").display()
+            )),
+            "{jobs}"
+        );
+        assert!(
+            lines[2].starts_with("ikigai: space `moved`: REFUSED"),
+            "{}",
+            lines[2]
+        );
+        assert!(lines[2].contains("`urn:evil`") && lines[2].contains("`urn:m`"));
+
+        // With no config home every file-backed space is on the fallback, said so.
+        let lines = space_handler_lines(&spaces, None);
+        assert_eq!(lines.len(), 3, "{lines:#?}");
+        assert!(
+            lines.iter().all(|l| l.contains("no config home")),
+            "{lines:#?}"
+        );
+
+        // The printed command really pins it: run its effect and the line goes away.
+        std::fs::copy(spaces.join("jobs").join("handler"), dir.join("jobs")).unwrap();
+        let lines = space_handler_lines(&spaces, Some(&dir));
+        assert!(!lines.iter().any(|l| l.contains("`jobs`")), "{lines:#?}");
+    }
+
+    /// The heartbeat counts a pinned space's dead letters even when it has no `handler` file.
+    #[test]
+    fn the_heartbeat_reports_a_pinned_space_without_a_file() {
+        let (spaces, authority) = scratch("reported");
+        let dir = authority.parent().unwrap().join(SPACE_HANDLER_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(spaces.join("hostonly")).unwrap();
+        std::fs::create_dir_all(spaces.join("plain")).unwrap();
+        std::fs::write(dir.join("hostonly"), "urn:h\n").unwrap();
+        assert_eq!(
+            reported_spaces(&spaces, Some(&dir)),
+            vec!["hostonly".to_string(), "jobs".to_string()]
+        );
+        assert_eq!(reported_spaces(&spaces, None), vec!["jobs".to_string()]);
+    }
+
     /// A `cap` file the host reactor ignores is NAMED at start-up, with where it belongs.
     #[test]
     fn an_inert_cap_file_is_named_with_its_new_home() {
@@ -9069,7 +9642,7 @@ mod space_authority_tests {
         let reactor = space_reactor(
             spaces.clone(),
             kernel as Arc<dyn ikigai_resolve::Resolver>,
-            Some(authority.clone()),
+            Some(authority.parent().unwrap().to_path_buf()),
         );
         let lines = inert_cap_file_lines(&reactor, &spaces, Some(&authority));
         assert_eq!(lines.len(), 1, "{lines:?}");
