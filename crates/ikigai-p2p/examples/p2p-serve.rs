@@ -74,6 +74,7 @@ fn main() -> Result<(), BoxError> {
                 Some(Session {
                     capability,
                     file_segment: String::new(),
+                    principal: None,
                 })
             }
             Err(why) => {

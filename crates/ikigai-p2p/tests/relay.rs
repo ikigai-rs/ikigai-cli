@@ -56,6 +56,7 @@ fn minter_for(enrolled: PeerId) -> PeerMinter {
         (*peer == enrolled).then(|| Session {
             capability: Capability::scoped(["urn:cap:demo:freebusy".to_string()]),
             file_segment: String::new(),
+            principal: None,
         })
     })
 }

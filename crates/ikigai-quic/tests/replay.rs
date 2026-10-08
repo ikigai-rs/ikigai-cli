@@ -27,6 +27,7 @@ fn root_minter() -> Minter {
         Some(Session {
             capability: Capability::root(),
             file_segment: String::new(),
+            principal: None,
         })
     })
 }

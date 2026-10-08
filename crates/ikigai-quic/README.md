@@ -44,6 +44,15 @@ per-connection `Session` from it:
 - **`file_segment`** transparently roots the connection's `urn:file:` namespace at
   `<segment>/…`, so each tenant addresses files as if its segment were the root and
   never sees another's.
+- **`principal`** names WHO the connection is from (an IRI the minter derives from the
+  certificate), and is never authority. The door stamps it on every request of the
+  connection as the inline argument `principal` (`PRINCIPAL_ARG`), on every verb,
+  replacing anything the client sent under that name; `None` stamps nothing and still
+  removes a client's. It reaches the endpoint whatever capability the client carries,
+  which a name hidden inside the session capability does not: the clamp intersects it
+  away under a narrower carried capability (ledger #879). ⚠ Since an argument is part of
+  the cache key, two clients reading one resource under one capability no longer share a
+  cached answer.
 
 ## Two deadlines: patience for work, a bound for self-description
 
