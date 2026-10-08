@@ -175,6 +175,16 @@ members = ["crates/*"]
 #   was reserved on mutating verbs only, so a GET reached the endpoint carrying the submitter's
 #   `principal`. Operator-visible: a read endpoint that took a `principal` query argument no
 #   longer gets it (none is known).
+# - ikigai-mcp: an OMITTED optional template binding is filled from the contract, not issued
+#   literally (ledger #886). `ledger-append__sink` without `ledger` issued
+#   `urn:iki:ledger:{ledger}:append` and failed "not a valid IRI". Now a declared default is
+#   filled in (`{ledger}` -> `default`, the same resource as the bare form); with no default the
+#   variable's whole `:`-segment is dropped (the bare spelling: `urn:iki:annotation` mints an id)
+#   and the shorter IRI must still describe as THE SAME endpoint, else the call is refused naming
+#   the variable; a variable inside a segment is refused by name. The schema is unchanged (the
+#   argument stays optional, as the contract declares). Surveyed: the optional bindings in the
+#   ecosystem are ledger `{ledger}` (default `default`), browse annotation `{id}` (bare = mint),
+#   a11y `{app}` and browse `{path}` (a concrete row or the bare spelling serves the omission).
 # 0.1.40: SECURITY FLOORS FROM AUDIT ROUND 3, A RESOLVER THAT FAILS CLOSED, AND A PASSKEY STORE
 # ONLY ITS OWNER COULD HAVE WRITTEN.
 # - Security floors (PR #408): ikigai-fs 0.1.8 (the jail authorizes the file it opens: no
