@@ -65,7 +65,8 @@ What fires, given the host entry and the space's `<workspace>/spaces/<space>/han
 
 A refused tuple is loud: it lands in `error/`, the dead-letter line is logged, and
 the heartbeat goes FAILING. Once the two agree, `sink urn:space:<space> retry=<id>`
-runs it again.
+runs it again; re-arming a dead letter needs `urn:cap:space:retry` beside
+`urn:cap:space:out`, which the REPL's root capability holds and a dropper does not.
 
 ### Migrating a space
 

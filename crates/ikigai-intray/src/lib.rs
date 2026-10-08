@@ -61,6 +61,12 @@ pub const CAP_READ: &str = "urn:cap:space:read";
 /// `take` (removing a tuple) requires this capability — strictly more authority than read,
 /// so a reader can observe the space without being able to consume from it.
 pub const CAP_TAKE: &str = "urn:cap:space:take";
+/// `retry=<id>` (re-arming a dead letter for another pass) requires this capability, on top
+/// of [`CAP_OUT`] (ledger #887). A dead letter can be one the reactor parked ON PURPOSE — an
+/// interrupted pass it refused to run twice ([`Interrupted::DeadLetter`]), or a handler the
+/// host refused — so re-arming it is the operator's decision, not a dropper's: none of the
+/// tuplespace verbs implies it, and no reactive handler holds it by default.
+pub const CAP_RETRY: &str = "urn:cap:space:retry";
 
 /// Where a [`SpaceReactor`] stages a tuple it has claimed for a pass:
 /// `<root>/<space>/.processing/<id>.tuple`, renamed to `outbox` or `error` when the pass
@@ -583,6 +589,19 @@ impl Endpoint for SpaceEndpoint {
                 // recovery meant knowing the on-disk layout and doing it by hand with `mv`,
                 // which is not something a system should ask of the person it just failed.
                 if let Some(id) = opt_str(inv, "retry")? {
+                    // ★ Re-arming is the OPERATOR's call, so it needs more than the drop
+                    // authority the Sink declares (ledger #887): a dead letter can be one the
+                    // reactor parked on purpose (an interrupted pass it refused to run twice, a
+                    // handler the host refused), and before this anyone who could drop could
+                    // undo that. Checked before the tree is looked at, so a denied caller cannot
+                    // learn which ids are dead letters. The verb's `requires` cannot say this (a
+                    // plain drop must not need it), so the `retry` input's summary does.
+                    if !inv.capability.allows(CAP_RETRY) {
+                        return Err(Error::Denied(format!(
+                            "re-arming a dead letter with `retry=` needs `{CAP_RETRY}` as well \
+                             as `{CAP_OUT}`"
+                        )));
+                    }
                     if id.is_empty() || id.contains(['/', '\\', '.']) {
                         return Err(Error::InvalidArgument {
                             name: "retry".to_string(),
@@ -825,7 +844,8 @@ impl Endpoint for SpaceEndpoint {
                             .class(XSD_STRING)
                             .summary(
                                 "instead of dropping: move this dead-lettered tuple back to \
-                                 the inbox for another pass (and clear its .err note)",
+                                 the inbox for another pass (and clear its .err note); needs \
+                                 `urn:cap:space:retry` as well as `urn:cap:space:out`",
                             ),
                     )
                     // The dropped tuple's id — the content hash, so a caller can read or
@@ -897,7 +917,8 @@ pub enum Outcome {
 pub enum Interrupted {
     /// Dead-letter it into `error/` with an `.err` note saying it was interrupted, and fire
     /// the [`DeadLetterHook`]. The handler is NOT run again; `retry=<id>` on the space's
-    /// Sink runs it again when a person (or a host) decides that is safe.
+    /// Sink runs it again when a person (or a host) decides that is safe, which is why
+    /// `retry=` needs [`CAP_RETRY`] and a dropper's [`CAP_OUT`] alone cannot re-arm it.
     ///
     /// The default, because the reactor's promise is that a handler fires once: a
     /// booking handler that sent its mail and died before settling must not send it
@@ -937,7 +958,8 @@ fn interrupted_note(space: &str, id: &str) -> String {
     format!(
         "interrupted: a reactor claimed this tuple for its handler and stopped before the \
          pass settled (a restart or crash mid-pass). The handler may have run in part or in \
-         full, so it was not run again. `sink urn:space:{space} retry={id}` runs it again."
+         full, so it was not run again. `sink urn:space:{space} retry={id}` runs it again \
+         (it needs `urn:cap:space:retry`)."
     )
 }
 
@@ -992,7 +1014,15 @@ pub struct SpaceReactor {
 /// good `.err` note, and nothing anywhere said so — the requester had already been told
 /// their request was received. A note nobody reads is not an alarm; this is the seam a host
 /// uses to raise one (a log line, a counter, a mail).
+///
+/// The hook runs on the thread that settled the tuple, AFTER the reactor has released every
+/// lock of its own, so it may call back into the same reactor (`drain`, `process`,
+/// `sweep_interrupted`). Until ledger #887 it ran under the pass lock, and such a hook
+/// deadlocked. It still runs synchronously: a slow hook delays that thread's next pass.
 pub type DeadLetterHook = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
+
+/// One dead letter waiting to be told to the [`DeadLetterHook`]: `(space, tuple id, reason)`.
+type Heard = (String, String, String);
 
 /// A host's own answer to "what authority does this space's handler run under?", installed
 /// with [`SpaceReactor::with_host_authority`]. `None` from the closure means "no opinion —
@@ -1067,13 +1097,25 @@ impl SpaceReactor {
     /// skipped (another live reactor, or a filesystem that cannot lock); nothing was moved.
     /// ⚠ Reactors from before this lease existed hold no lock and are not seen by it.
     pub fn recover_interrupted(&self) -> std::result::Result<&[Recovered], &str> {
-        let recovery = self.recovery.get_or_init(|| self.recover());
+        // The dead letters this call produced are told to the hook AFTER the initializer
+        // returns: a hook that drove this reactor from inside it would wait on its own `OnceLock`
+        // (ledger #887). `None` when another call initialized it.
+        let mut heard = None;
+        let recovery = self.recovery.get_or_init(|| {
+            let mut told = Vec::new();
+            let recovery = self.recover(&mut told);
+            heard = Some(told);
+            recovery
+        });
+        if let Some(heard) = heard {
+            self.tell(heard);
+        }
         recovery.report.as_deref().map_err(String::as_str)
     }
 
     /// Take the lease and, when it is exclusively ours, recover. See
     /// [`recover_interrupted`](SpaceReactor::recover_interrupted).
-    fn recover(&self) -> Recovery {
+    fn recover(&self, heard: &mut Vec<Heard>) -> Recovery {
         let lease = match self.open_lease() {
             Ok(file) => file,
             Err(why) => {
@@ -1085,7 +1127,7 @@ impl SpaceReactor {
         };
         let report = match lease.try_lock() {
             Ok(()) => {
-                let recovered = self.recover_spaces();
+                let recovered = self.recover_spaces(heard);
                 // Downgrade to SHARED for the rest of this reactor's life. Between the two
                 // calls another reactor could take it exclusively and recover — harmless,
                 // because this reactor has claimed nothing yet.
@@ -1146,30 +1188,36 @@ impl SpaceReactor {
                 .map(<[_]>::to_vec)
                 .unwrap_or_default();
         };
-        let _pass = self.pass.lock().unwrap_or_else(|p| p.into_inner());
-        let mut lease = recovery.lease.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(file) = lease.as_ref() else {
-            return Vec::new();
-        };
-        let _ = file.unlock();
-        let recovered = match file.try_lock() {
-            Ok(()) => {
-                let recovered = self.recover_spaces();
-                let _ = file.unlock();
-                recovered
+        let mut heard = Vec::new();
+        let recovered = {
+            let _pass = self.pass.lock().unwrap_or_else(|p| p.into_inner());
+            let mut lease = recovery.lease.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(file) = lease.as_ref() else {
+                return Vec::new();
+            };
+            let _ = file.unlock();
+            let recovered = match file.try_lock() {
+                Ok(()) => {
+                    let recovered = self.recover_spaces(&mut heard);
+                    let _ = file.unlock();
+                    recovered
+                }
+                Err(_) => Vec::new(),
+            };
+            // Back to SHARED. Blocks only while another reactor holds it exclusively (its own
+            // startup recovery). If it fails this reactor holds no lease, and says so once.
+            if let Err(e) = file.lock_shared() {
+                eprintln!(
+                    "ikigai-intray: reactor over {} lost its lease ({e}); another reactor's \
+                     recovery could now move this one's in-flight tuples",
+                    self.root.display()
+                );
+                *lease = None;
             }
-            Err(_) => Vec::new(),
+            recovered
         };
-        // Back to SHARED. Blocks only while another reactor holds it exclusively (its own
-        // startup recovery). If it fails this reactor holds no lease, and says so once.
-        if let Err(e) = file.lock_shared() {
-            eprintln!(
-                "ikigai-intray: reactor over {} lost its lease ({e}); another reactor's \
-                 recovery could now move this one's in-flight tuples",
-                self.root.display()
-            );
-            *lease = None;
-        }
+        // Only now, with the pass lock and the lease guard released (ledger #887).
+        self.tell(heard);
         recovered
     }
 
@@ -1187,7 +1235,7 @@ impl SpaceReactor {
 
     /// Apply the [`Interrupted`] policy to every tuple in every space's `.processing/`.
     /// Called only under the exclusive lease.
-    fn recover_spaces(&self) -> Vec<Recovered> {
+    fn recover_spaces(&self, heard: &mut Vec<Heard>) -> Vec<Recovered> {
         let mut names = self.space_names();
         names.sort();
         let mut recovered = Vec::new();
@@ -1198,7 +1246,7 @@ impl SpaceReactor {
                 let outcome = match self.interrupted {
                     Interrupted::DeadLetter => {
                         let note = interrupted_note(&name, &id);
-                        match self.settle(&name, &id, &claimed, Err(note.clone())) {
+                        match self.settle(&name, &id, &claimed, Err(note.clone()), heard) {
                             Outcome::Errored(said) if said == note => Ok(Interrupted::DeadLetter),
                             Outcome::Errored(said) => Err(said),
                             other => Err(format!("unexpected outcome {other:?}")),
@@ -1413,6 +1461,25 @@ impl SpaceReactor {
             )),
             Target::None => return Outcome::Skipped("no handler (not a reactive space)"),
         };
+        let mut heard = Vec::new();
+        let outcome = self.run_pass(name, id, handler, &mut heard);
+        // ★ The hook runs HERE, after the pass lock is released, never inside it (ledger
+        // #887): a hook that drove this reactor (`drain`, `process`, a sweep) would otherwise
+        // wait forever on a lock its own thread held.
+        self.tell(heard);
+        outcome
+    }
+
+    /// One pass over a claimed tuple, under the pass lock: claim it, fire `handler` (or settle
+    /// the refusal), move it to its terminal stage. Dead letters are recorded in `heard` for
+    /// [`process`](SpaceReactor::process) to tell the hook once the lock is released.
+    fn run_pass(
+        &self,
+        name: &str,
+        id: &str,
+        handler: std::result::Result<String, String>,
+        heard: &mut Vec<Heard>,
+    ) -> Outcome {
         // One pass at a time per reactor, held from the claim to the settle.
         let _pass = self.pass.lock().unwrap_or_else(|p| p.into_inner());
         // Claim atomically — rename out of the inbox into a private processing dir. If the
@@ -1425,12 +1492,14 @@ impl SpaceReactor {
         let bytes = match std::fs::read(&claimed) {
             Ok(b) if hashes_to(&b, id) => b,
             // Never fire a handler on bytes that are not the tuple that was dropped.
-            Ok(_) => return self.settle(name, id, &claimed, Err(corrupt_note(id))),
-            Err(e) => return self.settle(name, id, &claimed, Err(format!("read tuple: {e}"))),
+            Ok(_) => return self.settle(name, id, &claimed, Err(corrupt_note(id)), heard),
+            Err(e) => {
+                return self.settle(name, id, &claimed, Err(format!("read tuple: {e}")), heard)
+            }
         };
         let handler = match handler {
             Ok(uri) => uri,
-            Err(refused) => return self.settle(name, id, &claimed, Err(refused)),
+            Err(refused) => return self.settle(name, id, &claimed, Err(refused), heard),
         };
         // Fire the handler under the reactor's OWN authority, passing the tuple as content
         // plus the space/tuple ids (transport dumb, resource smart). A malformed handler URI
@@ -1466,24 +1535,38 @@ impl SpaceReactor {
             }
             Err(e) => Err(format!("bad handler URI `{handler}`: {e}")),
         };
-        self.settle(name, id, &claimed, result)
+        self.settle(name, id, &claimed, result, heard)
     }
 
     /// Move a claimed tuple to its terminal stage: `outbox` on Ok, `error` (+ an `.err` note)
-    /// on failure, and tell the [`DeadLetterHook`] about any `Errored` outcome. Returns the
-    /// matching [`Outcome`].
+    /// on failure, and record any `Errored` outcome in `heard` for the [`DeadLetterHook`] —
+    /// which the CALLER tells once it holds no lock ([`tell`](SpaceReactor::tell)). Returns
+    /// the matching [`Outcome`].
     fn settle(
         &self,
         name: &str,
         id: &str,
         claimed: &Path,
         result: std::result::Result<String, String>,
+        heard: &mut Vec<Heard>,
     ) -> Outcome {
         let outcome = self.move_to_stage(name, id, claimed, result);
-        if let (Outcome::Errored(reason), Some(hook)) = (&outcome, &self.on_dead_letter) {
-            hook(name, id, reason);
+        if let Outcome::Errored(reason) = &outcome {
+            heard.push((name.to_string(), id.to_string(), reason.clone()));
         }
         outcome
+    }
+
+    /// Tell the [`DeadLetterHook`] about each dead letter in `heard`, in order. Called only
+    /// where this reactor holds no lock of its own — not the pass lock, not the lease, not
+    /// inside the startup recovery's initializer — so a hook may drive this same reactor
+    /// (ledger #887; `tests/hook_reentry.rs` is the guard).
+    fn tell(&self, heard: Vec<Heard>) {
+        if let Some(hook) = &self.on_dead_letter {
+            for (space, tuple, reason) in heard {
+                hook(&space, &tuple, &reason);
+            }
+        }
     }
 
     /// [`settle`](SpaceReactor::settle) without the hook: the moves and the notes.
@@ -2268,7 +2351,12 @@ mod tests {
     fn a_dead_lettered_tuple_can_be_retried() {
         let root = reactive_root("react-retry", "jobs", "urn:test:handler");
         let k = Kernel::new(Arc::new(space(root.clone())));
-        let cap = Capability::scoped(vec![CAP_OUT.to_string(), CAP_READ.to_string()]);
+        // Re-arming needs the operator's `retry` grant beside `out` (ledger #887).
+        let cap = Capability::scoped(vec![
+            CAP_OUT.to_string(),
+            CAP_READ.to_string(),
+            CAP_RETRY.to_string(),
+        ]);
         let id = out(&k, &cap, "urn:space:jobs", b"work");
 
         // The environment is broken: the tuple dead-letters, with a note.
@@ -2313,7 +2401,12 @@ mod tests {
     fn retrying_an_unknown_tuple_is_not_found() {
         let root = reactive_root("react-retry-miss", "jobs", "urn:test:handler");
         let k = Kernel::new(Arc::new(space(root.clone())));
-        let cap = Capability::scoped(vec![CAP_OUT.to_string(), CAP_READ.to_string()]);
+        // Re-arming needs the operator's `retry` grant beside `out` (ledger #887).
+        let cap = Capability::scoped(vec![
+            CAP_OUT.to_string(),
+            CAP_READ.to_string(),
+            CAP_RETRY.to_string(),
+        ]);
         let err = block_on(
             k.issue(
                 Request::new(Verb::Sink, iri("urn:space:jobs"))
