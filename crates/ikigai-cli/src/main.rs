@@ -67,6 +67,12 @@ usage:
   ikigai --daemon              headless: timers, the watcher, and the standing sync — for launchd
   ikigai --name <instance>     name this instance (scopes <name>.* config properties; defaults
                                repl / daemon / serve by mode)
+  ikigai --config-home <dir>   use <dir> as the config home (config.toml, grants.json, clients.json,
+                               …) instead of $XDG_CONFIG_HOME/ikigai or ~/.config/ikigai. Any mode
+                               (REPL, -c, serve, mcp, --daemon, --connect, cert). A relative <dir> is
+                               made absolute against the working directory. The flag WINS: with it,
+                               XDG_CONFIG_HOME is not read for the config home at all. It moves the
+                               config home only; the data home (~/.ikigai) stays where it is
   ikigai --scheduler <spec>    fan-out width: single | pool | pool:N (any mode). Also
                                `scheduler = \"pool:N\"` in the config home (instance-scoped as
                                <name>.scheduler); IKIGAI_SCHEDULER still works, deprecated.
@@ -540,8 +546,100 @@ fn version_requested<'a>(mut args: impl Iterator<Item = &'a str>) -> bool {
 }
 
 /// Parse argv. `Ok(None)` means a usage request was handled and we should exit 0.
+///
+/// `--config-home` is taken out FIRST and applied before any mode is parsed, because every
+/// mode reads the config home and some read it while parsing (a `--mount` line's peer cert
+/// directory, the `arrangement` key) — the flag has to be in force before the first read.
 fn parse_args() -> Result<Option<Mode>, String> {
-    parse_argv(std::env::args().skip(1))
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // Read only to resolve a relative `--config-home`: a process whose working directory is
+    // gone must still start when it was not given one.
+    let cwd = std::env::current_dir().ok();
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    if let Some(dir) = take_config_home(&mut args, cwd.as_deref(), home.as_deref())? {
+        apply_config_home(dir)?;
+    }
+    parse_argv(args.into_iter())
+}
+
+/// Take every `--config-home <dir>` (or `--config-home=<dir>`) out of `args` and return the
+/// directory, ABSOLUTE (ledger #919): a relative `<dir>` is joined to `cwd`, and a leading
+/// `~/` is expanded from `home`, because a config home that moves with the working directory
+/// is the thing `config_home` exists to refuse (gonk's flag takes the path as typed; this one
+/// does not, ledger #918). Given twice with two different directories is refused — a process
+/// has one config home — and the same directory twice is one.
+///
+/// Like [`version_requested`], the scan is by exact token and does not know which flags take a
+/// value, so `--config-home` as the literal VALUE of another flag reads as this flag. That
+/// is the price of applying it before any mode is parsed, which every mode needs.
+fn take_config_home(
+    args: &mut Vec<String>,
+    cwd: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let mut found: Option<std::path::PathBuf> = None;
+    let mut at = 0;
+    while at < args.len() {
+        let value = if args[at] == "--config-home" {
+            args.remove(at);
+            if at >= args.len() {
+                return Err("--config-home needs <dir>".to_string());
+            }
+            args.remove(at)
+        } else if let Some(value) = args[at].strip_prefix("--config-home=") {
+            let value = value.to_string();
+            args.remove(at);
+            value
+        } else {
+            at += 1;
+            continue;
+        };
+        if value.is_empty() || value.starts_with('-') {
+            return Err(format!(
+                "--config-home needs <dir>, and was given `{value}`"
+            ));
+        }
+        let typed = match (value.strip_prefix("~/"), home) {
+            (Some(rest), Some(home)) => home.join(rest),
+            (Some(_), None) => {
+                return Err(format!(
+                    "--config-home `{value}` starts with `~/` and HOME is not set"
+                ))
+            }
+            (None, _) => std::path::PathBuf::from(&value),
+        };
+        let absolute: std::path::PathBuf = if typed.is_absolute() {
+            typed
+        } else {
+            cwd.ok_or_else(|| {
+                format!("--config-home `{value}` is relative and the working directory is unknown")
+            })?
+            .join(typed)
+        }
+        .components()
+        .filter(|part| !matches!(part, std::path::Component::CurDir))
+        .collect();
+        match &found {
+            Some(prior) if *prior != absolute => {
+                return Err(format!(
+                "--config-home was given twice, as `{}` and `{}`; a process has one config home",
+                prior.display(),
+                absolute.display()
+            ))
+            }
+            _ => found = Some(absolute),
+        }
+    }
+    Ok(found)
+}
+
+/// Put a `--config-home` in force for this process: both spellings of the config home read
+/// it (the host's, and the engine's twin that `config` and the TUI's keybindings use).
+fn apply_config_home(dir: std::path::PathBuf) -> Result<(), String> {
+    #[cfg(feature = "embedded")]
+    ikigai_embedded::config::set_config_home(dir.clone())
+        .map_err(|e| format!("--config-home: {e}"))?;
+    ikigai_engine::config::set_config_home(dir).map_err(|e| format!("--config-home: {e}"))
 }
 
 /// The argument parser proper, over any argv — so it can be tested without a
@@ -4052,6 +4150,67 @@ mod scheduler_flag_tests {
 /// by resolving a known name and interpreting the failure — and it is exactly the
 /// kind of flag that works the day it is written and breaks silently the next time
 /// the argument parser is restructured. Nothing else in this suite would notice.
+#[cfg(test)]
+mod config_home_flag_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn take(args: &[&str]) -> (Result<Option<PathBuf>, String>, Vec<String>) {
+        let mut args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let found = take_config_home(
+            &mut args,
+            Some(Path::new("/work/here")),
+            Some(Path::new("/home/b")),
+        );
+        (found, args)
+    }
+
+    /// The flag leaves argv in either spelling, anywhere, so every mode's parser sees the rest
+    /// unchanged — and the directory comes back absolute.
+    #[test]
+    fn the_flag_is_taken_out_of_every_position_and_made_absolute() {
+        let (found, rest) = take(&["--config-home", "/abs/cfg", "-c", "list"]);
+        assert_eq!(found, Ok(Some(PathBuf::from("/abs/cfg"))));
+        assert_eq!(rest, ["-c", "list"]);
+
+        let (found, rest) = take(&["serve", "/tmp/s.sock", "--config-home=./cfg"]);
+        assert_eq!(found, Ok(Some(PathBuf::from("/work/here/cfg"))));
+        assert_eq!(rest, ["serve", "/tmp/s.sock"]);
+
+        let (found, _) = take(&["mcp", "--config-home", "~/scratch/cfg"]);
+        assert_eq!(found, Ok(Some(PathBuf::from("/home/b/scratch/cfg"))));
+
+        let (found, rest) = take(&["-c", "list"]);
+        assert_eq!(found, Ok(None));
+        assert_eq!(rest, ["-c", "list"]);
+    }
+
+    #[test]
+    fn a_missing_or_doubled_directory_is_refused() {
+        assert!(take(&["--config-home"])
+            .0
+            .unwrap_err()
+            .contains("needs <dir>"));
+        assert!(take(&["--config-home", "--plain"])
+            .0
+            .unwrap_err()
+            .contains("--plain"));
+        assert!(take(&["--config-home="])
+            .0
+            .unwrap_err()
+            .contains("needs <dir>"));
+        let twice = take(&["--config-home", "/a", "--config-home", "/b"])
+            .0
+            .unwrap_err();
+        assert!(twice.contains("/a") && twice.contains("/b"), "{twice}");
+        // The same directory twice, in two spellings, is one.
+        assert_eq!(
+            take(&["--config-home", "/work/here/cfg", "--config-home=cfg"]).0,
+            Ok(Some(PathBuf::from("/work/here/cfg")))
+        );
+    }
+}
+
 #[cfg(test)]
 mod version_flag_tests {
     use super::*;

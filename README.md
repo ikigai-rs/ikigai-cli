@@ -273,7 +273,15 @@ line starts in Insert (like `set -o vi`). (Counts like `3w` aren't in yet.)
 The scheme is configurable — set `keybindings` from inside the REPL with
 `config keybindings=vi`, or edit `$XDG_CONFIG_HOME/ikigai/config.toml`
 (falling back to `~/.config/ikigai/config.toml` — the one shared config home, the
-same file the host reads `mail.*`, `mount` and `scheduler` from):
+same file the host reads `mail.*`, `mount` and `scheduler` from).
+
+`--config-home <dir>` names the config home outright, in every mode (REPL, `-c`, `serve`,
+`mcp`, `--daemon`, `--connect`, `cert`), so a scratch run needs no environment variable:
+`ikigai --config-home ./scratch -c config`. `<dir>` IS the config home (it holds
+`config.toml`, `grants.json`, …), and a relative one is made absolute against the working
+directory. **The flag wins**: when both it and `XDG_CONFIG_HOME` are set, the environment is
+not read for the config home. It moves the config home only; the data home (`~/.ikigai`)
+stays put.
 
 ```toml
 keybindings = "emacs"   # "emacs" (default) · "vi" · "native"

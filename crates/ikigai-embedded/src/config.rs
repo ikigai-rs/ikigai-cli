@@ -17,9 +17,55 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-/// The ikigai config home: `$XDG_CONFIG_HOME/ikigai`, or `$HOME/.config/ikigai` when
-/// `XDG_CONFIG_HOME` is unset. `None` when neither base directory is known.
+/// The config home a `--config-home` FLAG named for this process, if one did. Set once, by the
+/// binary, before anything reads the config home; see [`set_config_home`].
+static FLAG_HOME: OnceLock<PathBuf> = OnceLock::new();
+
+/// Name this process's config home outright, as the `--config-home` flag does (ledger #919):
+/// from here on [`config_home`], [`config_path`] and every file under them resolve inside
+/// `dir`, and `XDG_CONFIG_HOME` and `HOME` are not consulted for it. **An explicit flag wins
+/// over the environment** — the rule is config home plus flags, so the flag is the channel and
+/// the environment the fallback, never the other way round.
+///
+/// `dir` IS the config home (it holds `config.toml`, `grants.json`, …), not an XDG base with an
+/// `ikigai/` beneath it: gonk's `--config-home` means the same. It must be ABSOLUTE — the
+/// binary absolutizes what was typed — because a relative config home is one that moves with
+/// the working directory, which `config_home` exists to refuse. Setting it twice to the same
+/// directory is a no-op; to a different one is refused, since a process has one config home.
+///
+/// `ikigai_engine::config::set_config_home` is this function's TWIN (the engine reads the same
+/// `config.toml` and depends on nothing here); the binary sets both.
+pub fn set_config_home(dir: PathBuf) -> Result<(), String> {
+    if !dir.is_absolute() {
+        return Err(format!(
+            "the config home must be an absolute path, and `{}` is not",
+            dir.display()
+        ));
+    }
+    match FLAG_HOME.get() {
+        Some(prior) if *prior == dir => Ok(()),
+        Some(prior) => Err(format!(
+            "the config home is already `{}`; a process has one",
+            prior.display()
+        )),
+        None => FLAG_HOME
+            .set(dir)
+            .map_err(|_| "the config home was set concurrently".into()),
+    }
+}
+
+/// The config home a `--config-home` flag named, if any — for a caller that must hand a home
+/// to a module that would otherwise read the environment itself (the durable store's
+/// `store.toml`, browse's `a11y.toml` layers).
+pub fn config_home_flag() -> Option<&'static Path> {
+    FLAG_HOME.get().map(PathBuf::as_path)
+}
+
+/// The ikigai config home: the `--config-home` flag's directory when one was given
+/// ([`set_config_home`]), else `$XDG_CONFIG_HOME/ikigai`, or `$HOME/.config/ikigai` when
+/// `XDG_CONFIG_HOME` is unset. `None` when none of the three is known.
 ///
 /// THE spelling of the config home — every file the host reads from it resolves through
 /// here. It used to be written twice: this module honoured `XDG_CONFIG_HOME` while nine
@@ -36,6 +82,9 @@ use std::path::{Path, PathBuf};
 /// neither crate depends on the other, so one shared function would have to be pushed down
 /// into `ikigai-core`. Keep the two in step.
 pub fn config_home() -> Option<PathBuf> {
+    if let Some(flag) = config_home_flag() {
+        return Some(flag.to_path_buf());
+    }
     config_home_from(
         std::env::var_os("XDG_CONFIG_HOME"),
         std::env::var_os("HOME"),
