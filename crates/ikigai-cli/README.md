@@ -43,8 +43,8 @@ mode all behave identically whether the kernel is in-process or across a wire. T
 remote transports speak the [ikigai-wire](https://crates.io/crates/ikigai-wire)
 `Call`/`Reply` protocol.
 
-REPL commands: `source`, `describe`, `list`, `cache`, `cap`, `trace`, `config`,
-`help`, `quit`. The pipeline grammar (`|` pipe, `..` map, `( ; )` fork/join,
+REPL commands: `source`, `describe`, `list`, `cache`, `cap`, `trace`, `explain`, `why`,
+`dependents`, `show`, `config`, `help`, `quit`. The pipeline grammar (`|` pipe, `..` map, `( ; )` fork/join,
 `"…"` quoting), Emacs/vi keybindings, and cache visibility are documented in the
 **workspace README**.
 

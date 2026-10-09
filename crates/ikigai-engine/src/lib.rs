@@ -17,5 +17,5 @@ pub mod fanout;
 mod plan;
 pub mod suggest;
 
-pub use engine::{Action, CacheStats, Engine, Entry, HELP};
+pub use engine::{Action, CacheStats, Engine, Entry, Viewer, COMMANDS, HELP};
 pub use fanout::FanOut;

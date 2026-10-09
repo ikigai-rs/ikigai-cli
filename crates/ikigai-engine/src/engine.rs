@@ -96,6 +96,9 @@ pub(crate) fn combine_outputs(parts: Vec<Staged>) -> Staged {
 
 use crate::config;
 
+mod why;
+pub use why::{Viewer, COMMANDS};
+
 /// Help text shown by the `help` command (and the TUI's hint line links to it).
 pub const HELP: &str = "\
 commands:
@@ -127,6 +130,15 @@ commands:
                              reset` returns to), or drop to the floor — auth-scheme-agnostic
                              (also `sink urn:host:login <scope…>` / `sink urn:host:logout`)
   trace <iri> [args]         resolve a resource and show its path: client, transport, endpoint
+  explain <iri> [verb] [scopes=…]  a DRY RUN of resolving it (nothing is invoked): rewrites, each
+                             space in the chain and what it did, the door and bindings that would
+                             answer, the scopes the capability lacks; plus whether it is cached
+                             now. `scopes=a,b` answers for a narrower capability; as=text/turtle
+  why <iri>                  why the last read of it was not cached (the kernel's uncached log)
+  dependents <thread>        what cutting a golden thread would recompute (a thread is a
+                             resource's IRI, or urn:kernel:bindings); as=text/turtle
+  show <iri> [args]          draw a resource that answers image/svg+xml (urn:diagram:kernel,
+                             urn:diagram:arrangement of=<iri>): write it to a file and open it
   config [key=value]         show settings, or save one (e.g. config keybindings=emacs)
   list                       list the resources bound in the current space
   demo [on|off]              show or toggle the interactive runbook (urn:runbook:*)
@@ -311,6 +323,10 @@ pub struct Engine {
     /// restored after one, so nothing leaks into the next line: a per-request corridor needs
     /// no session state, which is why this is not (yet) a `scope` command.
     scope: RefCell<Scope>,
+    /// What `show` hands a picture to — the FACE's to supply ([`with_viewer`](Self::with_viewer)),
+    /// because writing a file and opening it is a fact about the medium, not the grammar (a
+    /// browser frontend draws it inline; a terminal cannot). `None` ⇒ `show` is refused by name.
+    viewer: Option<Arc<dyn why::Viewer>>,
 }
 
 /// The name a temporal corridor is injected under: `urn:ctx:time:` + the instant in canonical
@@ -435,6 +451,7 @@ impl Engine {
             piped_input: RefCell::new(None),
             as_of_doors: None,
             scope: RefCell::new(Scope::empty()),
+            viewer: None,
         }
     }
 
@@ -742,6 +759,10 @@ impl Engine {
             "demo" => output(self, self.run_demo(rest).await),
             "history" => output(self, self.run_history(rest).await),
             "trace" => output(self, self.run_trace(rest).await),
+            "explain" => output(self, self.run_explain(rest).await),
+            "why" => output(self, self.run_why(rest).await),
+            "dependents" => output(self, self.run_dependents(rest).await),
+            "show" => output(self, self.run_show(rest).await),
             ":lisp" => output(self, self.enter_lisp_mode()),
             ":load" => output(self, self.run_load(rest).await),
             "source" | "src" => output(self, self.run_pipeline(rest).await),
@@ -1787,6 +1808,24 @@ impl Engine {
         request: Request,
         incoming: Option<Provenance>,
     ) -> Result<Staged, String> {
+        let representation = self.run_repr(request, incoming).await?;
+        let expiry = representation.expiry;
+        let threads = representation.threads().clone();
+        Ok(Staged {
+            bytes: representation.bytes,
+            expiry,
+            threads,
+        })
+    }
+
+    /// Issue a request in the line's chain under the session capability, record how the cache
+    /// served it, and return the whole representation — media type included, which `show`
+    /// needs and a pipe stage does not.
+    pub(crate) async fn run_repr(
+        &self,
+        request: Request,
+        incoming: Option<Provenance>,
+    ) -> Result<Representation, String> {
         let capability = self.capability.borrow().clone();
         // The empty chain takes the unscoped path inside `issue_as_async_in` on every resolver,
         // so a line without `as-of=` issues exactly what it issued before chains existed.
@@ -1798,13 +1837,7 @@ impl Engine {
         let mut stats = self.cache.get();
         stats.record(status);
         self.cache.set(stats);
-        let expiry = representation.expiry;
-        let threads = representation.threads().clone();
-        Ok(Staged {
-            bytes: representation.bytes,
-            expiry,
-            threads,
-        })
+        Ok(representation)
     }
 }
 

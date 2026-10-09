@@ -20,6 +20,8 @@ mod quic;
 mod repl;
 #[cfg(feature = "web")]
 mod route_load;
+#[cfg(all(feature = "embedded", not(target_family = "wasm")))]
+mod show;
 #[cfg(not(target_family = "wasm"))]
 mod tui;
 
@@ -1528,7 +1530,7 @@ fn mcp(_grants: Vec<String>, _scopes: Vec<String>, _mounts: Mounts) {
 }
 
 /// Register the demo capability profiles on an engine (so `cap freebusy` reads
-/// friendlier than a scope list). Applied to every backend — embedded and, over
+/// friendlier than a scope list), and give `show` its file viewer. Applied to every backend — embedded and, over
 /// IPC, the capability is carried to the server so it takes effect there too.
 #[cfg(feature = "embedded")]
 fn with_profiles(engine: Engine) -> Engine {
@@ -1556,6 +1558,11 @@ fn with_profiles(engine: Engine) -> Engine {
     // reaches no other authority." Additive; the embedded REPL's default root session
     // already covers `urn:cap:lisp`, so this is only needed after a narrowing.
     engine.define_cap_profile("lisp", ["urn:cap:lisp"]);
+    // `show <iri>`: a terminal cannot draw SVG, so the picture goes to a file and the
+    // config home's `show.opener` (the platform's own by default). Every backend gets it —
+    // over `--connect` the picture is fetched remotely and shown HERE.
+    #[cfg(not(target_family = "wasm"))]
+    let engine = engine.with_viewer(std::sync::Arc::new(show::FileViewer));
     engine
 }
 
