@@ -199,6 +199,45 @@ ikigai> cache urn:iki:fn:toUpper hi
 cached
 ```
 
+**Why did it resolve that way?** Four views answer the module author's questions, each a
+thin face over a kernel resource (so they work the same over `--connect`):
+
+- `explain <iri> [verb] [scopes=a,b] [as=text/turtle]` is a dry run of resolution from
+  `urn:kernel:explain` (nothing is invoked): the rewrites that would fire, each space in the
+  chain and whether it answers, declines or is **shadowed** by one ahead of it, the door and
+  grammar bindings, and the scopes a capability lacks. Beside it, from the live
+  `urn:kernel:cached`, whether a read is cached right now. `scopes=` answers for a narrower
+  capability (never a wider one); `as-of=` explains inside that temporal corridor.
+- `why <iri>` is that name's rows of `urn:kernel:uncached`: why its last computations were not
+  stored (`declared`, `dependency <iri>`, `upstream`, …) and how many times.
+- `dependents <thread>` is `urn:kernel:dependents`: the live cache entries a cut of that golden
+  thread (a resource's IRI, or `urn:kernel:bindings`) would make stale.
+- `show <iri> [args]` draws a resource that answers `image/svg+xml` (`urn:diagram:kernel`,
+  `urn:diagram:arrangement of=<iri>`): a terminal cannot, so the SVG is written to the temporary
+  directory, its path printed, and it is opened with `show.opener` from the config home (the
+  platform's opener by default; `none` only writes it).
+
+```
+ikigai> explain urn:test:guarded scopes=urn:cap:kernel:inspect
+explain source urn:test:guarded
+  capability  attenuated to urn:cap:kernel:inspect
+  chain       root
+  spaces, in the order they are consulted:
+    1. root  endpoint-space  answered
+  endpoint    guarded (urn:ikigai:endpoint:guarded)
+  door        urn:test:guarded (exact)
+  bindings    (none)
+  requires    urn:cap:test:secret
+  denied      yes: the capability lacks urn:cap:test:secret — a real request is refused before the endpoint is entered
+  cacheable   decided by the endpoint per answer — …
+  cached now  no (for this session's capability, not the `scopes=` one)   (urn:kernel:cached, live)
+ikigai> why urn:test:volatile
+why urn:test:volatile
+  cached now  no   (urn:kernel:cached, live)
+  uncached    ×2  declared  [root]
+  reasons     declared = the endpoint answered uncacheable; …
+```
+
 In the TUI the input line is a real editor with **Emacs / readline keybindings**:
 
 | keys | action |

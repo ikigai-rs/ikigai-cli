@@ -343,8 +343,16 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 [workspace.dependencies]
 # The released kernel, consumed from crates.io. For local cross-repo development
 # against a sibling checkout, use .cargo/config.toml (see .cargo/config.toml.example).
-ikigai-core = "0.1.86" # 0.1.86 = EXCLUSIONS ARE STICKY (ledger #858, #874), a SAFETY floor and
-# the reason for the pin: through 0.1.85 `attenuate` and `clamp` intersected a deny-shaped scope
+ikigai-core = "0.1.87" # 0.1.87 = THE MODULE AUTHOR'S "WHY" (ledger #906, #907, #908), a
+# BEHAVIORAL floor with no new Rust API: `urn:kernel:explain` (a dry run of resolution: rewrites,
+# each chain member's outcome, the answering door and bindings, the scopes a capability lacks) and
+# `urn:kernel:dependents thread=` (what a cut would recompute) exist only from 0.1.87. The REPL's
+# `explain`, `why` and `dependents` (`ikigai-engine`) are thin views over those names, so below
+# 0.1.87 `explain` and `dependents` answer "unresolved" for every target. The engine tests source
+# both, so they are red below the floor. ⚠ `^0.1.87` is also a ceiling below 0.2.0.
+# Beneath it, and each called:
+# 0.1.86 = EXCLUSIONS ARE STICKY (ledger #858, #874), a SAFETY floor and
+# the reason for the pin before 0.1.87: through 0.1.85 `attenuate` and `clamp` intersected a deny-shaped scope
 # (`urn:cap:fs:read:-<path>`) like a grant, so narrowing a capability DROPPED the exclusion and
 # widened what it reached. A tenant grant of the workspace minus `other`, narrowed to the allow
 # (a delegate) or clamped by a carried allow (the QUIC door), read `other`. 0.1.86 keeps every
@@ -425,7 +433,12 @@ ikigai-core = "0.1.86" # 0.1.86 = EXCLUSIONS ARE STICKY (ledger #858, #874), a S
 # holds beneath it: below that a MOUNTED template row whose local name-guess collides with a
 # shorter sibling is dropped from the manifold, so `ikigai mcp` silently stops projecting
 # browse-pr-explain and browse-pr-review.
-ikigai-vocab = "0.1.85" # 0.1.85 = core 0.1.85's lockstep release, and NOT an API floor: no new
+ikigai-vocab = "0.1.87" # 0.1.87 = core 0.1.87's lockstep release: it adds the terms the Turtle
+# faces of `urn:kernel:explain` and `urn:kernel:dependents` emit (the dry run and its consultations,
+# the cache as a graph). Nothing here parses those faces, so it is NOT an API floor; it is raised
+# with core because this repo's tests validate against the vocabulary the lock resolves.
+# Beneath it, and each called:
+# 0.1.85 = core 0.1.85's lockstep release, and NOT an API floor: no new
 # terms (the `ik:Alias` comment now says sorted precedence). Raised with core for the reason
 # 0.1.84 was: this repo's tests validate against the vocabulary the lock resolves.
 # Beneath it, and each called:
