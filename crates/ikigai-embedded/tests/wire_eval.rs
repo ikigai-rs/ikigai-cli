@@ -25,7 +25,13 @@ fn eval(src: &str) -> Request {
 fn the_served_eval_is_governed_clamped_and_absent_without_optin() {
     // ALL process-global config — including the signed-run door's — before any
     // kernel exists; this single test fn owns it (see signed_run_door).
-    ikigai_embedded::set_eval_timeout_secs(2);
+    //
+    // ⚠ 10 s, not the 2 it was: ikigai-lisp 0.2 builds an ENGINE PER EVAL (ledger #903), and
+    // a worker builds its next one right after answering. So the warm-up below no longer
+    // makes the next eval cheap — a back-to-back eval waits out an unoptimized engine build,
+    // which on a loaded CI runner took past 2 s and timed the "granted eval runs" step out.
+    // The governor is what this test is about, and any finite budget proves it.
+    ikigai_embedded::set_eval_timeout_secs(10);
 
     // The workspace root FIRST, before any kernel: the served kernels below bind the file
     // module, the intray spaces and the client registry to `file_root()`, so without this
@@ -44,9 +50,11 @@ fn the_served_eval_is_governed_clamped_and_absent_without_optin() {
     ikigai_embedded::set_code_signers(vec!["urn:codekey:k1.pub".to_string()]);
 
     // Warm the (global) worker pool through an ungoverned kernel first: a fresh
-    // worker builds its Steel template on first use, which on a slow CI runner
-    // in a debug build can alone exceed the tight budget below — the governed
-    // assertions are about the GOVERNOR, not template build speed.
+    // worker spawns and builds its first Steel engine on first use, which on a slow
+    // CI runner in a debug build is the slowest eval there is — the governed
+    // assertions are about the GOVERNOR, not engine build speed. (Since ikigai-lisp
+    // 0.2 every eval builds an engine, so this no longer makes the next one cheap;
+    // the budget above carries that.)
     let warm = ikigai_core::Kernel::new(std::sync::Arc::new(ikigai_lisp::space()));
     block_on(warm.issue(eval("(+ 1 1)"), &Capability::root())).expect("warm-up eval");
 
@@ -68,7 +76,7 @@ fn the_served_eval_is_governed_clamped_and_absent_without_optin() {
         "the governor bounds a served runaway: {err:?}"
     );
     assert!(
-        started.elapsed() < Duration::from_secs(10),
+        started.elapsed() < Duration::from_secs(40),
         "released at the budget: {:?}",
         started.elapsed()
     );
