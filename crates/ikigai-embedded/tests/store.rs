@@ -177,3 +177,30 @@ fn the_store_resources_join_the_composed_catalog() {
         );
     }
 }
+
+/// ⚠ **Deeply nested SPARQL is refused at both SPARQL families this host binds, never
+/// parsed.** oxigraph's parser and evaluator recurse, and a stack overflow ABORTS the
+/// process rather than failing one request. Through ikigai-store 0.2.6 and ikigai-sparql
+/// 0.1.10 a few KB of nested parentheses did exactly that at every door that parses caller
+/// text; against those releases this test does not fail, it takes the test binary down with
+/// SIGABRT. The pins in the workspace manifest (store 0.2.7, ledger #915; sparql 0.1.11,
+/// ledger #962) are what make the answer a typed `InvalidArgument` naming the input instead.
+#[test]
+fn nested_sparql_is_refused_before_either_parser_sees_it() {
+    let depth = 4_000;
+    let query = format!(
+        "SELECT * WHERE {{ FILTER({}1{}) }}",
+        "(".repeat(depth),
+        ")".repeat(depth)
+    );
+    for iri in ["urn:iki:store:select", "urn:sparql:select"] {
+        match issue(&Capability::root(), Verb::Source, iri, &[("query", &query)]) {
+            Err(Error::InvalidArgument { name, .. }) => {
+                assert_eq!(name, "query", "{iri} names the input it refused")
+            }
+            other => {
+                panic!("{iri}: expected InvalidArgument for {depth}-deep SPARQL, got {other:?}")
+            }
+        }
+    }
+}

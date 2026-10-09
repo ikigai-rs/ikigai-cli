@@ -91,6 +91,23 @@ members = ["crates/*"]
 # whose tree version is ahead of crates.io. ⚠ So this comment names NO crate as
 # behind or ahead — that was a snapshot of the registry, true for one afternoon
 # and wrong the next, in the most authoritative place in the tree. Ask the gate.
+# NEXT (unreleased) — the hub cuts 0.1.43 from these lines.
+# - ikigai-engine: the REPL's why views — `explain <iri> [verb]`, `why <iri>`, `dependents
+#   <thread>`, `show <iri>` — thin views over core 0.1.87's `urn:kernel:explain`,
+#   `urn:kernel:uncached`, `urn:kernel:dependents` and `urn:kernel:cached`, so each works the
+#   same in process and over --connect (ledger #908, PR #424). Core and vocab pins rise to
+#   0.1.87 (a behavioral floor: explain/dependents exist only from it). Engine API, additive:
+#   `COMMANDS`, `Viewer` + `with_viewer`, `run_repr`.
+# - ikigai-cli: `--config-home <dir>` names the config home outright for every mode (REPL,
+#   -c, serve, mcp, --daemon, --connect, cert), absolutized, and with it XDG_CONFIG_HOME is not
+#   read for the config home (ledger #919, PR #425). The data home (~/.ikigai) stays put.
+# - ⚠ SECURITY FLOORS: ikigai-store 0.2.7 (ledger #915) and ikigai-sparql 0.1.11 (ledger
+#   #962). Through 0.2.6 / 0.1.10 a few KB of nested SPARQL aborted the whole host process (a
+#   stack overflow is an abort, not a panic) at every door that parses caller text:
+#   `urn:iki:store:*` query and update, and `urn:sparql:*`, which this host binds in every
+#   root space. Both now refuse text over 1 MiB or nested past 64 levels before parsing, and
+#   parse and evaluate on a thread sized for the text. Pins raised to those floors.
+#
 # 0.1.42: THE HOST DECIDES WHAT EACH REACTIVE SPACE FIRES, AND retry= NEEDS ITS OWN GRANT.
 # - ikigai-embedded: the HOST decides what each reactive space fires (ledger #887, the wiring
 #   the 0.1.41 `with_host_handler` seam left open). A space's `handler` file sits in the drop
@@ -572,7 +589,15 @@ ikigai-rdf = "0.1.8" # 0.1.8 = `urn:rdf:transrept` declares all seven faces it p
 # one_of/default. 0.1.9 is a dev-dependency bump for this crate only, so 0.1.8 is the true
 # minimum rather than the newest. 0.1.3 = + urn:rdf:union / urn:rdf:diff (graph set ops,
 # with= carries ?k=v args)
-ikigai-sparql = "0.1.9" # 0.1.9 REFUSES an `as=` it cannot serve, naming the target and the
+ikigai-sparql = "0.1.11" # 0.1.11 is a SECURITY floor (ledger #962): the store's parse bound
+# (ikigai-store 0.2.7, below) for `urn:sparql:*`. Every door that parses caller text — the four
+# query forms in both spaces and `urn:sparql:update` — ran oxigraph's recursive parser and
+# evaluator inline, so about 2 KB of nested SPARQL aborted a release-built host. This host binds
+# `urn:sparql:*` in every root space (`root_members`, either regime), so the abort was one query
+# away from any caller holding the space. 0.1.11 refuses text over 1 MiB or nested past 64 levels
+# before parsing (before any `graph=` source is resolved) and runs the parse, evaluation and
+# serialization on a sized stack. 0.1.10 (CSV/TSV media type) is subsumed.
+# 0.1.9 REFUSES an `as=` it cannot serve, naming the target and the
 # accepted list, where `serialize_results` used to substitute in silence — `as=text/turtle`
 # on a SELECT fell back to JSON and the caller was never told. Every SPARQL call in this
 # workspace (`route_load.rs`, one `urn:sparql:select` for the RDF route table) passes NO
@@ -861,7 +886,15 @@ ikigai-meeting = "0.1.1" # 0.1.1 runs the module's OWN rules — both Zoom hosts
 # read token (ledger #760): `ikigai-ledger`'s purge reads the graveyard. The one other behavior
 # a host can see is "two live spaces over one store forfeit coverage"; this host binds ONE space
 # per process (`STORE_SPACE`), so nothing here meets it. API: additive only.
-ikigai-store = { version = "0.2.6", features = ["persistent"] }
+# ⚠ …and 0.2.7 (ledger #915), a SECURITY floor, and the one this line states now: through 0.2.6
+# oxigraph's recursive SPARQL parser ran inline on the caller's thread, so a ~3 KB query of
+# nested parentheses at any of the ten doors that parse caller text (the eight query IRIs and
+# both updates) overflowed the stack, and a stack overflow ABORTS the process — gonk, the
+# ledger and every other tenant with it. 0.2.7 refuses text over 1 MiB or nested past 64
+# levels as a typed InvalidArgument before the parser sees it, and parses and evaluates on a
+# thread of 16 MiB + 512 B per byte of text. The safety of this host now depends on that
+# release, so the floor states it. API: additive only.
+ikigai-store = { version = "0.2.7", features = ["persistent"] }
 # The work ledger (`urn:iki:ledger:*`): items, comments, labels, links, claims and
 # `next`, as RDF in the store above. It owns no bytes — every read is a scoped SPARQL
 # query at `urn:iki:store:graph-select` and every write a scoped UPDATE at
