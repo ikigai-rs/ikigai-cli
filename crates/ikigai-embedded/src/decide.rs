@@ -647,11 +647,17 @@ impl Endpoint for DecideAccept {
         }
 
         // Hand it to the same program a person would use at the terminal.
+        //
+        // ⚠ SOURCE, not Sink, although confirming writes the calendar and sends mail: a stored
+        // program serves Source only since ikigai-lisp 0.2 (ledger #903, C-B9 — a Sink, an
+        // Exists or a Delete on a program door used to RUN it, verb unexamined), so a Sink here
+        // is refused as `InvalidArgument { name: "verb" }` and every approval clicked on the
+        // edge would stop at this line. The command is the program's DATA, read by `(input)`.
         let command = format!("({action} \"{id}\")");
         let out = inv
             .issue(
                 Request::new(
-                    Verb::Sink,
+                    Verb::Source,
                     Iri::parse("urn:booking:confirm").expect("literal IRI"),
                 )
                 .with_arg("content", ArgRef::Inline(command.into_bytes())),
@@ -1017,5 +1023,45 @@ mod endpoint_tests {
             .post_form("approve", ID, exp, &forged)
             .contains("didn't work"));
         assert!(w.dropped().is_empty());
+    }
+
+    /// ★ **An accepted decision reaches a REAL Lisp program.** The program a decision runs,
+    /// `urn:booking:confirm`, is an `ikigai_lisp::program`, and since ikigai-lisp 0.2 a program
+    /// door serves Source only (ledger #903, C-B9). This used to issue a Sink, which 0.2
+    /// refuses as `InvalidArgument { name: "verb" }` — so every approval clicked on the edge
+    /// would have been verified here and then dropped. The stand-in program echoes its
+    /// `(input)`, which is the command a person would type at the terminal.
+    #[test]
+    fn an_accepted_decision_runs_the_confirm_program_through_lisp() {
+        let w = world("accept-runs-lisp");
+        let (exp, token) = w.valid("approve");
+        w.post_form("approve", ID, exp, &token);
+        let tuple = w.dropped().pop().expect("the edge recorded the decision");
+        let kernel = Kernel::new(Arc::new(
+            EndpointSpace::new()
+                .bind(
+                    Exact::new("urn:decide:accept"),
+                    DecideAccept {
+                        key_path: w._dir.join("decide.pub"),
+                    },
+                )
+                .bind(
+                    Exact::new("urn:booking:confirm"),
+                    ikigai_lisp::program("confirm", "(input)"),
+                ),
+        ));
+        let out = block_on(
+            kernel.issue(
+                Request::new(Verb::Sink, Iri::parse("urn:decide:accept").unwrap())
+                    .with_arg("content", ArgRef::Inline(tuple.into_bytes())),
+                &Capability::root(),
+            ),
+        )
+        .expect("a decision this host signed is acted on");
+        let out = String::from_utf8(out.bytes).unwrap();
+        assert!(
+            out.contains("(approve") && out.contains(ID),
+            "the program ran on the command: {out}"
+        );
     }
 }

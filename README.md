@@ -338,6 +338,38 @@ ikigai -e '(cacheable (+ 1 2))'                 # opt-in cacheable eval
 `:lisp` opens a multi-line mode; the TUI has a **Scratch (Lisp) tab** where `F5`
 evaluates the buffer.
 
+**The sandbox is an allowlist, the REPL's included.** Since ikigai-lisp 0.2 a program
+reaches the world through the kernel verbs and a short list of pure Steel functions,
+and nothing else: `display`, `vector-ref`, `string-join`, `when` and `struct` are refused,
+and so are `require` and `defmacro`. The REPL gets no wider list on purpose: its
+`urn:lisp:eval` is the same door the IPC daemon serves to every client that holds
+`urn:cap:lisp`, so a wider evaluator would be a second door to keep off every served
+surface. The REPL prints a form's value, so `(+ 1 2)` needs no `display`. A stored
+program (`urn:booking:confirm` and the others) serves **Source** only, so it is
+invoked with `source`. A `sink` is refused.
+
+**Bounds and a governor, from the config home.** These keys go in `config.toml`. Each is
+a whole number of at least 1, and `_` separators are allowed. A bad value, an unknown
+`lisp.*` key or a key given twice stops every mode at start-up rather than reading as
+the default:
+
+| key | default | what it bounds |
+|---|---|---|
+| `lisp.timeout` | 300 | seconds any Lisp door this host runs for itself may take: `urn:lisp:eval` and every stored program. Past it the eval is interrupted and the caller gets a transient `Timeout` |
+| `lisp.workers` | available parallelism, ≥ 8 | live eval worker threads; past it, a transient `Unavailable` |
+| `lisp.worker_stack_bytes` | 128 MiB | each worker's reserved stack. Lower it only with `lisp.max_nesting`: an overflow aborts the process |
+| `lisp.max_program_bytes` | 4 MiB | program text |
+| `lisp.max_input_bytes` | 16 MiB | `(input)` data |
+| `lisp.max_nesting` | 1,000 | nesting in program text, `read` data and values passed to the s-expression compilers |
+
+The 300 s default is set by the longest legitimate handler. The booking handler on its
+live host settles in a median of 1 s, takes 5 s on its `urn:llm:ask` path and took 37 s
+at worst. `ikigai-llm` has no timeout of its own, and the operator already runs 300
+everywhere. The derivation is in `crates/ikigai-embedded/src/lisp.rs`.
+
+A served kernel runs a stranger's program under a separate, tighter budget:
+`serve --eval-timeout <s>`, default 10. When that flag is absent it reads `lisp.timeout`.
+
 **S-expressions as an RDF surface** ([`ikigai-sexpr`](https://github.com/ikigai-rs/ikigai-sexpr))
 — write queries and graphs *as data*, transrepted on the fly:
 

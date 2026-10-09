@@ -1165,6 +1165,16 @@ fn main() {
         }
     };
 
+    // ikigai-lisp's bounds, from the config home's `lisp.*` keys, fixed once and before
+    // anything can evaluate (ledger #920). A bad line stops every mode here rather than
+    // reading as the default; `--version` alone answers whatever the config says.
+    if !matches!(mode, Mode::Version) {
+        if let Err(e) = ikigai_embedded::lisp::configure() {
+            eprintln!("ikigai: {e}");
+            std::process::exit(2);
+        }
+    }
+
     // The default instance name follows the mode; an explicit --name (already
     // set during parsing) wins because set_instance_name is first-write-wins.
     #[cfg(feature = "embedded")]

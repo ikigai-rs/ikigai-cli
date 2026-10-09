@@ -3273,9 +3273,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-lisp"
-version = "0.1.15"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e9cfe31a6ff2c8dd51d9a3b8c76f772d75d38b1762e19c3ffafc478bd5df6d3"
+checksum = "d96ebdd4fa97ba12375a67bc5a0616e71ba368c40eae023576c17f331e19ce96"
 dependencies = [
  "async-trait",
  "ikigai-core",
