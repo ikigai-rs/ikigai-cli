@@ -314,11 +314,10 @@ mod tests {
             .map(|r| String::from_utf8_lossy(&r.bytes).into_owned())
     }
 
-    /// ★ **The governor stops a runaway, and stopping it releases the worker.** ikigai-lisp
-    /// 0.2 interrupts an eval whose future is dropped; this is the drop. The program loops
-    /// forever without consuming anything; the governed door answers a transient `Timeout`
-    /// near the budget, and the next eval on the same kernel still answers — the worker came
-    /// back, so a ceiling's worth of runaways cannot take the evaluator down.
+    /// ★ **The governor stops a runaway, and the evaluator survives it.** ikigai-lisp 0.2
+    /// interrupts an eval whose future is dropped, and releases its worker (pinned in that
+    /// crate); this is the drop. The program loops forever; the governed door answers a
+    /// transient `Timeout` near the budget, and the evaluator still answers afterwards.
     #[test]
     // Native-only test: the wall clock measures how long the governor took to fire.
     #[allow(clippy::disallowed_methods)]
@@ -340,9 +339,16 @@ mod tests {
             took < Duration::from_secs(20),
             "stopped near its {budget:?} budget, not by something else: {took:?}"
         );
+        // The evaluator's worker pool is process-wide, so an UNGOVERNED kernel over it shows
+        // it still answers. Not through the governed one: a debug engine build on a loaded CI
+        // runner alone can take longer than any budget short enough for a test (seen: past
+        // 3 s), and that would time the follow-up out for a reason that is not the runaway.
+        let plain = Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:lisp:eval"), ikigai_lisp::eval()),
+        ));
         for _ in 0..3 {
             assert_eq!(
-                eval(&kernel, "(+ 1 2)").expect("the evaluator survives"),
+                eval(&plain, "(+ 1 2)").expect("the evaluator survives"),
                 "3"
             );
         }
