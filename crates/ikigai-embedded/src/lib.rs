@@ -56,6 +56,7 @@ pub mod decide;
 pub mod decisions;
 pub mod foaf;
 pub mod jsonl;
+pub mod lisp;
 pub mod passkey;
 pub mod people;
 // `urn:host:posture` — what THIS PROCESS composed at startup (mounts, trusted client
@@ -1438,7 +1439,9 @@ fn local_space(nature: &'static str) -> EndpointSpace {
         // never `base_space`/`served_space`: it runs arbitrary code, so it stays off
         // served/remote transports and is gated by `urn:cap:lisp` (the embedded REPL's
         // default session is root, which covers it; a `cap`/`login`-narrowed session
-        // must hold `urn:cap:lisp` explicitly).
+        // must hold `urn:cap:lisp` explicitly). Governed at the root by a wall-clock
+        // `Timeout` (`lisp::govern`, ledger #920), which is what stops a runaway: the binding
+        // here stays plain so a declared arrangement can still name it.
         .bind(Exact::new("urn:lisp:eval"), ikigai_lisp::eval())
         .bind(
             Exact::new("urn:view:ingest"),
@@ -1698,14 +1701,21 @@ static EVAL_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(0);
 /// hostile. The threat differs by transport, so the budget has to be settable rather than
 /// fixed — and a wire-facing server should state its own with `--eval-timeout` (bug's peer
 /// plist already does).
+///
+/// ⚠ This is the budget of the wire-eval layer ([`with_wire_eval`]) only. The root's own Lisp
+/// doors — the REPL's `urn:lisp:eval` and the stored programs ([`PROGRAMS`]) — have their own
+/// governor, `lisp::host_timeout` (`lisp.timeout` → 300 s, ledger #920). With `lisp.timeout`
+/// set the two agree; without it a kernel built over [`with_wire_eval`] answers its eval at
+/// 10 s here, ahead of the root's 300.
 fn eval_timeout_secs() -> u64 {
     let flag = EVAL_TIMEOUT_SECS.load(Ordering::Relaxed);
     if flag > 0 {
         return flag;
     }
-    config::get("lisp.timeout")
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|secs| *secs > 0)
+    // Validated once (`lisp::configure`): an invalid `lisp.timeout` stops the binary at
+    // start-up instead of reading as 10 here.
+    lisp::configured_timeout()
+        .map(|budget| budget.as_secs())
         .unwrap_or(10)
 }
 static CODE_SIGNERS_DIR: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
@@ -4200,9 +4210,14 @@ fn root_space_with_mounts(mounts: Vec<MountSpec>) -> Arc<dyn Space> {
         },
     };
     let dump = arrangement::dump(&arranged.topology(), &origin, &harvest);
+    // The wall-clock governor in front of every Lisp door the host runs for itself (ledger
+    // #920): without it nothing drops a runaway eval, and ikigai-lisp interrupts only on a
+    // drop. Around the ARRANGED root, so a declared arrangement is governed too, and after the
+    // dump, which describes the arrangement rather than this host layer.
+    let governed = lisp::govern(arranged, lisp::host_timeout(), lisp_doors());
     compose_mounts(
         vec![
-            arranged,
+            governed,
             Arc::new(arrangement::dump_space(dump)) as Arc<dyn Space>,
             demo_runbook(),
         ],
@@ -4228,6 +4243,94 @@ fn demo_runbook() -> Arc<dyn Space> {
             .bind(Exact::new("urn:data:ollama-offline"), ollama_offline()),
         on: demo_flag(),
     })
+}
+
+/// A stored Lisp program this host binds as an endpoint, when the workspace provides its file.
+pub struct Program {
+    /// The door it is bound at.
+    pub iri: &'static str,
+    /// The endpoint's id (`ikigai_lisp::program`'s name), what a declared arrangement names.
+    pub id: &'static str,
+    /// Its file under the workspace ([`file_root`]).
+    pub file: &'static str,
+}
+
+/// **Every stored program the root binds** — ONE list, read by the bindings in
+/// `root_members` and by the Lisp governor in `root_space_with_mounts`, so a program added
+/// here is governed by construction (ledger #920). In resolution order. Each reaches its
+/// request as DATA via `(input)`, never as code.
+///
+/// - `urn:booking:handle` (`booking-handler.scm`, from `schedule.scm`): the reactive
+///   `bookings` space fires it on each dropped request, under that space's host-owned
+///   authority.
+/// - `urn:contact:handle` (`contact-handler.scm`): the reactive `contact` space fires it on
+///   each dropped enquiry, and it emails the enquiry on via `urn:email:send`.
+/// - `urn:contactblock:apply` (`contactblock-apply.scm`): the public `urn:contact-block` link
+///   RECORDS a verified block into `urn:space:contact-blocks`; the reactive `contact-blocks`
+///   space fires this on each drop, under that space's authority (`urn:cap:decisions:write`),
+///   and it writes the block into the edge-local `urn:decisions`. Keeping the write here — off
+///   the internet-facing HTTP ceiling — is the whole point of the airlock.
+/// - `urn:booking:confirm` (`confirm.scm`): the human step. It reads the confirmations space,
+///   and on approval writes the calendar and emails the requester. NO space fires it — it is
+///   invoked by hand, or by `urn:decide:accept` for a decision signed on the edge, because
+///   deciding to give someone your time is the one step that is meant to wait for a person.
+///   Host kernel only: it reaches the calendar, which never leaves this machine. ⚠ Invoked with
+///   SOURCE: a program door serves Source only since ikigai-lisp 0.2 (ledger #903, C-B9), so the
+///   `sink urn:booking:confirm …` its own header still documents is refused.
+/// - `urn:contact:record` (`contact-record.scm`): takes a person tuple the edge dropped (the
+///   contact handler runs on the edge, which has no people ledger) and sinks it into
+///   `urn:people`. The drain delivers to it. Host-only, beside confirm — it reaches the ledger,
+///   which never leaves this machine. ⚠ `drain.scm` delivers with `(sink to tuple)`, which
+///   ikigai-lisp 0.2 refuses on a program door, so the people leg of the drain fails — quietly:
+///   `deliver` reads the refusal as a passing fault and leaves the tuple on the edge — until
+///   ikigai-programs' drain issues a Source.
+/// - `urn:booking:drain` (`drain.scm`): reads the EDGE's bookings space (mounted here at
+///   `urn:edge:` — see `--mount`) and delivers each tuple into the LOCAL bookings space, where
+///   dropping it fires `urn:booking:handle`. Bound here and scheduled by the host's standing
+///   drain job (`drain_every`); the edge itself never runs it (the edge is the airlock — it
+///   only accepts and holds). No mount → the drain finds nothing to read and reports zero.
+pub const PROGRAMS: &[Program] = &[
+    Program {
+        iri: "urn:booking:handle",
+        id: "booking",
+        file: "booking-handler.scm",
+    },
+    Program {
+        iri: "urn:contact:handle",
+        id: "contact",
+        file: "contact-handler.scm",
+    },
+    Program {
+        iri: "urn:contactblock:apply",
+        id: "contactblock-apply",
+        file: "contactblock-apply.scm",
+    },
+    Program {
+        iri: "urn:booking:confirm",
+        id: "confirm",
+        file: "confirm.scm",
+    },
+    Program {
+        iri: "urn:contact:record",
+        id: "contact-record",
+        file: "contact-record.scm",
+    },
+    Program {
+        iri: "urn:booking:drain",
+        id: "drain",
+        file: "drain.scm",
+    },
+];
+
+/// The doors the root's Lisp governor fronts: the evaluator, the signed-run door, and every
+/// stored program ([`PROGRAMS`]).
+fn lisp_doors() -> Vec<String> {
+    lisp::DOORS
+        .iter()
+        .copied()
+        .chain(PROGRAMS.iter().map(|p| p.iri))
+        .map(str::to_string)
+        .collect()
 }
 
 /// The spaces the embedded root's built-in arrangement is composed of, in resolution order —
@@ -4409,69 +4512,16 @@ fn root_members() -> Vec<Arc<dyn Space>> {
     if let Some(space) = store::setup() {
         spaces.push(space as Arc<dyn Space>);
     }
-    // The booking handler: `schedule.scm` bound as an endpoint (`ikigai_lisp::program` — the
-    // program IS the endpoint), IF the workspace provides `booking-handler.scm`. The reactive
-    // `bookings` space fires `urn:booking:handle` on each dropped request, under that space's
-    // own scoped `cap` file. The request reaches the program as DATA via `(input)`, never as
-    // code. Absent the file, the endpoint simply isn't bound.
-    if let Ok(program) = std::fs::read_to_string(file_root().join("booking-handler.scm")) {
-        spaces.push(Arc::new(ikigai_core::EndpointSpace::new().bind(
-            Exact::new("urn:booking:handle"),
-            ikigai_lisp::program("booking", program),
-        )) as Arc<dyn Space>);
-    }
-    // Likewise the contact handler: the reactive `contact` space fires urn:contact:handle
-    // on each dropped enquiry, and the program emails it on via urn:email:send. Same
-    // "the program IS the endpoint" shape — a public enquiry is DATA read with `(input)`.
-    if let Ok(program) = std::fs::read_to_string(file_root().join("contact-handler.scm")) {
-        spaces.push(Arc::new(ikigai_core::EndpointSpace::new().bind(
-            Exact::new("urn:contact:handle"),
-            ikigai_lisp::program("contact", program),
-        )) as Arc<dyn Space>);
-    }
-    // The block-apply reactor: the public `urn:contact-block` link RECORDS a verified block
-    // into `urn:space:contact-blocks`; the reactive `contact-blocks` space fires this program
-    // on each drop, under that space's own `cap` file (`urn:cap:decisions:write`), and it
-    // writes the block into the edge-local `urn:decisions`. Keeping the write here — off the
-    // internet-facing HTTP ceiling — is the whole point of the airlock. Same "the program IS
-    // the endpoint" shape; the drop reaches it as DATA via `(input)`.
-    if let Ok(program) = std::fs::read_to_string(file_root().join("contactblock-apply.scm")) {
-        spaces.push(Arc::new(ikigai_core::EndpointSpace::new().bind(
-            Exact::new("urn:contactblock:apply"),
-            ikigai_lisp::program("contactblock-apply", program),
-        )) as Arc<dyn Space>);
-    }
-    // The human step. `confirm.scm` reads the confirmations space, and on approval writes
-    // the calendar and emails the requester. Unlike the two handlers above, NO space fires
-    // it — it is invoked by hand (`sink urn:booking:confirm (approve …)`), because deciding
-    // to give someone your time is the one step that is meant to wait for a person. Bound in
-    // the host kernel only: it reaches the calendar, which never leaves this machine.
-    if let Ok(program) = std::fs::read_to_string(file_root().join("confirm.scm")) {
-        spaces.push(Arc::new(ikigai_core::EndpointSpace::new().bind(
-            Exact::new("urn:booking:confirm"),
-            ikigai_lisp::program("confirm", program),
-        )) as Arc<dyn Space>);
-    }
-    // Recording a drained contact. `contact-record.scm` takes a person tuple the edge dropped
-    // (the contact handler runs on the edge, which has no people ledger) and sinks it into
-    // `urn:people`. The drain delivers to it (see drain.scm's people leg). Host-only, beside
-    // confirm — it reaches the ledger, which never leaves this machine.
-    if let Ok(program) = std::fs::read_to_string(file_root().join("contact-record.scm")) {
-        spaces.push(Arc::new(ikigai_core::EndpointSpace::new().bind(
-            Exact::new("urn:contact:record"),
-            ikigai_lisp::program("contact-record", program),
-        )) as Arc<dyn Space>);
-    }
-    // The drain. `drain.scm` reads the EDGE's bookings space (mounted here at `urn:edge:` —
-    // see `--mount`) and delivers each tuple into the LOCAL bookings space, where dropping it
-    // fires `urn:booking:handle`. It is bound here and scheduled below; the edge itself never
-    // runs it (the edge is the airlock — it only accepts and holds). No mount → the drain
-    // simply finds nothing to read and reports zero.
-    if let Ok(program) = std::fs::read_to_string(file_root().join("drain.scm")) {
-        spaces.push(Arc::new(ikigai_core::EndpointSpace::new().bind(
-            Exact::new("urn:booking:drain"),
-            ikigai_lisp::program("drain", program),
-        )) as Arc<dyn Space>);
+    // The stored programs (`PROGRAMS`): each bound as an endpoint — the program IS the
+    // endpoint — IF the workspace provides its file. Absent the file, the endpoint simply
+    // isn't bound. One space per program, in table order, as they always were.
+    for program in PROGRAMS {
+        if let Ok(text) = std::fs::read_to_string(file_root().join(program.file)) {
+            spaces.push(Arc::new(ikigai_core::EndpointSpace::new().bind(
+                Exact::new(program.iri),
+                ikigai_lisp::program(program.id, text),
+            )) as Arc<dyn Space>);
+        }
     }
     // The two halves of the decision loop that must stay on this machine: minting a link
     // (it signs, so it touches the private key) and acting on a decision that came back

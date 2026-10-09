@@ -106,7 +106,37 @@ members = ["crates/*"]
 #   stack overflow is an abort, not a panic) at every door that parses caller text:
 #   `urn:iki:store:*` query and update, and `urn:sparql:*`, which this host binds in every
 #   root space. Both now refuse text over 1 MiB or nested past 64 levels before parsing, and
-#   parse and evaluate on a thread sized for the text. Pins raised to those floors.
+#   parse and evaluate on a thread sized for the text. Pins raised to those floors (PR #426).
+# - ⚠ ikigai-lisp 0.1.15 → 0.2.0, a BREAKING minor and a SECURITY floor (ledger #903, #920): the
+#   program-visible world is an allowlist, an engine is built per eval, nesting and sizes are
+#   bounded and an eval whose future is dropped is INTERRUPTED. Operator-visible:
+#   - `display`, `vector-ref`, `string-join`, `when`, `struct`, `require` and `defmacro` are
+#     refused in every Lisp this host runs, the REPL's included (no operator-only widening).
+#   - A stored program (`urn:booking:confirm`, `urn:contact:record`, …) and `urn:lisp:eval`
+#     serve SOURCE only; a Sink, Exists or Delete is refused as `InvalidArgument { name:
+#     "verb" }`. `urn:decide:accept` ran confirm with a Sink, so every edge-signed approval
+#     would have stopped there: it now issues a Source (reproduced, and pinned by
+#     `an_accepted_decision_runs_the_confirm_program_through_lisp`). ⚠ NOT fixable here:
+#     ikigai-programs' `drain.scm` delivers the people leg with `(sink "urn:contact:record" …)`,
+#     which 0.2 refuses, and `deliver` reads the refusal as a passing fault, so drained people
+#     stay on the edge until drain.scm issues a Source. confirm.scm's header documents
+#     `sink urn:booking:confirm …` for the operator; that form is refused too.
+#   - `IKIGAI_LISP_WORKERS` is gone. The bounds come from the config home: `lisp.workers`,
+#     `lisp.worker_stack_bytes`, `lisp.max_program_bytes`, `lisp.max_input_bytes`,
+#     `lisp.max_nesting` (ikigai-lisp's defaults), fixed once before the first eval
+#     (`ikigai_embedded::lisp::configure`, called by the binary at start-up). A bad value, an
+#     unknown `lisp.*` key or a key given twice stops every mode with exit 2. `lisp.timeout`
+#     was read leniently before (garbage or 0 read as 10); it is validated the same way now.
+# - ikigai-embedded: the root governs every Lisp door it runs for itself — `urn:lisp:eval`,
+#   `urn:lisp:run` and the six stored programs (`PROGRAMS`, now one table) — with
+#   `ikigai-throttle`'s `Timeout` (`lisp::govern`), so a runaway in the REPL, `-c`/`-e`, MCP or a
+#   reactive handler is interrupted and its worker released (ledger #87 closes for this host).
+#   Budget `lisp.timeout`, default 300 s: the booking handler's longest observed legitimate run
+#   was 37 s (median 1 s, 5 s on its LLM path), `ikigai-llm` has no timeout of its own, and both
+#   live hosts already set 300. Wraps the ARRANGED root, so a declared arrangement is governed
+#   too and its doors stay nameable. The wire-eval budget (`--eval-timeout` → `lisp.timeout` →
+#   10 s) is unchanged. New public API: `lisp` module, `PROGRAMS`/`Program`,
+#   `config::entries_under`.
 #
 # 0.1.42: THE HOST DECIDES WHAT EACH REACTIVE SPACE FIRES, AND retry= NEEDS ITS OWN GRANT.
 # - ikigai-embedded: the HOST decides what each reactive space fires (ledger #887, the wiring
@@ -779,7 +809,21 @@ ikigai-browse = "0.5.0" # 0.5.0 (ledger #444) is a BEHAVIOURAL break this host d
 # 0.2.11 it also leaked the light theme into dark mode, rendering parameters at 1.03:1.
 # Steel-backed Lisp evaluator (urn:lisp:eval): code is a resource, builtins ARE the
 # cap-scoped kernel verbs. Embedded-only (arbitrary code); gated by urn:cap:lisp.
-ikigai-lisp = "0.1.15" # Two floors, both behavioural, both with named sites here.
+# ⚠ 0.2.0 is a BREAKING minor and a SECURITY floor (ledger #903, audit round 6), and
+# `"0.2.0"` is a RANGE `>=0.2.0, <0.3.0`. Below it a program holding only `urn:cap:lisp` could
+# reach about 1,800 Steel globals beside the kernel verbs (environment, argv, process and git
+# modules, runtime `eval`, the host's stdio) and `require` any file the service user could
+# read; nothing bounded nesting, so one deeply nested program ABORTED the host on a stack
+# overflow; one warm engine was cloned per eval, so a `define-syntax` from one caller rewrote
+# the next caller's program; and nothing could stop a runaway. 0.2.0 builds the program-visible
+# world from an allowlist (`require`, `defmacro`, and Sink/Delete through `urn:lisp:run` are
+# refused), builds an engine per eval, bounds nesting and sizes and runs each worker on a sized
+# stack (`Limits`, which this host sets from the config home's `lisp.*` keys —
+# `crates/ikigai-embedded/src/lisp.rs`), and INTERRUPTS an eval whose future is dropped — which
+# is only a fix in a host that drops it, so the root governs every Lisp door with a `Timeout`
+# (ledger #920, #87). `IKIGAI_LISP_WORKERS` is gone; `lisp.workers` replaces it.
+# The floors below are still true and subsumed:
+ikigai-lisp = "0.2.0" # Two earlier floors, both behavioural, both with named sites here.
 # 0.1.13: Steel keeps ONE module-global reader that never cleared on a mid-form eof, so a
 # single malformed input left a partial form in it and POISONED every later `read` in that
 # worker for the life of the process. This host runs `urn:lisp:eval` on a long-lived worker,

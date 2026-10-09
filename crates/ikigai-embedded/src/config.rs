@@ -174,6 +174,32 @@ pub fn all(key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Every `key = value` line whose key begins with `prefix`, in file order, as
+/// `(key, value)` — for a family of settings that is validated as a whole, so a misspelled
+/// key is reported rather than silently ignored (the `lisp.*` bounds read it).
+pub fn entries_under(prefix: &str) -> Vec<(String, String)> {
+    std::fs::read_to_string(config_path())
+        .map(|text| entries_under_in(&text, prefix))
+        .unwrap_or_default()
+}
+
+/// The `(key, value)` lines of `text` whose key begins with `prefix`. See [`value_for`] for
+/// the parsing rules.
+pub(crate) fn entries_under_in(text: &str, prefix: &str) -> Vec<(String, String)> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| line.split_once('='))
+        .filter(|(name, _)| name.trim().starts_with(prefix))
+        .map(|(name, value)| {
+            (
+                name.trim().to_string(),
+                value.trim().trim_matches(['"', '\'']).trim().to_string(),
+            )
+        })
+        .collect()
+}
+
 /// The instance names that SCOPE `key` in the file — the `<instance>` of every
 /// `<instance>.<key> = …` line, in file order, deduped.
 ///
