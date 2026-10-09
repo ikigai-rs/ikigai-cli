@@ -156,9 +156,26 @@ pub(crate) fn setup() -> Option<Browse> {
     }
 
     Some(Browse {
-        space: ikigai_browse::space_with_explain(roots, explain),
+        space: browse_space(roots, explain),
         store,
     })
+}
+
+/// The browse mount over `roots`. Its `urn:browse:style` reads `a11y.toml` layers from a
+/// config home of its own choosing — the environment's, unless the host STATES one — so a
+/// `--config-home` flag is handed on here, or browse alone would still read the
+/// environment's config home (ledger #919). Without the flag this is exactly
+/// `space_with_explain`.
+fn browse_space(
+    roots: Vec<(String, PathBuf)>,
+    explain: ikigai_browse::ExplainConfig,
+) -> ikigai_core::EndpointSpace {
+    let mount = ikigai_browse::Mount::new(roots).explain(explain);
+    match crate::config::config_home_flag() {
+        Some(home) => mount.config_home(Some(home.to_path_buf())),
+        None => mount,
+    }
+    .space()
 }
 
 /// The configured roots: one root line per `browse.root` (or scoped

@@ -276,13 +276,28 @@ fn path() -> Option<PathBuf> {
         // Named in full rather than imported: the type is used only on this side of the
         // `cfg`, and an import that one configuration does not reach is an unused-import
         // error under `-D warnings`.
-        let config =
-            ikigai_store::StoreConfig::load(Some(crate::instance_name())).unwrap_or_else(|e| {
-                panic!(
-                    "ikigai: `store` is on for this instance but the store configuration \
+        // A `--config-home` flag names where `store.toml` lives (ledger #919); the store's own
+        // `load` would read the environment's config home instead.
+        let config = match crate::config::config_home_flag() {
+            Some(home) => ikigai_core::config::data_home()
+                .ok_or_else(|| {
+                    ikigai_core::Error::Endpoint(
+                        "no ikigai data home: HOME is not set, so the durable store has no \
+                         default location"
+                            .to_string(),
+                    )
+                })
+                .and_then(|data| {
+                    ikigai_store::StoreConfig::load_in(home, &data, Some(crate::instance_name()))
+                }),
+            None => ikigai_store::StoreConfig::load(Some(crate::instance_name())),
+        }
+        .unwrap_or_else(|e| {
+            panic!(
+                "ikigai: `store` is on for this instance but the store configuration \
                  cannot be read: {e}"
-                )
-            });
+            )
+        });
         Some(config.path)
     }
 }

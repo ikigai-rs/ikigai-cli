@@ -8,6 +8,35 @@
 //! grows a real parser if and when the config does.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
+
+/// The config home a `--config-home` flag named for this process; see [`set_config_home`].
+static FLAG_HOME: OnceLock<PathBuf> = OnceLock::new();
+
+/// Name this process's config home outright, as the CLI's `--config-home` flag does (ledger
+/// #919): [`path`] is then `<dir>/config.toml`, and `XDG_CONFIG_HOME`/`HOME` are not consulted
+/// — an explicit flag wins over the environment. `dir` IS the config home (not an XDG base)
+/// and must be absolute. The TWIN of `ikigai_embedded::config::set_config_home`, for the
+/// reason [`path`] is the twin of that crate's `config_home`; the binary sets both. Setting it
+/// again to the same directory is a no-op, to a different one is refused.
+pub fn set_config_home(dir: PathBuf) -> Result<(), String> {
+    if !dir.is_absolute() {
+        return Err(format!(
+            "the config home must be an absolute path, and `{}` is not",
+            dir.display()
+        ));
+    }
+    match FLAG_HOME.get() {
+        Some(prior) if *prior == dir => Ok(()),
+        Some(prior) => Err(format!(
+            "the config home is already `{}`; a process has one",
+            prior.display()
+        )),
+        None => FLAG_HOME
+            .set(dir)
+            .map_err(|_| "the config home was set concurrently".to_string()),
+    }
+}
 
 /// Which keybinding scheme the TUI input line uses.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
@@ -58,10 +87,14 @@ pub fn keybindings_supported(value: &str) -> bool {
     Keybindings::parse(value).is_some()
 }
 
+/// `<--config-home>/config.toml` when the flag named one ([`set_config_home`]), else
 /// `$XDG_CONFIG_HOME/ikigai/config.toml`, or `$HOME/.config/...` when
 /// `XDG_CONFIG_HOME` is unset. `None` if neither base directory is known. The
 /// same file the host reads `mail.*` from — one shared config home.
 pub fn path() -> Option<PathBuf> {
+    if let Some(home) = FLAG_HOME.get() {
+        return Some(home.join("config.toml"));
+    }
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
