@@ -326,24 +326,42 @@ fn a_map_over_a_fork_is_refused_not_degraded() {
 }
 
 #[test]
-fn a_plan_carrying_named_results_is_refused_rather_than_run_without_them() {
-    // Named results (`x = …`, `@x`) are the next arc. Nothing emits ik:binds or ik:ref
-    // yet — but a graph that carries them means something this engine cannot honour, and
-    // running it with the references dropped would be a different plan that looked fine.
-    let (engine, _, stored) = fixture();
+fn a_plan_carrying_named_results_runs_them_rather_than_dropping_them() {
+    // Named results (`x = …`, `@x`) have no text-face spelling yet, but a graph can carry
+    // them, and the runner honors them: a reference to a bound name is an EDGE, so the
+    // binder runs first and its bytes are the argument. (Until ledger #956 this graph was
+    // refused, because running it with the references DROPPED would have been a different
+    // plan that looked fine.)
+    let (engine, log, stored) = fixture();
     *stored.lock().expect("stored") = r#"
 @prefix ik: <https://ikigai-rs.dev/ns#> .
 <urn:plan:named> a ik:Process ;
-    ik:step <urn:plan:named:step:1> ;
-    ik:result <urn:plan:named:step:1> .
+    ik:step <urn:plan:named:step:1> , <urn:plan:named:step:2> ;
+    ik:result <urn:plan:named:step:2> .
 <urn:plan:named:step:1> a ik:Step ;
     ik:verb "Source" ;
     ik:resolves <urn:t:up> ;
-    ik:binds "greeting" .
+    ik:binds "greeting" ;
+    ik:argument <urn:plan:named:step:1:arg:in> .
+<urn:plan:named:step:1:arg:in> a ik:Argument ; ik:inputName "in" ; ik:value "hi" .
+<urn:plan:named:step:2> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:t:down> ;
+    ik:argument <urn:plan:named:step:2:arg:in> .
+<urn:plan:named:step:2:arg:in> a ik:Argument ;
+    ik:inputName "in" ;
+    ik:ref <urn:plan:named:var:greeting> .
 "#
     .to_string();
-    let err = output(engine.eval("run urn:t:plan")).unwrap_err();
-    assert!(err.contains("ik:binds"), "{err}");
+    let answer = output(engine.eval("run urn:t:plan")).expect("runs");
+    assert_eq!(answer, "down(up(hi))");
+    assert_eq!(
+        drain(&log),
+        vec![
+            "Source urn:t:up [in=hi]".to_string(),
+            "Source urn:t:down [in=up(hi)]".to_string(),
+        ]
+    );
 }
 
 #[test]

@@ -1,0 +1,100 @@
+# Variant 2 of the link check — REPAIR INSTEAD OF REMOVE: add stages. A durably-gone link
+# is looked up in the archive and rewritten rather than struck. New behavior with no new
+# Rust in the CMS: two stages naming two resources, and `urn:wayback:latest` is general.
+# The validator checks the route (the archive's output type -> the replace sink's input)
+# before anything runs, or refuses the plan.
+#
+# --- text face ---
+#   urls    = source urn:cms:bookmarks root=@root as=text/uri-list
+#   checks  = @urls .. urn:http:reachable ttl=@ttl
+#   verdict = @checks .. urn:cms:policy:lenient
+#   dead    = @verdict .. urn:cms:policy:only-gone
+#   found   = @dead .. urn:wayback:latest
+#   sink urn:cms:link-replace content=@found
+# --- end text face ---
+#
+# Not yet existing, named as the shape the following arcs build toward:
+# `urn:cms:policy:lenient` and `urn:cms:policy:only-gone` (decision tables — the second a
+# filter that keeps only the `gone` verdicts), `urn:wayback:latest` (the Internet Archive's
+# latest capture of a URL, a general resource that belongs beside ikigai-http), and a
+# plan-driven `urn:cms:link-replace` Sink (rewrite a bookmark's URL in place; today's
+# `RemoveLinks` only strikes).
+
+@prefix ik:   <https://ikigai-rs.dev/ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+
+<urn:plan:linkcheck-repair> a ik:Process ;
+    rdfs:label "CMS link check, repair from the archive" ;
+    ik:input <urn:plan:linkcheck-repair:input:root> , <urn:plan:linkcheck-repair:input:ttl> ;
+    ik:output "text/plain" ;
+    ik:requires <urn:cap:net:*> , <urn:cap:fs:write:*> ;
+    ik:step <urn:plan:linkcheck-repair:step:1> , <urn:plan:linkcheck-repair:step:2> ,
+            <urn:plan:linkcheck-repair:step:3> , <urn:plan:linkcheck-repair:step:4> ,
+            <urn:plan:linkcheck-repair:step:5> , <urn:plan:linkcheck-repair:step:6> ;
+    ik:result <urn:plan:linkcheck-repair:step:6> .
+
+<urn:plan:linkcheck-repair:input:root> ik:inputName "root" ;
+    ik:source "argument" ;
+    ik:required false ;
+    ik:class rdfs:Resource ;
+    ik:default "urn:cms:graph" .
+
+<urn:plan:linkcheck-repair:input:ttl> ik:inputName "ttl" ;
+    ik:source "argument" ;
+    ik:required false ;
+    ik:class xsd:integer ;
+    ik:default "604800" .
+
+<urn:plan:linkcheck-repair:step:1> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:cms:bookmarks> ;
+    ik:binds "urls" ;
+    ik:argument <urn:plan:linkcheck-repair:step:1:arg:root> , <urn:plan:linkcheck-repair:step:1:arg:as> .
+
+<urn:plan:linkcheck-repair:step:1:arg:root> a ik:Argument ;
+    ik:inputName "root" ;
+    ik:ref <urn:plan:linkcheck-repair:var:root> .
+
+<urn:plan:linkcheck-repair:step:1:arg:as> a ik:Argument ;
+    ik:inputName "as" ;
+    ik:value "text/uri-list" .
+
+<urn:plan:linkcheck-repair:step:2> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:http:reachable> ;
+    ik:binds "checks" ;
+    ik:mapOver <urn:plan:linkcheck-repair:step:1> ;
+    ik:argument <urn:plan:linkcheck-repair:step:2:arg:ttl> .
+
+<urn:plan:linkcheck-repair:step:2:arg:ttl> a ik:Argument ;
+    ik:inputName "ttl" ;
+    ik:ref <urn:plan:linkcheck-repair:var:ttl> .
+
+<urn:plan:linkcheck-repair:step:3> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:cms:policy:lenient> ;
+    ik:binds "verdict" ;
+    ik:mapOver <urn:plan:linkcheck-repair:step:2> .
+
+# The two added stages: keep the gone ones, look each up in the archive.
+<urn:plan:linkcheck-repair:step:4> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:cms:policy:only-gone> ;
+    ik:binds "dead" ;
+    ik:mapOver <urn:plan:linkcheck-repair:step:3> .
+
+<urn:plan:linkcheck-repair:step:5> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:wayback:latest> ;
+    ik:binds "found" ;
+    ik:mapOver <urn:plan:linkcheck-repair:step:4> .
+
+<urn:plan:linkcheck-repair:step:6> a ik:Step ;
+    ik:verb "Sink" ;
+    ik:resolves <urn:cms:link-replace> ;
+    ik:argument <urn:plan:linkcheck-repair:step:6:arg:content> .
+
+<urn:plan:linkcheck-repair:step:6:arg:content> a ik:Argument ;
+    ik:inputName "content" ;
+    ik:ref <urn:plan:linkcheck-repair:var:found> .

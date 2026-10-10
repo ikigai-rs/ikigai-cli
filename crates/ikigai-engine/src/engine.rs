@@ -24,7 +24,7 @@ use futures::executor::block_on;
 use futures::future::join_all;
 use ikigai_core::{
     ArgRef, BoxFuture, Capability, Description, Expiry, FixedClock, InputSource, Iri, Provenance,
-    Representation, Request, Scope, Space, Spawner, Thread, TraceEvent, Tracer, Verb,
+    ReprType, Representation, Request, Scope, Space, Spawner, Thread, TraceEvent, Tracer, Verb,
 };
 use ikigai_resolve::{CacheStatus, Resolver};
 
@@ -44,6 +44,31 @@ pub(crate) struct Staged {
     pub(crate) bytes: Vec<u8>,
     expiry: Expiry,
     threads: BTreeSet<Thread>,
+    /// The media type the stage was served as, parameters included — `None` for a join
+    /// (fork branches or mapped items rejoined with newlines), which is newline-joined text
+    /// whatever its parts were. Only `urn:plan:eval` reads it: a terminal prints bytes, but
+    /// a resource has to say what it answered with.
+    #[cfg_attr(
+        not(feature = "plan-reader"),
+        allow(
+            dead_code,
+            reason = "read only by `plan_space`, which is the plan-reader feature's"
+        )
+    )]
+    pub(crate) media: Option<ReprType>,
+}
+
+impl From<Representation> for Staged {
+    fn from(representation: Representation) -> Self {
+        let expiry = representation.expiry;
+        let threads = representation.threads().clone();
+        Staged {
+            media: Some(representation.repr_type),
+            bytes: representation.bytes,
+            expiry,
+            threads,
+        }
+    }
 }
 
 impl Staged {
@@ -91,6 +116,7 @@ pub(crate) fn combine_outputs(parts: Vec<Staged>) -> Staged {
         bytes,
         expiry,
         threads,
+        media: None,
     }
 }
 
@@ -1123,13 +1149,7 @@ impl Engine {
                 .expect("spawned branch completed")
                 .map_err(|e| describe(&*self.resolver, &e))?;
             stats.record(status);
-            let expiry = representation.expiry;
-            let threads = representation.threads().clone();
-            outputs.push(Staged {
-                bytes: representation.bytes,
-                expiry,
-                threads,
-            });
+            outputs.push(Staged::from(representation));
         }
         self.cache.set(stats);
         Ok(outputs)
@@ -1808,14 +1828,7 @@ impl Engine {
         request: Request,
         incoming: Option<Provenance>,
     ) -> Result<Staged, String> {
-        let representation = self.run_repr(request, incoming).await?;
-        let expiry = representation.expiry;
-        let threads = representation.threads().clone();
-        Ok(Staged {
-            bytes: representation.bytes,
-            expiry,
-            threads,
-        })
+        Ok(Staged::from(self.run_repr(request, incoming).await?))
     }
 
     /// Issue a request in the line's chain under the session capability, record how the cache

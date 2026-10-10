@@ -1,0 +1,88 @@
+# Variant 1 of the link check — HOW AGGRESSIVE REMOVAL IS: swap a stage's resource and
+# the terminal sink. The classification the Rust pass hard-codes (`removable`,
+# `durably_unreachable`) becomes a decision-table resource the plan names:
+# `urn:cms:policy:strict` (unreachable thirty days -> gone), and the verdicts go straight
+# to `urn:cms:link-remove`. The lenient twin is one word and one sink away —
+# `urn:cms:policy:lenient` (ninety days across three passes) sinking to
+# `urn:cms:review-queue`, a human queue — two `urn:program:` resources, diffable; run
+# both against the same `@checks` and compare sinks before trusting the strict one.
+#
+# --- text face ---
+#   urls    = source urn:cms:bookmarks root=@root as=text/uri-list
+#   checks  = @urls .. urn:http:reachable ttl=@ttl
+#   verdict = @checks .. urn:cms:policy:strict
+#   sink urn:cms:link-remove content=@verdict
+# --- end text face ---
+#
+# Not yet existing, named as the shape the following arcs build toward: `urn:cms:policy:*`
+# (a decision table over outcome and age, reading the clock from the kernel), and a
+# plan-driven `urn:cms:link-remove` Sink (today it is `RemoveLinks`, a purge under human
+# authorization; the policy resource is where that authorization moves). The result is the
+# unnamed sink step: a step need not bind a name to be the answer.
+
+@prefix ik:   <https://ikigai-rs.dev/ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+
+<urn:plan:linkcheck-strict> a ik:Process ;
+    rdfs:label "CMS link check, strict removal" ;
+    ik:input <urn:plan:linkcheck-strict:input:root> , <urn:plan:linkcheck-strict:input:ttl> ;
+    ik:output "text/plain" ;
+    ik:requires <urn:cap:net:*> , <urn:cap:fs:write:*> ;
+    ik:step <urn:plan:linkcheck-strict:step:1> , <urn:plan:linkcheck-strict:step:2> ,
+            <urn:plan:linkcheck-strict:step:3> , <urn:plan:linkcheck-strict:step:4> ;
+    ik:result <urn:plan:linkcheck-strict:step:4> .
+
+<urn:plan:linkcheck-strict:input:root> ik:inputName "root" ;
+    ik:source "argument" ;
+    ik:required false ;
+    ik:class rdfs:Resource ;
+    ik:default "urn:cms:graph" .
+
+<urn:plan:linkcheck-strict:input:ttl> ik:inputName "ttl" ;
+    ik:source "argument" ;
+    ik:required false ;
+    ik:class xsd:integer ;
+    ik:default "604800" .
+
+<urn:plan:linkcheck-strict:step:1> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:cms:bookmarks> ;
+    ik:binds "urls" ;
+    ik:argument <urn:plan:linkcheck-strict:step:1:arg:root> , <urn:plan:linkcheck-strict:step:1:arg:as> .
+
+<urn:plan:linkcheck-strict:step:1:arg:root> a ik:Argument ;
+    ik:inputName "root" ;
+    ik:ref <urn:plan:linkcheck-strict:var:root> .
+
+<urn:plan:linkcheck-strict:step:1:arg:as> a ik:Argument ;
+    ik:inputName "as" ;
+    ik:value "text/uri-list" .
+
+<urn:plan:linkcheck-strict:step:2> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:http:reachable> ;
+    ik:binds "checks" ;
+    ik:mapOver <urn:plan:linkcheck-strict:step:1> ;
+    ik:argument <urn:plan:linkcheck-strict:step:2:arg:ttl> .
+
+<urn:plan:linkcheck-strict:step:2:arg:ttl> a ik:Argument ;
+    ik:inputName "ttl" ;
+    ik:ref <urn:plan:linkcheck-strict:var:ttl> .
+
+# verdict = @checks .. urn:cms:policy:strict  — the one word that differs from lenient
+<urn:plan:linkcheck-strict:step:3> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:cms:policy:strict> ;
+    ik:binds "verdict" ;
+    ik:mapOver <urn:plan:linkcheck-strict:step:2> .
+
+# sink urn:cms:link-remove content=@verdict  — the terminal sink that differs from lenient
+<urn:plan:linkcheck-strict:step:4> a ik:Step ;
+    ik:verb "Sink" ;
+    ik:resolves <urn:cms:link-remove> ;
+    ik:argument <urn:plan:linkcheck-strict:step:4:arg:content> .
+
+<urn:plan:linkcheck-strict:step:4:arg:content> a ik:Argument ;
+    ik:inputName "content" ;
+    ik:ref <urn:plan:linkcheck-strict:var:verdict> .

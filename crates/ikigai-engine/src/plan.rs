@@ -7,8 +7,11 @@
 //!
 //! * [`Engine::build_plan`] parses a spec and resolves it into a [`Plan`];
 //!   [`Plan::to_turtle`] renders that as a graph — the `plan <spec>` command.
-//! * [`Plan::from_turtle`] reads such a graph back and [`Engine::execute_plan`] runs it —
-//!   the `run <spec>` command, which resolves a resource and executes what it holds.
+//! * [`Plan::from_turtle`] reads such a graph back and [`execute`] runs it — the
+//!   `run <spec>` command, which resolves a resource and executes what it holds, AND
+//!   `urn:plan:eval` (see `plan_space`), which runs the plan it is handed. **One runner**:
+//!   both call [`execute`], each through its own [`PlanHost`] — the REPL's session
+//!   ([`Engine`]) or the invocation that is serving the resource.
 //!
 //! **Why bother**: a workflow that is a graph is a file you can diff, sign, review in a
 //! pull request, and *refuse before it runs*. A shell pipeline can be none of those.
@@ -26,20 +29,32 @@
 //! input is not an argument, it arrives through `ik:pipeFrom` / `ik:mapOver`. So the plan
 //! names the edge and the host routes it at run time, exactly as the text face does.
 //!
+//! ## Named results and parameters
+//!
+//! A graph may bind a step's representation to a name (`ik:binds`), declare the plan's
+//! own parameters (`ik:input` ArgSpec nodes), and pass either to a step by reference
+//! (`ik:ref <urn:plan:{id}:var:{name}>`). The runner executes all three: a reference to a
+//! bound name is an EDGE (the binder runs first, its bytes are the argument), a reference
+//! to a parameter is the value the caller supplied or the parameter's `ik:default`, and a
+//! reference to any other IRI is sourced and its representation passed. The text face has
+//! no spelling for them yet (`x = …`, `@x`), so [`Engine::build_plan`] never emits them.
+//!
+//! An `ik:ref` edge is the one the SHACL shapes cannot follow (it goes through a NAME, a
+//! hop no property path takes), so the reader closes it here: a plan whose references make
+//! a cycle is refused before anything runs, wherever the cycle is — not only on the part
+//! the result reaches.
+//!
 //! ## What is deliberately not here
 //!
-//! * **Named results** (`x = …`, `@x` — `ik:binds`, `ik:ref`, a process's `ik:input`).
-//!   The grammar has no spelling for them yet, so nothing emits them; a graph that
-//!   *carries* them is REFUSED rather than run with the references quietly dropped.
 //! * **Conditionals and loops.** A plan is deliberately not Turing complete — that is
 //!   what makes it total, validatable and refusable. When a plan cannot express
 //!   something the answer is a new *resource* (`urn:iki:fn:conditional` is branching as a
 //!   resource, and being a resource it recomputes and can take the other branch when a
 //!   thread is cut), never new syntax.
-//! * **`ik:requires` and `ik:output`** — the capability union and the result's media
-//!   type. Both are optional in the shapes, and computing either honestly needs every
-//!   step's contract; a *partial* union is worse than none, because it would let a
-//!   pre-flight pass a plan the kernel then denies. The plan validator arc owns them.
+//! * **`ik:requires` and `ik:output` as INPUT.** A graph may carry them (the fixtures do),
+//!   and the reader ignores them: what a plan needs is derived from its steps' contracts
+//!   by `urn:plan:requires`, never believed from the plan, because a plan that understated
+//!   its needs would let a pre-flight pass a plan the kernel then denies.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -53,7 +68,7 @@ use oxrdf::{NamedOrBlankNode, Term};
 use oxttl::TurtleParser;
 
 #[cfg(feature = "plan-reader")]
-use ikigai_core::{ArgRef, Request};
+use ikigai_core::{ArgRef, Description, Provenance, Request};
 
 #[cfg(feature = "plan-reader")]
 use crate::engine::{combine_outputs, root_provenance, Staged};
@@ -64,9 +79,9 @@ use crate::engine::{
 
 /// The ikigai vocabulary namespace — the terms a plan graph is written in.
 #[cfg(feature = "plan-reader")]
-const IK: &str = "https://ikigai-rs.dev/ns#";
+pub(crate) const IK: &str = "https://ikigai-rs.dev/ns#";
 #[cfg(feature = "plan-reader")]
-const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+pub(crate) const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
 /// A node of a plan: a step, or a fork — which stands where a step can, as an upstream or
 /// as the plan's result.
@@ -89,6 +104,36 @@ pub(crate) enum Feed {
     Branch { fork: usize, order: usize },
 }
 
+/// What a by-reference argument (`ik:ref`) names.
+#[derive(Clone, PartialEq, Eq, Debug)]
+#[cfg_attr(
+    not(feature = "plan-reader"),
+    allow(
+        dead_code,
+        reason = "only the reader constructs a reference; the renderer, always built, writes one"
+    )
+)]
+pub(crate) enum RefTo {
+    /// `@name` — `urn:plan:{id}:var:{name}`: a step's `ik:binds` or one of the plan's own
+    /// parameters, which share one namespace.
+    Name(String),
+    /// Any other resource: sourced when the step runs, and its representation passed.
+    Resource(Iri),
+}
+
+/// A declared parameter of a plan — the ArgSpec node an endpoint would carry as `ik:input`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Param {
+    pub name: String,
+    pub required: bool,
+    pub default: Option<String>,
+    /// `ik:source` — "argument" or "binding". Either way the value arrives BY NAME at run
+    /// time; the mode is carried so a stored plan describes itself as an endpoint does.
+    pub source: Option<String>,
+    pub class: Option<String>,
+    pub summary: Option<String>,
+}
+
 /// One request of a plan: one verb against one IRI, with named arguments.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct Step {
@@ -97,6 +142,11 @@ pub(crate) struct Step {
     /// Named arguments carrying literal values, sorted by name — so the graph a spec
     /// renders to is canonical and two plans diff on meaning rather than word order.
     pub arguments: BTreeMap<String, String>,
+    /// Named arguments carrying a reference (`ik:ref`), sorted by name. Disjoint from
+    /// `arguments`: an argument is given once, one way.
+    pub refs: BTreeMap<String, RefTo>,
+    /// `ik:binds` — the name this step's representation is bound to, if any.
+    pub binds: Option<String>,
     pub feed: Feed,
 }
 
@@ -107,11 +157,14 @@ pub(crate) struct Fork {
     pub upstream: Option<NodeRef>,
 }
 
-/// A plan: the steps, the forks, and which node's representation is the answer.
+/// A plan: the parameters, the steps, the forks, and which node's representation is the
+/// answer.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct Plan {
     /// `{plan-id}` — the content address of the spec, for an anonymous plan.
     pub id: String,
+    /// The plan's declared parameters, sorted by name.
+    pub params: Vec<Param>,
     /// Steps in text-face order; index `i` is `urn:plan:{id}:step:{i + 1}`.
     pub steps: Vec<Step>,
     /// Forks in text-face order; index `i` is `urn:plan:{id}:fork:{i + 1}`.
@@ -127,7 +180,7 @@ impl Plan {
         ikigai_vocab::plan::process_iri(&self.id)
     }
 
-    fn node_iri(&self, node: NodeRef) -> String {
+    pub(crate) fn node_iri(&self, node: NodeRef) -> String {
         match node {
             NodeRef::Step(i) => ikigai_vocab::plan::step_iri(&self.id, i + 1),
             NodeRef::Fork(i) => ikigai_vocab::plan::fork_iri(&self.id, i + 1),
@@ -152,6 +205,17 @@ impl Plan {
         if let Some(text) = text_face {
             out.push_str(&format!("    rdfs:comment {} ;\n", literal(text)));
         }
+        if !self.params.is_empty() {
+            let inputs: Vec<String> = self
+                .params
+                .iter()
+                .map(|param| format!("<{}>", ikigai_vocab::plan::input_iri(&self.id, &param.name)))
+                .collect();
+            out.push_str(&format!(
+                "    ik:input {} ;\n",
+                inputs.join(" ,\n             ")
+            ));
+        }
         let steps: Vec<String> = (0..self.steps.len())
             .map(|i| format!("<{}>", self.node_iri(NodeRef::Step(i))))
             .collect();
@@ -160,6 +224,28 @@ impl Plan {
             steps.join(" ,\n            "),
             self.node_iri(self.result)
         ));
+
+        for param in &self.params {
+            out.push_str(&format!(
+                "\n<{}> ik:inputName {} ;\n",
+                ikigai_vocab::plan::input_iri(&self.id, &param.name),
+                literal(&param.name)
+            ));
+            if let Some(source) = &param.source {
+                out.push_str(&format!("    ik:source {} ;\n", literal(source)));
+            }
+            if let Some(summary) = &param.summary {
+                out.push_str(&format!("    ik:summary {} ;\n", literal(summary)));
+            }
+            if let Some(class) = &param.class {
+                out.push_str(&format!("    ik:class <{class}> ;\n"));
+            }
+            if let Some(default) = &param.default {
+                out.push_str(&format!("    ik:default {} ;\n", literal(default)));
+            }
+            // A Turtle boolean literal: `xsd:boolean`, which the parameter shape requires.
+            out.push_str(&format!("    ik:required {} .\n", param.required));
+        }
 
         for (i, fork) in self.forks.iter().enumerate() {
             out.push_str(&format!(
@@ -184,6 +270,9 @@ impl Plan {
             ));
             out.push_str(&format!("    ik:verb \"{}\" ;\n", verb_name(step.verb)));
             out.push_str(&format!("    ik:resolves <{}> ;\n", step.resolves.as_str()));
+            if let Some(name) = &step.binds {
+                out.push_str(&format!("    ik:binds {} ;\n", literal(name)));
+            }
             match step.feed {
                 Feed::None => {}
                 Feed::Pipe(up) => {
@@ -199,9 +288,13 @@ impl Plan {
                     ));
                 }
             }
-            let args: Vec<String> = step
-                .arguments
-                .keys()
+            // By value and by reference, one sorted list: the argument IRI is named by the
+            // argument, so the two kinds interleave in the graph exactly as they would in
+            // the text face's words.
+            let mut names: Vec<&String> = step.arguments.keys().chain(step.refs.keys()).collect();
+            names.sort();
+            let args: Vec<String> = names
+                .iter()
                 .map(|name| format!("<{}>", self.argument_iri(i, name)))
                 .collect();
             if args.is_empty() {
@@ -212,12 +305,19 @@ impl Plan {
                     "    ik:argument {} .\n",
                     args.join(" ,\n                ")
                 ));
-                for (name, value) in &step.arguments {
+                for name in names {
+                    let object = match (step.arguments.get(name), step.refs.get(name)) {
+                        (Some(value), _) => format!("ik:value {}", literal(value)),
+                        (None, Some(RefTo::Name(var))) => {
+                            format!("ik:ref <{}>", ikigai_vocab::plan::var_iri(&self.id, var))
+                        }
+                        (None, Some(RefTo::Resource(iri))) => format!("ik:ref <{}>", iri.as_str()),
+                        (None, None) => unreachable!("the name came from one of the two maps"),
+                    };
                     out.push_str(&format!(
-                        "\n<{}> a ik:Argument ;\n    ik:inputName {} ;\n    ik:value {} .\n",
+                        "\n<{}> a ik:Argument ;\n    ik:inputName {} ;\n    {object} .\n",
                         self.argument_iri(i, name),
                         literal(name),
-                        literal(value)
                     ));
                 }
             }
@@ -240,7 +340,7 @@ fn close_description(out: &mut String) {
     }
 }
 
-fn verb_name(verb: Verb) -> &'static str {
+pub(crate) fn verb_name(verb: Verb) -> &'static str {
     match verb {
         Verb::Source => "Source",
         Verb::Sink => "Sink",
@@ -268,7 +368,7 @@ fn parse_verb(name: &str) -> Option<Verb> {
 /// private. The rule is small, and the alternative — emitting an author's text
 /// unescaped — is a parse failure for every consumer, so it is restated rather than
 /// worked around.
-fn literal(s: &str) -> String {
+pub(crate) fn literal(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
@@ -283,6 +383,15 @@ fn literal(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// A name a plan binds — a step's `ik:binds` or a parameter's `ik:inputName` — is an
+/// identifier: the pattern both shapes state, `^[A-Za-z_][A-Za-z0-9_-]*$`.
+#[cfg(feature = "plan-reader")]
+fn is_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 // --- reading -----------------------------------------------------------------
@@ -417,6 +526,50 @@ fn blank_node_refusal(label: &str) -> String {
     )
 }
 
+/// Which rule a refused plan broke: the one the shapes cannot see, or any other.
+///
+/// The distinction is for `urn:plan:validate`, which reports a reader refusal beside the
+/// SHACL report: a CYCLE is the check the shapes' own header hands to "the validator arc"
+/// (a reference goes through a name, a hop no property path takes), and every other
+/// refusal is a graph this executor cannot run as written.
+#[cfg(feature = "plan-reader")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RefusalKind {
+    /// The plan is not a DAG, counting the edges an `ik:ref` makes through a bound name.
+    Cycle,
+    /// Anything else the reader refuses.
+    Unexecutable,
+}
+
+#[cfg(feature = "plan-reader")]
+impl RefusalKind {
+    /// The IRI `urn:plan:validate` names the check by, in `sh:sourceConstraint`.
+    pub(crate) fn check_iri(self) -> &'static str {
+        match self {
+            RefusalKind::Cycle => "urn:ikigai:plan:check:acyclic",
+            RefusalKind::Unexecutable => "urn:ikigai:plan:check:executable",
+        }
+    }
+}
+
+/// Why the reader refused a graph.
+#[cfg(feature = "plan-reader")]
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Refusal {
+    pub kind: RefusalKind,
+    pub message: String,
+}
+
+#[cfg(feature = "plan-reader")]
+impl From<String> for Refusal {
+    fn from(message: String) -> Self {
+        Refusal {
+            kind: RefusalKind::Unexecutable,
+            message,
+        }
+    }
+}
+
 #[cfg(feature = "plan-reader")]
 impl Plan {
     /// Read a plan back out of an `ik:Process` graph.
@@ -424,16 +577,26 @@ impl Plan {
     /// Strict on purpose: a plan is a thing you *refuse before it runs*, so anything this
     /// engine cannot execute exactly as written is an error rather than a best effort.
     pub fn from_turtle(turtle: &str) -> Result<Plan, String> {
+        Plan::read(turtle).map_err(|refusal| refusal.message)
+    }
+
+    /// [`from_turtle`](Self::from_turtle), saying which kind of rule a refusal broke.
+    pub(crate) fn read(turtle: &str) -> Result<Plan, Refusal> {
         let graph = Graph::parse(turtle)?;
 
         let plan_iri = match graph.of_class("Process").as_slice() {
             [only] => (*only).to_string(),
-            [] => return Err("no ik:Process in this graph — it is not a plan".to_string()),
+            [] => {
+                return Err("no ik:Process in this graph — it is not a plan"
+                    .to_string()
+                    .into())
+            }
             many => {
                 return Err(format!(
                     "{} ik:Process nodes in one graph; a plan resource holds exactly one",
                     many.len()
-                ))
+                )
+                .into())
             }
         };
         let id = plan_iri
@@ -441,20 +604,11 @@ impl Plan {
             .ok_or_else(|| format!("a plan is named `urn:plan:{{id}}`, not <{plan_iri}>"))?
             .to_string();
 
-        // Named results are step 3. A graph that carries them means something this engine
-        // cannot yet honour, and running it with the references dropped would be a
-        // different plan that looked like it worked.
-        for (subject, predicates) in &graph.subjects {
-            for term in ["binds", "ref", "input"] {
-                if predicates.contains_key(&format!("{IK}{term}")) {
-                    return Err(format!(
-                        "<{subject}> uses ik:{term} — named results (`x = …`, `@x`) are not \
-                         executable yet, and a plan that names them will not be run with the \
-                         references dropped"
-                    ));
-                }
-            }
+        let mut params = Vec::new();
+        for object in graph.objects(&plan_iri, "input") {
+            params.push(read_param(&graph, object.iri(&plan_iri, "input")?)?);
         }
+        params.sort_by(|a, b| a.name.cmp(&b.name));
 
         let step_iris = ordered_steps(&graph, &plan_iri)?;
         let fork_iris = ordered_forks(&graph, &plan_iri);
@@ -476,9 +630,10 @@ impl Plan {
                 .ok_or_else(|| format!("<{iri}> ({whose}) is not a step or fork of <{plan_iri}>"))
         };
 
+        let var_prefix = format!("{plan_iri}:var:");
         let mut steps = Vec::with_capacity(step_iris.len());
         for step_iri in &step_iris {
-            steps.push(read_step(&graph, step_iri, &node_ref)?);
+            steps.push(read_step(&graph, step_iri, &var_prefix, &node_ref)?);
         }
 
         let mut forks = Vec::with_capacity(fork_iris.len());
@@ -496,7 +651,8 @@ impl Plan {
                     return Err(format!(
                         "<{fork_iri}> joins its branches by \"{join}\"; this engine performs \
                          only the \"newline\" join"
-                    ));
+                    )
+                    .into());
                 }
             }
             forks.push(Fork { upstream });
@@ -509,6 +665,7 @@ impl Plan {
 
         let plan = Plan {
             id,
+            params,
             steps,
             forks,
             result,
@@ -517,42 +674,168 @@ impl Plan {
         Ok(plan)
     }
 
+    /// The step that binds `name`, if one does (a parameter is a name too, but not a step).
+    pub(crate) fn binder(&self, name: &str) -> Option<usize> {
+        self.steps
+            .iter()
+            .position(|step| step.binds.as_deref() == Some(name))
+    }
+
     /// The structural rules a reader must hold that reading one node at a time cannot
-    /// see. The SHACL shapes state all of these too — but a graph is validated by
-    /// whoever chooses to, and an executor may not assume anyone did.
-    fn check(&self) -> Result<(), String> {
+    /// see. The SHACL shapes state most of these too — but a graph is validated by
+    /// whoever chooses to, and an executor may not assume anyone did. Acyclicity through
+    /// a named reference is one the shapes CANNOT state, and it is checked here for the
+    /// whole graph, not only the part the result reaches.
+    fn check(&self) -> Result<(), Refusal> {
+        // Single assignment: a name is bound once, across steps and parameters.
+        let mut bound: BTreeMap<&str, usize> = BTreeMap::new();
+        for name in self
+            .params
+            .iter()
+            .map(|param| param.name.as_str())
+            .chain(self.steps.iter().filter_map(|step| step.binds.as_deref()))
+        {
+            *bound.entry(name).or_default() += 1;
+        }
+        if let Some((name, count)) = bound.iter().find(|(_, count)| **count > 1) {
+            return Err(format!(
+                "<{}> binds the name `{name}` {count} times — a plan is single-assignment, \
+                 across its steps' ik:binds and its parameters",
+                self.iri()
+            )
+            .into());
+        }
         for (i, step) in self.steps.iter().enumerate() {
+            for (argument, to) in &step.refs {
+                if let RefTo::Name(name) = to {
+                    if !bound.contains_key(name.as_str()) {
+                        return Err(format!(
+                            "<{}> passes `{argument}=@{name}`, a name this plan never binds",
+                            self.node_iri(NodeRef::Step(i))
+                        )
+                        .into());
+                    }
+                }
+            }
             if step.verb == Verb::Sink
                 && !matches!(step.feed, Feed::None)
-                && step.arguments.contains_key("content")
+                && (step.arguments.contains_key("content") || step.refs.contains_key("content"))
             {
                 return Err(format!(
                     "<{}> is fed by the plan AND names `content` — two bodies, with no rule \
                      for choosing between them",
                     self.node_iri(NodeRef::Step(i))
-                ));
+                )
+                .into());
             }
             if let Feed::Branch { fork, .. } = step.feed {
                 if fork >= self.forks.len() {
                     return Err(format!(
                         "<{}> is a branch of a fork this plan does not hold",
                         self.node_iri(NodeRef::Step(i))
-                    ));
+                    )
+                    .into());
                 }
             }
         }
-        // Every fork has at least one branch, and its branches join in distinct order —
-        // both of which `branch_tails` needs to be true before it walks anything.
-        for fork in 0..self.forks.len() {
-            self.branch_tails(fork)?;
+        // Every node, so a cycle among steps the result never reaches is refused too: a
+        // plan is a graph someone reviews, and a cyclic one is wrong wherever it is. This
+        // also takes every fork's branch tails, so a fork with no branch, two branches at
+        // one order, or a branch with no single tail is refused here.
+        let mut marks = BTreeMap::new();
+        let nodes = (0..self.steps.len())
+            .map(NodeRef::Step)
+            .chain((0..self.forks.len()).map(NodeRef::Fork));
+        for node in nodes {
+            self.visit(node, &mut marks, &mut Vec::new(), &mut Vec::new())?;
         }
+        Ok(())
+    }
+
+    /// The nodes a run evaluates, dependencies first: everything the result depends on,
+    /// and nothing else — the plan is a dependency graph, not a script.
+    pub(crate) fn run_order(&self) -> Result<Vec<NodeRef>, Refusal> {
+        let mut order = Vec::new();
+        self.visit(
+            self.result,
+            &mut BTreeMap::new(),
+            &mut Vec::new(),
+            &mut order,
+        )?;
+        Ok(order)
+    }
+
+    /// What `node` needs before it can run: its feed's upstream, the steps that bind the
+    /// names its arguments reference (the edge the shapes cannot follow), and — for a
+    /// fork — the tail of each branch, in join order.
+    fn deps(&self, node: NodeRef) -> Result<Vec<NodeRef>, Refusal> {
+        match node {
+            NodeRef::Fork(fork) => self.branch_tails(fork),
+            NodeRef::Step(index) => {
+                let step = &self.steps[index];
+                let mut deps = Vec::new();
+                match step.feed {
+                    Feed::None => {}
+                    Feed::Pipe(up) | Feed::Map(up) => deps.push(up),
+                    Feed::Branch { fork, .. } => deps.extend(self.forks[fork].upstream),
+                }
+                for to in step.refs.values() {
+                    if let RefTo::Name(name) = to {
+                        deps.extend(self.binder(name).map(NodeRef::Step));
+                    }
+                }
+                Ok(deps)
+            }
+        }
+    }
+
+    /// Depth-first, dependencies first. `marks` holds `false` while a node is on the
+    /// current path and `true` once it is done, so meeting a `false` is a cycle — and the
+    /// path says which nodes close it.
+    fn visit(
+        &self,
+        node: NodeRef,
+        marks: &mut BTreeMap<NodeRef, bool>,
+        path: &mut Vec<NodeRef>,
+        order: &mut Vec<NodeRef>,
+    ) -> Result<(), Refusal> {
+        match marks.get(&node) {
+            Some(true) => return Ok(()),
+            Some(false) => {
+                let start = path.iter().position(|n| *n == node).unwrap_or(0);
+                let cycle: Vec<String> = path[start..]
+                    .iter()
+                    .chain(std::iter::once(&node))
+                    .map(|n| format!("<{}>", self.node_iri(*n)))
+                    .collect();
+                return Err(Refusal {
+                    kind: RefusalKind::Cycle,
+                    message: format!(
+                        "<{}> depends on itself — a plan is a DAG, and this one is not: {} \
+                         (each node needs the next, counting the edge an ik:ref makes through \
+                         a bound name)",
+                        self.node_iri(node),
+                        cycle.join(" → ")
+                    ),
+                });
+            }
+            None => {}
+        }
+        marks.insert(node, false);
+        path.push(node);
+        for dep in self.deps(node)? {
+            self.visit(dep, marks, path, order)?;
+        }
+        path.pop();
+        marks.insert(node, true);
+        order.push(node);
         Ok(())
     }
 
     /// The tail of each branch of `fork`, in join order: the branches are the steps whose
     /// `ik:forkOf` names it, and a branch that is itself a pipeline is the chain from
     /// that head — what the fork joins is the chain's last node.
-    fn branch_tails(&self, fork: usize) -> Result<Vec<NodeRef>, String> {
+    pub(crate) fn branch_tails(&self, fork: usize) -> Result<Vec<NodeRef>, Refusal> {
         let mut heads: Vec<(usize, usize)> = self
             .steps
             .iter()
@@ -567,13 +850,15 @@ impl Plan {
             return Err(format!(
                 "<{}> has no branch (no step names it with ik:forkOf)",
                 self.node_iri(NodeRef::Fork(fork))
-            ));
+            )
+            .into());
         }
         if heads.windows(2).any(|pair| pair[0].0 == pair[1].0) {
             return Err(format!(
                 "<{}> has two branches at the same ik:order, so the join has no order",
                 self.node_iri(NodeRef::Fork(fork))
-            ));
+            )
+            .into());
         }
         heads
             .into_iter()
@@ -582,7 +867,7 @@ impl Plan {
     }
 
     /// Follow the chain forward from a branch head to the node nothing else consumes.
-    fn chain_tail(&self, head: NodeRef) -> Result<NodeRef, String> {
+    fn chain_tail(&self, head: NodeRef) -> Result<NodeRef, Refusal> {
         let mut current = head;
         for _ in 0..=(self.steps.len() + self.forks.len()) {
             let mut next = Vec::new();
@@ -605,14 +890,18 @@ impl Plan {
                          tail for a fork to join",
                         self.node_iri(current),
                         many.len()
-                    ))
+                    )
+                    .into())
                 }
             }
         }
-        Err(format!(
-            "the edges from <{}> form a cycle — a plan is a DAG",
-            self.node_iri(head)
-        ))
+        Err(Refusal {
+            kind: RefusalKind::Cycle,
+            message: format!(
+                "the edges from <{}> form a cycle — a plan is a DAG",
+                self.node_iri(head)
+            ),
+        })
     }
 }
 
@@ -665,10 +954,68 @@ fn number_by_iri(iris: &mut Vec<String>, prefix: &str) {
     iris.dedup();
 }
 
+/// One `ik:input` ArgSpec node of the process.
+#[cfg(feature = "plan-reader")]
+fn read_param(graph: &Graph, node: &str) -> Result<Param, String> {
+    let name = graph
+        .one(node, "inputName")?
+        .literal(node, "inputName")?
+        .to_string();
+    if !is_identifier(&name) {
+        return Err(format!(
+            "<{node}> names the parameter `{name}`; a parameter name is an identifier \
+             (letters, digits, _ and -)"
+        ));
+    }
+    let source = match graph.at_most_one(node, "source")? {
+        None => None,
+        Some(object) => match object.literal(node, "source")? {
+            mode @ ("argument" | "binding") => Some(mode.to_string()),
+            other => {
+                return Err(format!(
+                    "<{node}> ik:source \"{other}\" — a parameter arrives as an \"argument\" \
+                     or a \"binding\""
+                ))
+            }
+        },
+    };
+    let required = match graph.at_most_one(node, "required")? {
+        // An ArgSpec is required unless it says otherwise — the same default
+        // `ArgSpec::new` has, so a plan's parameter means what an endpoint's input means.
+        None => true,
+        Some(object) => match object.literal(node, "required")? {
+            "true" | "1" => true,
+            "false" | "0" => false,
+            other => return Err(format!("<{node}> ik:required \"{other}\" is not a boolean")),
+        },
+    };
+    let default = graph
+        .at_most_one(node, "default")?
+        .map(|object| object.literal(node, "default").map(str::to_string))
+        .transpose()?;
+    let class = graph
+        .at_most_one(node, "class")?
+        .map(|object| object.iri(node, "class").map(str::to_string))
+        .transpose()?;
+    let summary = graph
+        .at_most_one(node, "summary")?
+        .map(|object| object.literal(node, "summary").map(str::to_string))
+        .transpose()?;
+    Ok(Param {
+        name,
+        required,
+        default,
+        source,
+        class,
+        summary,
+    })
+}
+
 #[cfg(feature = "plan-reader")]
 fn read_step(
     graph: &Graph,
     step_iri: &str,
+    var_prefix: &str,
     node_ref: &impl Fn(&str, &str) -> Result<NodeRef, String>,
 ) -> Result<Step, String> {
     let verb_name = graph.one(step_iri, "verb")?.literal(step_iri, "verb")?;
@@ -680,6 +1027,20 @@ fn read_step(
     })?;
     let resolves = graph.one(step_iri, "resolves")?.iri(step_iri, "resolves")?;
     let resolves = Iri::parse(resolves).map_err(|e| format!("<{step_iri}> ik:resolves: {e}"))?;
+
+    let binds = match graph.at_most_one(step_iri, "binds")? {
+        None => None,
+        Some(object) => {
+            let name = object.literal(step_iri, "binds")?;
+            if !is_identifier(name) {
+                return Err(format!(
+                    "<{step_iri}> binds `{name}`; a bound name is an identifier (letters, \
+                     digits, _ and -)"
+                ));
+            }
+            Some(name.to_string())
+        }
+    };
 
     let pipe = graph.at_most_one(step_iri, "pipeFrom")?;
     let map = graph.at_most_one(step_iri, "mapOver")?;
@@ -722,20 +1083,51 @@ fn read_step(
     };
 
     let mut arguments = BTreeMap::new();
+    let mut refs = BTreeMap::new();
     for object in graph.objects(step_iri, "argument") {
         let arg_iri = object.iri(step_iri, "argument")?;
         let name = graph
             .one(arg_iri, "inputName")?
             .literal(arg_iri, "inputName")?
             .to_string();
-        let value = graph
-            .one(arg_iri, "value")?
-            .literal(arg_iri, "value")?
-            .to_string();
-        if arguments.insert(name.clone(), value).is_some() {
+        if arguments.contains_key(&name) || refs.contains_key(&name) {
             return Err(format!(
                 "<{step_iri}> gives the argument `{name}` more than once"
             ));
+        }
+        match (
+            graph.at_most_one(arg_iri, "value")?,
+            graph.at_most_one(arg_iri, "ref")?,
+        ) {
+            (Some(value), None) => {
+                arguments.insert(name, value.literal(arg_iri, "value")?.to_string());
+            }
+            (None, Some(target)) => {
+                let target = target.iri(arg_iri, "ref")?;
+                let to = match target.strip_prefix(var_prefix) {
+                    Some(var) if is_identifier(var) => RefTo::Name(var.to_string()),
+                    Some(var) => {
+                        return Err(format!(
+                            "<{arg_iri}> references `@{var}`; a bound name is an identifier"
+                        ))
+                    }
+                    None => RefTo::Resource(
+                        Iri::parse(target).map_err(|e| format!("<{arg_iri}> ik:ref: {e}"))?,
+                    ),
+                };
+                refs.insert(name, to);
+            }
+            _ => {
+                return Err(format!(
+                    "<{arg_iri}> carries {} — an argument carries exactly one of ik:value \
+                     and ik:ref",
+                    if graph.objects(arg_iri, "value").is_empty() {
+                        "neither ik:value nor ik:ref"
+                    } else {
+                        "both ik:value and ik:ref"
+                    }
+                ))
+            }
         }
     }
 
@@ -743,6 +1135,8 @@ fn read_step(
         verb,
         resolves,
         arguments,
+        refs,
+        binds,
         feed,
     })
 }
@@ -760,7 +1154,7 @@ struct Builder {
 impl Engine {
     /// Parse a pipeline spec and resolve it into a [`Plan`].
     ///
-    /// Contracts are consulted exactly where the text face consults them — to recognise a
+    /// Contracts are consulted exactly where the text face consults them — to recognize a
     /// `key=value` word as a named argument, and to route a positional value — so a plan
     /// is what the spec *means*, resolved once, rather than a transcription of its words.
     pub(crate) async fn build_plan(&self, spec: &str) -> Result<Plan, String> {
@@ -774,6 +1168,9 @@ impl Engine {
             // An anonymous plan is named by its content, so the same spec is the same
             // plan wherever it is rendered and two renders of it diff to nothing.
             id: ContentId::of(spec.trim().as_bytes()).to_string(),
+            // The text face has no spelling for parameters, named results or references
+            // yet, so a rendered plan carries none of them.
+            params: Vec::new(),
             steps: builder.steps,
             forks: builder.forks,
             result,
@@ -860,6 +1257,8 @@ impl Engine {
                             verb: Verb::Source,
                             resolves: iri,
                             arguments,
+                            refs: BTreeMap::new(),
+                            binds: None,
                             feed,
                         },
                     ))
@@ -910,6 +1309,8 @@ impl Engine {
                             verb: Verb::Sink,
                             resolves: iri,
                             arguments,
+                            refs: BTreeMap::new(),
+                            binds: None,
                             feed,
                         },
                     ))
@@ -968,126 +1369,290 @@ fn push_step(builder: &RefCell<Builder>, step: Step) -> NodeRef {
 
 // --- executing a plan ---------------------------------------------------------
 
-/// Per-run state: each node's representation, computed once, and the stack that catches a
-/// cycle the shapes did not (a graph is validated by whoever chooses to).
+/// What the runner needs from whoever is running a plan: a way to issue a step's request
+/// and a way to read a target's contract. Two hosts, one runner — the REPL session
+/// ([`Engine`]: the session's capability, the line's chain, the cache tally) and the
+/// invocation serving `urn:plan:eval` (the CALLER's capability, every step recorded as a
+/// dependency of the answer, so it is exactly as cacheable as its least cacheable step).
+///
+/// `async fn` in a crate-private trait on purpose: the runner is generic over the host, so
+/// whether its future is `Send` is decided per host — the invocation's is (an endpoint's
+/// future must be), the session's is not (the REPL is single-threaded by design) — without
+/// a second copy of the runner for each.
 #[cfg(feature = "plan-reader")]
-#[derive(Default)]
-struct Run {
-    done: RefCell<BTreeMap<NodeRef, Staged>>,
-    visiting: RefCell<Vec<NodeRef>>,
+pub(crate) trait PlanHost {
+    /// How a failed request is reported — kept as the host's own type, so a typed
+    /// `Denied` from a step reaches `urn:plan:eval`'s caller as a typed `Denied`.
+    type Error;
+
+    /// Issue one request. `incoming` is the provenance of everything the request was built
+    /// from (its feed and its references), for a host that folds it into the result's
+    /// cacheability itself; a host whose sub-requests are recorded for it may ignore it.
+    async fn issue(&self, request: Request, incoming: Provenance) -> Result<Staged, Self::Error>;
+
+    /// The target's contract, for routing a fed value — `None` when it cannot be read,
+    /// which routes to the conventional `in` exactly as the text face does.
+    async fn describe(&self, iri: &Iri) -> Option<Description>;
+
+    /// A fan-out happened, `nominal` wide, and ran sequentially.
+    fn fan_out(&self, _nominal: usize) {}
+}
+
+/// Why a run did not produce an answer.
+#[cfg(feature = "plan-reader")]
+#[derive(Debug)]
+pub(crate) enum RunError<E> {
+    /// The plan cannot run as written: a structural refusal, a value the routing rule
+    /// cannot place, a map over bytes that are not text.
+    Plan(String),
+    /// A supplied parameter the plan does not declare.
+    Parameter { name: String, detail: String },
+    /// A required parameter with no default, and no value supplied.
+    MissingParameter(String),
+    /// A step's request failed; the host's error, untouched.
+    Step(E),
 }
 
 #[cfg(feature = "plan-reader")]
-impl Engine {
-    /// Run a plan and return the representation of its `ik:result`.
-    ///
-    /// Nodes nothing reaches from the result are not run — the plan is a dependency
-    /// graph, not a script, so what runs is what the answer depends on.
-    pub(crate) async fn execute_plan(&self, plan: &Plan) -> Result<Staged, String> {
-        let run = Run::default();
-        self.eval_node(plan, plan.result, &run).await
+impl RunError<String> {
+    /// The message a text face prints.
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            RunError::Plan(message) | RunError::Step(message) => message,
+            RunError::Parameter { detail, .. } => detail,
+            RunError::MissingParameter(name) => format!(
+                "the plan's parameter `{name}` is required and has no default, and `run` \
+                 supplies no parameters — give it an ik:default, or evaluate the plan through \
+                 `urn:plan:eval` with `{name}` as an argument"
+            ),
+        }
     }
+}
 
-    fn eval_node<'a>(
-        &'a self,
-        plan: &'a Plan,
-        node: NodeRef,
-        run: &'a Run,
-    ) -> Pin<Box<dyn Future<Output = Result<Staged, String>> + 'a>> {
-        Box::pin(async move {
-            if let Some(staged) = run.done.borrow().get(&node) {
-                return Ok(staged.clone());
+#[cfg(feature = "plan-reader")]
+impl Plan {
+    /// Every parameter's value for one run: what the caller supplied, else its
+    /// `ik:default`, else nothing (an optional parameter with no default is left UNSET —
+    /// a step's argument referencing it is omitted, as an unset optional input is).
+    pub(crate) fn parameter_values<E>(
+        &self,
+        supplied: &BTreeMap<String, String>,
+    ) -> Result<BTreeMap<String, Option<String>>, RunError<E>> {
+        if let Some(unknown) = supplied
+            .keys()
+            .find(|name| !self.params.iter().any(|param| &param.name == *name))
+        {
+            let declared: Vec<&str> = self.params.iter().map(|p| p.name.as_str()).collect();
+            return Err(RunError::Parameter {
+                name: unknown.clone(),
+                detail: format!(
+                    "<{}> declares no parameter `{unknown}` (it declares {})",
+                    self.iri(),
+                    if declared.is_empty() {
+                        "none".to_string()
+                    } else {
+                        declared.join(", ")
+                    }
+                ),
+            });
+        }
+        let mut values = BTreeMap::new();
+        for param in &self.params {
+            let value = supplied
+                .get(&param.name)
+                .cloned()
+                .or_else(|| param.default.clone());
+            if value.is_none() && param.required {
+                return Err(RunError::MissingParameter(param.name.clone()));
             }
-            {
-                let mut visiting = run.visiting.borrow_mut();
-                if visiting.contains(&node) {
-                    return Err(format!(
-                        "<{}> depends on itself — a plan is a DAG",
-                        plan.node_iri(node)
-                    ));
+            values.insert(param.name.clone(), value);
+        }
+        Ok(values)
+    }
+}
+
+/// Run a plan and return the representation of its `ik:result`.
+///
+/// THE runner — the REPL's `run` and `urn:plan:eval` both call it. Nodes nothing reaches
+/// from the result are not run: the plan is a dependency graph, not a script, so what runs
+/// is what the answer depends on, dependencies first ([`Plan::run_order`]). Sequential:
+/// a fork's branches and a map's items run one after another.
+#[cfg(feature = "plan-reader")]
+pub(crate) async fn execute<H: PlanHost>(
+    host: &H,
+    plan: &Plan,
+    supplied: &BTreeMap<String, String>,
+) -> Result<Staged, RunError<H::Error>> {
+    let values = plan.parameter_values(supplied)?;
+    let order = plan
+        .run_order()
+        .map_err(|refusal| RunError::Plan(refusal.message))?;
+    let mut done: BTreeMap<NodeRef, Staged> = BTreeMap::new();
+    for node in order {
+        let staged = match node {
+            NodeRef::Step(index) => run_step(host, plan, index, &done, &values).await?,
+            NodeRef::Fork(index) => {
+                let tails = plan
+                    .branch_tails(index)
+                    .map_err(|refusal| RunError::Plan(refusal.message))?;
+                // Sequential, so the achieved width is 1 however many branches there are —
+                // the same honest number `run_node`'s no-spawner fork path records. ⚠ The
+                // text face has a concurrent path for single-`source` branches
+                // (`run_parallel`); a plan does not yet, so moving a wide fork into a plan
+                // costs its concurrency today.
+                host.fan_out(tails.len());
+                combine_outputs(tails.iter().map(|tail| done[tail].clone()).collect())
+            }
+        };
+        done.insert(node, staged);
+    }
+    Ok(done
+        .remove(&plan.result)
+        .expect("the result is the last node of its own run order"))
+}
+
+/// One step: its arguments (by value, and by reference — resolved once, for every item of
+/// a map), then its request — once, or once per item of a mapped upstream.
+#[cfg(feature = "plan-reader")]
+async fn run_step<H: PlanHost>(
+    host: &H,
+    plan: &Plan,
+    index: usize,
+    done: &BTreeMap<NodeRef, Staged>,
+    values: &BTreeMap<String, Option<String>>,
+) -> Result<Staged, RunError<H::Error>> {
+    let step = &plan.steps[index];
+    let upstream: Option<&Staged> = match step.feed {
+        Feed::None => None,
+        Feed::Pipe(up) | Feed::Map(up) => Some(&done[&up]),
+        Feed::Branch { fork, .. } => plan.forks[fork].upstream.map(|up| &done[&up]),
+    };
+
+    let mut arguments: Vec<(String, Vec<u8>)> = step
+        .arguments
+        .iter()
+        .map(|(name, value)| (name.clone(), value.as_bytes().to_vec()))
+        .collect();
+    // Everything the request is built from, for its provenance: the feed, every bound
+    // name it references, and every resource it sources.
+    let mut inputs: Vec<Provenance> = upstream.iter().map(|up| up.provenance()).collect();
+    for (name, to) in &step.refs {
+        match to {
+            RefTo::Name(var) => match plan.binder(var) {
+                Some(binder) => {
+                    let bound = &done[&NodeRef::Step(binder)];
+                    arguments.push((name.clone(), bound.bytes.clone()));
+                    inputs.push(bound.provenance());
                 }
-                visiting.push(node);
-            }
-            let staged = match node {
-                NodeRef::Step(index) => self.eval_step(plan, index, run).await,
-                NodeRef::Fork(index) => self.eval_fork(plan, index, run).await,
-            };
-            run.visiting.borrow_mut().pop();
-            let staged = staged?;
-            run.done.borrow_mut().insert(node, staged.clone());
-            Ok(staged)
-        })
-    }
-
-    async fn eval_step(&self, plan: &Plan, index: usize, run: &Run) -> Result<Staged, String> {
-        let step = &plan.steps[index];
-        let upstream = match step.feed {
-            Feed::None => None,
-            Feed::Pipe(up) | Feed::Map(up) => Some(self.eval_node(plan, up, run).await?),
-            Feed::Branch { fork, .. } => match plan.forks[fork].upstream {
-                Some(up) => Some(self.eval_node(plan, up, run).await?),
-                None => None,
+                // A parameter: its value for this run, or — unset and optional — no
+                // argument at all.
+                None => {
+                    if let Some(Some(value)) = values.get(var) {
+                        arguments.push((name.clone(), value.as_bytes().to_vec()));
+                    }
+                }
             },
-        };
-        let Some(upstream) = upstream else {
-            let request = self.plan_request(step, None).await?;
-            return self.run_staged(request, Some(root_provenance())).await;
-        };
-        if !matches!(step.feed, Feed::Map(_)) {
-            let request = self.plan_request(step, Some(&upstream.bytes)).await?;
-            return self.run_staged(request, Some(upstream.provenance())).await;
+            RefTo::Resource(iri) => {
+                let sourced = host
+                    .issue(Request::new(Verb::Source, iri.clone()), root_provenance())
+                    .await
+                    .map_err(RunError::Step)?;
+                inputs.push(sourced.provenance());
+                arguments.push((name.clone(), sourced.bytes));
+            }
         }
-
-        // `..` — the same newline-item convention `run_map` uses, item for item.
-        let text = std::str::from_utf8(&upstream.bytes).map_err(|_| {
-            "`..` maps over newline-separated text items, but the piped value is not \
-             UTF-8 text — use a plain `|` to pass the bytes through whole"
-                .to_string()
-        })?;
-        let provenance = upstream.provenance();
-        self.record_sequential_fan_out(text.split('\n').count());
-        let mut outputs = Vec::new();
-        for item in text.split('\n') {
-            let request = self.plan_request(step, Some(item.as_bytes())).await?;
-            outputs.push(self.run_staged(request, Some(provenance.clone())).await?);
-        }
-        Ok(combine_outputs(outputs))
     }
+    let provenance = fold_provenance(inputs);
 
-    async fn eval_fork(&self, plan: &Plan, index: usize, run: &Run) -> Result<Staged, String> {
-        let tails = plan.branch_tails(index)?;
-        // Sequential, so the achieved width is 1 however many branches there are — the
-        // same honest number `run_node`'s no-spawner fork path records. ⚠ The text face
-        // has a concurrent path for single-`source` branches (`run_parallel`); a plan does
-        // not yet, so moving a wide fork into a plan costs its concurrency today.
-        self.record_sequential_fan_out(tails.len());
-        let mut outputs = Vec::with_capacity(tails.len());
-        for tail in tails {
-            outputs.push(self.eval_node(plan, tail, run).await?);
-        }
-        Ok(combine_outputs(outputs))
-    }
-
-    /// Build a step's [`Request`]: the graph's arguments verbatim, plus the fed value
-    /// routed the way the text face routes it — `content` for a mutating verb, and the
-    /// one declared argument left unnamed for a read.
-    async fn plan_request(&self, step: &Step, incoming: Option<&[u8]>) -> Result<Request, String> {
+    // Where a fed value goes: `content` for a mutating verb, and the one declared argument
+    // left unnamed for a read — the text face's rule, through the one function both use.
+    let fed_name = match upstream {
+        None => None,
+        Some(_) => Some(match step.verb {
+            Verb::Sink | Verb::Delete => "content".to_string(),
+            _ => {
+                let description = host.describe(&step.resolves).await;
+                let named: Vec<&str> = step
+                    .arguments
+                    .keys()
+                    .chain(step.refs.keys())
+                    .map(String::as_str)
+                    .collect();
+                route_value_name(&step.resolves, description.as_ref(), &named)
+                    .map_err(RunError::Plan)?
+            }
+        }),
+    };
+    let request = |value: Option<&[u8]>| {
         let mut request = Request::new(step.verb, step.resolves.clone());
-        for (name, value) in &step.arguments {
-            request = request.with_arg(name, ArgRef::Inline(value.as_bytes().to_vec()));
+        for (name, bytes) in &arguments {
+            request = request.with_arg(name, ArgRef::Inline(bytes.clone()));
         }
-        if let Some(value) = incoming {
-            let name = match step.verb {
-                Verb::Sink | Verb::Delete => "content".to_string(),
-                _ => {
-                    let description = self.describe_struct(&step.resolves).await;
-                    let named: Vec<&str> = step.arguments.keys().map(String::as_str).collect();
-                    route_value_name(&step.resolves, description.as_ref(), &named)?
-                }
-            };
+        if let (Some(name), Some(value)) = (&fed_name, value) {
             request = request.with_arg(name, ArgRef::Inline(value.to_vec()));
         }
-        Ok(request)
+        request
+    };
+
+    let Some(upstream) = upstream else {
+        return host
+            .issue(request(None), provenance)
+            .await
+            .map_err(RunError::Step);
+    };
+    if !matches!(step.feed, Feed::Map(_)) {
+        return host
+            .issue(request(Some(&upstream.bytes)), provenance)
+            .await
+            .map_err(RunError::Step);
+    }
+
+    // `..` — the same newline-item convention `run_map` uses, item for item.
+    let text = std::str::from_utf8(&upstream.bytes).map_err(|_| {
+        RunError::Plan(
+            "`..` maps over newline-separated text items, but the piped value is not \
+             UTF-8 text — use a plain `|` to pass the bytes through whole"
+                .to_string(),
+        )
+    })?;
+    host.fan_out(text.split('\n').count());
+    let mut outputs = Vec::new();
+    for item in text.split('\n') {
+        outputs.push(
+            host.issue(request(Some(item.as_bytes())), provenance.clone())
+                .await
+                .map_err(RunError::Step)?,
+        );
+    }
+    Ok(combine_outputs(outputs))
+}
+
+/// The provenance of a request built from `inputs`: the most restrictive expiry and every
+/// thread — the identity (`Never`, no threads) when it was built from nothing.
+#[cfg(feature = "plan-reader")]
+fn fold_provenance(inputs: Vec<Provenance>) -> Provenance {
+    inputs.into_iter().fold(root_provenance(), |acc, part| {
+        let mut threads = acc.threads;
+        threads.extend(part.threads);
+        Provenance::new(acc.expiry.most_restrictive(part.expiry), threads)
+    })
+}
+
+/// The REPL session as a plan host: its capability, its line's chain, its cache tally.
+#[cfg(feature = "plan-reader")]
+impl PlanHost for Engine {
+    type Error = String;
+
+    async fn issue(&self, request: Request, incoming: Provenance) -> Result<Staged, String> {
+        self.run_staged(request, Some(incoming)).await
+    }
+
+    async fn describe(&self, iri: &Iri) -> Option<Description> {
+        self.describe_struct(iri).await
+    }
+
+    fn fan_out(&self, nominal: usize) {
+        self.record_sequential_fan_out(nominal);
     }
 }
 
@@ -1102,7 +1667,9 @@ impl Engine {
     }
 
     /// `run <spec>` — resolve `<spec>` (the full `source` grammar) and execute the
-    /// `ik:Process` graph it returns. `sink` stores a plan; this runs a stored one.
+    /// `ik:Process` graph it returns. `sink` stores a plan; this runs a stored one, through
+    /// the same runner `urn:plan:eval` uses. Parameters take their defaults: the text face
+    /// has no spelling for supplying one yet.
     #[cfg(feature = "plan-reader")]
     pub(crate) async fn run_stored_plan(&self, spec: &str) -> Result<String, String> {
         if spec.trim().is_empty() {
@@ -1112,7 +1679,10 @@ impl Engine {
         }
         let turtle = self.run_pipeline(spec).await?;
         let plan = Plan::from_turtle(&turtle)?;
-        self.execute_plan(&plan).await?.into_text()
+        execute(self, &plan, &BTreeMap::new())
+            .await
+            .map_err(RunError::into_message)?
+            .into_text()
     }
 
     /// Without the reader there is no Turtle parser in this build, so say which feature is
@@ -1147,6 +1717,8 @@ mod tests {
                 .iter()
                 .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
                 .collect(),
+            refs: BTreeMap::new(),
+            binds: None,
             feed,
         }
     }
@@ -1156,6 +1728,7 @@ mod tests {
     fn every_shape() -> Plan {
         Plan {
             id: "demo".to_string(),
+            params: Vec::new(),
             steps: vec![
                 step("urn:t:one", Feed::None, &[("in", "hello")]),
                 step("urn:t:two", Feed::Pipe(NodeRef::Step(0)), &[]),
@@ -1178,6 +1751,37 @@ mod tests {
         }
     }
 
+    /// What a graph can say that the text face cannot yet: parameters, a bound name, and
+    /// references to a name, to a parameter, and to a resource.
+    fn named() -> Plan {
+        let mut first = step("urn:t:one", Feed::None, &[("as", "text/plain")]);
+        first.binds = Some("greeting".to_string());
+        first
+            .refs
+            .insert("in".to_string(), RefTo::Name("who".to_string()));
+        let mut second = step("urn:t:two", Feed::None, &[]);
+        second
+            .refs
+            .insert("in".to_string(), RefTo::Name("greeting".to_string()));
+        second
+            .refs
+            .insert("style".to_string(), RefTo::Resource(iri("urn:t:style")));
+        Plan {
+            id: "named".to_string(),
+            params: vec![Param {
+                name: "who".to_string(),
+                required: false,
+                default: Some("world".to_string()),
+                source: Some("argument".to_string()),
+                class: Some("http://www.w3.org/2001/XMLSchema#string".to_string()),
+                summary: Some("whom to greet".to_string()),
+            }],
+            steps: vec![first, second],
+            forks: Vec::new(),
+            result: NodeRef::Step(1),
+        }
+    }
+
     #[test]
     fn a_plan_reads_back_as_itself() {
         let plan = every_shape();
@@ -1190,11 +1794,116 @@ mod tests {
     }
 
     #[test]
+    fn named_results_and_parameters_read_back_as_themselves() {
+        let plan = named();
+        let turtle = plan.to_turtle(None);
+        assert!(turtle.contains("ik:binds \"greeting\""), "{turtle}");
+        assert!(turtle.contains("<urn:plan:named:var:who>"), "{turtle}");
+        assert!(turtle.contains("ik:ref <urn:t:style>"), "{turtle}");
+        let read = Plan::from_turtle(&turtle).expect("read back");
+        assert_eq!(read, plan);
+        assert_eq!(read.to_turtle(None), turtle);
+    }
+
+    #[test]
+    fn a_reference_is_an_edge_so_the_binder_runs_first() {
+        let plan = named();
+        assert_eq!(
+            plan.run_order().expect("a DAG"),
+            vec![NodeRef::Step(0), NodeRef::Step(1)]
+        );
+    }
+
+    #[test]
+    fn a_cycle_through_a_reference_is_refused_as_a_cycle() {
+        // Two steps that each reference the other's name: no pipe, map or fork edge, so
+        // the shapes' edge-cycle constraint cannot see it — this is the hop it hands over.
+        let turtle = r#"
+@prefix ik: <https://ikigai-rs.dev/ns#> .
+<urn:plan:loop> a ik:Process ;
+    ik:step <urn:plan:loop:step:1> , <urn:plan:loop:step:2> ;
+    ik:result <urn:plan:loop:step:2> .
+<urn:plan:loop:step:1> a ik:Step ; ik:verb "Source" ; ik:resolves <urn:t:a> ;
+    ik:binds "a" ; ik:argument <urn:plan:loop:step:1:arg:in> .
+<urn:plan:loop:step:1:arg:in> a ik:Argument ; ik:inputName "in" ; ik:ref <urn:plan:loop:var:b> .
+<urn:plan:loop:step:2> a ik:Step ; ik:verb "Source" ; ik:resolves <urn:t:b> ;
+    ik:binds "b" ; ik:argument <urn:plan:loop:step:2:arg:in> .
+<urn:plan:loop:step:2:arg:in> a ik:Argument ; ik:inputName "in" ; ik:ref <urn:plan:loop:var:a> .
+"#;
+        let refusal = Plan::read(turtle).expect_err("a cycle");
+        assert_eq!(refusal.kind, RefusalKind::Cycle, "{}", refusal.message);
+        assert!(refusal.message.contains("DAG"), "{}", refusal.message);
+    }
+
+    #[test]
+    fn a_cycle_the_result_never_reaches_is_refused_too() {
+        // Step 1 is the result and depends on nothing; steps 2 and 3 reference each other.
+        // A run would never reach them — and the plan is still wrong, so it is refused.
+        let turtle = r#"
+@prefix ik: <https://ikigai-rs.dev/ns#> .
+<urn:plan:aside> a ik:Process ;
+    ik:step <urn:plan:aside:step:1> , <urn:plan:aside:step:2> , <urn:plan:aside:step:3> ;
+    ik:result <urn:plan:aside:step:1> .
+<urn:plan:aside:step:1> a ik:Step ; ik:verb "Source" ; ik:resolves <urn:t:a> .
+<urn:plan:aside:step:2> a ik:Step ; ik:verb "Source" ; ik:resolves <urn:t:b> ;
+    ik:binds "b" ; ik:argument <urn:plan:aside:step:2:arg:in> .
+<urn:plan:aside:step:2:arg:in> a ik:Argument ; ik:inputName "in" ; ik:ref <urn:plan:aside:var:c> .
+<urn:plan:aside:step:3> a ik:Step ; ik:verb "Source" ; ik:resolves <urn:t:c> ;
+    ik:binds "c" ; ik:pipeFrom <urn:plan:aside:step:2> .
+"#;
+        assert_eq!(
+            Plan::read(turtle).expect_err("a cycle").kind,
+            RefusalKind::Cycle
+        );
+    }
+
+    #[test]
+    fn names_are_single_assignment_and_references_must_be_bound() {
+        let mut twice = named();
+        twice.steps[1].binds = Some("who".to_string());
+        let err = Plan::from_turtle(&twice.to_turtle(None)).expect_err("bound twice");
+        assert!(err.contains("single-assignment"), "{err}");
+
+        let mut dangling = named();
+        dangling.steps[1]
+            .refs
+            .insert("extra".to_string(), RefTo::Name("nobody".to_string()));
+        let err = Plan::from_turtle(&dangling.to_turtle(None)).expect_err("unbound");
+        assert!(err.contains("never binds"), "{err}");
+    }
+
+    #[test]
+    fn parameter_values_take_the_supplied_then_the_default_and_refuse_strangers() {
+        let plan = named();
+        let none = BTreeMap::new();
+        let values = plan.parameter_values::<String>(&none).expect("defaults");
+        assert_eq!(values["who"].as_deref(), Some("world"));
+        let supplied = BTreeMap::from([("who".to_string(), "Brian".to_string())]);
+        let values = plan
+            .parameter_values::<String>(&supplied)
+            .expect("supplied");
+        assert_eq!(values["who"].as_deref(), Some("Brian"));
+        let stranger = BTreeMap::from([("whom".to_string(), "x".to_string())]);
+        assert!(matches!(
+            plan.parameter_values::<String>(&stranger),
+            Err(RunError::Parameter { name, .. }) if name == "whom"
+        ));
+        let mut required = named();
+        required.params[0].default = None;
+        required.params[0].required = true;
+        assert!(matches!(
+            required.parameter_values::<String>(&none),
+            Err(RunError::MissingParameter(name)) if name == "who"
+        ));
+    }
+
+    #[test]
     fn a_step_with_no_arguments_still_ends_its_description() {
         // The `;` of the last predicate has to become a `.` when no `ik:argument` follows,
         // or the graph is a Turtle syntax error that only shows up on the way back in.
         let plan = Plan {
             id: "bare".to_string(),
+            params: Vec::new(),
             steps: vec![step("urn:t:one", Feed::None, &[])],
             forks: Vec::new(),
             result: NodeRef::Step(0),
@@ -1210,6 +1919,7 @@ mod tests {
         let quoted = "say \"hi\" \\ then\na newline\ttab";
         let plan = Plan {
             id: "quoted".to_string(),
+            params: Vec::new(),
             steps: vec![step("urn:t:one", Feed::None, &[("in", quoted)])],
             forks: Vec::new(),
             result: NodeRef::Step(0),
@@ -1266,6 +1976,15 @@ mod tests {
                    ik:resolves <urn:t:one> ; ik:argument [ ik:inputName \"in\" ] .",
                 "blank node",
             ),
+            (
+                "@prefix ik: <https://ikigai-rs.dev/ns#> .\n\
+                 <urn:plan:x> a ik:Process ; ik:step <urn:plan:x:step:1> ;\n\
+                   ik:result <urn:plan:x:step:1> .\n\
+                 <urn:plan:x:step:1> a ik:Step ; ik:verb \"Source\" ;\n\
+                   ik:resolves <urn:t:one> ; ik:argument <urn:plan:x:step:1:arg:in> .\n\
+                 <urn:plan:x:step:1:arg:in> ik:inputName \"in\" .",
+                "exactly one of ik:value and ik:ref",
+            ),
         ];
         for (turtle, expected) in cases {
             let err = Plan::from_turtle(turtle).expect_err("should refuse");
@@ -1279,6 +1998,7 @@ mod tests {
         // easily, and an executor that picked one would be picking silently.
         let plan = Plan {
             id: "two".to_string(),
+            params: Vec::new(),
             steps: vec![
                 step("urn:t:one", Feed::None, &[]),
                 Step {
@@ -1287,6 +2007,8 @@ mod tests {
                     arguments: [("content".to_string(), "named".to_string())]
                         .into_iter()
                         .collect(),
+                    refs: BTreeMap::new(),
+                    binds: None,
                     feed: Feed::Pipe(NodeRef::Step(0)),
                 },
             ],

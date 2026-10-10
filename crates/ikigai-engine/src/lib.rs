@@ -15,6 +15,10 @@ pub mod config;
 pub mod engine;
 pub mod fanout;
 mod plan;
+/// `urn:plan:eval`, `urn:plan:validate` and `urn:plan:requires` — plan execution as a
+/// resource. Reading a plan needs the Turtle parser, so this is the `plan-reader` feature's.
+#[cfg(feature = "plan-reader")]
+pub mod plan_space;
 pub mod suggest;
 
 pub use engine::{Action, CacheStats, Engine, Entry, Viewer, COMMANDS, HELP};
