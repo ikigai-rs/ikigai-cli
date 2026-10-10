@@ -46,15 +46,8 @@ pub(crate) struct Staged {
     threads: BTreeSet<Thread>,
     /// The media type the stage was served as, parameters included — `None` for a join
     /// (fork branches or mapped items rejoined with newlines), which is newline-joined text
-    /// whatever its parts were. Only `urn:plan:eval` reads it: a terminal prints bytes, but
-    /// a resource has to say what it answered with.
-    #[cfg_attr(
-        not(feature = "plan-reader"),
-        allow(
-            dead_code,
-            reason = "read only by `plan_space`, which is the plan-reader feature's"
-        )
-    )]
+    /// whatever its parts were. Read by `urn:plan:eval` (a resource has to say what it
+    /// answered with) and by the `source` command's picture hint (ledger #983).
     pub(crate) media: Option<ReprType>,
 }
 
@@ -315,6 +308,10 @@ pub struct Engine {
     /// Whether `cap seal` has lowered the floor. Reported by `cap`, `login` and the other
     /// identity replies, so a sealed session says so.
     sealed: Cell<bool>,
+    /// Whether a `source` that answers a picture (`image/*`) prints a one-line hint instead of
+    /// the bytes (ledger #983). Off by default; a face turns it on when its output is a person
+    /// at a terminal ([`set_picture_hint`](Self::set_picture_hint)).
+    picture_hint: Cell<bool>,
     /// Named capability profiles a host registers (e.g. `freebusy` → a set of
     /// `urn:cap:` scopes), so `cap <name>` reads friendlier than a scope list.
     profiles: RefCell<HashMap<String, Vec<String>>>,
@@ -475,6 +472,7 @@ impl Engine {
             capability: RefCell::new(identity.clone()),
             floor: RefCell::new(identity.clone()),
             sealed: Cell::new(false),
+            picture_hint: Cell::new(false),
             identity: RefCell::new(identity),
             profiles: RefCell::new(HashMap::new()),
             spawner: None,
@@ -811,7 +809,7 @@ impl Engine {
             "show" => output(self, self.run_show(rest).await),
             ":lisp" => output(self, self.enter_lisp_mode()),
             ":load" => output(self, self.run_load(rest).await),
-            "source" | "src" => output(self, self.run_pipeline(rest).await),
+            "source" | "src" => output(self, self.run_source_command(rest).await),
             "plan" => output(self, self.run_plan(rest).await),
             "run" => output(self, self.run_stored_plan(rest).await),
             "sink" => output(self, self.run_sink(rest).await),
@@ -836,14 +834,44 @@ impl Engine {
     /// `source`, so routing, the binding-only error, and caching all come from
     /// [`run_source`](Self::run_source).
     pub(crate) async fn run_pipeline(&self, spec: &str) -> Result<String, String> {
+        self.run_pipeline_staged(spec).await?.into_text()
+    }
+
+    /// [`run_pipeline`](Self::run_pipeline) before the answer is turned into text.
+    async fn run_pipeline_staged(&self, spec: &str) -> Result<Staged, String> {
         let mut pipeline = parse_spec(spec)?;
         let scope = self.as_of_scope(take_as_of(&mut pipeline)?.as_ref())?;
         self.in_scope(
             scope,
             self.run_pipeline_node(&pipeline, None, root_provenance()),
         )
-        .await?
-        .into_text()
+        .await
+    }
+
+    /// The `source` command: [`run_pipeline`](Self::run_pipeline), except that with the
+    /// [picture hint](Self::set_picture_hint) on, an `image/*` answer is NAMED rather than
+    /// printed (ledger #983: `source urn:diagram:arrangement …` filled the REPL with SVG).
+    async fn run_source_command(&self, spec: &str) -> Result<String, String> {
+        let staged = self.run_pipeline_staged(spec).await?;
+        if self.picture_hint.get() {
+            if let Some(media) = staged.media.as_ref() {
+                if let Some(hint) = picture_hint(&media.media_type, staged.bytes.len(), spec) {
+                    return Ok(hint);
+                }
+            }
+        }
+        staged.into_text()
+    }
+
+    /// Name a picture instead of printing it: a `source` whose final answer is `image/*` prints
+    /// one line (its type, its size, and how to see it) in place of the bytes (ledger #983).
+    ///
+    /// A FACE decides this, because it is a fact about where the output goes: on for a person
+    /// at a terminal, off when the output is piped or redirected, so `ikigai -c 'source …' >
+    /// kernel.svg` still writes the picture. Off by default, so every existing caller of the
+    /// engine sees the bytes it always did.
+    pub fn set_picture_hint(&self, on: bool) {
+        self.picture_hint.set(on);
     }
 
     /// Evaluate an s-expression as Lisp: issue `source urn:lisp:eval` with the
@@ -1733,10 +1761,18 @@ impl Engine {
                         preview_of(&text),
                     ));
                 } else {
-                    render_trace_tree(&events, &entries, scoped, &representation, &mut out);
+                    render_trace_tree(&events, &entries, scoped, Some(&representation), &mut out);
                 }
             }
             Err(error) => {
+                // What the resolution DID before it failed is now the most useful part
+                // (ledger #1063): since core 0.1.92 a failed invocation is a trace node, so
+                // the collected tree shows which hop failed and with what kind. It used to be
+                // dropped here for a single error line.
+                let events = collector.take();
+                if !events.is_empty() {
+                    render_trace_tree(&events, &entries, scoped, None, &mut out);
+                }
                 // The real resolution aborted — surface where. A capability denial is
                 // the authority dimension made visible (`cap ✗`). The kernel's own
                 // `require_cap` now returns a *typed* `Error::Denied`, so recognize that
@@ -2379,7 +2415,7 @@ fn render_trace_tree(
     events: &[TraceEvent],
     entries: &[ikigai_core::SpaceEntry],
     scoped: bool,
-    repr: &Representation,
+    repr: Option<&Representation>,
     out: &mut Vec<String>,
 ) {
     // children[parent span] → child events; roots have no parent. Ordered by span
@@ -2404,7 +2440,7 @@ fn render_trace_tree(
             entries,
             scoped,
             None,
-            Some(repr),
+            repr,
             String::new(),
             true,
             idx + 1 == count,
@@ -2440,11 +2476,7 @@ fn render_trace_event(
     let endpoint = Iri::parse(&event.target)
         .map(|iri| endpoint_name(entries, &iri))
         .unwrap_or_else(|_| "?".to_string());
-    let cache = if event.cache_hit {
-        "cached"
-    } else {
-        "computed"
-    };
+    let cache = trace_outcome(event);
     let dur = match (event.started, event.ended) {
         (Some(start), Some(end)) => {
             format!("{}ms", end.as_millis().saturating_sub(start.as_millis()))
@@ -2553,6 +2585,26 @@ fn preview_of(text: &str) -> String {
     }
 }
 
+/// The one line a picture answer prints in place of its bytes, or `None` when `media` is not a
+/// picture. `show` draws SVG, so an SVG names it; any other image says how to keep the bytes.
+fn picture_hint(media: &str, len: usize, spec: &str) -> Option<String> {
+    let essence = media
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if !essence.starts_with("image/") {
+        return None;
+    }
+    let spec = spec.trim();
+    Some(if essence == "image/svg+xml" {
+        format!("a picture ({essence}, {len} bytes): `show {spec}` opens it; `ikigai -c 'source {spec}' > file.svg` keeps it")
+    } else {
+        format!("a picture ({essence}, {len} bytes), not printed here: `ikigai -c 'source {spec}' > file` keeps it, or pipe it into a `sink`")
+    })
+}
+
 /// Truncate a long IRI for a tree label.
 fn short_iri(iri: &str) -> String {
     if iri.chars().count() > 50 {
@@ -2560,6 +2612,27 @@ fn short_iri(iri: &str) -> String {
         format!("{head}…")
     } else {
         iri.to_string()
+    }
+}
+
+/// The one word a trace node's outcome is (ledger #1063): what the kernel noted about the
+/// invocation first, the cache second. A node that RAN and returned `Err` is `failed` (core
+/// 0.1.92's [`FAILED_NOTE`](ikigai_core::FAILED_NOTE), paired with the error's kind, which the
+/// notes show beside it); one the capability floor refused before it ran is `denied`, and one
+/// past the nesting budget `refused`. Only then `cached` or `computed` — which is what every
+/// failed node used to be called.
+fn trace_outcome(event: &TraceEvent) -> &'static str {
+    let noted = |key: &str| event.notes.iter().any(|(k, _)| k == key);
+    if noted(ikigai_core::FAILED_NOTE) {
+        "failed"
+    } else if noted(ikigai_core::DENIED_NOTE) {
+        "denied"
+    } else if noted(ikigai_core::DEPTH_NOTE) {
+        "refused"
+    } else if event.cache_hit {
+        "cached"
+    } else {
+        "computed"
     }
 }
 
@@ -3888,7 +3961,7 @@ mod tests {
         ];
         let repr = Representation::new(ReprType::new("text/plain"), b"x".to_vec());
         let mut out = Vec::new();
-        render_trace_tree(&events, &[], false, &repr, &mut out);
+        render_trace_tree(&events, &[], false, Some(&repr), &mut out);
 
         // The root stays uncluttered; the child, whose authority differs, names it.
         assert!(!out[0].contains("· cap"), "root uncluttered: {out:#?}");
@@ -3926,7 +3999,7 @@ mod tests {
         ];
         let repr = Representation::new(ReprType::new("text/plain"), b"assembled".to_vec());
         let mut out = Vec::new();
-        render_trace_tree(&events, &[], false, &repr, &mut out);
+        render_trace_tree(&events, &[], false, Some(&repr), &mut out);
 
         // Root first, carrying the assembled result and its worker/timing.
         assert!(out[0].contains("urn:test:compose"), "{out:#?}");
@@ -3944,6 +4017,133 @@ mod tests {
         assert!(
             out[4].starts_with("   └─ urn:test:upper") && out[4].contains("cached"),
             "grandchild indented under about: {out:#?}"
+        );
+    }
+
+    /// ledger #1063: a node that RAN and failed is labeled `failed`, not `computed`; and when
+    /// the ROOT fails, the collected tree is rendered above the error line instead of dropped.
+    #[test]
+    fn trace_labels_a_failed_node_and_keeps_the_tree_when_the_root_fails() {
+        let inner = FnEndpoint::new("inner", |_inv: &Invocation<'_>| {
+            Err(ikigai_core::Error::InvalidArgument {
+                name: "x".to_string(),
+                detail: "no".to_string(),
+            })
+        });
+        // `outer` propagates the child's failure; `rescue` swallows it and answers anyway.
+        let outer = ikigai_core::AsyncFnEndpoint::new("outer", |inv| {
+            Box::pin(async move {
+                let iri = Iri::parse("urn:test:inner").unwrap();
+                inv.issue(Request::new(Verb::Source, iri)).await
+            })
+        });
+        let rescue = ikigai_core::AsyncFnEndpoint::new("rescue", |inv| {
+            Box::pin(async move {
+                let iri = Iri::parse("urn:test:inner").unwrap();
+                let said = match inv.issue(Request::new(Verb::Source, iri)).await {
+                    Ok(_) => "inner answered",
+                    Err(_) => "rescued",
+                };
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    said.as_bytes().to_vec(),
+                ))
+            })
+        });
+        let engine = Engine::new(Kernel::new(Arc::new(
+            EndpointSpace::new()
+                .bind(Exact::new("urn:test:inner"), inner)
+                .bind(Exact::new("urn:test:outer"), outer)
+                .bind(Exact::new("urn:test:rescue"), rescue),
+        )));
+        let text = |cmd: &str| match engine.eval(cmd) {
+            Action::Output(entry) => entry.result.unwrap(),
+            _ => panic!("expected Action::Output"),
+        };
+        let row = |out: &str, iri: &str| -> String {
+            out.lines()
+                .find(|l| {
+                    l.trim_start_matches(['├', '└', '│', '─', ' '])
+                        .starts_with(&format!("{iri} "))
+                })
+                .unwrap_or_else(|| panic!("no row for {iri}: {out}"))
+                .to_string()
+        };
+
+        // The root survives its child's failure: the child is `failed`, the root `computed`.
+        let rescued = text("trace urn:test:rescue");
+        let child = row(&rescued, "urn:test:inner");
+        assert!(child.contains(" · failed · "), "{rescued}");
+        assert!(!child.contains(" · computed · "), "{rescued}");
+        assert!(
+            child.contains("failed=invalid-argument"),
+            "the kind is noted: {rescued}"
+        );
+        assert!(
+            row(&rescued, "urn:test:rescue").contains(" · computed · "),
+            "{rescued}"
+        );
+
+        // The root fails: the tree is still there, both nodes `failed`, then the error.
+        let failed = text("trace urn:test:outer");
+        assert!(
+            row(&failed, "urn:test:outer").contains(" · failed · "),
+            "{failed}"
+        );
+        assert!(
+            row(&failed, "urn:test:inner").contains(" · failed · "),
+            "{failed}"
+        );
+        let last = failed.lines().last().unwrap();
+        assert!(
+            last.contains("error:"),
+            "the error line closes the trace: {failed}"
+        );
+    }
+
+    /// ledger #983 part 1: with the picture hint on, a `source` answering `image/*` prints a
+    /// line naming it, not the bytes; off (the default, and any piped face) prints the bytes.
+    #[test]
+    fn a_picture_answer_is_named_not_printed_when_the_face_asks() {
+        let pic = |media: &'static str| {
+            FnEndpoint::new("pic", move |_inv: &Invocation<'_>| {
+                Ok(Representation::new(
+                    ReprType::new(media),
+                    b"<svg xmlns='http://www.w3.org/2000/svg'/>".to_vec(),
+                ))
+            })
+        };
+        let engine = Engine::new(Kernel::new(Arc::new(
+            EndpointSpace::new()
+                .bind(Exact::new("urn:test:svg"), pic("image/svg+xml"))
+                .bind(Exact::new("urn:test:png"), pic("image/png"))
+                .bind(Exact::new("urn:test:text"), pic("text/plain")),
+        )));
+        let text = |cmd: &str| match engine.eval(cmd) {
+            Action::Output(entry) => entry.result.unwrap(),
+            _ => panic!("expected Action::Output"),
+        };
+        assert!(
+            text("source urn:test:svg").starts_with("<svg"),
+            "off by default"
+        );
+        engine.set_picture_hint(true);
+        let svg = text("source urn:test:svg");
+        assert!(
+            svg.starts_with("a picture (image/svg+xml, 41 bytes)")
+                && svg.contains("`show urn:test:svg`"),
+            "{svg}"
+        );
+        let png = text("source urn:test:png");
+        assert!(png.contains("image/png") && !png.contains("show"), "{png}");
+        assert!(
+            text("source urn:test:text").starts_with("<svg"),
+            "not a picture: printed"
+        );
+        engine.set_picture_hint(false);
+        assert!(
+            text("source urn:test:svg").starts_with("<svg"),
+            "a piped face gets the bytes"
         );
     }
 
