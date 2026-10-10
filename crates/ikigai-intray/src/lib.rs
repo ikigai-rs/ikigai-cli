@@ -20,7 +20,9 @@
 //! than Linda's positional match — the whole graph-pattern language, not field equality —
 //! and a non-RDF tuple simply never matches a template (take it by id or FIFO instead).
 //! The one part of SPARQL a template may NOT use is `SERVICE`: a match is a question about a
-//! tuple's own graph and never leaves the host (see `parse_match`).
+//! tuple's own graph and never leaves the host (see `parse_match`). And a template is bounded
+//! like every other door that parses caller SPARQL: refused over 1 MiB or nested past 64
+//! levels, and parsed and evaluated on a stack sized for its text (see `with_template`).
 //!
 //! The space is *physical and inspectable* — tuples are files under a jailed root, moving
 //! through an **inbox → outbox → error** state machine. The [`SpaceReactor`] makes a space
@@ -37,6 +39,7 @@ use ikigai_core::{
     ActionSpec, ArgRef, Capability, Description, Endpoint, EndpointSpace, Error, Invocation, Iri,
     ReprType, Representation, Request, Result, UriTemplate, Verb,
 };
+use ikigai_store::limits;
 use notify::{RecursiveMode, Watcher};
 use oxigraph::io::{RdfFormat, RdfParser};
 use oxigraph::sparql::{DefaultServiceHandler, QueryResults, QuerySolutionIter, SparqlEvaluator};
@@ -371,7 +374,31 @@ fn take_id<'a>(inv: &'a Invocation<'_>) -> Result<Option<&'a str>> {
     }
 }
 
-/// Parse a `match=` argument into the template every tuple is tested against.
+/// Bound a `match=` template, then parse it and run `work` with it — every evaluation
+/// included — on a thread whose stack is sized for its text (ledger #963).
+///
+/// oxigraph's SPARQL parser and evaluator are RECURSIVE, and running out of stack is not an
+/// error a caller gets back: Rust aborts the whole process. Through cli 0.1.43 a template of
+/// ~3,000 nested parentheses, or a flat `1 || 1 || …` chain of a few hundred terms, parsed
+/// inline on the request's thread and took down the host — gonk wraps this space, and
+/// `ikigai-embedded` mounts it unwrapped, so the bound lives HERE, where every host gets it.
+/// The two layers are `ikigai-store`'s, the same ones its own SPARQL doors and `urn:sparql:*`
+/// use: [`limits::check_sparql`] refuses text over 1 MiB or nested deeper than 64 as a typed
+/// `InvalidArgument` on `match` before anything is parsed, and [`limits::on_sparql_stack`]
+/// gives the parse, the `SERVICE` walk and every per-tuple evaluation a stack of 16 MiB plus
+/// 512 bytes per byte of template. ⚠ Like the store's, the second layer is a RELEASE-build
+/// guarantee, and neither bounds TIME (see `ikigai_store::limits`).
+fn with_template<T, F>(query: &str, work: F) -> Result<T>
+where
+    T: Send,
+    F: FnOnce(&spargebra::Query) -> Result<T> + Send,
+{
+    limits::check_sparql(query, "match")?;
+    limits::on_sparql_stack(query, || work(&parse_match(query)?))
+}
+
+/// Parse a `match=` argument into the template every tuple is tested against. Call it only
+/// through [`with_template`], which bounds the text first and parses it on a sized stack.
 ///
 /// Refused with a typed `InvalidArgument` (on `match`), before any tuple is read:
 /// - a SPARQL syntax error;
@@ -693,16 +720,18 @@ impl Endpoint for SpaceEndpoint {
                     ))
                 } else if let Some(query) = opt_str(inv, "match")? {
                     // Associative rd: the ids of tuples whose graph satisfies the ASK.
-                    let template = parse_match(query)?;
-                    let mut hits = Vec::new();
-                    for id in Self::list_ids(&dir) {
-                        if let Ok(bytes) = std::fs::read(dir.join(format!("{id}.tuple"))) {
-                            // A file that is not the tuple its name says never matches.
-                            if hashes_to(&bytes, &id) && tuple_matches(&template, &bytes)? {
-                                hits.push(id);
+                    let hits = with_template(query, |template| {
+                        let mut hits = Vec::new();
+                        for id in Self::list_ids(&dir) {
+                            if let Ok(bytes) = std::fs::read(dir.join(format!("{id}.tuple"))) {
+                                // A file that is not the tuple its name says never matches.
+                                if hashes_to(&bytes, &id) && tuple_matches(template, &bytes)? {
+                                    hits.push(id);
+                                }
                             }
                         }
-                    }
+                        Ok(hits)
+                    })?;
                     Ok(Representation::new(
                         ReprType::new("text/plain").with_param("charset", "utf-8"),
                         hits.join("\n").into_bytes(),
@@ -741,27 +770,32 @@ impl Endpoint for SpaceEndpoint {
                 // Otherwise take the first tuple matching the template (or any). We scan
                 // deterministically and claim the first that both matches and we win the
                 // race for; a lost claim just moves to the next candidate.
-                let matcher = opt_str(inv, "match")?.map(parse_match).transpose()?;
-                for id in Self::list_ids(&inbox) {
-                    if let Some(template) = &matcher {
-                        match std::fs::read(inbox.join(format!("{id}.tuple"))) {
-                            Ok(bytes) if !tuple_matches(template, &bytes)? => continue,
-                            Ok(_) => {}
-                            Err(_) => continue, // vanished between listing and read
+                let take_first = |matcher: Option<&spargebra::Query>| {
+                    for id in Self::list_ids(&inbox) {
+                        if let Some(template) = matcher {
+                            match std::fs::read(inbox.join(format!("{id}.tuple"))) {
+                                Ok(bytes) if !tuple_matches(template, &bytes)? => continue,
+                                Ok(_) => {}
+                                Err(_) => continue, // vanished between listing and read
+                            }
+                        }
+                        // Lost the race, or a file that is not its tuple (now in `error/`): next.
+                        if let Claim::Taken(bytes) = self.claim(name, &id)? {
+                            return Ok(Representation::new(
+                                ReprType::new("application/octet-stream"),
+                                bytes,
+                            ));
                         }
                     }
-                    // Lost the race, or a file that is not its tuple (now in `error/`): next.
-                    if let Claim::Taken(bytes) = self.claim(name, &id)? {
-                        return Ok(Representation::new(
-                            ReprType::new("application/octet-stream"),
-                            bytes,
-                        ));
-                    }
+                    Err(Error::NotFound(match matcher {
+                        Some(_) => format!("no matching tuple to take in space `{name}`"),
+                        None => format!("space `{name}` is empty"),
+                    }))
+                };
+                match opt_str(inv, "match")? {
+                    Some(query) => with_template(query, |template| take_first(Some(template))),
+                    None => take_first(None),
                 }
-                Err(Error::NotFound(match matcher {
-                    Some(_) => format!("no matching tuple to take in space `{name}`"),
-                    None => format!("space `{name}` is empty"),
-                }))
             }
             v => Err(Error::Endpoint(format!(
                 "urn:space:* answers Source (rd), Sink (out), and Delete (take), not {v:?}"

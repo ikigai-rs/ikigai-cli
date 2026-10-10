@@ -35,6 +35,12 @@ spargebra = { version = "0.4", features = ["sep-0006"] }
 # Only to NAME the type in oxigraph's `DefaultServiceHandler::handle` signature, which the
 # match evaluator implements to refuse every `SERVICE` call whatever features the build has.
 oxiri = "0.2.11"
+# The bound on caller SPARQL (ledger #963): `limits::check_sparql` refuses a `match=` template
+# over 1 MiB or nested past 64 levels before it is parsed, and `limits::on_sparql_stack` parses
+# and evaluates it on a stack sized for its text — the same two layers the store's own doors
+# and `urn:sparql:*` use. 0.2.7 is the first release with `limits`. No features: `persistent`
+# (RocksDB) is the host's to enable, and this crate opens no store.
+ikigai-store = "0.2.7"
 
 [dev-dependencies]
 futures = { workspace = true }
