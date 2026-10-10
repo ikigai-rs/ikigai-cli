@@ -277,9 +277,10 @@ pub fn serve_with(
     idle: std::time::Duration,
 ) -> io::Result<()> {
     let config = server_config(identity, trusted_client_cert_pems, idle)?;
+    let endpoint_config = endpoint_config(identity);
     let runtime = Runtime::new()?;
     runtime.block_on(async move {
-        let endpoint = bind_endpoint(config, addr)?;
+        let endpoint = bind_endpoint(config, addr, endpoint_config)?;
         let kernel = Arc::new(kernel);
         while let Some(incoming) = endpoint.accept().await {
             let kernel = Arc::clone(&kernel);
@@ -314,9 +315,23 @@ pub fn serve_with(
 /// real fix for the `.local`-resolves-to-both-families-and-picks-IPv6 timeout: the
 /// server no longer cares which family the name resolved to. A specific bind address
 /// is honored as-is (`quinn::Endpoint::server`), single-family.
-fn bind_endpoint(config: quinn::ServerConfig, addr: SocketAddr) -> io::Result<quinn::Endpoint> {
+///
+/// Either way the endpoint runs under `endpoint_config` (see [`endpoint_config`]): what
+/// `quinn::Endpoint::server` would build is a RANDOM stateless-reset key per process.
+fn bind_endpoint(
+    config: quinn::ServerConfig,
+    addr: SocketAddr,
+    endpoint_config: quinn::EndpointConfig,
+) -> io::Result<quinn::Endpoint> {
     if !addr.ip().is_unspecified() {
-        return quinn::Endpoint::server(config, addr);
+        let udp = std::net::UdpSocket::bind(addr)?;
+        udp.set_nonblocking(true)?;
+        return quinn::Endpoint::new(
+            endpoint_config,
+            Some(config),
+            udp,
+            Arc::new(quinn::TokioRuntime),
+        );
     }
     use socket2::{Domain, Protocol, Socket, Type};
     let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
@@ -326,11 +341,51 @@ fn bind_endpoint(config: quinn::ServerConfig, addr: SocketAddr) -> io::Result<qu
     let udp: std::net::UdpSocket = socket.into();
     udp.set_nonblocking(true)?;
     quinn::Endpoint::new(
-        quinn::EndpointConfig::default(),
+        endpoint_config,
         Some(config),
         udp,
         Arc::new(quinn::TokioRuntime),
     )
+}
+
+/// The server endpoint's config, with a stateless-reset key DERIVED FROM ITS IDENTITY
+/// (ledger #1092).
+///
+/// A QUIC server that loses a connection's state (it restarted, or crashed) answers that
+/// connection's next packet with a STATELESS RESET, and the client drops the connection at
+/// once — but only if the reset's token checks out, and the token is an HMAC under the
+/// server's reset key. quinn's default key is random per process, so a RESTARTED server's
+/// resets were ignored: the client kept the dead connection and every call on it waited out
+/// the idle timeout ([`DEFAULT_IDLE_TIMEOUT`], five minutes; gonk's explain took 304 s after
+/// its model peer restarted). Keyed on the identity, the restarted server's resets carry the
+/// tokens its predecessor issued, so the client's next call fails at once, redials (its
+/// existing heal-on-use path) and succeeds.
+///
+/// The key is a hash of the server's PRIVATE key under a domain label: as stable as the
+/// identity, and as secret (someone who could forge resets could only end connections). The
+/// connection-ID generator is keyed from the same material, for the reason in the body.
+fn endpoint_config(identity: &Identity) -> quinn::EndpointConfig {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"ikigai-quic stateless-reset key v1\0");
+    hasher.update(identity.key_pem.as_bytes());
+    let material = hasher.finalize();
+    let mut config = quinn::EndpointConfig::new(Arc::new(ring::hmac::Key::new(
+        ring::hmac::HMAC_SHA256,
+        &material,
+    )));
+    // ★ The connection IDs too. quinn's default generator signs each ID under a RANDOM
+    // per-process key and drops a packet whose ID does not validate, before it would reset
+    // it: so a restarted server with the right reset key still never sent a reset (found by
+    // `restart::a_restarted_server_resets_…`, which waited out the full idle timeout). A key
+    // from the same material makes the predecessor's IDs the successor's own.
+    let mut cid_key = [0u8; 8];
+    cid_key.copy_from_slice(&Sha256::digest([b"cid:".as_slice(), &material].concat())[..8]);
+    let cid_key = u64::from_le_bytes(cid_key);
+    config.cid_generator(move || {
+        Box::new(quinn_proto::HashedConnectionIdGenerator::from_key(cid_key))
+    });
+    config
 }
 
 /// The leaf certificate DER the peer presented, if any (quinn exposes it
@@ -604,6 +659,7 @@ pub fn connect_with(
             endpoint,
             addr,
             connection: Mutex::new(connection),
+            stale: std::sync::atomic::AtomicBool::new(false),
         }),
         tracer: Mutex::new(None),
         describe_timeout: Some(DEFAULT_DESCRIBE_TIMEOUT),
@@ -688,6 +744,13 @@ struct Wire {
     /// (a daemon's mount) must survive the peer restarting or an idle timeout, not wedge
     /// on the one connection it opened at startup.
     connection: Mutex<quinn::Connection>,
+    /// Set when a self-description timed out on the current connection (ledger #1092): the
+    /// next round trip redials FIRST instead of trying that connection again. A peer that
+    /// restarted without resetting it (one older than this release, or one killed outright
+    /// with nothing listening) leaves a connection that looks alive and answers nothing, and
+    /// trying it again is what cost a second describe deadline and then the whole idle
+    /// timeout. The old connection is not closed: a call already in flight on it keeps it.
+    stale: std::sync::atomic::AtomicBool,
 }
 
 impl Wire {
@@ -709,6 +772,13 @@ impl Wire {
     /// the transport's choice to make (ledger #733, finding Q2). The connection still
     /// heals: the next call's stream fails to open on the dead one and reconnects.
     async fn round_trip(&self, request: Vec<u8>, replayable: bool) -> io::Result<Reply> {
+        use std::sync::atomic::Ordering;
+        if self.stale.swap(false, Ordering::SeqCst) {
+            if let Err(error) = self.reconnect().await {
+                self.stale.store(true, Ordering::SeqCst);
+                return Err(error);
+            }
+        }
         match self.attempt(&request).await {
             Ok(reply) => Ok(reply),
             Err(Attempt::Sent(error)) if !replayable => Err(error),
@@ -839,12 +909,17 @@ impl QuicResolver {
                     match tokio::time::timeout(deadline, wire.round_trip(request, replayable)).await
                     {
                         Ok(reply) => reply,
-                        Err(_) => Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            // `Debug` keeps the unit (`300ms`, `30s`); `as_secs()` would
-                            // report a sub-second bound as `0s`.
-                            format!("the peer did not describe itself within {deadline:?}"),
-                        )),
+                        Err(_) => {
+                            // The connection answered nothing for a whole describe deadline:
+                            // the next call redials rather than trusting it (ledger #1092).
+                            wire.stale.store(true, std::sync::atomic::Ordering::SeqCst);
+                            Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                // `Debug` keeps the unit (`300ms`, `30s`); `as_secs()` would
+                                // report a sub-second bound as `0s`.
+                                format!("the peer did not describe itself within {deadline:?}"),
+                            ))
+                        }
                     }
                 }
             }
@@ -2738,5 +2813,156 @@ mod describe_timeout {
         // The message names the bound that fired. `as_secs()` truncated it, so this 300ms
         // deadline was reported as "within 0s": a bound the operator never set.
         assert!(error.to_string().contains("within 300ms"), "{error}");
+    }
+}
+
+/// ledger #1092: a peer that RESTARTS under a standing client. The server is run on a
+/// runtime the test owns, and "crashes" by `shutdown_background`, which drops its endpoint
+/// driver mid-connection: nothing sends a close frame, exactly like a SIGTERMed or
+/// launchd-restarted `ikigai serve`. The replacement binds the same address.
+#[cfg(test)]
+mod restart {
+    use super::*;
+    use ikigai_core::{builtins, EndpointSpace, Exact, Verb};
+    use tokio::runtime::Runtime;
+
+    /// A server answering `urn:test:upper` at `addr`, under `endpoint_config`, on a runtime
+    /// the caller owns (drop it with `shutdown_background` to crash the server).
+    fn serve_on(
+        addr: SocketAddr,
+        server_id: &Identity,
+        client_id: &Identity,
+        endpoint_config: quinn::EndpointConfig,
+    ) -> Runtime {
+        let config = server_config(
+            server_id,
+            std::slice::from_ref(&client_id.cert_pem),
+            DEFAULT_IDLE_TIMEOUT,
+        )
+        .unwrap();
+        let rt = Runtime::new().unwrap();
+        // `shutdown_background` releases the crashed server's socket on its own schedule, so
+        // the replacement may find the port still held for a moment (macOS CI did): retry the
+        // bind, boundedly, rather than racing it.
+        let mut tries = 0;
+        let endpoint = loop {
+            match rt
+                .block_on(async { bind_endpoint(config.clone(), addr, endpoint_config.clone()) })
+            {
+                Ok(endpoint) => break endpoint,
+                Err(e) if e.kind() == io::ErrorKind::AddrInUse && tries < 100 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => panic!("bind {addr}: {e}"),
+            }
+        };
+        let kernel = Arc::new(Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),
+        )));
+        rt.spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                let kernel = Arc::clone(&kernel);
+                tokio::spawn(async move {
+                    if let Ok(connection) = incoming.await {
+                        let session = Session {
+                            capability: Capability::root(),
+                            file_segment: String::new(),
+                            principal: None,
+                        };
+                        serve_connection(&kernel, connection, &session).await;
+                    }
+                });
+            }
+        });
+        rt
+    }
+
+    fn free_udp_addr() -> SocketAddr {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.local_addr().unwrap()
+    }
+
+    fn upper(text: &str) -> Request {
+        Request::new(Verb::Source, Iri::parse("urn:test:upper").unwrap())
+            .with_arg("in", ikigai_core::ArgRef::Inline(text.as_bytes().to_vec()))
+    }
+
+    /// The server half: the replacement's stateless reset is honored because its key is the
+    /// identity's, so the client's next call fails at once, redials and answers — well inside
+    /// the five-minute idle timeout this client keeps.
+    #[test]
+    // Native-only (QUIC is not built for wasm); elapsed time is the measurement.
+    #[allow(clippy::disallowed_methods)]
+    fn a_restarted_server_resets_the_old_connection_and_the_next_call_heals() {
+        let server_id = generate();
+        let client_id = generate();
+        let addr = free_udp_addr();
+        let first = serve_on(addr, &server_id, &client_id, endpoint_config(&server_id));
+        let client = connect(addr, &client_id, &server_id.cert_pem).unwrap();
+        let (answer, _) = client.issue(upper("one")).unwrap();
+        assert_eq!(answer.bytes, b"ONE");
+
+        first.shutdown_background();
+        let _second = serve_on(addr, &server_id, &client_id, endpoint_config(&server_id));
+
+        let start = std::time::Instant::now();
+        let (answer, _) = client
+            .issue(upper("two"))
+            .expect("the call heals onto the restarted server");
+        let elapsed = start.elapsed();
+        assert_eq!(answer.bytes, b"TWO");
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "reset and redialled, not the idle timeout: {elapsed:?}"
+        );
+    }
+
+    /// The client half, against a replacement whose resets the client cannot verify (a random
+    /// key: a peer older than this release). A self-description that times out marks the
+    /// connection stale, so the NEXT one redials first instead of timing out again.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn a_describe_timeout_makes_the_next_call_redial() {
+        let server_id = generate();
+        let client_id = generate();
+        let addr = free_udp_addr();
+        let first = serve_on(
+            addr,
+            &server_id,
+            &client_id,
+            quinn::EndpointConfig::default(),
+        );
+        let client = connect(addr, &client_id, &server_id.cert_pem)
+            .unwrap()
+            .with_describe_timeout(Some(std::time::Duration::from_secs(2)));
+        assert!(
+            client.try_entries().is_ok(),
+            "the first enumeration answers"
+        );
+
+        first.shutdown_background();
+        let _second = serve_on(
+            addr,
+            &server_id,
+            &client_id,
+            quinn::EndpointConfig::default(),
+        );
+
+        let timed_out = client
+            .try_entries()
+            .expect_err("the dead connection answers nothing");
+        assert!(
+            timed_out.to_string().contains("did not describe itself"),
+            "{timed_out}"
+        );
+        let start = std::time::Instant::now();
+        let entries = client.try_entries();
+        let elapsed = start.elapsed();
+        assert!(entries.is_ok(), "the next call redialled: {entries:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "redialled, not another deadline: {elapsed:?}"
+        );
     }
 }
