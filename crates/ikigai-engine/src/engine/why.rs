@@ -35,6 +35,7 @@ pub const COMMANDS: &[&str] = &[
     "run",
     "sink",
     "delete",
+    "exists",
     "describe",
     ":lisp",
     ":load",
@@ -84,7 +85,7 @@ impl Engine {
 
     /// The one stage a view command takes, and the chain its `as-of=` (if any) names. A view
     /// explains ONE name, so pipes, maps and forks are refused rather than read as one.
-    fn single_stage(
+    pub(super) fn single_stage(
         &self,
         spec: &str,
         command: &str,
@@ -336,6 +337,7 @@ fn usage(command: &str) -> String {
         "why" => "`why <iri>`",
         "dependents" => "`dependents <thread> [as=text/turtle]`",
         "show" => "`show <iri> [key=value …]`",
+        "exists" => "`exists <iri> [key=value …]`",
         _ => "see `help`",
     }
     .to_string()

@@ -2317,7 +2317,7 @@ fn run_repl(engine: Engine, plain: bool, commands: &[String], topology: &[String
         // placed on the command line. A TTY stdin is left alone (nothing to read, no block).
         #[cfg(not(target_family = "wasm"))]
         {
-            use std::io::{IsTerminal, Read};
+            use std::io::IsTerminal;
             if !std::io::stdin().is_terminal() {
                 // LAZILY. Reading stdin to EOF here blocks whenever stdin is a non-TTY that
                 // never closes — an inherited pipe from an editor, a harness, launchd — so
@@ -2325,11 +2325,13 @@ fn run_repl(engine: Engine, plain: bool, commands: &[String], topology: &[String
                 // `is_terminal()` cannot tell "a pipe with data" from "a pipe nobody will
                 // write to"; the only safe moment to block is when a content-less `sink`
                 // has actually asked for the content.
-                engine.set_piped_input_with(|| {
-                    let mut buf = Vec::new();
-                    let _ = std::io::stdin().read_to_end(&mut buf);
-                    buf
-                });
+                //
+                // And even then, not forever (ledger #1088): an agent's backgrounded shell
+                // hands a `sink urn:iki:ledger:close item=N` an inherited pipe nobody writes,
+                // and the read waited on it for good. So the reader waits [`STDIN_GRACE`] for
+                // the FIRST byte (or EOF); a stdin silent that long is idle, and the sink goes
+                // without `content` rather than with an empty one.
+                engine.set_piped_input_polled(|| read_stdin_unless_idle(STDIN_GRACE));
             }
         }
         std::process::exit(repl::run_commands(engine, commands));
@@ -2350,6 +2352,49 @@ fn run_repl(engine: Engine, plain: bool, commands: &[String], topology: &[String
     }
     #[cfg(target_family = "wasm")]
     repl::run(engine, topology);
+}
+
+/// How long a content-less `sink` waits for stdin's FIRST byte (or its end) before calling
+/// it idle (ledger #1088). Data a producer has already written, a file, `/dev/null` and a
+/// closed pipe all answer at once; only a descriptor nobody writes to waits the whole grace.
+/// A producer slower than this to say anything (a long network fetch) loses the race: the
+/// note on stderr says so, and a sink that requires `content` then refuses instead of
+/// writing an empty body.
+#[cfg(all(feature = "embedded", not(target_family = "wasm")))]
+const STDIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Read stdin to its end — unless nothing at all arrives within `grace`, which is `None`.
+///
+/// The read runs on a thread of its own because a blocking `read` cannot be given a
+/// deadline portably. When stdin turns out idle that thread stays parked on it; a `-c`
+/// batch ends in `process::exit`, which takes it down.
+#[cfg(all(feature = "embedded", not(target_family = "wasm")))]
+fn read_stdin_unless_idle(grace: std::time::Duration) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let (started, first) = std::sync::mpsc::channel::<()>();
+    let (finished, done) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let mut stdin = std::io::stdin().lock();
+        let mut buf = vec![0u8; 64 * 1024];
+        let n = stdin.read(&mut buf).unwrap_or(0);
+        buf.truncate(n);
+        let _ = started.send(());
+        if n > 0 {
+            let _ = stdin.read_to_end(&mut buf);
+        }
+        let _ = finished.send(buf);
+    });
+    match first.recv_timeout(grace) {
+        Ok(()) => done.recv().ok(),
+        Err(_) => {
+            eprintln!(
+                "ikigai: nothing arrived on stdin within {}s, so the sink was sent with no \
+                 content (pipe the value in, or name it with content=…)",
+                grace.as_secs()
+            );
+            None
+        }
+    }
 }
 
 // --- `cert generate` --------------------------------------------------------
