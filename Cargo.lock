@@ -3097,6 +3097,7 @@ dependencies = [
  "ikigai-discovery",
  "ikigai-email",
  "ikigai-encrypt",
+ "ikigai-engine",
  "ikigai-fn",
  "ikigai-fs",
  "ikigai-http",

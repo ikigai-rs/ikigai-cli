@@ -91,8 +91,8 @@ the branch, or make the inner fork **one resource**.
   being a resource it recomputes and can take the other branch when a thread is cut, which
   an `if` in a script can never do. `ikigai-throttle`'s `Retry` and `Timeout` are bounded
   repetition and deadlines the same way.
-* **Not a workflow engine.** The plan is data. `run` walks the dependency graph from the
-  result, so what runs is what the answer depends on; nothing schedules, retries, or
+* **Not a workflow engine.** The plan is data. The runner walks the dependency graph from
+  the result, so what runs is what the answer depends on; nothing schedules, retries, or
   resumes.
 
 ## ⚠ The reader is a feature, and that is about wasm
@@ -111,18 +111,68 @@ The claim that this crate builds for wasm was a comment and nothing checked it; 
 now runs `cargo clippy -p ikigai-engine --lib --target wasm32-unknown-unknown` under
 default features, so it is a gate.
 
+## Plans as resources: `urn:plan:eval`, `urn:plan:validate`, `urn:plan:requires`
+
+`run` is a REPL command, and a command cannot be reached by a sub-request. So the same
+runner also answers three resources (ledger #956), each over the plan passed as `in`
+(Turtle, inline or as the IRI of a resource holding one). They are bound on the embedded
+host's local root (`ikigai-embedded`), and nowhere else yet:
+
+| name | answers |
+| --- | --- |
+| `urn:plan:eval` | the plan's `ik:result`, with every step a sub-request under the **caller's** capability; `as=` names the result's face (transrepted, or refused if nothing converts it); each declared parameter is a further argument by its own name |
+| `urn:plan:validate` | the SHACL report against `ikigai_vocab::SHAPES` (through `urn:shacl:validate`), plus the checks the shapes cannot make; `text/plain` or `text/turtle` |
+| `urn:plan:requires` | the capability the plan needs, **derived** from each step's contract (`Description::required_scopes` for the step's verb, read with a `Meta` request that invokes nothing), what the asking capability lacks, and every step whose target resolves nowhere |
+
+```sh
+ikigai -c 'source urn:file:shout.ttl | urn:plan:eval'
+ikigai -c 'source urn:file:shout.ttl | urn:plan:requires'
+```
+
+* **One runner.** `run` and `urn:plan:eval` both call `plan::execute`, each through its own
+  host — the REPL session, or the invocation serving the resource. The test that holds this
+  (`tests/plan_eval.rs`) runs the four CMS link-check fixtures from `ikigai-vocab` both ways
+  and requires the same answer AND the same requests at every stub.
+* **No authority of its own.** None of the three declares a scope. `eval` issues every step
+  through the invocation, so each step meets its own target's floor under the caller's
+  capability — a plan can never do what its caller could not do one request at a time —
+  and a step's typed `Denied` reaches the caller typed. `requires` says where: the first step
+  it reports as lacking is the step a run under that capability is refused at.
+* **Validation fails closed.** `eval` validates first and refuses a non-conforming plan
+  with `InvalidArgument` naming the shape. A kernel that does not bind `urn:shacl:validate`
+  runs no plan at all, and says why.
+* **As cacheable as its least cacheable step.** Every step, the validation and every
+  contract read is a recorded sub-request, so the kernel folds them into the answer: a plan
+  of pure reads is served from the cache the second time; a plan with a `Sink` runs again.
+* **Not on the HTTP door or the served kernels.** A plan is a request *amplifier* — one
+  request, many steps, a map over a list. Whether a public or peer surface should offer
+  one is a posture decision, not a default.
+
+## Named results and parameters
+
+A graph may bind a step's representation to a name (`ik:binds`), declare the plan's own
+parameters (`ik:input`, the ArgSpec nodes an endpoint carries), and pass either by
+reference (`ik:ref <urn:plan:{id}:var:{name}>`). The runner executes all three: a
+reference to a bound name is an **edge** (the binder runs first), a reference to a
+parameter is the caller's value or its `ik:default`, and a reference to any other IRI is
+sourced and its representation passed. `run` supplies no parameters (defaults only);
+`urn:plan:eval` takes them by name and refuses one the plan does not declare.
+
+The grammar still has no spelling for them (`x = …`, `@x`), so `plan` never emits them.
+
+An `ik:ref` edge goes through a NAME, which no SHACL property path can follow, so the
+shapes cannot see a cycle closed that way. The reader can: a plan whose references form a
+cycle — anywhere in the graph, not only on the part the result reaches — is refused before
+anything runs, and `urn:plan:validate` reports it as `urn:ikigai:plan:check:acyclic`.
+
 ## Not built yet
 
-* **Named results** (`x = …`, `@x` — `ik:binds`, `ik:ref`, a process's `ik:input`). The
-  grammar has no spelling for them, so nothing emits them. A graph that *carries* them is
-  refused rather than run with the references quietly dropped.
-* **`ik:requires` and `ik:output`.** A plan's capability union and its result's media type
-  are both optional in the shapes, and computing either honestly needs every step's
-  contract — a *partial* union is worse than none, because a pre-flight would then pass a
-  plan the kernel goes on to deny.
+* **Parameters from the text face.** `run` uses defaults; supplying a value needs a
+  spelling the grammar does not have.
 * **A concurrent fork.** The text face resolves single-`source` fork branches and mapped
   items on the injected scheduler; `run` is sequential, and records the width it actually
   reaches (1) rather than the one it does not.
 * **A resolvable plan face.** `urn:program:{name}` — a stored plan that answers `Source` by
-  running, and describes itself from its `ik:input` parameters — needs those parameters,
-  so it waits on named results.
+  running, and describes itself from its `ik:input` parameters. The parameters and the
+  evaluator exist now; `ikigai-script`'s `language=plan` is where a stored plan is meant
+  to become a resource (ledger #936).

@@ -4470,6 +4470,16 @@ fn root_members() -> Vec<Arc<dyn Space>> {
         // SHACL validation (urn:shacl:validate) — rudof's validator, native-only (wasm-gated
         // upstream); the browser serves the same resource via shacl-engine (JS).
         Arc::new(ikigai_shacl::space()) as Arc<dyn Space>,
+        // Plans as resources (ledger #956): `urn:plan:eval` runs an ik:Process graph with
+        // every step a sub-request under the CALLER's capability, `urn:plan:validate` applies
+        // the published shapes through `urn:shacl:validate` just above (plus the cycle check
+        // the shapes cannot make), and `urn:plan:requires` derives what a plan needs from its
+        // steps' contracts. None declares authority of its own, so binding them grants
+        // nothing a caller could not already do one request at a time. Local root only for
+        // now: the HTTP door and the served kernels are minimal by design, and a plan is a
+        // request AMPLIFIER (one request, many steps, a map over a list) — whether a public
+        // or peer surface should offer that is a posture decision, not a default.
+        Arc::new(ikigai_engine::plan_space::space()) as Arc<dyn Space>,
         // Content sniffing + sniff-and-dispatch: `urn:sniff` classifies opaque bytes,
         // `urn:transrept:auto` sniffs then routes them to the matching transreptor — so a
         // mislabeled fetch or a file read transrepts without asserting its input type.

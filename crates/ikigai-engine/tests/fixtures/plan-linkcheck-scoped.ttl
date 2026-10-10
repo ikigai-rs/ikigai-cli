@@ -1,0 +1,134 @@
+# Variant 3 of the link check — SCOPE AND AUTHORITY: change inputs and the capability, not
+# the stages. Against the base plan the stages are identical; what changed is data:
+#   - `tag=research` on the bookmarks read restricts the pass to one tag (an argument by
+#     value, where the base plan has none);
+#   - `ttl` defaults to one day instead of seven — daily with a one-day cache age, weekly
+#     with seven, one plan (`ttl=` at invocation does the same without an edit);
+#   - the plan is run under a capability attenuated to the hosts it may touch. That is the
+#     CALLER's ceiling, enforced by the kernel per step, so it cannot be edited away in the
+#     plan: any other host is a typed denial recorded in the sink, not a silent skip. The
+#     plan's own ik:requires stays the floor it needs (`urn:cap:net:*` — "holds some grant
+#     under this prefix"); today's net ACL grants host by host (`urn:cap:net:<host>`), so
+#     an "only .edu" ceiling is a set of such grants, not a glob.
+# The principle the four fixtures pin: a policy is (a) which resources the stages name,
+# (b) the parameters, (c) the capability the plan runs under, (d) whether a stage is
+# present — all data, all validated before execution, none requiring the reachability
+# check, the status store or the report renderer to change.
+#
+# --- text face ---
+#   urls   = source urn:cms:bookmarks root=@root tag=research as=text/uri-list
+#   checks = @urls .. urn:http:reachable ttl=@ttl
+#   count  = @checks | urn:text:wc count=lines
+#   stored = sink urn:cms:linkstatus content=@checks checked=@count
+#   @stored | ( source urn:cms:linkstatus as=text/html ; source urn:cms:linkstatus as=text/turtle )
+# --- end text face ---
+
+@prefix ik:   <https://ikigai-rs.dev/ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+
+<urn:plan:linkcheck-scoped> a ik:Process ;
+    rdfs:label "CMS link check, research tag, daily" ;
+    ik:input <urn:plan:linkcheck-scoped:input:root> , <urn:plan:linkcheck-scoped:input:ttl> ;
+    ik:output "text/plain" ;
+    ik:requires <urn:cap:net:*> ;
+    ik:step <urn:plan:linkcheck-scoped:step:1> , <urn:plan:linkcheck-scoped:step:2> ,
+            <urn:plan:linkcheck-scoped:step:3> , <urn:plan:linkcheck-scoped:step:4> ,
+            <urn:plan:linkcheck-scoped:step:5> , <urn:plan:linkcheck-scoped:step:6> ;
+    ik:result <urn:plan:linkcheck-scoped:fork:1> .
+
+<urn:plan:linkcheck-scoped:input:root> ik:inputName "root" ;
+    ik:source "argument" ;
+    ik:required false ;
+    ik:class rdfs:Resource ;
+    ik:default "urn:cms:graph" .
+
+# One day, not seven: the only parameter edit.
+<urn:plan:linkcheck-scoped:input:ttl> ik:inputName "ttl" ;
+    ik:source "argument" ;
+    ik:required false ;
+    ik:class xsd:integer ;
+    ik:default "86400" .
+
+<urn:plan:linkcheck-scoped:step:1> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:cms:bookmarks> ;
+    ik:binds "urls" ;
+    ik:argument <urn:plan:linkcheck-scoped:step:1:arg:root> ,
+                <urn:plan:linkcheck-scoped:step:1:arg:tag> ,
+                <urn:plan:linkcheck-scoped:step:1:arg:as> .
+
+<urn:plan:linkcheck-scoped:step:1:arg:root> a ik:Argument ;
+    ik:inputName "root" ;
+    ik:ref <urn:plan:linkcheck-scoped:var:root> .
+
+# The scope: one tag, by value.
+<urn:plan:linkcheck-scoped:step:1:arg:tag> a ik:Argument ;
+    ik:inputName "tag" ;
+    ik:value "research" .
+
+<urn:plan:linkcheck-scoped:step:1:arg:as> a ik:Argument ;
+    ik:inputName "as" ;
+    ik:value "text/uri-list" .
+
+<urn:plan:linkcheck-scoped:step:2> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:http:reachable> ;
+    ik:binds "checks" ;
+    ik:mapOver <urn:plan:linkcheck-scoped:step:1> ;
+    ik:argument <urn:plan:linkcheck-scoped:step:2:arg:ttl> .
+
+<urn:plan:linkcheck-scoped:step:2:arg:ttl> a ik:Argument ;
+    ik:inputName "ttl" ;
+    ik:ref <urn:plan:linkcheck-scoped:var:ttl> .
+
+<urn:plan:linkcheck-scoped:step:3> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:text:wc> ;
+    ik:binds "count" ;
+    ik:pipeFrom <urn:plan:linkcheck-scoped:step:2> ;
+    ik:argument <urn:plan:linkcheck-scoped:step:3:arg:count> .
+
+<urn:plan:linkcheck-scoped:step:3:arg:count> a ik:Argument ;
+    ik:inputName "count" ;
+    ik:value "lines" .
+
+<urn:plan:linkcheck-scoped:step:4> a ik:Step ;
+    ik:verb "Sink" ;
+    ik:resolves <urn:cms:linkstatus> ;
+    ik:binds "stored" ;
+    ik:argument <urn:plan:linkcheck-scoped:step:4:arg:content> , <urn:plan:linkcheck-scoped:step:4:arg:checked> .
+
+<urn:plan:linkcheck-scoped:step:4:arg:content> a ik:Argument ;
+    ik:inputName "content" ;
+    ik:ref <urn:plan:linkcheck-scoped:var:checks> .
+
+<urn:plan:linkcheck-scoped:step:4:arg:checked> a ik:Argument ;
+    ik:inputName "checked" ;
+    ik:ref <urn:plan:linkcheck-scoped:var:count> .
+
+<urn:plan:linkcheck-scoped:fork:1> a ik:Fork ;
+    ik:upstream <urn:plan:linkcheck-scoped:step:4> ;
+    ik:join "newline" .
+
+<urn:plan:linkcheck-scoped:step:5> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:cms:linkstatus> ;
+    ik:forkOf <urn:plan:linkcheck-scoped:fork:1> ;
+    ik:order 1 ;
+    ik:argument <urn:plan:linkcheck-scoped:step:5:arg:as> .
+
+<urn:plan:linkcheck-scoped:step:5:arg:as> a ik:Argument ;
+    ik:inputName "as" ;
+    ik:value "text/html" .
+
+<urn:plan:linkcheck-scoped:step:6> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:cms:linkstatus> ;
+    ik:forkOf <urn:plan:linkcheck-scoped:fork:1> ;
+    ik:order 2 ;
+    ik:argument <urn:plan:linkcheck-scoped:step:6:arg:as> .
+
+<urn:plan:linkcheck-scoped:step:6:arg:as> a ik:Argument ;
+    ik:inputName "as" ;
+    ik:value "text/turtle" .

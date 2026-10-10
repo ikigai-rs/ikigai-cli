@@ -1,0 +1,148 @@
+# The CMS link-check pass (ikigai-cms-web src/maintenance.rs, `urn:cms:linkcheck`) as a
+# plan — the fixture that pins the emitted shape of the process vocabulary. Its data flow
+# is the text face below, one line per stage; the graph is that text, skolemized. The
+# lines between the `text face` markers are read by a test and matched step for step
+# against the graph (name, verb, target, upstream, arguments).
+#
+# --- text face ---
+#   urls   = source urn:cms:bookmarks root=@root as=text/uri-list
+#   checks = @urls .. urn:http:reachable ttl=@ttl
+#   count  = @checks | urn:text:wc count=lines
+#   stored = sink urn:cms:linkstatus content=@checks checked=@count
+#   @stored | ( source urn:cms:linkstatus as=text/html ; source urn:cms:linkstatus as=text/turtle )
+# --- end text face ---
+#
+# What the Rust pass has that the plan deliberately does NOT — and where each goes:
+#   - the HEAD-then-confirm-with-GET conditional (`check_once` / `confirm_gone_with_get`):
+#     inside `urn:http:reachable`, a small general resource that belongs in ikigai-http,
+#     not the CMS. A conditional in a plan is a missing resource.
+#   - the classification (`removable`, `dead_domain`, `durably_unreachable` over outcome
+#     and age): a decision-table resource driven by the kernel's clock (see the strict
+#     and repair variants, `urn:cms:policy:*`). A plan never carries "now" — the
+#     environment comes from the kernel, not the plan.
+#   - the fold (`merge`, carrying first_broken_at / broken_count / kept_at forward): the
+#     `urn:cms:linkstatus` Sink owns the merge. A plan sinks; it does not fold.
+# Neither `urn:http:reachable` nor a plan-driven `urn:cms:linkstatus` Sink exists yet;
+# this plan names them as the shape the following arcs build toward. `urn:cms:bookmarks`
+# as text/uri-list is the `list_bookmarks` SPARQL query as a resource.
+#
+# The result is a fork whose two branches read the report back as HTML and as Turtle,
+# joined by newline — the engine's only join — so the process's declared ik:output is the
+# honest text/plain, not either face. Beyond the four data-flow lines, the plan carries
+# what they do not exercise so every term appears once: two declared parameters (`root`,
+# `ttl`) as ArgSpec nodes, a fork with two ordered branches, and a name referenced twice
+# (`@checks` feeds both the count and the sink).
+
+@prefix ik:   <https://ikigai-rs.dev/ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+
+<urn:plan:linkcheck> a ik:Process ;
+    rdfs:label "CMS link check" ;
+    rdfs:comment "Check every bookmark's reachability, store the outcomes, and read the report back in two faces." ;
+    ik:input <urn:plan:linkcheck:input:root> , <urn:plan:linkcheck:input:ttl> ;
+    ik:output "text/plain" ;
+    ik:requires <urn:cap:net:*> ;
+    ik:step <urn:plan:linkcheck:step:1> , <urn:plan:linkcheck:step:2> ,
+            <urn:plan:linkcheck:step:3> , <urn:plan:linkcheck:step:4> ,
+            <urn:plan:linkcheck:step:5> , <urn:plan:linkcheck:step:6> ;
+    ik:result <urn:plan:linkcheck:fork:1> .
+
+# Parameters: exactly the ArgSpec nodes an endpoint declares, so the stored plan's
+# Description is derivable from the graph and the manifold can offer it.
+<urn:plan:linkcheck:input:root> ik:inputName "root" ;
+    ik:source "argument" ;
+    ik:required false ;
+    ik:summary "The graph the bookmarks are listed from." ;
+    ik:class rdfs:Resource ;
+    ik:default "urn:cms:graph" .
+
+<urn:plan:linkcheck:input:ttl> ik:inputName "ttl" ;
+    ik:source "argument" ;
+    ik:required false ;
+    ik:summary "How long a reachability answer is trusted, in seconds (the HEAD cache age)." ;
+    ik:class xsd:integer ;
+    ik:default "604800" .
+
+# urls = source urn:cms:bookmarks root=@root as=text/uri-list
+<urn:plan:linkcheck:step:1> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:cms:bookmarks> ;
+    ik:binds "urls" ;
+    ik:argument <urn:plan:linkcheck:step:1:arg:root> , <urn:plan:linkcheck:step:1:arg:as> .
+
+<urn:plan:linkcheck:step:1:arg:root> a ik:Argument ;
+    ik:inputName "root" ;
+    ik:ref <urn:plan:linkcheck:var:root> .
+
+<urn:plan:linkcheck:step:1:arg:as> a ik:Argument ;
+    ik:inputName "as" ;
+    ik:value "text/uri-list" .
+
+# checks = @urls .. urn:http:reachable ttl=@ttl
+<urn:plan:linkcheck:step:2> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:http:reachable> ;
+    ik:binds "checks" ;
+    ik:mapOver <urn:plan:linkcheck:step:1> ;
+    ik:argument <urn:plan:linkcheck:step:2:arg:ttl> .
+
+<urn:plan:linkcheck:step:2:arg:ttl> a ik:Argument ;
+    ik:inputName "ttl" ;
+    ik:ref <urn:plan:linkcheck:var:ttl> .
+
+# count = @checks | urn:text:wc count=lines
+<urn:plan:linkcheck:step:3> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:text:wc> ;
+    ik:binds "count" ;
+    ik:pipeFrom <urn:plan:linkcheck:step:2> ;
+    ik:argument <urn:plan:linkcheck:step:3:arg:count> .
+
+<urn:plan:linkcheck:step:3:arg:count> a ik:Argument ;
+    ik:inputName "count" ;
+    ik:value "lines" .
+
+# stored = sink urn:cms:linkstatus content=@checks checked=@count
+<urn:plan:linkcheck:step:4> a ik:Step ;
+    ik:verb "Sink" ;
+    ik:resolves <urn:cms:linkstatus> ;
+    ik:binds "stored" ;
+    ik:argument <urn:plan:linkcheck:step:4:arg:content> , <urn:plan:linkcheck:step:4:arg:checked> .
+
+<urn:plan:linkcheck:step:4:arg:content> a ik:Argument ;
+    ik:inputName "content" ;
+    ik:ref <urn:plan:linkcheck:var:checks> .
+
+<urn:plan:linkcheck:step:4:arg:checked> a ik:Argument ;
+    ik:inputName "checked" ;
+    ik:ref <urn:plan:linkcheck:var:count> .
+
+# @stored | ( source urn:cms:linkstatus as=text/html ; source urn:cms:linkstatus as=text/turtle )
+# The sink's receipt is the fork's upstream: the edge is what orders the read after the
+# write. Each branch ignores its piped input and reads the status afresh.
+<urn:plan:linkcheck:fork:1> a ik:Fork ;
+    ik:upstream <urn:plan:linkcheck:step:4> ;
+    ik:join "newline" .
+
+<urn:plan:linkcheck:step:5> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:cms:linkstatus> ;
+    ik:forkOf <urn:plan:linkcheck:fork:1> ;
+    ik:order 1 ;
+    ik:argument <urn:plan:linkcheck:step:5:arg:as> .
+
+<urn:plan:linkcheck:step:5:arg:as> a ik:Argument ;
+    ik:inputName "as" ;
+    ik:value "text/html" .
+
+<urn:plan:linkcheck:step:6> a ik:Step ;
+    ik:verb "Source" ;
+    ik:resolves <urn:cms:linkstatus> ;
+    ik:forkOf <urn:plan:linkcheck:fork:1> ;
+    ik:order 2 ;
+    ik:argument <urn:plan:linkcheck:step:6:arg:as> .
+
+<urn:plan:linkcheck:step:6:arg:as> a ik:Argument ;
+    ik:inputName "as" ;
+    ik:value "text/turtle" .

@@ -126,6 +126,11 @@ const OWN: &[(&str, &str)] = &[
     ("people", "ikigai-embedded"),
     // Sibling members of this workspace.
     ("booking", "ikigai-intake"),
+    // Plans as resources (ledger #956): `urn:plan:eval`, `urn:plan:validate`,
+    // `urn:plan:requires`, beside the runner they share with the REPL's `run`.
+    ("plan-eval", "ikigai-engine"),
+    ("plan-requires", "ikigai-engine"),
+    ("plan-validate", "ikigai-engine"),
     ("contact", "ikigai-intake"),
     ("send", "ikigai-email"),
     ("space", "ikigai-intray"),
@@ -254,6 +259,11 @@ const OWNER_ONLY: &[&str] = &[
     // `host-arrangement`, which says the same thing as a declaration.
     "diagram-arrangement",
     "diagram-kernel",
+    // A plan is a request AMPLIFIER — one request, many steps, a map over a list — so the
+    // door does not offer one until someone decides a public surface should (ledger #956).
+    "plan-eval",
+    "plan-requires",
+    "plan-validate",
 ];
 
 // ---------------------------------------------------------------------------
@@ -439,6 +449,23 @@ const ARRANGEMENT_TURTLE: &str = "\
     ik:pattern \"urn:demo:a\" ;
     ik:matchKind \"exact\" ;
     ik:endpointName \"demo\" .
+";
+
+/// A plan that is safe to fire under root: one pure step, and nothing it reads touches the
+/// network, a process or the platform — so the walk RUNS `urn:plan:eval` rather than
+/// reporting a plan that did not resolve.
+const PLAN: &str = "\
+@prefix ik: <https://ikigai-rs.dev/ns#> .
+<urn:plan:conformance> a ik:Process ;
+    ik:step <urn:plan:conformance:step:1> ;
+    ik:result <urn:plan:conformance:step:1> .
+<urn:plan:conformance:step:1> a ik:Step ;
+    ik:verb \"Source\" ;
+    ik:resolves <urn:iki:fn:toUpper> ;
+    ik:argument <urn:plan:conformance:step:1:arg:in> .
+<urn:plan:conformance:step:1:arg:in> a ik:Argument ;
+    ik:inputName \"in\" ;
+    ik:value \"conformance\" .
 ";
 
 /// An identity stylesheet — enough for `xslt-transform` to have a real transform to run.
@@ -658,6 +685,10 @@ fn root_suite() -> Suite {
             Fixture::new("diagram-arrangement", Verb::Source)
                 .arg("of", "urn:iki:host:arrangement"),
         )
+        // The plan resources, over a real plan: one pure step, so evaluating it is a read.
+        .fixture(Fixture::new("plan-eval", Verb::Source).arg("in", PLAN))
+        .fixture(Fixture::new("plan-validate", Verb::Source).arg("in", PLAN))
+        .fixture(Fixture::new("plan-requires", Verb::Source).arg("in", PLAN))
         // ---- waived, per check, with the exception pinned by hand -----------------
         // ★ A REAL VOCABULARY GAP, in a repo that cannot fix it. Declaring `urn:host:health`'s
         // `text/turtle` face (it was served and unannounced) brought it under VOCABULARY,
