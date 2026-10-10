@@ -2236,7 +2236,7 @@ fn openapi_of(
             let params: Vec<Value> = action
                 .inputs
                 .iter()
-                .filter(|a| !ADAPTER_OWNED.contains(&a.name.as_str()))
+                .filter(|a| projected(a))
                 .map(|a| {
                     json!({
                         "name": a.name,
@@ -2308,14 +2308,21 @@ fn operation_id(method: &str, path: &str) -> String {
 /// same mistake on the read side: it is the `Accept` header here, not a query parameter.
 const ADAPTER_OWNED: &[&str] = &["as", "content"];
 
+/// Whether an input is something a client SENDS, and so belongs in the projection: not one the
+/// adapter owns ([`ADAPTER_OWNED`]), and not one the resolving grammar BINDS from the IRI
+/// (`InputSource::Binding`, ledger #1065). A description is asked of a concrete path, so a
+/// template variable is already in it: listing it as a required query parameter (as this did)
+/// described a call that sends the value twice, and a client generated from it would.
+fn projected(input: &ikigai_core::ArgSpec) -> bool {
+    !ADAPTER_OWNED.contains(&input.name.as_str())
+        && input.source != ikigai_core::InputSource::Binding
+}
+
 fn schema_properties(inputs: &[ikigai_core::ArgSpec]) -> (serde_json::Value, Vec<String>) {
     use serde_json::{Map, Value};
     let mut props = Map::new();
     let mut required = Vec::new();
-    for a in inputs
-        .iter()
-        .filter(|a| !ADAPTER_OWNED.contains(&a.name.as_str()))
-    {
+    for a in inputs.iter().filter(|a| projected(a)) {
         props.insert(a.name.clone(), arg_schema(a));
         if a.required {
             required.push(a.name.clone());
@@ -4105,6 +4112,28 @@ mod tests {
         let required = schema["required"].as_array().unwrap();
         assert!(required.iter().any(|r| r == "slot") && required.iter().any(|r| r == "email"));
         assert!(!required.iter().any(|r| r == "preference"));
+    }
+
+    /// ledger #1065: an input the resolving grammar BINDS from the IRI (`InputSource::Binding`)
+    /// is already satisfied by the path the description was asked of, so it is not a query
+    /// parameter a client could send. It used to be listed as `in: query, required`.
+    #[tokio::test]
+    async fn description_omits_an_input_the_path_already_binds() {
+        let addr = start().await;
+        let resp = roundtrip(
+            addr,
+            "GET /test/tpl/alice?description HTTP/1.1\r\nHost: x\r\n\r\n",
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
+        let v = openapi_body(&resp);
+        let get = &v["paths"]["/test/tpl/alice"]["get"];
+        assert!(get.is_object(), "the read is projected: {v}");
+        let named = get["parameters"]
+            .as_array()
+            .map(|params| params.iter().any(|p| p["name"] == "name"))
+            .unwrap_or(false);
+        assert!(!named, "a bound input is not a query parameter: {v}");
     }
 
     #[tokio::test]

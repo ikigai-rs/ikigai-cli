@@ -73,8 +73,14 @@ impl Listener {
     }
 }
 
+/// The refusal names `match`, says `SERVICE`, gives the intray's own remedy and never the
+/// store's (`urn:iki:store:load` means nothing to a match; ledger #1108).
 fn is_match_refusal(r: &Result<ikigai_core::Representation, Error>) -> bool {
-    matches!(r, Err(Error::InvalidArgument { name, detail }) if name == "match" && detail.contains("SERVICE"))
+    matches!(r, Err(Error::InvalidArgument { name, detail })
+        if name == "match"
+            && detail.contains("SERVICE")
+            && detail.contains("never leaves this host")
+            && !detail.contains("urn:iki:store:load"))
 }
 
 #[test]

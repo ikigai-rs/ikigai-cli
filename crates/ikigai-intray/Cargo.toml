@@ -41,7 +41,10 @@ spargebra = { version = "0.4", features = ["sep-0006"] }
 # (`service::evaluator`) and the algebra walk (`service::refuse_service`) every `match=` goes
 # through — exists only from 0.2.10. This crate carried its own copy of both (ledger #877) until
 # then, and that copy is gone.
-ikigai-store = "0.2.10"
+# ⚠ 0.2.11 is an API floor (ledger #1108): `service::refuse_service_with` refuses with the
+# store's shared `SERVICE_REFUSAL` sentence followed by THIS crate's remedy, never the store's
+# own (`urn:iki:store:load`, which means nothing to a match). It exists only from 0.2.11.
+ikigai-store = "0.2.11"
 
 [dev-dependencies]
 futures = { workspace = true }
