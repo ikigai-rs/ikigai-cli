@@ -25,3 +25,13 @@ tokio = { version = "1", default-features = false, features = ["rt-multi-thread"
 # For a dual-stack server socket (IPV6_V6ONLY off) — std can't set it. Already in
 # the tree via quinn; declared directly so `serve` can build the socket itself.
 socket2 = "0.6"
+# The server's STATELESS-RESET key as an HMAC key (ledger #1092): derived from the server's
+# own identity, so a restarted server resets the connections its predecessor held and a
+# client heals at once instead of waiting out the idle timeout. Already in the tree through
+# quinn's and rustls's `ring` features; declared directly to construct `hmac::Key`.
+ring = "0.17"
+# quinn does not re-export `HashedConnectionIdGenerator`: the server's connection IDs must be
+# keyed on its identity too, or a restarted server REJECTS the old IDs as not its own and
+# drops their packets without resetting (ledger #1092). `from_key` is the API used; the floor
+# is the version this lock has always built (quinn 0.11.11 requires it), not a guess older.
+quinn-proto = { version = "0.11.17", default-features = false }
