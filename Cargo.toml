@@ -884,7 +884,11 @@ ikigai-jsonld = "0.2.1" # 0.2.1 is a SECURITY floor: JSON-LD nesting past 64 is 
 # operators could not be narrowed to before matching fell through to the LLM residual.
 # SHACL validation (urn:shacl:validate) — rudof's validator is native-only (gated off wasm),
 # so it's linked natively here; the browser serves the same resource via shacl-engine (JS).
-ikigai-shacl = "0.3.2" # 0.3.2 is a SECURITY floor (ledger #1099): rudof evaluates a shape's `sh:select`
+ikigai-shacl = "0.3.3" # 0.3.3 = validation runs on a SIZED pool (ledger #1121, #1102): rudof validated on
+# rayon's default 2 MiB worker threads, where a deep caller query can overflow the stack, and a
+# stack overflow ABORTS the host process. It also shares the store's SERVICE refusal text
+# (ledger #1108) and refuses a WHERE rudof misreads. A safety floor.
+# Beneath it, still true: 0.3.2 is a SECURITY floor (ledger #1099): rudof evaluates a shape's `sh:select`
 # with oxigraph's HTTP service handler installed (this build has `http-client` on), so through
 # 0.3.1 `SERVICE <http://…>` in a caller's shapes graph — in an `sh:select`, in an `sh:declare`
 # prefix name, or spliced in through an IRI holding `>` — was an outbound request no
@@ -958,7 +962,10 @@ ikigai-repo = "0.2.0" # 0.2.0 = naming only: names its `space()` `urn:iki:space:
 # Repository browsing (urn:repo:{root}:tree/file/state/hash/explain +
 # urn:iki:annotation:*) over configured roots — opt-in via `browse.root` config lines
 # (embedded host).
-ikigai-browse = "0.18.1" # 0.18.1: `^0.5.0` was a CEILING thirteen minors behind. The Rust API this host calls
+ikigai-browse = "0.18.2" # 0.18.2 is a SECURITY floor (ledger #1126): it never serves `.git` (refused at
+# the jail, hidden from the listing). 0.18.1 answered `.git/config`, a credentialed remote included,
+# to an ordinary browse read grant.
+# Beneath it, still true: 0.18.1: `^0.5.0` was a CEILING thirteen minors behind. The Rust API this host calls
 # (`space_with_explain`, `Mount`, `ExplainConfig`) compiles unchanged; the behavior a caller sees
 # moved a lot. 0.17 is a SECURITY floor: an annotation Delete also needs `urn:cap:browse:read:*`,
 # and cross-root deletes and overwrites are denied. 0.6 makes a review with zero findings a valid
@@ -1174,7 +1181,10 @@ ikigai-meeting = "0.1.2" # 0.1.2 = the Zoom `account_id` moves out of the token 
 # ⚠ …and 0.2.11 (ledger #1108), an API floor taken with `ikigai-intray`'s: the consumer-worded
 # refusals (`service::refuse_service_with`), so a `match=` refusal names the intray's remedy.
 # Additive for this host otherwise.
-ikigai-store = { version = "0.2.11", features = ["persistent"] }
+# ⚠ …and 0.2.12 (ledger #1127), a PERFORMANCE floor: every update runs on the store's one writer
+# thread. Each used to commit on a fresh thread, and RocksDB seeds its memtable skiplist from the
+# thread id, so reads after a bulk write ran 2x to 14x slower in release until the memtable flushed.
+ikigai-store = { version = "0.2.12", features = ["persistent"] }
 # The work ledger (`urn:iki:ledger:*`): items, comments, labels, links, claims and
 # `next`, as RDF in the store above. It owns no bytes — every read is a scoped SPARQL
 # query at `urn:iki:store:graph-select` and every write a scoped UPDATE at

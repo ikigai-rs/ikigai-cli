@@ -2973,9 +2973,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-browse"
-version = "0.18.1"
+version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc7e2fceb667233d534710903263d77abc8d14ae93130530b4c92724de2484e6"
+checksum = "bd5fd3436258a851d9bb5cd40af1175300abb439dedb8ad2972446d3050c4557"
 dependencies = [
  "async-trait",
  "ikigai-a11y",
@@ -3503,15 +3503,16 @@ dependencies = [
 
 [[package]]
 name = "ikigai-shacl"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cea5375b88ee4911b99371daef0529f540fae07bc820478f996304d0bc421d3"
+checksum = "a049a0b32e6ca75a4ab2f7ff631e84419e5ad6c5ff3a71764c53829962d9304f"
 dependencies = [
  "async-trait",
  "futures",
  "ikigai-core",
  "ikigai-store",
  "oxrdf",
+ "rayon",
  "rudof_rdf",
  "serde",
  "serde_json",
@@ -3566,9 +3567,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-store"
-version = "0.2.11"
+version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc1fec3c06beb29ddef13e4ee0f38c55ecead5ec9a2bc06be8a20d33ce9794d2"
+checksum = "ea0b4781a1d7b93c158f35faae5223ed63018e777c427a7c4d52980c5405419a"
 dependencies = [
  "async-trait",
  "ikigai-core",

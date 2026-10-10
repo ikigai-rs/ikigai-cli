@@ -44,7 +44,9 @@ spargebra = { version = "0.4", features = ["sep-0006"] }
 # ⚠ 0.2.11 is an API floor (ledger #1108): `service::refuse_service_with` refuses with the
 # store's shared `SERVICE_REFUSAL` sentence followed by THIS crate's remedy, never the store's
 # own (`urn:iki:store:load`, which means nothing to a match). It exists only from 0.2.11.
-ikigai-store = "0.2.11"
+# 0.2.12 is taken with the root's (ledger #1127, the writer-thread perf fix) so the two pins
+# cannot resolve apart off-tree; the API floor above is unchanged.
+ikigai-store = "0.2.12"
 
 [dev-dependencies]
 futures = { workspace = true }
