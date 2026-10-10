@@ -114,6 +114,15 @@ pub fn fixed_cap(scopes: Vec<String>) -> CapFn {
 /// representation cache by identity); and `?principal=…` in the query string is **dropped**
 /// on every verb, so a submitter cannot name their own principal, and a read names nobody.
 ///
+/// ★ **Since core 0.1.93 the answer is ALSO minted into the request's capability** (ledger
+/// #1077), on every verb, reads included: `urn:cap:principal:<iri>`, which an endpoint reads
+/// with `inv.capability.principal()`. That one does partition the kernel's cache per
+/// principal, deliberately (an answer for alice is alice's), and an answer under a named
+/// capability is sent `Cache-Control: private` with the credential headers in `Vary`. Only an
+/// answer core can carry verbatim is minted (an absolute IRI, at most 512 bytes, no `*`; a
+/// label like `p` is not), and nothing is minted under a root capability. The stamped
+/// argument is kept for hosts that still read it.
+///
 /// ```
 /// use ikigai_core::{
 ///     Description, EndpointSpace, Exact, FnEndpoint, Invocation, Kernel, ReprType,
@@ -1150,8 +1159,9 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
             }
             // The headers a capability function reads identity from. The edge cannot see
             // inside `cap_fn`, so it names them whenever `cap_fn` was consulted; a route that
-            // pins its capability makes the answer the same for every caller.
-            if matched.and_then(|m| m.cap.as_ref()).is_none() {
+            // pins its capability makes the answer the same for every caller — unless the
+            // door named a principal, which it read off the same credentials.
+            if matched.and_then(|m| m.cap.as_ref()).is_none() || cap.principal().is_some() {
                 vary.extend(CREDENTIAL_HEADERS.iter().map(|(_, name)| *name));
             }
             read_resp(req, repr, freshness, vary)
@@ -1177,10 +1187,21 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
 /// The capability a request resolves under: a matched route's per-route ceiling (the
 /// multi-tenant seam) when it pins one, otherwise the server-wide `cap_fn`. One function, so
 /// the description face and resolution cannot disagree about who is asking.
+///
+/// The door's [`PrincipalFn`] answer is MINTED into it as core's principal scope (ledger
+/// #1077, core 0.1.93), on every verb, reads included: an endpoint asks who it serves with
+/// `inv.capability.principal()`, and the kernel's cache, which keys on the capability, keeps
+/// one principal's answer from another's. Nothing is minted under a root capability (root
+/// names nobody), or for an answer core cannot carry verbatim (not an absolute IRI, over 512
+/// bytes, holding `*`); the stamped `principal` argument on a write is unchanged either way.
 fn request_capability(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) -> Capability {
-    match matched.and_then(|m| m.cap.as_ref()) {
+    let capability = match matched.and_then(|m| m.cap.as_ref()) {
         Some(scopes) => Capability::scoped(scopes.clone()),
         None => (shared.cap_fn)(req),
+    };
+    match shared.config.principal_fn.as_ref().and_then(|f| f(req)) {
+        Some(principal) => capability.with_principal(&principal).unwrap_or(capability),
+        None => capability,
     }
 }
 
@@ -1616,6 +1637,11 @@ fn shaped_by_credentials(
     matched: Option<&Matched>,
     cap: &Capability,
 ) -> bool {
+    // A capability naming a principal is that party's answer (ledger #1077), whatever else
+    // the credentials did or did not grant.
+    if cap.principal().is_some() {
+        return true;
+    }
     if matched.and_then(|m| m.cap.as_ref()).is_some() {
         return false;
     }
@@ -2741,10 +2767,11 @@ mod tests {
         // Delete response does carry: the error body (`error_resp` renders `{e}`).
         let provenance = FnEndpoint::new("provenance", |inv: &Invocation<'_>| {
             let seen = format!(
-                "received={} client={} principal={}",
+                "received={} client={} principal={} cap={}",
                 inv.inline_str("received").unwrap_or("-"),
                 inv.inline_str("client").unwrap_or("-"),
-                inv.inline_str("principal").unwrap_or("-")
+                inv.inline_str("principal").unwrap_or("-"),
+                inv.capability.principal().unwrap_or("-")
             );
             if inv.request.verb == Verb::Delete {
                 return Err(Error::Denied(seen));
@@ -3025,6 +3052,46 @@ mod tests {
             out.contains("principal=-"),
             "a read must not carry the principal: {out}"
         );
+    }
+
+    // A door whose hook names every connection with an IRI core can carry as a principal.
+    fn alice_door() -> EdgeConfig {
+        let door: PrincipalFn =
+            Arc::new(|_req: &HttpRequest| Some("urn:example:alice".to_string()));
+        EdgeConfig {
+            principal_fn: Some(door),
+            ..EdgeConfig::default()
+        }
+    }
+
+    /// ledger #1077: the door's principal is MINTED into the request capability on every
+    /// verb, reads included, so an endpoint can ask who it serves; the stamped argument stays
+    /// on writes only, as before.
+    #[tokio::test]
+    async fn the_doors_principal_is_minted_into_the_capability_on_reads_and_writes() {
+        let addr = start_with(alice_door()).await;
+        let read = roundtrip(addr, "GET /test/provenance HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(
+            read.contains("principal=- cap=urn:example:alice"),
+            "a read is attributed through its capability, not an argument: {read}"
+        );
+        let write = roundtrip(
+            addr,
+            "POST /test/provenance HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nhi",
+        )
+        .await;
+        assert!(
+            write.contains("principal=urn:example:alice cap=urn:example:alice"),
+            "a write carries both: {write}"
+        );
+        // A name core cannot carry (`p` is no IRI) is stamped as before and minted nowhere.
+        let addr = start_with(naming_door()).await;
+        let named = roundtrip(
+            addr,
+            "POST /test/provenance HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nhi",
+        )
+        .await;
+        assert!(named.contains("principal=p cap=-"), "{named}");
     }
 
     #[tokio::test]
@@ -5435,6 +5502,37 @@ mod tests {
             let resp = get(addr, "/test/c/whoami", "").await;
             assert_eq!(body(&resp), "anonymous");
             assert_eq!(cache_control(&resp), "public, no-cache", "{resp}");
+        }
+
+        /// ledger #1077: a door that names a principal makes the answer that party's — the
+        /// kernel keys it on the minted capability — so no shared cache may hand it to another,
+        /// and a route that pins its capability still varies on the credentials it was read from.
+        #[tokio::test]
+        async fn a_named_principal_makes_it_private_even_on_a_pinned_route() {
+            let door: PrincipalFn =
+                Arc::new(|_req: &HttpRequest| Some("urn:example:alice".to_string()));
+            let addr = serve(EdgeConfig {
+                principal_fn: Some(door.clone()),
+                ..EdgeConfig::default()
+            })
+            .await;
+            let resp = get(addr, "/test/c/whoami", "").await;
+            assert_eq!(cache_control(&resp), "private, no-cache", "{resp}");
+            let addr = serve(EdgeConfig {
+                principal_fn: Some(door),
+                routes: RouteTable::new(vec![Route {
+                    pattern: "/members/whoami".to_string(),
+                    iri_template: "urn:test:c:whoami".to_string(),
+                    cap: Some(vec!["urn:cap:member".to_string()]),
+                    cors: None,
+                    csp: None,
+                }]),
+                ..EdgeConfig::default()
+            })
+            .await;
+            let resp = get(addr, "/members/whoami", "").await;
+            assert_eq!(cache_control(&resp), "private, no-cache", "{resp}");
+            assert!(vary_of(&resp).contains(&"Cookie".to_string()), "{resp}");
         }
 
         #[tokio::test]

@@ -83,6 +83,26 @@ fn covers(holder: &Capability, recorded: &Capability) -> bool {
     holder.clamp(recorded) == *recorded
 }
 
+/// The capability a job's tick fires under: `recorded` clamped to the registry's `ceiling`,
+/// with `recorded`'s PRINCIPAL re-minted after the clamp (ledger #1077).
+///
+/// Core's `clamp` keeps the CEILING's principal, which is right for a capability a peer
+/// presents and wrong for this one: `recorded` is the capability the scheduler held when it
+/// scheduled the job, which this registry recorded itself, so the name in it is the party
+/// the job runs for. Without the re-mint a narrowing ceiling would fire every job
+/// anonymous (or as the ceiling's own name). The re-mint adds no authority: a principal
+/// scope grants only that name, and the scopes are the clamp's. A clamp that comes out ROOT
+/// (root ceiling, root job) names nobody, as root never does.
+fn fire_capability(ceiling: &Capability, recorded: &Capability) -> Capability {
+    let clamped = ceiling.clamp(recorded);
+    match recorded.principal() {
+        Some(principal) if clamped.principal() != Some(principal) => {
+            clamped.with_principal(principal).unwrap_or(clamped)
+        }
+        _ => clamped,
+    }
+}
+
 /// A resource IRI — what `target=` is, on both `urn:time:schedule` and `urn:time:cancel`.
 const XSD_ANY_URI: &str = "http://www.w3.org/2001/XMLSchema#anyURI";
 /// A duration spelling (`1s`, `10m`) or a job id: a string on the wire.
@@ -654,7 +674,8 @@ impl JobRegistry {
     /// = 1) so the result is visible.
     ///
     /// ★ The request resolves under `ceiling.clamp(&job.capability)` — the job's RECORDED
-    /// authority, bounded by the registry's ceiling — and never under the ceiling alone.
+    /// authority, bounded by the registry's ceiling — and never under the ceiling alone, with
+    /// the recorded principal re-minted after the clamp ([`fire_capability`]).
     /// That one line is the whole of ledger #79: this used to pass the registry's own
     /// capability, which was root, so every job fired at root whoever scheduled it. A tick
     /// for a job no longer in the map (cancelled, or not yet inserted) has no recorded
@@ -670,7 +691,7 @@ impl JobRegistry {
                 Arc::clone(resolver),
                 job.target.clone(),
                 job.verb,
-                inner.ceiling.clamp(&job.capability),
+                fire_capability(&inner.ceiling, &job.capability),
             )
         };
         let (outcome, succeeded) = match Iri::parse(&target) {
@@ -1662,6 +1683,41 @@ mod tests {
         .expect("scheduled");
         backend.fire_all(1);
         assert_eq!(entered.load(Ordering::SeqCst), 1);
+    }
+
+    /// ledger #1077: a tick keeps the name of the party that scheduled it. Core's clamp keeps
+    /// the CEILING's principal, so a narrowing ceiling used to fire every job anonymous; the
+    /// recorded principal is re-minted after the clamp, and the scopes stay the clamp's.
+    #[test]
+    fn a_tick_fires_under_the_scheduling_principal_after_the_clamp() {
+        let alice = Capability::scoped(["urn:cap:x:write", "urn:cap:x:read"])
+            .with_principal("urn:example:alice")
+            .unwrap();
+        // A narrowing ceiling with no name of its own.
+        let ceiling = Capability::scoped(["urn:cap:x:write"]);
+        assert_eq!(
+            ceiling.clamp(&alice).principal(),
+            None,
+            "core's clamp sheds it"
+        );
+        let fired = fire_capability(&ceiling, &alice);
+        assert_eq!(fired.principal(), Some("urn:example:alice"));
+        assert!(fired.allows("urn:cap:x:write") && !fired.allows("urn:cap:x:read"));
+        // A ceiling naming the host: the job still runs for alice.
+        let host = ceiling.with_principal("urn:example:host").unwrap();
+        assert_eq!(
+            fire_capability(&host, &alice).principal(),
+            Some("urn:example:alice")
+        );
+        // A root ceiling passes the recorded capability whole, name included.
+        assert_eq!(fire_capability(&Capability::root(), &alice), alice);
+        // A job scheduled anonymously stays as core's clamp leaves it, and root stays root.
+        let anonymous = Capability::scoped(["urn:cap:x:write"]);
+        assert_eq!(fire_capability(&ceiling, &anonymous).principal(), None);
+        assert_eq!(
+            fire_capability(&Capability::root(), &Capability::root()),
+            Capability::root()
+        );
     }
 
     /// `with_capability` only narrows: a later root (or broader) ceiling cannot undo an
