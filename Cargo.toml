@@ -1171,7 +1171,10 @@ ikigai-meeting = "0.1.2" # 0.1.2 = the Zoom `account_id` moves out of the token 
 # over 100k rows or 16 MiB refused (raised by `urn:cap:store:answer:*`); a write-without-read
 # caller's DROP/CLEAR/CREATE runs SILENT. The ledger's grant list (`store::grants_for`) needs none
 # of the new grants: its reads stay inside the defaults.
-ikigai-store = { version = "0.2.10", features = ["persistent"] }
+# ⚠ …and 0.2.11 (ledger #1108), an API floor taken with `ikigai-intray`'s: the consumer-worded
+# refusals (`service::refuse_service_with`), so a `match=` refusal names the intray's remedy.
+# Additive for this host otherwise.
+ikigai-store = { version = "0.2.11", features = ["persistent"] }
 # The work ledger (`urn:iki:ledger:*`): items, comments, labels, links, claims and
 # `next`, as RDF in the store above. It owns no bytes — every read is a scoped SPARQL
 # query at `urn:iki:store:graph-select` and every write a scoped UPDATE at

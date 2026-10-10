@@ -594,6 +594,24 @@ protocol the remote transports speak. The transports are feature-gated:
 `ipc`. The WebAssembly build enables only `embedded`; `ipc`/`quic` are gated out
 by target.
 
+The modules and pieces the host composes, each published on crates.io from this workspace:
+
+| crate | what it is |
+|-------|------------|
+| `ikigai-discovery` | announce and find ikigai kernels on the local network over multicast DNS (`--announce`, `peer:<name>` targets, `urn:peer:list`) |
+| `ikigai-email` | `urn:email:send`: a capability-gated Sink that submits a message over SMTP, with typed transient/permanent failures |
+| `ikigai-intake` | public form intake: parse an untrusted urlencoded/JSON submission, validate it against declared fields, drop it into a tuplespace |
+| `ikigai-intray` | the intray as a tuplespace, `urn:space:{name}`: out (Sink), rd (Source), in (Delete), associative match by SPARQL `ASK` |
+| `ikigai-mcp` | `ikigai mcp`: the capability-scoped manifold projected as an MCP (Model Context Protocol) server |
+| `ikigai-passkey` | a minimal single-user WebAuthn (ES256) assertion verifier, the second factor on the edge's decision links |
+| `ikigai-scheduler` | the kernel's work scheduler: `single` or a threadpool (`pool`, `pool:N`) that parks rather than blocks on awaits |
+| `ikigai-time` | the time transport: originates resource requests on a timer, one-shot or recurring, under the scheduling capability |
+| `ikigai-tz` | `urn:tz:convert` (IANA/DST-correct) and `urn:tz:now` (a zoned clock) |
+| `ikigai-view` | the org⊕calendar consolidated-view derivation, reconciled entirely through the kernel |
+
+`ikigai-time` is released on its own version line; the rest move in lockstep with the
+workspace.
+
 ## Local development against a core checkout
 Copy `.cargo/config.toml.example` to `.cargo/config.toml` (gitignored) to redirect
 the `ikigai-core` dependency to a sibling `../ikigai-core` checkout.

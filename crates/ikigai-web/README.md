@@ -41,6 +41,13 @@ dropped from the query string on a write, so a submitter cannot name their own o
 identity; `principal` is dropped from a read's query string too, so a read names nobody.
 The doctest on `PrincipalFn` pins the shape.
 
+Since core 0.1.93 the door's principal is ALSO minted into the request's capability, on
+every verb, reads included (`urn:cap:principal:<iri>`, read with
+`inv.capability.principal()`). That one does partition the kernel's cache per principal,
+deliberately, and such an answer is sent `Cache-Control: private` with the credential
+headers in `Vary`. Only an answer core can carry verbatim is minted (an absolute IRI of at
+most 512 bytes with no `*`), and nothing is minted under a root capability.
+
 ### Admission before anything answers
 
 `EdgeConfig::admit_fn` (an `AdmitFn`) sees each request before ANY answer the door gives
@@ -61,6 +68,7 @@ default) admits everything. The doctest on `AdmitFn` pins the behavior.
 | `Accept:` / `?as=` | the `as=` face, negotiated against the faces the resource declares |
 | query params | inspectable request args |
 | request body (a write) | the piped `content`, with `Content-Type` as `content-type` |
+| `?description` | the offered actions as a minimal OpenAPI 3.1 document: a read's inputs as query parameters, a write's as the request body. An input the IRI template BINDS from the path (`InputSource::Binding`) is already in the path asked about, and is left out |
 
 - **The allow-list and `405` come from the endpoint's declared `describe().verbs`** —
   a Source+Sink resource `405`s a `DELETE`, and `OPTIONS` reports the real method set.
@@ -102,7 +110,9 @@ for the verb: its `as` input's `one_of` when it has one, otherwise the verb's `o
 - Nothing acceptable is **`406 Not Acceptable`**, listing the faces. `Accept: text/turtle`
   on a plain-only resource is still refused.
 - **`?as=<type>`** names the face explicitly and beats `Accept` — a link in a page cannot
-  set a header. A type outside the declared faces is a 406 too.
+  set a header. A type outside the declared faces is a 406 too. ⚠ The query is
+  form-encoded, so a raw `+` in it is a SPACE: `?as=application/ld+json` asks for
+  `application/ld json` and is refused. Write `?as=application/ld%2Bjson`.
 - A resource that declares no faces cannot be negotiated for and is never refused: it is
   handed the client's most preferred concrete type as `as`, and judges it itself.
 

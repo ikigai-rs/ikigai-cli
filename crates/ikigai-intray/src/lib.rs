@@ -40,7 +40,7 @@ use ikigai_core::{
     ReprType, Representation, Request, Result, UriTemplate, Verb,
 };
 use ikigai_store::limits;
-use ikigai_store::service::{self, refuse_service};
+use ikigai_store::service::{self, refuse_service_with};
 use notify::{RecursiveMode, Watcher};
 use oxigraph::io::{RdfFormat, RdfParser};
 use oxigraph::sparql::QueryResults;
@@ -418,11 +418,12 @@ where
 /// if this walk ever missed a construct, whatever features the build carries.
 ///
 /// Both halves are `ikigai-store`'s since 0.2.10 (`ikigai_store::service`, ledger #1085): the
-/// walk is [`refuse_service`] and the evaluator [`service::evaluator`]. This crate carried its
-/// own copy of each from ledger #877 until then; one copy, maintained where the store's ten doors
-/// use it, is what keeps a new spargebra variant from being covered in one place and not the
-/// other. The refusal TEXT stays this crate's, because the store's names the store's remedy
-/// (`urn:iki:store:load`), which means nothing to a match.
+/// walk is [`refuse_service_with`] and the evaluator [`service::evaluator`]. This crate carried
+/// its own copy of each from ledger #877 until then; one copy, maintained where the store's ten
+/// doors use it, is what keeps a new spargebra variant from being covered in one place and not
+/// the other. The refusal is the store's shared sentence followed by THIS crate's remedy
+/// ([`MATCH_REMEDY`], store 0.2.11's consumer form, ledger #1108): the store's own names its
+/// remedy (`urn:iki:store:load`), which means nothing to a match.
 fn parse_match(query: &str) -> Result<spargebra::Query> {
     let invalid = |detail: String| Error::InvalidArgument {
         name: "match".to_string(),
@@ -436,15 +437,14 @@ fn parse_match(query: &str) -> Result<spargebra::Query> {
             "an associative match must be an ASK query".to_string(),
         ));
     }
-    refuse_service(&parsed, "match").map_err(|_| {
-        invalid(
-            "`SERVICE` is not allowed in an associative match: a match is evaluated against \
-             one tuple's graph and never leaves this host"
-                .to_string(),
-        )
-    })?;
+    refuse_service_with(&parsed, "match", Some(MATCH_REMEDY))?;
     Ok(parsed)
 }
+
+/// What a `match=` refused for `SERVICE` should do instead: the remedy sentence after the
+/// store's shared refusal (`ikigai_store::service::SERVICE_REFUSAL`).
+const MATCH_REMEDY: &str = "A match is evaluated against one tuple's graph and never leaves \
+     this host: put the data it needs in the tuple.";
 
 /// Does a tuple's graph satisfy the template (from [`parse_match`])? The tuple is parsed as
 /// Turtle into the default graph; a tuple that isn't valid RDF simply never matches.
