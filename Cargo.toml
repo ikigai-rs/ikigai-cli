@@ -392,7 +392,16 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 [workspace.dependencies]
 # The released kernel, consumed from crates.io. For local cross-repo development
 # against a sibling checkout, use .cargo/config.toml (see .cargo/config.toml.example).
-ikigai-core = "0.1.89" # 0.1.89 = A SPACE'S NAME IS A CLAIM (ledger #987): `space_iri` and
+ikigai-core = "0.1.91" # 0.1.91 = AN ACTION MATCH HAS ITS OWN IDENTITY (ledger #948), a WIRE
+# floor and an API floor at once. `urn:kernel:actions` names each row `urn:ikigai:match:{verb}:{door}`
+# and joins it to a CONTENT-ADDRESSED contract by `ik:contract`
+# (`urn:ikigai:contract:{id}:{verb}:b3:{hex}`); the old `urn:ikigai:endpoint:{id}:action:{verb}`
+# subject is gone, not aliased. `urn:agent:select`, `urn:lisp:aliases` and the MCP pre-flight read
+# the new shape and call `parse_contract_iri` / `ActionSpec::contract_iri`, which exist only from
+# 0.1.91 — and the reverse is the trap this pin closes: cli 0.1.43 against 0.1.91 compiles and
+# emits an EMPTY alias prelude, silently. ⚠ `^0.1.91` is also a ceiling below 0.2.0.
+# Beneath it, and each called:
+# 0.1.89 = A SPACE'S NAME IS A CLAIM (ledger #987): `space_iri` and
 # `SPACE_PREFIX` (`urn:iki:space:`) exist only from 0.1.89, and `ikigai-tz`'s `space()` and
 # `ikigai-engine`'s `plan_space::space()` name themselves with `space_iri`. 0.1.89 also makes
 # `bind` DROP a space's name, so a host that extends a named module space no longer carries the
@@ -488,7 +497,13 @@ ikigai-core = "0.1.89" # 0.1.89 = A SPACE'S NAME IS A CLAIM (ledger #987): `spac
 # holds beneath it: below that a MOUNTED template row whose local name-guess collides with a
 # shorter sibling is dropped from the manifold, so `ikigai mcp` silently stops projecting
 # browse-pr-explain and browse-pr-review.
-ikigai-vocab = "0.1.87" # 0.1.87 = core 0.1.87's lockstep release: it adds the terms the Turtle
+ikigai-vocab = "0.1.91" # 0.1.91 = core 0.1.91's lockstep release: it defines `ik:contract`
+# (rdfs:domain `ik:ActionMatch`), the predicate every manifold row and every selection graph this
+# host emits now carries (`urn:agent:select` re-emits it). Not an API floor: nothing here calls a
+# vocab item new in 0.1.91. Raised with core because this repo's tests validate against the
+# vocabulary the lock resolves, and a vocabulary without `ik:contract` would not define it.
+# Beneath it, and each called:
+# 0.1.87 = core 0.1.87's lockstep release: it adds the terms the Turtle
 # faces of `urn:kernel:explain` and `urn:kernel:dependents` emit (the dry run and its consultations,
 # the cache as a graph). Nothing here parses those faces, so it is NOT an API floor; it is raised
 # with core because this repo's tests validate against the vocabulary the lock resolves.

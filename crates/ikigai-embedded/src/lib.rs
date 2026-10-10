@@ -1082,7 +1082,14 @@ fn stamp() -> String {
 /// One candidate parsed back out of the `urn:kernel:actions` Turtle face.
 #[derive(Debug, Clone)]
 struct SelectCandidate {
+    /// The match's OWN IRI, `urn:ikigai:match:{verb}:{door}` — one per door and verb
+    /// (core 0.1.91, ledger #948). Never the endpoint id: a mounted copy and a second
+    /// door share that.
     action: String,
+    /// The content-addressed contract the match satisfies (`ik:contract`,
+    /// `urn:ikigai:contract:{id}:{verb}:b3:{hex}`) — the join to the catalog, and the
+    /// only place the endpoint id travels ([`ikigai_core::parse_contract_iri`]).
+    contract: String,
     /// The exact endpoint IRI (`ik:endpoint`) or, when `template` is set, the
     /// URI-template pattern (`ik:template`, e.g. `urn:demo:echo/{message}`) —
     /// a pattern is not a legal IRI, so the two travel as different predicates.
@@ -1094,10 +1101,16 @@ struct SelectCandidate {
 }
 
 /// Parse the `ik:ActionMatch` nodes of a manifold graph.
+///
+/// Keyed on the TYPE, not on the shape of the subject: a node is a candidate because it
+/// says `a ik:ActionMatch`, and each one is its own subject (one per door and verb), so two
+/// doors onto one endpoint and a mounted copy beside the local one stay two candidates.
 fn parse_action_matches(turtle: &str) -> Vec<SelectCandidate> {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     const IK: &str = "https://ikigai-rs.dev/ns#";
+    const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
     let mut by_subject: BTreeMap<String, SelectCandidate> = BTreeMap::new();
+    let mut typed: BTreeSet<String> = BTreeSet::new();
     for quad in
         oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle).for_slice(turtle.as_bytes())
     {
@@ -1109,6 +1122,7 @@ fn parse_action_matches(turtle: &str) -> Vec<SelectCandidate> {
             .entry(subject.as_str().to_string())
             .or_insert_with(|| SelectCandidate {
                 action: subject.as_str().to_string(),
+                contract: String::new(),
                 endpoint: String::new(),
                 template: false,
                 verb: String::new(),
@@ -1117,6 +1131,14 @@ fn parse_action_matches(turtle: &str) -> Vec<SelectCandidate> {
             });
         let pred = quad.predicate.as_str();
         match &quad.object {
+            oxrdf::Term::NamedNode(n)
+                if pred == RDF_TYPE && n.as_str() == format!("{IK}ActionMatch") =>
+            {
+                typed.insert(subject.as_str().to_string());
+            }
+            oxrdf::Term::NamedNode(n) if pred == format!("{IK}contract") => {
+                entry.contract = n.as_str().to_string();
+            }
             oxrdf::Term::NamedNode(n) if pred == format!("{IK}endpoint") => {
                 entry.endpoint = n.as_str().to_string();
             }
@@ -1142,8 +1164,9 @@ fn parse_action_matches(turtle: &str) -> Vec<SelectCandidate> {
         }
     }
     let mut candidates: Vec<SelectCandidate> = by_subject
-        .into_values()
-        .filter(|c| !c.verb.is_empty())
+        .into_iter()
+        .filter(|(subject, c)| typed.contains(subject) && !c.verb.is_empty())
+        .map(|(_, c)| c)
         .collect();
     candidates
         .sort_by(|a, b| (a.missing_optional, &a.action).cmp(&(b.missing_optional, &b.action)));
@@ -1209,6 +1232,12 @@ fn selection_turtle(
             "\n<{}> a ik:ActionMatch ;\n    {named} ;\n    ik:verb \"{}\"",
             c.action, c.verb
         ));
+        // The join to the catalog travels with every match, chosen or considered: without
+        // it a reader of the selection cannot tell which contract a door serves, and two
+        // doors with one id but different contracts read as the same action.
+        if !c.contract.is_empty() {
+            ttl.push_str(&format!(" ;\n    ik:contract <{}>", c.contract));
+        }
         for r in &c.requires {
             ttl.push_str(&format!(" ;\n    ik:requires <{r}>"));
         }
@@ -2158,8 +2187,12 @@ impl Endpoint for LispAliases {
 /// Join the capability-scoped manifold (which knows WHAT MAY BE CALLED and its resolvable
 /// IRI) with the catalog (which knows the arguments), on the endpoint's id.
 ///
-/// The manifold's `ik:ActionMatch` subject encodes that id:
-/// `urn:ikigai:endpoint:{id}:action:{verb}`.
+/// The id comes from the match's `ik:contract`
+/// (`urn:ikigai:contract:{id}:{verb}:b3:{hex}`), parsed by core. Until core 0.1.91 it was
+/// read out of the match's own subject, `urn:ikigai:endpoint:{id}:action:{verb}`; that
+/// subject is now `urn:ikigai:match:{verb}:{door}` and names no id, and parsing it as the
+/// old shape matched NOTHING, so every action was skipped and the prelude came back empty
+/// without an error (ledger #948).
 fn alias_targets(
     candidates: &[SelectCandidate],
     described: &std::collections::BTreeMap<String, DescribedEndpoint>,
@@ -2173,10 +2206,12 @@ fn alias_targets(
         if candidate.endpoint.contains('{') || candidate.endpoint.is_empty() {
             continue;
         }
-        let Some(id) = action_endpoint_id(&candidate.action) else {
-            continue;
-        };
-        let (summary, actions) = match described.get(&id) {
+        // A match whose contract does not parse is still an AUTHORIZED action: it gets an
+        // argument-less verb below, like an undescribed one, rather than being dropped.
+        // Dropping is how a manifold shape this parser did not know about once emptied the
+        // whole prelude with no error.
+        let id = ikigai_core::parse_contract_iri(&candidate.contract).map(|(id, _, _)| id);
+        let (summary, actions) = match id.and_then(|id| described.get(&id)) {
             Some(described) => described.clone(),
             // Described nowhere: still callable, just undocumented and with no declared
             // inputs — emit it argument-less rather than dropping an authorized action.
@@ -2205,14 +2240,6 @@ fn alias_targets(
     // diff, and these get committed.
     targets.sort_by(|a, b| a.iri.cmp(&b.iri));
     targets
-}
-
-/// `urn:ikigai:endpoint:agent-select:action:source` → `agent-select`.
-fn action_endpoint_id(action: &str) -> Option<String> {
-    action
-        .strip_prefix("urn:ikigai:endpoint:")?
-        .rsplit_once(":action:")
-        .map(|(id, _verb)| id.to_string())
 }
 
 /// Parse the catalog's Turtle into `endpoint id -> (summary, [(verb, required inputs)])`.
@@ -7169,9 +7196,18 @@ mod tests {
         assert_eq!(escape_markers("$b{x} costs $"), "$b{x} costs $");
     }
 
+    /// A manifold row as core 0.1.91 mints it: its own match IRI, and the id only inside
+    /// the content-addressed contract it carries.
     fn candidate(id: &str, iri: &str, verb: &str) -> SelectCandidate {
+        let v = match verb {
+            "Sink" => Verb::Sink,
+            "Exists" => Verb::Exists,
+            "Delete" => Verb::Delete,
+            _ => Verb::Source,
+        };
         SelectCandidate {
-            action: format!("urn:ikigai:endpoint:{id}:action:{}", verb.to_lowercase()),
+            action: ikigai_core::match_iri(v, iri),
+            contract: ActionSpec::new(v).contract_iri(id),
             endpoint: iri.to_string(),
             template: false,
             verb: verb.to_string(),
@@ -8401,23 +8437,34 @@ mod tests {
     /// whole round trip stays parseable RDF.
     #[test]
     fn parse_action_matches_round_trips_a_template_candidate() {
+        // The shape core 0.1.91 mints: each row its own match IRI, joined to its
+        // content-addressed contract by ik:contract.
         let manifold = r#"@prefix ik: <https://ikigai-rs.dev/ns#> .
-<urn:ikigai:endpoint:demo-echo:action:source> a ik:ActionMatch ;
+<urn:ikigai:match:source:urn:demo:echo/%7Bmessage%7D> a ik:ActionMatch ;
     ik:template "urn:demo:echo/{message}" ;
+    ik:contract <urn:ikigai:contract:demo-echo:source:b3:0000000000000000000000000000000000000000000000000000000000000001> ;
     ik:verb "Source" .
-<urn:ikigai:endpoint:upper:action:source> a ik:ActionMatch ;
+<urn:ikigai:match:source:urn:test:upper> a ik:ActionMatch ;
     ik:endpoint <urn:test:upper> ;
+    ik:contract <urn:ikigai:contract:upper:source:b3:0000000000000000000000000000000000000000000000000000000000000002> ;
     ik:verb "Source" .
 "#;
         let cands = parse_action_matches(manifold);
         assert_eq!(cands.len(), 2);
         let echo = cands
             .iter()
-            .find(|c| c.action.contains("demo-echo"))
+            .find(|c| c.contract.contains(":demo-echo:"))
             .unwrap();
         assert!(echo.template);
         assert_eq!(echo.endpoint, "urn:demo:echo/{message}");
-        let upper = cands.iter().find(|c| c.action.contains("upper")).unwrap();
+        assert_eq!(
+            echo.action, "urn:ikigai:match:source:urn:demo:echo/%7Bmessage%7D",
+            "the candidate's action is the match IRI, its own subject"
+        );
+        let upper = cands
+            .iter()
+            .find(|c| c.contract.contains(":upper:"))
+            .unwrap();
         assert!(!upper.template, "an exact IRI stays an ik:endpoint");
         assert_eq!(upper.endpoint, "urn:test:upper");
 
@@ -8428,11 +8475,36 @@ mod tests {
         );
         assert!(ttl.contains("ik:endpoint <urn:test:upper>"), "{ttl}");
         assert!(!ttl.contains("ik:endpoint <>"), "{ttl}");
+        assert!(
+            ttl.contains(&format!("ik:contract <{}>", upper.contract)),
+            "the selection re-emits each match's contract: {ttl}"
+        );
         let reparsed = parse_action_matches(&ttl);
         assert_eq!(reparsed.len(), 2, "the emitted graph re-parses whole");
         assert!(reparsed
             .iter()
             .any(|c| c.template && c.endpoint == "urn:demo:echo/{message}"));
+        assert!(
+            reparsed.iter().all(|c| !c.contract.is_empty()),
+            "the contract survives the round trip: {reparsed:?}"
+        );
+    }
+
+    /// A candidate is a node TYPED `ik:ActionMatch`, whatever its subject looks like —
+    /// and only such a node. An untyped node that happens to carry `ik:verb` (the catalog's
+    /// contract nodes do) is not an action someone may call.
+    #[test]
+    fn parse_action_matches_keys_on_the_type() {
+        let manifold = r#"@prefix ik: <https://ikigai-rs.dev/ns#> .
+<urn:ikigai:match:source:urn:test:upper> a ik:ActionMatch ;
+    ik:endpoint <urn:test:upper> ;
+    ik:verb "Source" .
+<urn:ikigai:contract:upper:source:b3:0000000000000000000000000000000000000000000000000000000000000002> a ik:Action ;
+    ik:verb "Source" .
+"#;
+        let cands = parse_action_matches(manifold);
+        assert_eq!(cands.len(), 1, "{cands:?}");
+        assert_eq!(cands[0].action, "urn:ikigai:match:source:urn:test:upper");
     }
 
     /// The residual's pick is the number AFTER the declared `CHOICE`, not the first number
@@ -8466,7 +8538,8 @@ mod tests {
     fn selection_turtle_distinguishes_no_goal_from_a_failed_residual() {
         let cands = vec![
             SelectCandidate {
-                action: "urn:ikigai:endpoint:a:action:source".to_string(),
+                action: "urn:ikigai:match:source:urn:a".to_string(),
+                contract: String::new(),
                 endpoint: "urn:a".to_string(),
                 template: false,
                 verb: "Source".to_string(),
@@ -8474,7 +8547,8 @@ mod tests {
                 missing_optional: 0,
             },
             SelectCandidate {
-                action: "urn:ikigai:endpoint:b:action:source".to_string(),
+                action: "urn:ikigai:match:source:urn:b".to_string(),
+                contract: String::new(),
                 endpoint: "urn:b".to_string(),
                 template: false,
                 verb: "Source".to_string(),
@@ -8508,14 +8582,31 @@ mod tests {
         // scope gets a selection graph that simply lacks the write actions —
         // the attenuation propagates through inv.issue to urn:kernel:actions.
         let kernel = kernel();
-        let scoped = Capability::scoped(["urn:cap:personal:calendar:read:freebusy"]);
-        let request = Request::new(Verb::Source, Iri::parse("urn:agent:select").unwrap())
-            .with_arg("verb", ArgRef::Inline(b"sink".to_vec()));
-        let repr = block_on(kernel.issue(request, &scoped)).unwrap();
-        let body = String::from_utf8(repr.bytes).unwrap();
+        let select = |cap: &Capability| {
+            let request = Request::new(Verb::Source, Iri::parse("urn:agent:select").unwrap())
+                .with_arg("verb", ArgRef::Inline(b"sink".to_vec()));
+            String::from_utf8(block_on(kernel.issue(request, cap)).unwrap().bytes).unwrap()
+        };
+        // The calendar's write action, by its match IRI — the name the selection graph
+        // hands out (core 0.1.91). This assertion was VACUOUS for a release: it looked for
+        // the pre-0.1.91 `personal-calendar:action:sink`, which no graph contains any more,
+        // so it passed whatever the attenuation did. The positive control below is what
+        // keeps it honest: root DOES see the action under this exact spelling.
+        let calendar_sink = format!(
+            "<{}>",
+            ikigai_core::match_iri(Verb::Sink, "urn:personal:calendar")
+        );
+        let root = select(&Capability::root());
         assert!(
-            !body.contains("personal-calendar:action:sink"),
-            "write actions must not be offered through the agent face either: {body}"
+            root.contains(&calendar_sink),
+            "root is offered the calendar's write action (the control): {root}"
+        );
+        let scoped = select(&Capability::scoped([
+            "urn:cap:personal:calendar:read:freebusy",
+        ]));
+        assert!(
+            !scoped.contains(&calendar_sink),
+            "write actions must not be offered through the agent face either: {scoped}"
         );
     }
 
@@ -10261,5 +10352,266 @@ mod arrangement_tests {
                 }
             }
         }
+    }
+}
+
+/// Ledger #948, the cli half: what a manifold with ONE id at several doors does to the three
+/// readers this host builds on it — `urn:agent:select`, `urn:lisp:aliases`, and (in
+/// `ikigai-mcp`) the tool list. Ported from the hub's reproduction
+/// (`claude/research/repro-948-manifold-collisions.diff`), which printed; these assert.
+///
+/// Core 0.1.91 gives every manifold row its own subject, `urn:ikigai:match:{verb}:{door}`,
+/// and joins it to a content-addressed contract by `ik:contract`. Before this host read that
+/// shape, all three cases produced an EMPTY alias prelude with no error: the generator parsed
+/// the endpoint id out of the old subject, found none, and skipped every action.
+#[cfg(test)]
+mod manifold_identity_948 {
+    use super::*;
+    use futures::executor::block_on;
+    use ikigai_core::{ArgRef, Capability, Fallback, FnEndpoint, Iri, Request};
+
+    fn upper() -> FnEndpoint {
+        FnEndpoint::new("toUpper", |inv| {
+            let s = inv.inline_str("in").unwrap_or("").to_uppercase();
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                s.into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("toUpper")
+                .verb(Verb::Source)
+                .input(ArgSpec::new("in").class(XSD_STRING)),
+        )
+    }
+
+    /// A peer's toUpper with a DIFFERENT contract: an extra capability and an extra
+    /// optional input.
+    fn peer_upper() -> FnEndpoint {
+        FnEndpoint::new("toUpper", |_| {
+            Ok(Representation::new(ReprType::new("text/plain"), Vec::new()))
+        })
+        .with_description(
+            Description::new("toUpper")
+                .verb(Verb::Source)
+                .requires("urn:cap:peer:only")
+                .input(ArgSpec::new("in").class(XSD_STRING))
+                .input(ArgSpec::new("locale").optional().class(XSD_STRING)),
+        )
+    }
+
+    fn selection_doors() -> EndpointSpace {
+        EndpointSpace::new()
+            .bind(Exact::new("urn:agent:select"), AgentSelectEndpoint)
+            .bind(Exact::new("urn:lisp:aliases"), LispAliases)
+    }
+
+    fn src(k: &Kernel, iri: &str, args: &[(&str, &str)]) -> String {
+        let mut r = Request::new(Verb::Source, Iri::parse(iri).unwrap());
+        for (n, v) in args {
+            r = r.with_arg(*n, ArgRef::Inline(v.as_bytes().to_vec()));
+        }
+        String::from_utf8(block_on(k.issue(r, &Capability::root())).unwrap().bytes).unwrap()
+    }
+
+    /// The peer, reached on a fresh thread per call, so its own executor never nests in the
+    /// test's (in production the peer is another process behind a socket).
+    struct Hop(Arc<Kernel>);
+    impl ikigai_resolve::Resolver for Hop {
+        fn issue(&self, request: Request) -> Result<(Representation, ikigai_resolve::CacheStatus)> {
+            self.issue_as(request, &Capability::root())
+        }
+        fn issue_as(
+            &self,
+            request: Request,
+            capability: &Capability,
+        ) -> Result<(Representation, ikigai_resolve::CacheStatus)> {
+            let k = Arc::clone(&self.0);
+            let cap = capability.clone();
+            std::thread::spawn(move || {
+                ikigai_resolve::Resolver::issue_as(k.as_ref(), request, &cap)
+            })
+            .join()
+            .unwrap()
+        }
+        fn is_cached(&self, _: &Request, _: &Capability) -> bool {
+            false
+        }
+        fn entries(&self) -> Option<Vec<ikigai_core::SpaceEntry>> {
+            self.0.entries()
+        }
+    }
+
+    /// A local toUpper beside a peer's `peer` endpoint mounted at `urn:narrow:`.
+    fn mounted(peer: FnEndpoint) -> Kernel {
+        let peer = Kernel::with_meta_renderer(
+            Arc::new(EndpointSpace::new().bind(Exact::new("urn:iki:fn:toUpper"), peer)),
+            Arc::new(CliRenderer),
+        );
+        let local: Vec<Arc<dyn Space>> = vec![
+            Arc::new(selection_doors().bind(Exact::new("urn:iki:fn:toUpper"), upper())),
+            Arc::new(ikigai_resolve::MountedRemote::new(
+                Arc::new(Hop(Arc::new(peer))) as Arc<dyn ikigai_resolve::Resolver>,
+                "urn:narrow:".to_string(),
+                "peer".to_string(),
+            )),
+        ];
+        Kernel::with_meta_renderer(Arc::new(Fallback::new(local)), Arc::new(CliRenderer))
+    }
+
+    /// The toUpper candidates the manifold yields, as (door, match IRI, contract IRI).
+    fn upper_candidates(k: &Kernel) -> Vec<(String, String, String)> {
+        let ttl = src(k, "urn:kernel:actions", &[("as", "text/turtle")]);
+        let mut out: Vec<(String, String, String)> = parse_action_matches(&ttl)
+            .into_iter()
+            .filter(|c| c.contract.starts_with("urn:ikigai:contract:toUpper:"))
+            .map(|c| (c.endpoint, c.action, c.contract))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The `(define (…` lines of the Scheme prelude.
+    fn defines(k: &Kernel) -> Vec<String> {
+        src(k, "urn:lisp:aliases", &[])
+            .lines()
+            .filter(|l| l.starts_with("(define ("))
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn assert_defines(defines: &[String], name: &str) {
+        assert!(
+            defines
+                .iter()
+                .any(|l| l.starts_with(&format!("(define ({name} "))),
+            "the prelude defines `{name}`: {defines:#?}"
+        );
+    }
+
+    /// Case 1: a mounted copy with the SAME contract. Both doors stay candidates, each its own
+    /// match, and both get a Lisp verb.
+    #[test]
+    fn a_mount_does_not_shadow_the_local_copy() {
+        let k = mounted(upper());
+        let cands = upper_candidates(&k);
+        assert_eq!(
+            cands
+                .iter()
+                .map(|(door, action, _)| (door.as_str(), action.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "urn:iki:fn:toUpper",
+                    "urn:ikigai:match:source:urn:iki:fn:toUpper"
+                ),
+                (
+                    "urn:narrow:iki:fn:toUpper",
+                    "urn:ikigai:match:source:urn:narrow:iki:fn:toUpper"
+                ),
+            ]
+        );
+        assert_eq!(cands[0].2, cands[1].2, "identical contracts share one node");
+
+        let defines = defines(&k);
+        assert_defines(&defines, "fn-toUpper");
+        assert_defines(&defines, "narrow-iki-fn-toUpper");
+
+        let select = src(&k, "urn:agent:select", &[("verb", "source")]);
+        for (_, action, contract) in &cands {
+            assert!(
+                select.contains(&format!("<{action}> a ik:ActionMatch")),
+                "{select}"
+            );
+            assert!(
+                select.contains(&format!("ik:contract <{contract}>")),
+                "{select}"
+            );
+        }
+    }
+
+    /// Case 2: one endpoint bound at two doors. Two candidates, one contract, two verbs.
+    #[test]
+    fn one_endpoint_at_two_doors_is_two_actions() {
+        let k = Kernel::with_meta_renderer(
+            Arc::new(
+                selection_doors()
+                    .bind(Exact::new("urn:iki:fn:toUpper"), upper())
+                    .bind(Exact::new("urn:shout"), upper()),
+            ),
+            Arc::new(CliRenderer),
+        );
+        let cands = upper_candidates(&k);
+        let doors: Vec<&str> = cands.iter().map(|(door, _, _)| door.as_str()).collect();
+        assert_eq!(doors, ["urn:iki:fn:toUpper", "urn:shout"]);
+        assert_eq!(cands[0].2, cands[1].2);
+
+        let defines = defines(&k);
+        assert_defines(&defines, "fn-toUpper");
+        assert_defines(&defines, "shout");
+        // Both doors' verbs take the one required input the shared contract declares.
+        assert!(
+            defines.iter().any(|l| l.starts_with("(define (shout in ")),
+            "{defines:#?}"
+        );
+    }
+
+    /// Case 3, the deciding one: a mounted copy with a DIFFERENT contract stays a different
+    /// action. The local toUpper does not appear to need the peer's capability, and each
+    /// selection row names its own contract.
+    #[test]
+    fn a_mounted_copy_with_a_different_contract_stays_distinct() {
+        let k = mounted(peer_upper());
+        let cands = upper_candidates(&k);
+        assert_eq!(cands.len(), 2, "{cands:?}");
+        assert_ne!(cands[0].2, cands[1].2, "different contracts never merge");
+
+        let ttl = src(&k, "urn:kernel:actions", &[("as", "text/turtle")]);
+        let parsed = parse_action_matches(&ttl);
+        let local = parsed
+            .iter()
+            .find(|c| c.endpoint == "urn:iki:fn:toUpper")
+            .unwrap();
+        let peer = parsed
+            .iter()
+            .find(|c| c.endpoint == "urn:narrow:iki:fn:toUpper")
+            .unwrap();
+        assert!(local.requires.is_empty(), "{local:?}");
+        assert_eq!(peer.requires, ["urn:cap:peer:only"]);
+
+        let select = src(&k, "urn:agent:select", &[("verb", "source")]);
+        for c in [local, peer] {
+            assert!(
+                select.contains(&format!(
+                    "<{}> a ik:ActionMatch ;\n    ik:endpoint <{}> ;\n    ik:verb \"Source\" ;\n    ik:contract <{}>",
+                    c.action, c.endpoint, c.contract
+                )),
+                "each selection row carries ITS contract: {select}"
+            );
+        }
+
+        let defines = defines(&k);
+        assert_defines(&defines, "fn-toUpper");
+        assert_defines(&defines, "narrow-iki-fn-toUpper");
+    }
+
+    /// The failure this arc exists to close, pinned at its source: a manifold row whose
+    /// contract this host cannot parse is still an authorized action, and still gets a verb
+    /// (argument-less), never silently dropped.
+    #[test]
+    fn an_unparseable_contract_degrades_to_an_argument_less_verb() {
+        let mut c = SelectCandidate {
+            action: ikigai_core::match_iri(Verb::Source, "urn:iki:fn:toUpper"),
+            contract: "urn:ikigai:endpoint:toUpper:action:source".to_string(),
+            endpoint: "urn:iki:fn:toUpper".to_string(),
+            template: false,
+            verb: "Source".to_string(),
+            requires: Vec::new(),
+            missing_optional: 0,
+        };
+        let targets = alias_targets(std::slice::from_ref(&c), &Default::default());
+        assert_eq!(targets.len(), 1, "{targets:?}");
+        c.contract.clear();
+        assert_eq!(alias_targets(&[c], &Default::default()).len(), 1);
     }
 }

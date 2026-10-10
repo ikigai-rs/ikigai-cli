@@ -54,7 +54,12 @@ forbids.
 ## What the server does
 
 - **`tools/list`** — `select_actions` under the grant → `describe` each →
-  project. The manifold *is* the tool list.
+  project. The manifold *is* the tool list. A tool is one id, verb and
+  **contract**: an endpoint served at several doors with one contract is one tool
+  (the doors become a selector argument where they align), while a mounted copy
+  whose contract differs (another capability, another input) is its own tool,
+  `{id}-{first 8 hex of its contract digest}__{verb}`, beside the plain
+  `{id}__{verb}` the first contract keeps.
 - **`tools/call`** — reverse the name to `(endpoint, verb)`, route Binding
   inputs into the IRI and Argument inputs as request args, **validate** the JSON
   arguments against the typed contract (a non-conforming call returns a SHACL
