@@ -54,5 +54,5 @@ oxigraph = { version = "0.5", features = ["http-client"] }
 # engine's write path, and a hand-built request would only restate what we believe it sends.
 # serde_json renders the Meta the engine reads to route named arguments (without a JSON Meta
 # renderer the engine fails open and a routing defect is invisible — field guide).
-ikigai-engine = { path = "../ikigai-engine", version = "0.1.43" }
+ikigai-engine = { path = "../ikigai-engine", version = "0.1.44" }
 serde_json = { workspace = true }
