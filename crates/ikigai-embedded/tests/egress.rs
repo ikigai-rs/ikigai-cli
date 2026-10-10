@@ -26,6 +26,8 @@
 //!
 //! The tuple space's `match=` (`ikigai-intray`, which builds its own evaluator) is walked here
 //! too; since ledger #1085 it evaluates through `ikigai_store::service`, the store's own helpers.
+//! So is `urn:shacl:validate`, whose SHACL-SPARQL rudof evaluates with the same client (ledger
+//! #1099): ikigai-shacl 0.3.2 is its floor, and every case there reached the stub on 0.3.1.
 //!
 //! This binary is the DEFAULT regime: no `browse.root`, so `urn:sparql:*` is
 //! `ikigai_sparql::space()` (a private per-query store, no update door). With the `store`
@@ -232,6 +234,124 @@ fn the_tuple_space_refuses_service_in_a_match_and_nothing_reaches_the_network() 
     assert!(
         failures.is_empty() && stub.hits() == 0,
         "SPARQL egress through urn:space:* ({} connection(s) reached the stub):\n{}",
+        stub.hits(),
+        failures.join("\n")
+    );
+}
+
+/// The shapes-graph prelude every `urn:shacl:validate` case below shares.
+const SHACL_HEAD: &str = "@prefix sh: <http://www.w3.org/ns/shacl#> .\n\
+                          @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\
+                          @prefix ex: <http://example.org/> .\n";
+
+/// A data graph with one `ex:Person`, so a shape targeting the class has a focus node and rudof
+/// really evaluates its `sh:select` (once per focus node).
+const SHACL_DATA: &str = "@prefix ex: <http://example.org/> .\nex:a a ex:Person ; ex:p ex:b .\n";
+
+/// A node shape on `ex:Person` with one `sh:sparql` whose `sh:select` is `select`.
+fn shacl_select_shape(select: &str) -> String {
+    format!(
+        "{SHACL_HEAD}ex:S a sh:NodeShape ; sh:targetClass ex:Person ;\n  \
+         sh:sparql [ sh:select \"\"\"{select}\"\"\" ] .\n"
+    )
+}
+
+/// `text` with every character a SPARQL `IRIREF` forbids written as a Turtle `\uXXXX` escape,
+/// so it survives rudof's lenient Turtle reader into an IRI term (as in ikigai-shacl's own test).
+fn shacl_escaped_iri(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\' | '\0'..=' ' => {
+                format!("\\u{:04X}", c as u32)
+            }
+            c => c.to_string(),
+        })
+        .collect()
+}
+
+/// `urn:shacl:validate`, as this host binds it (`ikigai_shacl::space()` in the embedded root,
+/// no `requires`): a SHACL-SPARQL `sh:select` that federates, and an IRI that breaks out of the
+/// `VALUES ?this { … }` rudof splices a focus node into. Each must make ZERO connections to the
+/// stub and be refused as a typed `InvalidArgument` naming the graph that carried it
+/// (ledger #1099).
+///
+/// ★ Measured before the fix: on ikigai-shacl 0.3.1 (the pin cli 0.1.45 merged with) every case
+/// here REACHED the stub. ikigai-shacl 0.3.2 is the floor that makes this pass: it parses every
+/// query rudof will run and refuses `SERVICE` before rudof sees it, and refuses any IRI no
+/// SPARQL query can hold. rudof builds its evaluator privately, so that pre-check is the only
+/// guard there is; this host cannot install a refusing service handler of its own.
+#[test]
+fn the_shacl_door_refuses_sparql_service_and_nothing_reaches_the_network() {
+    let stub = Stub::start();
+    let svc = stub.url("/sparql");
+    let service = format!("SERVICE <{svc}> {{ ?s ?p ?o }}");
+    let breakout = shacl_escaped_iri(&format!(
+        "http://example.org/x> }} {service} VALUES ?q {{ <http://example.org/y"
+    ));
+    // (what, data, shapes, the input the refusal must name)
+    let cases: Vec<(&str, String, String, &str)> = vec![
+        (
+            "sh:select with SERVICE",
+            SHACL_DATA.to_string(),
+            shacl_select_shape(&format!(
+                "SELECT $this WHERE {{ $this a ?t . {service} }}"
+            )),
+            "shapes",
+        ),
+        (
+            "sh:select with SERVICE SILENT",
+            SHACL_DATA.to_string(),
+            shacl_select_shape(&format!(
+                "SELECT $this WHERE {{ $this a ?t . SERVICE SILENT <{svc}> {{ ?s ?p ?o }} }}"
+            )),
+            "shapes",
+        ),
+        (
+            "SERVICE hidden in an sh:declare prefix name",
+            SHACL_DATA.to_string(),
+            format!(
+                "{SHACL_HEAD}ex:S a sh:NodeShape ; sh:targetClass ex:Person ;\n  \
+                 sh:sparql [ sh:prefixes ex:decls ; sh:select \"# nothing\" ] .\n\
+                 ex:decls sh:declare [ sh:prefix \"\"\"a: <http://example.org/a/> SELECT $this WHERE {{ {service} }} #\"\"\" ;\n  \
+                 sh:namespace \"http://example.org/b/\"^^xsd:anyURI ] .\n"
+            ),
+            "shapes",
+        ),
+        (
+            "a data literal whose datatype IRI breaks out of VALUES",
+            format!("@prefix ex: <http://example.org/> .\nex:a ex:p \"v\"^^<{breakout}> .\n"),
+            format!(
+                "{SHACL_HEAD}ex:S a sh:NodeShape ; sh:targetObjectsOf ex:p ;\n  \
+                 sh:sparql [ sh:select \"\"\"SELECT $this WHERE {{ OPTIONAL {{ ?s ?p $this }} }}\"\"\" ] .\n"
+            ),
+            "data",
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (what, data, shapes, input) in cases {
+        let before = stub.hits();
+        let request = Request::new(
+            Verb::Source,
+            Iri::parse("urn:shacl:validate").expect("the door IRI"),
+        )
+        .with_arg("data", ArgRef::Inline(data.into_bytes()))
+        .with_arg("shapes", ArgRef::Inline(shapes.into_bytes()));
+        let answer = block_on(kernel().issue(request, &Capability::root()));
+        let reached = stub.hits() - before;
+        if reached != 0 {
+            failures.push(format!("{what}: REACHED the stub {reached} time(s)"));
+        }
+        match answer {
+            Err(Error::InvalidArgument { name, .. }) if name == input => {}
+            Err(other) => failures.push(format!(
+                "{what}: refused, but not as InvalidArgument naming `{input}`: {other:?}"
+            )),
+            Ok(_) => failures.push(format!("{what}: ANSWERED a report instead of refusing")),
+        }
+    }
+    assert!(
+        failures.is_empty() && stub.hits() == 0,
+        "SHACL-SPARQL egress through urn:shacl:validate ({} connection(s) reached the stub):\n{}",
         stub.hits(),
         failures.join("\n")
     );
