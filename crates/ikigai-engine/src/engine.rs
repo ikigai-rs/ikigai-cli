@@ -672,6 +672,14 @@ impl Engine {
     /// what the floor grants, and root becomes the floor itself. Under a root floor (an
     /// engine built with [`new`](Self::new) and never sealed) that is the identity as
     /// given, exactly as before.
+    ///
+    /// ★ **A principal survives the clamp only where the floor could act as it** (ledger
+    /// #1077): core's clamp keeps the FLOOR's principal, so under a root floor the identity's
+    /// name passes (root acts as anyone), under a floor naming alice the session stays alice,
+    /// and under an anonymous scoped floor (a sealed hand-off) login cannot ADD a name. The
+    /// last is deliberate and is NOT re-minted, though core's design note lists this site:
+    /// `login`'s scopes are typed (`login …`, `sink urn:host:login …`), so a re-mint would let
+    /// whoever holds a sealed session name itself anyone and pass that name's `acts_as` gates.
     pub fn login(&self, identity: Capability) {
         let identity = self.floor.borrow().clamp(&identity);
         *self.identity.borrow_mut() = identity.clone();
@@ -4198,6 +4206,31 @@ mod tests {
             output(engine.eval("source urn:demo:cal")).unwrap(),
             "DETAIL"
         );
+    }
+
+    /// ledger #1077, pinned: `login` never names a principal its floor could not act as.
+    #[test]
+    fn login_never_names_a_principal_the_floor_cannot_act_as() {
+        let alice = Capability::scoped(["urn:cap:x".to_string()])
+            .with_principal("urn:example:alice")
+            .unwrap();
+        // A root floor acts as anyone: the name passes.
+        let engine = builtin_engine();
+        engine.login(alice.clone());
+        assert_eq!(engine.capability().principal(), Some("urn:example:alice"));
+        // An anonymous scoped floor (a sealed hand-off) cannot gain one.
+        let floor = Capability::scoped(["urn:cap:x".to_string()]);
+        let kernel = Kernel::new(Arc::new(EndpointSpace::new()));
+        let engine = Engine::with_identity(kernel, floor);
+        engine.login(alice.clone());
+        assert_eq!(engine.capability().principal(), None);
+        // A floor naming bob stays bob, whatever login names.
+        let bob = Capability::scoped(["urn:cap:x".to_string()])
+            .with_principal("urn:example:bob")
+            .unwrap();
+        let engine = Engine::with_identity(Kernel::new(Arc::new(EndpointSpace::new())), bob);
+        engine.login(alice);
+        assert_eq!(engine.capability().principal(), Some("urn:example:bob"));
     }
 
     #[test]

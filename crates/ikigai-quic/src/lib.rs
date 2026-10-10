@@ -86,18 +86,67 @@ pub fn generate() -> Identity {
 /// addresses files as if its segment were the root and never sees another's.
 ///
 /// ★ **`principal` is WHO, never WHAT.** It names the client the minter recognized (an IRI
-/// the host derives from the certificate, such as `urn:iki:gonk:client:<fingerprint>`), and
-/// [`dispatch`] stamps it on every request of the connection as the inline argument
-/// [`PRINCIPAL_ARG`], replacing anything a client sent under that name. It is not authority:
-/// what a call may do is `capability` alone, clamped by whatever capability the client
-/// carries. Keeping the two apart is the point: a name carried INSIDE the capability (as a
-/// scope no resource requires) is intersected away the moment a client carries a narrower
-/// capability of its own, so the request arrives anonymous (ledger #879). `None` stamps
-/// nothing, and a client-sent `principal` is still removed.
+/// the host derives from the certificate, such as `urn:iki:gonk:client:<fingerprint>`).
+/// [`dispatch`] carries it two ways:
+///
+/// - **minted into the capability** ([`Session::authority`]): core 0.1.93's
+///   `urn:cap:principal:<iri>` scope, which an endpoint reads with
+///   `inv.capability.principal()` and gates on with `acts_as`. A clamp keeps the CEILING's
+///   principal (core's rule), so a client that carries a narrower capability of its own (the
+///   `ikigai mcp --grant hermes` shape, ledger #879) still arrives named, and one it carries
+///   never enters. Not authority either: a principal scope grants nothing a resource requires
+///   unless it requires exactly that name.
+/// - **stamped** as the inline argument [`PRINCIPAL_ARG`] on every request, replacing anything
+///   a client sent under that name. The older channel, kept while a host still reads it
+///   (ikigai-gonk did until its own 0.1.93 adoption); it partitions the cache per client at
+///   the door, which the minted scope does anyway.
+///
+/// `None` mints and stamps nothing, and a client-sent `principal` is still removed. Under a
+/// ROOT `capability` nothing is minted: root holds every principal and names none.
 pub struct Session {
     pub capability: Capability,
     pub file_segment: String,
     pub principal: Option<String>,
+}
+
+impl Session {
+    /// The capability every call on the connection resolves under (or is clamped to): the
+    /// session's `capability` with its `principal` MINTED in as core's principal scope
+    /// (ledger #1077), so an endpoint can ask who it serves and a clamp cannot shed the name.
+    ///
+    /// The capability as given when there is no principal, when it is root (root names
+    /// nobody, and `with_principal` refuses it), or when the principal is not a name core can
+    /// carry verbatim (not an absolute IRI, longer than 512 bytes, holding `*`): then the
+    /// stamped [`PRINCIPAL_ARG`] is the only channel, as before.
+    ///
+    /// ```
+    /// use ikigai_core::Capability;
+    /// use ikigai_quic::Session;
+    ///
+    /// let session = Session {
+    ///     capability: Capability::scoped(["urn:cap:demo:read".to_string()]),
+    ///     file_segment: String::new(),
+    ///     principal: Some("urn:example:alice".to_string()),
+    /// };
+    /// let authority = session.authority();
+    /// assert_eq!(authority.principal(), Some("urn:example:alice"));
+    /// // A client carrying a narrower capability of its own stays named after the clamp.
+    /// let carried = Capability::scoped(["urn:cap:demo:read".to_string()]);
+    /// assert_eq!(authority.clamp(&carried).principal(), Some("urn:example:alice"));
+    ///
+    /// // Root names nobody.
+    /// let root = Session { capability: Capability::root(), ..session };
+    /// assert_eq!(root.authority(), Capability::root());
+    /// ```
+    pub fn authority(&self) -> Capability {
+        match self.principal.as_deref() {
+            Some(principal) => self
+                .capability
+                .with_principal(principal)
+                .unwrap_or_else(|_| self.capability.clone()),
+            None => self.capability.clone(),
+        }
+    }
 }
 
 /// The inline argument a [`Session`]'s principal arrives under, on every request the
@@ -460,6 +509,9 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 }
 
 fn dispatch_call(kernel: &Kernel, call: Call, session: &Session) -> Reply {
+    // The session's capability with its principal minted in (ledger #1077): every arm below
+    // resolves under it or clamps to it, so the name rides the capability on every verb.
+    let authority = session.authority();
     let issue = |mut request: Request, capability: &Capability| {
         admit(&mut request, session);
         match Resolver::issue_as(kernel, request, capability) {
@@ -469,21 +521,21 @@ fn dispatch_call(kernel: &Kernel, call: Call, session: &Session) -> Reply {
     };
     match call {
         // Resolve under the session — capability-on-the-wire via the client cert.
-        Call::Issue(request) => issue(request, &session.capability),
+        Call::Issue(request) => issue(request, &authority),
         // A carried capability is untrusted: the peer can only *narrow* its own
         // authority, so clamp it to the session before resolving (never widen past
         // the authenticated principal).
-        Call::IssueAs(request, carried) => issue(request, &session.capability.clamp(&carried)),
+        Call::IssueAs(request, carried) => issue(request, &authority.clamp(&carried)),
         // Admitted exactly as an issue is, or the answer would name a cache key no issue
         // on this connection ever uses.
         Call::IsCached(mut request) => {
             admit(&mut request, session);
-            Reply::Cached(Resolver::is_cached(kernel, &request, &session.capability))
+            Reply::Cached(Resolver::is_cached(kernel, &request, &authority))
         }
         // List the manifold the client's authenticated capability actually permits —
         // never the full catalog. Affordance = authorization: a scoped principal must
         // not even enumerate what it may not invoke (the leak this closes).
-        Call::Entries => Reply::Entries(Some(scoped_entries(kernel, &session.capability))),
+        Call::Entries => Reply::Entries(Some(scoped_entries(kernel, &authority))),
         // Trace-over-the-wire: resolve under the clamped authority with a
         // PER-CALL collector (`issue_traced_as`), ship the recorded spans back.
         // Each tenant's trace records into its own scope — concurrent traced
@@ -493,7 +545,7 @@ fn dispatch_call(kernel: &Kernel, call: Call, session: &Session) -> Reply {
         // mount-stitch.
         Call::IssueTraced(mut request, carried, _ctx) => {
             admit(&mut request, session);
-            let capability = session.capability.clamp(&carried);
+            let capability = authority.clamp(&carried);
             let collector = Arc::new(SpanCollector::default());
             match ikigai_resolve::issue_traced_as(kernel, request, &capability, collector.clone()) {
                 Ok((representation, status)) => {
@@ -1787,9 +1839,10 @@ mod tests {
                 "freebusy"
             };
             let tag = if tagged { "tagged" } else { "untagged" };
+            let named = inv.capability.principal().unwrap_or("-");
             Ok(Representation::new(
                 ReprType::new("text/plain"),
-                format!("{who} {tag} {reach}").into_bytes(),
+                format!("{who} {tag} {reach} cap={named}").into_bytes(),
             ))
         })
         .with_description(
@@ -1927,15 +1980,59 @@ mod tests {
             principal.starts_with("urn:example:client:") && principal.len() == 27,
             "the minter's principal reached the endpoint: {answers:?}"
         );
+        // ledger #1077: the principal is ALSO minted into the capability, and a clamp keeps
+        // the session's, so the narrowed carries (the Hermes shape) are attributed through the
+        // capability too, on a read and a write, traced or not.
         assert_eq!(
             answers,
             vec![
-                format!("{principal} tagged DETAIL"),
-                format!("{principal} tagged DETAIL"),
-                format!("{principal} untagged freebusy"),
-                format!("{principal} untagged freebusy"),
-                format!("{principal} untagged freebusy"),
+                format!("{principal} tagged DETAIL cap={principal}"),
+                format!("{principal} tagged DETAIL cap={principal}"),
+                format!("{principal} untagged freebusy cap={principal}"),
+                format!("{principal} untagged freebusy cap={principal}"),
+                format!("{principal} untagged freebusy cap={principal}"),
             ]
+        );
+    }
+
+    /// ledger #1077: a ROOT session names nobody in its capability, even with a principal
+    /// (root holds every principal and carries none; `with_principal` refuses it). The
+    /// stamped argument still names the client, and a client carrying a narrower capability
+    /// cannot bring a principal of its own in.
+    #[test]
+    fn a_root_session_carries_no_principal_in_its_capability() {
+        let rooted: Minter = Arc::new(|peer: &PeerIdentity| {
+            Some(Session {
+                capability: Capability::root(),
+                file_segment: peer.segment_id.clone(),
+                principal: Some(format!("urn:example:client:{}", &peer.fingerprint[..8])),
+            })
+        });
+        let answers = whoami_over(
+            rooted,
+            vec![
+                whoami(Verb::Source, None),
+                whoami(Verb::Source, Some(Capability::root())),
+            ],
+        );
+        for answer in &answers {
+            assert!(
+                answer.starts_with("urn:example:client:") && answer.ends_with(" cap=-"),
+                "stamped, not minted: {answers:?}"
+            );
+        }
+        // A client of a NAMED session carrying a principal of its own: the session's wins.
+        let forged_cap = Capability::scoped([
+            "urn:cap:demo:other".to_string(),
+            "urn:cap:principal:urn:example:mallory".to_string(),
+        ]);
+        let named = whoami_over(
+            naming_minter(),
+            vec![whoami(Verb::Source, Some(forged_cap))],
+        );
+        assert!(
+            named[0].contains(" cap=urn:example:client:") && !named[0].contains("mallory"),
+            "{named:?}"
         );
     }
 
@@ -1982,7 +2079,7 @@ mod tests {
         );
         assert_eq!(
             unnamed,
-            vec!["- untagged DETAIL", "- untagged DETAIL"],
+            vec!["- untagged DETAIL cap=-", "- untagged DETAIL cap=-"],
             "a session with no principal stamps none, and a client's is removed"
         );
     }
