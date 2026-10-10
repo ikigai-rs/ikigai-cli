@@ -450,7 +450,15 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 [workspace.dependencies]
 # The released kernel, consumed from crates.io. For local cross-repo development
 # against a sibling checkout, use .cargo/config.toml (see .cargo/config.toml.example).
-ikigai-core = "0.1.92" # 0.1.92 = A FAILED INVOCATION IS A TRACE NODE (ledger #20, #559): an endpoint that is entered and
+ikigai-core = "0.1.95" # 0.1.95 = a Sink/Delete that RAN AND FAILED cuts its target (ledger #1105), so a cached
+# fallback over state a failed write changed stops answering for the old state; and match/contract
+# IRIs are emitted CANONICAL and parsed lenient (ledger #1107), which is what `urn:kernel:validate`
+# echoes back to this host's MCP pre-flight. 0.1.94 refuses a sign in a percent escape (`%+1`) in
+# those IRIs (ledger #1096). 0.1.93 = principals are capability scopes (`urn:cap:principal:<iri>`,
+# `Capability::with_principal`/`principal`/`acts_as`, ledger #1077). Behavior floors for the host,
+# taken so 0.1.46 is not born ceilinged below the current release; ⚠ `^0.1.95` is also a ceiling
+# below 0.2.0.
+# Beneath it, still true: 0.1.92 = A FAILED INVOCATION IS A TRACE NODE (ledger #20, #559): an endpoint that is entered and
 # returns `Err` is now a TIMED `TraceEvent` noted `(FAILED_NOTE, <kind>)`, distinct from the
 # floor's `DENIED_NOTE`. A floor with a named site:
 # `adapter_gate_tests::a_step_outside_the_granted_segment_is_denied_and_never_reaches_the_disk`
@@ -563,8 +571,9 @@ ikigai-core = "0.1.92" # 0.1.92 = A FAILED INVOCATION IS A TRACE NODE (ledger #2
 # holds beneath it: below that a MOUNTED template row whose local name-guess collides with a
 # shorter sibling is dropped from the manifold, so `ikigai mcp` silently stops projecting
 # browse-pr-explain and browse-pr-review.
-ikigai-vocab = "0.1.92" # 0.1.92 = core 0.1.92's lockstep release; only `owl:versionInfo` moved. Not an API floor; raised
-# with core for the reason given below.
+ikigai-vocab = "0.1.95" # 0.1.95 = core 0.1.95's lockstep release. Not an API floor; raised with core because this
+# repo's tests validate against the vocabulary the lock resolves.
+# Beneath it: 0.1.92 = core 0.1.92's lockstep release; only `owl:versionInfo` moved.
 # Beneath it, still true: 0.1.91 = core 0.1.91's lockstep release: it defines `ik:contract`
 # (rdfs:domain `ik:ActionMatch`), the predicate every manifold row and every selection graph this
 # host emits now carries (`urn:agent:select` re-emits it). Not an API floor: nothing here calls a
@@ -696,7 +705,9 @@ ikigai-fs = "0.1.8" # 0.1.8 is a SECURITY floor (audit round 3, ledger #856): th
 # live mount is unchanged, so nothing else here moves.
 # 0.1.5 = path declared as Binding input (urn:file/orgfile rows in urn:kernel:actions)
 # Outbound HTTP-client module (urn:httpGet…), linked as a published module crate.
-ikigai-http = "0.1.8" # 0.1.8 = every input of the six verbs had been declared REQUIRED —
+ikigai-http = "0.1.9" # 0.1.9 = a host-DENY survives attenuate and clamp (core floor 0.1.86, ledger #874): a
+# narrowed capability no longer reaches a denied path. A safety floor, and the version the lock
+# already built. Beneath it, still true: 0.1.8 = every input of the six verbs had been declared REQUIRED —
 # `authorization`, `range`, `headers` and the rest. `ikigai-mcp` projects `required` straight
 # into each tool's `inputSchema`, so this host was telling every agent that an optional
 # header was mandatory; forty inputs also gained classes (`url` xsd:anyURI, `max_age`
@@ -841,7 +852,14 @@ ikigai-secret = "0.1.8" # 0.1.8 = a secret name beginning with `-` is refused as
 # 0.1.5 = the urn:secret Sink write face (owns the item's ACL → silent reads)
 # XSLT transform module (urn:xslt:transform) — linked natively (no download cost in a
 # native binary; the dynamic/lazy form is a browser/WASI concern).
-ikigai-xslt = "0.2.1" # 0.2.1 is a SECURITY floor: XML depth 64, XPath expression depth 32 and 1 MiB of entity expansion
+ikigai-xslt = "0.3.0" # 0.3.0 REFUSES (typed `InvalidArgument` naming `stylesheet`) the constructs xrust 2.2.0 answers
+# WRONGLY without an error (a predicate in a match pattern, a numeric predicate, position()/last()
+# away from the root, a leading // away from the root, a prefixed name in a literal result
+# element's attribute value template), and serializes `method="html"` as HTML (an empty non-void
+# element keeps its end tag), ledger #193. A behavior floor: `^0.2.1` was a CEILING below it. The
+# host's own stylesheets (`foaf.rs`, the catalog cards in `lib.rs`) use `//` only from the root
+# template, which 0.3.0 keeps.
+# Beneath it, still true: 0.2.1 is a SECURITY floor: XML depth 64, XPath expression depth 32 and 1 MiB of entity expansion
 # are bounds, markup-valued, parameter and external entities are REFUSED (`InvalidArgument` on
 # `src`/`content`/`stylesheet`), and the transform runs on a sized, pooled thread. 0.2.0 names its
 # `space()` `urn:iki:space:xslt` (ledger #987), so `answered_by`, `urn:kernel:topology` and
@@ -1187,7 +1205,10 @@ ikigai-store = { version = "0.2.10", features = ["persistent"] }
 # `STRUCTURAL_CLASSES` and marks `select::Excluded` `#[non_exhaustive]` (nothing here names them).
 # 0.4.2 keeps an item with a bad timestamp and reports it as a defect; 0.4.1 answers a taken keyed
 # append without writing.
-ikigai-ledger = "0.6.1"
+# 0.6.2 is a SECURITY floor (ledger #1085): its own store floor is 0.2.10, so the grants the ledger
+# issues carry no SPARQL egress; this host's store pin is already there, and the ledger's is taken
+# so the two cannot be resolved apart off-tree.
+ikigai-ledger = "0.6.2"
 # ── Intra-workspace siblings: LOCKSTEP pins, not floors ───────────────────────
 # The seventeen members that take `version.workspace = true` are released TOGETHER, at one
 # version, always. So every sibling pin below states the CURRENT workspace version rather
@@ -1319,3 +1340,16 @@ libc = "0.2"
 # runtime-free, so it works under the CLI's `futures::block_on` without pulling Tokio.
 ureq = "2"
 
+
+# ── Profiles ──────────────────────────────────────────────────────────────────
+# Steel's engine build is the cost of every Lisp door, reactor tick and `(…)` in the REPL, and
+# steel-core 0.8.3 (through ikigai-lisp 0.3.1's `=0.8.3` pin) roughly DOUBLED it; in an
+# UNOPTIMIZED debug build that is ~2.4x (ledger #1100: `urn:lisp:eval` of `(+ 1 2)` ~0.42 s ->
+# ~0.97 s). Optimizing that ONE package in dev builds takes it back below where 0.8.2 was, and
+# changes nothing in release (already optimized) or in this workspace's own code's debuggability.
+# Measured here on cli main a82c4e1: four back-to-back `(+ 1 2)` evals in one `ikigai --plain`
+# process, see the PR that added this. The stanza is per CONSUMING workspace (a profile in a
+# dependency's manifest is ignored), so every workspace that builds Steel in debug carries it;
+# ikigai-programs does (ikigai-programs PR #40).
+[profile.dev.package.steel-core]
+opt-level = 3
