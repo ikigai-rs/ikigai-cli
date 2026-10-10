@@ -2311,6 +2311,13 @@ fn connect_mount_ipc(
 /// it is reading. The human sitting at a prompt did not.
 #[cfg(feature = "embedded")]
 fn run_repl(engine: Engine, plain: bool, commands: &[String], topology: &[String]) {
+    // A picture answer is NAMED to a person at a terminal and written whole anywhere else
+    // (ledger #983), so `ikigai -c 'source urn:diagram:kernel' > kernel.svg` keeps working.
+    #[cfg(not(target_family = "wasm"))]
+    {
+        use std::io::IsTerminal;
+        engine.set_picture_hint(std::io::stdout().is_terminal());
+    }
     if !commands.is_empty() {
         // A batch fed on a NON-TTY stdin (`printf %s "$v" | ikigai -c 'sink urn:secret:x'`)
         // routes that stdin to the first content-less `sink` — so a secret is piped in, never
