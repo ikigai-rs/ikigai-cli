@@ -16,3 +16,7 @@ chrono-tz = "0.10"
 
 [dev-dependencies]
 futures = { workspace = true }
+# The module recipe as one test (`tests/conformance.rs`). 0.6.0 is the floor for SPACE-NAME,
+# the check that `space()` claims `urn:iki:space:tz` over the same doors on every call.
+# ⚠ `^0.6.0` is also a ceiling below 0.7.0.
+ikigai-conformance = "0.6.0"

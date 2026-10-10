@@ -39,6 +39,10 @@ its own crate for the browser build to reuse unchanged.
   injected); with no spawner the path is a sequential fallback, so the engine still
   compiles to wasm.
 
+With the `plan-reader` feature, `plan_space::space()` binds `urn:plan:eval`,
+`urn:plan:validate` and `urn:plan:requires`, and names itself
+`urn:iki:space:engine:plan` (`plan_space::SPACE_ID`).
+
 `config` is a small user-settings reader (used by the `config` command and the TUI's
 keybindings); on a target with no config directory it reports defaults.
 

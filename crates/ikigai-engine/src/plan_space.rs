@@ -43,8 +43,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ikigai_core::{
-    ArgRef, ArgSpec, AsyncFnEndpoint, ContentId, Description, EndpointSpace, Error, Exact,
-    Invocation, Iri, Provenance, ReprType, Representation, Request, Result, Verb,
+    space_iri, ArgRef, ArgSpec, AsyncFnEndpoint, ContentId, Description, EndpointSpace, Error,
+    Exact, Invocation, Iri, Provenance, ReprType, Representation, Request, Result, Verb,
 };
 use oxrdf::{Literal, NamedNode, NamedOrBlankNode, Term, Triple};
 use oxttl::{TurtleParser, TurtleSerializer};
@@ -76,13 +76,25 @@ const TEXT: &str = "text/plain";
 /// `unresolved`) — the same shape as `urn:kernel:explain`'s `urn:ikigai:explain:outcome:`.
 const OUTCOME: &str = "urn:ikigai:plan:requires:outcome:";
 
-/// The space binding the three plan resources. A host binds it where its operator's
-/// requests resolve; see the crate's README for which hosts do.
+/// The name [`space`] claims: `urn:iki:space:engine:plan`.
+///
+/// `engine:plan`, a PART of the engine crate, rather than `engine` or `plan`: these three
+/// doors are not everything the engine is (the REPL grammar is not a space at all), and no
+/// crate is called `ikigai-plan`, so a bare `plan` would claim a module that does not exist.
+pub const SPACE_ID: &str = "urn:iki:space:engine:plan";
+
+/// The space binding the three plan resources, named [`SPACE_ID`]. A host binds it where
+/// its operator's requests resolve; see the crate's README for which hosts do.
+///
+/// Configuration-free (no parameters, nothing read while building it), so every call holds
+/// the same three doors and the name is a true claim. A host that binds another door onto it
+/// drops the name (core 0.1.89).
 pub fn space() -> EndpointSpace {
     EndpointSpace::new()
         .bind(Exact::new(EVAL), eval_endpoint())
         .bind(Exact::new(VALIDATE), validate_endpoint())
         .bind(Exact::new(REQUIRES), requires_endpoint())
+        .named(space_iri("engine:plan"))
 }
 
 // --- the three endpoints ----------------------------------------------------------

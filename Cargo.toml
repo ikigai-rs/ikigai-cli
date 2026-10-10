@@ -392,7 +392,13 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 [workspace.dependencies]
 # The released kernel, consumed from crates.io. For local cross-repo development
 # against a sibling checkout, use .cargo/config.toml (see .cargo/config.toml.example).
-ikigai-core = "0.1.87" # 0.1.87 = THE MODULE AUTHOR'S "WHY" (ledger #906, #907, #908), a
+ikigai-core = "0.1.89" # 0.1.89 = A SPACE'S NAME IS A CLAIM (ledger #987): `space_iri` and
+# `SPACE_PREFIX` (`urn:iki:space:`) exist only from 0.1.89, and `ikigai-tz`'s `space()` and
+# `ikigai-engine`'s `plan_space::space()` name themselves with `space_iri`. 0.1.89 also makes
+# `bind` DROP a space's name, so a host that extends a named module space no longer carries the
+# module's name over different doors; nothing in this workspace binds onto either space.
+# ⚠ `^0.1.89` is also a ceiling below 0.2.0. Beneath it, and each called:
+# 0.1.87 = THE MODULE AUTHOR'S "WHY" (ledger #906, #907, #908), a
 # BEHAVIORAL floor with no new Rust API: `urn:kernel:explain` (a dry run of resolution: rewrites,
 # each chain member's outcome, the answering door and bindings, the scopes a capability lacks) and
 # `urn:kernel:dependents thread=` (what a cut would recompute) exist only from 0.1.87. The REPL's

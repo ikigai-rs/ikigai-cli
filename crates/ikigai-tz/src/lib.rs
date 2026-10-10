@@ -18,6 +18,8 @@
 //! engine's `as-of=`) pins it like any other resolution: cacheable until the next minute
 //! under a live clock, [`Expiry::Never`](ikigai_core::Expiry) under a pinned one. Open (no
 //! capability) — nothing sensitive, just arithmetic.
+//!
+//! [`space`] names itself `urn:iki:space:tz` ([`SPACE_ID`]).
 #![forbid(unsafe_code)]
 
 use chrono::offset::LocalResult;
@@ -26,18 +28,27 @@ use chrono_tz::Tz;
 #[cfg(doc)]
 use ikigai_core::Expiry;
 use ikigai_core::{
-    ArgSpec, Description, EndpointSpace, Error, Exact, FnEndpoint, Invocation, ReprType,
+    space_iri, ArgSpec, Description, EndpointSpace, Error, Exact, FnEndpoint, Invocation, ReprType,
     Representation, Result, Time, Verb,
 };
 
 /// The XSD `string` datatype IRI — the `class` of the datetime/zone arguments.
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
-/// Mount the module: `urn:tz:convert` + `urn:tz:now`.
+/// The name [`space`] claims: `urn:iki:space:tz`.
+pub const SPACE_ID: &str = "urn:iki:space:tz";
+
+/// Mount the module: `urn:tz:convert` + `urn:tz:now`, named [`SPACE_ID`].
+///
+/// Configuration-free (no parameters, nothing read while building it), so every call holds
+/// the same two doors and the name is a true claim. `urn:tz:now`'s default zone is the host's
+/// local zone, read when it ANSWERS, not here. A host that binds another door onto this space
+/// drops the name (core 0.1.89), so an extended copy never answers to `urn:iki:space:tz`.
 pub fn space() -> EndpointSpace {
     EndpointSpace::new()
         .bind(Exact::new("urn:tz:convert"), convert())
         .bind(Exact::new("urn:tz:now"), now())
+        .named(space_iri("tz"))
 }
 
 /// A `text/plain; charset=utf-8` representation.
@@ -387,10 +398,15 @@ mod tests {
 
     /// The corridor the engine's `as-of=` injects: named for its instant, binding the same
     /// door, carrying the clock derived from that instant.
+    ///
+    /// The doors go into a FRESH, anonymous space rather than `space()` itself: `space()` is
+    /// named `urn:iki:space:tz`, and injecting a named space under a different name panics in
+    /// core's `check_claim` (the corridor's name and the space's own must agree). The engine's
+    /// `as-of=` builds its corridor the same way, from `ikigai_embedded::time_doors()`.
     fn pinned_at(millis: u64) -> Scope {
         Scope::empty().with_named_at(
             Iri::parse("urn:ctx:time:2026-09-25T18:00:00Z").unwrap(),
-            Arc::new(space()),
+            Arc::new(EndpointSpace::new().bind(Exact::new("urn:tz:now"), now())),
             Arc::new(FixedClock::at(millis)),
         )
     }

@@ -55,3 +55,8 @@ ikigai-fs = { workspace = true }
 # only, so the real validator has to come from somewhere.
 ikigai-shacl = { workspace = true }
 serde_json = { workspace = true }
+# The module recipe as one test over the plan space (`tests/conformance.rs`, plan-reader
+# only). 0.6.0 is the floor for SPACE-NAME, the check that `plan_space::space()` claims
+# `urn:iki:space:engine:plan` over the same doors on every call. ⚠ `^0.6.0` is also a
+# ceiling below 0.7.0.
+ikigai-conformance = "0.6.0"
