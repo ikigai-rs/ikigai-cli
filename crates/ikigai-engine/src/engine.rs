@@ -141,6 +141,7 @@ commands:
   sink <iri> [k=v …] <content>  SINK into a resource: leading k=v name declared args, the rest is content
   source a | sink <iri> [k=v …]  pipeline write-terminal: store the piped value as the sink's content
   delete <iri> [k=v …]       DELETE a resource (the delete verb)
+  exists <iri> [k=v …]       EXISTS: ask whether a resource is there, without reading it
   describe <iri> [type]      META a resource; `type` defaults to text/turtle
   (<sexpr>)                  evaluate a Lisp form (leading `(` routes to urn:lisp:eval)
   :lisp                      enter multi-line Lisp mode; a blank line evaluates, `:lisp` cancels
@@ -180,6 +181,9 @@ arguments:
 quoting:
   wrap a word in \"…\" to keep `|`, `..`, `(`, `)`, `;`, or spaces literal inside an
   IRI or input; \\\" is a literal quote and \\\\ a literal backslash.
+  a `sink` content is VERBATIM (spaces, JSON, Turtle and quotes kept) with one exception:
+  content that is ONE quoted token, `sink <iri> \"a note\"`, is unquoted by the same rules
+  (stores: a note). To store the quote marks, escape them: `sink <iri> \"\\\"a note\\\"\"`.
 
 try:
   source urn:iki:fn:toUpper resource-oriented computing
@@ -197,6 +201,7 @@ try:
   sink urn:file:notes.txt remember the milk
   source urn:iki:fn:toUpper hello | sink urn:file:shout.txt
   source urn:file:notes.txt
+  exists urn:file:notes.txt
   (+ 1 2)
   (source \"urn:iki:fn:toUpper\" \"hi\")
   cap read-only ; sink urn:file:notes.txt nope   (write now refused)
@@ -280,7 +285,9 @@ pub enum Action {
 /// needed. See [`Engine::set_piped_input_with`] for why the second variant exists.
 enum PipedInput {
     Ready(Vec<u8>),
-    Deferred(Box<dyn FnOnce() -> Vec<u8>>),
+    /// `None` from the reader means stdin offered NOTHING (an idle descriptor): the sink is
+    /// then sent with no `content` at all, never with an empty one.
+    Deferred(Box<dyn FnOnce() -> Option<Vec<u8>>>),
 }
 
 pub struct Engine {
@@ -546,6 +553,19 @@ impl Engine {
     /// nobody will ever write to", and nothing can: the only safe moment to block on stdin
     /// is when a command has asked for its content.
     pub fn set_piped_input_with(&self, read: impl FnOnce() -> Vec<u8> + 'static) {
+        *self.piped_input.borrow_mut() = Some(PipedInput::Deferred(Box::new(move || Some(read()))));
+    }
+
+    /// [`set_piped_input_with`](Self::set_piped_input_with) for a reader that may find stdin
+    /// IDLE: `read` answers `None` when nothing arrived (ledger #1088), and the content-less
+    /// `sink` that asked is then sent with NO `content` argument.
+    ///
+    /// Why not an empty one: an idle descriptor cannot be told from a slow producer
+    /// (`slow-command | ikigai -c 'sink …'`), so the reader gives up after a grace period,
+    /// and an empty body would silently overwrite whatever the target held. Without
+    /// `content`, a sink that requires it refuses (nothing is written) and one where it is
+    /// optional (a ledger close's note) proceeds as asked.
+    pub fn set_piped_input_polled(&self, read: impl FnOnce() -> Option<Vec<u8>> + 'static) {
         *self.piped_input.borrow_mut() = Some(PipedInput::Deferred(Box::new(read)));
     }
 
@@ -796,6 +816,7 @@ impl Engine {
             "run" => output(self, self.run_stored_plan(rest).await),
             "sink" => output(self, self.run_sink(rest).await),
             "delete" | "del" => output(self, self.run_delete(rest).await),
+            "exists" => output(self, self.run_exists(rest).await),
             "describe" | "desc" => {
                 let (target, ty) = split_first_word(rest);
                 let ty = if ty.is_empty() { "text/turtle" } else { ty };
@@ -1275,6 +1296,23 @@ impl Engine {
             .await
     }
 
+    /// `exists <iri> [key=value …]` — issue the `Exists` verb (ledger #1069) and show the
+    /// endpoint's answer (by convention `true`/`false`). Arguments route exactly as `source`'s
+    /// do, against the target's declared contract, and `as-of=` works as it does there; a
+    /// pipeline is refused, since the question is about ONE resource. Every other face already
+    /// spoke the verb (MCP's `…__exists` tools, `explain <iri> exists`, plans); this is the
+    /// REPL's spelling of it.
+    async fn run_exists(&self, spec: &str) -> Result<String, String> {
+        let (words, scope) = self.single_stage(spec, "exists")?;
+        self.in_scope(scope, async {
+            let (target, args) = words.split_first().ok_or("expected an IRI")?;
+            let mut request = self.source_request(target, args, None).await?;
+            request.verb = Verb::Exists;
+            self.run(request).await
+        })
+        .await
+    }
+
     /// Build a write [`Request`] (`Sink`/`Delete`) for `sink`/`delete`.
     ///
     /// A leading run of `key=value` words whose key is a *declared* argument of the
@@ -1287,7 +1325,9 @@ impl Engine {
     ///
     /// ⚠ `content` is itself a declared argument of most sinks, so `content="…"` names
     /// the body directly — which is the way to send a *structured* body, since the
-    /// remainder is verbatim down to the quote characters. When `content=` is named the
+    /// remainder is verbatim down to the quote characters — with ONE exception, for `sink`
+    /// only: a remainder that is a single quoted token (`sink <iri> "a note"`) is unquoted by
+    /// the same rules as `content="…"` ([`unquote_whole`]). When `content=` is named the
     /// remainder fallback is skipped entirely (it would otherwise overwrite it), and a
     /// remainder alongside `content=` is refused rather than silently resolved.
     async fn write_request(&self, verb: Verb, rest: &str) -> Result<Request, String> {
@@ -1345,8 +1385,19 @@ impl Engine {
             let piped = self.piped_input.borrow_mut().take();
             match piped {
                 Some(PipedInput::Ready(bytes)) => bytes,
-                Some(PipedInput::Deferred(read)) => read(),
+                Some(PipedInput::Deferred(read)) => match read() {
+                    Some(bytes) => bytes,
+                    // An idle stdin: no content at all (see `set_piped_input_polled`).
+                    None => return Ok(request),
+                },
                 None => Vec::new(),
+            }
+        } else if verb == Verb::Sink {
+            // The NARROW quote rule (ledger #1069): a remainder that is one quoted token is
+            // unquoted exactly as `content="…"` is; anything else is verbatim.
+            match unquote_whole(tail) {
+                Some(unquoted) => unquoted.into_bytes(),
+                None => tail.as_bytes().to_vec(),
             }
         } else {
             tail.as_bytes().to_vec()
@@ -2544,29 +2595,55 @@ fn take_named_arg<'a>(tail: &'a str, declared: &[String]) -> Option<(&'a str, St
     }
     let after_eq = &tail[key.len() + 1..];
     if let Some(quoted) = after_eq.strip_prefix('"') {
-        let mut value = String::new();
-        let mut chars = quoted.char_indices();
-        while let Some((i, c)) = chars.next() {
-            match c {
-                // The tokenizer's rule: only `\"` and `\\` escape; any other backslash
-                // is literal. A trailing backslash ends the loop: unterminated.
-                '\\' => match chars.next() {
-                    Some((_, e @ ('"' | '\\'))) => value.push(e),
-                    Some((_, other)) => {
-                        value.push('\\');
-                        value.push(other);
-                    }
-                    None => return None,
-                },
-                '"' => return Some((key, value, quoted[i + 1..].trim_start())),
-                ch => value.push(ch),
-            }
-        }
-        None // unterminated quote: not an argument — leave it for the content
+        // An unterminated quote is not an argument — leave it for the content.
+        let (value, after) = scan_quoted(quoted)?;
+        Some((key, value, quoted[after..].trim_start()))
     } else {
         let (word, rest) = split_first_word(tail);
         Some((key, word[key.len() + 1..].to_string(), rest))
     }
+}
+
+/// Read a quoted span whose opening `"` has been stripped: the value up to the closing `"`,
+/// and the byte index just past it. The tokenizer's rule: only `\"` and `\\` escape; any
+/// other backslash is literal. `None` when the quote is unterminated (a trailing backslash
+/// included).
+fn scan_quoted(quoted: &str) -> Option<(String, usize)> {
+    let mut value = String::new();
+    let mut chars = quoted.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some((_, e @ ('"' | '\\'))) => value.push(e),
+                Some((_, other)) => {
+                    value.push('\\');
+                    value.push(other);
+                }
+                None => return None,
+            },
+            '"' => return Some((value, i + 1)),
+            ch => value.push(ch),
+        }
+    }
+    None
+}
+
+/// The NARROW quote rule for a `sink` remainder (Brian's decision on ledger #1069): when
+/// the WHOLE remainder is one quoted token — it opens with `"` and its first unescaped
+/// closing `"` is its last character — answer the unquoted value, by the same rules as
+/// `content="…"`. Anything else (`None`) stays verbatim: whitespace, JSON, Turtle, two
+/// quoted words, a quote that does not close.
+///
+/// ```text
+/// "a note"            → a note
+/// "say \"hi\""        → say "hi"
+/// "a" "b"             → verbatim
+/// {"k": "v"}          → verbatim
+/// ```
+fn unquote_whole(remainder: &str) -> Option<String> {
+    let quoted = remainder.strip_prefix('"')?;
+    let (value, after) = scan_quoted(quoted)?;
+    (after == quoted.len()).then_some(value)
 }
 
 fn split_first_word(s: &str) -> (&str, &str) {
@@ -3278,6 +3355,129 @@ mod tests {
         engine.set_piped_input(b"piped".to_vec());
         assert_eq!(run(&engine, "sink urn:echo typed"), "stored:typed");
         assert_eq!(run(&engine, "sink urn:echo"), "stored:piped");
+    }
+
+    /// An echo sink that reports whether `content` arrived at all, and what it was.
+    fn content_probe_engine() -> Engine {
+        let echo = FnEndpoint::new("echo", |inv: &Invocation<'_>| {
+            let body = match inv.request.args.get("content") {
+                Some(_) => format!("content:{}", inv.inline_str("content").unwrap_or("?")),
+                None => "no-content".to_string(),
+            };
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                body.into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("echo")
+                .verb(Verb::Sink)
+                .input(ArgSpec::new("note").summary("a named arg").optional())
+                .input(ArgSpec::new("content").summary("the body").optional())
+                .output("text/plain"),
+        );
+        Engine::new(Kernel::with_meta_renderer(
+            Arc::new(EndpointSpace::new().bind(Exact::new("urn:echo"), echo)),
+            Arc::new(JsonRenderer),
+        ))
+    }
+
+    /// ledger #1088: a reader that finds stdin IDLE answers `None`, and the sink then goes
+    /// with NO `content` (not an empty one), so a sink requiring it refuses instead of
+    /// writing an empty body. A reader that found bytes, and an empty-but-closed stdin, still
+    /// deliver content as before.
+    #[test]
+    fn an_idle_stdin_sends_the_sink_without_content() {
+        let engine = content_probe_engine();
+        let run = |e: &Engine, cmd: &str| match e.eval(cmd) {
+            Action::Output(entry) => entry.result.unwrap(),
+            _ => panic!("expected Action::Output"),
+        };
+        engine.set_piped_input_polled(|| None);
+        assert_eq!(run(&engine, "sink urn:echo note=x"), "no-content");
+        engine.set_piped_input_polled(|| Some(b"piped".to_vec()));
+        assert_eq!(run(&engine, "sink urn:echo note=x"), "content:piped");
+        engine.set_piped_input_polled(|| Some(Vec::new()));
+        assert_eq!(run(&engine, "sink urn:echo"), "content:");
+        // No piped input at all (a terminal) is unchanged: an empty body.
+        assert_eq!(run(&engine, "sink urn:echo"), "content:");
+    }
+
+    /// ledger #1069, Brian's NARROW rule, pinned both ways: a sink remainder that is ONE
+    /// quoted token is unquoted with `content="…"`'s escapes; everything else is verbatim.
+    #[test]
+    fn a_sink_remainder_that_is_one_quoted_token_is_unquoted_and_nothing_else_is() {
+        let engine = content_probe_engine();
+        let run = |cmd: &str| match engine.eval(cmd) {
+            Action::Output(entry) => entry.result.unwrap(),
+            _ => panic!("expected Action::Output"),
+        };
+        // Unquoted: one quoted token, with the same escapes `content="…"` reads.
+        assert_eq!(run(r#"sink urn:echo "a note""#), "content:a note");
+        assert_eq!(run(r#"sink urn:echo "say \"hi\"""#), r#"content:say "hi""#);
+        assert_eq!(run(r#"sink urn:echo """#), "content:");
+        assert_eq!(run(r#"sink urn:echo note=x "a note""#), "content:a note");
+        assert_eq!(
+            run(r#"sink urn:echo "a note""#),
+            run(r#"sink urn:echo content="a note""#),
+            "the remainder and content= read one quoting rule"
+        );
+        // The way to store the quote marks themselves.
+        assert_eq!(run(r#"sink urn:echo "\"a note\"""#), r#"content:"a note""#);
+        // Verbatim: everything that is not exactly one quoted token.
+        for verbatim in [
+            r#""a" "b""#,
+            r#"{"k": "v"}"#,
+            r#""a note" trailing"#,
+            r#"leading "a note""#,
+            r#""unterminated"#,
+            r#""ends in an escape\"#,
+            r#"<urn:s> <urn:p> "o" ."#,
+            "remember   the milk",
+        ] {
+            assert_eq!(
+                run(&format!("sink urn:echo {verbatim}")),
+                format!("content:{verbatim}"),
+                "{verbatim} must stay verbatim"
+            );
+        }
+    }
+
+    /// ledger #1069: `exists` issues the EXISTS verb (not a Source) and shows the answer;
+    /// arguments route by the declared contract as `source`'s do; a pipeline is refused.
+    #[test]
+    fn exists_issues_the_exists_verb() {
+        let probe = FnEndpoint::new("probe", |inv: &Invocation<'_>| {
+            let answer = match inv.request.verb {
+                Verb::Exists => format!("exists:{}", inv.inline_str("name").unwrap_or("-")),
+                other => format!("wrong verb {other:?}"),
+            };
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                answer.into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("probe")
+                .verb(Verb::Source)
+                .verb(Verb::Exists)
+                .input(ArgSpec::new("name").summary("what to look for"))
+                .output("text/plain"),
+        );
+        let engine = Engine::new(Kernel::with_meta_renderer(
+            Arc::new(EndpointSpace::new().bind(Exact::new("urn:probe"), probe)),
+            Arc::new(JsonRenderer),
+        ));
+        let result = |cmd: &str| match engine.eval(cmd) {
+            Action::Output(entry) => entry.result,
+            _ => panic!("expected Action::Output"),
+        };
+        assert_eq!(result("exists urn:probe name=a").unwrap(), "exists:a");
+        assert_eq!(result("exists urn:probe b").unwrap(), "exists:b");
+        let usage = result("exists").unwrap_err();
+        assert!(usage.contains("exists <iri>"), "{usage}");
+        let piped = result("exists urn:probe a | urn:probe").unwrap_err();
+        assert!(piped.contains("single resource"), "{piped}");
     }
 
     #[test]
