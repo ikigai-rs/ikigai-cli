@@ -3036,10 +3036,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "ikigai-core"
-version = "0.1.87"
+name = "ikigai-conformance"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "763c99b4fa0b8bb21780655fda6f1888782ea39081dbc4782c0a314c348b9809"
+checksum = "e12110212fc02b27d7b15f428b1ba7b9d1ca915c018997664bdad6faa79aedca"
+dependencies = [
+ "futures",
+ "ikigai-core",
+ "ikigai-vocab",
+ "oxrdf",
+ "oxrdfio",
+]
+
+[[package]]
+name = "ikigai-core"
+version = "0.1.89"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86129df2cac7dedf90efa632f1a978fb23ba9a9c482c25ad59228c88df3044a9"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3091,7 +3104,7 @@ dependencies = [
  "getrandom 0.2.17",
  "ikigai-browse",
  "ikigai-cms",
- "ikigai-conformance",
+ "ikigai-conformance 0.2.0",
  "ikigai-core",
  "ikigai-diagram",
  "ikigai-discovery",
@@ -3161,6 +3174,7 @@ version = "0.1.43"
 dependencies = [
  "chrono",
  "futures",
+ "ikigai-conformance 0.6.0",
  "ikigai-core",
  "ikigai-fs",
  "ikigai-resolve",
@@ -3578,6 +3592,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "futures",
+ "ikigai-conformance 0.6.0",
  "ikigai-core",
 ]
 
@@ -3595,9 +3610,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-vocab"
-version = "0.1.87"
+version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "deaf4b9b78cf2614d5c243e904a55f6a4e4ab1906028324598cf6babf60ed7af"
+checksum = "ebb816f571a13994fa64fdfee11cdda35e646c54c7abb8164480a72823b88561"
 dependencies = [
  "ikigai-core",
  "serde_json",
