@@ -101,8 +101,12 @@ members = ["crates/*"]
 #   `crates/ikigai-embedded/tests/egress.rs` / `egress_shared.rs` prove it in the host build with a
 #   counting loopback stub (every case reached it on 0.1.44; none does now). ikigai-intray's
 #   `match=` evaluates through `ikigai_store::service` (ledger #1085); it was already refusing.
-#   ⚠ NOT covered: `urn:shacl:validate` with a `sh:sparql`/`sh:select` that federates still
-#   reaches the network (ikigai-shacl 0.3.1; reported, fix belongs there).
+#   `urn:shacl:validate` was the last door (ledger #1099): a shapes graph whose `sh:sparql`
+#   `sh:select` federates, a `SERVICE` hidden in an `sh:declare` prefix name, or an IRI that
+#   breaks out of the `VALUES` rudof splices a focus node into, each CONNECTED through 0.3.1.
+#   ikigai-shacl 0.3.2 refuses all of them as `InvalidArgument` on `shapes`/`data` before rudof
+#   evaluates anything; `egress.rs` walks that door too (every case reached the stub on 0.3.1).
+#   ⚠ Behavior change: shacl 0.3.2 refuses ANY graph holding an IRI no SPARQL query can hold.
 # - The re-pin (PR #434): every ikigai dependency at its published head; most old pins were 0.x
 #   ceilings (browse 0.5 → 0.18.1, shacl 0.1 → 0.3.1, ledger 0.4 → 0.6.1, lisp 0.2 → 0.3.1,
 #   runbook 0.1 → 0.2.1, linkeddata 0.1 → 0.2.1, fn 0.3 → 0.4.1, …). Behavior a user sees, each
@@ -862,8 +866,17 @@ ikigai-jsonld = "0.2.1" # 0.2.1 is a SECURITY floor: JSON-LD nesting past 64 is 
 # operators could not be narrowed to before matching fell through to the LLM residual.
 # SHACL validation (urn:shacl:validate) — rudof's validator is native-only (gated off wasm),
 # so it's linked natively here; the browser serves the same resource via shacl-engine (JS).
-ikigai-shacl = "0.3.1" # 0.3.1 is a SECURITY floor: shapes-graph depth and triple-term nesting are bounded, so a deep
-# shape is refused instead of aborting the host. 0.3.0 names its `space()` `urn:iki:space:shacl`
+ikigai-shacl = "0.3.2" # 0.3.2 is a SECURITY floor (ledger #1099): rudof evaluates a shape's `sh:select`
+# with oxigraph's HTTP service handler installed (this build has `http-client` on), so through
+# 0.3.1 `SERVICE <http://…>` in a caller's shapes graph — in an `sh:select`, in an `sh:declare`
+# prefix name, or spliced in through an IRI holding `>` — was an outbound request no
+# `urn:cap:net:*` gated. 0.3.2 parses every query rudof will run and refuses `SERVICE`, and refuses
+# any shapes or data IRI no SPARQL query can hold (a behavior change even for graphs with no SPARQL
+# shapes), as `InvalidArgument` before rudof sees the text. `crates/ikigai-embedded/tests/egress.rs`
+# measures it in this host: every case reached the loopback stub on 0.3.1, none does on 0.3.2. Read
+# the caret as a RANGE: `^0.3.2` is `>=0.3.2, <0.4.0`, so a 0.4 line needs a deliberate re-pin.
+# Beneath it, still true: 0.3.1 is a SECURITY floor: shapes-graph depth and triple-term nesting are
+# bounded, so a deep shape is refused instead of aborting the host. 0.3.0 names its `space()` `urn:iki:space:shacl`
 # (ledger #987), so `answered_by`, `urn:kernel:topology` and `urn:diagram:*` show that name where
 # this host mounts it plain, and the cache partitions under it. Under 0.x the old caret was a
 # CEILING below the named release. 0.2.1 bounds `sh:select`/`sh:ask` and brings `ikigai-store`
