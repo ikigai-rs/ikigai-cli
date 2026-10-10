@@ -2841,9 +2841,22 @@ mod restart {
         )
         .unwrap();
         let rt = Runtime::new().unwrap();
-        let endpoint = rt
-            .block_on(async { bind_endpoint(config, addr, endpoint_config) })
-            .unwrap();
+        // `shutdown_background` releases the crashed server's socket on its own schedule, so
+        // the replacement may find the port still held for a moment (macOS CI did): retry the
+        // bind, boundedly, rather than racing it.
+        let mut tries = 0;
+        let endpoint = loop {
+            match rt
+                .block_on(async { bind_endpoint(config.clone(), addr, endpoint_config.clone()) })
+            {
+                Ok(endpoint) => break endpoint,
+                Err(e) if e.kind() == io::ErrorKind::AddrInUse && tries < 100 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => panic!("bind {addr}: {e}"),
+            }
+        };
         let kernel = Arc::new(Kernel::new(Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),
         )));
