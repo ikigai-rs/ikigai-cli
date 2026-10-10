@@ -833,6 +833,14 @@ impl Engine {
     /// literal operator can appear inside an IRI or input. Every leaf is just a
     /// `source`, so routing, the binding-only error, and caching all come from
     /// [`run_source`](Self::run_source).
+    #[cfg_attr(
+        not(feature = "plan-reader"),
+        allow(
+            dead_code,
+            reason = "read only by `run <spec>` in plan.rs, which is the plan-reader feature's; \
+                      the `source` command reads `run_pipeline_staged`"
+        )
+    )]
     pub(crate) async fn run_pipeline(&self, spec: &str) -> Result<String, String> {
         self.run_pipeline_staged(spec).await?.into_text()
     }
