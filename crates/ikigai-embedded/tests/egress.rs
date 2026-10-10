@@ -18,8 +18,10 @@
 //! door, for each shape (`SILENT`, inside `EXISTS`, in an update's `WHERE`, `LOAD`).
 //!
 //! ★ Measured before the fix: against ikigai-sparql 0.1.11 / ikigai-store 0.2.7 (the pins
-//! cli 0.1.44 shipped) every `SERVICE` case below REACHED the stub and most of them answered
-//! with its rows. `LOAD` at `urn:iki:store:update` was already refused at the door by 0.2.7.
+//! cli 0.1.44 shipped) every `SERVICE` and `LOAD` case at `urn:sparql:*` and `urn:iki:store:*`
+//! REACHED the stub, and most of them answered with its rows. That includes `LOAD` at
+//! `urn:iki:store:update`, which an earlier note said 0.2.7 already refused at the door: in this
+//! build it did not.
 //! ikigai-sparql 0.2.1 and ikigai-store 0.2.10 are the floors that make this file pass.
 //!
 //! The tuple space's `match=` (`ikigai-intray`, which builds its own evaluator) is walked here
