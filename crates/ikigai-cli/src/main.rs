@@ -4329,9 +4329,11 @@ mod version_flag_tests {
 ///   [`TraceEvent`] tagged [`DENIED_NOTE`] with `started == None` — the one event that names
 ///   something which never ran.
 /// * **The module's ACL** (the parameterized rule). A session holding a grant under the
-///   family but not for THIS path passes the floor and is refused inside `invoke`. That
-///   refusal leaves NO trace event (core records an invocation only after `invoke` returns
-///   `Ok` — reported for the hub), so the witness is the disk: no file, no directory.
+///   family but not for THIS path passes the floor and is refused inside `invoke`. Since core
+///   0.1.92 (ledger #20, #559) that is a TIMED event noted `(FAILED_NOTE, "denied")` and never
+///   `DENIED_NOTE`: the endpoint was entered and returned `Err`. Through 0.1.91 it left no
+///   event at all, so the only witness was the disk; the disk is still asserted (no file, no
+///   directory), and now the trace says which gate refused by its key alone.
 ///
 /// In both the text the adapter shows begins `denied:`, which is prose — `Entry.result` is
 /// `Result<String, String>`, so the taxonomy does not survive to the page. The TYPE is
@@ -4349,6 +4351,7 @@ mod adapter_gate_tests {
     use super::*;
     use ikigai_core::{
         ArgRef, Capability, Error, Iri, Kernel, Request, TraceEvent, Tracer, Verb, DENIED_NOTE,
+        FAILED_NOTE,
     };
     use ikigai_engine::Action;
     use std::path::{Path, PathBuf};
@@ -4541,8 +4544,9 @@ mod adapter_gate_tests {
     }
 
     /// **The module's ACL gate**: a session that DOES hold a grant under the family, but for
-    /// another path, clears the floor and is refused inside `invoke` — with no trace event
-    /// at all, so the only witness is that nothing reached the disk.
+    /// another path, clears the floor and is refused inside `invoke` — one TIMED trace event
+    /// noted `("failed", "denied")` (core 0.1.92), never the floor's `DENIED_NOTE`, and nothing
+    /// on the disk.
     ///
     /// This is the half a status code cannot distinguish: both gates answer 403 through the
     /// HTTP face and `denied:` through this one, and only the absence of the file says the
@@ -4575,8 +4579,19 @@ mod adapter_gate_tests {
         let after = s.trace.events();
         assert_eq!(
             after.len(),
-            before,
-            "the module's ACL refused inside invoke, which core does not trace: {after:?}"
+            before + 1,
+            "one event, the endpoint's own refusal: {after:?}"
+        );
+        let refusal = &after[before];
+        assert_eq!(refusal.target, "urn:file:someone-else/secret.txt");
+        assert_eq!(
+            refusal.notes,
+            vec![(FAILED_NOTE.to_string(), "denied".to_string())],
+            "the module refused (it ran and failed), not the floor: {refusal:?}"
+        );
+        assert!(
+            refusal.started.is_some() && refusal.ended.is_some(),
+            "entered, so timed: {refusal:?}"
         );
         assert!(
             matches!(

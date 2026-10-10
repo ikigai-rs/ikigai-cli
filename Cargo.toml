@@ -422,7 +422,15 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 [workspace.dependencies]
 # The released kernel, consumed from crates.io. For local cross-repo development
 # against a sibling checkout, use .cargo/config.toml (see .cargo/config.toml.example).
-ikigai-core = "0.1.91" # 0.1.91 = AN ACTION MATCH HAS ITS OWN IDENTITY (ledger #948), a WIRE
+ikigai-core = "0.1.92" # 0.1.92 = A FAILED INVOCATION IS A TRACE NODE (ledger #20, #559): an endpoint that is entered and
+# returns `Err` is now a TIMED `TraceEvent` noted `(FAILED_NOTE, <kind>)`, distinct from the
+# floor's `DENIED_NOTE`. A floor with a named site:
+# `adapter_gate_tests::a_step_outside_the_granted_segment_is_denied_and_never_reaches_the_disk`
+# (crates/ikigai-cli/src/main.rs) asserts the fs ACL's refusal as `("failed", "denied")` and
+# imports `FAILED_NOTE`, which exists only from 0.1.92; under 0.1.91 the same refusal left no
+# event. Every module re-pinned on 2026-10-10 needs 0.1.89 at least. ⚠ `^0.1.92` is also a ceiling
+# below 0.2.0.
+# Beneath it, still true: 0.1.91 = AN ACTION MATCH HAS ITS OWN IDENTITY (ledger #948), a WIRE
 # floor and an API floor at once. `urn:kernel:actions` names each row `urn:ikigai:match:{verb}:{door}`
 # and joins it to a CONTENT-ADDRESSED contract by `ik:contract`
 # (`urn:ikigai:contract:{id}:{verb}:b3:{hex}`); the old `urn:ikigai:endpoint:{id}:action:{verb}`
@@ -527,7 +535,9 @@ ikigai-core = "0.1.91" # 0.1.91 = AN ACTION MATCH HAS ITS OWN IDENTITY (ledger #
 # holds beneath it: below that a MOUNTED template row whose local name-guess collides with a
 # shorter sibling is dropped from the manifold, so `ikigai mcp` silently stops projecting
 # browse-pr-explain and browse-pr-review.
-ikigai-vocab = "0.1.91" # 0.1.91 = core 0.1.91's lockstep release: it defines `ik:contract`
+ikigai-vocab = "0.1.92" # 0.1.92 = core 0.1.92's lockstep release; only `owl:versionInfo` moved. Not an API floor; raised
+# with core for the reason given below.
+# Beneath it, still true: 0.1.91 = core 0.1.91's lockstep release: it defines `ik:contract`
 # (rdfs:domain `ik:ActionMatch`), the predicate every manifold row and every selection graph this
 # host emits now carries (`urn:agent:select` re-emits it). Not an API floor: nothing here calls a
 # vocab item new in 0.1.91. Raised with core because this repo's tests validate against the
@@ -605,7 +615,14 @@ ikigai-vocab = "0.1.91" # 0.1.91 = core 0.1.91's lockstep release: it defines `i
 # CEILING. The lock alone was holding `ikigai-fn` at 0.2.0 and shipping a manifold that
 # contradicted itself. Refresh the lock when you touch these, and diff the lock FILE.
 # The reusable function library, linked in as a published module crate.
-ikigai-fn = "0.3.0" # 0.3.0 = compose is a view TEMPLATE LANGUAGE: `$h{…}` (HTML-escaped) and
+ikigai-fn = "0.4.1" # 0.4.1 = the 0.4 line names its `space()` `urn:iki:space:fn` (ledger #987), so `answered_by`,
+# `urn:kernel:topology` and `urn:diagram:*` show that name where this host mounts it plain, and
+# the cache partitions under it. Under 0.x the old caret was a CEILING below the named release. ⚠
+# `base_space` EXTENDS `ikigai_fn::space()` with `bind`, and core 0.1.89 drops the name there, so
+# the embedded root's base layer stays anonymous; the claim is never made over doors fn does not
+# own. 0.4.1 adds only `MARKER_LETTERS`/`escape_markers`, which nothing here calls: taken as the
+# published head so the host is not born behind it.
+# Beneath it, still true: 0.3.0 = compose is a view TEMPLATE LANGUAGE: `$h{…}` (HTML-escaped) and
 # `$r{…}` (raw) splice without re-expanding, `{name}` in a marker is a template argument, and
 # `$h{<iri> || <fallback>}` covers a failed part. This host serves `urn:iki:fn:compose`, so the
 # language IS its output, and the floor is the language rather than any Rust item (the host
@@ -660,19 +677,41 @@ ikigai-http = "0.1.8" # 0.1.8 = every input of the six verbs had been declared R
 # Interactive runbook module (urn:runbook:*) — Linked Data demo tab since 0.1.3;
 # 0.1.5 adds the JSON-LD demo tab (expand/flatten/compact), which works here because
 # the CLI links its own pipe-fixed ikigai-engine.
-ikigai-runbook = "0.1.14" # 0.1.14 DECLARES the text/plain and application/json faces the
+ikigai-runbook = "0.2.1" # 0.2.1 = the 0.2 line names its `space()` `urn:iki:space:runbook` (ledger #987), so
+# `answered_by`, `urn:kernel:topology` and `urn:diagram:*` show that name where this host mounts
+# it plain, and the cache partitions under it. Under 0.x the old caret was a CEILING below the
+# named release. 0.2.1 REFUSES an `as` outside `PAGE_FACES` as `InvalidArgument` naming `as` (it
+# used to serve HTML); a missing `as` is still text/html, and every `as=` this workspace sends
+# (`urn:runbook:zerotrust as=text/html` in the adapter tests) is a member. The ZeroTrust tab's
+# steps are unchanged, so the tests that index them by POSITION still hold (ledger #1068).
+# Beneath it, still true: 0.1.14 DECLARES the text/plain and application/json faces the
 # pages have served since 0.1.1 and never announced, and makes `as` optional (it always was,
 # in the body) with its real one_of and default. Undeclared-but-served is precisely the class
 # `ikigai-conformance` 0.2.0 added a check for, and this host is what serves these pages.
 # 0.1.13 added `hide_tab`/`tab_ids`, which this workspace does not call yet.
 # 0.1.12 Lisp page: + generated aliases (named verbs, cap-scoped, transcluded)
 # Linked Data toolkit (separate ikigai-linkeddata repo): RDF transreption + SPARQL.
-ikigai-rdf = "0.1.8" # 0.1.8 = `urn:rdf:transrept` declares all seven faces it produces
+ikigai-rdf = "0.2.1" # 0.2.1 = the linkeddata lockstep line (`ikigai-sparql` 0.2.1 depends on it): `urn:iki:space:rdf`
+# (ledger #987), and Turtle / JSON / RDF-XML nesting refused past 64 before a recursive parser
+# sees it.
+# Beneath it, still true: 0.1.8 = `urn:rdf:transrept` declares all seven faces it produces
 # (its outputs and its transreptsTo set are pinned equal upstream), and `mode=` carries its
 # one_of/default. 0.1.9 is a dev-dependency bump for this crate only, so 0.1.8 is the true
 # minimum rather than the newest. 0.1.3 = + urn:rdf:union / urn:rdf:diff (graph set ops,
 # with= carries ?k=v args)
-ikigai-sparql = "0.1.11" # 0.1.11 is a SECURITY floor (ledger #962): the store's parse bound
+ikigai-sparql = "0.2.1" # 0.2.1 is a SECURITY floor (ledger #1083): `SERVICE` and `LOAD` are refused as a typed
+# `InvalidArgument` at every door, before evaluation, and every evaluator carries a refusing
+# service handler. This build has oxigraph's `http-client` ON (rudof, through `ikigai-shacl`,
+# turns it on by feature unification), so through 0.1.11 `SERVICE <http://…>` in a caller's query
+# was an outbound request no `urn:cap:net:*` gated, in BOTH regimes, and `LOAD` through
+# `urn:sparql:update` wrote the fetched triples into browse's store. Measured in this host before
+# and after: `crates/ikigai-embedded/tests/egress.rs` and `egress_shared.rs`. ⚠ `^0.1.11` was a
+# CEILING below the fix. Other behavior a caller sees across 0.1.12–0.2.1: a 5 s time budget
+# (`Timeout`), algebra-size bounds, answers over 100k rows or 16 MiB REFUSED rather than
+# truncated, optional `budget=`/`max_rows=`/`max_bytes=` inputs that can only lower the bounds,
+# `FROM`/`FROM NAMED` honored, `SERVICE SILENT` refused rather than empty, and `space()` named
+# `urn:iki:space:sparql` (`space_with_store` stays anonymous).
+# Beneath it, still true: 0.1.11 is a SECURITY floor (ledger #962): the store's parse bound
 # (ikigai-store 0.2.7, below) for `urn:sparql:*`. Every door that parses caller text — the four
 # query forms in both spaces and `urn:sparql:update` — ran oxigraph's recursive parser and
 # evaluator inline, so about 2 KB of nested SPARQL aborted a release-built host. This host binds
@@ -689,7 +728,8 @@ ikigai-sparql = "0.1.11" # 0.1.11 is a SECURITY floor (ledger #962): the store's
 # `space_with_store` — which the browse composition uses — behind `urn:cap:sparql:update`.
 # 0.1.6 = space_with_store (shared-store seam for browse/annotations)
 # Content sniffing + sniff-and-dispatch (urn:sniff, urn:transrept:auto).
-ikigai-sniff = "0.1.9" # 0.1.9 sniffs a leading `<urn:…>` subject as text/turtle. Below it
+ikigai-sniff = "0.2.1" # 0.2.1 = the linkeddata lockstep line: `urn:iki:space:sniff` (ledger #987).
+# Beneath it, still true: 0.1.9 sniffs a leading `<urn:…>` subject as text/turtle. Below it
 # `angle_token_is_iri` tested for `://` — an AUTHORITY, not a scheme — so every Turtle
 # document whose first subject is a URN sniffed as application/rdf+xml and died in the XML
 # parser. This ecosystem skolemizes into `urn:` by rule (`urn:ikigai:endpoint:*`,
@@ -697,7 +737,14 @@ ikigai-sniff = "0.1.9" # 0.1.9 sniffs a leading `<urn:…>` subject as text/turt
 # `source <urn: graph> | urn:rdf:transrept` and `urn:transrept:auto` — both bound here.
 # 0.1.9 also declares `urn:transrept:auto`'s own text/turtle face and refuses an unknown `as=`.
 # Neutral s-expr foundation: Sexpr datum + urn:sparql:from-sexpr transreptor (text/x-sexpr → SPARQL).
-ikigai-sexpr = "0.1.4" # 0.1.4 = arrangements as s-expressions: `urn:sexpr:arrangement-to-rdf` /
+ikigai-sexpr = "0.2.0" # 0.2.0 = names its `space()` `urn:iki:space:sexpr` (ledger #987), so `answered_by`,
+# `urn:kernel:topology` and `urn:diagram:*` show that name where this host mounts it plain, and
+# the cache partitions under it. Under 0.x the old caret was a CEILING below the named release.
+# `arrangement_space()` (unused here) is `urn:iki:space:sexpr:arrangement`; `ArrangementError`
+# gained a public field, which nothing here constructs; the `from-sexpr` transreptors now declare
+# themselves lossy. ⚠ `ikigai-lisp` 0.3.1 still depends on `ikigai-sexpr` `^0.1.2`, so the lock
+# carries 0.1.4 beside 0.2.0 until lisp moves.
+# Beneath it, still true: 0.1.4 = arrangements as s-expressions: `urn:sexpr:arrangement-to-rdf` /
 # `-from-rdf`, lossless both ways (each reads its own output back and refuses to answer
 # otherwise). The bootstrap kernel's transreptor selection finds the first one for an
 # `.arrangement` file, and `urn:iki:host:arrangement as=text/x-ikigai-arrangement` calls
@@ -717,9 +764,17 @@ ikigai-sexpr = "0.1.4" # 0.1.4 = arrangements as s-expressions: `urn:sexpr:arran
 # of=<iri>`, both `image/svg+xml`. Bound in the LOCAL root only (`root_members`), never in a
 # served posture. 0.1.0 is the first release and the one API called (`space()`); its core
 # floor is 0.1.83, beneath this workspace's 0.1.84, so the host still links one `ikigai-core`.
-ikigai-diagram = "0.1.0"
+ikigai-diagram = "0.2.0" # 0.2.0 = names its `space()` `urn:iki:space:diagram` (ledger #987), so `answered_by`,
+# `urn:kernel:topology` and `urn:diagram:*` show that name where this host mounts it plain, and
+# the cache partitions under it. Under 0.x the old caret was a CEILING below the named release.
+# The SVG `<desc>` now lists the names of the named spaces it draws.
 # Signing + verification: urn:sign:sign (cap-gated) / urn:sign:verify (open), Ed25519.
-ikigai-sign = "0.2.3" # 0.2.3 is a SECURITY floor (ledger #857): ES256 verify refuses high-S, so
+ikigai-sign = "0.3.0" # 0.3.0 = naming only: names its `space()` `urn:iki:space:sign` (ledger #987), so `answered_by`,
+# `urn:kernel:topology` and `urn:diagram:*` show that name where this host mounts it plain, and
+# the cache partitions under it. Under 0.x the old caret was a CEILING below the named release.
+# This host mounts `ikigai_sign::space()` at TWO sites (the root and the served composition); same
+# name, same doors, so core's one-name-one-arrangement check holds.
+# Beneath it, still true: 0.2.3 is a SECURITY floor (ledger #857): ES256 verify refuses high-S, so
 # one (message, key) mints one node; one sig:Signature per graph. 0.2.2 fixed the key ArgSpec summaries, which had said Ed25519-only
 # since ES256 shipped in 0.2.0 — a manifold this host publishes describing an argument it
 # does not have, and the same family of defect as the `ikigai-fn` one above. It also makes a
@@ -732,14 +787,20 @@ ikigai-sign = "0.2.3" # 0.2.3 is a SECURITY floor (ledger #857): ES256 verify re
 # does not match after this bump.
 # Public-key encryption (urn:encrypt:encrypt/decrypt, age/X25519) — the dual of sign.
 # Keys resolved through the kernel (urn:secret:<id>.enc). Embedded-only (off the wire).
-ikigai-encrypt = "0.1.2" # 0.1.2 is a SECURITY floor (ledger #853): a low-order recipient no longer
+ikigai-encrypt = "0.2.0" # 0.2.0 = naming only: names its `space()` `urn:iki:space:encrypt` (ledger #987), so
+# `answered_by`, `urn:kernel:topology` and `urn:diagram:*` show that name where this host mounts
+# it plain, and the cache partitions under it. Under 0.x the old caret was a CEILING below the
+# named release.
+# Beneath it, still true: 0.1.2 is a SECURITY floor (ledger #853): a low-order recipient no longer
 # PANICS the host (any caller, no capability needed); input is read as bytes. 0.1.1 stops declaring `urn:encrypt:encrypt` cacheable. age mints
 # a FRESH ephemeral key on every call, so the result is not a function of its inputs and a
 # cached ciphertext is a cached answer to a question nobody asked twice; `decrypt` is as
 # cacheable as its key, which is the correct claim. This host served the cached one.
 # Secrets custody: urn:secret:{name} (cap-gated read) + urn:secret:generate/unlock
 # (Ed25519 keygen + Touch ID), macOS Keychain backend. Owner-only, not served.
-ikigai-secret = "0.1.7" # 0.1.7 is a SECURITY floor (ledger #854): the file store maps names
+ikigai-secret = "0.1.8" # 0.1.8 = a secret name beginning with `-` is refused as `InvalidArgument` on every face, before
+# any backend sees it. The space stays host-named.
+# Beneath it, still true: 0.1.7 is a SECURITY floor (ledger #854): the file store maps names
 # injectively, writes 0600 atomically, and generate needs write authority. 0.1.6 gives `urn:secret:{name}` per-verb ActionSpecs — Source under
 # `urn:cap:secret:read:*`, Sink under `urn:cap:secret:write:*` with a required, typed
 # `content`. The Sink shipped in 0.1.5 with NO `describe()` line at all, so the write face
@@ -752,7 +813,13 @@ ikigai-secret = "0.1.7" # 0.1.7 is a SECURITY floor (ledger #854): the file stor
 # 0.1.5 = the urn:secret Sink write face (owns the item's ACL → silent reads)
 # XSLT transform module (urn:xslt:transform) — linked natively (no download cost in a
 # native binary; the dynamic/lazy form is a browser/WASI concern).
-ikigai-xslt = "0.1.2" # 0.1.2 DECLARES `content`, which the endpoint already read. That is
+ikigai-xslt = "0.2.1" # 0.2.1 is a SECURITY floor: XML depth 64, XPath expression depth 32 and 1 MiB of entity expansion
+# are bounds, markup-valued, parameter and external entities are REFUSED (`InvalidArgument` on
+# `src`/`content`/`stylesheet`), and the transform runs on a sized, pooled thread. 0.2.0 names its
+# `space()` `urn:iki:space:xslt` (ledger #987), so `answered_by`, `urn:kernel:topology` and
+# `urn:diagram:*` show that name where this host mounts it plain, and the cache partitions under
+# it. Under 0.x the old caret was a CEILING below the named release.
+# Beneath it, still true: 0.1.2 DECLARES `content`, which the endpoint already read. That is
 # pipeline citizenship and it is load-bearing in THIS workspace specifically: the engine
 # routes a piped body by the declared contract, so an undeclared intake is an endpoint you
 # cannot pipe into from the REPL. It also makes `as` optional and takes the result's media
@@ -760,13 +827,26 @@ ikigai-xslt = "0.1.2" # 0.1.2 DECLARES `content`, which the endpoint already rea
 # claimed text/html, and accepts a stylesheet inline as well as by IRI.
 # JSON-LD operators (urn:jsonld:expand/compact/flatten) — linked natively (the heavy
 # json-ld tree is a browser-wasm concern, lazy-loaded there; native links it directly).
-ikigai-jsonld = "0.1.2" # 0.1.2 types `content`/`context`/`base`. Untyped inputs are
+ikigai-jsonld = "0.2.1" # 0.2.1 is a SECURITY floor: JSON-LD nesting past 64 is refused naming `content` or `context`, and
+# json-ld runs on a sized thread. 0.2.0 names its `space()` `urn:iki:space:jsonld` (ledger #987),
+# so `answered_by`, `urn:kernel:topology` and `urn:diagram:*` show that name where this host
+# mounts it plain, and the cache partitions under it. Under 0.x the old caret was a CEILING below
+# the named release.
+# Beneath it, still true: 0.1.2 types `content`/`context`/`base`. Untyped inputs are
 # invisible to the selection funnel's deterministic first stage — `urn:kernel:actions`
 # narrows on `ik:class`, and this host is the thing that serves that manifold — so the three
 # operators could not be narrowed to before matching fell through to the LLM residual.
 # SHACL validation (urn:shacl:validate) — rudof's validator is native-only (gated off wasm),
 # so it's linked natively here; the browser serves the same resource via shacl-engine (JS).
-ikigai-shacl = "0.1.2" # 0.1.2 SKOLEMIZES the report graph under `urn:ikigai:shacl:report:`
+ikigai-shacl = "0.3.1" # 0.3.1 is a SECURITY floor: shapes-graph depth and triple-term nesting are bounded, so a deep
+# shape is refused instead of aborting the host. 0.3.0 names its `space()` `urn:iki:space:shacl`
+# (ledger #987), so `answered_by`, `urn:kernel:topology` and `urn:diagram:*` show that name where
+# this host mounts it plain, and the cache partitions under it. Under 0.x the old caret was a
+# CEILING below the named release. 0.2.1 bounds `sh:select`/`sh:ask` and brings `ikigai-store`
+# `^0.2.8` (default features off); 0.2.0 pins rudof `>=0.3.22, <0.3.25`. ⚠ rudof still turns
+# oxigraph's `http-client` on for the whole graph (`just … egress-drift` stays RED for this repo);
+# what 0.2.1 of sparql and 0.2.10 of the store change is that their evaluators refuse.
+# Beneath it, still true: 0.1.2 SKOLEMIZES the report graph under `urn:ikigai:shacl:report:`
 # instead of emitting blank nodes — the recipe's "skolemize, no blank nodes" rule, in a graph
 # this host serves from `urn:shacl:validate` and from the pre-flight leg of the selection
 # funnel. Its application/json face also gained `message` (the resolved, language-tagged
@@ -784,13 +864,21 @@ ikigai-org = "0.1.7" # 0.1.7 makes the text/turtle face a DECLARED output with `
 # 0.1.6 = drawer properties are read wherever the drawer sits (:ID:/:URL: below SCHEDULED:) + :ZOOM_PASSCODE:
 # Unix-like text endpoints (urn:text:wc/head/tail/grep/sort/uniq/nl/rev) — the
 # first satellite-built module; pure text, wasm-clean, ArgSpec showcase.
-ikigai-text = "0.1.1" # 0.1.1 types `in`/`count`/`pattern` and declares all eight endpoints
+ikigai-text = "0.2.0" # 0.2.0 = naming only: names its `space()` `urn:iki:space:text` (ledger #987), so `answered_by`,
+# `urn:kernel:topology` and `urn:diagram:*` show that name where this host mounts it plain, and
+# the cache partitions under it. Under 0.x the old caret was a CEILING below the named release.
+# Beneath it, still true: 0.1.1 types `in`/`count`/`pattern` and declares all eight endpoints
 # pure and cacheable. Same reason as ikigai-jsonld above — an untyped input is invisible to
 # `urn:kernel:actions` narrowing — and upstream calls the typing "a contract change consumers
 # can see", which for a host is the literal truth: it is in our catalog.
 # Semantic-CMS transreptors (urn:cms:*): personal content (org bookmarks/notes,
 # library metadata) as one RDF graph on the dc:subject tag axis.
-ikigai-cms = "0.1.3" # 0.1.2 SKOLEMIZES the bookmark subject to
+ikigai-cms = "0.2.0" # 0.2.0 = names its `space()` `urn:iki:space:cms` (ledger #987), so `answered_by`,
+# `urn:kernel:topology` and `urn:diagram:*` show that name where this host mounts it plain, and
+# the cache partitions under it. Under 0.x the old caret was a CEILING below the named release.
+# 0.1.4 also fixed the org bookmarks parser (every heading is a record boundary; TODO/priority,
+# BOM and link unescape handled).
+# Beneath it, still true: 0.1.2 SKOLEMIZES the bookmark subject to
 # `urn:cms:bookmark:<fnv1a-of-url>` and carries the URL as a `dc:identifier` literal. Using
 # the raw URL as the subject meant a bookmark with a bare `%` or a stray `#` produced an
 # INVALID subject IRI in a graph this host emits. 0.1.3 declares the Turtle face and marks
@@ -800,7 +888,10 @@ ikigai-cms = "0.1.3" # 0.1.2 SKOLEMIZES the bookmark subject to
 # `urn:cms:*` — it binds the transreptors and serves them — but ikigai-cms-web does.
 # 0.1.1 = stitch wrapped bookmark titles (no dropped entries)
 # Dev-tooling seam: git/gh/cargo as resources (urn:system:exec, urn:repo:*).
-ikigai-repo = "0.1.6" # A floor a test in this repo actually holds, rather than an argument:
+ikigai-repo = "0.2.0" # 0.2.0 = naming only: names its `space()` `urn:iki:space:repo` (ledger #987), so `answered_by`,
+# `urn:kernel:topology` and `urn:diagram:*` show that name where this host mounts it plain, and
+# the cache partitions under it. Under 0.x the old caret was a CEILING below the named release.
+# Beneath it, still true: A floor a test in this repo actually holds, rather than an argument:
 # 0.1.3 and 0.1.5 bound `urn:repo:pr:list`, `urn:repo:pr:diff` and `urn:repo:pr:files`, and
 # `conformance::the_walked_catalog_is_classified` now names all three. Below 0.1.6 they are
 # unbound and that test fails the other way — "classified but no longer bound". 0.1.4 also
@@ -812,7 +903,15 @@ ikigai-repo = "0.1.6" # A floor a test in this repo actually holds, rather than 
 # Repository browsing (urn:repo:{root}:tree/file/state/hash/explain +
 # urn:iki:annotation:*) over configured roots — opt-in via `browse.root` config lines
 # (embedded host).
-ikigai-browse = "0.5.0" # 0.5.0 (ledger #444) is a BEHAVIOURAL break this host does not use but
+ikigai-browse = "0.18.1" # 0.18.1: `^0.5.0` was a CEILING thirteen minors behind. The Rust API this host calls
+# (`space_with_explain`, `Mount`, `ExplainConfig`) compiles unchanged; the behavior a caller sees
+# moved a lot. 0.17 is a SECURITY floor: an annotation Delete also needs `urn:cap:browse:read:*`,
+# and cross-root deletes and overwrites are denied. 0.6 makes a review with zero findings a valid
+# archived pass; 0.9 remembers declines; 0.11 adds the `superseded` state; 0.14 the finding Sink's
+# `retract`; 0.16 a JUDGE (one more LLM call per serious finding a review produces) and
+# `urn:repo:{repo}:judge:{path}`; 0.18 `explain-status`/`review-status`. The space stays
+# host-named.
+# Beneath it, still true: 0.5.0 (ledger #444) is a BEHAVIOURAL break this host does not use but
 # must not be frozen below: `urn:repo:{repo}:review:{path}` stops minting annotations and
 # produces PENDING findings instead, promoted only by a human, and the review actions stop
 # declaring `urn:cap:annotate` because they no longer write annotations. This host binds browse
@@ -876,7 +975,15 @@ ikigai-browse = "0.5.0" # 0.5.0 (ledger #444) is a BEHAVIOURAL break this host d
 # is only a fix in a host that drops it, so the root governs every Lisp door with a `Timeout`
 # (ledger #920, #87). `IKIGAI_LISP_WORKERS` is gone; `lisp.workers` replaces it.
 # The floors below are still true and subsumed:
-ikigai-lisp = "0.2.0" # Two earlier floors, both behavioural, both with named sites here.
+ikigai-lisp = "0.3.1" # 0.3.1 = the 0.3 line names its `space()` `urn:iki:space:lisp` (ledger #987), so `answered_by`,
+# `urn:kernel:topology` and `urn:diagram:*` show that name where this host mounts it plain, and
+# the cache partitions under it. Under 0.x the old caret was a CEILING below the named release. ⚠
+# 0.3.1's stored-program doors DECLARE `in` (and `run_signed` `data`) rather than `content`, which
+# they still READ: `decide.rs`'s `urn:booking:confirm` call sends `content` by name and is served
+# unchanged, but the manifold no longer offers `content` there. 0.3.1 also pins `steel-core
+# =0.8.3`, stops creating Steel's home directory, and keeps a program's own error text.
+# `Limits`/`set_limits` are unchanged.
+# Beneath it, still true: Two earlier floors, both behavioural, both with named sites here.
 # 0.1.13: Steel keeps ONE module-global reader that never cleared on a mid-form eof, so a
 # single malformed input left a partial form in it and POISONED every later `read` in that
 # worker for the life of the process. This host runs `urn:lisp:eval` on a long-lived worker,
@@ -887,7 +994,9 @@ ikigai-lisp = "0.2.0" # Two earlier floors, both behavioural, both with named si
 # client reads `Endpoint` as RETRYABLE — so a permanent authority refusal came back over IPC
 # and QUIC as something worth trying again, and the HTTP face mapped it to 500 rather than
 # 403. 0.1.12 = scope_sync migration (core-owned bridge; channels deleted)
-ikigai-throttle = "0.1.10" # 0.1.10 = the over-budget `RateLimit` stand-in FORWARDS the
+ikigai-throttle = "0.1.11" # 0.1.11 = the overlays forward `topology()` and `id()`, so a governed space shows (and keeps its
+# name) in `urn:kernel:topology`; `Failover` stays opaque. One wrapper per endpoint.
+# Beneath it, still true: 0.1.10 = the over-budget `RateLimit` stand-in FORWARDS the
 # wrapped endpoint's `describe()`. Below it the stand-in described itself ("rate-limited",
 # no `requires`), so once a prefix went over budget the wrapped endpoint's declared-capability
 # floor vanished with it: a caller holding no grant for a gated resource was told the prefix
@@ -918,7 +1027,9 @@ ikigai-throttle = "0.1.10" # 0.1.10 = the over-budget `RateLimit` stand-in FORWA
 # Timeout governor + Failover (the --prefer mount degrades through it)
 # LLM inference (urn:llm:ask + urn:llm:<provider>:ask + urn:llm:config): a facade grammar
 # over pluggable backends. OpenAI-compatible REST backend (Ollama/vLLM/llama.cpp/mlx_lm).
-ikigai-llm = "0.13.0" # 0.13.0: the audit round 5 fixes (ledger #884), a SECURITY floor. 0.12.1 stops a backend's 4xx body reaching the error text verbatim —
+ikigai-llm = "0.13.1" # 0.13.1 = an unstructured backend error body is DESCRIBED rather than forwarded into the error
+# text this host relays. The space stays host-named.
+# Beneath it, still true: 0.13.0: the audit round 5 fixes (ledger #884), a SECURITY floor. 0.12.1 stops a backend's 4xx body reaching the error text verbatim —
 # only the OpenAI-shaped `error.message` is kept — so a PROMPT can no longer appear in an
 # error this host composes and relays over the wire. In the same release `require_net`
 # refuses with the typed permanent `Denied` instead of `Error::Endpoint`, which a wire client
@@ -936,7 +1047,9 @@ ikigai-llm = "0.13.0" # 0.13.0: the audit round 5 fixes (ledger #884), a SECURIT
 # urn:llm:{provider}:model, which browse's explain archive keys its version tags on.
 # Video-conference scheduling (urn:meeting:schedule + urn:meeting:<provider>:schedule): a facade
 # over provider backends, Zoom first. Now on crates.io — the git-rev bridge retired at first publish.
-ikigai-meeting = "0.1.1" # 0.1.1 runs the module's OWN rules — both Zoom hosts, port-aware,
+ikigai-meeting = "0.1.2" # 0.1.2 = the Zoom `account_id` moves out of the token URL into the form body, and the Turtle face
+# escapes line breaks. API unchanged.
+# Beneath it, still true: 0.1.1 runs the module's OWN rules — both Zoom hosts, port-aware,
 # and each credential name — BEFORE any secret is read. The original read all three secrets
 # and then let its net gate refuse, so a call that was never going to be allowed had already
 # touched the keystore. It also declares `urn:cap:net:*` + `urn:cap:secret:read:*` on the
@@ -991,7 +1104,19 @@ ikigai-meeting = "0.1.1" # 0.1.1 runs the module's OWN rules — both Zoom hosts
 # levels as a typed InvalidArgument before the parser sees it, and parses and evaluates on a
 # thread of 16 MiB + 512 B per byte of text. The safety of this host now depends on that
 # release, so the floor states it. API: additive only.
-ikigai-store = { version = "0.2.7", features = ["persistent"] }
+# ⚠ …and 0.2.10 (ledger #1083), a SECURITY floor, and the one this line states now: every one of
+# the ten doors refuses `SERVICE` and `LOAD` as a typed `InvalidArgument` before evaluation, and
+# every evaluator carries a refusing service handler. In THIS build oxigraph's `http-client` is on
+# (rudof, by feature unification), and under 0.2.7 a `SERVICE` at any query door, an update whose
+# `WHERE` federates, and `LOAD <http://…>` at `urn:iki:store:update` all REACHED a loopback stub
+# (`crates/ikigai-embedded/tests/egress.rs`, measured before and after). 0.2.10 also exports
+# `ikigai_store::service` (the refusing evaluator and the door checks) for consumers that build
+# their own. Behavior across 0.2.8–0.2.10 a caller sees: a time budget (5 s base, 120 s ceiling,
+# raised by a `urn:cap:store:budget:<ms>` grant), algebra bounds and a `budget=` input; answers
+# over 100k rows or 16 MiB refused (raised by `urn:cap:store:answer:*`); a write-without-read
+# caller's DROP/CLEAR/CREATE runs SILENT. The ledger's grant list (`store::grants_for`) needs none
+# of the new grants: its reads stay inside the defaults.
+ikigai-store = { version = "0.2.10", features = ["persistent"] }
 # The work ledger (`urn:iki:ledger:*`): items, comments, labels, links, claims and
 # `next`, as RDF in the store above. It owns no bytes — every read is a scoped SPARQL
 # query at `urn:iki:store:graph-select` and every write a scoped UPDATE at
@@ -1016,7 +1141,16 @@ ikigai-store = { version = "0.2.7", features = ["persistent"] }
 # unchanged. Taken at 0.4.0 rather than 0.3.0 so this host is not born ceilinged below the
 # current release (rule 5's second half); `ikigai-gonk` sits on 0.3.0 as this is written, and
 # the difference is additive in behavior (every 0.3.0 request answers the same bytes).
-ikigai-ledger = "0.4.0"
+# ⚠ 0.6.1, and `"0.6.1"` is a RANGE `>=0.6.1, <0.7.0`; `^0.4.0` was a CEILING two minors behind.
+# 0.6.0 names `space()` `urn:iki:space:ledger` (ledger #987), and this host binds that config-free
+# `space()` (`crates/ikigai-embedded/src/store.rs`), so the ledger layer answers under that name.
+# 0.6.1 gives `items` a footer total and an `offset=` input (JSON `total`/`offset`),
+# `…:item:{id}:about`, and the blank-content Sink fix. 0.5.0 adds item `state` (CAS
+# `from=`/`to=`), lifecycles, `doctor`, and claim `lease=`/`takeover=`, and grows `RESERVED` and
+# `STRUCTURAL_CLASSES` and marks `select::Excluded` `#[non_exhaustive]` (nothing here names them).
+# 0.4.2 keeps an item with a bad timestamp and reports it as a defect; 0.4.1 answers a taken keyed
+# append without writing.
+ikigai-ledger = "0.6.1"
 # ── Intra-workspace siblings: LOCKSTEP pins, not floors ───────────────────────
 # The seventeen members that take `version.workspace = true` are released TOGETHER, at one
 # version, always. So every sibling pin below states the CURRENT workspace version rather

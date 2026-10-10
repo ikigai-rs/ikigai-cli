@@ -59,4 +59,4 @@ serde_json = { workspace = true }
 # only). 0.6.0 is the floor for SPACE-NAME, the check that `plan_space::space()` claims
 # `urn:iki:space:engine:plan` over the same doors on every call. ⚠ `^0.6.0` is also a
 # ceiling below 0.7.0.
-ikigai-conformance = "0.6.0"
+ikigai-conformance = "0.6.1"
