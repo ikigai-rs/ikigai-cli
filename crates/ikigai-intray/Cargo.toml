@@ -40,7 +40,7 @@ oxiri = "0.2.11"
 # and evaluates it on a stack sized for its text — the same two layers the store's own doors
 # and `urn:sparql:*` use. 0.2.7 is the first release with `limits`. No features: `persistent`
 # (RocksDB) is the host's to enable, and this crate opens no store.
-ikigai-store = "0.2.7"
+ikigai-store = "0.2.10"
 
 [dev-dependencies]
 futures = { workspace = true }

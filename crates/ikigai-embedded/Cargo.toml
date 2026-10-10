@@ -153,7 +153,9 @@ futures = { workspace = true }
 # findings on endpoints this crate owns — `host-arrangement` CACHEABLE (cached with no thread
 # but its own name), and `calendar-request` / `contact-block` AUTHORITY on the HTTP door (a
 # Sink declaring no `requires` that resolved under no grants). Each needs a decision, not a
-# pin edit, so the move waits for the arc that makes them.
+# pin edit, so the move waits for the arc that makes them. Re-tried 2026-10-10 at 0.6.1 (core
+# 0.1.92, the post-0.1.44 re-pin): the SAME three findings and no others against this crate's
+# own endpoints, so the decisions are still the blocker, not the suite.
 ikigai-conformance = "0.2.0"
 # The conformance fixture SEEDS the two edge verifying keys and one signing key, so the
 # decision faces are walked over real state instead of reporting "did not resolve". Same
