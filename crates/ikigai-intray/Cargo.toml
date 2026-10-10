@@ -27,19 +27,20 @@ blake3 = "1"
 oxigraph = "0.5"
 # The `match=` template is parsed to ALGEBRA so a `SERVICE` clause can be refused wherever it
 # hides (a `FILTER EXISTS`, an `OPTIONAL`, a sub-select) rather than by scanning text (audit
-# round 5, ledger #877). The same version oxigraph pins exactly (it re-exports none of these
-# types), so this adds no crate to the graph. `sep-0006` is named HERE because it adds the
-# `Lateral` variant the walk must cover: oxigraph enables it today, and a variant whose
-# existence depended on someone else's feature list would make the walk's exhaustiveness theirs.
+# round 5, ledger #877); the walk itself is `ikigai_store::service::refuse_service`, which takes
+# spargebra's `Query`. The same version oxigraph pins exactly (it re-exports none of these
+# types), so this adds no crate to the graph. `sep-0006` stays named here: the store enables it
+# for its own walk, and this crate parses the `LATERAL` the walk is written to cover.
 spargebra = { version = "0.4", features = ["sep-0006"] }
-# Only to NAME the type in oxigraph's `DefaultServiceHandler::handle` signature, which the
-# match evaluator implements to refuse every `SERVICE` call whatever features the build has.
-oxiri = "0.2.11"
 # The bound on caller SPARQL (ledger #963): `limits::check_sparql` refuses a `match=` template
 # over 1 MiB or nested past 64 levels before it is parsed, and `limits::on_sparql_stack` parses
 # and evaluates it on a stack sized for its text — the same two layers the store's own doors
 # and `urn:sparql:*` use. 0.2.7 is the first release with `limits`. No features: `persistent`
 # (RocksDB) is the host's to enable, and this crate opens no store.
+# ⚠ 0.2.10 is an API floor (ledger #1085): `ikigai_store::service` — the refusing evaluator
+# (`service::evaluator`) and the algebra walk (`service::refuse_service`) every `match=` goes
+# through — exists only from 0.2.10. This crate carried its own copy of both (ledger #877) until
+# then, and that copy is gone.
 ikigai-store = "0.2.10"
 
 [dev-dependencies]

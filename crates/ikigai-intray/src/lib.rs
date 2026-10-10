@@ -40,9 +40,10 @@ use ikigai_core::{
     ReprType, Representation, Request, Result, UriTemplate, Verb,
 };
 use ikigai_store::limits;
+use ikigai_store::service::{self, refuse_service};
 use notify::{RecursiveMode, Watcher};
 use oxigraph::io::{RdfFormat, RdfParser};
-use oxigraph::sparql::{DefaultServiceHandler, QueryResults, QuerySolutionIter, SparqlEvaluator};
+use oxigraph::sparql::QueryResults;
 use oxigraph::store::Store;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -415,6 +416,13 @@ where
 /// found, and the word in a literal or a comment is not mistaken for one. [`tuple_matches`]
 /// ALSO evaluates with a service handler that refuses every call, so the guarantee holds even
 /// if this walk ever missed a construct, whatever features the build carries.
+///
+/// Both halves are `ikigai-store`'s since 0.2.10 (`ikigai_store::service`, ledger #1085): the
+/// walk is [`refuse_service`] and the evaluator [`service::evaluator`]. This crate carried its
+/// own copy of each from ledger #877 until then; one copy, maintained where the store's ten doors
+/// use it, is what keeps a new spargebra variant from being covered in one place and not the
+/// other. The refusal TEXT stays this crate's, because the store's names the store's remedy
+/// (`urn:iki:store:load`), which means nothing to a match.
 fn parse_match(query: &str) -> Result<spargebra::Query> {
     let invalid = |detail: String| Error::InvalidArgument {
         name: "match".to_string(),
@@ -423,139 +431,19 @@ fn parse_match(query: &str) -> Result<spargebra::Query> {
     let parsed = spargebra::SparqlParser::new()
         .parse_query(query)
         .map_err(|e| invalid(format!("SPARQL syntax error: {e}")))?;
-    let spargebra::Query::Ask { pattern, .. } = &parsed else {
+    if !matches!(parsed, spargebra::Query::Ask { .. }) {
         return Err(invalid(
             "an associative match must be an ASK query".to_string(),
         ));
-    };
-    if pattern_reaches_service(pattern) {
-        return Err(invalid(
+    }
+    refuse_service(&parsed, "match").map_err(|_| {
+        invalid(
             "`SERVICE` is not allowed in an associative match: a match is evaluated against \
              one tuple's graph and never leaves this host"
                 .to_string(),
-        ));
-    }
+        )
+    })?;
     Ok(parsed)
-}
-
-/// Does any part of this graph pattern — including the patterns inside its expressions
-/// (`EXISTS`/`NOT EXISTS`) — contain a `SERVICE`? Exhaustive on purpose (no `_` arm): a
-/// variant a later spargebra adds fails the BUILD here instead of being waved through.
-fn pattern_reaches_service(pattern: &spargebra::algebra::GraphPattern) -> bool {
-    use spargebra::algebra::{AggregateExpression, GraphPattern as P, OrderExpression};
-    match pattern {
-        P::Service { .. } => true,
-        P::Bgp { .. } | P::Path { .. } | P::Values { .. } => false,
-        P::Join { left, right }
-        | P::Union { left, right }
-        | P::Minus { left, right }
-        | P::Lateral { left, right } => {
-            pattern_reaches_service(left) || pattern_reaches_service(right)
-        }
-        P::LeftJoin {
-            left,
-            right,
-            expression,
-        } => {
-            pattern_reaches_service(left)
-                || pattern_reaches_service(right)
-                || expression.as_ref().is_some_and(expression_reaches_service)
-        }
-        P::Filter { expr, inner } => {
-            expression_reaches_service(expr) || pattern_reaches_service(inner)
-        }
-        P::Extend {
-            inner, expression, ..
-        } => pattern_reaches_service(inner) || expression_reaches_service(expression),
-        P::OrderBy { inner, expression } => {
-            pattern_reaches_service(inner)
-                || expression.iter().any(|order| match order {
-                    OrderExpression::Asc(e) | OrderExpression::Desc(e) => {
-                        expression_reaches_service(e)
-                    }
-                })
-        }
-        P::Group {
-            inner, aggregates, ..
-        } => {
-            pattern_reaches_service(inner)
-                || aggregates.iter().any(|(_, aggregate)| match aggregate {
-                    AggregateExpression::CountSolutions { .. } => false,
-                    AggregateExpression::FunctionCall { expr, .. } => {
-                        expression_reaches_service(expr)
-                    }
-                })
-        }
-        P::Graph { inner, .. }
-        | P::Project { inner, .. }
-        | P::Distinct { inner }
-        | P::Reduced { inner }
-        | P::Slice { inner, .. } => pattern_reaches_service(inner),
-    }
-}
-
-/// The expression half of [`pattern_reaches_service`]: only `EXISTS` holds a pattern, but it
-/// can sit under any operator, so every operand is walked.
-fn expression_reaches_service(expression: &spargebra::algebra::Expression) -> bool {
-    use spargebra::algebra::Expression as E;
-    match expression {
-        E::Exists(pattern) => pattern_reaches_service(pattern),
-        E::NamedNode(_) | E::Literal(_) | E::Variable(_) | E::Bound(_) => false,
-        E::Or(a, b)
-        | E::And(a, b)
-        | E::Equal(a, b)
-        | E::SameTerm(a, b)
-        | E::Greater(a, b)
-        | E::GreaterOrEqual(a, b)
-        | E::Less(a, b)
-        | E::LessOrEqual(a, b)
-        | E::Add(a, b)
-        | E::Subtract(a, b)
-        | E::Multiply(a, b)
-        | E::Divide(a, b) => expression_reaches_service(a) || expression_reaches_service(b),
-        E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => expression_reaches_service(a),
-        E::In(a, list) => {
-            expression_reaches_service(a) || list.iter().any(expression_reaches_service)
-        }
-        E::If(a, b, c) => {
-            expression_reaches_service(a)
-                || expression_reaches_service(b)
-                || expression_reaches_service(c)
-        }
-        E::Coalesce(list) | E::FunctionCall(_, list) => list.iter().any(expression_reaches_service),
-    }
-}
-
-/// The `SERVICE` handler every match is evaluated with: it refuses every call. Installed as
-/// oxigraph's DEFAULT handler, which replaces its HTTP one when the `http-client` feature is
-/// on and fills the empty slot when it is off, so the outcome does not depend on the build's
-/// feature set. [`parse_match`] already refuses a template with a `SERVICE`; this is the floor
-/// under it.
-struct NoService;
-
-/// What [`NoService`] answers.
-#[derive(Debug)]
-struct ServiceRefused;
-
-impl std::fmt::Display for ServiceRefused {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SERVICE is not available to an associative match")
-    }
-}
-
-impl std::error::Error for ServiceRefused {}
-
-impl DefaultServiceHandler for NoService {
-    type Error = ServiceRefused;
-
-    fn handle(
-        &self,
-        _service_name: &oxigraph::model::NamedNode,
-        _pattern: &spargebra::algebra::GraphPattern,
-        _base_iri: Option<&oxiri::Iri<String>>,
-    ) -> std::result::Result<QuerySolutionIter<'static>, ServiceRefused> {
-        Err(ServiceRefused)
-    }
 }
 
 /// Does a tuple's graph satisfy the template (from [`parse_match`])? The tuple is parsed as
@@ -568,8 +456,11 @@ fn tuple_matches(template: &spargebra::Query, bytes: &[u8]) -> Result<bool> {
     {
         return Ok(false); // non-RDF tuple: no template matches it
     }
-    match SparqlEvaluator::new()
-        .with_default_service_handler(NoService)
+    // `service::evaluator()` installs a default service handler that refuses every call: it
+    // replaces oxigraph's HTTP one when the `http-client` feature is on and fills the empty slot
+    // when it is off, so the outcome does not depend on the build's feature set. [`parse_match`]
+    // already refuses a template with a `SERVICE`; this is the floor under it.
+    match service::evaluator()
         .for_query(template.clone())
         .on_store(&store)
         .execute()

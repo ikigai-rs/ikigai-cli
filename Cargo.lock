@@ -3243,7 +3243,6 @@ dependencies = [
  "ikigai-store",
  "notify",
  "oxigraph",
- "oxiri 0.2.11",
  "serde_json",
  "spargebra",
 ]
