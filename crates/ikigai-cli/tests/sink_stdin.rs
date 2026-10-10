@@ -42,6 +42,9 @@ struct Ran {
 /// Run `ikigai -c <command>` with a piped stdin, hand the write end to `feed`, and reap the
 /// child on a thread so a hang becomes a failed deadline rather than a stuck test.
 fn run(home: &Path, command: &str, feed: impl FnOnce(std::process::ChildStdin)) -> Ran {
+    // Native-only: a test of the host binary, never built for wasm; the wall clock is what
+    // the deadline is about. Bound to a `let` so the attribute has a statement to sit on.
+    #[allow(clippy::disallowed_methods)]
     let started = Instant::now();
     let mut child = Command::new(env!("CARGO_BIN_EXE_ikigai"))
         .args(["-c", command])
