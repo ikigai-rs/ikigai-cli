@@ -68,51 +68,23 @@ fn tools_list(kernel: &Kernel, capability: &Capability, filter: &ToolFilter) -> 
         capability: Some(capability),
         ..Default::default()
     };
-    // Group the manifold rows by projected tool name: MCP clients key on the
-    // name, so same-named rows — a namespace listed by both a fronted mount and
-    // the local space (`--override`/`--prefer`), or one endpoint bound once per
-    // configured root (browse) — must collapse to ONE tool without losing
-    // reach. Identical patterns collapse by precedence (resolution serves the
-    // first); patterns that differ come back as synthesized selector arguments
-    // in the input schema (see [`crate::collapse`]), so every row stays
-    // addressable by call.
-    let mut order: Vec<String> = Vec::new();
-    let mut groups: std::collections::BTreeMap<String, Vec<ikigai_core::ActionMatch>> =
-        std::collections::BTreeMap::new();
-    for m in kernel.select_actions(&query) {
-        // A name this projection cannot certify is not offered. Silence would be the
-        // wrong answer twice over — the tool would be missing with no reason given, and
-        // an over-long name reaching a client rejects the ENTIRE list, not the one tool
-        // — so the reason goes to stderr, which is the stdio server's log channel.
-        let name = match crate::checked_tool_name(&m.id, m.verb) {
-            Ok(name) => name,
-            Err(reason) => {
-                eprintln!("ikigai-mcp: not projected as a tool — {reason}");
-                continue;
-            }
-        };
-        if !groups.contains_key(&name) {
-            order.push(name.clone());
-        }
-        groups.entry(name).or_default().push(m);
-    }
     let mut tools = Vec::new();
-    for name in order {
-        if !filter.allows(&name) {
+    for group in tool_groups(kernel.select_actions(&query), true) {
+        if !filter.allows(&group.base) {
             continue;
         }
-        let rows = &groups[&name];
-        // ★ The collapse above is a collapse of ONE endpoint bound many ways. Two
-        // DIFFERENT ids landing on one name is a different thing entirely: the name is
-        // the identity an MCP client calls by, so serving it would route by selection
-        // precedence rather than by what the caller asked for. Refuse instead — an
-        // ambiguous name is not a usable tool, and a silent merge is the one outcome a
-        // caller cannot detect. See [`crate::distinct_ids`].
-        let ids = crate::distinct_ids(rows.iter().map(|m| m.id.as_str()));
-        if ids.len() > 1 {
+        let rows = &group.rows;
+        // ★ The collapse is a collapse of ONE endpoint bound many ways. Two DIFFERENT ids
+        // landing on one name is a different thing entirely: the name is the identity an
+        // MCP client calls by, so serving it would route by selection precedence rather
+        // than by what the caller asked for. Refuse instead — an ambiguous name is not a
+        // usable tool, and a silent merge is the one outcome a caller cannot detect. See
+        // [`crate::distinct_ids`].
+        if let Some(ids) = &group.ambiguous {
             eprintln!(
-                "ikigai-mcp: `{name}` is claimed by {} endpoint ids that differ only in \
+                "ikigai-mcp: `{}` is claimed by {} endpoint ids that differ only in \
                  punctuation ({}) — not projected; rename one of them",
+                group.name,
                 ids.len(),
                 ids.join(", ")
             );
@@ -133,11 +105,139 @@ fn tools_list(kernel: &Kernel, capability: &Capability, filter: &ToolFilter) -> 
         };
         let mut tool = action_to_tool(&description, &action);
         let patterns: Vec<String> = rows.iter().map(|m| m.endpoint.clone()).collect();
+        if group.name != group.base {
+            // A second contract under one id: named apart, and SAID to be apart, so a model
+            // choosing between the two reads why there are two.
+            tool["name"] = json!(group.name);
+            let summary = tool["description"].as_str().unwrap_or_default().to_string();
+            tool["description"] = json!(format!(
+                "{summary} [a different contract for `{}` than the tool `{}`; served at {}]",
+                rows[0].id,
+                group.base,
+                patterns.join(", ")
+            ));
+        }
         let declared: Vec<String> = action.inputs.iter().map(|i| i.name.clone()).collect();
         crate::add_synthesized(&mut tool, &crate::collapse(&patterns, &declared));
         tools.push(tool);
     }
     json!({ "tools": tools })
+}
+
+/// One projected tool: the name a client calls, and the manifold rows behind it.
+struct ToolGroup {
+    /// The tool's name: `{id}__{verb}` for an id's first contract, `{id}-{digest}__{verb}`
+    /// for every other contract under the same id and verb (see [`tool_groups`]).
+    name: String,
+    /// `{id}__{verb}` — what a [`ToolFilter`](crate::ToolFilter) is matched against, so
+    /// hiding an endpoint hides every contract it is served under.
+    base: String,
+    /// The rows, all of ONE contract, in selection order.
+    rows: Vec<ikigai_core::ActionMatch>,
+    /// Set when two DIFFERENT ids sanitize to one base name: listed nowhere, routed nowhere.
+    ambiguous: Option<Vec<String>>,
+}
+
+/// Group the manifold's rows into tools — ONE function, run by `tools/list` to project and by
+/// `tools/call` to route, so what a client is shown is exactly what routes.
+///
+/// Rows group first by the projected name (`{id}__{verb}`): MCP clients key on the name, so
+/// same-named rows — a namespace listed by both a fronted mount and the local space
+/// (`--override`/`--prefer`), or one endpoint bound once per configured root (browse) —
+/// collapse to ONE tool without losing reach. Identical patterns collapse by precedence
+/// (resolution serves the first); patterns that differ come back as synthesized selector
+/// arguments in the input schema (see [`crate::collapse`]), so every row stays addressable.
+///
+/// ★ Then by CONTRACT (ledger #948). An id is not unique in a kernel: a mounted peer's
+/// `toUpper` can declare another capability or another input than the local one, and core
+/// 0.1.91 content-addresses contracts so the two never merge. Grouping by name alone took
+/// the schema from the first row, so the peer's copy was listed under the local contract and
+/// a call using the peer's extra input was refused as an unknown argument — unreachable. So
+/// the first contract (selection order) keeps the plain name, and each further contract gets
+/// its own tool, `{id}-{first 8 hex of its digest}__{verb}`: stable while the contract is,
+/// and different exactly when the contract is.
+///
+/// `report` sends the reason a row is not projected to stderr (the stdio server's log
+/// channel); `tools/call` regroups silently.
+fn tool_groups(matches: Vec<ikigai_core::ActionMatch>, report: bool) -> Vec<ToolGroup> {
+    let skip = |reason: String| {
+        if report {
+            eprintln!("ikigai-mcp: not projected as a tool — {reason}");
+        }
+    };
+    let mut by_base: Vec<(String, Vec<ikigai_core::ActionMatch>)> = Vec::new();
+    for m in matches {
+        // A name this projection cannot certify is not offered. Silence would be the
+        // wrong answer twice over — the tool would be missing with no reason given, and
+        // an over-long name reaching a client rejects the ENTIRE list, not the one tool.
+        let base = match crate::checked_tool_name(&m.id, m.verb) {
+            Ok(name) => name,
+            Err(reason) => {
+                skip(reason);
+                continue;
+            }
+        };
+        match by_base.iter_mut().find(|(b, _)| *b == base) {
+            Some((_, rows)) => rows.push(m),
+            None => by_base.push((base, vec![m])),
+        }
+    }
+    let mut groups: Vec<ToolGroup> = Vec::new();
+    for (base, rows) in by_base {
+        let ids = crate::distinct_ids(rows.iter().map(|m| m.id.as_str()));
+        if ids.len() > 1 {
+            groups.push(ToolGroup {
+                name: base.clone(),
+                base,
+                rows,
+                ambiguous: Some(ids),
+            });
+            continue;
+        }
+        let mut by_contract: Vec<(String, Vec<ikigai_core::ActionMatch>)> = Vec::new();
+        for m in rows {
+            match by_contract.iter_mut().find(|(c, _)| *c == m.action) {
+                Some((_, rows)) => rows.push(m),
+                None => by_contract.push((m.action.clone(), vec![m])),
+            }
+        }
+        for (i, (contract, rows)) in by_contract.into_iter().enumerate() {
+            let name = if i == 0 {
+                base.clone()
+            } else {
+                let Some(digest) = ikigai_core::parse_contract_iri(&contract)
+                    .and_then(|_| contract.rsplit_once(":b3:"))
+                    .and_then(|(_, hex)| hex.get(..8))
+                else {
+                    skip(format!(
+                        "a second `{base}` contract `{contract}` is not content-addressed, so \
+                         it has no name to be listed under"
+                    ));
+                    continue;
+                };
+                match crate::checked_tool_name(&format!("{}-{digest}", rows[0].id), rows[0].verb) {
+                    Ok(name) => name,
+                    Err(reason) => {
+                        skip(reason);
+                        continue;
+                    }
+                }
+            };
+            // A qualified name that some OTHER endpoint already projects to would make the
+            // call route by list order; the later one is not offered.
+            if groups.iter().any(|g| g.name == name) {
+                skip(format!("`{name}` is already the name of another tool"));
+                continue;
+            }
+            groups.push(ToolGroup {
+                name,
+                base: base.clone(),
+                rows,
+                ambiguous: None,
+            });
+        }
+    }
+    groups
 }
 
 /// Invoke one tool. Re-checks the grant (the tool must be in the manifold),
@@ -172,16 +272,11 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
         capability: Some(capability),
         ..Default::default()
     };
-    // Match on the sanitized id: `id` from the tool name is already in
-    // `sanitize_id` form, so sanitize each candidate the same way (a URI-shaped
-    // id like `urn:llm:config` projects to `urn_llm_config`). ALL matching rows
-    // are kept — one tool may front many bound rows (see [`crate::collapse`]).
-    let rows: Vec<ikigai_core::ActionMatch> = kernel
-        .select_actions(&query)
-        .into_iter()
-        .filter(|m| crate::sanitize_id(&m.id) == id && m.verb == verb)
-        .collect();
-    if rows.is_empty() {
+    // Regroup exactly as `tools/list` projected (see [`tool_groups`]): the name picks ONE
+    // group — one contract, all of its rows (one tool may front many bound rows, see
+    // [`crate::collapse`]).
+    let groups = tool_groups(kernel.select_actions(&query), false);
+    let Some(group) = groups.into_iter().find(|g| g.name == name) else {
         // Absence has two causes and the distinction IS the diagnosis: re-select
         // without the capability filter to tell them apart. Rows that exist
         // unrestricted were withheld by the grant; rows gone even unrestricted
@@ -200,10 +295,12 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
         // both answers reveal the same thing. Affordance = authorization means a
         // denial should ideally be unreachable; this is a diagnosis for a caller we
         // trust, not a hint for one we don't.
-        let offered = kernel
-            .select_actions(&ikigai_core::ActionQuery::default())
-            .into_iter()
-            .any(|m| crate::sanitize_id(&m.id) == id && m.verb == verb);
+        let offered = tool_groups(
+            kernel.select_actions(&ikigai_core::ActionQuery::default()),
+            false,
+        )
+        .iter()
+        .any(|g| g.name == name);
         return tool_error(if offered {
             format!("tool `{name}` is not available under this capability")
         } else {
@@ -212,14 +309,13 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
                  (a mounted peer may be unreachable, or the tool list is stale)"
             )
         });
-    }
+    };
 
     // The same ambiguity `tools/list` refuses to project, refused again on the way in —
     // both sides compute it from the rows, so a name that is not offered is not routed
     // either. A loud error here is strictly better than a silent pick by precedence: the
     // caller named a tool, and two endpoints answer to that name.
-    let ids = crate::distinct_ids(rows.iter().map(|m| m.id.as_str()));
-    if ids.len() > 1 {
+    if let Some(ids) = &group.ambiguous {
         return tool_error(format!(
             "`{name}` is ambiguous — {} endpoint ids project to it ({}); it is not offered \
              in tools/list and cannot be routed. Rename one of them.",
@@ -227,6 +323,7 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
             ids.join(", ")
         ));
     }
+    let rows = group.rows;
 
     // Exact IRI or URI-template pattern alike — the contract comes back either
     // way; the substituted target is IRI-checked below, after binding args land.
@@ -1207,5 +1304,137 @@ mod tests {
         let text = resp["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("`message`"), "{text}");
         assert!(!text.contains("not a valid IRI"), "{text}");
+    }
+}
+
+/// Ledger #948 through the MCP face: a local `toUpper` and a peer's mounted at `urn:narrow:`
+/// with a DIFFERENT contract (an extra optional `locale`). Ported from the hub's
+/// reproduction, which showed ONE tool carrying the local schema, so the peer's copy was
+/// unreachable: a call with `locale` was refused as an unknown argument.
+#[cfg(test)]
+mod manifold_identity_948 {
+    use super::*;
+    use ikigai_core::{
+        ActionSpec, ArgSpec, Description, EndpointSpace, Exact, FnEndpoint, ReprType,
+        Representation, Verb,
+    };
+    use std::sync::Arc;
+
+    fn upper(tag: &'static str, extra: bool) -> FnEndpoint {
+        let mut d = Description::new("toUpper")
+            .verb(Verb::Source)
+            .input(ArgSpec::new("in"));
+        if extra {
+            d = d.input(ArgSpec::new("locale").optional());
+        }
+        FnEndpoint::new("toUpper", move |_| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                tag.as_bytes().to_vec(),
+            ))
+        })
+        .with_description(d)
+    }
+
+    fn call(k: &Kernel, tool: &str, args: Value) -> Value {
+        let msg = json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":tool,"arguments":args}});
+        handle(k, &Capability::root(), &ToolFilter::default(), &msg).unwrap()["result"].clone()
+    }
+
+    fn text(result: &Value) -> &str {
+        result["content"][0]["text"].as_str().unwrap()
+    }
+
+    #[test]
+    fn each_contract_under_one_id_is_its_own_reachable_tool() {
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:iki:fn:toUpper"), upper("local", false))
+            .bind(Exact::new("urn:narrow:iki:fn:toUpper"), upper("peer", true));
+        let k = Kernel::new(Arc::new(space));
+        let list = handle(
+            &k,
+            &Capability::root(),
+            &ToolFilter::default(),
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .unwrap();
+        let tools: Vec<&Value> = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["name"].as_str().unwrap().starts_with("toUpper"))
+            .collect();
+        assert_eq!(tools.len(), 2, "one tool per contract: {tools:?}");
+
+        // The first contract keeps the plain name and ITS schema.
+        assert_eq!(tools[0]["name"], "toUpper__source");
+        assert!(tools[0]["inputSchema"]["properties"]
+            .get("locale")
+            .is_none());
+        // The peer's is named by its digest, and carries ITS schema.
+        let peer_contract = ActionSpec::new(Verb::Source)
+            .input(ArgSpec::new("in"))
+            .input(ArgSpec::new("locale").optional())
+            .contract_iri("toUpper");
+        let digest = &peer_contract.rsplit_once(":b3:").unwrap().1[..8];
+        let peer_name = format!("toUpper-{digest}__source");
+        assert_eq!(tools[1]["name"], peer_name.as_str());
+        assert!(tools[1]["inputSchema"]["properties"]
+            .get("locale")
+            .is_some());
+        assert!(
+            tools[1]["description"]
+                .as_str()
+                .unwrap()
+                .contains("urn:narrow:iki:fn:toUpper"),
+            "{}",
+            tools[1]
+        );
+
+        // Both are reachable, each under its own contract.
+        let local = call(&k, "toUpper__source", json!({"in":"x"}));
+        assert_eq!(text(&local), "local", "{local}");
+        let peer = call(&k, &peer_name, json!({"in":"x","locale":"tr"}));
+        assert_eq!(text(&peer), "peer", "{peer}");
+
+        // The local contract still refuses the peer's input, and the report names the
+        // local CONTRACT, not the id both copies share.
+        let refused = call(&k, "toUpper__source", json!({"in":"x","locale":"tr"}));
+        assert_eq!(refused["isError"], true, "{refused}");
+        let local_contract = ActionSpec::new(Verb::Source)
+            .input(ArgSpec::new("in"))
+            .contract_iri("toUpper");
+        assert!(
+            text(&refused).contains(&format!("sh:focusNode <{local_contract}>")),
+            "{refused}"
+        );
+    }
+
+    /// Identical contracts at two doors stay ONE tool, as before #948.
+    #[test]
+    fn identical_contracts_at_two_doors_stay_one_tool() {
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:iki:fn:toUpper"), upper("local", false))
+            .bind(
+                Exact::new("urn:narrow:iki:fn:toUpper"),
+                upper("peer", false),
+            );
+        let k = Kernel::new(Arc::new(space));
+        let list = handle(
+            &k,
+            &Capability::root(),
+            &ToolFilter::default(),
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .unwrap();
+        let names: Vec<&str> = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .filter(|n| n.starts_with("toUpper"))
+            .collect();
+        assert_eq!(names, ["toUpper__source"]);
     }
 }

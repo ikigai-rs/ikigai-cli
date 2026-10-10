@@ -117,7 +117,7 @@ pub fn checked_tool_name(id: &str, verb: Verb) -> Result<String, String> {
 /// The distinct endpoint ids behind one projected tool name, in sorted order.
 ///
 /// ★★ [`sanitize_id`] is LOSSY, and its result is used as an IDENTITY KEY: `tools/list`
-/// groups rows by tool name and `tools/call` keeps every row whose sanitized id matches.
+/// and `tools/call` both group rows by the tool name it builds (then by contract).
 /// Collapsing many rows of ONE endpoint is deliberate and correct — a federated mount
 /// lists a namespace twice, browse binds one endpoint per configured root. Collapsing two
 /// DIFFERENT endpoints is not: `urn:llm:config` and `urn.llm.config` both sanitize to
@@ -658,16 +658,12 @@ pub fn validate_arguments(
     let empty = Map::new();
     let args = arguments.as_object().unwrap_or(&empty);
 
-    let verb = format!("{:?}", action.verb).to_lowercase();
-    let action_iri = format!("urn:ikigai:endpoint:{}:action:{verb}", description.id);
-    // Explicit actions own action-scoped input nodes; synthesized ones reference
-    // the endpoint-level nodes — mirror the projection so resultPath joins.
-    let explicit = description.actions.iter().any(|a| a.verb == action.verb);
-    let input_ns = if explicit {
-        format!("{action_iri}:input:")
-    } else {
-        format!("urn:ikigai:endpoint:{}:input:", description.id)
-    };
+    // The focus node is the CONTRACT checked — content-addressed, so a mounted copy with a
+    // different contract is a different node — and every contract owns its input nodes
+    // under its own IRI, explicit and synthesized alike. Exactly what `urn:kernel:validate`
+    // and the catalog mint (core 0.1.91, ledger #948), so resultPath joins to the catalog.
+    let action_iri = action.contract_iri(&description.id);
+    let input_ns = format!("{action_iri}:input:");
 
     let mut violations: Vec<(String, Option<String>)> = Vec::new();
     for input in &action.inputs {
@@ -779,7 +775,18 @@ mod tests {
             report.contains("not an accepted value of `count`"),
             "{report}"
         );
-        assert!(report.contains("wc:input:count"), "{report}");
+        // Joined to the CONTRACT the catalog and `urn:kernel:validate` name (core 0.1.91):
+        // the content-addressed node, and its own input node beneath it.
+        let contract = action.contract_iri("wc");
+        assert!(
+            report.contains(&format!("sh:focusNode <{contract}>")),
+            "{report}"
+        );
+        assert!(
+            report.contains(&format!("sh:resultPath <{contract}:input:count>")),
+            "{report}"
+        );
+        assert!(!report.contains("urn:ikigai:endpoint:"), "{report}");
 
         // Unknown argument.
         let report = validate_arguments(&d, action, &json!({ "bogus": "x" })).unwrap();
