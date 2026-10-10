@@ -33,7 +33,10 @@ description = "The time transport: originates kernel resource-requests on a time
 # ceiling instead of setting the fire authority, and the three `urn:time:*` actions declare
 # `urn:cap:time:{schedule,cancel,read}`, which the kernel enforces. Source-breaking for every
 # caller of `schedule`, and behavior-breaking for any attenuated caller of `urn:time:*`.
-version = "0.4.1"
+# 0.4.2 — a tick keeps the PRINCIPAL of the capability that scheduled it (ledger #1077): core
+# 0.1.93's clamp keeps the ceiling's principal, so the recorded one is re-minted after the clamp.
+# No API change.
+version = "0.4.2"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
