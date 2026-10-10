@@ -3226,6 +3226,7 @@ dependencies = [
  "ikigai-core",
  "ikigai-engine",
  "ikigai-resolve",
+ "ikigai-store",
  "notify",
  "oxigraph",
  "oxiri 0.2.11",
