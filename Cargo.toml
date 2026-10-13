@@ -104,6 +104,9 @@ members = ["crates/*"]
 #   validator implements `sh:closed` and `sh:ignoredProperties`) and `ikigai-shacl` "0.3.6"
 #   (`futures` optional). This workspace keeps `ikigai-shacl`'s defaults, so `urn:shacl:validate`
 #   and the layer door's admission both validate with rudof, by feature unification, as before.
+# - `ikigai-embedded`'s `store` module docs named two private items (`STORE_SPACE`, `refusal`) as
+#   intra-doc links, which `cargo doc --all-features` under `-D warnings` refuses
+#   (`private_intra_doc_links`); they are code spans now. Docs only.
 #
 # 0.1.60 was AN HTTP DOOR ANSWERS `Expect: 100-continue`.
 # Stacked on 0.1.59, which was already on crates.io; nothing unpublished sat beneath it.

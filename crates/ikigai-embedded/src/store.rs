@@ -64,7 +64,7 @@
 //! `DurableStore::open` on the same path **is refused inside one process too** (RocksDB
 //! keeps its own registry; POSIX advisory locks would not have caught it). This host
 //! builds more than one kernel per process in several modes — and its own test binaries
-//! build a dozen — so the open is memoised in [`STORE_SPACE`] and every kernel gets an
+//! build a dozen — so the open is memoised in `STORE_SPACE` and every kernel gets an
 //! `Arc` of the one space. Binding `ikigai_store::space(DurableStore::open(…))` per
 //! kernel, which is what the crate's README composition shows, panics on the second
 //! kernel.
@@ -80,7 +80,7 @@
 //!   in topology (b) a held directory is not an event but every command forever, and a
 //!   host that printed three lines on each one would be teaching its operator to ignore
 //!   stderr. If the lines are missing, or cover only one of the two families, the operator
-//!   gets the sentence that names what is missing. See [`refusal`].
+//!   gets the sentence that names what is missing. See `refusal`.
 //! * **Anything else** — an unwritable path, a `store.toml` that cannot be parsed, a
 //!   config home that does not exist — is a misconfiguration, and it **panics**. A host
 //!   that started anyway would be one whose durable store silently is not there.
