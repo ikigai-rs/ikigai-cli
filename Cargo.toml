@@ -1173,7 +1173,14 @@ ikigai-jsonld = "0.2.1" # 0.2.1 is a SECURITY floor: JSON-LD nesting past 64 is 
 # operators could not be narrowed to before matching fell through to the LLM residual.
 # SHACL validation (urn:shacl:validate) — rudof's validator is native-only (gated off wasm),
 # so it's linked natively here; the browser serves the same resource via shacl-engine (JS).
-ikigai-shacl = "0.3.4" # 0.3.4 = a SECURITY floor (ledger #1326): a recursive shape over a long chain in the
+ikigai-shacl = "0.3.6" # 0.3.6: `futures` is optional (on only under `module`), and the rudof-free subset
+# gains `sh:closed` and `sh:ignoredProperties`. Taken because `ikigai-layers` 0.2.9 asks for it; nothing in
+# this workspace calls the subset. DEFAULT FEATURES STAY ON, BY CHOICE: `urn:shacl:validate` on a cli host
+# is rudof, and since the layers crate takes this crate with default features off, cargo's feature
+# unification makes the layer door's admission validate with rudof too. One validator per host. The subset
+# would refuse nothing today (every shipped layer's shapes fit it); dropping rudof here is a separate,
+# deliberate decision, not a side effect of a pin. `"0.3.6"` is `<0.4.0`.
+# Beneath it, still true: 0.3.4 = a SECURITY floor (ledger #1326): a recursive shape over a long chain in the
 # data overflowed the stack and ABORTED the host; the edge door's `layers-door-check` refuses anything older.
 # Beneath it, still true: 0.3.3 = validation runs on a SIZED pool (ledger #1121, #1102): rudof validated on
 # rayon's default 2 MiB worker threads, where a deep caller query can overflow the stack, and a
@@ -1575,8 +1582,12 @@ ikigai-ledger = "0.11.0"
 # the JSON-LD face gives it as an array even with one value; 0.2.7's compacted one argument to a
 # bare string. Participants of a gateway between kernels rely on the array. `tests/layers_https.rs`
 # installs that context into its config home; a deployed config home carries its OWN copy of the
-# file, which is what a running host reads. `"0.2.8"` is `<0.3.0`.
-ikigai-layers = "0.2.8"
+# file, which is what a running host reads.
+# ⚠ …and 0.2.9 takes `ikigai-shacl` with default features OFF (no rudof of its own; it asks for
+# `"0.3.6"`), and its validation subset implements `sh:closed` and `sh:ignoredProperties`. In this
+# workspace that changes nothing a request sees: `ikigai-shacl` above keeps its defaults, so feature
+# unification links rudof and admission validates with it, exactly as under 0.2.8. `"0.2.9"` is `<0.3.0`.
+ikigai-layers = "0.2.9"
 # ── Intra-workspace siblings: LOCKSTEP pins, not floors ───────────────────────
 # The seventeen members that take `version.workspace = true` are released TOGETHER, at one
 # version, always. So every sibling pin below states the CURRENT workspace version rather
