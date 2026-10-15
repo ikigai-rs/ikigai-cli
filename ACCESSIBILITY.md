@@ -9,7 +9,7 @@ how to report a barrier. It is not a conformance claim. Adapted from the
 | Target | WCAG 2.2 Level AA for the HTML this repository writes |
 | Status | Evaluation in progress. No conformance claim. |
 | Owner | the maintainers of this repository |
-| Report a barrier | [a GitHub issue](https://github.com/ikigai-rs/ikigai-cli/issues/new); anything security-sensitive through [private vulnerability reporting](https://github.com/ikigai-rs/ikigai-cli/security/advisories/new) |
+| Report a barrier | [a GitHub issue](https://github.com/ikigai-rs/ikigai-cli/issues/new?labels=accessibility) with the `accessibility` label; anything security-sensitive through [private vulnerability reporting](https://github.com/ikigai-rs/ikigai-cli/security/advisories/new) |
 | Last reviewed | 2026-10-15 |
 
 ## What it emits that people read
@@ -82,6 +82,7 @@ Found by reading the source on 2026-10-15, not by testing:
 |---|---|
 | 2026-10-15 | First version ([PR 521](https://github.com/ikigai-rs/ikigai-cli/pull/521)). |
 | 2026-10-15 | The embedded host's pages and the intake's redirect page gain `<html lang="en">` and a `<main>`; the passkey status lines become live regions; the full-screen REPL honors `NO_COLOR`. Three known limitations removed ([PR 522](https://github.com/ikigai-rs/ikigai-cli/pull/522)). |
+| 2026-10-15 | Reports use the `accessibility` issue label instead of a word in the title; `AGENTS.md` (with `CLAUDE.md` a link to it) asks for this file to be read before any change to rendered output. |
 
 ## Contributing
 
@@ -91,8 +92,9 @@ the pull request what was tested, with what, and what was not.
 
 ## Reporting a barrier
 
-[Open an issue](https://github.com/ikigai-rs/ikigai-cli/issues/new) with "accessibility" in its
-title: what you were doing, what happened, and your terminal or browser and any assistive
+[Open an issue](https://github.com/ikigai-rs/ikigai-cli/issues/new?labels=accessibility) with the
+`accessibility` label (the link sets it when GitHub lets you add labels; otherwise a maintainer
+adds it): what you were doing, what happened, and your terminal or browser and any assistive
 technology, if you are comfortable sharing them. Anything security-sensitive goes through
 [private vulnerability reporting](https://github.com/ikigai-rs/ikigai-cli/security/advisories/new).
 **We acknowledge a report within 7 days**, and promise nothing further.
