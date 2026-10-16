@@ -299,6 +299,33 @@ pub const DEFAULT_DESCRIBE_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// change (ledger [#1335](http://localhost:1060/l/default/item/1335)).
 pub const CANCELED: u32 = 0x1335;
 
+/// How many calls a door answers AT ONCE on one connection (ledger
+/// [#1692](http://localhost:1060/l/default/item/1692)).
+///
+/// ★ Every call is its own bidirectional stream, and a mount holds ONE connection to its peer
+/// for everything its host asks of it. Through cli 0.1.63 a door answered a connection's streams
+/// one at a time, so a long poll (`urn:layers:feed … wait=50`) held every other call on that
+/// mount past its deadline; gonk's Layers page had to give its follower a connection of its
+/// own. Now each call runs as its own task, up to this many at once per connection.
+///
+/// **Past the bound a call is REFUSED at once**, as a transient
+/// [`Unavailable`](Error::Unavailable) naming the bound, never queued: a queue at the door
+/// would be the same silent stall with a longer fuse, while a refusal tells the caller now, and
+/// a reliability overlay may retry it. The bound frees as calls finish.
+///
+/// Why sixteen: a connection belongs to ONE enrolled client (mTLS), and what one client runs
+/// at once is a handful of long polls (a follower per layer it watches) beside its ordinary
+/// calls, well under it. It is a per-connection bound, not the door's: the door still caps
+/// neither connections nor calls across them, and each call in progress takes a thread for as
+/// long as it runs (`block_in_place`), as it always did, drawn from the door runtime's
+/// blocking pool (tokio's default, 512 threads) that every connection shares. What it costs: a
+/// connection may now hold sixteen requests in memory at once, each under the per-message
+/// bound (64 MiB), where it used to hold one. Above it, QUIC's own stream limit (quinn's
+/// default, 100 streams open at once per connection) still caps how many calls a client can
+/// have open, refused ones included; past THAT the client waits for a stream, under its own
+/// call deadline.
+pub const MAX_CALLS_PER_CONNECTION: usize = 16;
+
 pub fn serve(
     kernel: Kernel,
     addr: SocketAddr,
@@ -345,10 +372,13 @@ pub fn serve_with(
 /// connection (a daemon's standing mount, an MCP server) may never make one. The bound
 /// turns "eventually, if the client reconnects" into "within `max_age`".
 ///
-/// What the client sees: nothing, normally. The bound is checked BETWEEN calls (calls on a
-/// connection are answered one at a time), so a call in progress when it passes finishes
-/// and its reply is delivered (waited for up to five seconds) before the door closes with
-/// code 3; a connection that is idle when it passes is closed then. The resolver from
+/// What the client sees: nothing, normally. When the bound passes the door stops accepting
+/// calls on the connection; the calls already in progress (up to [`MAX_CALLS_PER_CONNECTION`])
+/// finish and their replies are delivered (each waited for up to five seconds) before the
+/// door closes with code 3; a connection that is idle when it passes is closed then. A call
+/// the client opens while those finish is turned away at once (its stream reset under code
+/// 3), so the resolver redials rather than wait behind them; a read is replayed on the new
+/// connection, a Sink or Delete is not (it did not run). The resolver from
 /// [`connect_with`] heals onto a new connection at its next call, minted afresh — refused,
 /// if the client was revoked. ⚠ One race remains: a call the client opens in the instant
 /// the door closes fails as a lost reply, and a Sink or Delete is then NOT replayed (the
@@ -457,7 +487,7 @@ pub fn serve_shared_on(
                     // on its next connection rather than at the end of some TTL.
                     match minter(&PeerIdentity::of(&connection)) {
                         Some(session) => {
-                            serve_connection_aged(&kernel, connection, &session, max_age).await
+                            serve_connection_aged(kernel, connection, session, max_age).await
                         }
                         // Authenticated but not authorized: close rather than serve. The
                         // alternative — falling back to a shared ceiling — is how a
@@ -598,16 +628,21 @@ fn peer_cert_id(connection: &quinn::Connection) -> String {
 /// (The unbounded form, which this crate's tests drive directly; a door goes through
 /// [`serve_connection_aged`].)
 #[cfg(test)]
-async fn serve_connection(kernel: &Kernel, connection: quinn::Connection, session: &Session) {
-    serve_connection_aged(kernel, connection, session, None).await;
+async fn serve_connection(kernel: &Arc<Kernel>, connection: quinn::Connection, session: Session) {
+    serve_connection_aged(Arc::clone(kernel), connection, session, None).await;
 }
 
 /// [`serve_connection`], closing the connection once it is `max_age` old — see
 /// [`serve_bounded`] for when, and what a client sees.
+///
+/// Each call is answered by its own task ([`answer`]), up to [`MAX_CALLS_PER_CONNECTION`] at
+/// once; past that a call is refused ([`refuse`]). This loop only accepts streams, so a long
+/// call never holds up the next one on the same connection (ledger
+/// [#1692](http://localhost:1060/l/default/item/1692)).
 async fn serve_connection_aged(
-    kernel: &Kernel,
+    kernel: Arc<Kernel>,
     connection: quinn::Connection,
-    session: &Session,
+    session: Session,
     max_age: Option<std::time::Duration>,
 ) {
     let Some(version) = negotiated_version(&connection) else {
@@ -617,46 +652,110 @@ async fn serve_connection_aged(
         );
         return;
     };
+    let session = Arc::new(session);
     // tokio's clock, not `std::time::Instant` (banned workspace-wide for wasm's sake): this
     // crate is native-only, and the deadline is compared only with tokio's own timers.
     let deadline = max_age.map(|age| tokio::time::Instant::now() + age);
-    let aged = |connection: &quinn::Connection| {
-        connection.close(
-            AGED.into(),
-            b"this door bounds connection age; reconnect to continue",
-        )
-    };
+    // One permit per call in progress. A call holds its permit until its reply is written
+    // (and, past the age bound, delivered), so taking EVERY permit is how the age bound
+    // waits for the calls in progress to finish.
+    let in_flight = Arc::new(tokio::sync::Semaphore::new(MAX_CALLS_PER_CONNECTION));
     loop {
         let next = match deadline {
             Some(at) => match tokio::time::timeout_at(at, connection.accept_bi()).await {
                 Ok(next) => next,
-                // Idle when the bound passed: nothing is in flight, so close now.
-                Err(_elapsed) => return aged(&connection),
+                Err(_elapsed) => break,
             },
             None => connection.accept_bi().await,
         };
-        let Ok((mut send, mut recv)) = next else {
+        let Ok((send, recv)) = next else {
             return;
         };
-        let bytes = match recv.read_to_end(MAX_MESSAGE).await {
-            Ok(bytes) => bytes,
-            Err(_) => return,
-        };
-        let reply = match decode::<Call>(&bytes) {
-            Ok(call) => dispatch_off_worker(kernel, call, session),
-            Err(e) => Reply::ErrorTyped(ikigai_wire::WireError::Endpoint(format!(
-                "malformed call: {e}"
-            ))),
-        };
-        if let Ok(out) = encode(&reply.for_peer(version)) {
-            let _ = send.write_all(&out).await;
-            let _ = send.finish();
+        match Arc::clone(&in_flight).try_acquire_owned() {
+            Ok(permit) => {
+                let kernel = Arc::clone(&kernel);
+                let session = Arc::clone(&session);
+                tokio::spawn(async move {
+                    answer(&kernel, &session, send, recv, version, deadline).await;
+                    drop(permit);
+                });
+            }
+            Err(_) => {
+                tokio::spawn(refuse(send, recv, version));
+            }
         }
-        // The bound passed while this call ran: let its reply land, then close.
-        if deadline.is_some_and(|at| tokio::time::Instant::now() >= at) {
-            let _ = tokio::time::timeout(REPLY_GRACE, send.stopped()).await;
-            return aged(&connection);
+    }
+    // The bound passed: run nothing more, let the calls in progress finish and their replies
+    // land (idle, this returns at once), then close. Meanwhile a call opened on this connection
+    // is turned away at once, both halves reset under code 3, rather than left unaccepted
+    // behind a long call (a long poll) past its own deadline: its client heals onto a new
+    // connection, where a read is replayed and a Sink or Delete fails as a transient (not run).
+    let turn_away = tokio::spawn({
+        let connection = connection.clone();
+        async move {
+            while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+                let _ = send.reset(AGED.into());
+                let _ = recv.stop(AGED.into());
+            }
         }
+    });
+    let all = u32::try_from(MAX_CALLS_PER_CONNECTION).unwrap_or(u32::MAX);
+    let _ = in_flight.acquire_many(all).await;
+    connection.close(
+        AGED.into(),
+        b"this door bounds connection age; reconnect to continue",
+    );
+    turn_away.abort();
+}
+
+/// Answer ONE call: read it (at most [`MAX_MESSAGE`]), resolve it under the connection's
+/// session off the runtime's workers ([`dispatch_off_worker`]), and write the reply at the
+/// connection's wire `version`. A stream that fails or overruns the message bound while being
+/// read gets no reply; that costs this call and never the connection's other calls.
+async fn answer(
+    kernel: &Kernel,
+    session: &Session,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    version: u32,
+    deadline: Option<tokio::time::Instant>,
+) {
+    let Ok(bytes) = recv.read_to_end(MAX_MESSAGE).await else {
+        return;
+    };
+    let reply = match decode::<Call>(&bytes) {
+        Ok(call) => dispatch_off_worker(kernel, call, session),
+        Err(e) => Reply::ErrorTyped(ikigai_wire::WireError::Endpoint(format!(
+            "malformed call: {e}"
+        ))),
+    };
+    if let Ok(out) = encode(&reply.for_peer(version)) {
+        let _ = send.write_all(&out).await;
+        let _ = send.finish();
+    }
+    // The age bound passed while this call ran: the door closes once every call in progress
+    // is done, so let this reply land first.
+    if deadline.is_some_and(|at| tokio::time::Instant::now() >= at) {
+        let _ = tokio::time::timeout(REPLY_GRACE, send.stopped()).await;
+    }
+}
+
+/// Refuse ONE call because its connection already has [`MAX_CALLS_PER_CONNECTION`] in
+/// progress: a transient [`Unavailable`](Error::Unavailable) naming the bound, at once. The
+/// request is read to its end first (under the same message bound), so the client sees a
+/// reply to a call it finished sending, never a stream cut off mid-write.
+async fn refuse(mut send: quinn::SendStream, mut recv: quinn::RecvStream, version: u32) {
+    if recv.read_to_end(MAX_MESSAGE).await.is_err() {
+        return;
+    }
+    let reply = Reply::ErrorTyped(ikigai_wire::WireError::Unavailable(format!(
+        "this connection already has {MAX_CALLS_PER_CONNECTION} calls in progress, the most a \
+         door answers at once on one connection; the call was not run, retry it when one \
+         finishes"
+    )));
+    if let Ok(out) = encode(&reply.for_peer(version)) {
+        let _ = send.write_all(&out).await;
+        let _ = send.finish();
     }
 }
 
@@ -1245,8 +1344,8 @@ impl QuicResolver {
                             // Dropping the round trip canceled its stream (`InFlight`). The
                             // connection answered nothing for a whole deadline: the next call
                             // redials rather than trusting it (ledger #1092), and so does not
-                            // queue behind the abandoned call on a door that serves one
-                            // connection's calls in order.
+                            // queue behind the abandoned call on a door of cli 0.1.63 or older,
+                            // which served one connection's calls in order (ledger #1692).
                             wire.stale.store(true, std::sync::atomic::Ordering::SeqCst);
                             // `Debug` keeps the unit (`300ms`, `30s`); `as_secs()` would
                             // report a sub-second bound as `0s`.
@@ -1870,7 +1969,7 @@ mod tests {
             rt.block_on(async move {
                 let incoming = endpoint.accept().await.unwrap();
                 let connection = incoming.await.unwrap();
-                serve_connection(&kernel, connection, &session).await;
+                serve_connection(&kernel, connection, session).await;
             });
         });
         let client = connect(server_addr, &client_id, &server_id.cert_pem).unwrap();
@@ -1954,7 +2053,7 @@ mod tests {
             rt.block_on(async move {
                 let incoming = endpoint.accept().await.unwrap();
                 let connection = incoming.await.unwrap();
-                serve_connection(&kernel, connection, &session).await;
+                serve_connection(&kernel, connection, session).await;
             });
         });
         let client = connect(server_addr, &client_id, &server_id.cert_pem).unwrap();
@@ -2066,7 +2165,7 @@ mod tests {
             rt.block_on(async move {
                 let incoming = endpoint.accept().await.unwrap();
                 let connection = incoming.await.unwrap();
-                serve_connection(&served, connection, &session).await;
+                serve_connection(&served, connection, session).await;
             });
         });
         let client = connect(server_addr, &client_id, &server_id.cert_pem).unwrap();
@@ -2152,7 +2251,7 @@ mod tests {
             rt.block_on(async move {
                 let incoming = endpoint.accept().await.unwrap();
                 let connection = incoming.await.unwrap();
-                serve_connection(&kernel, connection, &session).await;
+                serve_connection(&kernel, connection, session).await;
             });
         });
         let client = connect(server_addr, &client_id, &server_id.cert_pem).unwrap();
@@ -2255,7 +2354,7 @@ mod tests {
                             file_segment: String::new(),
                             principal: None,
                         };
-                        serve_connection(&kernel, connection, &session).await;
+                        serve_connection(&kernel, connection, session).await;
                     });
                 }
             });
@@ -2384,7 +2483,7 @@ mod tests {
                             return;
                         };
                         match minter(&PeerIdentity::of(&connection)) {
-                            Some(session) => serve_connection(&kernel, connection, &session).await,
+                            Some(session) => serve_connection(&kernel, connection, session).await,
                             None => connection.close(UNAUTHORIZED.into(), b"unauthorized"),
                         }
                     });
@@ -2491,7 +2590,7 @@ mod tests {
                             return;
                         };
                         match minter(&PeerIdentity::of(&connection)) {
-                            Some(session) => serve_connection(&kernel, connection, &session).await,
+                            Some(session) => serve_connection(&kernel, connection, session).await,
                             None => connection.close(UNAUTHORIZED.into(), b"unauthorized"),
                         }
                     });
@@ -2783,7 +2882,7 @@ mod tests {
                 rt.block_on(async move {
                     let incoming = endpoint.accept().await.unwrap();
                     let connection = incoming.await.unwrap();
-                    serve_connection(&kernel, connection, &session).await;
+                    serve_connection(&kernel, connection, session).await;
                 });
             })
         };
@@ -2851,7 +2950,7 @@ mod tests {
                     file_segment: String::new(),
                     principal: None,
                 };
-                serve_connection(&conflict_kernel(), connection, &session).await;
+                serve_connection(&Arc::new(conflict_kernel()), connection, session).await;
                 endpoint.wait_idle().await;
                 version
             })
@@ -3020,7 +3119,7 @@ mod reconnect_tests {
                 if let Some(incoming) = endpoint.accept().await {
                     if let Ok(connection) = incoming.await {
                         let serving = tokio::spawn(async move {
-                            serve_connection(&kernel, connection, &session).await;
+                            serve_connection(&kernel, connection, session).await;
                         });
                         match stop {
                             Some(stop) => {
@@ -3141,7 +3240,7 @@ mod runtime_reentrancy {
             rt.block_on(async move {
                 let incoming = endpoint.accept().await.unwrap();
                 let connection = incoming.await.unwrap();
-                serve_connection(&kernel, connection, &session).await;
+                serve_connection(&kernel, connection, session).await;
             });
         });
         (server_addr, client_id, server_id.cert_pem, server)
@@ -3402,7 +3501,7 @@ mod restart {
                             file_segment: String::new(),
                             principal: None,
                         };
-                        serve_connection(&kernel, connection, &session).await;
+                        serve_connection(&kernel, connection, session).await;
                     }
                 });
             }
@@ -3592,7 +3691,7 @@ mod call_deadline {
                                 file_segment: String::new(),
                                 principal: None,
                             };
-                            serve_connection(&kernel, connection, &session).await;
+                            serve_connection(&kernel, connection, session).await;
                         }
                     });
                 }
@@ -3921,7 +4020,7 @@ mod keep_alive {
                                 file_segment: String::new(),
                                 principal: None,
                             };
-                            serve_connection(&kernel, connection, &session).await;
+                            serve_connection(&kernel, connection, session).await;
                         }
                     });
                 }
