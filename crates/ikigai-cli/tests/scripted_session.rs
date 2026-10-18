@@ -15,7 +15,8 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::{Mutex, PoisonError};
 
 fn scratch(case: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("iki-sc-{}-{case}", std::process::id()));
@@ -38,13 +39,54 @@ fn ikigai(home: &Path, args: &[&str]) -> Command {
     command
 }
 
+/// Every child this file starts, and the one pipe it makes itself, is created under this lock
+/// (ledger #1626). On macOS a new pipe is not close-on-exec from birth (the flag is set by a
+/// separate call), so a child that ANOTHER test thread spawns in between inherits both ends:
+/// 481 of 3,000 children did, beside a thread making pipes in a loop. A sibling child that holds the writer of this
+/// child's stdin keeps that pipe open for as long as it lives, and an open pipe with nothing
+/// in it yet is a slow producer, never a closed empty one.
+static SPAWN: Mutex<()> = Mutex::new(());
+
+fn spawn(command: &mut Command) -> Child {
+    let _one_at_a_time = SPAWN.lock().unwrap_or_else(PoisonError::into_inner);
+    command.spawn().expect("spawn ikigai")
+}
+
 /// Spawn, write `input` to a piped stdin (then close it), and reap with `wait` (never
 /// `try_wait`: see the field guide on stderr EOF).
 fn piped(mut command: Command, input: &[u8]) -> Output {
-    let mut child = command.stdin(Stdio::piped()).spawn().expect("spawn ikigai");
+    let mut child = spawn(command.stdin(Stdio::piped()));
     let mut stdin = child.stdin.take().expect("piped stdin");
     stdin.write_all(input).expect("write stdin");
     drop(stdin);
+    child.wait_with_output().expect("reap ikigai")
+}
+
+/// Run `command` with `stdin` and reap it.
+fn run(mut command: Command, stdin: impl Into<Stdio>) -> Output {
+    spawn(command.stdin(stdin))
+        .wait_with_output()
+        .expect("reap ikigai")
+}
+
+/// Run `command` on a pipe that is ALREADY closed and empty when the child starts: the writer
+/// is dropped before the spawn, and the pipe is made under [`SPAWN`] so no sibling child holds
+/// a copy of it.
+///
+/// Not [`piped`], which closes its write end only after the spawn (ledger #1626). A child that
+/// reaches its stdin probe before that close sees an open pipe with nothing in it yet, which
+/// is a slow producer by the probe's own rule (`stdin_ended_empty` answers `false`), so it
+/// fetches the contracts and the listing reports 2 entries. The parent only has to stall for
+/// about 40 ms between the spawn and the close for that to happen: 0 of 10 runs with a 20 ms
+/// stall, 10 of 10 with 40 ms. The product is right to fetch there: the pipe was not closed
+/// yet, and the test asserted about a closed one.
+fn closed_empty_pipe(mut command: Command) -> Output {
+    let child = {
+        let _one_at_a_time = SPAWN.lock().unwrap_or_else(PoisonError::into_inner);
+        let (reader, writer) = std::io::pipe().expect("pipe");
+        drop(writer);
+        command.stdin(reader).spawn().expect("spawn ikigai")
+    };
     child.wait_with_output().expect("reap ikigai")
 }
 
@@ -76,17 +118,14 @@ fn entries(listing: &str) -> &str {
 fn a_batch_on_an_empty_stdin_caches_what_it_asked_for_and_nothing_else() {
     let home = scratch("empty");
 
-    let null = ikigai(&home, &BATCH)
-        .stdin(Stdio::null())
-        .output()
-        .expect("run ikigai");
-    let pipe = piped(ikigai(&home, &BATCH), b"");
+    let null = run(ikigai(&home, &BATCH), Stdio::null());
+    let pipe = closed_empty_pipe(ikigai(&home, &BATCH));
     let file = home.join("empty.txt");
     std::fs::write(&file, b"").expect("empty file");
-    let from_file = ikigai(&home, &BATCH)
-        .stdin(std::fs::File::open(&file).expect("open"))
-        .output()
-        .expect("run ikigai");
+    let from_file = run(
+        ikigai(&home, &BATCH),
+        std::fs::File::open(&file).expect("open"),
+    );
 
     for (case, output) in [
         ("/dev/null", &null),
