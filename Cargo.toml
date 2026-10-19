@@ -120,9 +120,9 @@ members = ["crates/*"]
 #   order and byte vectors are in PR #556).
 # - ikigai-throttle 0.2.0 (PR #555): the overlays decide from `Error::class()`. This host wires
 #   only `Timeout`, which is unchanged.
-# - ikigai-meeting 0.3.1 is still on ikigai-http 0.2.1, so `ikigai-embedded` carries a TRANSITIONAL
-#   second copy of ikigai-http (`ikigai-http-02`) for its `HttpTransport`; it goes when meeting
-#   ships on 0.3 (PR #555).
+# - ikigai-meeting 0.4.0 is on ikigai-http 0.3.0, so the TRANSITIONAL second copy of ikigai-http
+#   (`ikigai-http-02`) that `ikigai-embedded` carried for its `HttpTransport` is deleted (PR #559,
+#   after 0.1.66; it rides the next bump).
 # - MCP (PR #557): a kernel error's tool result names `kind` and `class` (and a RetryAfter's delay)
 #   on a line after the display; the 2024-11-05 result has no structured slot.
 # - Triage (PR #554, ledger #1905): the CORS no-Origin early return and the `/proc/meminfo` parse
@@ -1730,10 +1730,10 @@ ikigai-llm = "0.16.0" # 0.16.0 = on ikigai-http 0.3.0 (ledger #1546): `space(tra
 # urn:llm:{provider}:model, which browse's explain archive keys its version tags on.
 # Video-conference scheduling (urn:meeting:schedule + urn:meeting:<provider>:schedule): a facade
 # over provider backends, Zoom first. Now on crates.io — the git-rev bridge retired at first publish.
-ikigai-meeting = "0.3.0" # ⚠ Still on ikigai-http 0.2 (0.3.1 pins `0.2.1`), while this workspace moved to 0.3.0 with
-# ikigai-llm 0.16 (ledger #1546). Its `space()` therefore takes the 0.2 `HttpTransport`, which ikigai-embedded
-# implements for the same `UreqTransport` through a second, aliased copy of ikigai-http (`ikigai-http-02` in its
-# manifest). When ikigai-meeting ships on ikigai-http 0.3, raise this pin and DELETE that alias and its impl.
+ikigai-meeting = "0.4.0" # 0.4.0 = on ikigai-http 0.3.0 and core 0.1.108 (ledger #1917): its `space()` takes the
+# 0.3 `HttpTransport`, the one this host hands ikigai-http and ikigai-llm 0.16, so the three move together again;
+# Zoom 401/403 are `Refused` (was `Endpoint`), 429 `RetryAfter`, 413/414/431 `OverBudget`. ⚠ `"0.4.0"` is a
+# RANGE, `>=0.4.0, <0.5.0`: a 0.5 release of meeting needs this pin raised by hand.
 # 0.3.0 = on ikigai-http 0.2.0 (ledger #11), the shared `HttpTransport`. 0.2.0 renamed
 # the description id `urn:meeting:zoom:schedule` → `meeting` (IRIs unchanged) and added `attendees`.
 # Beneath it, still true: 0.1.2 = the Zoom `account_id` moves out of the token URL into the form body, and the Turtle face

@@ -3018,7 +3018,7 @@ dependencies = [
  "ikigai-discovery",
  "ikigai-embedded",
  "ikigai-engine",
- "ikigai-http 0.3.0",
+ "ikigai-http",
  "ikigai-intake",
  "ikigai-ipc",
  "ikigai-layers",
@@ -3129,8 +3129,7 @@ dependencies = [
  "ikigai-engine",
  "ikigai-fn",
  "ikigai-fs",
- "ikigai-http 0.2.1",
- "ikigai-http 0.3.0",
+ "ikigai-http",
  "ikigai-intake",
  "ikigai-intray",
  "ikigai-jsonld",
@@ -3226,18 +3225,6 @@ dependencies = [
  "ikigai-core",
  "rustix",
  "web-sys",
-]
-
-[[package]]
-name = "ikigai-http"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9d05f32ac83d00da7ef5c77d3e5b7b6a1155147b366115879a3cf98f3bcc50a"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "ikigai-core",
- "url",
 ]
 
 [[package]]
@@ -3365,7 +3352,7 @@ checksum = "201a0ee3797ee4b537fb195167ac660a42258d52cad35de9d4d9d09a7eacb5c4"
 dependencies = [
  "async-trait",
  "ikigai-core",
- "ikigai-http 0.3.0",
+ "ikigai-http",
  "serde",
  "serde_json",
  "url",
@@ -3383,13 +3370,13 @@ dependencies = [
 
 [[package]]
 name = "ikigai-meeting"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "594d191d06036b33a795e780da4b03d9f76fc27a01b74deb185bf687e6c2b45f"
+checksum = "fabd4635aff609344fc2089b17e2759da59fe392d233f34546d8e8a0a10e5da0"
 dependencies = [
  "async-trait",
  "ikigai-core",
- "ikigai-http 0.2.1",
+ "ikigai-http",
  "serde",
  "serde_json",
  "url",

@@ -64,11 +64,6 @@ ikigai-discovery = { path = "../ikigai-discovery", version = "0.1.66" }
 ikigai-engine = { path = "../ikigai-engine", version = "0.1.66", features = ["plan-reader"] }
 ikigai-fs = { workspace = true }
 ikigai-http = { workspace = true }
-# ⚠ TRANSITIONAL: the SAME crate on its previous line, under another name. ikigai-meeting 0.3.1 still pins
-# ikigai-http `0.2.1`, so its `space()` takes the 0.2 `HttpTransport`, a different trait from the 0.3 one the
-# workspace moved to (ledger #1546). `UreqTransport` implements both over one send body, and this alias is what
-# names the 0.2 trait. Delete it, and the impl beside it in `lib.rs`, when ikigai-meeting ships on 0.3.
-ikigai-http-02 = { package = "ikigai-http", version = "0.2.1" }
 ikigai-runbook = { workspace = true }
 ikigai-rdf = { workspace = true }
 ikigai-sparql = { workspace = true }

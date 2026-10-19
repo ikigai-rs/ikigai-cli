@@ -2235,8 +2235,9 @@ type Exchanged = (u16, Vec<(String, String)>, Vec<u8>);
 
 impl UreqTransport {
     /// One blocking exchange: the method as its token, the URL, the headers and the body
-    /// out; the status, headers and body back. Shared by the two `HttpTransport` impls
-    /// below, which differ only in the crate version of the structs they carry.
+    /// out; the status, headers and body back. The `HttpTransport` impl below is the one
+    /// caller; it carries these into the structs ikigai-http, ikigai-llm and ikigai-meeting
+    /// share.
     fn exchange(
         method: &str,
         url: &str,
@@ -2295,30 +2296,6 @@ impl ikigai_http::HttpTransport for UreqTransport {
             &request.body,
         )?;
         Ok(ikigai_http::HttpResponse {
-            status,
-            headers,
-            body,
-        })
-    }
-}
-
-/// ⚠ TRANSITIONAL (ledger #1546): the same transport as the 0.2 `HttpTransport`, for
-/// ikigai-meeting, which still pins ikigai-http 0.2.1 while the workspace is on 0.3. The
-/// trait and both structs have the same shape in the two releases; only the crate differs.
-/// Delete this impl and the `ikigai-http-02` alias when ikigai-meeting ships on 0.3.
-#[async_trait::async_trait]
-impl ikigai_http_02::HttpTransport for UreqTransport {
-    async fn send(
-        &self,
-        request: ikigai_http_02::HttpRequest,
-    ) -> std::result::Result<ikigai_http_02::HttpResponse, String> {
-        let (status, headers, body) = Self::exchange(
-            request.method.as_str(),
-            &request.url,
-            &request.headers,
-            &request.body,
-        )?;
-        Ok(ikigai_http_02::HttpResponse {
             status,
             headers,
             body,
