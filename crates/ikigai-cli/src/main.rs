@@ -77,6 +77,16 @@ usage:
                                --layers-state <dir>, else `layers.state` (instance-scoped as
                                <name>.layers.state; relative to the config home) in config.toml,
                                else ~/.ikigai/layers/<name>. No environment variable names it.
+                               The state is SEALED AT REST (age): --layers-key <file> names the
+                               host's age identity (`age-keygen -o <file>`), else `layers.key`
+                               (<name>.layers.key) in config.toml. Required: without one the
+                               door refuses to start, and a wrong key is refused at open
+  ikigai serve <q> --layers-reseal  ONCE, over state an ikigai before 0.1.67 wrote (plaintext,
+                               refused until then): seal every state file in place to the
+                               --layers-key identity, then serve. Also rotates the key (new
+                               identity first in the file, the old after it; drop the old line
+                               after). Safe to rerun: it resumes a stopped run and changes
+                               nothing over sealed state; later starts leave it off
                                A layer door serves ONLY its layers: none of the general served
                                surface (host, files, intake, links, passkey), and it refuses to
                                start with a mount or a ceiling that opens another face
@@ -396,6 +406,12 @@ enum Mode {
         /// entries, tuples, receipts and feeds (ledger #1188). Layers are hosted when the
         /// config home has a `layers/` directory; see `ikigai_embedded::layers`.
         layers_state: Option<std::path::PathBuf>,
+        /// `--layers-key <path>` (absolute): the age identity file the layer host seals its
+        /// state with (ikigai-layers 0.3.0, ledger #2011).
+        layers_key: Option<std::path::PathBuf>,
+        /// `--layers-reseal`: seal a plaintext state directory in place (and rotate the key)
+        /// on this start, then serve (`ikigai_layers::Migration::Reseal`).
+        layers_reseal: bool,
         /// `--layers-https <addr>`: also serve the layers' participant verbs over HTTPS there
         /// (ledger #1371). See `front.rs`.
         layers_https: Option<String>,
@@ -1212,6 +1228,8 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
         let mut passkey_rp_id: Option<String> = None;
         let mut passkey_origin: Option<String> = None;
         let mut layers_state: Option<std::path::PathBuf> = None;
+        let mut layers_key: Option<std::path::PathBuf> = None;
+        let mut layers_reseal = false;
         let mut layers_https: Option<String> = None;
         let mut require_enrollment = false;
         while let Some(arg) = argv.next() {
@@ -1228,6 +1246,34 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                     return Err("--layers-https given twice; a door has one front".to_string());
                 }
                 layers_https = Some(addr);
+                continue;
+            }
+            if arg == "--layers-reseal" {
+                layers_reseal = true;
+                continue;
+            }
+            if arg == "--layers-key" {
+                let file = argv.next().ok_or_else(|| {
+                    "--layers-key needs a file (an age identity, as `age-keygen -o` writes one)"
+                        .to_string()
+                })?;
+                if layers_key.is_some() {
+                    return Err(
+                        "--layers-key given twice; a layer host seals its state with one key \
+                         file (it may hold several identities, the current one first)"
+                            .to_string(),
+                    );
+                }
+                // Absolute now, as `--layers-state` is: the key is read at open, against the
+                // directory it was typed in.
+                let file = std::path::PathBuf::from(file);
+                layers_key = Some(if file.is_absolute() {
+                    file
+                } else {
+                    std::env::current_dir()
+                        .map_err(|e| format!("--layers-key: no working directory ({e})"))?
+                        .join(file)
+                });
                 continue;
             }
             if arg == "--layers-state" {
@@ -1448,6 +1494,8 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
             announce,
             mounts,
             layers_state,
+            layers_key,
+            layers_reseal,
             layers_https,
             require_enrollment,
         }));
@@ -1759,6 +1807,8 @@ fn main() {
             max_body,
             push,
             layers_state,
+            layers_key,
+            layers_reseal,
             layers_https,
             require_enrollment,
         } => match (http, target.as_deref()) {
@@ -1777,12 +1827,15 @@ fn main() {
             // participant from its certificate, and a layer refuses a write that names nobody.
             // A state directory for a door that hosts nothing is a flag that does nothing.
             (http, target)
-                if (layers_state.is_some() || layers_https.is_some())
+                if (layers_state.is_some()
+                    || layers_key.is_some()
+                    || layers_reseal
+                    || layers_https.is_some())
                     && (http.is_some() || !target.is_some_and(is_quic)) =>
             {
                 eprintln!(
-                    "ikigai: --layers-state and --layers-https apply to `serve quic://…`, the \
-                     door that hosts layers"
+                    "ikigai: --layers-state, --layers-key, --layers-reseal and --layers-https \
+                     apply to `serve quic://…`, the door that hosts layers"
                 );
                 std::process::exit(2);
             }
@@ -1813,6 +1866,8 @@ fn main() {
                     mounts,
                     QuicDoorFlags {
                         layers_state,
+                        layers_key,
+                        layers_reseal,
                         layers_https,
                         require_enrollment,
                     },
@@ -3378,6 +3433,10 @@ fn trusted_identities(
 struct QuicDoorFlags {
     /// `--layers-state <dir>`.
     layers_state: Option<std::path::PathBuf>,
+    /// `--layers-key <path>`.
+    layers_key: Option<std::path::PathBuf>,
+    /// `--layers-reseal`.
+    layers_reseal: bool,
     /// `--layers-https <addr>`.
     layers_https: Option<String>,
     /// `--require-enrollment`.
@@ -3395,6 +3454,8 @@ fn serve_quic(
 ) -> ! {
     let QuicDoorFlags {
         layers_state,
+        layers_key,
+        layers_reseal,
         layers_https,
         require_enrollment,
     } = flags;
@@ -3409,7 +3470,13 @@ fn serve_quic(
         // manifest mounting another collaboration's layer, a shape that is not closed) stops
         // the door here rather than at its first write. `None` without `layers/`: the door is
         // built exactly as it always was.
-        let layers = ikigai_embedded::layers::open(layers_state.as_deref())?;
+        // Sealed at rest (ledger #2011): a missing or wrong key, or a plaintext state directory
+        // without `--layers-reseal`, stops the door here too.
+        let layers = ikigai_embedded::layers::open(ikigai_embedded::layers::Flags {
+            state: layers_state.as_deref(),
+            key: layers_key.as_deref(),
+            reseal: layers_reseal,
+        })?;
         // THE HTTPS FRONT (ledger #1371), when the flag or the config home names an address: a
         // second face onto THIS door's kernel and authority, for participants that speak only
         // HTTP. It fronts layers and nothing else, so it needs a door that hosts them.
@@ -3835,6 +3902,19 @@ fn serve_quic(
                 hosted.state.display(),
                 hosted.source.as_str()
             );
+            // The recipient is the PUBLIC half: what an operator checks against the key file.
+            eprintln!(
+                "ikigai: layers: state sealed at rest to {} (key {}, {})",
+                hosted.recipient,
+                hosted.key.display(),
+                hosted.key_source.as_str()
+            );
+            if hosted.resealed {
+                eprintln!(
+                    "ikigai: layers: --layers-reseal: every state file is sealed to that \
+                     recipient now; later starts leave the flag off (rerunning it is safe)"
+                );
+            }
         }
         // The front binds before the banner too, and its line comes first, so the QUIC banner
         // stays the last line a harness waits for and both addresses are bound when it prints.
@@ -4248,6 +4328,8 @@ fn serve_quic(
     // Read here so a build without `quic` does not call the fields dead; nothing uses them.
     let _ = (
         flags.layers_state,
+        flags.layers_key,
+        flags.layers_reseal,
         flags.layers_https,
         flags.require_enrollment,
     );

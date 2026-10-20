@@ -477,10 +477,24 @@ fn a_token_bound_to_a_removed_client_is_refused_under_a_default() {
     enrolled["default"] = serde_json::Value::String(alice_grant);
     std::fs::write(&clients, serde_json::to_string_pretty(&enrolled).unwrap()).unwrap();
 
+    // The layer host seals its state to an age identity (ikigai-layers 0.3.0, ledger #2011): a
+    // throwaway one, as `age-keygen -o` would write it.
+    let key = home.join("state.key");
+    write(
+        key.clone(),
+        age::secrecy::ExposeSecret::expose_secret(&age::x25519::Identity::generate().to_string()),
+    );
     let (_door, banner) = serve(
         &home,
         &certs,
-        &["--name", "layers", "--layers-https", "127.0.0.1:0"],
+        &[
+            "--name",
+            "layers",
+            "--layers-key",
+            key.to_str().unwrap(),
+            "--layers-https",
+            "127.0.0.1:0",
+        ],
     );
     let https = after(&banner, "layers https on https://");
     let server_pem = std::fs::read_to_string(certs.join("server.crt")).unwrap();

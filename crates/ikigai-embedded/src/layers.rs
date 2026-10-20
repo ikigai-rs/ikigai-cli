@@ -16,6 +16,25 @@
 //! 3. `<data home>/layers/<instance>`, i.e. `~/.ikigai/layers/<instance>`
 //!    ([`StateSource::Default`]).
 //!
+//! **The state is sealed at rest** (ikigai-layers 0.3.0, ledger #2011): every file the host
+//! writes is age ciphertext sealed to the host's key, an age identity FILE (`age-keygen -o`)
+//! whose path comes from
+//!
+//! 1. `--layers-key <path>` on `serve` ([`KeySource::Flag`]), relative to the working directory;
+//! 2. `<instance>.layers.key` in the config home's `config.toml`, else `layers.key`
+//!    ([`KeySource::Config`]), relative to the config home.
+//!
+//! There is no default and no environment variable: a door that hosts layers and is given no
+//! key refuses to start, naming the flag, and never serves its state unsealed. A path, not the
+//! key itself, so a deployment can hand the file over from an in-memory credential store
+//! (systemd's `LoadCredentialEncrypted`). A wrong key is refused at open, before anything is
+//! read. A state directory written before 0.3.0 holds plaintext, and the host refuses it until
+//! ONE start with `--layers-reseal` ([`ikigai_layers::Migration::Reseal`]) seals it in place;
+//! that start then serves normally, and running it again is safe (it resumes an interrupted
+//! run, and over a sealed directory it changes nothing). The same flag rotates the key: put
+//! the new identity FIRST in the file, keep the old one after it, start once with
+//! `--layers-reseal`, then drop the old line.
+//!
 //! The default is per INSTANCE because a layer host is one host per state directory, and the
 //! host enforces it: [`ikigai_layers::Host::open`] holds `<state>/host.lock` exclusively while
 //! the host lives and refuses a second host over the same directory, in this process or
@@ -52,6 +71,18 @@ pub const STATE_KEY: &str = "layers.state";
 /// The flag naming the state directory, on `serve quic://`.
 pub const STATE_FLAG: &str = "--layers-state";
 
+/// The config-home key naming the host's age identity file, instance-scoped as
+/// `<instance>.layers.key`. A relative path is resolved against the config home; `~/` against
+/// `$HOME`.
+pub const KEY_KEY: &str = "layers.key";
+
+/// The flag naming the host's age identity file, on `serve quic://`.
+pub const KEY_FLAG: &str = "--layers-key";
+
+/// The one-time flag that seals a state directory written before ikigai-layers 0.3.0 in place
+/// (and rotates the key), on `serve quic://`: [`ikigai_layers::Migration::Reseal`].
+pub const RESEAL_FLAG: &str = "--layers-reseal";
+
 /// The name the served root gives the layer space: the space answers what its host was
 /// handed, so it claims no name of its own and the host names it (core's `SPACE-NAME` rule).
 pub const SPACE: &str = "urn:ikigai:space:served:layers";
@@ -78,6 +109,53 @@ impl StateSource {
     }
 }
 
+/// Which channel named the host's key file. There is no default: see the module docs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeySource {
+    /// `--layers-key <path>`.
+    Flag,
+    /// `layers.key` (or `<instance>.layers.key`) in the config home.
+    Config,
+}
+
+impl KeySource {
+    /// `flag` / `config`, as the banner says it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeySource::Flag => "flag",
+            KeySource::Config => "config",
+        }
+    }
+}
+
+/// What `serve quic://` was told about the layer host, every flag already absolute.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Flags<'a> {
+    /// `--layers-state <dir>`.
+    pub state: Option<&'a Path>,
+    /// `--layers-key <path>`.
+    pub key: Option<&'a Path>,
+    /// `--layers-reseal`.
+    pub reseal: bool,
+}
+
+impl Flags<'_> {
+    /// The flags given, by name, for a refusal that says which ones do nothing.
+    fn given(&self) -> Vec<&'static str> {
+        let mut given = Vec::new();
+        if self.state.is_some() {
+            given.push(STATE_FLAG);
+        }
+        if self.key.is_some() {
+            given.push(KEY_FLAG);
+        }
+        if self.reseal {
+            given.push(RESEAL_FLAG);
+        }
+        given
+    }
+}
+
 /// An opened layer host and where it came from.
 pub struct Hosted {
     /// The host [`ikigai_layers::space`] binds.
@@ -88,6 +166,14 @@ pub struct Hosted {
     pub state: PathBuf,
     /// Which channel named [`state`](Self::state).
     pub source: StateSource,
+    /// The age identity file the state is sealed with.
+    pub key: PathBuf,
+    /// Which channel named [`key`](Self::key).
+    pub key_source: KeySource,
+    /// The recipient (`age1…`, public) every state file is sealed to now.
+    pub recipient: String,
+    /// Whether this open sealed the state in place (`--layers-reseal`).
+    pub resealed: bool,
 }
 
 impl Hosted {
@@ -165,30 +251,97 @@ pub fn state_dir_from(
     ))
 }
 
+/// Where the host's age identity file is, by the precedence in the module docs. `flag` is
+/// `--layers-key`, already absolute (the binary absolutizes what was typed).
+pub fn key_path(flag: Option<&Path>) -> Result<(PathBuf, KeySource), String> {
+    let instance = crate::instance_name();
+    let configured = crate::config::get(&format!("{instance}.{KEY_KEY}"))
+        .or_else(|| crate::config::get(KEY_KEY));
+    key_path_from(
+        flag,
+        configured.as_deref(),
+        crate::config::config_home().as_deref(),
+        std::env::var_os("HOME").as_deref().map(Path::new),
+    )
+}
+
+/// [`key_path`] with every input passed in, so the precedence is testable without touching
+/// the process environment. Neither channel naming a key is refused, naming both: a door
+/// that hosts layers never serves their state unsealed.
+pub fn key_path_from(
+    flag: Option<&Path>,
+    configured: Option<&str>,
+    config_home: Option<&Path>,
+    home: Option<&Path>,
+) -> Result<(PathBuf, KeySource), String> {
+    if let Some(path) = flag {
+        return Ok((path.to_path_buf(), KeySource::Flag));
+    }
+    if let Some(value) = configured.map(str::trim).filter(|v| !v.is_empty()) {
+        let path = ikigai_resolve::expand_home(value, home)
+            .map_err(|e| format!("`{KEY_KEY}` in the config home: {e}"))?;
+        let path = match config_home {
+            Some(base) if path.is_relative() => base.join(path),
+            _ => path,
+        };
+        return Ok((path, KeySource::Config));
+    }
+    Err(format!(
+        "layers are configured, and their state is sealed at rest with the host's key, but no \
+         key is named: pass {KEY_FLAG} <file> or set `{KEY_KEY}` in the config home. The file \
+         is an age identity, as `age-keygen -o <file>` writes one; no environment variable \
+         names it, and the host does not serve its state unsealed"
+    ))
+}
+
 /// Open the layer host when the config home configures one: `Ok(None)` without `layers/`
-/// (and then `flag` must be `None`: a state directory for layers nobody configured is a
-/// flag that does nothing, and is refused rather than ignored).
-pub fn open(flag: Option<&Path>) -> Result<Option<Hosted>, String> {
+/// (and then no flag may be given: a state directory, a key or a reseal for layers nobody
+/// configured is a flag that does nothing, and is refused rather than ignored).
+pub fn open(flags: Flags<'_>) -> Result<Option<Hosted>, String> {
+    let given = flags.given();
     let Some(home) = crate::config::config_home() else {
-        return match flag {
-            Some(_) => Err(format!("{STATE_FLAG} needs a config home holding `{DIR}/`")),
-            None => Ok(None),
+        return match given.is_empty() {
+            false => Err(format!(
+                "{} need{} a config home holding `{DIR}/`",
+                given.join(" and "),
+                if given.len() == 1 { "s" } else { "" }
+            )),
+            true => Ok(None),
         };
     };
     if configured_in(&home).is_none() {
-        return match flag {
-            Some(_) => Err(format!(
-                "{STATE_FLAG} names where layers keep their state, but {} does not exist, so \
-                 no layer is configured",
+        return match given.is_empty() {
+            false => Err(format!(
+                "{} appl{} to a door that hosts layers, but {} does not exist, so no layer is \
+                 configured",
+                given.join(" and "),
+                if given.len() == 1 { "ies" } else { "y" },
                 home.join(DIR).display()
             )),
-            None => Ok(None),
+            true => Ok(None),
         };
     }
-    let (state, source) = state_dir(flag)?;
-    let host = ikigai_layers::Host::open(&home, &state).map_err(|e| {
+    let (state, source) = state_dir(flags.state)?;
+    let (key, key_source) = key_path(flags.key)?;
+    let opened = ikigai_layers::StateKey::load(&key).map_err(|e| e.to_string())?;
+    let migration = if flags.reseal {
+        ikigai_layers::Migration::Reseal
+    } else {
+        ikigai_layers::Migration::None
+    };
+    let host = ikigai_layers::Host::open_with(&home, &state, &opened, migration).map_err(|e| {
+        // The library names its option; this door's operator holds a flag.
+        let e = e.to_string();
+        let hint = if !flags.reseal && e.contains("Migration::Reseal") {
+            format!(
+                ". For this door: start it ONCE with {RESEAL_FLAG} beside the same key, which \
+                 seals them in place and then serves"
+            )
+        } else {
+            String::new()
+        };
         format!(
-            "layers are configured in {} but the host cannot open: {e}",
+            "layers are configured in {} but the host cannot open: {e}{hint}",
             home.join(DIR).display()
         )
     })?;
@@ -197,6 +350,10 @@ pub fn open(flag: Option<&Path>) -> Result<Option<Hosted>, String> {
         config: home,
         state,
         source,
+        recipient: opened.recipient(),
+        key,
+        key_source,
+        resealed: flags.reseal,
     }))
 }
 
@@ -294,6 +451,40 @@ mod tests {
             err.contains(STATE_KEY) && err.contains("HOME is not set"),
             "{err}"
         );
+    }
+
+    /// ledger #2011: the key comes from the flag, then the config home, and from nowhere else.
+    /// No channel naming one is a refusal that names both, never a host that serves unsealed.
+    #[test]
+    fn the_key_is_the_flag_then_the_config_home_and_never_a_default() {
+        let flag = Path::new("/run/credentials/edge/layers.key");
+        let home = Path::new("/home/b");
+        let config = Path::new("/home/b/.config/ikigai");
+        assert_eq!(
+            key_path_from(Some(flag), Some("ignored"), Some(config), Some(home)),
+            Ok((flag.to_path_buf(), KeySource::Flag))
+        );
+        assert_eq!(
+            key_path_from(None, Some("layers.key"), Some(config), Some(home)),
+            Ok((config.join("layers.key"), KeySource::Config))
+        );
+        assert_eq!(
+            key_path_from(None, Some("~/keys/l.key"), Some(config), Some(home)),
+            Ok((home.join("keys/l.key"), KeySource::Config))
+        );
+        assert_eq!(
+            key_path_from(None, Some("/etc/l.key"), Some(config), Some(home)),
+            Ok((PathBuf::from("/etc/l.key"), KeySource::Config))
+        );
+        for configured in [None, Some(""), Some("   ")] {
+            let err = key_path_from(None, configured, Some(config), Some(home)).unwrap_err();
+            assert!(
+                err.contains(KEY_FLAG) && err.contains(KEY_KEY) && err.contains("age-keygen"),
+                "{configured:?}: {err}"
+            );
+        }
+        let err = key_path_from(None, Some("~bob/k"), Some(config), Some(home)).unwrap_err();
+        assert!(err.contains(KEY_KEY), "{err}");
     }
 
     #[test]

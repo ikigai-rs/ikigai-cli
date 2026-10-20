@@ -104,6 +104,17 @@ fn fingerprint(cert: &Path) -> String {
     ikigai_quic::fingerprint_of_pem(&pem).expect("a certificate")
 }
 
+/// A throwaway age identity at `path`, as `age-keygen -o` writes one: the key the layer host
+/// seals its state to (ikigai-layers 0.3.0, ledger #2011).
+fn mint_key(path: &Path) -> age::x25519::Identity {
+    let identity = age::x25519::Identity::generate();
+    write(
+        path.to_path_buf(),
+        age::secrecy::ExposeSecret::expose_secret(&identity.to_string()),
+    );
+    identity
+}
+
 fn write(path: PathBuf, text: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, text).unwrap();
@@ -187,6 +198,13 @@ fn configure_layers(home: &Path, certs: &Path) {
             fingerprint(&certs.join("clients/alice.crt")),
             fingerprint(&certs.join("clients/bob.crt"))
         ),
+    );
+    // The host's key through the config home's channel (`layers.key`), so every door below
+    // opens sealed without a flag; the sealed-state tests name theirs with `--layers-key`.
+    mint_key(&home.join("state.key"));
+    write(
+        config.join("config.toml"),
+        &format!("layers.key = \"{}\"\n", home.join("state.key").display()),
     );
     // `ikigai-layers grants <config home>`, as a library call.
     let loaded = ikigai_layers::Config::load(&config).expect("the configuration checks");
@@ -331,6 +349,14 @@ fn a_message_in_a_channel_layer_is_attributed_to_each_sender_and_a_sent_stamp_is
     assert!(
         banner.contains(&format!("state in {} (flag)", state.display())),
         "and where the state lives, by which channel: {banner}"
+    );
+    assert!(
+        banner.contains("state sealed at rest to age1")
+            && banner.contains(&format!(
+                "(key {}, config)",
+                home.join("state.key").display()
+            )),
+        "and the key it is sealed with, by which channel: {banner}"
     );
 
     let say = |who: &str, body: &str| {
@@ -784,23 +810,29 @@ fn without_a_layers_directory_serve_is_unchanged() {
         );
     }
 
-    // A state directory for a door that hosts no layer is a flag that does nothing: refused.
-    let out = run(
-        &home,
-        &[
+    // A state directory, a key or a reseal for a door that hosts no layer is a flag that does
+    // nothing: refused. (The config home's `layers.key` stays: it is for whichever process
+    // hosts layers, and this one hosts none.)
+    let nowhere = home.join("nowhere");
+    for flag in [
+        &["--layers-state", nowhere.to_str().unwrap()][..],
+        &["--layers-key", nowhere.to_str().unwrap()][..],
+        &["--layers-reseal"][..],
+    ] {
+        let mut args = vec![
             "serve",
             "quic://127.0.0.1:0",
             "--cert-dir",
             certs.to_str().unwrap(),
-            "--layers-state",
-            home.join("nowhere").to_str().unwrap(),
-        ],
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        !out.status.success() && stderr.contains("--layers-state"),
-        "{stderr}"
-    );
+        ];
+        args.extend_from_slice(flag);
+        let out = run(&home, &args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success() && stderr.contains(flag[0]),
+            "{flag:?}: {stderr}"
+        );
+    }
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -1422,5 +1454,228 @@ fn a_layer_door_refuses_a_face_or_a_mount_beside_its_layers() {
         );
         assert!(!stderr.contains("serving on"), "{extra:?}: {stderr}");
     }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Every file under `dir`, recursively.
+fn files_in(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// The files under `state` that hold `text` in the clear.
+fn holding(state: &Path, text: &str) -> Vec<PathBuf> {
+    files_in(state)
+        .into_iter()
+        .filter(|file| {
+            let bytes = std::fs::read(file).unwrap();
+            bytes.windows(text.len()).any(|w| w == text.as_bytes())
+        })
+        .collect()
+}
+
+/// What a host before ikigai-layers 0.3.0 left: open every sealed file under `state` with
+/// `identity` and write it back in the clear (a feed line at a time), and no key check. Only
+/// channel layers are used where this is called, so no tuple is renamed.
+fn unseal_all(state: &Path, identity: &age::x25519::Identity) {
+    use base64::Engine;
+    const MAGIC: &[u8] = b"age-encryption.org/v1";
+    std::fs::remove_file(state.join("key-check.age")).unwrap();
+    for file in files_in(state) {
+        let bytes = std::fs::read(&file).unwrap();
+        if file.file_name().is_some_and(|n| n == "feed.log") {
+            let text: String = String::from_utf8(bytes)
+                .unwrap()
+                .lines()
+                .map(|line| {
+                    let sealed = base64::engine::general_purpose::STANDARD
+                        .decode(line)
+                        .unwrap();
+                    String::from_utf8(age::decrypt(identity, &sealed).unwrap()).unwrap() + "\n"
+                })
+                .collect();
+            std::fs::write(&file, text).unwrap();
+        } else if bytes.starts_with(MAGIC) {
+            std::fs::write(&file, age::decrypt(identity, &bytes).unwrap()).unwrap();
+        }
+    }
+}
+
+/// The feed of `talk` and one entry, as bob reads them.
+fn read_talk(home: &Path, certs: &Path, target: &str, entry: &str) -> (String, String) {
+    let feed = ok(
+        ask(
+            home,
+            certs,
+            "bob",
+            target,
+            "source urn:layer:talk:feed after=0",
+            None,
+        ),
+        "the feed",
+    );
+    let stored = ok(
+        ask(home, certs, "bob", target, &format!("source {entry}"), None),
+        "an entry",
+    );
+    (feed, stored)
+}
+
+/// ledger #2011: a layer door's state is sealed at rest with the key `--layers-key` names. The
+/// door serves, nothing it wrote holds a message or a participant in the clear, and a restart
+/// with the same key serves the same feed. No key, a key file that is not there and a key that
+/// is not this state's are each refused at startup, naming the problem, and serve nothing.
+#[test]
+fn a_sealed_layer_door_restarts_with_its_feed_and_refuses_a_missing_or_wrong_key() {
+    let home = scratch("sealed");
+    let certs = certs(&home);
+    configure_layers(&home, &certs);
+    // Only the flag names a key here.
+    std::fs::remove_file(config_home(&home).join("config.toml")).unwrap();
+    let state = home.join("layer-state");
+    let key = home.join("flag.key");
+    mint_key(&key);
+    let (s, k) = (state.to_str().unwrap(), key.to_str().unwrap());
+
+    // No key: refused before the host opens, so nothing is written.
+    let (code, stderr) = start_or_refuse(&home, &certs, &["--layers-state", s])
+        .expect_err("a layer door with no key must not serve");
+    assert_ne!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains("--layers-key") && stderr.contains("layers.key"),
+        "the refusal names both channels: {stderr}"
+    );
+    assert!(!state.exists(), "nothing was written without a key");
+
+    let (door, target, banner) = serve(&home, &certs, &["--layers-state", s, "--layers-key", k]);
+    assert!(
+        banner.contains("state sealed at rest to age1")
+            && banner.contains(&format!("(key {}, flag)", key.display())),
+        "{banner}"
+    );
+    let entry = first_line(
+        ask(
+            &home,
+            &certs,
+            "alice",
+            &target,
+            "sink urn:layer:talk:say",
+            Some(&message("a sealed hello")),
+        ),
+        "alice says",
+    );
+    let before = read_talk(&home, &certs, &target, &entry);
+    assert!(before.1.contains("a sealed hello"), "{}", before.1);
+    drop(door);
+    assert!(state.join("key-check.age").is_file());
+    for text in ["a sealed hello", ALICE] {
+        assert_eq!(
+            holding(&state, text),
+            Vec::<PathBuf>::new(),
+            "no state file holds `{text}` in the clear"
+        );
+    }
+
+    // The same key: the same feed and entry, after a restart.
+    let (door, target, _) = serve(&home, &certs, &["--layers-state", s, "--layers-key", k]);
+    assert_eq!(read_talk(&home, &certs, &target, &entry), before);
+    drop(door);
+
+    // A key file that is not there, and a key that is not this state's.
+    let absent = home.join("absent.key");
+    let other = home.join("other.key");
+    mint_key(&other);
+    for (path, says) in [
+        (&absent, "does not exist"),
+        (&other, "does not open this state directory"),
+    ] {
+        let (code, stderr) = start_or_refuse(
+            &home,
+            &certs,
+            &["--layers-state", s, "--layers-key", path.to_str().unwrap()],
+        )
+        .expect_err("a wrong key must not serve");
+        assert_ne!(code, 0, "{stderr}");
+        assert!(
+            stderr.contains(says) && stderr.contains(path.to_str().unwrap()),
+            "{path:?}: {stderr}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// ledger #2011: a state directory an ikigai before 0.1.67 wrote holds plaintext, and a door
+/// refuses it, naming `--layers-reseal`. One start with that flag seals it in place and serves
+/// the same feed; starting with it again is safe; later starts leave it off.
+#[test]
+fn a_plaintext_state_directory_is_refused_until_one_layers_reseal() {
+    let home = scratch("reseal");
+    let certs = certs(&home);
+    configure_layers(&home, &certs);
+    std::fs::remove_file(config_home(&home).join("config.toml")).unwrap();
+    let state = home.join("layer-state");
+    let key = home.join("flag.key");
+    let identity = mint_key(&key);
+    let (s, k) = (state.to_str().unwrap(), key.to_str().unwrap());
+    let flags = ["--layers-state", s, "--layers-key", k];
+
+    let (door, target, _) = serve(&home, &certs, &flags);
+    let entry = first_line(
+        ask(
+            &home,
+            &certs,
+            "alice",
+            &target,
+            "sink urn:layer:talk:say",
+            Some(&message("a plain hello")),
+        ),
+        "alice says",
+    );
+    let before = read_talk(&home, &certs, &target, &entry);
+    drop(door);
+    unseal_all(&state, &identity);
+    assert!(
+        !holding(&state, "a plain hello").is_empty(),
+        "the state is plaintext now, as a host before 0.3.0 left it"
+    );
+
+    let (code, stderr) =
+        start_or_refuse(&home, &certs, &flags).expect_err("plaintext state must not serve");
+    assert_ne!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains("plaintext") && stderr.contains("--layers-reseal"),
+        "the refusal names the flag that seals it: {stderr}"
+    );
+
+    let resealing = [&flags[..], &["--layers-reseal"][..]].concat();
+    for pass in ["first", "again"] {
+        let (door, target, banner) = serve(&home, &certs, &resealing);
+        assert!(
+            banner.contains("--layers-reseal: every state file is sealed"),
+            "{pass}: {banner}"
+        );
+        assert_eq!(read_talk(&home, &certs, &target, &entry), before, "{pass}");
+        drop(door);
+        assert_eq!(
+            holding(&state, "a plain hello"),
+            Vec::<PathBuf>::new(),
+            "{pass}: nothing is left in the clear"
+        );
+    }
+    let (door, target, banner) = serve(&home, &certs, &flags);
+    assert!(!banner.contains("--layers-reseal"), "{banner}");
+    assert_eq!(read_talk(&home, &certs, &target, &entry), before);
+    drop(door);
     let _ = std::fs::remove_dir_all(&home);
 }

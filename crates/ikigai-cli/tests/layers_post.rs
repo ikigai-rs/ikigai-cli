@@ -74,6 +74,20 @@ fn ok(out: Output, what: &str) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
+/// A throwaway age identity at `path`, as `age-keygen -o` writes one: the key the layer host
+/// seals its state to (ikigai-layers 0.3.0, ledger #2011). Kept when it is already there, so a
+/// restarted door opens what the first one sealed.
+fn mint_key(path: &Path) {
+    if !path.exists() {
+        let identity = age::x25519::Identity::generate();
+        std::fs::write(
+            path,
+            age::secrecy::ExposeSecret::expose_secret(&identity.to_string()),
+        )
+        .unwrap();
+    }
+}
+
 fn write(path: PathBuf, text: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, text).unwrap();
@@ -133,6 +147,8 @@ fn configure(home: &Path) -> PathBuf {
 /// Start the door; returns it and the address its banner names (the BOUND port).
 fn serve(home: &Path, certs: &Path) -> (Door, String) {
     let state = home.join("layer-state");
+    let key = home.join("state.key");
+    mint_key(&key);
     let args = [
         "serve",
         "quic://127.0.0.1:0",
@@ -142,6 +158,8 @@ fn serve(home: &Path, certs: &Path) -> (Door, String) {
         certs.to_str().unwrap(),
         "--layers-state",
         state.to_str().unwrap(),
+        "--layers-key",
+        key.to_str().unwrap(),
     ];
     let mut child = spawn(home, &args)
         .stdin(Stdio::null())

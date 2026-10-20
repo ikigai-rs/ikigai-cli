@@ -155,7 +155,15 @@ fn a_layer_door_binds_the_layer_spaces_and_nothing_else() {
     }
 
     let before = listing(&files);
-    let host = ikigai_layers::Host::open(&config, scratch.join("state")).expect("the host opens");
+    // The state is sealed at rest (ikigai-layers 0.3.0): a throwaway key, as `age-keygen -o`.
+    std::fs::write(
+        scratch.join("state.key"),
+        age::secrecy::ExposeSecret::expose_secret(&age::x25519::Identity::generate().to_string()),
+    )
+    .unwrap();
+    let key = ikigai_layers::StateKey::load(scratch.join("state.key")).expect("an age identity");
+    let host =
+        ikigai_layers::Host::open(&config, scratch.join("state"), &key).expect("the host opens");
     let door = served_kernel_hosting(
         "Test (QUIC)",
         ServedSurface::default(),

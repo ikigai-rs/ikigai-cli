@@ -350,9 +350,29 @@ ikigai serve quic://0.0.0.0:4434 --name layers
   else `~/.ikigai/layers/<name>` under the data home. No environment variable names it. One
   door per state directory: the host holds `<state>/host.lock` while it lives, and a second
   door over the same directory is refused with the holder's pid.
+- **The state is sealed at rest** (ikigai-cli 0.1.67+, ikigai-layers 0.3.0): every file the
+  host writes is age ciphertext sealed to the host's key, so the files, a backup of them or an
+  image of the disk say nothing without it. The key is an age identity FILE
+  (`age-keygen -o layers.key`), named by `--layers-key <file>` on `serve`, else
+  `layers.key = "<file>"` in `config.toml` (instance-scoped as `<name>.layers.key`; relative to
+  the config home, a leading `~` to `$HOME`). It is **required**: a door that hosts layers and
+  names no key refuses to start, a file that is missing or holds no identity is refused naming
+  it, and a key that is not this state's is refused before anything is read. No environment
+  variable names it, and a path rather than the key itself lets a deployment hand the file over
+  from an in-memory credential store (systemd's `LoadCredentialEncrypted`, as
+  `--layers-key %d/<credential>`).
+- **State from before 0.1.67 is plaintext**, and a door refuses it, naming `--layers-reseal`.
+  Start the door ONCE with `--layers-reseal` beside the key: it seals every state file in place,
+  file by file, then serves. Running it again is safe (it resumes a run that stopped part-way
+  and changes nothing over sealed state); later starts leave it off. The same flag rotates the
+  key: put the new identity first in the key file and keep the old one after it, start once with
+  `--layers-reseal`, then drop the old line. A directory under the state directory that no layer
+  definition names is not the host's state, and is neither read nor sealed.
 - The banner names each hosted layer and its model, where the state is and which of the three
-  channels chose it, and the surface gains `+ layers`. `--layers-state` on a door that hosts
-  no layer (no `layers/`, or not a QUIC door) is refused rather than ignored.
+  channels chose it, the recipient (`age1…`, the public half) the state is sealed to and which
+  channel named the key, and the surface gains `+ layers`. `--layers-state`, `--layers-key` or
+  `--layers-reseal` on a door that hosts no layer (no `layers/`, or not a QUIC door) is refused
+  rather than ignored.
 
 ### The HTTPS front: a participant with only an HTTP client
 
@@ -433,7 +453,7 @@ prefix. To read another kernel's catalog or action manifold, connect to it:
 **A leading `~` in a config-home path** (ikigai-cli 0.1.58+). Every config-home value that
 names a path expands a leading `~` to the current user's home by one rule: a `mount` line's
 socket and certificate directory (`mount = "prefer urn:x:=~/.ikigai/x.sock"`), `files`,
-`layers.state`, `arrangement`, `browse.root` and `browse.store`, and the `--config-home` and
+`layers.state`, `layers.key`, `arrangement`, `browse.root` and `browse.store`, and the `--config-home` and
 `--files` flags. Since 0.1.59 the `--mount`/`--override`/`--prefer` flags' targets do too, so
 `--mount 'urn:x:=~/x.sock'` works even though no shell expands a `~` that follows `=`. Only `~`
 and `~/…` are expanded. Another user's `~name/…`, and any `~` while `HOME` is unset, stop the

@@ -152,6 +152,9 @@ async-trait = "0.1"
 
 [dev-dependencies]
 futures = { workspace = true }
+# `tests/layer_door.rs` and `layers.rs`'s own tests mint a throwaway age identity, the key a layer
+# host (ikigai-layers 0.3.0) seals its state to, as `age-keygen -o` would.
+age = { workspace = true }
 # What "done" means for a module, as one test — run here over the two kernels this crate
 # COMPOSES (`kernel()` and `kernel_for()`), not over a module's own space. See
 # `tests/conformance.rs` for what that changes: the walk fires endpoints under root, and a

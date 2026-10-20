@@ -147,6 +147,9 @@ toml = "0.8"
 # (`ikigai_layers::grants`, the library behind `ikigai-layers grants <config dir>`), so the test
 # proves the door serves the pair of files that generator writes, not a hand-copied imitation.
 ikigai-layers = { workspace = true }
+# The layer suites mint a throwaway age identity for `serve --layers-key` (ikigai-layers 0.3.0
+# seals its state to one), as `age-keygen -o` would; never a key checked into the tree.
+age = { workspace = true }
 # `tests/layers_serve.rs` signs decision, block and label links the way the Mac and the edge do
 # (Ed25519 over the link's payload), so the layer-door surface test can show that a participant
 # holding a VALID link is still refused by its own capability, not only by a door with no key

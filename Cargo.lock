@@ -3005,6 +3005,7 @@ dependencies = [
 name = "ikigai-cli"
 version = "0.1.66"
 dependencies = [
+ "age",
  "async-trait",
  "base64 0.22.1",
  "crossterm",
@@ -3111,6 +3112,7 @@ dependencies = [
 name = "ikigai-embedded"
 version = "0.1.66"
 dependencies = [
+ "age",
  "async-trait",
  "base64 0.22.1",
  "chrono",
@@ -3294,10 +3296,11 @@ dependencies = [
 
 [[package]]
 name = "ikigai-layers"
-version = "0.2.9"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "209a6b8891807ae2c4e878c885011c8ea572e8990f592cad2bcf3653483234f4"
+checksum = "115d9648a7952b8b1ba841718441230f56c59ad706646951e29d29633aaf5d13"
 dependencies = [
+ "age",
  "async-trait",
  "base64 0.22.1",
  "futures",
@@ -3307,11 +3310,13 @@ dependencies = [
  "ikigai-jsonld",
  "ikigai-shacl",
  "ikigai-store",
+ "oxigraph",
  "oxrdf",
  "oxrdfio",
  "oxttl",
  "serde",
  "serde_json",
+ "spargebra",
  "toml 0.8.23",
 ]
 
