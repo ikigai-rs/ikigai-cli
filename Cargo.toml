@@ -1556,7 +1556,15 @@ ikigai-repo = "0.2.0" # 0.2.0 = naming only: names its `space()` `urn:iki:space:
 # Repository browsing (urn:repo:{root}:tree/file/state/hash/explain +
 # urn:iki:annotation:*) over configured roots — opt-in via `browse.root` config lines
 # (embedded host).
-ikigai-browse = "0.18.10" # 0.18.10 = on ikigai-a11y 0.3.0, the naming wave (ledger #11), and the core floor it
+ikigai-browse = "0.19.0" # 0.19.0 = the review pass and the judge loop stop at the first `Refused` or `RetryAfter`,
+# as they already stopped at a `Denied`, and return that error with its class kept (ledger #1932). This host mounts
+# browse's review family over its `browse.root`s, so a model call refused (an llm 0.16 backend 401) or rate-limited
+# (a 429, or the throttle's budget) now answers ONE typed error carrying its delay, instead of being collapsed region
+# by region while the remaining regions spend calls. An `Endpoint` (a 500) stays the region's own. 0.19.0 also carries
+# the never-published 0.18.11 (an llm 0.15 / http 0.2 dev-dependency bump). Its floors (core/vocab 0.1.108, llm
+# 0.16.0, http 0.3.0, conformance 0.10.0) are this workspace's already. ⚠ Under 0.x the caret is a RANGE: this pin is
+# `>=0.19.0, <0.20.0`, and the old `"0.18.10"` was a ceiling below this release.
+# 0.18.10 = on ikigai-a11y 0.3.0, the naming wave (ledger #11), and the core floor it
 # imposes. Between 0.18.5 and 0.18.10: one writer per store handle narrowed to the mount graph (ledger #1324), and a
 # paged findings listing that refuses an unpaged answer past 32 MiB (ledger #1663).
 # Beneath it, still true: 0.18.5 is a CORRECTNESS floor (ledger #1207, #1253): every archive record
