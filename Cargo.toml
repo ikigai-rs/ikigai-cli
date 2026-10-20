@@ -91,6 +91,34 @@ members = ["crates/*"]
 # whose tree version is ahead of crates.io. ⚠ So this comment names NO crate as
 # behind or ahead — that was a snapshot of the registry, true for one afternoon
 # and wrong the next, in the most authoritative place in the tree. Ask the gate.
+# 0.1.67: LAYER STATE ENCRYPTED AT REST (ikigai-layers 0.3.0, ledger #2011), A --prefer MOUNT THAT
+# CARRIES A RUN (ledger #1942), AND A DOOR'S OWN HTML ERROR PAGE (ledger #2025).
+# Stacks on 0.1.66, which is already on crates.io. Nothing unpublished sits beneath it. It carries
+# PRs #559-#563.
+# Operators, read these first:
+# - A door that hosts layers needs a KEY (PR #563, ikigai-layers 0.3.0): every layer state file is
+#   age ciphertext sealed to the host's key, an age identity file (`age-keygen -o <file>`) named by
+#   `--layers-key <file>` on `serve quic://`, else `layers.key` (instance-scoped) in config.toml.
+#   There is no default and no environment variable, so a layer door started as before REFUSES TO
+#   START, naming the flag. State an earlier release wrote is refused until ONE start with
+#   `--layers-reseal` beside the key seals it in place (rerunning it is safe; later starts leave it
+#   off). The same flag rotates the key: new identity first in the file, old after it, one reseal
+#   start, then drop the old line. 0.3.0 also bounds Turtle nesting before it parses a write
+#   (ledger #2015). The banner names the recipient (`age1…`) the state is sealed to.
+# - A `--prefer` mount carries a v9 client's run (PR #561, ledger #1942): `serve <sock> --prefer
+#   urn:x:=<peer>` forwards the run's deadline to the peer as time left. Before, the lazily dialed
+#   mount dropped it and the peer saw no deadline. The retry count stops at the door (serve sets no
+#   retry budget), and a spent deadline is answered, not refused. ikigai-python's and ikigai-deno's
+#   pinned real-door tests see `left=<about 10>` where they saw `left=none` (ledger #1991).
+# - ikigai-web (PR #562, ledger #2025): `EdgeConfig::error_page` lets a door write its own HTML
+#   error page for a browser navigation; JSON clients, curl and htmx fragments keep today's bodies,
+#   and the status and headers never change. Unset, nothing changes.
+# - Pin moves: ikigai-browse 0.19.0 (PR #560: the review loops stop typed at `Refused` and
+#   `RetryAfter`), ikigai-meeting 0.4.0 (PR #559: on ikigai-http 0.3.0, so the transitional second
+#   ikigai-http copy in ikigai-embedded is gone; Zoom 401/403 are `Refused`).
+# ⚠ Source-level: `ikigai_embedded::layers::open` takes `Flags { state, key, reseal }` and `Hosted`
+#   gains four fields (PR #563); only this workspace calls it. `EdgeConfig` gains `error_page`
+#   (every literal in ~/git-personal spreads `..EdgeConfig::default()`).
 # 0.1.66: THE FAILURE CLASSES (CORE 0.1.108), WIRE V9, AND THE EDGE'S DECIDED STATUSES (ledger #1546).
 # Stacks on 0.1.65, which is already on crates.io. Nothing unpublished sits beneath it. It carries
 # PRs #554-#557.
@@ -962,7 +990,7 @@ members = ["crates/*"]
 #
 # 0.1.36 was THE SECURITY RELEASE from the review-value experiment (ledger #723, #733, #741, #738).
 #
-version = "0.1.66"
+version = "0.1.67"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -1969,17 +1997,17 @@ ikigai-bayes = "0.1.0"
 # that reconciles personal/org/rdf THROUGH the kernel. Published since 0.1.14 (#296):
 # ikigai-embedded depends on it, and a path-only dependency makes every crate above it
 # in this workspace unpublishable, the `ikigai` binary included.
-ikigai-view = { path = "crates/ikigai-view", version = "0.1.66" }
+ikigai-view = { path = "crates/ikigai-view", version = "0.1.67" }
 # Timezone conversion (urn:tz:convert, IANA/DST-correct) + a zoned clock (urn:tz:now).
 # Published since 0.1.14 (#296); keeps the tzdata dependency out of the lean modules.
-ikigai-tz = { path = "crates/ikigai-tz", version = "0.1.66" }
+ikigai-tz = { path = "crates/ikigai-tz", version = "0.1.67" }
 # The intray / tuplespace (urn:space:{name}: out/rd). Published since 0.1.14 (#296);
 # a dir-backed space under file_root. The scheduling booking-inbox drops into it.
-ikigai-intray = { path = "crates/ikigai-intray", version = "0.1.66" }
+ikigai-intray = { path = "crates/ikigai-intray", version = "0.1.67" }
 # Outbound email (urn:email:send): a cap-gated Sink submitting over SMTP to a local MTA
 # that relays onward. Published since 0.1.14 (#296); the contact service and the
 # scheduling confirm-link both need it.
-ikigai-email = { path = "crates/ikigai-email", version = "0.1.66" }
+ikigai-email = { path = "crates/ikigai-email", version = "0.1.67" }
 # Public form intake (urn:*:submit): parse an untrusted urlencoded/JSON body, validate
 # declared fields, drop an escaped s-expr tuple into a space. Contact + booking share it.
 # API history — 0.1.17 = `IntakeField::max_len` and `IntakeField::legacy` (#300, the bounded
@@ -1991,9 +2019,9 @@ ikigai-email = { path = "crates/ikigai-email", version = "0.1.66" }
 # the caret resolves against the registry — `^0.1.14` picked the live 0.1.16, which
 # predates both methods, and ikigai-embedded failed to verify with four E0599s. Nothing
 # else catches this: the gates pass, CI passes, and the break waits for release day.
-ikigai-intake = { path = "crates/ikigai-intake", version = "0.1.66" }
+ikigai-intake = { path = "crates/ikigai-intake", version = "0.1.67" }
 # WebAuthn (ES256) assertion verifier: the second factor gating the edge decision links.
-ikigai-passkey = { path = "crates/ikigai-passkey", version = "0.1.66" }
+ikigai-passkey = { path = "crates/ikigai-passkey", version = "0.1.67" }
 # Sibling workspace crates pinned to the current release: a published crate requires
 # its siblings at this version too, so ANY subset of the workspace can publish in
 # dependency order (resolve → wire → engine → …) and a crate never builds against an
@@ -2001,15 +2029,15 @@ ikigai-passkey = { path = "crates/ikigai-passkey", version = "0.1.66" }
 # — `crates/ikigai-cli/tests/lockstep_pins.rs` enforces it here — and says nothing
 # about the REGISTRY, which only matches the tree after a full wave. The two parted for
 # weeks without anything saying so (ledger #494); `registry-drift` is what says so now.
-ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.1.66" } # naming_entry: the most specific catalog row names a target (the engine's trace labels use it)
-ikigai-wire = { path = "crates/ikigai-wire", version = "0.1.66" } # v6 hello + ErrorTyped/WireError
+ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.1.67" } # naming_entry: the most specific catalog row names a target (the engine's trace labels use it)
+ikigai-wire = { path = "crates/ikigai-wire", version = "0.1.67" } # v6 hello + ErrorTyped/WireError
 # API history — 0.1.16 = `Spawner::width()`: the scheduler answers how many tasks make progress AT ONCE
 # (1 for `single`), which is what the engine's fan-out routing sizes itself by. Core
 # defaults that method to `None` = unknown, and a caller reading unknown as "wide" is the
 # ~1.8x-slower case — so below this floor the routing is silently inert, not merely older.
 # API history — 0.1.15 = SchedulerSpec: a spec parsed WITHOUT building, so `--scheduler pool:xyz` is
 # rejected while argv is read instead of by spawning a threadpool to find out.
-ikigai-scheduler = { path = "crates/ikigai-scheduler", version = "0.1.66" }
+ikigai-scheduler = { path = "crates/ikigai-scheduler", version = "0.1.67" }
 # ⚠⚠ EXEMPT from the lockstep above — deliberately, and this pin must NOT be raised to the
 # workspace version. ikigai-time is the eighteenth member and the only one that does not take
 # `version.workspace = true`: it declares its own `version` in its own manifest and is
@@ -2041,7 +2069,7 @@ ikigai-scheduler = { path = "crates/ikigai-scheduler", version = "0.1.66" }
 ikigai-time = { path = "crates/ikigai-time", version = "0.4.2" }
 # Inbound HTTP transport (method↔verb, path↔iri, cap-per-request). A published
 # transport like ipc/quic/mcp; only the `web`-featured CLI pulls it (and Tokio).
-ikigai-web = { path = "crates/ikigai-web", version = "0.1.66" }
+ikigai-web = { path = "crates/ikigai-web", version = "0.1.67" }
 futures = "0.3"
 # Turtle parsing for the engine's plan face — reading a stored `ik:Process` graph back.
 # Default features only: no tokio, so `ikigai-engine` still compiles to wasm. oxttl pins
