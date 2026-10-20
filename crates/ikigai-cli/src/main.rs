@@ -82,7 +82,10 @@ usage:
                                start with a mount or a ceiling that opens another face
   ikigai serve <s> --prefer …  a served host may take --mount/--override/--prefer too, so IT owns
                                the topology: a local client reaches a peer through this socket
-                               without holding its certs or finding it itself
+                               without holding its certs or finding it itself. A v9 client's
+                               deadline reaches the peer as time left; its retry count stops
+                               here (serve sets no retry budget, so the peer uses its own), and
+                               a spent deadline is answered, not refused
   ikigai serve … --code-signer <k>  accept SIGNED programs (urn:lisp:run) vouched for by key
                                resource <k> (repeatable; --code-signers-dir sets where
                                urn:codekey:{file} reads from). Without it the door is unbound.
@@ -2643,6 +2646,19 @@ impl ikigai_resolve::Resolver for LazyResolver {
     ) -> Result<(ikigai_core::Representation, ikigai_resolve::CacheStatus), ikigai_core::Error>
     {
         self.get()?.issue_as(request, capability)
+    }
+
+    /// Forwarded, or the run is lost here (ledger #1942): the trait's default DROPS the
+    /// context and resolves as `issue_as`, so a `--prefer` peer was sent a plain `IssueAs`
+    /// and never saw the deadline of the run the door minted for a v9 client.
+    fn issue_as_in_run(
+        &self,
+        request: ikigai_core::Request,
+        capability: &ikigai_core::Capability,
+        run: &ikigai_resolve::RunContext,
+    ) -> Result<(ikigai_core::Representation, ikigai_resolve::CacheStatus), ikigai_core::Error>
+    {
+        self.get()?.issue_as_in_run(request, capability, run)
     }
 
     async fn issue_as_async(
