@@ -32,7 +32,8 @@
 //!   `Unsupported`→405 with `Allow` (a verb) or 501 (a facility), else 500. The body is the message as
 //!   `text/plain`, or a typed JSON object (see [`error_json`]) when [`EdgeConfig::error_body`]
 //!   asks for [`ErrorBody::Json`]. A plain-text error is a minimal HTML page for a client that
-//!   asks for `text/html` over `text/plain` (a browser), with `Vary: Accept` either way.
+//!   asks for `text/html` over `text/plain` (a browser), with `Vary: Accept` either way; a
+//!   door writes that page itself with [`EdgeConfig::error_page`] ([`ErrorPageFn`]).
 //! - **response headers from an endpoint**: an endpoint that needs `Set-Cookie`,
 //!   `Cache-Control`, `Vary`, `Content-Disposition`, `Content-Language` or `Location` answers an
 //!   [`HTTP_ENTITY`] envelope ([`with_headers`]); the door checks each header against a closed
@@ -71,7 +72,7 @@ pub use origin::{InvalidOrigin, OriginCheck};
 pub use push::{PushConfig, DEFAULT_PUSH_PATH};
 pub use source_limit::{source_key, SourceLimits, SourceRate, DEFAULT_MAX_SOURCES};
 
-use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request, Verb};
+use ikigai_core::{ArgRef, Capability, FailureClass, Iri, Kernel, Request, Verb};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -293,8 +294,124 @@ fn refusal_resp(refusal: &Refusal) -> Resp {
         429 => (429, "Too Many Requests"),
         _ => (403, "Forbidden"),
     };
-    Resp::text(status, phrase, &refusal.reason)
+    // The class the decided status table (ledger #1546) gives the status: `403` is the
+    // caller's capability, `429` a stated wait, the rest a wrong request.
+    let class = match status {
+        403 => FailureClass::Denied,
+        429 => FailureClass::RetryAfter,
+        _ => FailureClass::Permanent,
+    };
+    Resp {
+        refusal: Some(refusal.clone()),
+        class: Some(class),
+        ..Resp::text(status, phrase, &refusal.reason)
+    }
 }
+
+/// What an [`ErrorPageFn`] is shown of the error it may write a page for. Fields are added as
+/// doors need them (`#[non_exhaustive]`), so a door reads them and never builds one.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct ErrorView<'a> {
+    /// The status the answer carries, whatever page is written: the hook chooses the body,
+    /// never the status.
+    pub status: u16,
+    /// The status's reason phrase (`"Forbidden"`).
+    pub reason: &'a str,
+    /// The sentence the answer would carry as `text/plain`, unescaped: the error's message,
+    /// the refusal's reason, or the edge's own sentence. Escape it before putting it in HTML
+    /// (`ikigai_fn::html::html_text`).
+    pub message: &'a str,
+    /// The typed kernel error, when the answer reports one (a `Denied` read, a `NotFound`).
+    pub error: Option<&'a ikigai_core::Error>,
+    /// The [`AdmitFn`]'s refusal, when the door refused the request before anything answered.
+    pub refusal: Option<&'a Refusal>,
+    /// The failure class (ledger #1546): the error's [`Error::class`](ikigai_core::Error::class),
+    /// or for a refusal the class its status is decided as (`403` denied, `429` retry-after,
+    /// the rest permanent), and retry-after for a per-source rate limit. `None` when the edge
+    /// answered on its own with no class decided (a `405`, `406`, `413`, a route's `400`).
+    pub class: Option<FailureClass>,
+    /// Whether the browser is navigating to a page (`Sec-Fetch-Mode: navigate`, a link
+    /// followed, a URL typed, a form submitted) rather than fetching from script (`cors`,
+    /// `same-origin`). A door may write a whole page for the first and `None` for the second.
+    pub navigation: bool,
+}
+
+/// A door's own HTML page for an error a browser asked for as a page (ledger #2025): a
+/// refusal in the door's own shell, styled, with whatever the error calls for on it (a
+/// sign-in, a way back). `Some(html)` is the body, served as `text/html; charset=utf-8`;
+/// `None` keeps the minimal page this crate writes.
+///
+/// It is asked only when all of these hold, so a JSON client, a script and curl never see
+/// the door's HTML:
+/// - the answer is an error (`>= 400`) whose body is the sentence (`text/plain`); a door
+///   answering [`ErrorBody::Json`] keeps its JSON;
+/// - `Accept` names `text/html` over `text/plain` (the rule of [`EdgeConfig::error_body`]);
+/// - the request carries `Sec-Fetch-Mode`, which only a browser sends, and is not htmx
+///   asking for a fragment (`HX-Request: true`).
+///
+/// The status and every header the answer was built with (`Retry-After`, `Allow`) are
+/// unchanged, and the edge policy applies to the page as to any answer: the door's
+/// `Content-Security-Policy` governs it, so an inline `<style>` or `<script>` the CSP does not
+/// allow is blocked; link the door's own stylesheet instead. With a hook set, `Vary` names
+/// `Sec-Fetch-Mode` and `HX-Request` beside `Accept`.
+///
+/// ⚠ A browser sends `Sec-Fetch-Mode` only to a potentially trustworthy origin (HTTPS or
+/// `localhost`), so over plain `http://` to a LAN address the hook is never asked.
+///
+/// ```
+/// use ikigai_core::{Description, EndpointSpace, Error, Exact, FailureClass, FnEndpoint, Invocation, Kernel, Verb};
+/// use ikigai_fn::html::html_text;
+/// use ikigai_web::{EdgeConfig, ErrorPageFn, ErrorView, HttpRequest};
+/// use std::sync::Arc;
+/// use tokio::io::{AsyncReadExt, AsyncWriteExt};
+///
+/// # #[tokio::main]
+/// # async fn main() {
+/// let ledger = FnEndpoint::new("ledger", |_inv: &Invocation<'_>| -> ikigai_core::Result<_> {
+///     Err(Error::Denied("sign in to read this ledger".into()))
+/// })
+/// .with_description(Description::new("ledger").verb(Verb::Source));
+/// let kernel = Arc::new(Kernel::new(Arc::new(
+///     EndpointSpace::new().bind(Exact::new("urn:test:ledger"), ledger),
+/// )));
+/// // A denied page navigation gets the door's own page; anything else keeps the default.
+/// let error_page: ErrorPageFn = Arc::new(|req: &HttpRequest, view: &ErrorView<'_>| {
+///     (view.class == Some(FailureClass::Denied) && view.navigation).then(|| {
+///         format!(
+///             "<!DOCTYPE html><html lang=\"en\"><title>Sign in</title><main><h1>Sign in</h1>\
+///              <p>{}</p><a href=\"/signin?back={}\">Sign in with a passkey</a></main></html>",
+///             html_text(view.message),
+///             html_text(&req.path),
+///         )
+///     })
+/// });
+/// let config = EdgeConfig { error_page: Some(error_page), ..EdgeConfig::default() };
+/// let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+/// let addr = listener.local_addr().unwrap();
+/// tokio::spawn(async move {
+///     let _ = ikigai_web::serve_with_listener(kernel, ikigai_web::public_cap(), listener, config).await;
+/// });
+/// async fn send(addr: std::net::SocketAddr, raw: &str) -> String {
+///     let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+///     c.write_all(raw.as_bytes()).await.unwrap();
+///     let mut out = Vec::new();
+///     c.read_to_end(&mut out).await.unwrap();
+///     String::from_utf8_lossy(&out).into_owned()
+/// }
+/// let browser = send(
+///     addr,
+///     "GET /test/ledger HTTP/1.1\r\nHost: localhost\r\nAccept: text/html\r\nSec-Fetch-Mode: navigate\r\n\r\n",
+/// )
+/// .await;
+/// assert!(browser.starts_with("HTTP/1.1 403 Forbidden"), "{browser}");
+/// assert!(browser.contains("Sign in with a passkey"), "{browser}");
+/// // curl asking for HTML sends no fetch metadata, and gets the default page.
+/// let curl = send(addr, "GET /test/ledger HTTP/1.1\r\nHost: localhost\r\nAccept: text/html\r\n\r\n").await;
+/// assert!(curl.starts_with("HTTP/1.1 403 Forbidden") && !curl.contains("passkey"), "{curl}");
+/// # }
+/// ```
+pub type ErrorPageFn = Arc<dyn Fn(&HttpRequest, &ErrorView<'_>) -> Option<String> + Send + Sync>;
 
 /// The largest request body accepted from a client, in bytes.
 ///
@@ -390,7 +507,11 @@ pub struct EdgeConfig {
     /// Either way, a `text/plain` error body is answered as a minimal HTML page to a client
     /// that names `text/html` in `Accept` and prefers it to `text/plain` (a browser
     /// navigating), and every such answer carries `Vary: Accept`. A JSON body is left as it is.
+    /// [`error_page`](Self::error_page) lets the door write that page itself.
     pub error_body: ErrorBody,
+    /// The door's own page for an error a browser asked for as a page — see [`ErrorPageFn`].
+    /// `None` (the default) answers the minimal page, exactly as before the hook existed.
+    pub error_page: Option<ErrorPageFn>,
     /// The response headers this door accepts from an endpoint's [`HTTP_ENTITY`] envelope
     /// (see [`with_headers`]), out of the closed list [`EndpointHeader::ALL`]. An envelope
     /// asking for a header not listed here is refused with `500` naming it. Default
@@ -538,6 +659,7 @@ impl Default for EdgeConfig {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             push: None,
             error_body: ErrorBody::Text,
+            error_page: None,
             endpoint_headers: EndpointHeader::DEFAULTS.to_vec(),
             source_limits: None,
         }
@@ -1115,6 +1237,14 @@ struct Resp {
     vary: Vec<String>,
     /// Extra headers layered on by the edge policy (security headers, CORS).
     headers: Vec<(String, String)>,
+    /// The typed kernel error this answer reports, when it reports one: what an
+    /// [`ErrorPageFn`] is shown as [`ErrorView::error`].
+    error: Option<ikigai_core::Error>,
+    /// The [`AdmitFn`]'s refusal this answer reports, when it reports one
+    /// ([`ErrorView::refusal`]).
+    refusal: Option<Refusal>,
+    /// The failure class of the error or refusal ([`ErrorView::class`]).
+    class: Option<FailureClass>,
     /// An answer to HEAD: the head GET would carry, `Content-Length` included, and no
     /// content (RFC 9110 §9.3.2). Set once, by [`into_head`](Self::into_head), after the answer
     /// is complete, so every path that builds a body builds GET's and none has to know the
@@ -1152,6 +1282,9 @@ impl Resp {
             cache_control: None,
             vary: Vec::new(),
             headers: Vec::new(),
+            error: None,
+            refusal: None,
+            class: None,
             head_only: false,
         }
     }
@@ -1466,7 +1599,7 @@ async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::
     // `?description` face and dispatch alike (ledger #879). Nothing below has run, so a
     // refused request learns nothing about what is behind the door.
     if let Some(refusal) = shared.config.admit_fn.as_ref().and_then(|f| f(&req)) {
-        let mut resp = finish(refusal_resp(&refusal), &req);
+        let mut resp = finish(refusal_resp(&refusal), &req, &shared.config);
         apply_edge_policy(&mut resp, &shared.config, &req, None);
         return write_within(&mut sock, resp, wt).await;
     }
@@ -1478,7 +1611,11 @@ async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::
         }
     }
     let matched = table.match_path(&req.path);
-    let mut resp = finish(respond(&shared, &req, matched.as_ref()).await, &req);
+    let mut resp = finish(
+        respond(&shared, &req, matched.as_ref()).await,
+        &req,
+        &shared.config,
+    );
     apply_edge_policy(&mut resp, &shared.config, &req, matched.as_ref());
     write_within(&mut sock, resp, wt).await
 }
@@ -1488,8 +1625,8 @@ async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::
 /// alone ([`Resp::into_head`]). Every path that writes an answer to a request it has parsed
 /// goes through here, so no path has to remember either rule (ledger #117: a refusal written
 /// on its own path sent its body to HEAD).
-fn finish(resp: Resp, req: &HttpRequest) -> Resp {
-    let resp = error_page::negotiate(resp, req.header("accept"));
+fn finish(resp: Resp, req: &HttpRequest, config: &EdgeConfig) -> Resp {
+    let resp = error_page::negotiate(resp, req, config);
     if req.method == "HEAD" {
         resp.into_head()
     } else {
@@ -2110,6 +2247,7 @@ fn rate_limited(config: &EdgeConfig, limited: &source_limit::Limited) -> Resp {
     };
     resp.headers
         .push(("Retry-After".to_string(), retry_after.to_string()));
+    resp.class = Some(FailureClass::RetryAfter);
     resp
 }
 
@@ -2555,6 +2693,8 @@ fn error_resp_allowing(config: &EdgeConfig, e: &ikigai_core::Error, allow: Optio
         resp.headers
             .push(("Retry-After".to_string(), seconds.to_string()));
     }
+    resp.class = Some(e.class());
+    resp.error = Some(e.clone());
     if status == 405 {
         resp.allow = allow.map(str::to_string);
     }

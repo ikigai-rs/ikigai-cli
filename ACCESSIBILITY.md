@@ -16,7 +16,9 @@ how to report a barrier. It is not a conformance claim. Adapted from the
 
 - **Error pages** from the HTTP door (`crates/ikigai-web/src/error_page.rs`): a refusal, as a page,
   for a client that names `text/html` over `text/plain` (a browser); every other client gets the
-  same sentence as text.
+  same sentence as text. A door that sets `EdgeConfig::error_page` writes that page itself for a
+  browser's request; that page, its markup and its accessibility, is the door's (gonk's, say), and
+  this repository guarantees only the status and headers it is served with.
 - **Pages from the embedded host's HTTP face**: the emailed decision, contact-block and label
   links and the passkey enrollment page (`crates/ikigai-embedded`: `decide.rs`, `contactblock.rs`,
   `passkey.rs`, all through `decide::page`), and the contact intake's redirect page
@@ -65,7 +67,9 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
 
 - `crates/ikigai-web/tests/error_pages.rs` (7 tests) and the unit tests in `error_page.rs` pin the
   page's shape (`lang`, title, `main`, `h1`), escaping, which clients get a page, `Vary: Accept`,
-  and that a JSON door and a success are left alone.
+  and that a JSON door and a success are left alone. `crates/ikigai-web/tests/door_error_page.rs`
+  pins that a door's own page keeps the status and headers, is served under the door's CSP, and
+  never reaches a JSON client, curl or an htmx fragment request.
 - `decide.rs` (`a_page_states_its_language_and_has_one_main_holding_its_content`, and the served
   decision page in `a_get_shows_the_decision_but_records_nothing`) and the intake's
   `with_a_redirect_the_response_is_an_html_page_to_the_url` pin `lang` and the one `main`;

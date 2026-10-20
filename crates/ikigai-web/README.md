@@ -103,6 +103,17 @@ Every refusal is a sentence. A client that names `text/html` in `Accept` and pre
 style or script); every other client gets `text/plain` as before. Both carry `Vary: Accept`.
 A door that chose `ErrorBody::Json` keeps JSON.
 
+A door can write that page itself (ledger #2025): `EdgeConfig::error_page` takes an
+`ErrorPageFn`, `Fn(&HttpRequest, &ErrorView) -> Option<String>`, shown the status, the
+sentence, the typed kernel error or the admission refusal, its failure class, and whether the
+browser is navigating. `Some(html)` is the body; `None` keeps the minimal page. It is asked only
+for a request a browser made (it carries `Sec-Fetch-Mode`) that is not an htmx fragment request
+(`HX-Request: true`), so curl, a script asking for JSON and htmx never get the door's HTML. Only
+the body changes: the status and the headers (`Retry-After`, `Allow`) are the answer's own, the
+door's CSP governs the page, and `Vary` also names `Sec-Fetch-Mode` and `HX-Request`. A browser
+sends fetch metadata only to HTTPS or `localhost`, so a plain-`http` LAN door keeps the minimal
+page.
+
 A `HEAD` is answered with the head GET would carry (its `Content-Length` included) and no
 content on every path: the adapter's answers, the admission refusal, the push stream's
 refusals, every framing refusal `read_request` makes (its method is read off the raw request

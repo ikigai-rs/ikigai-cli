@@ -1,27 +1,76 @@
-//! An error a browser asked for as a page (ledger #117).
+//! An error a browser asked for as a page (ledger #117), and the door's own page for it
+//! (ledger #2025).
 //!
 //! Every refusal this door writes is a sentence. A client that names `text/html` in `Accept`
 //! (a browser navigating) and prefers it to `text/plain` gets that sentence as a minimal,
 //! accessible HTML page; anything else (curl's `*/*`, a script asking for JSON, no `Accept`
 //! at all) gets it as `text/plain`, exactly as before. The status is the same either way.
-use crate::{bare_media, match_of, parse_accept, MatchedBy, Resp};
+//!
+//! A door with an [`ErrorPageFn`](crate::ErrorPageFn) is asked for the page first, when the
+//! client is a browser (it sent `Sec-Fetch-Mode`) and not htmx asking for a fragment
+//! (`HX-Request`); `None` from the hook keeps the minimal page.
+use crate::{
+    bare_media, match_of, parse_accept, EdgeConfig, ErrorView, HttpRequest, MatchedBy, Resp,
+};
 use ikigai_fn::html::html_text;
 
 /// Answer `resp` as the client asked, when it is an error whose body is a plain sentence:
 /// rewritten as a page for a client that asks for HTML, and in either case marked `Vary:
 /// Accept`, because the body now depends on it (a `404` is cacheable by default, RFC 9110
 /// §15.1). Any other answer, including a JSON error body a door chose, is left alone.
-pub(crate) fn negotiate(mut resp: Resp, accept: Option<&str>) -> Resp {
+///
+/// The page is the door's own ([`EdgeConfig::error_page`]) when it has one, the request is
+/// one a browser made ([`from_a_browser`]) and the hook answers `Some`; otherwise the minimal
+/// [`page`]. With a hook set, `Vary` also names `Sec-Fetch-Mode` and `HX-Request`, which then
+/// select the body too. Only the body and its type change: the status and every header the
+/// answer already carries (`Retry-After`, `Allow`) are the ones it was built with, and the
+/// edge policy (the door's CSP among it) is applied after this, to whichever page it is.
+pub(crate) fn negotiate(mut resp: Resp, req: &HttpRequest, config: &EdgeConfig) -> Resp {
     if resp.status < 400 || bare_media(&resp.content_type) != "text/plain" {
         return resp;
     }
     resp.add_vary("Accept");
-    if wants_html(accept) {
-        let message = String::from_utf8_lossy(&resp.body).into_owned();
-        resp.body = page(resp.status, resp.reason, &message).into_bytes();
-        resp.content_type = "text/html; charset=utf-8".to_string();
+    let hook = config.error_page.as_ref();
+    if hook.is_some() {
+        resp.add_vary("Sec-Fetch-Mode");
+        resp.add_vary("HX-Request");
     }
+    if !wants_html(req.header("accept")) {
+        return resp;
+    }
+    let message = String::from_utf8_lossy(&resp.body).into_owned();
+    let door_page = hook.filter(|_| from_a_browser(req)).and_then(|hook| {
+        let view = ErrorView {
+            status: resp.status,
+            reason: resp.reason,
+            message: &message,
+            error: resp.error.as_ref(),
+            refusal: resp.refusal.as_ref(),
+            class: resp.class,
+            navigation: req.header("sec-fetch-mode") == Some("navigate"),
+        };
+        hook(req, &view)
+    });
+    resp.body = door_page
+        .unwrap_or_else(|| page(resp.status, resp.reason, &message))
+        .into_bytes();
+    resp.content_type = "text/html; charset=utf-8".to_string();
     resp
+}
+
+/// Whether a browser made the request, so a door's own page may answer it: it carries the
+/// fetch metadata only a browser sends (`Sec-Fetch-Mode`, W3C Fetch Metadata), and it is not
+/// htmx asking for a fragment (`HX-Request: true`), which would swap a whole page into part of
+/// one. curl naming `text/html` carries neither, and gets the minimal page.
+///
+/// ⚠ A browser sends fetch metadata only to a potentially trustworthy origin (HTTPS, or
+/// `localhost`), so a door served as plain `http://` on a LAN address never offers its page
+/// and answers the minimal one.
+fn from_a_browser(req: &HttpRequest) -> bool {
+    req.header("sec-fetch-mode").is_some()
+        && !req
+            .header("hx-request")
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
 }
 
 /// Whether `Accept` asks for HTML over plain text: `text/html` NAMED (a wildcard tolerates

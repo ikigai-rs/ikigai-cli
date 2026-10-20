@@ -429,7 +429,7 @@ pub(crate) async fn stream(
     // Every refusal below is finished like any other answer: a page for a browser, and the
     // head alone for HEAD (ledger #117).
     let refuse = |resp: Resp| {
-        let mut resp = finish(resp, &req);
+        let mut resp = finish(resp, &req, config);
         apply_edge_policy(&mut resp, config, &req, None);
         resp
     };
