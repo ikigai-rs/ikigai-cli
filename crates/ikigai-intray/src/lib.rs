@@ -630,7 +630,7 @@ const MATCH_REMEDY: &str = "A match is evaluated against one tuple's graph and n
      this host: put the data it needs in the tuple.";
 
 /// Refuse a tuple that nests RDF 1.2 triple terms deeper than
-/// [`ikigai_store::depth::MAX_RDF_NESTING`] (64), as a typed `InvalidArgument` on `content`,
+/// [`ikigai_rdf::MAX_TURTLE_NESTING`] (64), as a typed `InvalidArgument` on `content`,
 /// before anything is written (ledger #992).
 ///
 /// Every `match=` parses every pending tuple as Turtle ([`tuple_matches`]), and in a build
@@ -644,28 +644,30 @@ const MATCH_REMEDY: &str = "A match is evaluated against one tuple's graph and n
 /// match, since one planted tuple failing every caller's match would be the same denial by
 /// another route.
 ///
-/// The scan is the store's ([`ikigai_store::depth::check_rdf_nesting`]), which reads text
-/// the way oxttl's STRICT Turtle lexer does, the mode a match parses in. ⚠ It reads text, not
+/// The scan is RDF's ([`ikigai_rdf::check_turtle_nesting`]), whose lenient reading
+/// also bounds the strict Turtle parser a match uses: the strict parser stops at the first
+/// error, before any later nesting can be built. ⚠ It reads text, not
 /// intent: a tuple that is not RDF but has more than 64 unclosed `<<` outside quotes, `<…>`
 /// and `#` comments (a long C++ `cout << …` chain, say) is refused too. Seal or encode such a
 /// tuple; a sealed one is ciphertext and never reads that way.
 fn check_tuple_nesting(content: &[u8]) -> Result<()> {
-    ikigai_store::depth::check_rdf_nesting(content, RdfFormat::Turtle, "content").map_err(|e| {
-        match e {
-            Error::InvalidArgument { .. } => Error::InvalidArgument {
-                name: "content".to_string(),
-                detail: format!(
-                    "this tuple, read as Turtle the way every `match=` reads it, nests RDF 1.2 \
+    // Tuples may be arbitrary bytes. Replacing invalid UTF-8 preserves the ASCII Turtle
+    // delimiters the scan reads, without refusing binary content or changing stored bytes.
+    let text = String::from_utf8_lossy(content);
+    ikigai_rdf::check_turtle_nesting(&text, "content").map_err(|e| match e {
+        Error::InvalidArgument { .. } => Error::InvalidArgument {
+            name: "content".to_string(),
+            detail: format!(
+                "this tuple, read as Turtle the way every `match=` reads it, nests RDF 1.2 \
                      triple terms deeper than {} (MAX_RDF_NESTING), counting `<<( … )>>` and \
                      `<< … >>` outside literals, IRIs and comments: the RDF library copies a \
                      nested triple term recursively, once per level, where a stack overflow \
                      aborts the whole host. Nothing was dropped. A tuple that is not RDF and \
                      only reads this way: seal or encode it",
-                    ikigai_store::depth::MAX_RDF_NESTING
-                ),
-            },
-            other => other,
-        }
+                ikigai_rdf::MAX_TURTLE_NESTING
+            ),
+        },
+        other => other,
     })
 }
 

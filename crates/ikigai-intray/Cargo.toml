@@ -57,6 +57,9 @@ spargebra = { version = "0.4", features = ["sep-0006"] }
 # so an in-bounds `match=` could plan uncancellably for minutes, and the overdue cap now reserves its slot
 # at start. A real FILTER closing a group now counts that group into the enclosing join. No signature changed.
 ikigai-store = "0.2.21"
+# 0.2.1 first exports check_turtle_nesting and MAX_TURTLE_NESTING.
+# The host already resolves 0.2.6; intray needs only this API floor.
+ikigai-rdf = "0.2.1"
 
 [dev-dependencies]
 futures = { workspace = true }

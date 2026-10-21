@@ -25,7 +25,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 const PROBE: &str = "IKIGAI_INTRAY_TUPLE_NESTING_PROBE";
-/// `ikigai_store::depth::MAX_RDF_NESTING`, restated so a change upstream is noticed here.
+/// `ikigai_rdf::MAX_TURTLE_NESTING`, restated so a change upstream is noticed here.
 const BOUND: usize = 64;
 /// The tuple every probe drops beside the planted one, and the only one that can match.
 const SHALLOW: &[u8] = b"<urn:a> <urn:b> \"c\" .";
@@ -168,4 +168,30 @@ fn out_refuses_a_tuple_nested_past_the_bound_and_keeps_one_at_it() {
     )
     .expect("match");
     assert_eq!(String::from_utf8_lossy(&listed.bytes).trim(), kept);
+}
+
+#[test]
+fn binary_tuples_keep_their_bytes_and_cannot_hide_deep_nesting() {
+    let k = Kernel::new(Arc::new(space(scratch("nesting-binary"))));
+    let out = Capability::scoped([CAP_OUT]);
+    let bytes = b"\xff\0binary tuple";
+    let id = drop_tuple(&k, &out, "urn:space:q", bytes).expect("binary tuple");
+    let read = block_on(
+        k.issue(
+            Request::new(Verb::Source, iri("urn:space:q"))
+                .with_arg("tuple", ArgRef::Inline(id.into_bytes())),
+            &Capability::scoped([CAP_READ]),
+        ),
+    )
+    .expect("read binary tuple");
+    assert_eq!(read.bytes, bytes);
+
+    // Invalid UTF-8 before the Turtle delimiters must not bypass the nesting scan.
+    let mut deep = vec![0xff];
+    deep.extend(nested(BOUND + 1));
+    let refused = drop_tuple(&k, &out, "urn:space:q", &deep)
+        .expect_err("deep binary tuple")
+        .to_string();
+    assert!(refused.starts_with("invalid argument `content`"));
+    assert!(refused.contains("MAX_RDF_NESTING"));
 }
