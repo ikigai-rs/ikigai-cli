@@ -1952,8 +1952,11 @@ ikigai-ledger = "0.11.0"
 # identity file, `serve --layers-key`), a wrong key is refused at open, and a state directory a host
 # before 0.3.0 wrote is refused until ONE `Migration::Reseal` open (`serve --layers-reseal`) seals
 # it in place. 0.3.0 also bounds Turtle nesting before it parses a write (ledger #2015).
-# `"0.3.0"` is `<0.4.0`.
-ikigai-layers = "0.3.0"
+# ⚠ …and 0.3.1 bounds Turtle nesting at 64 levels in `rdf::parse_turtle` before parsing
+# (ledger #2020, ikigai-rs/ikigai-layers PR 36), protecting participants reading door answers
+# through `ikigai layers post|save|follow` as well as hosts accepting writes.
+# `"0.3.1"` is `<0.4.0`.
+ikigai-layers = "0.3.1"
 # TEST-ONLY (a dev-dependency of ikigai-cli and ikigai-embedded): the layer tests mint a throwaway
 # age identity for `--layers-key`, as `age-keygen -o` would. Already in the graph through
 # ikigai-layers and ikigai-encrypt, so it adds no package. `"0.11.1"` is what ikigai-layers 0.3.0
