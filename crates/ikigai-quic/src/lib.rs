@@ -1690,6 +1690,26 @@ fn server_config_pinning(
     idle: std::time::Duration,
     alpns: Vec<Vec<u8>>,
 ) -> io::Result<quinn::ServerConfig> {
+    quic_server_config(server_tls(identity, pins, alpns)?, idle)
+}
+
+/// The TLS half of [`server_config_pinning`]: TLS 1.3 only, the client certificate checked
+/// by a [`PinnedPeer`] over `pins`, and NO session resumption.
+///
+/// ★ Resumption is off (ledger #2084). rustls never calls the client-certificate verifier
+/// on a resumed TLS 1.3 handshake: it restores the chain it stored at the full handshake and
+/// skips the CertificateRequest. With its defaults (a 256-session in-memory cache, two
+/// tickets per handshake, each resumption issuing two more) a client that once passed the
+/// verifier could keep resuming after its certificate's `notAfter` (ledger #1826) or after
+/// it was removed from a live trust list (ledger #1825), for as long as the process ran, and
+/// `QuicResolver` redials on the same client config, so its tickets were offered on every
+/// redial. With no session storage and no tickets, every connection is a full handshake and
+/// the verifier's answer is the one that holds.
+fn server_tls(
+    identity: &Identity,
+    pins: Pins,
+    alpns: Vec<Vec<u8>>,
+) -> io::Result<rustls::ServerConfig> {
     let verifier = Arc::new(PinnedPeer::pinning(pins));
     let mut tls = rustls::ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -1701,6 +1721,16 @@ fn server_config_pinning(
         )
         .map_err(other)?;
     tls.alpn_protocols = alpns;
+    tls.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    tls.send_tls13_tickets = 0;
+    Ok(tls)
+}
+
+/// A QUIC server config over a built `tls`, with the server's idle-only [`transport`].
+fn quic_server_config(
+    tls: rustls::ServerConfig,
+    idle: std::time::Duration,
+) -> io::Result<quinn::ServerConfig> {
     let quic = quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(other)?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic));
     config.transport_config(Arc::new(transport(idle)?));
@@ -4428,5 +4458,155 @@ mod keep_alive {
             matches!(reason, Some(quinn::ConnectionError::TimedOut)),
             "the server kept a ping-less client's quiet connection alive: {reason:?}"
         );
+    }
+}
+
+/// A door's verifier answers for EVERY connection, a resumed one too (ledger #2084).
+///
+/// rustls does not call the client-certificate verifier on a resumed TLS 1.3 handshake, and
+/// a client that keeps one config across dials (as [`QuicResolver`] does when it redials)
+/// offers the tickets its last connection received. These tests dial twice on ONE client
+/// endpoint, so the second dial offers the first one's tickets, and change what the verifier
+/// would say in between: the server's clock passes the certificate's `notAfter`, or the
+/// certificate leaves a live trust list. Both must refuse the second connection.
+#[cfg(test)]
+mod resumption {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    /// A server clock the test sets, in seconds since the Unix epoch.
+    #[derive(Debug)]
+    struct Clock(Arc<AtomicU64>);
+
+    impl rustls::time_provider::TimeProvider for Clock {
+        fn current_time(&self) -> Option<UnixTime> {
+            Some(UnixTime::since_unix_epoch(Duration::from_secs(
+                self.0.load(Ordering::SeqCst),
+            )))
+        }
+    }
+
+    /// Seconds since the Unix epoch at midnight UTC on `year`-01-01.
+    fn new_year(year: i32) -> u64 {
+        rcgen::date_time_ymd(year, 1, 1).unix_timestamp() as u64
+    }
+
+    /// A self-signed client identity valid from 2000 to the start of 2030.
+    fn expiring_identity() -> Identity {
+        let mut params = rcgen::CertificateParams::new(vec!["ikigai".to_string()]).unwrap();
+        params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2030, 1, 1);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        Identity {
+            cert_pem: cert.pem(),
+            key_pem: key.serialize_pem(),
+        }
+    }
+
+    /// Stand up `tls` as a server, then dial it twice from ONE client endpoint, calling
+    /// `between` after the first connection. Returns whether the server admitted each dial
+    /// (its handshake completed, so its verifier, if it ran, accepted).
+    fn dial_twice(
+        tls: rustls::ServerConfig,
+        client: &Identity,
+        server: &Identity,
+        between: impl FnOnce(),
+    ) -> (bool, bool) {
+        let config = quic_server_config(tls, Duration::from_secs(10)).unwrap();
+        let client_config =
+            client_config(client, &server.cert_pem, Duration::from_secs(10)).unwrap();
+        let rt = Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let server_endpoint =
+            quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server_endpoint.local_addr().unwrap();
+        let mut client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client_endpoint.set_default_client_config(client_config);
+
+        // One dial: the server's verdict on its handshake. On admission the server sends a
+        // byte on a stream, and the client reads it before closing: the session tickets were
+        // sent ahead of it, so a client that can resume has them by then.
+        let dial = || {
+            rt.block_on(async {
+                let connecting = client_endpoint.connect(addr, "ikigai").unwrap();
+                let incoming = server_endpoint.accept().await.unwrap();
+                let admitted = tokio::spawn(async move { incoming.await });
+                let connection = connecting.await;
+                let admitted = admitted.await.unwrap();
+                let admitted = match admitted {
+                    Ok(served) => {
+                        let mut stream = served.open_uni().await.unwrap();
+                        stream.write_all(b"!").await.unwrap();
+                        stream.finish().unwrap();
+                        if let Ok(connection) = &connection {
+                            let mut stream = connection.accept_uni().await.unwrap();
+                            stream.read_to_end(1).await.unwrap();
+                        }
+                        true
+                    }
+                    Err(_) => false,
+                };
+                if let Ok(connection) = connection {
+                    connection.close(0u32.into(), b"done");
+                }
+                admitted
+            })
+        };
+        let first = dial();
+        between();
+        let second = dial();
+        (first, second)
+    }
+
+    #[test]
+    fn a_resumed_connection_is_refused_once_the_certificate_has_expired() {
+        let (client, server) = (expiring_identity(), generate());
+        let now = Arc::new(AtomicU64::new(new_year(2029)));
+        let mut tls = server_tls(
+            &server,
+            Pins::Fixed(vec![load_cert(&client.cert_pem).unwrap()]),
+            alpn_protocols(),
+        )
+        .unwrap();
+        tls.time_provider = Arc::new(Clock(Arc::clone(&now)));
+
+        let (first, second) = dial_twice(tls, &client, &server, || {
+            now.store(new_year(2031), Ordering::SeqCst)
+        });
+        assert!(first, "a pinned certificate inside its window is admitted");
+        assert!(
+            !second,
+            "the certificate expired between the dials: its next connection, resumed or not, \
+             must be refused"
+        );
+    }
+
+    #[test]
+    fn a_resumed_connection_is_refused_once_the_certificate_leaves_the_trust_list() {
+        let (client, server) = (generate(), generate());
+        let listed = Arc::new(Mutex::new(vec![client.cert_pem.clone()]));
+        let read = Arc::clone(&listed);
+        let trust: TrustList = Arc::new(move || Ok(read.lock().unwrap().clone()));
+        let tls = server_tls(&server, Pins::Live(trust), alpn_protocols()).unwrap();
+
+        let (first, second) = dial_twice(tls, &client, &server, || listed.lock().unwrap().clear());
+        assert!(first, "a listed certificate is admitted");
+        assert!(
+            !second,
+            "the certificate left the trust list between the dials: its next connection, \
+             resumed or not, must be refused"
+        );
+    }
+
+    /// The door's config sends no tickets and keeps no sessions.
+    #[test]
+    fn a_door_offers_no_resumption() {
+        let server = generate();
+        let tls = server_tls(&server, Pins::Fixed(Vec::new()), alpn_protocols()).unwrap();
+        assert_eq!(tls.send_tls13_tickets, 0);
+        assert!(!tls.ticketer.enabled());
+        assert!(!tls.session_storage.can_cache());
     }
 }
