@@ -33,10 +33,12 @@
 //! through an **inbox → outbox → error** state machine. The [`SpaceReactor`] makes a space
 //! ACTIVE (Linda's `eval`): a `handler` file names a URI, and a dropped tuple is claimed,
 //! fired at that handler under the reactor's own scoped authority, and moved to `outbox`
-//! (handled) or `error` (dead-letter). A later slice adds **encrypt-on-drop** (sign-then-
-//! encrypt to the owner's key — both primitives already shipped). Two things Linda never had
-//! and this does: `out`/`take` are **capability-gated**, and tuples can be **sealed** so the
-//! space holds ciphertext it cannot read.
+//! (handled) or `error` (dead-letter). Two things Linda never had and this does: `out`/`take`
+//! are **capability-gated**, and tuples can be **sealed** at rest by a host-supplied
+//! [`TupleCodec`] ([`SpaceEndpoint::with_codec`], [`SpaceReactor::with_codec`]): `out` encodes
+//! before the file is written, and `rd`, `take`, every `match=` and every reactor pass decode
+//! after it is read, so a template matches PLAINTEXT and no caller ever sees the stored form.
+//! The default is [`IdentityCodec`], which stores the tuple as given.
 #![forbid(unsafe_code)]
 
 use async_trait::async_trait;
@@ -116,6 +118,138 @@ pub const CAP_RETRY: &str = "urn:cap:space:retry";
 /// stopped reactor left behind.
 pub const PROCESSING_DIR: &str = ".processing";
 
+/// A space's live drops: `<root>/<space>/inbox/<id>.tuple`. `rd state=inbox`.
+pub const INBOX_DIR: &str = "inbox";
+/// Where a reactor moves a tuple its handler answered: `<root>/<space>/outbox/`, beside an
+/// `<id>.out` note of what it said. `rd state=outbox`.
+pub const OUTBOX_DIR: &str = "outbox";
+/// The dead letters: `<root>/<space>/error/`, each beside an `<id>.err` note. `rd state=error`.
+pub const ERROR_DIR: &str = "error";
+/// Where `out` writes a tuple before it renames it into the inbox:
+/// `<root>/<space>/.dropping/`. A file here was never published; see
+/// [`SpaceEndpoint::discard_staging`].
+pub const DROPPING_DIR: &str = ".dropping";
+/// Where a take stages the tuple it claimed: `<root>/<space>/.taking/`. See
+/// [`SpaceEndpoint::discard_staging`].
+pub const TAKING_DIR: &str = ".taking";
+
+/// Every directory this crate may create under a space (`<root>/<space>/…`), so a host that
+/// keeps the tree private can make them itself, with its own mode, before the space first
+/// needs one, without spelling a name this crate owns.
+///
+/// ```
+/// use ikigai_intray::{SPACE_DIRS, INBOX_DIR, PROCESSING_DIR};
+/// assert!(SPACE_DIRS.contains(&INBOX_DIR) && SPACE_DIRS.contains(&PROCESSING_DIR));
+/// assert_eq!(SPACE_DIRS.len(), 6);
+/// ```
+pub const SPACE_DIRS: [&str; 6] = [
+    INBOX_DIR,
+    OUTBOX_DIR,
+    ERROR_DIR,
+    PROCESSING_DIR,
+    DROPPING_DIR,
+    TAKING_DIR,
+];
+
+/// How a space stores a tuple at rest, supplied by the HOST
+/// ([`SpaceEndpoint::with_codec`], [`SpaceReactor::with_codec`]).
+///
+/// [`encode`](TupleCodec::encode) runs on `out`, before the file is written, and
+/// [`decode`](TupleCodec::decode) wherever stored bytes are read for a caller or a handler:
+/// `rd tuple=`, `take`, every `match=` evaluation (inside its time budget) and every reactor
+/// pass. Nothing else in the crate looks inside a tuple file, so recovery, `retry=`, the stage
+/// moves and dead letters handle an encoded file exactly as they handle any other: by name.
+///
+/// ★ **A tuple's id is the hash of its STORED bytes** ([`tuple_id`] over what `encode`
+/// returned). Anyone who can list a space sees its ids, and a plaintext id would let them
+/// confirm a guessed tuple and see which tuples are equal; the stored-bytes id reveals neither
+/// for a codec that seals with fresh randomness. What it costs: two drops of the same
+/// plaintext are two tuples when the codec is randomized (a deterministic codec still dedups),
+/// and re-encoding a tuple ([`SpaceEndpoint::reencode`]) gives it a new id. The integrity check
+/// every reader makes (the bytes hash to their id) is on the stored bytes, before decoding.
+///
+/// ⚠ A failed decode is a typed `Conflict` that names the tuple, never a skipped tuple: a
+/// `match=` over a space holding one undecodable tuple refuses rather than answering as if it
+/// were absent, a take refuses and leaves it in the inbox, and a reactor dead-letters it. A
+/// tuple dropped through `out` always decodes under the codec that encoded it, so only a
+/// file written past this crate, or a codec that lost its key, can be undecodable.
+///
+/// ⚠ The `.err` and `.out` NOTES a reactor writes beside a tuple are not encoded: an `.err`
+/// note is this crate's sentence or the handler's error, and an `.out` note what the handler
+/// answered. A host whose handlers echo tuple content into either should know that.
+///
+/// The `Err` is a reason, which the crate wraps in a refusal naming the space and the tuple.
+///
+/// ```
+/// use ikigai_intray::TupleCodec;
+///
+/// /// Not a cipher: a test double that inverts every byte behind a marker.
+/// struct Inverted;
+/// impl TupleCodec for Inverted {
+///     fn encode(&self, plain: &[u8]) -> Result<Vec<u8>, String> {
+///         Ok([b"INV:".as_slice(), &plain.iter().map(|b| !b).collect::<Vec<_>>()].concat())
+///     }
+///     fn decode(&self, stored: &[u8]) -> Result<Vec<u8>, String> {
+///         let body = stored.strip_prefix(b"INV:").ok_or("not an inverted tuple")?;
+///         Ok(body.iter().map(|b| !b).collect())
+///     }
+/// }
+/// let stored = Inverted.encode(b"hello").unwrap();
+/// assert_ne!(stored, b"hello");
+/// assert_eq!(Inverted.decode(&stored).unwrap(), b"hello");
+/// assert!(Inverted.decode(b"hello").is_err());
+/// ```
+pub trait TupleCodec: Send + Sync {
+    /// The bytes to store for the tuple `plain`.
+    fn encode(&self, plain: &[u8]) -> std::result::Result<Vec<u8>, String>;
+
+    /// The tuple stored as `stored`, or why it cannot be read back.
+    fn decode(&self, stored: &[u8]) -> std::result::Result<Vec<u8>, String>;
+
+    /// Whether `stored` is already what [`encode`](TupleCodec::encode) would store now, so
+    /// [`SpaceEndpoint::reencode`] leaves it alone. `false` after a key rotation for a tuple
+    /// sealed to the old key. The default says every stored tuple is current.
+    fn is_current(&self, stored: &[u8]) -> bool {
+        let _ = stored;
+        true
+    }
+}
+
+/// The default [`TupleCodec`]: a tuple is stored exactly as it was dropped, so its id is the
+/// hash of its own bytes.
+///
+/// ```
+/// use ikigai_intray::{IdentityCodec, TupleCodec};
+/// assert_eq!(IdentityCodec.encode(b"t").unwrap(), b"t");
+/// assert_eq!(IdentityCodec.decode(b"t").unwrap(), b"t");
+/// ```
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IdentityCodec;
+
+impl TupleCodec for IdentityCodec {
+    fn encode(&self, plain: &[u8]) -> std::result::Result<Vec<u8>, String> {
+        Ok(plain.to_vec())
+    }
+    fn decode(&self, stored: &[u8]) -> std::result::Result<Vec<u8>, String> {
+        Ok(stored.to_vec())
+    }
+}
+
+/// The refusal a tuple that does not decode is answered with: typed, and naming the tuple.
+fn undecodable(space: &str, id: &str, why: &str) -> Error {
+    Error::Conflict(format!(
+        "space `{space}`: tuple `{id}` does not decode with this space's codec ({why}), so it \
+         was not read"
+    ))
+}
+
+/// Decode `stored`, the tuple `id` of `space`, or refuse naming it.
+fn decode(codec: &dyn TupleCodec, space: &str, id: &str, stored: &[u8]) -> Result<Vec<u8>> {
+    codec
+        .decode(stored)
+        .map_err(|why| undecodable(space, id, &why))
+}
+
 /// The lease every live reactor over a root holds on `<root>/.reactor.lock`: SHARED while
 /// it works, EXCLUSIVE only for the moment it recovers interrupted tuples. See
 /// [`SpaceReactor::recover_interrupted`].
@@ -151,6 +285,9 @@ pub fn space_with_budget(root: PathBuf, budget: EvaluationBudget) -> EndpointSpa
 /// hash (64 characters). `out` names a drop by it and every stage files it under it, so a
 /// tuple's id can be computed from its bytes alone, by anyone holding them.
 ///
+/// The bytes are the STORED ones, what the space's [`TupleCodec`] encoded (see there for
+/// why). Under the default [`IdentityCodec`] they are the dropped bytes themselves.
+///
 /// ```
 /// let id = ikigai_intray::tuple_id(b"((message \"hello\"))");
 /// assert_eq!(id.len(), 64);
@@ -178,14 +315,18 @@ pub struct SpaceEndpoint {
     /// The time budget every `match=` runs within, shared by every space under this root (and
     /// by every clone of it), so its overdue cap bounds the whole mount (ledger #1327).
     budget: EvaluationBudget,
+    /// How a tuple is stored at rest (see [`TupleCodec`]).
+    codec: Arc<dyn TupleCodec>,
 }
 
 impl SpaceEndpoint {
-    /// A tuplespace under `root`, its `match=` evaluations within [`EvaluationBudget::default`].
+    /// A tuplespace under `root`, its `match=` evaluations within [`EvaluationBudget::default`],
+    /// its tuples stored as dropped ([`IdentityCodec`]).
     pub fn new(root: PathBuf) -> Self {
         SpaceEndpoint {
             root,
             budget: EvaluationBudget::default(),
+            codec: Arc::new(IdentityCodec),
         }
     }
 
@@ -195,9 +336,24 @@ impl SpaceEndpoint {
         self
     }
 
+    /// Store every tuple of every space under this root through `codec` (see [`TupleCodec`]).
+    /// ⚠ A reactor over the same root needs the same codec ([`SpaceReactor::with_codec`]):
+    /// one left on the default [`IdentityCodec`] decodes nothing, so it fires its handlers
+    /// with the STORED bytes.
+    ///
+    /// ```
+    /// use ikigai_intray::{IdentityCodec, SpaceEndpoint};
+    /// use std::sync::Arc;
+    /// let _space = SpaceEndpoint::new("/tmp/spaces".into()).with_codec(Arc::new(IdentityCodec));
+    /// ```
+    pub fn with_codec(mut self, codec: Arc<dyn TupleCodec>) -> Self {
+        self.codec = codec;
+        self
+    }
+
     /// The inbox directory of a named space. The name is a single segment (validated).
     fn inbox(&self, name: &str) -> PathBuf {
-        self.root.join(name).join("inbox")
+        self.root.join(name).join(INBOX_DIR)
     }
 
     /// A named stage of the space's state machine: `inbox` (live drops), `processing`
@@ -206,7 +362,7 @@ impl SpaceEndpoint {
     /// the stage names are a fixed, inspectable set, not a path.
     fn state_dir(&self, name: &str, state: &str) -> Result<PathBuf> {
         match state {
-            "inbox" | "outbox" | "error" => Ok(self.root.join(name).join(state)),
+            INBOX_DIR | OUTBOX_DIR | ERROR_DIR => Ok(self.root.join(name).join(state)),
             "processing" => Ok(self.root.join(name).join(PROCESSING_DIR)),
             other => Err(Error::InvalidArgument {
                 name: "state".to_string(),
@@ -245,8 +401,9 @@ impl SpaceEndpoint {
     /// and removed it, and the second — which had WON its claim — failed its read: a tuple
     /// consumed and delivered to nobody (audit round 5, 2c, ledger #877).
     ///
-    /// A claim whose read fails is put back in the inbox (best effort) before the error
-    /// returns, so a failed take is a failed take, never a lost tuple. A claim left behind by
+    /// A claim whose read fails, or whose bytes do not decode ([`TupleCodec`]), is put back in
+    /// the inbox (best effort) before the error returns, so a failed take is a failed take,
+    /// never a lost tuple. The decoded tuple is what [`Claim::Taken`] carries. A claim left behind by
     /// a taker that died between the rename and the read is requeued by
     /// [`requeue_stale_claims`](SpaceEndpoint::requeue_stale_claims).
     fn claim(&self, name: &str, id: &str) -> Result<Claim> {
@@ -278,8 +435,153 @@ impl SpaceEndpoint {
             let why = quarantine(&self.root.join(name), id, &staged);
             return Ok(Claim::Corrupt(why));
         }
+        // Decoded BEFORE the claim is removed: a tuple this codec cannot read stays in the
+        // space (back in the inbox, under its own id) for a host that can.
+        let plain = match decode(self.codec.as_ref(), name, id, &bytes) {
+            Ok(plain) => plain,
+            Err(e) => {
+                let _ = std::fs::rename(&staged, &src);
+                return Err(e);
+            }
+        };
         let _ = std::fs::remove_file(&staged);
-        Ok(Claim::Taken(bytes))
+        Ok(Claim::Taken(plain))
+    }
+
+    /// Store every pending tuple of a space again through this endpoint's codec, unless the
+    /// codec says it is already current ([`TupleCodec::is_current`]): after a key rotation,
+    /// say. Each moved tuple gets a NEW id (an id is the hash of the stored bytes), and the
+    /// answer pairs each old id with its new one, in id order, so a host that indexes ids can
+    /// follow them. Only the inbox: a tuple a reactor has settled (`outbox/`, `error/`) or is
+    /// running (`.processing/`) is left as it is.
+    ///
+    /// Every tuple is read, checked against its id and decoded BEFORE anything moves, so a
+    /// tuple that does not decode refuses the whole call (a typed `Conflict` naming it) with
+    /// nothing changed. Then each is moved by the same steps as a take and a drop: the old one
+    /// is claimed (so a rival taker gets it or this call does, never both), the new one
+    /// published, the claim removed. One a rival took meanwhile is skipped. A stop between the
+    /// publish and the removal leaves the tuple in `.taking/` too, which the space requeues
+    /// after five minutes, so the same plaintext is then pending twice under two ids; a host
+    /// that cannot bear that clears the staging first ([`discard_staging`](Self::discard_staging)).
+    /// An I/O failure part way returns `Err` with the earlier tuples already moved.
+    ///
+    /// ```
+    /// # use ikigai_intray::SpaceEndpoint;
+    /// // Under the default codec every tuple is current, so nothing moves.
+    /// let root = std::env::temp_dir().join(format!("intray-reencode-doc-{}", std::process::id()));
+    /// let space = SpaceEndpoint::new(root);
+    /// assert!(space.reencode("jobs").unwrap().is_empty());
+    /// ```
+    pub fn reencode(&self, name: &str) -> Result<Vec<Reencoded>> {
+        if name.contains('.') || !ikigai_resolve::is_plain_file_name(name) {
+            return Err(Error::InvalidArgument {
+                name: "name".to_string(),
+                detail: "a space name is a single segment".to_string(),
+            });
+        }
+        let inbox = self.inbox(name);
+        let mut planned = Vec::new();
+        for id in Self::list_ids(&inbox) {
+            let Ok(stored) = std::fs::read(inbox.join(format!("{id}.tuple"))) else {
+                continue; // taken since it was listed
+            };
+            if !hashes_to(&stored, &id) || self.codec.is_current(&stored) {
+                continue; // not the tuple its name says (a take quarantines it), or current
+            }
+            let plain = decode(self.codec.as_ref(), name, &id, &stored)?;
+            let again = self.codec.encode(&plain).map_err(|why| {
+                Error::Endpoint(format!("space `{name}`: re-encode tuple `{id}`: {why}"))
+            })?;
+            let new = tuple_id(&again);
+            if new != id {
+                planned.push((id, new, again));
+            }
+        }
+        let mut moved = Vec::new();
+        for (old, new, stored) in planned {
+            let src = inbox.join(format!("{old}.tuple"));
+            let staging = self.root.join(name).join(TAKING_DIR);
+            std::fs::create_dir_all(&staging)
+                .map_err(|e| Error::Endpoint(format!("space `{name}`: staging: {e}")))?;
+            let claimed = staging.join(staging_name(&old, "claim"));
+            match std::fs::rename(&src, &claimed) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue, // a rival took it
+                Err(e) => return Err(Error::Endpoint(format!("space `{name}`: reencode: {e}"))),
+            }
+            if let Err(e) = self.publish(name, &new, &stored) {
+                let _ = std::fs::rename(&claimed, &src);
+                return Err(e);
+            }
+            let _ = std::fs::remove_file(&claimed);
+            moved.push(Reencoded { old, new });
+        }
+        Ok(moved)
+    }
+
+    /// Remove every staged drop ([`DROPPING_DIR`]) and staged claim ([`TAKING_DIR`]) a space
+    /// holds, and answer how many files went.
+    ///
+    /// ⚠ Only for a host that knows no drop or take is in flight over the space: one that
+    /// owns the whole tree and has not yet served it, say at startup. A staged drop was never
+    /// published, so removing it loses nothing a caller was told was stored. A staged claim is
+    /// a take whose taker stopped after its claim and before removing it: the space itself would
+    /// put it back in the inbox after five minutes, and this says instead that the take
+    /// HAPPENED, which is right for a host that records its takes itself (a receipt) and
+    /// wrong for any other.
+    ///
+    /// ```
+    /// # use ikigai_intray::SpaceEndpoint;
+    /// let root = std::env::temp_dir().join(format!("intray-discard-doc-{}", std::process::id()));
+    /// assert_eq!(SpaceEndpoint::new(root).discard_staging("jobs").unwrap(), 0);
+    /// ```
+    pub fn discard_staging(&self, name: &str) -> std::io::Result<usize> {
+        if name.contains('.') || !ikigai_resolve::is_plain_file_name(name) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a space name is a single segment",
+            ));
+        }
+        let mut removed = 0;
+        for stage in [DROPPING_DIR, TAKING_DIR] {
+            let dir = self.root.join(name).join(stage);
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            for entry in entries {
+                let path = entry?.path();
+                if path.is_file() {
+                    std::fs::remove_file(&path)?;
+                    removed += 1;
+                }
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Publish already-encoded `stored` as tuple `id` of `name`: written under a staging name
+    /// of this drop's own, then renamed into the inbox, so a reader sees the whole tuple or
+    /// nothing (see the Sink arm).
+    fn publish(&self, name: &str, id: &str, stored: &[u8]) -> Result<()> {
+        let inbox = self.inbox(name);
+        std::fs::create_dir_all(&inbox)
+            .map_err(|e| Error::Endpoint(format!("space `{name}`: create inbox: {e}")))?;
+        let staging = self.root.join(name).join(DROPPING_DIR);
+        std::fs::create_dir_all(&staging)
+            .map_err(|e| Error::Endpoint(format!("space `{name}`: staging: {e}")))?;
+        let tmp = staging.join(staging_name(id, "drop"));
+        let published = std::fs::write(&tmp, stored)
+            .map_err(|e| Error::Endpoint(format!("space `{name}`: out: {e}")))
+            .and_then(|()| {
+                std::fs::rename(&tmp, inbox.join(format!("{id}.tuple")))
+                    .map_err(|e| Error::Endpoint(format!("space `{name}`: out publish: {e}")))
+            });
+        if published.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        published
     }
 
     /// Put back every claim in a space's `.taking/` that is older than [`STALE_CLAIM`]: a
@@ -318,8 +620,14 @@ impl SpaceEndpoint {
     }
 }
 
-/// Where a take stages the tuple it claimed: `<root>/<space>/.taking/`.
-const TAKING_DIR: &str = ".taking";
+/// One tuple [`SpaceEndpoint::reencode`] stored again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reencoded {
+    /// The id it had: no longer in the space.
+    pub old: String,
+    /// The id it has now, in the inbox.
+    pub new: String,
+}
 
 /// How old a claim in [`TAKING_DIR`] must be before it counts as abandoned. A live take holds
 /// its claim for one file read; five minutes is several orders of magnitude past that.
@@ -327,7 +635,7 @@ const STALE_CLAIM: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// What a take's claim found.
 enum Claim {
-    /// The tuple, now removed from the space.
+    /// The tuple, decoded, now removed from the space.
     Taken(Vec<u8>),
     /// Not in the inbox: another taker won it, or it was never there.
     Gone,
@@ -448,7 +756,7 @@ fn staged(dir: &Path, id: &str) {
 /// note saying why, and return a reason naming where it went (or why it could not). The
 /// note goes first ([`place_note`]), so the quarantined file is never seen without it.
 fn quarantine(space_dir: &Path, id: &str, claimed: &Path) -> String {
-    let error = space_dir.join("error");
+    let error = space_dir.join(ERROR_DIR);
     let moved = std::fs::create_dir_all(&error).and_then(|()| {
         let noted = place_note(&error, id, "err", &corrupt_note(id)).is_ok();
         let moved = std::fs::rename(claimed, error.join(format!("{id}.tuple")));
@@ -550,6 +858,9 @@ fn take_id<'a>(inv: &'a Invocation<'_>) -> Result<Option<&'a str>> {
 ///   new match is refused as `Unavailable` while too many are, so readers cannot pin every core;
 /// - and [`parse_match`] applies the store's ALGEBRA bounds ([`check_query`]), so a join wide
 ///   enough to make oxigraph's PLANNER the cost (which no token reaches) is refused first.
+///
+/// Decoding each tuple ([`TupleCodec::decode`]) happens inside `work`, so it counts inside the
+/// budget too: a slow codec over a large space is a `Timeout`, never an unbounded scan.
 ///
 /// `work` may outlive this call (an overdue evaluation runs on after its caller is answered),
 /// so it owns what it uses and must not make an EFFECT the caller could be told did not
@@ -771,7 +1082,7 @@ impl Endpoint for SpaceEndpoint {
                             detail: "a tuple id is a content hash".to_string(),
                         });
                     }
-                    let from = self.root.join(name).join("error");
+                    let from = self.root.join(name).join(ERROR_DIR);
                     std::fs::create_dir_all(&inbox).map_err(|e| {
                         Error::Endpoint(format!("space `{name}`: create inbox: {e}"))
                     })?;
@@ -793,31 +1104,21 @@ impl Endpoint for SpaceEndpoint {
                 let content = inv
                     .inline_arg("content")
                     .map_err(|_| Error::MissingArgument("content".to_string()))?;
+                // The PLAINTEXT is bounded, since that is what every `match=` parses.
                 check_tuple_nesting(content)?;
-                let id = tuple_id(content);
-                std::fs::create_dir_all(&inbox)
-                    .map_err(|e| Error::Endpoint(format!("space `{name}`: create inbox: {e}")))?;
+                let stored = self
+                    .codec
+                    .encode(content)
+                    .map_err(|why| Error::Endpoint(format!("space `{name}`: encode: {why}")))?;
+                // The id is the hash of what is STORED (see [`TupleCodec`]).
+                let id = tuple_id(&stored);
                 // Atomic appearance: write to a staging file, then rename it into the inbox.
                 // rename is atomic on POSIX, so a reactor's watcher never observes a
                 // half-written tuple — it sees the whole tuple or nothing. The staging file is
                 // this drop's OWN ([`staging_name`]): two identical drops at once each write
                 // their own inode, and the second rename replaces the first with identical
                 // bytes, so both succeed and no reader sees a torn tuple (ledger #877).
-                let staging = self.root.join(name).join(".dropping");
-                std::fs::create_dir_all(&staging)
-                    .map_err(|e| Error::Endpoint(format!("space `{name}`: staging: {e}")))?;
-                let tmp = staging.join(staging_name(&id, "drop"));
-                let published = std::fs::write(&tmp, content)
-                    .map_err(|e| Error::Endpoint(format!("space `{name}`: out: {e}")))
-                    .and_then(|()| {
-                        std::fs::rename(&tmp, inbox.join(format!("{id}.tuple"))).map_err(|e| {
-                            Error::Endpoint(format!("space `{name}`: out publish: {e}"))
-                        })
-                    });
-                if published.is_err() {
-                    let _ = std::fs::remove_file(&tmp);
-                }
-                published?;
+                self.publish(name, &id, &stored)?;
                 Ok(Representation::new(
                     ReprType::new("text/plain").with_param("charset", "utf-8"),
                     id.into_bytes(),
@@ -857,11 +1158,14 @@ impl Endpoint for SpaceEndpoint {
                     }
                     Ok(Representation::new(
                         ReprType::new("application/octet-stream"),
-                        bytes,
+                        decode(self.codec.as_ref(), name, id, &bytes)?,
                     ))
                 } else if let Some(query) = opt_str(inv, "match")? {
                     // Associative rd: the ids of tuples whose graph satisfies the ASK, the
-                    // whole scan within the time budget (ledger #1327).
+                    // whole scan within the time budget (ledger #1327), decoding included: a
+                    // template matches the PLAINTEXT, and a tuple that does not decode refuses
+                    // the match rather than reading as absent.
+                    let (codec, space) = (Arc::clone(&self.codec), name.to_string());
                     let hits = with_template(
                         &self.budget,
                         inv.capability,
@@ -874,9 +1178,11 @@ impl Endpoint for SpaceEndpoint {
                                 }
                                 if let Ok(bytes) = std::fs::read(dir.join(format!("{id}.tuple"))) {
                                     // A file that is not the tuple its name says never matches.
-                                    if hashes_to(&bytes, &id)
-                                        && tuple_matches(template, &bytes, token)?
-                                    {
+                                    if !hashes_to(&bytes, &id) {
+                                        continue;
+                                    }
+                                    let plain = decode(codec.as_ref(), &space, &id, &bytes)?;
+                                    if tuple_matches(template, &plain, token)? {
                                         hits.push(id);
                                     }
                                 }
@@ -947,6 +1253,7 @@ impl Endpoint for SpaceEndpoint {
                 let mut from = 0;
                 loop {
                     let (scan, dir) = (Arc::clone(&ids), inbox.clone());
+                    let (codec, space) = (Arc::clone(&self.codec), name.to_string());
                     let found = with_template(
                         &self.budget,
                         inv.capability,
@@ -958,7 +1265,16 @@ impl Endpoint for SpaceEndpoint {
                                 }
                                 // A tuple that vanished between listing and read is no match.
                                 if let Ok(bytes) = std::fs::read(dir.join(format!("{id}.tuple"))) {
-                                    if tuple_matches(template, &bytes, token)? {
+                                    // A file that is not the tuple its name says is matched as
+                                    // stored, as it always was here: if it matches, the claim
+                                    // quarantines it and the scan goes on. Anything else is
+                                    // decoded first, and refuses the take if it cannot be.
+                                    let plain = if hashes_to(&bytes, id) {
+                                        decode(codec.as_ref(), &space, id, &bytes)?
+                                    } else {
+                                        bytes
+                                    };
+                                    if tuple_matches(template, &plain, token)? {
                                         return Ok(Some(i));
                                     }
                                 }
@@ -1225,6 +1541,8 @@ pub struct SpaceReactor {
     // sweep never sees one of THIS reactor's own tuples in `.processing/` mid-pass, and the
     // startup catch-up and the watcher never run a pass at the same time.
     pass: std::sync::Mutex<()>,
+    // How the spaces store their tuples; a handler is fired with the DECODED tuple.
+    codec: Arc<dyn TupleCodec>,
 }
 
 /// Called with `(space, tuple id, reason)` for every claimed tuple that settles as
@@ -1289,7 +1607,18 @@ impl SpaceReactor {
             interrupted: Interrupted::default(),
             recovery: std::sync::OnceLock::new(),
             pass: std::sync::Mutex::new(()),
+            codec: Arc::new(IdentityCodec),
         }
+    }
+
+    /// Decode every claimed tuple through `codec` before its handler is fired: the SAME codec
+    /// the spaces' endpoint stores through ([`SpaceEndpoint::with_codec`]). A tuple that does
+    /// not decode is dead-lettered with a note naming it, and its handler is not run; it
+    /// stays encoded in `error/`, and `retry=` re-arms it once the codec can read it.
+    /// Recovery, requeues and the stage moves never decode anything: they move files by name.
+    pub fn with_codec(mut self, codec: Arc<dyn TupleCodec>) -> Self {
+        self.codec = codec;
+        self
     }
 
     /// Choose what happens to a tuple a stopped reactor left claimed but unsettled — see
@@ -1473,7 +1802,7 @@ impl SpaceReactor {
                         }
                     }
                     Interrupted::Requeue => {
-                        let inbox = self.root.join(&name).join("inbox");
+                        let inbox = self.root.join(&name).join(INBOX_DIR);
                         std::fs::create_dir_all(&inbox)
                             .and_then(|()| {
                                 std::fs::rename(&claimed, inbox.join(format!("{id}.tuple")))
@@ -1658,7 +1987,7 @@ impl SpaceReactor {
     /// [`drain`](SpaceReactor::drain) without the recovery sweep, for a caller that has just
     /// swept once for every space.
     fn drain_inbox(&self, name: &str) -> Vec<(String, Outcome)> {
-        SpaceEndpoint::list_ids(&self.root.join(name).join("inbox"))
+        SpaceEndpoint::list_ids(&self.root.join(name).join(INBOX_DIR))
             .into_iter()
             .map(|id| {
                 let outcome = self.process(name, &id);
@@ -1709,13 +2038,19 @@ impl SpaceReactor {
             Ok(None) => return Outcome::Skipped("already claimed"),
             Err(e) => return Outcome::Errored(e),
         };
-        let bytes = match std::fs::read(&claimed) {
+        let stored = match std::fs::read(&claimed) {
             Ok(b) if hashes_to(&b, id) => b,
             // Never fire a handler on bytes that are not the tuple that was dropped.
             Ok(_) => return self.settle(name, id, &claimed, Err(corrupt_note(id)), heard),
             Err(e) => {
                 return self.settle(name, id, &claimed, Err(format!("read tuple: {e}")), heard)
             }
+        };
+        // Nor on bytes it cannot read back: a dead letter naming the tuple, never the stored
+        // form handed on as if it were the tuple.
+        let bytes = match decode(self.codec.as_ref(), name, id, &stored) {
+            Ok(plain) => plain,
+            Err(e) => return self.settle(name, id, &claimed, Err(e.to_string()), heard),
         };
         let handler = match handler {
             Ok(uri) => uri,
@@ -1798,8 +2133,8 @@ impl SpaceReactor {
         result: std::result::Result<String, String>,
     ) -> Outcome {
         let (stage, outcome) = match &result {
-            Ok(_) => ("outbox", Outcome::Handled),
-            Err(e) => ("error", Outcome::Errored(e.clone())),
+            Ok(_) => (OUTBOX_DIR, Outcome::Handled),
+            Err(e) => (ERROR_DIR, Outcome::Errored(e.clone())),
         };
         // A failure to MOVE must not lose why the handler failed in the first place.
         let failed = |what: String| match &result {
@@ -1866,8 +2201,8 @@ impl SpaceReactor {
         // went on reporting a tuple that had since been handled (audit round 5, 3b, ledger
         // #877); a failure likewise leaves no stale success in `outbox/` beside it.
         let (other, note) = match stage {
-            "outbox" => ("error", "err"),
-            _ => ("outbox", "out"),
+            OUTBOX_DIR => (ERROR_DIR, "err"),
+            _ => (OUTBOX_DIR, "out"),
         };
         let other = self.root.join(name).join(other);
         let _ = std::fs::remove_file(other.join(format!("{id}.tuple")));
@@ -1882,7 +2217,7 @@ impl SpaceReactor {
         let src = self
             .root
             .join(name)
-            .join("inbox")
+            .join(INBOX_DIR)
             .join(format!("{id}.tuple"));
         let staging = self.root.join(name).join(PROCESSING_DIR);
         std::fs::create_dir_all(&staging).map_err(|e| format!("staging: {e}"))?;
@@ -1957,7 +2292,7 @@ impl SpaceReactor {
         // and a missed tuple is silent, sitting in an inbox nobody looks at again until
         // something restarts. Creating them up front removes the race for known spaces.
         for name in self.space_names() {
-            let _ = std::fs::create_dir_all(self.root.join(&name).join("inbox"));
+            let _ = std::fs::create_dir_all(self.root.join(&name).join(INBOX_DIR));
         }
         // Canonicalize so the paths `notify` reports (it resolves symlinks — macOS maps
         // /var → /private/var) line up with `root` when we strip the prefix.
@@ -2117,7 +2452,7 @@ pub fn dead_letters_of(
     spaces
         .into_iter()
         .map(|space| {
-            let error = root.join(&space).join("error");
+            let error = root.join(&space).join(ERROR_DIR);
             let ids = SpaceEndpoint::list_ids(&error);
             let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
             let newest = ids
