@@ -512,6 +512,72 @@ pub fn serve_trusting_on(
     serve_config_on(kernel, socket, identity, config, minter, max_age)
 }
 
+/// [`serve_trusting_on`] for a door with a LOBBY (ledger #2009): it also admits a client
+/// certificate that is NOT on its trust list, and hands that connection to `lobby` instead of
+/// `minter`.
+///
+/// At TLS the door accepts ANY client certificate inside its validity window (ledger #1826).
+/// TLS 1.3's CertificateVerify still proves the client holds the certificate's key, so the
+/// [`PeerIdentity`] fingerprint is a real identity; it is just not a TRUSTED one. After the
+/// handshake the trust list is read, once per connection:
+///
+/// - a certificate ON the list goes to `minter`, exactly as [`serve_trusting_on`] would hand it
+///   over, so an enrolled client is served as before and removing its certificate from the
+///   list still takes it out of `minter`'s reach at its next connection;
+/// - a certificate NOT on the list goes to `lobby`, which mints what an unenrolled certificate
+///   may do (a host's lobby capability, and nothing more) or refuses with `None`;
+/// - a list that does not read refuses the connection: a door that cannot tell an enrolled
+///   client from a stranger serves neither.
+///
+/// Either minter's `None` closes the connection with the same application code a refused
+/// trusted client gets today. A door that has no lobby keeps calling [`serve_trusting_on`],
+/// which still refuses an unlisted certificate at the handshake.
+///
+/// The list is read once at start too, as [`serve_trusting_on`] does.
+#[allow(clippy::too_many_arguments)] // one door's whole configuration, in the order its siblings take it
+pub fn serve_lobby_on(
+    kernel: Arc<Kernel>,
+    socket: std::net::UdpSocket,
+    identity: &Identity,
+    trust: TrustList,
+    minter: Minter,
+    lobby: Minter,
+    idle: std::time::Duration,
+    max_age: Option<std::time::Duration>,
+) -> io::Result<()> {
+    for pem in trust()? {
+        load_cert(&pem)?;
+    }
+    let config = server_config_pinning(identity, Pins::AnyInWindow, idle, alpn_protocols())?;
+    serve_config_on(
+        kernel,
+        socket,
+        identity,
+        config,
+        lobby_router(trust, minter, lobby),
+        max_age,
+    )
+}
+
+/// The [`Minter`] a lobby door runs: the trusted path for a listed certificate, the lobby for
+/// any other, nothing when the list does not read. See [`serve_lobby_on`].
+///
+/// A listed certificate is matched by [`fingerprint`] (SHA-256 of its DER), which is what the
+/// [`PeerIdentity`] carries; a PEM in the list that does not parse lists nobody, as it pins
+/// nobody on the other doors.
+fn lobby_router(trust: TrustList, minter: Minter, lobby: Minter) -> Minter {
+    Arc::new(move |peer: &PeerIdentity| {
+        let listed = trust().ok()?.iter().any(|pem| {
+            load_cert(pem).is_ok_and(|der| fingerprint(der.as_ref()) == peer.fingerprint)
+        });
+        if listed {
+            minter(peer)
+        } else {
+            lobby(peer)
+        }
+    })
+}
+
 /// The accept loop every server door runs, under a built `config`.
 fn serve_config_on(
     kernel: Arc<Kernel>,
@@ -1928,10 +1994,16 @@ struct PinnedPeer {
 }
 
 /// The certificates a [`PinnedPeer`] accepts: a set fixed when the door was built, or a
-/// [`TrustList`] read at every handshake.
+/// [`TrustList`] read at every handshake, or (a lobby door's client side only) any
+/// certificate inside its validity window.
 enum Pins {
     Fixed(Vec<CertificateDer<'static>>),
     Live(TrustList),
+    /// Pins nothing: a lobby door ([`serve_lobby_on`]) admits every client certificate inside
+    /// its window and decides what it may do after the handshake. Only a SERVER builds this,
+    /// and a server certificate is never verified against it ([`PinnedPeer::verify_server_cert`]
+    /// refuses).
+    AnyInWindow,
 }
 
 impl std::fmt::Debug for Pins {
@@ -1939,6 +2011,7 @@ impl std::fmt::Debug for Pins {
         match self {
             Pins::Fixed(certs) => write!(f, "Pins::Fixed({} certificate(s))", certs.len()),
             Pins::Live(_) => f.write_str("Pins::Live(read at every handshake)"),
+            Pins::AnyInWindow => f.write_str("Pins::AnyInWindow(a lobby door)"),
         }
     }
 }
@@ -1965,6 +2038,7 @@ impl PinnedPeer {
                     .filter_map(|pem| load_cert(pem).ok())
                     .any(|c| c.as_ref() == presented.as_ref())
             }),
+            Pins::AnyInWindow => true,
         }
     }
 }
@@ -1978,7 +2052,9 @@ impl ServerCertVerifier for PinnedPeer {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        if self.matches(end_entity) {
+        // A client always pins the server it dials; "any certificate" is a lobby door's rule
+        // for its CLIENTS and must never verify a server.
+        if !matches!(self.pinned, Pins::AnyInWindow) && self.matches(end_entity) {
             Ok(ServerCertVerified::assertion())
         } else {
             Err(rustls::Error::General(
@@ -2023,7 +2099,10 @@ impl ClientCertVerifier for PinnedPeer {
     ) -> Result<ClientCertVerified, rustls::Error> {
         if self.matches(end_entity) {
             // Pinning says WHICH certificate; its window says WHEN (ledger #1826). Checked
-            // after the match, so only a certificate the operator trusts is ever parsed.
+            // after the match, so on a pinning door only a certificate the operator trusts is
+            // ever parsed. A lobby door (`Pins::AnyInWindow`) parses every presented one here:
+            // that is the price of admitting strangers, and x509-parser is the parser webpki's
+            // signature check would run over the same bytes moments later anyway.
             within_validity(end_entity, now)?;
             Ok(ClientCertVerified::assertion())
         } else {

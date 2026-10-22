@@ -1166,7 +1166,7 @@ impl Endpoint for SpaceEndpoint {
                     // template matches the PLAINTEXT, and a tuple that does not decode refuses
                     // the match rather than reading as absent.
                     let (codec, space) = (Arc::clone(&self.codec), name.to_string());
-                    let hits = with_template(
+                    let bytes = with_template(
                         &self.budget,
                         inv.capability,
                         query,
@@ -1187,12 +1187,14 @@ impl Endpoint for SpaceEndpoint {
                                     }
                                 }
                             }
-                            Ok(hits)
+                            // Rendering is part of the scan budget too: a large join must
+                            // not block the caller after its evaluation has already ended.
+                            Ok(hits.join("\n").into_bytes())
                         },
                     )?;
                     Ok(Representation::new(
                         ReprType::new("text/plain").with_param("charset", "utf-8"),
-                        hits.join("\n").into_bytes(),
+                        bytes,
                     ))
                 } else {
                     // The tuple ids, one per line (the newline-list `..` map convention).
@@ -2292,7 +2294,9 @@ impl SpaceReactor {
         // and a missed tuple is silent, sitting in an inbox nobody looks at again until
         // something restarts. Creating them up front removes the race for known spaces.
         for name in self.space_names() {
-            let _ = std::fs::create_dir_all(self.root.join(&name).join(INBOX_DIR));
+            let inbox = self.root.join(&name).join(INBOX_DIR);
+            std::fs::create_dir_all(&inbox)
+                .map_err(|e| format!("cannot create {}: {e}", inbox.display()))?;
         }
         // Canonicalize so the paths `notify` reports (it resolves symlinks — macOS maps
         // /var → /private/var) line up with `root` when we strip the prefix.
@@ -2415,21 +2419,18 @@ pub struct DeadLetter {
 ///
 /// Reactive spaces with nothing dead-lettered are included with `count: 0`, so a reader can
 /// tell "no dead letters" from "not looked at". Read straight off the tree, so any process
-/// sharing the workspace reports the same facts.
+/// sharing the workspace reports the same facts. Directory enumeration failures (other than
+/// absent directories) are reported on stderr; the returned report may then be incomplete.
 pub fn dead_letters(root: &Path) -> Vec<SpaceDeadLetters> {
-    let spaces: Vec<String> = match std::fs::read_dir(root) {
-        Ok(entries) => entries
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_dir())
-            .filter_map(|e| e.file_name().to_str().map(String::from))
-            .filter(|name| {
-                std::fs::read_to_string(root.join(name).join("handler"))
-                    .map(|raw| !raw.trim().is_empty())
-                    .unwrap_or(false)
-            })
-            .collect(),
-        Err(_) => Vec::new(),
-    };
+    let spaces: Vec<String> = dead_letter_entries(root)
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().to_str().map(String::from))
+        .filter(|name| {
+            std::fs::read_to_string(root.join(name).join("handler"))
+                .map(|raw| !raw.trim().is_empty())
+                .unwrap_or(false)
+        })
+        .collect();
     dead_letters_of(root, spaces)
 }
 
@@ -2437,6 +2438,7 @@ pub fn dead_letters(root: &Path) -> Vec<SpaceDeadLetters> {
 /// decides which spaces are reactive itself
 /// ([`with_host_handler`](SpaceReactor::with_host_handler)), so a space it fires with no
 /// `handler` file on disk is still counted. A name that is not a single path segment is skipped.
+/// Directory enumeration failures are reported on stderr as in [`dead_letters`].
 pub fn dead_letters_of(
     root: &Path,
     spaces: impl IntoIterator<Item = String>,
@@ -2453,7 +2455,14 @@ pub fn dead_letters_of(
         .into_iter()
         .map(|space| {
             let error = root.join(&space).join(ERROR_DIR);
-            let ids = SpaceEndpoint::list_ids(&error);
+            let ids: Vec<String> = dead_letter_entries(&error)
+                .filter_map(|e| {
+                    e.file_name()
+                        .to_str()
+                        .and_then(|n| n.strip_suffix(".tuple"))
+                        .map(String::from)
+                })
+                .collect();
             let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
             let newest = ids
                 .iter()
@@ -2480,6 +2489,36 @@ pub fn dead_letters_of(
             }
         })
         .collect()
+}
+
+/// Enumerate dead-letter directories, reporting failures instead of silently claiming
+/// they were empty. An absent root or stage is normal before the first drop or failure.
+fn dead_letter_entries(path: &Path) -> impl Iterator<Item = std::fs::DirEntry> + '_ {
+    let report = move |e| {
+        eprintln!(
+            "ikigai-intray: cannot read dead letters in {}: {e}; report may be incomplete",
+            path.display()
+        );
+    };
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => Some(entries),
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                report(e);
+            }
+            None
+        }
+    };
+    entries
+        .into_iter()
+        .flatten()
+        .filter_map(move |entry| match entry {
+            Ok(entry) => Some(entry),
+            Err(e) => {
+                report(e);
+                None
+            }
+        })
 }
 
 /// Parse a scope-list file: one capability scope IRI per line, surrounding whitespace
