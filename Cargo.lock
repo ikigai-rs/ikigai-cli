@@ -3176,9 +3176,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-encrypt"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19581756aaa4f3538f82be1f69821501e6eb2eb57002ec5905addfce24087549"
+checksum = "cafa6bfc6690f9994a85023025de7533752a96c8dfdaa88962a7d1e1966c367b"
 dependencies = [
  "age",
  "async-trait",
@@ -3297,26 +3297,32 @@ dependencies = [
 
 [[package]]
 name = "ikigai-layers"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "612c30a478ce54d9ab4ae63d0b8685f6379855073e313e6e507dea56891c12d7"
+checksum = "fb9d0d0937daec9bd580549b4fc37b22da9ede75c89d73e80c727e96f77e6bd8"
 dependencies = [
- "age",
  "async-trait",
  "base64 0.22.1",
+ "der",
  "futures",
  "futures-timer",
  "ikigai-core",
+ "ikigai-encrypt",
  "ikigai-intray",
  "ikigai-jsonld",
+ "ikigai-rdf",
  "ikigai-shacl",
+ "ikigai-sign",
  "ikigai-store",
  "oxigraph",
  "oxrdf",
  "oxrdfio",
+ "oxsdatatypes",
  "oxttl",
+ "pem-rfc7468",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "spargebra",
  "toml 0.8.23",
 ]
@@ -3577,9 +3583,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-sign"
-version = "0.3.0"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfe6ddcdbd171bbc7c39f83395ecc0f2a59820ff3d338420a964ac6e3d52c70f"
+checksum = "e296fa1d0ef14091493aacbd02f86d17111b2b4c9ac8e71ceba92c288fd4ee3b"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5613,9 +5619,9 @@ dependencies = [
 
 [[package]]
 name = "oxigraph"
-version = "0.5.11"
+version = "0.5.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f6632dd080bd07676f06e70254ff5862c9943e9483d700fa7258df73a3f9a6a"
+checksum = "2eede7fd83363baccff1b09ae33eca1072f637f8a50894b49ab7097a390db9a3"
 dependencies = [
  "dashmap",
  "getrandom 0.3.4",
@@ -5662,9 +5668,9 @@ dependencies = [
 
 [[package]]
 name = "oxjsonld"
-version = "0.2.6"
+version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86a3e89e005662e60327027f45ec7cefd0472404e01831b5d83a3ac522cfabe0"
+checksum = "f1554d73123a75723a4e0a4d400a3fb19ca09673563a2557090267729622fcb2"
 dependencies = [
  "json-event-parser",
  "oxiri 0.2.11",
@@ -5675,9 +5681,9 @@ dependencies = [
 
 [[package]]
 name = "oxrdf"
-version = "0.3.4"
+version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4be15186205eb60ddbdc2fb47cb25df472c7f399bbe119b68c0972b6b6dd46ea"
+checksum = "08037a3c3cf580d065caec6a864cf97f51be219862d95c691a48c7543406d675"
 dependencies = [
  "hex",
  "oxilangtag",
@@ -5690,9 +5696,9 @@ dependencies = [
 
 [[package]]
 name = "oxrdfio"
-version = "0.2.6"
+version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17b3fe3bb34179c376ab04f2a1b32616b0babab574b3b7eef64d587e60d5e1db"
+checksum = "e8e92599fc40510b01a1fa55548dffcc7160dde5cf1776e14b150a5cbcc607b4"
 dependencies = [
  "oxjsonld",
  "oxrdf",
@@ -5703,9 +5709,9 @@ dependencies = [
 
 [[package]]
 name = "oxrdfxml"
-version = "0.2.4"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71853d12051879f3e424c6864e978f5f5cbecd8e86a9817adbccaefccac9d61d"
+checksum = "b69a81d41e2ee7d0d296980e6e44d3d2282f558cd82a8b3b4988c2eb06a6e07d"
 dependencies = [
  "oxilangtag",
  "oxiri 0.2.11",
@@ -5716,9 +5722,9 @@ dependencies = [
 
 [[package]]
 name = "oxrocksdb-sys"
-version = "0.5.11"
+version = "0.5.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01fcf5ae1e1295a612bef72fc64cd81e1ac3d1bd3243ef84d330f2962a8335e1"
+checksum = "80f6fb657a167b8cea892d8a43c0c94409659a7cffa4fd8a197dbceb7a974a1c"
 dependencies = [
  "bindgen",
  "cc",
@@ -5726,9 +5732,9 @@ dependencies = [
 
 [[package]]
 name = "oxsdatatypes"
-version = "0.2.3"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c17c2ae62ac34fda465f6331105906c0e17b4e088dac3249e1f229b962062503"
+checksum = "034779b2d182d5069cd28b1f921ba334cad708ab1340db9776312464b6874b78"
 dependencies = [
  "js-sys",
  "thiserror 2.0.20",
@@ -5736,9 +5742,9 @@ dependencies = [
 
 [[package]]
 name = "oxttl"
-version = "0.2.4"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1d0fe19fa62a6a102f85b052bbd86e3cdc3360cd6a338d01bab1a6743bf1d8e"
+checksum = "c2f5a5c0e82734bb66c9e2a82839bafca5cc129531c51b92f428a4f43405793d"
 dependencies = [
  "memchr",
  "oxilangtag",
@@ -7743,9 +7749,9 @@ dependencies = [
 
 [[package]]
 name = "sparesults"
-version = "0.3.4"
+version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5dfa99dba6f5155ef4fdd75b78f794ea0c729e17b07d84eb88ae3c1278d1758d"
+checksum = "dd0fd25bd7e7eb2af56a45bc65ca768a246a50163db9215fc26da002135f6ece"
 dependencies = [
  "json-event-parser",
  "memchr",
@@ -7756,9 +7762,9 @@ dependencies = [
 
 [[package]]
 name = "spareval"
-version = "0.2.7"
+version = "0.2.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85b51144836ff9ca2f792b7a2422c4170ff04460d86cd8f2f764cf53e339cbec"
+checksum = "04145291b411c31eb6f40cb63c9701dc623af58c28cf4a85edf7ba0608027587"
 dependencies = [
  "hex",
  "json-event-parser",
@@ -7779,9 +7785,9 @@ dependencies = [
 
 [[package]]
 name = "spargebra"
-version = "0.4.7"
+version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bef3c186ffb9bf2dde7c5edd5528583f309fcb819b5773cf0e313194a990304f"
+checksum = "43d5fd4ba16eea5586aa54227ca2c0a394794a0f82e39c6c98a57cc6877f0230"
 dependencies = [
  "oxilangtag",
  "oxiri 0.2.11",
@@ -7793,9 +7799,9 @@ dependencies = [
 
 [[package]]
 name = "sparopt"
-version = "0.3.7"
+version = "0.3.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "973ee503ab3d6c3de66b4b459233cd5b22b44dad0fb7b8d0931daf73d2ede935"
+checksum = "e929a8b41fb443a90d211d26abab73ab465414618e2541fb92f7dc54e03ff578"
 dependencies = [
  "oxrdf",
  "rand 0.9.5",

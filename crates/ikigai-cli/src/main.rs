@@ -3755,6 +3755,48 @@ fn serve_quic(
                 })
             })
         };
+        // ★ A LOBBY (ledger #2009, #2104): when the layer host defines a `lobby = true` channel,
+        // the door also admits a certificate its trust list does NOT name, and this minter, not
+        // the one above, decides it. It mints exactly `Host::lobby_capability`: `say` on every
+        // lobby and nothing else, under `urn:iki:host:{name}:client:<fp>`. Never through
+        // `root_fs_scopes` and never combined with `--cap`: the lobby capability is the whole
+        // authority, so neither can widen or reshape it. The host holds every lobby to its size
+        // and rate bounds itself. Decided ONCE at startup, like the surface: a door with no
+        // lobby (or no layers) serves through `serve_trusting_on` exactly as before.
+        let lobby_minter: Option<ikigai_quic::Minter> = layers
+            .as_ref()
+            .filter(|hosted| !hosted.host.lobbies().is_empty())
+            .map(|hosted| -> ikigai_quic::Minter {
+                let layer_host = std::sync::Arc::clone(&hosted.host);
+                std::sync::Arc::new(move |peer: &ikigai_quic::PeerIdentity| {
+                    match layer_host.lobby_capability(host, &peer.fingerprint) {
+                        Ok(Some(capability)) => {
+                            let principal = capability.principal().map(str::to_string);
+                            Some(ikigai_quic::Session {
+                                capability,
+                                file_segment: peer.segment_id.clone(),
+                                principal,
+                            })
+                        }
+                        Ok(None) => {
+                            diagnose(format_args!(
+                                "ikigai: REFUSED an unlisted client certificate: this door's \
+                                 layer host has no lobby\n  fingerprint: {}",
+                                peer.fingerprint
+                            ));
+                            None
+                        }
+                        Err(why) => {
+                            diagnose(format_args!(
+                                "ikigai: REFUSED an unlisted client certificate: no lobby \
+                                 capability for it ({why})\n  fingerprint: {}",
+                                peer.fingerprint
+                            ));
+                            None
+                        }
+                    }
+                })
+            });
         let posture = match (&enrolment, caps.is_empty()) {
             (Some(e), true) => format!("per-identity grants: {} enrolled", e.len()),
             (Some(e), false) => format!(
@@ -3913,6 +3955,14 @@ fn serve_quic(
                 eprintln!(
                     "ikigai: layers: --layers-reseal: every state file is sealed to that \
                      recipient now; later starts leave the flag off (rerunning it is safe)"
+                );
+            }
+            let lobbies = hosted.host.lobbies();
+            if !lobbies.is_empty() {
+                eprintln!(
+                    "ikigai: layers: lobby open on {}: a client certificate this door does not \
+                     trust may say there and nothing else",
+                    lobbies.join(", ")
                 );
             }
         }
@@ -4090,15 +4140,27 @@ fn serve_quic(
             }
             (None, _) => {}
         }
-        ikigai_quic::serve_trusting_on(
-            kernel,
-            socket,
-            &identity,
-            trust,
-            minter,
-            quic_idle_timeout(),
-            Some(max_age),
-        )
+        match lobby_minter {
+            Some(lobby) => ikigai_quic::serve_lobby_on(
+                kernel,
+                socket,
+                &identity,
+                trust,
+                minter,
+                lobby,
+                quic_idle_timeout(),
+                Some(max_age),
+            ),
+            None => ikigai_quic::serve_trusting_on(
+                kernel,
+                socket,
+                &identity,
+                trust,
+                minter,
+                quic_idle_timeout(),
+                Some(max_age),
+            ),
+        }
         .map_err(|e| e.to_string())
     })();
     match result {

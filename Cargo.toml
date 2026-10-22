@@ -1969,8 +1969,13 @@ ikigai-ledger = "0.11.0"
 # ⚠ …and 0.3.1 bounds Turtle nesting at 64 levels in `rdf::parse_turtle` before parsing
 # (ledger #2020, ikigai-rs/ikigai-layers PR 36), protecting participants reading door answers
 # through `ikigai layers post|save|follow` as well as hosts accepting writes.
-# `"0.3.1"` is `<0.4.0`.
-ikigai-layers = "0.3.1"
+# ⚠ …and 0.4.0 is the LOBBY floor (ledger #2009, ikigai-rs/ikigai-layers PR 41 and PR 42): a channel
+# marked `lobby = true`, `Host::lobbies` and `Host::lobby_capability`, the capability `serve quic://`
+# mints for a certificate its enrollment does not name (`say` on every lobby and nothing else; ledger
+# #2104), and signed entitlements the host applies to its own enrollment. Every lobby is held to
+# 16 KiB an entry and to a per-certificate and a total rate. It also seals state through
+# ikigai-encrypt's library face (ledger #2016). `"0.4.0"` is `<0.5.0`.
+ikigai-layers = "0.4.0"
 # TEST-ONLY (a dev-dependency of ikigai-cli and ikigai-embedded): the layer tests mint a throwaway
 # age identity for `--layers-key`, as `age-keygen -o` would. Already in the graph through
 # ikigai-layers and ikigai-encrypt, so it adds no package. `"0.11.1"` is what ikigai-layers 0.3.0
