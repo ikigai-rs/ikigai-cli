@@ -1346,7 +1346,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 3.0.5",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -3462,9 +3462,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-rdf"
-version = "0.2.6"
+version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2255bcccea89c9acf7e4f178690a8c2f2a4a84b8f3735514f8262f0f78b0d7a"
+checksum = "d18935c4593bdbab12b74dde0986c3d08f2df28730137c6f96459b38f8df39e1"
 dependencies = [
  "async-trait",
  "getrandom 0.3.4",
@@ -3625,12 +3625,13 @@ dependencies = [
 
 [[package]]
 name = "ikigai-store"
-version = "0.2.21"
+version = "0.2.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c741ea5210ac4307716077785118c45d9598fbde735171308c062ebc3c60918"
+checksum = "2bff22f7dcb1c83439d224f8f88c516918fa096ccbc7bbe09880874599cd7dc8"
 dependencies = [
  "async-trait",
  "ikigai-core",
+ "ikigai-rdf",
  "oxigraph",
  "oxiri 0.2.11",
  "serde",
