@@ -1990,8 +1990,11 @@ ikigai-ledger = "0.11.0"
 # mints for a certificate its enrollment does not name (`say` on every lobby and nothing else; ledger
 # #2104), and signed entitlements the host applies to its own enrollment. Every lobby is held to
 # 16 KiB an entry and to a per-certificate and a total rate. It also seals state through
-# ikigai-encrypt's library face (ledger #2016). `"0.4.0"` is `<0.5.0`.
-ikigai-layers = "0.4.0"
+# ikigai-encrypt's library face (ledger #2016).
+# ⚠ …and 0.5.0 seals tuples through ikigai-intray's TupleCodec (ledger #2017, ikigai-rs/ikigai-layers
+# PR 44): a `match=` over an undecodable tuple refuses with a Conflict, and open discards claims a crashed
+# take left behind. `"0.5.0"` is `<0.6.0`.
+ikigai-layers = "0.5.0"
 # TEST-ONLY (a dev-dependency of ikigai-cli and ikigai-embedded): the layer tests mint a throwaway
 # age identity for `--layers-key`, as `age-keygen -o` would. Already in the graph through
 # ikigai-layers and ikigai-encrypt, so it adds no package. `"0.11.1"` is what ikigai-layers 0.3.0
