@@ -591,6 +591,20 @@ fn root_suite() -> Suite {
              ikigai-vocab (at the pin AND at HEAD); the fix is vocabulary.ttl in ikigai-core \
              plus a /ns deploy. The exact undefined set is pinned by hand below.",
         )
+        // ★ THE THIRD, from the same gap. `urn:time:jobs` grew a `text/turtle` face for the
+        // UI book's inspector (ledger #2142), and its job terms (`ik:JobList`, `ik:Job` and
+        // their properties) are not in `ikigai-vocab` either: they belong beside core's
+        // `ik:Scheduler` in `vocabulary.ttl`, which is ikigai-core's to change. Waived per
+        // check for the same reason as the two above, and pinned EXACTLY — over a registry
+        // that has jobs, run and unrun, read and withheld — in
+        // `the_jobs_graph_uses_exactly_thirteen_undefined_terms`.
+        .opt_out_check(
+            "time-jobs",
+            Check::Vocabulary,
+            "ik:JobList / ik:Job and their properties are undefined in ikigai-vocab; the fix \
+             is vocabulary.ttl in ikigai-core beside ik:Scheduler plus a /ns deploy. The exact \
+             undefined set is pinned by hand below.",
+        )
         // ---- NOT fired, and which hazard each one is -----------------------------
         //
         // ★ Written from the catalog BEFORE the first invoking run. See the module docs.
@@ -1057,6 +1071,121 @@ fn the_posture_graph_uses_exactly_fifteen_undefined_terms() {
             "https://ikigai-rs.dev/ns#reloads",
             "https://ikigai-rs.dev/ns#surface",
             "https://ikigai-rs.dev/ns#trustedClient",
+        ],
+        "the waived vocabulary exception has changed — widen the waiver's reason, or drop \
+         both it and this test if `vocabulary.ttl` now defines these"
+    );
+}
+
+/// ★ **The jobs graph's undefined terms, as an EXACT list — that waiver's other half.**
+///
+/// `opt_out_check("time-jobs", Check::Vocabulary, …)` in [`root_suite`] silences a rule this
+/// repo cannot satisfy: the `text/turtle` face of `urn:time:jobs` names `ik:` terms no version
+/// of `ikigai-vocab` defines. The set is pinned here so the waiver cannot quietly grow, and
+/// so this fails the day `vocabulary.ttl` defines them.
+///
+/// ⚠ NOT read from the composed kernel. Its registry is a process-global static driven by
+/// real timer threads, and the walk sees it with no jobs, which would pin one term. This
+/// reads the same `ikigai_time::space` over a registry of its own, with a job that has run
+/// and one that has not, read once by a caller that covers them and once by one that does
+/// not, so every term the face can emit is in the graph. `ik:verb` is the one it reuses: it
+/// is defined, with no domain, for the same five words.
+#[test]
+fn the_jobs_graph_uses_exactly_thirteen_undefined_terms() {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use ikigai_core::{
+        ArgRef, Capability, Description, EndpointSpace, Exact, FnEndpoint, Invocation, Iri,
+        ReprType, Representation, Request, SystemClock,
+    };
+    use ikigai_resolve::Resolver;
+    use ikigai_time::{JobRegistry, Schedule, TimerBackend, TimerHandle};
+
+    /// Holds each job's tick for the test to fire by hand.
+    #[derive(Default)]
+    struct Manual(Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>);
+    impl TimerBackend for Manual {
+        fn start(
+            &self,
+            _interval: Duration,
+            _recurring: bool,
+            on_tick: Arc<dyn Fn() + Send + Sync>,
+        ) -> TimerHandle {
+            self.0.lock().unwrap().push(on_tick);
+            TimerHandle::new(|| {})
+        }
+    }
+
+    let backend = Arc::new(Manual::default());
+    let registry = JobRegistry::new(backend.clone(), Arc::new(SystemClock));
+    let space: EndpointSpace = ikigai_time::space(registry.clone()).bind(
+        Exact::new("urn:x"),
+        FnEndpoint::new("x", |_: &Invocation<'_>| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                b"ok".to_vec(),
+            ))
+        })
+        .with_description(Description::new("x").verb(Verb::Source)),
+    );
+    let kernel = Arc::new(Kernel::new(Arc::new(space)));
+    registry.set_resolver(Arc::clone(&kernel) as Arc<dyn Resolver>);
+    let every = Schedule::Every(Duration::from_secs(1));
+    registry
+        .schedule(
+            "urn:x".into(),
+            Verb::Source,
+            every.clone(),
+            true,
+            Capability::root(),
+        )
+        .expect("schedule");
+    backend.0.lock().unwrap()[0]();
+    registry
+        .schedule(
+            "urn:x".into(),
+            Verb::Source,
+            every,
+            false,
+            Capability::root(),
+        )
+        .expect("schedule");
+
+    let mut undefined = BTreeSet::new();
+    for reader in [
+        Capability::root(),
+        Capability::scoped([ikigai_time::CAP_READ]),
+    ] {
+        let request = Request::new(Verb::Source, Iri::parse("urn:time:jobs").expect("iri"))
+            .with_arg("as", ArgRef::Inline(b"text/turtle".to_vec()));
+        let (repr, _) = Resolver::issue_as(kernel.as_ref(), request, &reader)
+            .expect("the jobs graph face resolves");
+        let triples =
+            rdf::parse(&repr.repr_type.media_type, &repr.bytes).expect("the face parses as Turtle");
+        assert!(rdf::blank_nodes(&triples).is_empty(), "skolemized");
+        undefined.extend(
+            rdf::terms(&triples)
+                .into_iter()
+                .filter(|t| !rdf::is_defined(t, &[])),
+        );
+    }
+    assert_eq!(
+        undefined.into_iter().collect::<Vec<_>>(),
+        vec![
+            "https://ikigai-rs.dev/ns#Job",
+            "https://ikigai-rs.dev/ns#JobList",
+            "https://ikigai-rs.dev/ns#interval",
+            "https://ikigai-rs.dev/ns#job",
+            "https://ikigai-rs.dev/ns#jobId",
+            "https://ikigai-rs.dev/ns#jobTarget",
+            "https://ikigai-rs.dev/ns#lastOutput",
+            "https://ikigai-rs.dev/ns#lastOutputWithheld",
+            "https://ikigai-rs.dev/ns#lastRunAt",
+            "https://ikigai-rs.dev/ns#nextRunAt",
+            "https://ikigai-rs.dev/ns#persistent",
+            "https://ikigai-rs.dev/ns#recurring",
+            "https://ikigai-rs.dev/ns#runs",
         ],
         "the waived vocabulary exception has changed — widen the waiver's reason, or drop \
          both it and this test if `vocabulary.ttl` now defines these"

@@ -19,7 +19,8 @@
 //! - `source urn:time:cancel id=<n>` — stops a job (or `id=all` for every
 //!   non-persistent job, or `target=<iri>` for every job firing that resource);
 //! - `source urn:time:jobs` — the live job list (id, target, interval, runs, last
-//!   output), which the Control page composes alongside the scheduler and cache.
+//!   output), which the Control page composes alongside the scheduler and cache;
+//!   `as=text/turtle` states it as a graph, each job a node with its next run due.
 //!
 //! `every=`/`after=` take a simple duration today (`500ms`, `1s`, `10s`, `1m`, `2h`).
 //! [`Schedule`] is an enum so a cron-expression variant can slot in later (parsed by
@@ -57,8 +58,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ikigai_core::{
-    ArgSpec, Capability, Clock, Description, EndpointSpace, Error, Exact, FnEndpoint, Invocation,
-    Iri, ReprType, Representation, Request, Time, Verb,
+    escape_iri_fragment, ArgSpec, Capability, Clock, Description, EndpointSpace, Error, Exact,
+    FnEndpoint, Invocation, Iri, ReprType, Representation, Request, Time, Verb,
 };
 use ikigai_resolve::Resolver;
 
@@ -281,6 +282,9 @@ struct JobRecord {
     capability: Capability,
     runs: u64,
     last_output: String,
+    /// When this job was scheduled, on the same injected [`Clock`] as `last_run`: what a job
+    /// that has not run yet is due from.
+    scheduled_at: Time,
     /// When this job last COMPLETED a fire, stamped from the kernel's injected
     /// [`Clock`]. The fact staleness is computed from: a recurring job that declares
     /// its own cadence can be judged against it without anyone configuring a threshold.
@@ -505,6 +509,8 @@ impl JobRegistry {
         persistent: bool,
         capability: Capability,
     ) -> std::result::Result<u64, String> {
+        // Stamp before locking, as `fire` does: the clock is host-injected code.
+        let scheduled_at = self.clock.now();
         // Reserve an id and grab the backend handle under a *short* lock, then release
         // it before calling into the backend. `start()` runs injected code that ticks
         // out of band, and every tick re-acquires this same lock in `fire()`; holding
@@ -544,6 +550,7 @@ impl JobRegistry {
                 capability,
                 runs: 0,
                 last_output: String::new(),
+                scheduled_at,
                 last_run: None,
                 asleep_at_last_run: None,
                 last_success: None,
@@ -802,6 +809,152 @@ impl JobRegistry {
         }
         s
     }
+
+    /// Render the job list as the `text/turtle` face of `urn:time:jobs`, from the same records
+    /// and under the same rule as [`render`](Self::render): every job's existence, its last
+    /// output only where `caller` covers the job's authority.
+    ///
+    /// ★ Skolemized, no blank nodes: the list is the resource itself, `<urn:time:jobs> a
+    /// ik:JobList`, and each job is `<urn:ikigai:time:job:{id}> a ik:Job`. Ids are never
+    /// reused by a registry, so a job keeps its node for its whole life.
+    ///
+    /// `ik:nextRunAt` is when the next fire is DUE, not a promise: one interval after the last
+    /// completed fire, or after the scheduling for a job that has not run. A native
+    /// [`ThreadTimer`] sleeps that interval from the end of each fire, so it fires then; a
+    /// `setInterval` backend keeps its own cadence and may fire sooner. A one-shot that has
+    /// fired has nothing due, and the property is absent.
+    ///
+    /// ⚠ The `ik:` terms here other than `ik:verb` are NOT yet defined in `ikigai-vocab`;
+    /// defining them is a `vocabulary.ttl` change in `ikigai-core` (beside `ik:Scheduler`)
+    /// plus a deploy of <https://ikigai-rs.dev/ns>, neither of which belongs to this repo.
+    /// `ikigai-embedded`'s conformance suite pins the exact undefined set.
+    fn render_turtle(&self, caller: &Capability) -> String {
+        let inner = self.inner.lock().expect("time registry lock");
+        let mut out = String::from(
+            "@prefix ik: <https://ikigai-rs.dev/ns#> .\n\
+             @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\n\
+             <urn:time:jobs> a ik:JobList",
+        );
+        for id in inner.jobs.keys() {
+            out.push_str(&format!(" ;\n    ik:job <{JOB_NODE}{id}>"));
+        }
+        out.push_str(" .\n");
+        for job in inner.jobs.values() {
+            let interval = job.schedule.interval();
+            out.push_str(&format!(
+                "\n<{JOB_NODE}{id}> a ik:Job ;\n    \
+                 ik:jobId \"{id}\"^^xsd:nonNegativeInteger ;\n    \
+                 ik:verb \"{verb}\" ;\n    \
+                 ik:jobTarget <{target}> ;\n    \
+                 ik:interval \"{interval}\"^^xsd:duration ;\n    \
+                 ik:recurring \"{recurring}\"^^xsd:boolean ;\n    \
+                 ik:persistent \"{persistent}\"^^xsd:boolean ;\n    \
+                 ik:runs \"{runs}\"^^xsd:nonNegativeInteger",
+                id = job.id,
+                verb = verb_name(job.verb),
+                target = escape_iri_fragment(&job.target),
+                interval = xsd_duration(interval),
+                recurring = job.recurring,
+                persistent = job.persistent,
+                runs = job.runs,
+            ));
+            if let Some(at) = job.last_run {
+                out.push_str(&format!(
+                    " ;\n    ik:lastRunAt \"{}\"^^xsd:dateTime",
+                    xsd_date_time(at)
+                ));
+            }
+            if job.recurring || job.runs == 0 {
+                let from = job.last_run.unwrap_or(job.scheduled_at);
+                let millis = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX);
+                out.push_str(&format!(
+                    " ;\n    ik:nextRunAt \"{}\"^^xsd:dateTime",
+                    xsd_date_time(from.plus_millis(millis))
+                ));
+            }
+            // Never run: no output to show or to withhold, as on the text face.
+            if !job.last_output.is_empty() {
+                if covers(caller, &job.capability) {
+                    out.push_str(&format!(
+                        " ;\n    ik:lastOutput \"{}\"",
+                        turtle_literal(&job.last_output)
+                    ));
+                } else {
+                    out.push_str(" ;\n    ik:lastOutputWithheld \"true\"^^xsd:boolean");
+                }
+            }
+            out.push_str(" .\n");
+        }
+        out
+    }
+}
+
+/// Where a job's node is skolemized in the `text/turtle` face: `{JOB_NODE}{id}`.
+const JOB_NODE: &str = "urn:ikigai:time:job:";
+
+/// A verb as the vocabulary spells `ik:verb`: `Source`, `Sink`, `Exists`, `Delete`, `Meta`.
+fn verb_name(v: Verb) -> &'static str {
+    match v {
+        Verb::Source => "Source",
+        Verb::Sink => "Sink",
+        Verb::Exists => "Exists",
+        Verb::Delete => "Delete",
+        Verb::Meta => "Meta",
+    }
+}
+
+/// `d` as an `xsd:duration` in seconds, exact to the millisecond: `PT1S`, `PT1.5S`, `PT90S`.
+fn xsd_duration(d: Duration) -> String {
+    let millis = d.subsec_millis();
+    if millis == 0 {
+        format!("PT{}S", d.as_secs())
+    } else {
+        let fraction = format!("{millis:03}");
+        format!("PT{}.{}S", d.as_secs(), fraction.trim_end_matches('0'))
+    }
+}
+
+/// `at` (milliseconds since the Unix epoch) as a UTC `xsd:dateTime`, with milliseconds only
+/// when there are any: `2026-01-01T00:00:02Z`, `2026-01-01T00:00:01.500Z`.
+fn xsd_date_time(at: Time) -> String {
+    let millis = at.as_millis();
+    let secs = millis / 1000;
+    let (days, of_day) = (secs / 86_400, secs % 86_400);
+    // Days since 1970-01-01 to a civil date (Howard Hinnant's `civil_from_days`), unsigned:
+    // a `Time` is never before the epoch.
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + u64::from(month <= 2);
+    let (h, m, s) = (of_day / 3600, of_day % 3600 / 60, of_day % 60);
+    let mut out = format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}");
+    if !millis.is_multiple_of(1000) {
+        out.push_str(&format!(".{:03}", millis % 1000));
+    }
+    out.push('Z');
+    out
+}
+
+/// Escape `text` for a Turtle string literal. A job's last output is whatever its target
+/// answered, so a quote or a backslash in it must not be able to end the literal.
+fn turtle_literal(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// What a kernel-facing cancel of one job id did.
@@ -829,6 +982,29 @@ fn text(body: String) -> Representation {
         ReprType::new("text/plain").with_param("charset", "utf-8"),
         body.into_bytes(),
     )
+}
+
+fn turtle(body: String) -> Representation {
+    Representation::new(
+        ReprType::new("text/turtle").with_param("charset", "utf-8"),
+        body.into_bytes(),
+    )
+}
+
+/// Whether `urn:time:jobs` was asked for its Turtle face: `as=text/turtle`, or the default
+/// text face when `as` is absent or `text/plain`. Anything else is refused, not guessed.
+fn wants_turtle(inv: &Invocation<'_>) -> Result<bool, Error> {
+    let Ok(face) = inv.inline_str("as") else {
+        return Ok(false);
+    };
+    match face.split(';').next().unwrap_or("").trim() {
+        "text/plain" => Ok(false),
+        "text/turtle" => Ok(true),
+        other => Err(Error::InvalidArgument {
+            name: "as".to_string(),
+            detail: format!("`{other}` is not a face of urn:time:jobs (text/plain, text/turtle)"),
+        }),
+    }
 }
 
 /// The `urn:time:*` control plane bound against `registry`. Mount this in the host's
@@ -1006,18 +1182,34 @@ pub fn space(registry: JobRegistry) -> EndpointSpace {
         .bind(
             Exact::new("urn:time:jobs"),
             FnEndpoint::new("time-jobs", move |inv: &Invocation<'_>| {
-                Ok(text(jobs_reg.render(inv.capability)))
+                if wants_turtle(inv)? {
+                    Ok(turtle(jobs_reg.render_turtle(inv.capability)))
+                } else {
+                    Ok(text(jobs_reg.render(inv.capability)))
+                }
             })
             .with_description(
                 Description::new("time-jobs")
                     .title("Scheduled timed jobs")
                     .summary(
                         "The live list of time-transport jobs: target, interval, runs, and last \
-                         output where the caller's capability covers the job's.",
+                         output where the caller's capability covers the job's. The Turtle face \
+                         states the list as one ik:JobList and each job as an ik:Job node \
+                         (urn:ikigai:time:job:{id}) with its target, interval, run count, and \
+                         last and next run.",
                     )
                     .verb(Verb::Source)
                     .requires(CAP_READ)
-                    .output("text/plain;charset=utf-8"),
+                    .input(
+                        ArgSpec::new("as")
+                            .summary("the representation to return (default text/plain)")
+                            .class(XSD_STRING)
+                            .one_of(["text/plain", "text/turtle"])
+                            .default_value("text/plain")
+                            .optional(),
+                    )
+                    .output("text/plain;charset=utf-8")
+                    .output("text/turtle;charset=utf-8"),
             ),
         )
 }
@@ -2018,5 +2210,141 @@ mod tests {
                 "cancel removed the job before calling host code: {rendered}"
             );
         }
+    }
+
+    /// Issue `source urn:time:jobs` with `args` under `capability`, keeping the media type.
+    fn jobs_face(
+        kernel: &ikigai_core::Kernel,
+        args: &[(&str, &str)],
+        capability: &Capability,
+    ) -> (String, String) {
+        let mut request = Request::new(Verb::Source, Iri::parse("urn:time:jobs").unwrap());
+        for (k, v) in args {
+            request = request.with_arg(*k, ikigai_core::ArgRef::Inline(v.as_bytes().to_vec()));
+        }
+        let (rep, _) = Resolver::issue_as(kernel, request, capability).expect("jobs resolves");
+        (
+            rep.repr_type.to_string(),
+            String::from_utf8_lossy(&rep.bytes).into_owned(),
+        )
+    }
+
+    /// ★ Ledger #2142: `urn:time:jobs` has a Turtle face. Each job is a skolemized node
+    /// carrying its target, cadence, run count and last/next run, stamped on the injected
+    /// clock, and the text face is unchanged beside it.
+    #[test]
+    fn the_job_list_has_a_turtle_face() {
+        let millis = Arc::new(AtomicU64::new(1_767_225_600_000)); // 2026-01-01T00:00:00Z
+        let backend = Arc::new(ManualBackend::default());
+        let reg = JobRegistry::new(backend.clone(), Arc::new(FixedClock(Arc::clone(&millis))));
+        let kernel = kernel_with_time(&reg, Arc::new(AtomicU64::new(0)));
+        reg.schedule(
+            "urn:x".to_string(),
+            Verb::Sink,
+            Schedule::Every(Duration::from_millis(1500)),
+            true,
+            Capability::root(),
+        )
+        .unwrap();
+        reg.schedule(
+            "urn:x".to_string(),
+            Verb::Source,
+            Schedule::Every(Duration::from_secs(90)),
+            false,
+            Capability::root(),
+        )
+        .unwrap();
+
+        let (media, before) = jobs_face(&kernel, &[("as", "text/turtle")], &Capability::root());
+        assert_eq!(media, "text/turtle;charset=utf-8");
+        assert!(
+            before.contains("<urn:time:jobs> a ik:JobList ;\n    ik:job <urn:ikigai:time:job:1> ;\n    ik:job <urn:ikigai:time:job:2> ."),
+            "{before}"
+        );
+        assert!(
+            before.contains(
+                "<urn:ikigai:time:job:1> a ik:Job ;\n    \
+                 ik:jobId \"1\"^^xsd:nonNegativeInteger ;\n    \
+                 ik:verb \"Sink\" ;\n    \
+                 ik:jobTarget <urn:x> ;\n    \
+                 ik:interval \"PT1.5S\"^^xsd:duration ;\n    \
+                 ik:recurring \"true\"^^xsd:boolean ;\n    \
+                 ik:persistent \"false\"^^xsd:boolean ;\n    \
+                 ik:runs \"0\"^^xsd:nonNegativeInteger ;\n    \
+                 ik:nextRunAt \"2026-01-01T00:00:01.500Z\"^^xsd:dateTime ."
+            ),
+            "a job that has not run is due one interval after it was scheduled: {before}"
+        );
+        assert!(!before.contains("ik:lastRunAt"), "{before}");
+
+        millis.store(1_767_225_600_000 + 2_000, Ordering::SeqCst);
+        backend.fire_all(1);
+        let (_, after) = jobs_face(&kernel, &[("as", "text/turtle")], &Capability::root());
+        assert!(
+            after.contains(
+                "ik:runs \"1\"^^xsd:nonNegativeInteger ;\n    \
+                 ik:lastRunAt \"2026-01-01T00:00:02Z\"^^xsd:dateTime ;\n    \
+                 ik:nextRunAt \"2026-01-01T00:00:03.500Z\"^^xsd:dateTime ;\n    \
+                 ik:lastOutput \"written\" ."
+            ),
+            "a recurring job is due one interval after its last run: {after}"
+        );
+        // The one-shot has fired once and has nothing more due.
+        let one_shot = after
+            .split("\n<urn:ikigai:time:job:2> a ik:Job")
+            .nth(1)
+            .unwrap();
+        assert!(
+            one_shot.contains("ik:interval \"PT90S\"^^xsd:duration"),
+            "{after}"
+        );
+        assert!(
+            one_shot.contains("ik:recurring \"false\"^^xsd:boolean"),
+            "{after}"
+        );
+        assert!(!one_shot.contains("ik:nextRunAt"), "{after}");
+
+        // A reader that does not cover the jobs' authority sees them, not their output.
+        let reader = Capability::scoped([CAP_READ]);
+        let (_, withheld) = jobs_face(&kernel, &[("as", "text/turtle")], &reader);
+        assert!(!withheld.contains("written"), "{withheld}");
+        assert!(
+            withheld.contains("ik:lastOutputWithheld \"true\"^^xsd:boolean"),
+            "{withheld}"
+        );
+
+        // The default face is still the text readout.
+        let (media, plain) = jobs_face(&kernel, &[], &Capability::root());
+        assert_eq!(media, "text/plain;charset=utf-8");
+        assert!(plain.starts_with("time jobs\n"), "{plain}");
+        let (_, explicit) = jobs_face(&kernel, &[("as", "text/plain")], &Capability::root());
+        assert_eq!(explicit, plain);
+    }
+
+    #[test]
+    fn xsd_lexical_forms() {
+        assert_eq!(xsd_date_time(Time::from_millis(0)), "1970-01-01T00:00:00Z");
+        // A leap day, with milliseconds.
+        assert_eq!(
+            xsd_date_time(Time::from_millis(1_709_210_096_789)),
+            "2024-02-29T12:34:56.789Z"
+        );
+        assert_eq!(
+            xsd_date_time(Time::from_millis(1_767_225_599_999)),
+            "2025-12-31T23:59:59.999Z"
+        );
+        assert_eq!(xsd_duration(Duration::from_millis(500)), "PT0.5S");
+        assert_eq!(xsd_duration(Duration::from_millis(1250)), "PT1.25S");
+        assert_eq!(xsd_duration(Duration::from_secs(3600)), "PT3600S");
+    }
+
+    /// A job's output is whatever its target answered: it must not be able to end the
+    /// literal and write triples of its own.
+    #[test]
+    fn a_last_output_cannot_escape_its_literal() {
+        assert_eq!(
+            turtle_literal(r#"x" ; ik:evil "y\"#),
+            r#"x\" ; ik:evil \"y\\"#
+        );
     }
 }
