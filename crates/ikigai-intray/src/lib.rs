@@ -131,6 +131,35 @@ pub const ERROR_DIR: &str = "error";
 pub const DROPPING_DIR: &str = ".dropping";
 /// Where a take stages the tuple it claimed: `<root>/<space>/.taking/`. See
 /// [`SpaceEndpoint::discard_staging`].
+///
+/// A claim is named `{id}.{millis}.{pid}.{n}.claim`: the tuple id, when the claim was made in
+/// milliseconds since the unix epoch, the taker's process id, and a per-process counter, so no
+/// two takers ever share one. A claim more than five minutes old by its `millis` is a taker that
+/// stopped between its claim and its read, and the next `rd` or `take` in the space puts it
+/// back in the inbox under its id. So `millis` = 1 (1970) plants a stale claim, which is how a
+/// test reproduces a crashed take:
+///
+/// ```
+/// use ikigai_core::{Capability, Iri, Kernel, Request, Verb};
+/// use ikigai_intray::{space, tuple_id, CAP_READ, INBOX_DIR, TAKING_DIR};
+/// use std::sync::Arc;
+///
+/// let root = std::env::temp_dir().join(format!("intray-taking-doc-{}", std::process::id()));
+/// let id = tuple_id(b"t");
+/// let taking = root.join("jobs").join(TAKING_DIR);
+/// std::fs::create_dir_all(&taking).unwrap();
+/// std::fs::write(taking.join(format!("{id}.1.0.0.claim")), b"t").unwrap();
+///
+/// // The next `rd` in `jobs` puts it back, and lists it.
+/// let kernel = Kernel::new(Arc::new(space(root.clone())));
+/// let rd = Request::new(Verb::Source, Iri::parse("urn:space:jobs").unwrap());
+/// let listed = futures::executor::block_on(kernel.issue(rd, &Capability::scoped([CAP_READ])));
+/// assert_eq!(listed.unwrap().bytes, id.as_bytes());
+/// assert!(root.join("jobs").join(INBOX_DIR).join(format!("{id}.tuple")).is_file());
+/// # let _ = std::fs::remove_dir_all(&root);
+/// ```
+///
+/// A drop stages the same way, as `{id}.{millis}.{pid}.{n}.drop` in [`DROPPING_DIR`].
 pub const TAKING_DIR: &str = ".taking";
 
 /// Every directory this crate may create under a space (`<root>/<space>/…`), so a host that
@@ -206,6 +235,38 @@ pub trait TupleCodec: Send + Sync {
     /// The tuple stored as `stored`, or why it cannot be read back.
     fn decode(&self, stored: &[u8]) -> std::result::Result<Vec<u8>, String>;
 
+    /// [`decode`](TupleCodec::decode) for the tuple `id` (its file is `{id}.tuple`), so a
+    /// reason can name the tuple. This is what the crate calls wherever it reads a tuple. The
+    /// default ignores `id` and calls `decode`, so a codec that implements only `decode` is
+    /// unchanged. The crate's refusal already names the space and the tuple and puts the
+    /// reason last, after a colon, so a reason need not repeat either.
+    ///
+    /// ```
+    /// use ikigai_intray::TupleCodec;
+    ///
+    /// /// Says which tuple it could not read.
+    /// struct Strict;
+    /// impl TupleCodec for Strict {
+    ///     fn encode(&self, plain: &[u8]) -> Result<Vec<u8>, String> {
+    ///         Ok(plain.to_vec())
+    ///     }
+    ///     fn decode(&self, stored: &[u8]) -> Result<Vec<u8>, String> {
+    ///         self.decode_tuple("(unnamed)", stored)
+    ///     }
+    ///     fn decode_tuple(&self, id: &str, stored: &[u8]) -> Result<Vec<u8>, String> {
+    ///         if stored.is_empty() {
+    ///             return Err(format!("{id}.tuple is empty"));
+    ///         }
+    ///         Ok(stored.to_vec())
+    ///     }
+    /// }
+    /// assert_eq!(Strict.decode_tuple("abc", b"").unwrap_err(), "abc.tuple is empty");
+    /// ```
+    fn decode_tuple(&self, id: &str, stored: &[u8]) -> std::result::Result<Vec<u8>, String> {
+        let _ = id;
+        self.decode(stored)
+    }
+
     /// Whether `stored` is already what [`encode`](TupleCodec::encode) would store now, so
     /// [`SpaceEndpoint::reencode`] leaves it alone. `false` after a key rotation for a tuple
     /// sealed to the old key. The default says every stored tuple is current.
@@ -238,16 +299,91 @@ impl TupleCodec for IdentityCodec {
 /// The refusal a tuple that does not decode is answered with: typed, and naming the tuple.
 fn undecodable(space: &str, id: &str, why: &str) -> Error {
     Error::Conflict(format!(
-        "space `{space}`: tuple `{id}` does not decode with this space's codec ({why}), so it \
-         was not read"
+        "space `{space}`: tuple `{id}` does not decode with this space's codec, so it was not \
+         read: {why}"
     ))
 }
 
 /// Decode `stored`, the tuple `id` of `space`, or refuse naming it.
 fn decode(codec: &dyn TupleCodec, space: &str, id: &str, stored: &[u8]) -> Result<Vec<u8>> {
     codec
-        .decode(stored)
+        .decode_tuple(id, stored)
         .map_err(|why| undecodable(space, id, &why))
+}
+
+/// The permissions a space gives every file and directory it creates
+/// ([`SpaceEndpoint::with_modes`]). `None`, the default, is the platform's own (the process
+/// umask on unix), exactly as before the setting existed.
+#[derive(Debug, Clone, Copy, Default)]
+struct Modes(Option<(u32, u32)>);
+
+impl Modes {
+    /// `std::fs::create_dir_all`, giving each directory it CREATES the chosen mode. One that
+    /// already exists is left as it is: the space did not make it.
+    fn create_dir_all(&self, dir: &Path) -> std::io::Result<()> {
+        let Some((_, mode)) = self.0 else {
+            return std::fs::create_dir_all(dir);
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut missing = Vec::new();
+            let mut at = Some(dir);
+            while let Some(d) = at.filter(|d| !d.as_os_str().is_empty() && !d.is_dir()) {
+                missing.push(d);
+                at = d.parent();
+            }
+            for d in missing.into_iter().rev() {
+                // Created with the mode, so the umask can only NARROW it, and then set to
+                // it exactly: the directory is never wider than asked, even for a moment.
+                match std::fs::DirBuilder::new().mode(mode).create(d) {
+                    Ok(()) => set_mode(d, mode)?,
+                    // A rival creator made it first; it sets the mode itself.
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && d.is_dir() => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = mode;
+            std::fs::create_dir_all(dir)
+        }
+    }
+
+    /// `std::fs::write` of a file the space creates (always under a fresh staging name), with
+    /// the chosen mode.
+    fn write(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        let Some((mode, _)) = self.0 else {
+            return std::fs::write(path, bytes);
+        };
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            // As for a directory: created with the mode (never wider), then set exactly.
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(mode)
+                .open(path)?;
+            set_mode(path, mode)?;
+            file.write_all(bytes)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = mode;
+            std::fs::write(path, bytes)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
 /// The lease every live reactor over a root holds on `<root>/.reactor.lock`: SHARED while
@@ -317,6 +453,8 @@ pub struct SpaceEndpoint {
     budget: EvaluationBudget,
     /// How a tuple is stored at rest (see [`TupleCodec`]).
     codec: Arc<dyn TupleCodec>,
+    /// The permissions of what it creates ([`with_modes`](SpaceEndpoint::with_modes)).
+    modes: Modes,
 }
 
 impl SpaceEndpoint {
@@ -327,6 +465,7 @@ impl SpaceEndpoint {
             root,
             budget: EvaluationBudget::default(),
             codec: Arc::new(IdentityCodec),
+            modes: Modes::default(),
         }
     }
 
@@ -348,6 +487,29 @@ impl SpaceEndpoint {
     /// ```
     pub fn with_codec(mut self, codec: Arc<dyn TupleCodec>) -> Self {
         self.codec = codec;
+        self
+    }
+
+    /// Give every file this endpoint creates the unix permissions `file`, and every directory
+    /// it creates `dir`, exactly: not narrowed by the process umask, and never wider than asked
+    /// even for a moment. Without it, the default, both come from the umask as before. It
+    /// covers everything `out`, `take`, `retry=`, [`reencode`](Self::reencode) and
+    /// [`reencode_settled`](Self::reencode_settled) write: the stage and staging directories
+    /// (and the space's own, and the root, when this makes them), every tuple, and the `.err`
+    /// note of a tuple a take finds corrupt. A directory that already exists keeps its mode.
+    /// Ignored off unix.
+    ///
+    /// ⚠ A [`SpaceReactor`] over the same root does not take this setting: the `.processing/`,
+    /// `outbox/` and `error/` entries and the notes a reactor writes still come from its
+    /// process umask.
+    ///
+    /// ```
+    /// # use ikigai_intray::SpaceEndpoint;
+    /// // Readable and writable by the host's own user only.
+    /// let _space = SpaceEndpoint::new("/tmp/spaces".into()).with_modes(0o600, 0o700);
+    /// ```
+    pub fn with_modes(mut self, file: u32, dir: u32) -> Self {
+        self.modes = Modes(Some((file, dir)));
         self
     }
 
@@ -415,7 +577,8 @@ impl SpaceEndpoint {
         }
         let src = self.inbox(name).join(format!("{id}.tuple"));
         let staging = self.root.join(name).join(TAKING_DIR);
-        std::fs::create_dir_all(&staging)
+        self.modes
+            .create_dir_all(&staging)
             .map_err(|e| Error::Endpoint(format!("space `{name}`: staging: {e}")))?;
         let staged = staging.join(staging_name(id, "claim"));
         match std::fs::rename(&src, &staged) {
@@ -432,7 +595,7 @@ impl SpaceEndpoint {
             }
         };
         if !hashes_to(&bytes, id) {
-            let why = quarantine(&self.root.join(name), id, &staged);
+            let why = quarantine(&self.root.join(name), id, &staged, self.modes);
             return Ok(Claim::Corrupt(why));
         }
         // Decoded BEFORE the claim is removed: a tuple this codec cannot read stays in the
@@ -453,7 +616,8 @@ impl SpaceEndpoint {
     /// say. Each moved tuple gets a NEW id (an id is the hash of the stored bytes), and the
     /// answer pairs each old id with its new one, in id order, so a host that indexes ids can
     /// follow them. Only the inbox: a tuple a reactor has settled (`outbox/`, `error/`) or is
-    /// running (`.processing/`) is left as it is.
+    /// running (`.processing/`) is left as it is, for
+    /// [`reencode_settled`](Self::reencode_settled).
     ///
     /// Every tuple is read, checked against its id and decoded BEFORE anything moves, so a
     /// tuple that does not decode refuses the whole call (a typed `Conflict` naming it) with
@@ -501,7 +665,8 @@ impl SpaceEndpoint {
         for (old, new, stored) in planned {
             let src = inbox.join(format!("{old}.tuple"));
             let staging = self.root.join(name).join(TAKING_DIR);
-            std::fs::create_dir_all(&staging)
+            self.modes
+                .create_dir_all(&staging)
                 .map_err(|e| Error::Endpoint(format!("space `{name}`: staging: {e}")))?;
             let claimed = staging.join(staging_name(&old, "claim"));
             match std::fs::rename(&src, &claimed) {
@@ -517,6 +682,172 @@ impl SpaceEndpoint {
             moved.push(Reencoded { old, new });
         }
         Ok(moved)
+    }
+
+    /// [`reencode`](Self::reencode) for the stages a tuple reaches after the inbox: `error/`,
+    /// `outbox/` and `.processing/`. Each tuple the codec says is not current
+    /// ([`TupleCodec::is_current`]) is stored again under its NEW id: the new `{new}.tuple`
+    /// written whole (under a staging name, then renamed into place), then its `.err` and
+    /// `.out` notes renamed to the new id, then the old file removed. A stop between leaves the
+    /// tuple twice (a dead letter or a settled answer seen twice), never a tuple lost.
+    ///
+    /// The notes: an `.out` note (what a handler answered, so it can echo the tuple) that is
+    /// not current is decoded and encoded again in place, through the same codec, under the
+    /// tuple's new id when the tuple moved. An `.err` note, this crate's sentence or a
+    /// handler's error, is only renamed. ⚠ A [`SpaceReactor`] writes its `.out` notes as the
+    /// handler answered them, not encoded, so over a reactor's outbox this decodes a plaintext
+    /// note: that refuses unless the codec passes plaintext through.
+    ///
+    /// A tuple file that does not hash to its name is one a take or a reactor already holds as
+    /// corrupt (see `rd state=error`): it is stored again IN PLACE, keeping its name and so its
+    /// standing.
+    ///
+    /// As in [`reencode`](Self::reencode), everything is read and decoded BEFORE anything
+    /// changes, so a tuple or an `.out` note that does not decode refuses the whole call (a
+    /// typed `Conflict` naming it) with nothing changed; an I/O failure part way returns `Err`
+    /// with the earlier files already rewritten. The answer lists every file rewritten, in the
+    /// order it was, per stage in `error/`, `outbox/`, `.processing/` order and id order within.
+    ///
+    /// ⚠ Only for a host that knows no reactor is running over the root, and that nothing is
+    /// re-arming a dead letter (`retry=`) meanwhile, as for
+    /// [`discard_staging`](Self::discard_staging): a live pass holds its tuple in
+    /// `.processing/` by name, and a tuple moved under it is settled twice.
+    ///
+    /// ```
+    /// # use ikigai_intray::SpaceEndpoint;
+    /// // Under the default codec every tuple and note is current, so nothing is rewritten.
+    /// let root = std::env::temp_dir().join(format!("intray-resettle-doc-{}", std::process::id()));
+    /// assert!(SpaceEndpoint::new(root).reencode_settled("jobs").unwrap().is_empty());
+    /// ```
+    pub fn reencode_settled(&self, name: &str) -> Result<Vec<Resettled>> {
+        if name.contains('.') || !ikigai_resolve::is_plain_file_name(name) {
+            return Err(Error::InvalidArgument {
+                name: "name".to_string(),
+                detail: "a space name is a single segment".to_string(),
+            });
+        }
+        let io = |what: &str, e: std::io::Error| {
+            Error::Endpoint(format!("space `{name}`: reencode settled: {what}: {e}"))
+        };
+        let encode = |id: &str, plain: &[u8]| {
+            self.codec
+                .encode(plain)
+                .map_err(|why| Error::Endpoint(format!("space `{name}`: re-encode `{id}`: {why}")))
+        };
+        // (stage, old id, new id, stored bytes): old == new is a corrupt tuple, kept in place.
+        let mut tuples: Vec<(&'static str, String, String, Vec<u8>)> = Vec::new();
+        // (stage, tuple id, stored bytes) of an `.out` note.
+        let mut notes: Vec<(&'static str, String, Vec<u8>)> = Vec::new();
+        for stage in [ERROR_DIR, OUTBOX_DIR, PROCESSING_DIR] {
+            let dir = self.root.join(name).join(stage);
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(io(stage, e)),
+            };
+            let mut files = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(|e| io(stage, e))?;
+                if let Some(file) = entry.file_name().to_str() {
+                    files.push(file.to_string());
+                }
+            }
+            files.sort();
+            for file in files {
+                let (id, is_tuple) = match (file.strip_suffix(".tuple"), file.strip_suffix(".out"))
+                {
+                    (Some(id), _) => (id, true),
+                    (_, Some(id)) => (id, false),
+                    _ => continue,
+                };
+                if !is_tuple_id(id) {
+                    continue;
+                }
+                let stored = match std::fs::read(dir.join(&file)) {
+                    Ok(stored) => stored,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(io(&format!("{stage}/{file}"), e)),
+                };
+                if self.codec.is_current(&stored) {
+                    continue;
+                }
+                if is_tuple {
+                    let plain = decode(self.codec.as_ref(), name, id, &stored)?;
+                    let again = encode(id, &plain)?;
+                    let new = if hashes_to(&stored, id) {
+                        tuple_id(&again)
+                    } else {
+                        id.to_string() // held as corrupt: rewritten in place, keeping its name
+                    };
+                    if new != id || !hashes_to(&stored, id) {
+                        tuples.push((stage, id.to_string(), new, again));
+                    }
+                } else {
+                    let plain = self.codec.decode(&stored).map_err(|why| {
+                        Error::Conflict(format!(
+                            "space `{name}`: the `.out` note of tuple `{id}` in `{stage}/` does                              not decode with this space's codec, so nothing was re-encoded: {why}"
+                        ))
+                    })?;
+                    notes.push((stage, id.to_string(), encode(id, &plain)?));
+                }
+            }
+        }
+        let mut done = Vec::new();
+        // Where each moved tuple's notes went, so a re-encoded `.out` note follows its tuple.
+        let mut renamed = std::collections::HashMap::new();
+        for (stage, old, new, stored) in tuples {
+            let dir = self.root.join(name).join(stage);
+            self.replace(&dir, &new, "tuple", &stored)
+                .map_err(|e| io(&format!("{stage}/{new}.tuple"), e))?;
+            if new != old {
+                for ext in ["err", "out"] {
+                    let from = dir.join(format!("{old}.{ext}"));
+                    match std::fs::rename(&from, dir.join(format!("{new}.{ext}"))) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(io(&format!("{stage}/{old}.{ext}"), e)),
+                    }
+                }
+                match std::fs::remove_file(dir.join(format!("{old}.tuple"))) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(io(&format!("{stage}/{old}.tuple"), e)),
+                }
+                renamed.insert((stage, old.clone()), new.clone());
+            }
+            done.push(Resettled {
+                stage,
+                was: format!("{old}.tuple"),
+                now: format!("{new}.tuple"),
+            });
+        }
+        for (stage, id, stored) in notes {
+            let dir = self.root.join(name).join(stage);
+            let now = renamed.get(&(stage, id.clone())).unwrap_or(&id).clone();
+            self.replace(&dir, &now, "out", &stored)
+                .map_err(|e| io(&format!("{stage}/{now}.out"), e))?;
+            done.push(Resettled {
+                stage,
+                was: format!("{id}.out"),
+                now: format!("{now}.out"),
+            });
+        }
+        Ok(done)
+    }
+
+    /// Put `bytes` at `<dir>/<id>.<ext>` whole: written under a staging name of its own in
+    /// `dir`, then renamed over whatever is there, so a reader finds the old file or the new
+    /// one, never part of either.
+    fn replace(&self, dir: &Path, id: &str, ext: &str, bytes: &[u8]) -> std::io::Result<()> {
+        let tmp = dir.join(staging_name(id, &format!("{ext}-reencode")));
+        let placed = self
+            .modes
+            .write(&tmp, bytes)
+            .and_then(|()| std::fs::rename(&tmp, dir.join(format!("{id}.{ext}"))));
+        if placed.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        placed
     }
 
     /// Remove every staged drop ([`DROPPING_DIR`]) and staged claim ([`TAKING_DIR`]) a space
@@ -566,13 +897,17 @@ impl SpaceEndpoint {
     /// nothing (see the Sink arm).
     fn publish(&self, name: &str, id: &str, stored: &[u8]) -> Result<()> {
         let inbox = self.inbox(name);
-        std::fs::create_dir_all(&inbox)
+        self.modes
+            .create_dir_all(&inbox)
             .map_err(|e| Error::Endpoint(format!("space `{name}`: create inbox: {e}")))?;
         let staging = self.root.join(name).join(DROPPING_DIR);
-        std::fs::create_dir_all(&staging)
+        self.modes
+            .create_dir_all(&staging)
             .map_err(|e| Error::Endpoint(format!("space `{name}`: staging: {e}")))?;
         let tmp = staging.join(staging_name(id, "drop"));
-        let published = std::fs::write(&tmp, stored)
+        let published = self
+            .modes
+            .write(&tmp, stored)
             .map_err(|e| Error::Endpoint(format!("space `{name}`: out: {e}")))
             .and_then(|()| {
                 std::fs::rename(&tmp, inbox.join(format!("{id}.tuple")))
@@ -614,7 +949,7 @@ impl SpaceEndpoint {
                 continue;
             }
             let inbox = self.inbox(name);
-            let _ = std::fs::create_dir_all(&inbox);
+            let _ = self.modes.create_dir_all(&inbox);
             let _ = std::fs::rename(entry.path(), inbox.join(format!("{id}.tuple")));
         }
     }
@@ -627,6 +962,19 @@ pub struct Reencoded {
     pub old: String,
     /// The id it has now, in the inbox.
     pub new: String,
+}
+
+/// One file [`SpaceEndpoint::reencode_settled`] stored again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Resettled {
+    /// The stage it is in: [`ERROR_DIR`], [`OUTBOX_DIR`] or [`PROCESSING_DIR`].
+    pub stage: &'static str,
+    /// Its file name before: `{id}.tuple`, or `{id}.out` for a note.
+    pub was: String,
+    /// Its file name now. A moved tuple's is `{new}.tuple`, and its notes moved with it; a
+    /// tuple held as corrupt, or a note of a tuple that did not move, keeps its name.
+    pub now: String,
 }
 
 /// How old a claim in [`TAKING_DIR`] must be before it counts as abandoned. A live take holds
@@ -645,9 +993,12 @@ enum Claim {
 }
 
 /// A staging file name no other writer can produce: `<id>.<millis>.<pid>.<n>.<suffix>`, where
-/// `millis` is when it was made, `pid` this process and `n` a per-process counter. Two writers
-/// of the same id — two identical drops, two takers — therefore never share an inode, and a
-/// stale claim can be judged by the time in its own name.
+/// `millis` is when it was made (milliseconds since the unix epoch), `pid` this process and `n`
+/// a per-process counter. Two writers of the same id — two identical drops, two takers —
+/// therefore never share an inode, and a stale claim can be judged by the time in its own name.
+///
+/// These names are on disk and documented for hosts on [`TAKING_DIR`]: a claim older than
+/// [`STALE_CLAIM`] by its `millis` is requeued, so `millis` = 1 plants a stale one.
 ///
 /// ★ This replaced `<id>.tuple` for both drops and takes. Shared, an identical concurrent drop
 /// re-truncated (`fs::write` is O_TRUNC) the very inode another drop was renaming into the
@@ -711,9 +1062,10 @@ fn corrupt_note(id: &str) -> String {
 /// note to follow, so a reader in between (`dead_letters`, the heartbeat's FAILING line,
 /// `rd state=error`) saw a fresh dead letter with "(no .err note)" or an empty one: 7 of
 /// 1,440 runs of gonk's trigger test under load.
-fn place_note(dir: &Path, id: &str, ext: &str, text: &str) -> std::io::Result<()> {
+fn place_note(dir: &Path, id: &str, ext: &str, text: &[u8], modes: Modes) -> std::io::Result<()> {
     let tmp = dir.join(staging_name(id, &format!("{ext}-note")));
-    let placed = std::fs::write(&tmp, text)
+    let placed = modes
+        .write(&tmp, text)
         .and_then(|()| std::fs::rename(&tmp, dir.join(format!("{id}.{ext}"))));
     if placed.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -755,10 +1107,10 @@ fn staged(dir: &Path, id: &str) {
 /// Move a claimed file that failed [`hashes_to`] into the space's `error/` stage beside a
 /// note saying why, and return a reason naming where it went (or why it could not). The
 /// note goes first ([`place_note`]), so the quarantined file is never seen without it.
-fn quarantine(space_dir: &Path, id: &str, claimed: &Path) -> String {
+fn quarantine(space_dir: &Path, id: &str, claimed: &Path, modes: Modes) -> String {
     let error = space_dir.join(ERROR_DIR);
-    let moved = std::fs::create_dir_all(&error).and_then(|()| {
-        let noted = place_note(&error, id, "err", &corrupt_note(id)).is_ok();
+    let moved = modes.create_dir_all(&error).and_then(|()| {
+        let noted = place_note(&error, id, "err", corrupt_note(id).as_bytes(), modes).is_ok();
         let moved = std::fs::rename(claimed, error.join(format!("{id}.tuple")));
         if moved.is_err() && noted {
             withdraw_note(&error, id, "err");
@@ -1083,7 +1435,7 @@ impl Endpoint for SpaceEndpoint {
                         });
                     }
                     let from = self.root.join(name).join(ERROR_DIR);
-                    std::fs::create_dir_all(&inbox).map_err(|e| {
+                    self.modes.create_dir_all(&inbox).map_err(|e| {
                         Error::Endpoint(format!("space `{name}`: create inbox: {e}"))
                     })?;
                     std::fs::rename(
@@ -2157,7 +2509,7 @@ impl SpaceReactor {
             // `error/` with no record of WHY, which is the one thing `rd state=error` exists
             // to show, so the reason goes to stderr instead of being dropped (ledger #1548).
             // The tuple still moves.
-            Err(msg) => match place_note(&dir, id, "err", msg) {
+            Err(msg) => match place_note(&dir, id, "err", msg.as_bytes(), Modes::default()) {
                 Ok(()) => Some("err"),
                 Err(e) => {
                     eprintln!(
@@ -2172,16 +2524,18 @@ impl SpaceReactor {
             // decided and whether anyone was told. Empty answers write nothing. A note that
             // cannot be written is said on stderr, without the answer itself (which may be
             // long, and is the handler's to log), so its absence is not mistaken for silence.
-            Ok(said) if !said.trim().is_empty() => match place_note(&dir, id, "out", said) {
-                Ok(()) => Some("out"),
-                Err(e) => {
-                    eprintln!(
-                        "ikigai-intray: space `{name}`: handled tuple {id} has no .out note \
+            Ok(said) if !said.trim().is_empty() => {
+                match place_note(&dir, id, "out", said.as_bytes(), Modes::default()) {
+                    Ok(()) => Some("out"),
+                    Err(e) => {
+                        eprintln!(
+                            "ikigai-intray: space `{name}`: handled tuple {id} has no .out note \
                          ({e}); its answer was not recorded"
-                    );
-                    None
+                        );
+                        None
+                    }
                 }
-            },
+            }
             // Said nothing THIS pass: an answer left by an earlier pass must not stand in
             // for it, not even for the moment before the tuple moves in.
             Ok(_) => {
