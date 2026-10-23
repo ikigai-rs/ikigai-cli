@@ -22,7 +22,7 @@ use std::time::Duration;
 /// write returns the error). These lines are written by the accept loop itself, so the panic
 /// would end [`serve`](crate::serve) and with it the whole door, for a log line nobody was
 /// reading. A diagnostic that cannot be written is lost; the door is not.
-fn diagnose(line: std::fmt::Arguments<'_>) {
+pub(crate) fn diagnose(line: std::fmt::Arguments<'_>) {
     use std::io::Write;
     let _ = writeln!(io::stderr().lock(), "{line}");
 }

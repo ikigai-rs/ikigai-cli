@@ -2133,6 +2133,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 postcard = { version = "1", features = ["use-std"] }
 libc = "0.2"
+# The peer-credential reads (`SO_PEERCRED`, `getpeereid`) and the user and group lookups of the
+# socket door's per-UID admission (ledger #2139), through a vetted crate rather than our own FFI.
+# 0.30.1 is already in the graph; `socket` and `user` are the two features ikigai-ipc reads.
+nix = { version = "0.30.1", default-features = false, features = ["socket", "user"] }
 # Native HTTP client for the embedded host's ikigai-http transport. Blocking and
 # runtime-free, so it works under the CLI's `futures::block_on` without pulling Tokio.
 ureq = "2"

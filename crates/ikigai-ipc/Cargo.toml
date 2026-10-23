@@ -12,3 +12,6 @@ ikigai-core = { workspace = true }
 ikigai-resolve = { workspace = true }
 ikigai-wire = { workspace = true }
 libc = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }

@@ -4624,6 +4624,106 @@ fn watch_served_workspace(
 
 // --- IPC serve / connect ----------------------------------------------------
 
+/// The other accounts a socket door admits (ledger #2139): the principals table's `uid`/`user`
+/// entries ([`ikigai_embedded::agents::socket_peers`]), each a bounded, named admission, and
+/// the group the socket is shared with (`ipc.group` in the config home's `config.toml`).
+#[cfg(all(feature = "embedded", feature = "ipc", unix))]
+struct SharedSocket {
+    admissions: ikigai_ipc::Admissions,
+    gid: u32,
+    /// One line per admitted account: `uid 502 as urn:…`.
+    accounts: Vec<String>,
+}
+
+/// Read [`SharedSocket`] from the grants file, or `None` when no principal names an account
+/// (or there is no grants file): the door then admits only its own user, as before.
+///
+/// # Errors
+///
+/// Every reason the table cannot be honored, named: a grants file that does not parse or fails
+/// a session check, an account that does not exist or is this user, a grants file the account
+/// could write, and a missing or unknown `ipc.group`.
+#[cfg(all(feature = "embedded", feature = "ipc", unix))]
+fn shared_socket() -> Result<Option<SharedSocket>, String> {
+    let Some(path) = ikigai_embedded::grants_path() else {
+        return Ok(None);
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let peers = ikigai_embedded::agents::socket_peers(&text)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if peers.is_empty() {
+        return Ok(None);
+    }
+    shared_socket_from(&path, peers, ikigai_embedded::config::get("ipc.group"))
+}
+
+/// [`shared_socket`] over the parsed accounts and the configured group, so the policy is
+/// testable without a config home.
+#[cfg(all(feature = "embedded", feature = "ipc", unix))]
+fn shared_socket_from(
+    path: &std::path::Path,
+    peers: Vec<ikigai_embedded::agents::SocketPeer>,
+    group: Option<String>,
+) -> Result<Option<SharedSocket>, String> {
+    use ikigai_embedded::agents::Account;
+    // SAFETY: `getuid` reads a process attribute and cannot fail.
+    let me = unsafe { libc::getuid() };
+    let group = group
+        .map(|g| g.trim().trim_matches('"').to_string())
+        .ok_or_else(|| {
+            format!(
+                "{} admits other accounts to the socket, so it needs a group to share the socket \
+             with: set `ipc.group = \"<group>\"` in {}, a group those accounts are in",
+                path.display(),
+                ikigai_embedded::config::config_path().display()
+            )
+        })?;
+    let gid = match group.parse::<u32>() {
+        Ok(gid) => gid,
+        Err(_) => ikigai_ipc::gid_of_group(&group).map_err(|e| format!("ipc.group: {e}"))?,
+    };
+    let mut admissions = ikigai_ipc::Admissions::owner_only();
+    let mut accounts = Vec::new();
+    for peer in peers {
+        let uid = match &peer.account {
+            Account::Uid(uid) => *uid,
+            Account::User(name) => ikigai_ipc::uid_of_user(name)
+                .map_err(|e| format!("the account of `{}`: {e}", peer.session.principal))?,
+        };
+        if uid == me {
+            return Err(format!(
+                "the account of `{}` is this user (uid {uid}): a same-uid client is the owner \
+                 to the operating system and cannot be bounded; run it as another account",
+                peer.session.principal
+            ));
+        }
+        ikigai_embedded::agents::check_protected_from(path, uid)?;
+        let ceiling = ikigai_resolve::without_principals(&peer.session.capability);
+        let admission =
+            ikigai_ipc::Admission::bounded(ceiling, Some(peer.session.principal.clone()))
+                .map_err(|e| format!("`{}`: {e}", peer.session.principal))?;
+        if admissions
+            .admit(me, Some(uid))
+            .is_ok_and(|a| a.principal().is_some())
+        {
+            return Err(format!(
+                "uid {uid} is named by two principals; an account is one principal"
+            ));
+        }
+        admissions = admissions.with_uid(uid, admission);
+        accounts.push(format!("uid {uid} as {}", peer.session.principal));
+    }
+    Ok(Some(SharedSocket {
+        admissions,
+        gid,
+        accounts,
+    }))
+}
+
 #[cfg(all(feature = "embedded", feature = "ipc", unix))]
 fn serve_ipc(path: Option<String>, mounts: Mounts) -> ! {
     let socket = ipc_socket(path);
@@ -4677,6 +4777,29 @@ fn serve_ipc(path: Option<String>, mounts: Mounts) -> ! {
     // start. (A `--prefer` mount is exempt — its peer being absent is normal, and it dials
     // on demand.)
     announce_mounts("ikigai", &mounts, declined);
+    // Other accounts this socket admits, from the principals table (ledger #2139). A table
+    // that names an account and cannot be honored stops the door: serving it owner-only would
+    // look like the bound was applied.
+    let shared = match shared_socket() {
+        Ok(shared) => shared,
+        Err(e) => {
+            eprintln!("ikigai: serve error: {e}");
+            std::process::exit(2);
+        }
+    };
+    let authority = match &shared {
+        None => "root, as the owner, naming no principal — only this user reaches the socket \
+                 (its file permissions and the peer's UID are the boundary), and a principal a \
+                 client supplies is removed"
+            .to_string(),
+        Some(shared) => format!(
+            "root for this user, as the owner, naming no principal; and {}, each bounded by \
+             its grant and named as its principal — the socket's group and mode and the peer's \
+             UID are the boundary, any other UID is refused, and a principal a client supplies \
+             is removed",
+            shared.accounts.join(", ")
+        ),
+    };
     // ★ The posture of the door a local client (Emacs, the REPL, MCP) actually talks to.
     // THE HOST OWNS THE TOPOLOGY, so this socket's mounts are the ones a connected client
     // resolves through without knowing where the peers are — and until now the only way to
@@ -4685,15 +4808,10 @@ fn serve_ipc(path: Option<String>, mounts: Mounts) -> ! {
         door: socket.display().to_string(),
         mounts: mount_posture(&mounts, declined),
         // A Unix socket authenticates nobody by certificate: the socket's file permissions
-        // are the boundary, which is exactly why the kernel behind it is the TRUSTED one.
+        // and the peer's kernel-verified UID are the boundary.
         clients: Vec::new(),
         surface: None,
-        authority: Some(
-            "root, as the owner, naming no principal — only this user reaches the socket (its \
-             file permissions and the peer's UID are the boundary), and a principal a client \
-             supplies is removed"
-                .to_string(),
-        ),
+        authority: Some(authority),
         reloads: Vec::new(),
     });
     let mut resolved = Vec::new();
@@ -4718,7 +4836,11 @@ fn serve_ipc(path: Option<String>, mounts: Mounts) -> ! {
     // before the bind, so a client that dialed on it got `No such file or directory` about
     // half the time. The listener is listening once `bind` returns, so a client that connects
     // after the banner waits in the backlog until the accept loop takes it.
-    let listener = match ikigai_ipc::bind(&socket) {
+    let listener = match &shared {
+        None => ikigai_ipc::bind(&socket),
+        Some(shared) => ikigai_ipc::bind_shared(&socket, shared.gid),
+    };
+    let listener = match listener {
         Ok(listener) => listener,
         Err(e) => {
             eprintln!(
@@ -4728,20 +4850,37 @@ fn serve_ipc(path: Option<String>, mounts: Mounts) -> ! {
             std::process::exit(1);
         }
     };
-    // ★ OWNER, explicitly (ledger #1830, row D12): a Unix socket admits only this user's UID,
-    // which names the owner and no party, so a principal is not meaningful here. Root, and a
-    // `principal` argument or carried principal scope a client supplies is removed.
-    eprintln!(
-        "ikigai: the socket admits only this user, as the owner: root authority, no \
-         principal (a client-supplied one is removed)"
-    );
+    // ★ OWNER, explicitly (ledger #1830, row D12): this user's UID names the owner and no
+    // party, so a principal is not meaningful for it. Root, and a `principal` argument or
+    // carried principal scope a client supplies is removed. Another account is admitted only
+    // as the principals table names it (ledger #2139), bounded and named.
+    let admissions = match &shared {
+        None => {
+            eprintln!(
+                "ikigai: the socket admits only this user, as the owner: root authority, no \
+                 principal (a client-supplied one is removed)"
+            );
+            ikigai_ipc::Admissions::owner_only()
+        }
+        Some(shared) => {
+            eprintln!(
+                "ikigai: the socket admits this user as the owner (root authority, no \
+                 principal), and {} other account(s), each bounded by its grant and named: {} \
+                 (socket group gid {}, mode 0660; any other uid is refused)",
+                shared.accounts.len(),
+                shared.accounts.join(", "),
+                shared.gid
+            );
+            shared.admissions.clone()
+        }
+    };
     // The banner stays LAST: it is the readiness signal, and a reader may stop at it.
     eprintln!("ikigai: serving on {}  (Ctrl-C to stop)", socket.display());
-    match ikigai_ipc::serve_shared_on_admitted(
+    match ikigai_ipc::serve_shared_on_admissions(
         kernel,
         listener,
         ikigai_ipc::Limits::default(),
-        ikigai_ipc::Admission::owner(),
+        admissions,
     ) {
         Ok(()) => std::process::exit(0),
         Err(e) => {
@@ -7068,5 +7207,104 @@ mod mcp_authority_tests {
         let agent = start.with_principal("urn:example:agent").unwrap();
         let (reloaded, _) = mcp_reloaded(&agent, &agent);
         assert_eq!(reloaded.principal(), Some("urn:example:agent"));
+    }
+}
+
+/// The socket door's reading of the principals table's accounts (ledger #2139).
+#[cfg(all(test, feature = "embedded", feature = "ipc", unix))]
+mod shared_socket_tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    fn me() -> u32 {
+        // SAFETY: `getuid` reads a process attribute and cannot fail.
+        unsafe { libc::getuid() }
+    }
+
+    /// A grants file only its owner (this user) can write, holding `account` on a machine
+    /// principal, and the parsed accounts.
+    fn grants(
+        name: &str,
+        account: &str,
+    ) -> (std::path::PathBuf, Vec<ikigai_embedded::agents::SocketPeer>) {
+        let dir = std::env::temp_dir().join(format!("ikss-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.join("grants.json");
+        let text = format!(
+            r#"{{
+              "brian": ["urn:cap:demo:read", "urn:cap:demo:write"],
+              "node": ["urn:cap:demo:read"],
+              "principals": {{
+                "urn:example:brian": {{"kind": "person", "grant": "brian"}},
+                "urn:example:node": {{
+                  "kind": "machine", "acts_for": "urn:example:brian", "grant": "node", {account}
+                }}
+              }}
+            }}"#
+        );
+        std::fs::write(&path, &text).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let peers = ikigai_embedded::agents::socket_peers(&text).unwrap();
+        (path, peers)
+    }
+
+    fn own_gid(path: &std::path::Path) -> String {
+        std::fs::metadata(path).unwrap().gid().to_string()
+    }
+
+    #[test]
+    fn another_account_is_admitted_bounded_and_named_and_nobody_else() {
+        let other = me().wrapping_add(1);
+        let (path, peers) = grants("ok", &format!(r#""uid": {other}"#));
+        let shared = shared_socket_from(&path, peers, Some(own_gid(&path)))
+            .unwrap()
+            .expect("an account is named");
+        assert_eq!(
+            shared.accounts,
+            [format!("uid {other} as urn:example:node")]
+        );
+        let node = shared.admissions.admit(me(), Some(other)).unwrap();
+        assert_eq!(node.principal(), Some("urn:example:node"));
+        assert!(!node.ceiling().allows("urn:cap:demo:write"));
+        assert!(shared
+            .admissions
+            .admit(me(), Some(me()))
+            .unwrap()
+            .ceiling()
+            .is_root());
+        assert!(shared
+            .admissions
+            .admit(me(), Some(other.wrapping_add(1)))
+            .is_err());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn the_door_s_own_user_cannot_be_bounded_as_an_account() {
+        let (path, peers) = grants("self", &format!(r#""uid": {}"#, me()));
+        let refused = shared_socket_from(&path, peers, Some(own_gid(&path)))
+            .err()
+            .unwrap();
+        assert!(
+            refused.contains("same-uid client is the owner"),
+            "{refused}"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn an_account_with_no_socket_group_or_no_such_user_stops_the_door() {
+        let (path, peers) = grants("nogroup", &format!(r#""uid": {}"#, me().wrapping_add(1)));
+        let refused = shared_socket_from(&path, peers, None).err().unwrap();
+        assert!(refused.contains("ipc.group"), "{refused}");
+        let (path2, peers) = grants("nouser", r#""user": "no-such-ikigai-account-2139""#);
+        let refused = shared_socket_from(&path2, peers, Some(own_gid(&path2)))
+            .err()
+            .unwrap();
+        assert!(refused.contains("no user named"), "{refused}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(path2.parent().unwrap());
     }
 }
