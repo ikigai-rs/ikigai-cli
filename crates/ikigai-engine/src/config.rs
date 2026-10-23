@@ -7,6 +7,7 @@
 //! read here. A minimal `key = value` scanner rather than a full TOML parser; it
 //! grows a real parser if and when the config does.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -89,16 +90,41 @@ pub fn keybindings_supported(value: &str) -> bool {
 
 /// `<--config-home>/config.toml` when the flag named one ([`set_config_home`]), else
 /// `$XDG_CONFIG_HOME/ikigai/config.toml`, or `$HOME/.config/...` when
-/// `XDG_CONFIG_HOME` is unset. `None` if neither base directory is known. The
+/// `XDG_CONFIG_HOME` is unset, or `%USERPROFILE%\.config\...` when `HOME` is unset too.
+/// `None` if no base directory is known. The
 /// same file the host reads `mail.*` from — one shared config home.
 pub fn path() -> Option<PathBuf> {
     if let Some(home) = FLAG_HOME.get() {
         return Some(home.join("config.toml"));
     }
-    let base = std::env::var_os("XDG_CONFIG_HOME")
+    config_home_from(
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+        std::env::var_os("USERPROFILE"),
+    )
+    .map(|home| home.join("config.toml"))
+}
+
+/// The config home from the environment values passed in, so the rule is testable without
+/// `set_var` (the environment is process-global and races the test harness's threads).
+/// `$XDG_CONFIG_HOME` (when non-empty), else `$HOME/.config`, else `%USERPROFILE%\.config` — the last only when
+/// `HOME` is unset or empty, which is plain PowerShell and cmd on Windows. A twin of
+/// `ikigai_embedded::config::config_home_from`; keep the two in step.
+fn config_home_from(
+    xdg: Option<OsString>,
+    home: Option<OsString>,
+    userprofile: Option<OsString>,
+) -> Option<PathBuf> {
+    let non_empty = |value: Option<OsString>| value.filter(|value| !value.is_empty());
+    non_empty(xdg)
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    Some(base.join("ikigai").join("config.toml"))
+        .or_else(|| {
+            non_empty(home.clone())
+                .or_else(|| non_empty(userprofile))
+                .or(home)
+                .map(|home| PathBuf::from(home).join(".config"))
+        })
+        .map(|base| base.join("ikigai"))
 }
 
 /// The stored value of `key`, or `None` if the file or key is absent.
@@ -113,7 +139,7 @@ pub fn set(key: &str, value: &str) -> std::io::Result<PathBuf> {
     let path = path().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "no config directory (set $XDG_CONFIG_HOME or $HOME)",
+            "no config directory (set $XDG_CONFIG_HOME, $HOME or $USERPROFILE)",
         )
     })?;
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
@@ -174,6 +200,40 @@ fn value_for(text: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Order: `XDG_CONFIG_HOME`, then `HOME`, then `USERPROFILE` (only when `HOME` is unset
+    /// or empty), else nothing. Pure, so it cannot race other tests on the process env.
+    #[test]
+    fn config_home_resolution_order() {
+        let os = |text: &str| Some(OsString::from(text));
+        let home = |xdg, home, profile| config_home_from(xdg, home, profile);
+        assert_eq!(
+            home(os("/xdg"), os("/h"), os("C:/u")),
+            Some(PathBuf::from("/xdg/ikigai"))
+        );
+        assert_eq!(
+            home(None, os("/h"), os("C:/u")),
+            Some(PathBuf::from("/h/.config/ikigai"))
+        );
+        assert_eq!(
+            home(None, None, os("C:/u")),
+            Some(PathBuf::from("C:/u/.config/ikigai"))
+        );
+        assert_eq!(
+            home(None, os(""), os("C:/u")),
+            Some(PathBuf::from("C:/u/.config/ikigai"))
+        );
+        // An empty `XDG_CONFIG_HOME` is unset, as in the embedded twin.
+        assert_eq!(
+            home(os(""), os("/h"), os("C:/u")),
+            Some(PathBuf::from("/h/.config/ikigai"))
+        );
+        assert_eq!(
+            home(os(""), None, os("C:/u")),
+            Some(PathBuf::from("C:/u/.config/ikigai"))
+        );
+        assert_eq!(home(None, None, None), None);
+    }
 
     #[test]
     fn reads_a_keybindings_value() {

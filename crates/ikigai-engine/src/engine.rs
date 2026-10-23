@@ -2496,7 +2496,7 @@ fn run_config(rest: &str) -> Result<String, String> {
 /// `urn:kernel:scheduler` reports the LIVE one, this reports the CONFIGURED one.
 fn config_summary() -> String {
     let location = config::path().map_or_else(
-        || "(no config directory — set $XDG_CONFIG_HOME or $HOME)".to_string(),
+        || "(no config directory — set $XDG_CONFIG_HOME, $HOME or $USERPROFILE)".to_string(),
         |path| path.display().to_string(),
     );
     let keybindings = config::get("keybindings").unwrap_or_else(|| "emacs (default)".to_string());

@@ -65,7 +65,8 @@ pub fn config_home_flag() -> Option<&'static Path> {
 
 /// The ikigai config home: the `--config-home` flag's directory when one was given
 /// ([`set_config_home`]), else `$XDG_CONFIG_HOME/ikigai`, or `$HOME/.config/ikigai` when
-/// `XDG_CONFIG_HOME` is unset. `None` when none of the three is known.
+/// `XDG_CONFIG_HOME` is unset, or `%USERPROFILE%\.config\ikigai` when `HOME` is unset too
+/// (Windows). `None` when none of them is known.
 ///
 /// THE spelling of the config home — every file the host reads from it resolves through
 /// here. It used to be written twice: this module honoured `XDG_CONFIG_HOME` while nine
@@ -88,6 +89,7 @@ pub fn config_home() -> Option<PathBuf> {
     config_home_from(
         std::env::var_os("XDG_CONFIG_HOME"),
         std::env::var_os("HOME"),
+        std::env::var_os("USERPROFILE"),
     )
 }
 
@@ -98,10 +100,23 @@ pub fn config_home() -> Option<PathBuf> {
 /// A set-but-EMPTY `XDG_CONFIG_HOME` counts as unset, per the XDG base directory spec. The
 /// old spellings took it literally and resolved a relative `ikigai/…` against the working
 /// directory — a config home that moved with `cd`.
-fn config_home_from(xdg: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
-    xdg.filter(|value| !value.is_empty())
+///
+/// `USERPROFILE` is read only when `HOME` is unset or empty: plain PowerShell and cmd on
+/// Windows set it instead of `HOME`. Where `HOME` is set, the result is unchanged.
+fn config_home_from(
+    xdg: Option<OsString>,
+    home: Option<OsString>,
+    userprofile: Option<OsString>,
+) -> Option<PathBuf> {
+    let non_empty = |value: Option<OsString>| value.filter(|value| !value.is_empty());
+    non_empty(xdg)
         .map(PathBuf::from)
-        .or_else(|| home.map(|home| PathBuf::from(home).join(".config")))
+        .or_else(|| {
+            non_empty(home.clone())
+                .or_else(|| non_empty(userprofile))
+                .or(home)
+                .map(|home| PathBuf::from(home).join(".config"))
+        })
         .map(|base| base.join("ikigai"))
 }
 
@@ -283,12 +298,12 @@ mod tests {
     #[test]
     fn xdg_config_home_decides_the_config_home_when_set() {
         assert_eq!(
-            config_home_from(Some("/xdg".into()), Some("/home/b".into())),
+            config_home_from(Some("/xdg".into()), Some("/home/b".into()), None),
             Some(PathBuf::from("/xdg/ikigai"))
         );
         // With no HOME to fall back to, XDG alone still resolves.
         assert_eq!(
-            config_home_from(Some("/xdg".into()), None),
+            config_home_from(Some("/xdg".into()), None, None),
             Some(PathBuf::from("/xdg/ikigai"))
         );
     }
@@ -299,12 +314,40 @@ mod tests {
     #[test]
     fn an_unset_or_empty_xdg_falls_back_to_home_config() {
         assert_eq!(
-            config_home_from(None, Some("/home/b".into())),
+            config_home_from(None, Some("/home/b".into()), None),
             Some(PathBuf::from("/home/b/.config/ikigai"))
         );
         assert_eq!(
-            config_home_from(Some(OsString::new()), Some("/home/b".into())),
+            config_home_from(Some(OsString::new()), Some("/home/b".into()), None),
             Some(PathBuf::from("/home/b/.config/ikigai"))
+        );
+    }
+
+    /// `USERPROFILE` is the last resort, consulted only when `HOME` is unset or empty (plain
+    /// PowerShell sets it and not `HOME`); `XDG_CONFIG_HOME` and `HOME` both beat it.
+    #[test]
+    fn userprofile_is_the_last_resort() {
+        let profile = || Some(OsString::from("C:/Users/b"));
+        assert_eq!(
+            config_home_from(None, None, profile()),
+            Some(PathBuf::from("C:/Users/b/.config/ikigai"))
+        );
+        assert_eq!(
+            config_home_from(None, Some(OsString::new()), profile()),
+            Some(PathBuf::from("C:/Users/b/.config/ikigai"))
+        );
+        assert_eq!(
+            config_home_from(None, Some("/home/b".into()), profile()),
+            Some(PathBuf::from("/home/b/.config/ikigai"))
+        );
+        assert_eq!(
+            config_home_from(Some("/xdg".into()), None, profile()),
+            Some(PathBuf::from("/xdg/ikigai"))
+        );
+        // An empty HOME with no USERPROFILE keeps the old (relative) answer on Unix.
+        assert_eq!(
+            config_home_from(None, Some(OsString::new()), None),
+            Some(PathBuf::from(".config/ikigai"))
         );
     }
 
@@ -312,7 +355,7 @@ mod tests {
     /// rather than inheriting one it did not choose.
     #[test]
     fn no_base_directory_at_all_is_none() {
-        assert_eq!(config_home_from(None, None), None);
+        assert_eq!(config_home_from(None, None, None), None);
         assert_eq!(
             config_path(),
             config_home()
