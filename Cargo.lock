@@ -1346,7 +1346,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -3297,9 +3297,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-layers"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb9d0d0937daec9bd580549b4fc37b22da9ede75c89d73e80c727e96f77e6bd8"
+checksum = "f2053fa360f335536a3115b29e2c9750259ba0106d553383b26e032a81ca0d16"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3314,7 +3314,6 @@ dependencies = [
  "ikigai-shacl",
  "ikigai-sign",
  "ikigai-store",
- "oxigraph",
  "oxrdf",
  "oxrdfio",
  "oxsdatatypes",
@@ -3323,7 +3322,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "spargebra",
  "toml 0.8.23",
 ]
 
@@ -8223,7 +8221,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
