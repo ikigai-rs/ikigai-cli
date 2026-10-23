@@ -10,13 +10,19 @@
 //! and is itself `0600`, so other users can't reach it; and [`serve`] checks each
 //! peer's kernel-verified UID and refuses anyone but the server's own user.
 //!
-//! **Who a connection is, and what it may do, is an [`Admission`]** (ledger #1830). Every
-//! door admits only its own UID, and the plain [`serve`] family admits that peer as
+//! **Who a connection is, and what it may do, is an [`Admission`]** (ledger #1830). The plain
+//! [`serve`] family admits only the door's own UID, as
 //! [`Admission::owner`]: root authority and NO principal, because a UID is the owner, not a
 //! party the door can name. Under it a name the client supplies (a `principal` argument, or a
 //! carried capability's `urn:cap:principal:<iri>`) is removed before the kernel sees the
 //! request. [`serve_shared_on_admitted`] serves under a bounded admission instead: a scoped
 //! ceiling every carried capability is clamped to, and optionally a principal the door mints.
+//!
+//! **A door can admit another account, bounded** (ledger #2139): [`serve_shared_on_admissions`]
+//! maps each peer's UID to an [`Admission`] through [`Admissions`], refusing any UID it does
+//! not name, and [`bind_shared`] makes a socket that account's group can reach. A process run
+//! as the door's own user is still the owner: to the operating system it is the same
+//! principal, so no table can bound it (see the README's trust model).
 //!
 //! Unix only — the module is empty elsewhere.
 #![cfg(unix)]
@@ -108,6 +114,145 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
     let listener = UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(listener)
+}
+
+/// [`bind`] a socket that the members of group `gid` can reach as well as its owner, for a
+/// door that admits other UIDs ([`serve_shared_on_admissions`], ledger #2139).
+///
+/// What it sets, exactly: the socket's group is `gid` and its mode `0660` (owner and group may
+/// connect, nobody else). What it does NOT set is the directory: it CHECKS the socket's parent
+/// directory and refuses to bind unless that directory is owned by this user, has group `gid`,
+/// is searchable by the group (`g+x`), is not writable by the group (`g-w`, or a member could
+/// replace the socket with its own), and grants other users nothing at all (`o-rwx`). So the
+/// socket is never connectable by every user, whether or not the operating system honors a
+/// socket file's mode on `connect` (Linux and macOS do; some BSDs historically did not): the
+/// directory alone already keeps out anyone outside the group. `0710` with group `gid` is the
+/// usual mode, and the refusal names the commands that set it.
+///
+/// Every directory above the parent must let the admitted UIDs search it too, or their
+/// `connect` fails with a permission error; this is not checked, since it does not widen who
+/// can connect. The per-user defaults ([`default_socket_path`]: `$XDG_RUNTIME_DIR`, macOS's
+/// per-user `$TMPDIR`) are `0700` and cannot be shared: a shared door names its own path.
+///
+/// # Errors
+///
+/// As [`bind`], and [`PermissionDenied`](io::ErrorKind::PermissionDenied) naming the directory,
+/// what is wrong with it and the fix.
+pub fn bind_shared(path: &Path, gid: u32) -> io::Result<UnixListener> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let meta = std::fs::metadata(&dir).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("the socket directory {}: {e}", dir.display()),
+        )
+    })?;
+    if let Some(problem) = shared_dir_problem(meta.uid(), meta.gid(), meta.mode(), own_uid(), gid) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to share a socket in {0}: {problem}. Set it with `chgrp {gid} {0}` and \
+                 `chmod 0710 {0}`",
+                dir.display()
+            ),
+        ));
+    }
+    let _held = bind_lock(path)?;
+    clear_stale(path)?;
+    let listener = UnixListener::bind(path)?;
+    std::os::unix::fs::chown(path, None, Some(gid))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
+    Ok(listener)
+}
+
+/// What is wrong with a directory, owned by `owner` with group `group` and mode `mode`, as the
+/// home of a socket shared with group `gid` by a door running as `own_uid` (see
+/// [`bind_shared`]); `None` when nothing is.
+///
+/// ```
+/// use ikigai_ipc::shared_dir_problem;
+///
+/// assert_eq!(shared_dir_problem(501, 20, 0o40710, 501, 20), None);
+/// assert_eq!(shared_dir_problem(501, 20, 0o40750, 501, 20), None);
+/// // Searchable by every user: every user could reach the socket.
+/// assert!(shared_dir_problem(501, 20, 0o40711, 501, 20).unwrap().contains("every user"));
+/// // Writable by the group: a member could replace the socket.
+/// assert!(shared_dir_problem(501, 20, 0o40770, 501, 20).unwrap().contains("replace"));
+/// // Another group, another owner, or a group that cannot search it.
+/// assert!(shared_dir_problem(501, 0, 0o40710, 501, 20).is_some());
+/// assert!(shared_dir_problem(0, 20, 0o40710, 501, 20).is_some());
+/// assert!(shared_dir_problem(501, 20, 0o40700, 501, 20).is_some());
+/// ```
+pub fn shared_dir_problem(
+    owner: u32,
+    group: u32,
+    mode: u32,
+    own_uid: u32,
+    gid: u32,
+) -> Option<String> {
+    let bits = mode & 0o7777;
+    if owner != own_uid {
+        return Some(format!(
+            "it is owned by uid {owner}, not this user (uid {own_uid}), so its owner decides \
+             who reaches the socket"
+        ));
+    }
+    if bits & 0o007 != 0 {
+        return Some(format!(
+            "its mode {bits:04o} lets every user in, so every user could reach the socket"
+        ));
+    }
+    if bits & 0o020 != 0 {
+        return Some(format!(
+            "its mode {bits:04o} lets the group write it, so a member could replace the socket"
+        ));
+    }
+    if group != gid {
+        return Some(format!(
+            "its group is gid {group}, not the socket's group (gid {gid})"
+        ));
+    }
+    if bits & 0o010 == 0 {
+        return Some(format!(
+            "its mode {bits:04o} does not let the group search it, so no member could connect"
+        ));
+    }
+    None
+}
+
+/// The UID of the account named `name`, as the system's user database says (`getpwnam`).
+///
+/// # Errors
+///
+/// [`NotFound`](io::ErrorKind::NotFound) for an unknown name, or the lookup's own error.
+pub fn uid_of_user(name: &str) -> io::Result<u32> {
+    match nix::unistd::User::from_name(name) {
+        Ok(Some(user)) => Ok(user.uid.as_raw()),
+        Ok(None) => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no user named `{name}`"),
+        )),
+        Err(e) => Err(io::Error::from(e)),
+    }
+}
+
+/// The GID of the group named `name`, as the system's group database says (`getgrnam`).
+///
+/// # Errors
+///
+/// [`NotFound`](io::ErrorKind::NotFound) for an unknown name, or the lookup's own error.
+pub fn gid_of_group(name: &str) -> io::Result<u32> {
+    match nix::unistd::Group::from_name(name) {
+        Ok(Some(group)) => Ok(group.gid.as_raw()),
+        Ok(None) => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no group named `{name}`"),
+        )),
+        Err(e) => Err(io::Error::from(e)),
+    }
 }
 
 /// Take the exclusive lock that orders binders of `path` (see [`bind`]): `<path>.lock`, created
@@ -361,8 +506,39 @@ pub fn serve_shared_on_admitted(
     limits: Limits,
     admission: Admission,
 ) -> io::Result<()> {
-    let admission = Arc::new(admission);
+    serve_shared_on_admissions(kernel, listener, limits, Admissions::own(admission))
+}
+
+/// [`serve_shared_on_with`] admitting each connection by its peer's UID (ledger #2139): the
+/// UID the operating system reports for the peer is looked up in `admissions`, and the
+/// connection resolves under the [`Admission`] found there. A peer with no admission, or one
+/// whose UID cannot be read, is closed at accept, before its hello is read, and logged with
+/// its UID (never anything it sent, since nothing is read).
+///
+/// ⚠ A door that admits another UID needs a socket that UID can reach: bind it with
+/// [`bind_shared`], which sets the socket's group and mode and refuses a directory that would
+/// let every user connect. [`bind`] makes a socket only its owner can reach, so the other UIDs
+/// in `admissions` would never connect at all.
+pub fn serve_shared_on_admissions(
+    kernel: Arc<Kernel>,
+    listener: UnixListener,
+    limits: Limits,
+    admissions: Admissions,
+) -> io::Result<()> {
+    serve_loop(kernel, listener, limits, admissions, peer_uid)
+}
+
+/// The accept loop, over an injected peer-credential source, so the mapping and the refusal
+/// can be tested for a UID a test cannot have (another account needs root to create).
+fn serve_loop(
+    kernel: Arc<Kernel>,
+    listener: UnixListener,
+    limits: Limits,
+    admissions: Admissions,
+    peer: impl Fn(&UnixStream) -> Option<u32>,
+) -> io::Result<()> {
     let me = own_uid();
+    let mut refused = RefusalLog::default();
     let mut backoff = accept::Backoff::default();
     // The connections being served. Only this loop adds to it, so reading it and then adding
     // cannot overshoot; a finishing connection subtracts (its `Slot` drops).
@@ -379,16 +555,19 @@ pub fn serve_shared_on_admitted(
                 accept::Fault::Fatal => return Err(e),
             },
         };
-        if peer_uid(&stream) != Some(me) {
-            continue; // not our user — drop it
-        }
+        let admission = match admissions.admit(me, peer(&stream)) {
+            Ok(admission) => Arc::clone(admission),
+            Err(refusal) => {
+                refused.record(&refusal);
+                continue; // dropped: closed without a word
+            }
+        };
         if live.load(Ordering::SeqCst) >= limits.max_connections {
             refuse_over_capacity(stream, limits.max_connections);
             continue;
         }
         let slot = Slot::take(&live);
         let kernel = Arc::clone(&kernel);
-        let admission = Arc::clone(&admission);
         let spawned = std::thread::Builder::new().spawn(move || {
             let _slot = slot;
             serve_connection(&kernel, stream, &limits, &admission)
@@ -400,6 +579,130 @@ pub fn serve_shared_on_admitted(
             // taking the whole accept loop with it.
             // The slot went down with the closure too, so it is free again.
             Err(e) => std::thread::sleep(backoff.failed(&e)),
+        }
+    }
+}
+
+/// Who a socket door admits, by the peer's kernel-verified UID (ledger #2139).
+///
+/// - The door's OWN UID gets the admission given to [`own`](Admissions::own) ([`Admission::owner`]
+///   in [`owner_only`](Admissions::owner_only), as every door before this one), unless
+///   [`with_uid`](Admissions::with_uid) names that UID too, which wins.
+/// - A UID named by [`with_uid`](Admissions::with_uid) gets its admission: typically
+///   [`Admission::bounded`] with a grant and the principal that account runs as.
+/// - Any other UID, and a peer whose UID cannot be read, is [`Refused`].
+///
+/// ⚠ A same-UID client is the owner to the operating system, so a door that admits its own UID
+/// as the owner admits every process that user runs, whatever it intends. A bound reaches a
+/// process only when it runs as ANOTHER account (see the crate README's trust model).
+///
+/// ```
+/// use ikigai_core::Capability;
+/// use ikigai_ipc::{Admission, Admissions, Refused};
+///
+/// let node = Admission::bounded(
+///     Capability::scoped(["urn:cap:demo:read"]),
+///     Some("urn:example:node".to_string()),
+/// )
+/// .unwrap();
+/// let admissions = Admissions::owner_only().with_uid(502, node);
+/// assert!(admissions.admit(501, Some(501)).unwrap().ceiling().is_root());
+/// assert_eq!(admissions.admit(501, Some(502)).unwrap().principal(), Some("urn:example:node"));
+/// assert_eq!(admissions.admit(501, Some(503)).unwrap_err(), Refused::Uid(503));
+/// assert_eq!(admissions.admit(501, None).unwrap_err(), Refused::Unreadable);
+/// ```
+#[derive(Clone, Debug)]
+pub struct Admissions {
+    own: Arc<Admission>,
+    others: std::collections::BTreeMap<u32, Arc<Admission>>,
+}
+
+impl Admissions {
+    /// Admit only the door's own UID, as the owner: what every door did before ledger #2139.
+    pub fn owner_only() -> Admissions {
+        Admissions::own(Admission::owner())
+    }
+
+    /// Admit only the door's own UID, under `admission`.
+    pub fn own(admission: Admission) -> Admissions {
+        Admissions {
+            own: Arc::new(admission),
+            others: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Admit `uid` under `admission`. Named for the door's own UID, it replaces the owner's.
+    #[must_use]
+    pub fn with_uid(mut self, uid: u32, admission: Admission) -> Admissions {
+        self.others.insert(uid, Arc::new(admission));
+        self
+    }
+
+    /// The UIDs admitted besides the door's own, ascending.
+    pub fn other_uids(&self, own_uid: u32) -> Vec<u32> {
+        self.others
+            .keys()
+            .copied()
+            .filter(|uid| *uid != own_uid)
+            .collect()
+    }
+
+    /// The admission for a peer whose UID the operating system reported as `peer` (`None`:
+    /// it could not be read), at a door running as `own_uid`.
+    ///
+    /// # Errors
+    ///
+    /// [`Refused`], naming the UID when there is one.
+    pub fn admit(&self, own_uid: u32, peer: Option<u32>) -> Result<&Arc<Admission>, Refused> {
+        let uid = peer.ok_or(Refused::Unreadable)?;
+        if let Some(admission) = self.others.get(&uid) {
+            return Ok(admission);
+        }
+        if uid == own_uid {
+            return Ok(&self.own);
+        }
+        Err(Refused::Uid(uid))
+    }
+}
+
+/// Why a socket door closed a connection at accept (see [`Admissions::admit`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// The operating system did not report the peer's UID.
+    Unreadable,
+    /// The peer's UID has no admission at this door.
+    Uid(u32),
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refused::Unreadable => f.write_str("a peer whose uid could not be read"),
+            Refused::Uid(uid) => write!(f, "uid {uid}, which this door does not admit"),
+        }
+    }
+}
+
+/// The refusals an accept loop has logged. Each refusal is counted, and logged when its count
+/// is a power of two (1, 2, 4, …), so a client that dials in a loop cannot flood the door's
+/// log while a refusal is still always seen.
+#[derive(Debug, Default)]
+struct RefusalLog {
+    counts: std::collections::BTreeMap<Option<u32>, u64>,
+}
+
+impl RefusalLog {
+    fn record(&mut self, refusal: &Refused) {
+        let key = match refusal {
+            Refused::Unreadable => None,
+            Refused::Uid(uid) => Some(*uid),
+        };
+        let count = self.counts.entry(key).or_insert(0);
+        *count += 1;
+        if count.is_power_of_two() {
+            accept::diagnose(format_args!(
+                "ikigai-ipc: refused a connection from {refusal} ({count} so far)"
+            ));
         }
     }
 }
@@ -1596,36 +1899,43 @@ fn own_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
-/// The connected peer's user id, kernel-verified — `None` if it can't be read.
-#[cfg(target_os = "linux")]
+/// The connected peer's user id, kernel-verified (Linux: `SO_PEERCRED`), or `None` if it
+/// cannot be read.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn peer_uid(stream: &UnixStream) -> Option<u32> {
-    let mut cred = libc::ucred {
-        pid: 0,
-        uid: 0,
-        gid: 0,
-    };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: a valid fd and correctly-sized out-params for SO_PEERCRED.
-    let rc = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut cred as *mut libc::ucred).cast(),
-            &mut len,
-        )
-    };
-    (rc == 0).then_some(cred.uid)
+    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+    getsockopt(stream, PeerCredentials)
+        .ok()
+        .map(|cred| cred.uid())
 }
 
-/// The connected peer's user id (macOS/BSD use `getpeereid`).
-#[cfg(not(target_os = "linux"))]
+/// The connected peer's user id, kernel-verified (macOS and the BSDs: `getpeereid`, which is
+/// `LOCAL_PEERCRED`), or `None` if it cannot be read.
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
 fn peer_uid(stream: &UnixStream) -> Option<u32> {
-    let mut uid: libc::uid_t = 0;
-    let mut gid: libc::gid_t = 0;
-    // SAFETY: a valid fd and two valid out-params.
-    let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
-    (rc == 0).then_some(uid)
+    nix::unistd::getpeereid(stream)
+        .ok()
+        .map(|(uid, _)| uid.as_raw())
+}
+
+/// Elsewhere the peer's user id is not read, so every connection is refused.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+)))]
+fn peer_uid(_stream: &UnixStream) -> Option<u32> {
+    None
 }
 
 /// The connected peer's process id, for naming a live server [`bind`] will not replace —
@@ -4156,5 +4466,165 @@ mod principal_tests {
         assert_eq!(String::from_utf8_lossy(&carried.bytes), "-|-");
         drop(client);
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Per-UID admission (ledger #2139). A second UID cannot be had in CI without root, so the
+/// mapping and the refusal are driven through an injected peer-credential source; the real
+/// read is exercised for this process's own UID by `a_self_connection_reports_our_own_uid`.
+#[cfg(test)]
+mod uid_admission_tests {
+    use super::*;
+    use ikigai_core::{Capability, EndpointSpace, Exact, FnEndpoint, Iri, ReprType, Verb};
+    use std::os::unix::fs::MetadataExt;
+    use std::thread;
+
+    /// Another account's UID: anything but ours.
+    fn other_uid() -> u32 {
+        own_uid().wrapping_add(1)
+    }
+
+    fn whoami_kernel() -> Arc<Kernel> {
+        let whoami = FnEndpoint::new("whoami", |inv: &ikigai_core::Invocation<'_>| {
+            let held = inv.capability.principal().unwrap_or("-").to_string();
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                held.into_bytes(),
+            ))
+        });
+        Arc::new(Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:test:whoami"), whoami),
+        )))
+    }
+
+    fn whoami() -> Request {
+        Request::new(Verb::Source, Iri::parse("urn:test:whoami").unwrap())
+    }
+
+    fn path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("iku-{}-{name}.sock", std::process::id()))
+    }
+
+    fn node() -> Admission {
+        Admission::bounded(
+            Capability::scoped(["urn:cap:demo:read"]),
+            Some("urn:example:node".to_string()),
+        )
+        .unwrap()
+    }
+
+    /// Serve `admissions` on `path`, every peer reported as `peer` says.
+    fn serve_as(path: &Path, admissions: Admissions, peer: Option<u32>) {
+        let listener = bind(path).unwrap();
+        thread::spawn(move || {
+            let _ = serve_loop(
+                whoami_kernel(),
+                listener,
+                Limits::default(),
+                admissions,
+                move |_| peer,
+            );
+        });
+    }
+
+    #[test]
+    fn a_configured_uid_is_served_bounded_and_named() {
+        let path = path("mapped");
+        serve_as(
+            &path,
+            Admissions::owner_only().with_uid(other_uid(), node()),
+            Some(other_uid()),
+        );
+        let client = connect(&path).unwrap();
+        let (answer, _) = client.issue_as(whoami(), &Capability::root()).unwrap();
+        assert_eq!(String::from_utf8_lossy(&answer.bytes), "urn:example:node");
+        drop(client);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_own_uid_stays_the_owner_beside_a_configured_one() {
+        let path = path("own");
+        serve_as(
+            &path,
+            Admissions::owner_only().with_uid(other_uid(), node()),
+            Some(own_uid()),
+        );
+        let client = connect(&path).unwrap();
+        let (answer, _) = client.issue(whoami()).unwrap();
+        assert_eq!(String::from_utf8_lossy(&answer.bytes), "-");
+        drop(client);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_own_uid_can_be_configured_otherwise() {
+        let admissions = Admissions::owner_only().with_uid(own_uid(), node());
+        let admitted = admissions.admit(own_uid(), Some(own_uid())).unwrap();
+        assert_eq!(admitted.principal(), Some("urn:example:node"));
+        assert!(admissions.other_uids(own_uid()).is_empty());
+    }
+
+    /// An unmapped UID, and a peer whose UID cannot be read, are closed at accept: the client's
+    /// hello is never answered, so it cannot even learn the protocol version.
+    #[test]
+    fn an_unmapped_or_unreadable_peer_is_closed_before_its_hello() {
+        for (name, peer) in [("stranger", Some(other_uid())), ("unread", None)] {
+            let path = path(name);
+            serve_as(&path, Admissions::owner_only(), peer);
+            let refused = connect_with_timeout(&path, Some(Duration::from_secs(5)));
+            assert!(refused.is_err(), "{name}: the door must not answer");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// A short directory under /tmp (a socket path does not fit in the scratchpad, field guide
+    /// 9h), with `mode`, this process's group, and a socket path inside it.
+    fn shared_dir(name: &str, mode: u32) -> (PathBuf, PathBuf) {
+        let dir = PathBuf::from(format!("/tmp/iks{}{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        let socket = dir.join("k.sock");
+        (dir, socket)
+    }
+
+    #[test]
+    fn a_shared_socket_takes_the_group_and_0660_in_a_0710_directory() {
+        let (dir, socket) = shared_dir("ok", 0o710);
+        let gid = std::fs::metadata(&dir).unwrap().gid();
+        let listener = bind_shared(&socket, gid).expect("a 0710 directory of the group is fine");
+        let meta = std::fs::metadata(&socket).unwrap();
+        assert_eq!(meta.mode() & 0o777, 0o660);
+        assert_eq!(meta.gid(), gid);
+        // The real peer read, through the shared socket: our own UID.
+        let client = UnixStream::connect(&socket).unwrap();
+        let (server_side, _) = listener.accept().unwrap();
+        assert_eq!(peer_uid(&server_side), Some(own_uid()));
+        drop(client);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_directory_every_user_can_search_is_refused_before_binding() {
+        let (dir, socket) = shared_dir("open", 0o711);
+        let gid = std::fs::metadata(&dir).unwrap().gid();
+        let refused = bind_shared(&socket, gid).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        assert!(refused.to_string().contains("every user"), "{refused}");
+        assert!(refused.to_string().contains("chmod 0710"), "{refused}");
+        assert!(!socket.exists(), "nothing is bound in a refused directory");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_refusal_log_backs_off_by_powers_of_two() {
+        let mut log = RefusalLog::default();
+        for _ in 0..5 {
+            log.record(&Refused::Uid(7));
+        }
+        log.record(&Refused::Unreadable);
+        assert_eq!(log.counts.get(&Some(7)), Some(&5));
+        assert_eq!(log.counts.get(&None), Some(&1));
     }
 }

@@ -30,8 +30,8 @@ No CA, no TLS — the operating system already authenticates a local peer:
   (`$XDG_RUNTIME_DIR`, else `$TMPDIR`/`/tmp` plus the uid), and the socket itself is
   `0600`, so no other user can reach it.
 - **`serve`** additionally checks each peer's **kernel-verified UID** (`SO_PEERCRED`
-  on Linux, `getpeereid` on macOS/BSD) and refuses any connection that isn't the
-  server's own user — defense in depth over the directory mode.
+  on Linux, `getpeereid` on macOS/BSD, read through the `nix` crate) and refuses any
+  connection that isn't the server's own user — defense in depth over the directory mode.
 
 Because the peer is the owner, a `cap`-attenuated `--connect` session carries its
 capability over `Call::IssueAs`; the server resolves under it (already ≤ root), so
@@ -43,9 +43,57 @@ endpoint: a `principal` argument is removed, and so is a carried capability's
 `urn:cap:principal:<iri>` (under a root ceiling core's `clamp` would keep it, since root may
 act as anyone). `serve_shared_on_admitted` serves under `Admission::bounded(ceiling,
 principal)` instead: every call is clamped to the ceiling, and the principal, if given, is
-minted into every call and stamped as the argument. ⚠ Every door still admits only its own
-UID, so a bounded socket constrains a cooperating or confined client, never a same-user process
-that dials an owner socket instead.
+minted into every call and stamped as the argument. ⚠ A door that admits only its own UID
+constrains a cooperating or confined client this way, never a same-user process that dials an
+owner socket instead: for a real bound, run the client as another account (below).
+
+## Admitting another account, bounded (ledger #2139)
+
+`serve_shared_on_admissions` admits each connection by its peer's kernel-verified UID, through
+an `Admissions` table:
+
+- **the door's own UID** is the owner (`Admission::owner()`), as before, unless the table
+  names that UID too;
+- **a UID the table names** gets its admission, typically `Admission::bounded(grant,
+  principal)`: every call is clamped to the grant and names the principal;
+- **any other UID**, and a peer whose UID cannot be read, is closed at accept, before its hello
+  is read, and the door logs the UID (at the 1st, 2nd, 4th, 8th, … refusal of that UID, so a
+  client dialing in a loop cannot flood the log). Nothing the peer sent is read, so nothing it
+  sent is logged.
+
+Such a door binds with **`bind_shared(path, gid)`**, which sets exactly this: the socket's
+group is `gid` and its mode is `0660`. It does not change the directory. It checks the
+socket's parent directory first and refuses to bind unless the directory is owned by the
+door's user, has group `gid`, is searchable by that group, is not writable by it, and grants
+other users nothing (`0710` or `0750` with group `gid`). So even on a system that ignored a
+socket file's mode on `connect`, nobody outside the group could reach the socket: the door
+refuses to start in a directory that would make the socket connectable by every user. The
+per-user default directories (`$XDG_RUNTIME_DIR`, macOS's per-user `$TMPDIR`) are `0700` and
+cannot be shared, so a shared door names its own socket path, for example:
+
+```sh
+sudo mkdir /var/run/ikigai && sudo chown brian:ikigai /var/run/ikigai && sudo chmod 0710 /var/run/ikigai
+```
+
+Every directory above it must let the group's members search it as well.
+
+### The trust model, plainly
+
+- **A process running as another account is bounded.** The operating system reports its UID,
+  the door maps that UID to a grant and a principal, and it holds no way to reach an owner
+  door: the owner's sockets are `0600` in `0700` directories, and every owner door refuses its
+  UID. This is what makes "a node on the same machine" boundable: run the node as its own
+  account, name that account in the table, and it gets its grant and nothing more.
+- **A process running as the door's own user is the owner, and that cannot change.** To the
+  operating system it IS the same principal: it can read the owner's files, dial the owner's
+  other sockets, ptrace the door, or edit the table that bounds it. A table entry naming the
+  door's own UID bounds only the clients that dial THIS socket, which is a cooperative bound,
+  not a security one. The `ikigai` host refuses to configure it for that reason.
+- **The table must be one the bounded account cannot write.** The `ikigai` host checks the
+  grants file, every directory above it and every link on the way, and refuses to start if the
+  account could rewrite or replace any of them.
+- **Root is never bounded** (it can do all of the above), and a UID of 0 is refused as an
+  account.
 
 Each accepted connection is served on its own thread, answering calls against the
 kernel's own `Resolver` impl until the peer hangs up — so cache status is computed

@@ -34,6 +34,12 @@
 //! a grant the operator wrote that the check would silently trim is a grant nobody reviewed.
 //!
 //! **The file an agent session reads must be one the agent cannot write** ([`check_protected`]).
+//!
+//! **A principal may also name the local ACCOUNT it runs as** (ledger #2139), with `"uid": 502`
+//! or `"user": "gonknode"` (one of them, never both). The socket door then admits a peer of
+//! that UID bounded by the same checked session ([`socket_peers`]), so a node run as another
+//! account on the same machine is held to its grant. The file must be one that ACCOUNT cannot
+//! write ([`check_protected_from`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -419,6 +425,210 @@ pub fn check_protected(path: &Path) -> Result<(), String> {
     ))
 }
 
+/// The local account a principals-table entry runs as, by its `uid` or `user` key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Account {
+    /// A numeric user id.
+    Uid(u32),
+    /// A user name, looked up in the system's user database by the door.
+    User(String),
+}
+
+impl std::fmt::Display for Account {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Account::Uid(uid) => write!(f, "uid {uid}"),
+            Account::User(name) => write!(f, "user `{name}`"),
+        }
+    }
+}
+
+/// One account the socket door admits, and the checked session it is admitted under.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SocketPeer {
+    /// The account, as the entry names it.
+    pub account: Account,
+    /// The session: the entry's grant checked against its person's, its principal minted.
+    pub session: AgentSession,
+}
+
+/// Every principal in the grants document `text` that names a local account (`uid` or
+/// `user`), each checked exactly as [`agent_session`] checks an MCP agent: an agent or a
+/// machine acting for a person, its grant within the person's. The socket door's per-UID
+/// admission (ledger #2139) reads this.
+///
+/// ```
+/// use ikigai_embedded::agents::{socket_peers, Account};
+///
+/// let grants = r#"{
+///   "brian": ["urn:cap:demo:read", "urn:cap:demo:write"],
+///   "node":  ["urn:cap:demo:read"],
+///   "principals": {
+///     "urn:example:brian": {"kind": "person", "grant": "brian"},
+///     "urn:example:node": {
+///       "kind": "machine", "acts_for": "urn:example:brian", "grant": "node", "uid": 502
+///     }
+///   }
+/// }"#;
+/// let peers = socket_peers(grants).unwrap();
+/// assert_eq!(peers.len(), 1);
+/// assert_eq!(peers[0].account, Account::Uid(502));
+/// assert_eq!(peers[0].session.capability.principal(), Some("urn:example:node"));
+/// assert!(!peers[0].session.capability.allows("urn:cap:demo:write"));
+/// ```
+///
+/// # Errors
+///
+/// A document that does not parse, an entry with both `uid` and `user` or a malformed one,
+/// two entries naming the same account, and every refusal of [`agent_session`] (a person
+/// cannot be admitted as an account: only a program runs as one), each naming the entry.
+pub fn socket_peers(text: &str) -> Result<Vec<SocketPeer>, String> {
+    let doc: Value =
+        serde_json::from_str(text).map_err(|e| format!("the grants file does not parse: {e}"))?;
+    let Some(table) = doc.get(PRINCIPALS_KEY).and_then(Value::as_object) else {
+        // A malformed table is `principals_in`'s refusal, and absent means no accounts.
+        principals_in(&doc)?;
+        return Ok(Vec::new());
+    };
+    let mut peers: Vec<SocketPeer> = Vec::new();
+    for (iri, entry) in table {
+        let account = match (entry.get("uid"), entry.get("user")) {
+            (None, None) => continue,
+            (Some(_), Some(_)) => {
+                return Err(format!(
+                    "principal `{iri}` names both `uid` and `user`; name its account once"
+                ))
+            }
+            (Some(uid), None) => Account::Uid(
+                uid.as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(|| format!("principal `{iri}`: `uid` must be a user id number"))?,
+            ),
+            (None, Some(user)) => Account::User(
+                user.as_str()
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| format!("principal `{iri}`: `user` must be a user name"))?
+                    .to_string(),
+            ),
+        };
+        if let Some(twin) = peers.iter().find(|p| p.account == account) {
+            return Err(format!(
+                "principals `{}` and `{iri}` both name {account}; an account is one principal",
+                twin.session.principal
+            ));
+        }
+        let session = agent_session(text, iri, &[], &[])
+            .map_err(|e| format!("the account of `{iri}` ({account}): {e}"))?;
+        peers.push(SocketPeer { account, session });
+    }
+    Ok(peers)
+}
+
+/// Why one path component, owned by `owner` with mode `mode`, would let ANOTHER account, `uid`,
+/// replace or rewrite the file, if it would: [`check_protected_from`]'s rule. The account's
+/// group memberships are not looked up, so any group-writable component is refused.
+///
+/// ```
+/// use ikigai_embedded::agents::replaceable_by_account;
+///
+/// // The owner's 0644 file in its 0755 directory: protected from uid 502.
+/// assert_eq!(replaceable_by_account(501, 0o100644, 502, false), None);
+/// assert!(replaceable_by_account(502, 0o100644, 502, false).is_some());
+/// assert!(replaceable_by_account(501, 0o100664, 502, false).is_some());
+/// assert!(replaceable_by_account(501, 0o40777, 502, true).is_some());
+/// // A sticky directory every user can write (/tmp): the entry's own owner is what counts.
+/// assert_eq!(replaceable_by_account(0, 0o41777, 502, true), None);
+/// ```
+pub fn replaceable_by_account(
+    owner: u32,
+    mode: u32,
+    uid: u32,
+    is_dir: bool,
+) -> Option<&'static str> {
+    let writable = mode & 0o022 != 0;
+    let sticky = mode & 0o1000 != 0;
+    if owner == uid {
+        return Some("it is owned by that account, which can change its mode");
+    }
+    if writable && !(is_dir && sticky) {
+        return Some(if is_dir {
+            "its group or every user can write the directory, so can replace what is in it"
+        } else {
+            "its group or every user can write it"
+        });
+    }
+    None
+}
+
+/// Refuse a grants file that the account `uid` could rewrite or replace: the file, every
+/// directory above it and every symbolic link on the way, by owner and mode
+/// ([`replaceable_by_account`]). What the socket door checks for each account it admits
+/// (ledger #2139), so a node bounded by the file cannot widen itself in it. The door's own
+/// user may write the file: that user is already the owner. Root (`uid` 0) is refused, since
+/// it can rewrite every file.
+///
+/// # Errors
+///
+/// The path and the reason, naming the first component that fails.
+#[cfg(unix)]
+pub fn check_protected_from(path: &Path, uid: u32) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    if uid == 0 {
+        return Err(
+            "root can rewrite any grants file, so it cannot be admitted as a bounded account"
+                .to_string(),
+        );
+    }
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .join(path)
+    };
+    let refuse = |p: &Path, why: &str| {
+        Err(format!(
+            "{} cannot bound uid {uid}: {} ({why})",
+            path.display(),
+            p.display()
+        ))
+    };
+    let mut prefix = std::path::PathBuf::new();
+    for component in path.components() {
+        prefix.push(component);
+        if let Ok(meta) = std::fs::symlink_metadata(&prefix) {
+            if meta.file_type().is_symlink() && meta.uid() == uid {
+                return refuse(&prefix, "a symbolic link owned by that account");
+            }
+        }
+    }
+    let real = std::fs::canonicalize(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut here: Option<&Path> = Some(&real);
+    while let Some(p) = here {
+        let meta = std::fs::metadata(p).map_err(|e| format!("{}: {e}", p.display()))?;
+        if let Some(why) = replaceable_by_account(meta.uid(), meta.mode(), uid, meta.is_dir()) {
+            return refuse(p, why);
+        }
+        here = p.parent();
+    }
+    Ok(())
+}
+
+/// Not Unix: there is no portable owner and mode to check, so nothing is protected.
+///
+/// # Errors
+///
+/// Always.
+#[cfg(not(unix))]
+pub fn check_protected_from(path: &Path, _uid: u32) -> Result<(), String> {
+    Err(format!(
+        "{}: a bounded account needs a grants file it cannot write, and this platform has no \
+         check for one",
+        path.display()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,6 +648,90 @@ mod tests {
         "urn:example:box": {"kind": "machine", "acts_for": "urn:example:brian", "grant": ["claude"]}
       }
     }"#;
+
+    fn with_accounts(accounts: &str) -> String {
+        format!(
+            r#"{{
+              "brian": ["urn:cap:demo:read", "urn:cap:demo:write"],
+              "node": ["urn:cap:demo:read"],
+              "wide": ["urn:cap:other:x"],
+              "principals": {{
+                "urn:example:brian": {{"kind": "person", "grant": "brian"}},
+                {accounts}
+              }}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn an_account_is_admitted_under_its_checked_session() {
+        let text = with_accounts(
+            r#""urn:example:a": {"kind": "agent", "acts_for": "urn:example:brian", "grant": "node", "uid": 502},
+               "urn:example:b": {"kind": "machine", "acts_for": "urn:example:brian", "grant": "node", "user": "nodeacct"},
+               "urn:example:c": {"kind": "agent", "acts_for": "urn:example:brian", "grant": "node"}"#,
+        );
+        let peers = socket_peers(&text).unwrap();
+        let accounts: Vec<&Account> = peers.iter().map(|p| &p.account).collect();
+        assert_eq!(
+            accounts,
+            [&Account::Uid(502), &Account::User("nodeacct".into())]
+        );
+        assert_eq!(
+            peers[1].session.capability.principal(),
+            Some("urn:example:b")
+        );
+    }
+
+    #[test]
+    fn a_bad_account_entry_is_refused_naming_it() {
+        let refuse = |accounts: &str| socket_peers(&with_accounts(accounts)).unwrap_err();
+        let both = refuse(
+            r#""urn:example:a": {"kind": "agent", "acts_for": "urn:example:brian", "grant": "node", "uid": 502, "user": "x"}"#,
+        );
+        assert!(both.contains("both `uid` and `user`"), "{both}");
+        let twice = refuse(
+            r#""urn:example:a": {"kind": "agent", "acts_for": "urn:example:brian", "grant": "node", "uid": 502},
+               "urn:example:b": {"kind": "agent", "acts_for": "urn:example:brian", "grant": "node", "uid": 502}"#,
+        );
+        assert!(twice.contains("both name uid 502"), "{twice}");
+        let person = refuse(r#""urn:example:p": {"kind": "person", "grant": "node", "uid": 503}"#);
+        assert!(person.contains("is a person"), "{person}");
+        let wider = refuse(
+            r#""urn:example:a": {"kind": "agent", "acts_for": "urn:example:brian", "grant": "wide", "uid": 502}"#,
+        );
+        assert!(wider.contains("`urn:cap:other:x`"), "{wider}");
+        let negative = refuse(
+            r#""urn:example:a": {"kind": "agent", "acts_for": "urn:example:brian", "grant": "node", "uid": -1}"#,
+        );
+        assert!(negative.contains("user id number"), "{negative}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_grants_file_another_account_can_write_does_not_bound_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ikg-protect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let file = dir.join("grants.json");
+        std::fs::write(&file, "{}").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // SAFETY: `getuid` reads a process attribute and cannot fail.
+        let me = unsafe { libc::getuid() };
+        let other = me.wrapping_add(1);
+        // The temp dir's ancestors may be writable by others only when sticky (/tmp), which
+        // is allowed; macOS's per-user temp dir is ours. Either way, our own file passes.
+        let ok = check_protected_from(&file, other);
+        assert!(ok.is_ok(), "{ok:?}");
+        let owned = check_protected_from(&file, me).unwrap_err();
+        assert!(owned.contains("owned by that account"), "{owned}");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let open = check_protected_from(&file, other).unwrap_err();
+        assert!(open.contains("can write it"), "{open}");
+        assert!(check_protected_from(&file, 0).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn refusal(principal: &str, grants: &[&str], scopes: &[&str]) -> String {
         let grants: Vec<String> = grants.iter().map(|s| s.to_string()).collect();
