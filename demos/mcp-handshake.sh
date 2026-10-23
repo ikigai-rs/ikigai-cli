@@ -2,7 +2,8 @@
 # Drive the ikigai MCP server (stdio) with a scripted JSON-RPC session.
 # Shows: the handshake, the capability-scoped tool list, and a tool call.
 #
-#   ./demos/mcp-handshake.sh [ikigai mcp args...]
+#   ./demos/mcp-handshake.sh <ikigai mcp args...>          # an authority is required
+#   ./demos/mcp-handshake.sh --root                          # unrestricted, by request
 #   ./demos/mcp-handshake.sh --scope urn:cap:demo:nothing   # narrow grant
 #   ./demos/mcp-handshake.sh --grant research-agent          # a named grant
 set -euo pipefail

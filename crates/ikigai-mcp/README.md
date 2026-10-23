@@ -23,9 +23,16 @@ stdio — no tokio): each `ik:Action` becomes a tool, the tool name reverses to 
 ```bash
 ikigai mcp --grant <name>        # serve under a named grant (the ceiling)
 ikigai mcp --scope urn:cap:…     # …or an ad-hoc scope union
-ikigai mcp                       # no grant → root (unrestricted; warns)
+ikigai mcp --principal <iri> --grants /etc/ikigai/grants.json
+                                 # …or as an AGENT, its grant checked against its person's
+ikigai mcp --root                # root (unrestricted), only by asking for it
 ikigai mcp … --show urn:layer:   # list only the tools bound under an IRI prefix (repeatable)
 ```
+
+A bare `ikigai mcp` refuses to start and names these flags: it used to serve root, and an
+agent's tool server that is root because nobody said otherwise is the default this removes
+(ledger #1830). `--root` cannot be combined with the others, and the banner says
+UNRESTRICTED.
 
 `--show <pattern>` narrows the LIST, never the authority. A pattern is a tool name
 (`grep__source`), a bare endpoint id (`grep`, every verb), a trailing-`*` prefix
@@ -58,6 +65,33 @@ A **grant** is a named union of capability scopes, in
 { "booking-agent": ["urn:cap:personal:calendar:read:freebusy"],
   "research-agent": ["urn:cap:net:query.wikidata.org", "urn:cap:fs:read:*"] }
 ```
+
+## Agents: `--principal`
+
+`ikigai mcp --principal <agent IRI>` serves as an agent acting for a person. The grants
+file gains a reserved `principals` table (so no grant may be named `principals`):
+
+```json
+{ "brian":  ["urn:cap:ledger:read:default", "urn:cap:ledger:write:default"],
+  "claude": ["urn:cap:ledger:read:default"],
+  "principals": {
+    "urn:collab:participant:brian": { "kind": "person", "grant": "brian" },
+    "urn:collab:participant:hub":   { "kind": "agent", "acts_for": "urn:collab:participant:brian",
+                                      "grant": "claude" } } }
+```
+
+- The principal is MINTED into every call's capability (`urn:cap:principal:<iri>`) and stamped
+  as the `principal` argument; a `principal` argument the MCP client sends is removed (it is
+  removed in every session, named or not).
+- The agent's authority is its entry's `grant` plus any `--grant`/`--scope`, and every scope in
+  it must be one its person's grant lists, compared literally. Anything outside is refused at
+  start, naming each scope; it is never trimmed. Only `agent` and `machine` entries are served:
+  a person's principal is never minted for a program. No grant may name a principal scope.
+- The grants file must be one **its user cannot write**: not owned by this user, not writable
+  by it, in directories it cannot write, with no symbolic link it owns on the way, and the
+  process not running as root. Otherwise an agent could widen itself through a shell or through
+  its own tools. In practice: `sudo install -o root -m 0644 grants.json /etc/ikigai/grants.json`
+  and `--grants /etc/ikigai/grants.json`. The check runs at start and at every reload.
 
 The grant is the **ceiling**. Because the manifold gates each action
 independently, a union grant yields a union of affordances *across features* —
@@ -109,8 +143,11 @@ forbids.
   was read. At end of input the server still answers every running call.
 - **Live grant-swap** — the server watches the grants file; edit the active
   grant and it emits `notifications/tools/list_changed`, so a connected client's
-  tool list morphs with no restart. (Broadening is safe here: it is the human
-  editing the grant — root re-granting — never the client escalating itself.)
+  tool list morphs with no restart. A reload NARROWS live, and can restore what an
+  earlier reload narrowed, but never widens past the authority the session started
+  with: a widening is reported on stderr and applies at the next start (ledger
+  #1830). A file the session's own user can write can still be widened for the
+  next start; an agent session (`--principal`) refuses such a file.
 
 ## Try it without a client
 

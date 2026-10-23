@@ -51,7 +51,7 @@ fn a_fast_call_answers_while_a_slow_one_runs() {
         Command::new(env!("CARGO_BIN_EXE_ikigai"))
             .arg("--config-home")
             .arg(home.join("config"))
-            .args(["mcp", "--no-config-mounts"])
+            .args(["mcp", "--root", "--no-config-mounts"])
             .current_dir(&home)
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", home.join("decoy"))

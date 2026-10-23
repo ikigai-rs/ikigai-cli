@@ -21,6 +21,7 @@ fn every_invalid_line_gets_its_json_rpc_error_and_the_session_goes_on() {
     std::fs::create_dir_all(home.join("config").join("ikigai")).expect("scratch config home");
     let mut child = Command::new(env!("CARGO_BIN_EXE_ikigai"))
         .arg("mcp")
+        .arg("--root")
         .arg("--no-config-mounts")
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", home.join("config"))

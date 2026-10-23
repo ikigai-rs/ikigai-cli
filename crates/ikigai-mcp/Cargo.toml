@@ -10,6 +10,7 @@ readme = "README.md"
 
 [dependencies]
 ikigai-core = { workspace = true }
+ikigai-resolve = { workspace = true } # the door's principal rule (stamp_principal, ledger #1830)
 serde = { workspace = true }
 serde_json = { workspace = true }
 futures = { workspace = true }

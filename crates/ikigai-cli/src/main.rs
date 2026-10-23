@@ -152,8 +152,15 @@ usage:
   <p> = <p1>,<p2>,…            several prefixes, ONE connection and one cert set: `--override
                                urn:layer:,urn:layers:,urn:collab:=quic://door:4434 --cert-dir <d>`
                                follows a layer door (a comma cannot appear inside a prefix)
-  ikigai mcp [--grant <n>] [--scope <s>] [--show <p>] [mounts…]
-                               serve the manifold as MCP tools over stdio; --show (repeatable)
+  ikigai mcp --grant <n> | --scope <s> | --principal <iri> | --root  [--grants <f>] [--show <p>] [mounts…]
+                               serve the manifold as MCP tools over stdio, under the named
+                               authority: --grant/--scope (repeatable, unioned); --principal, an
+                               agent in the grants file's `principals` table, minted into every
+                               call, its grant checked to be within its person's, read from a
+                               grants file this user cannot write (--grants <f>, root-owned);
+                               or --root, UNRESTRICTED, by request. Naming none refuses to start.
+                               A grants-file edit narrows a running session live; a widening
+                               waits for the next start. --show (repeatable)
                                lists only tools matching <p>: a tool name (`echo`, `repo-*`) or,
                                with a `:`, an IRI prefix they are bound under (`urn:layer:`), so
                                an entry for a mounted peer leaves the local tools out. It unions
@@ -426,6 +433,15 @@ enum Mode {
     Mcp {
         grants: Vec<String>,
         scopes: Vec<String>,
+        /// `--principal <agent IRI>` (ledger #1830): serve as that agent, minted into the
+        /// session capability, its grant checked to be within its person's.
+        principal: Option<String>,
+        /// `--root`: serve UNRESTRICTED, by explicit request. Without it and without a grant,
+        /// a scope or a principal, `ikigai mcp` refuses to start.
+        root: bool,
+        /// `--grants <file>`: read grants (and the principals table) from this file instead
+        /// of the config home's `grants.json`.
+        grants_file: Option<std::path::PathBuf>,
         /// `--show <pattern>` (repeatable): project only the tools matching one of these,
         /// unioned with the named grants' `show` lists (ledger #1284). An IRI prefix
         /// (`urn:layer:`) selects by where a tool is bound. Relevance, never authority.
@@ -1505,6 +1521,9 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
         argv.next();
         let mut grants = Vec::new();
         let mut scopes = Vec::new();
+        let mut principal = None;
+        let mut root = false;
+        let mut grants_file = None;
         let mut shows = Vec::new();
         let mut certs = Certs::default();
         let mut mounts = Mounts::default();
@@ -1553,6 +1572,20 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                     argv.next()
                         .ok_or_else(|| "--scope needs a capability IRI".to_string())?,
                 ),
+                "--principal" => {
+                    principal = Some(argv.next().ok_or_else(|| {
+                        "--principal needs an agent IRI (an entry of the grants file's \
+                         `principals` table)"
+                            .to_string()
+                    })?)
+                }
+                "--root" => root = true,
+                "--grants" => {
+                    grants_file = Some(std::path::PathBuf::from(
+                        argv.next()
+                            .ok_or_else(|| "--grants needs a file".to_string())?,
+                    ))
+                }
                 "--show" => shows.push(argv.next().ok_or_else(|| {
                     "--show needs a pattern (a tool name, `repo-*`, or an IRI prefix such as \
                      `urn:layer:`)"
@@ -1563,9 +1596,19 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
         }
         // Both postures at once is a startup error, not a precedence rule (see `Mounts`).
         mounts.refuse_conflict()?;
+        if root && (!grants.is_empty() || !scopes.is_empty() || principal.is_some()) {
+            return Err(
+                "`mcp --root` serves UNRESTRICTED and cannot be combined with --grant, --scope \
+                 or --principal, which bound the session; pass one or the other"
+                    .to_string(),
+            );
+        }
         return Ok(Some(Mode::Mcp {
             grants,
             scopes,
+            principal,
+            root,
+            grants_file,
             shows,
             mounts,
         }));
@@ -1779,12 +1822,25 @@ fn main() {
         Mode::Mcp {
             grants,
             scopes,
+            principal,
+            root,
+            grants_file,
             shows,
             mounts,
         } => {
             arm_local_root();
             arm_bayes(true);
-            mcp(grants, scopes, shows, mounts)
+            mcp(
+                McpAuthority {
+                    grants,
+                    scopes,
+                    principal,
+                    root,
+                    grants_file,
+                },
+                shows,
+                mounts,
+            )
         }
         Mode::CertGenerate { force, dir } => cert_generate(force, dir),
         Mode::CertAddClient {
@@ -2015,14 +2071,110 @@ fn daemon(_mounts: Mounts) {
     std::process::exit(2);
 }
 
+/// What `ikigai mcp` was told its session may do: the flags that name its authority.
+#[derive(Clone, Debug, Default)]
+struct McpAuthority {
+    grants: Vec<String>,
+    scopes: Vec<String>,
+    principal: Option<String>,
+    root: bool,
+    grants_file: Option<std::path::PathBuf>,
+}
+
+/// The refusal for an `ikigai mcp` that names no authority (ledger #1830). It used to serve
+/// root; an agent's tool server that is root because nobody said otherwise is the default the
+/// principal model removes.
+#[cfg(feature = "embedded")]
+const MCP_NO_AUTHORITY: &str = "no authority was named. Pass --grant <name> (a grant in \
+     grants.json), --scope <capability IRI>, --principal <agent IRI> (an agent in grants.json's \
+     `principals` table, checked against its person's grant), or --root to serve UNRESTRICTED";
+
+/// An MCP session's authority, as resolved: the capability, the grant names whose `show`/`hide`
+/// profiles shape its tool list, and the agent session when there is one.
+#[cfg(feature = "embedded")]
+struct McpSession {
+    capability: ikigai_core::Capability,
+    grants: Vec<String>,
+    agent: Option<ikigai_embedded::agents::AgentSession>,
+}
+
+/// Resolve `authority` into the session it serves, or refuse with the reason.
+///
+/// - `--root`: root, by request.
+/// - `--principal`: the agent session ([`ikigai_embedded::agents::agent_session`]) from a
+///   grants file its user cannot write ([`ikigai_embedded::agents::check_protected`]).
+/// - `--grant`/`--scope`: their union ([`mcp_capability`]).
+/// - none of them: refused ([`MCP_NO_AUTHORITY`]).
+#[cfg(feature = "embedded")]
+fn mcp_session(authority: &McpAuthority) -> Result<McpSession, String> {
+    if authority.root {
+        return Ok(McpSession {
+            capability: ikigai_core::Capability::root(),
+            grants: Vec::new(),
+            agent: None,
+        });
+    }
+    if let Some(principal) = &authority.principal {
+        let path = ikigai_embedded::grants_path()
+            .ok_or_else(|| "no grants file: pass --grants <file>".to_string())?;
+        ikigai_embedded::agents::check_protected(&path)?;
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let agent = ikigai_embedded::agents::agent_session(
+            &text,
+            principal,
+            &authority.grants,
+            &authority.scopes,
+        )
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+        return Ok(McpSession {
+            capability: agent.capability.clone(),
+            grants: agent.grants.clone(),
+            agent: Some(agent),
+        });
+    }
+    if authority.grants.is_empty() && authority.scopes.is_empty() {
+        return Err(MCP_NO_AUTHORITY.to_string());
+    }
+    Ok(McpSession {
+        capability: mcp_capability(&authority.grants, &authority.scopes)?,
+        grants: authority.grants.clone(),
+        agent: None,
+    })
+}
+
+/// The capability a live reload may move a session to: `fresh` within `baseline`, the
+/// authority the session STARTED with (ledger #1830). A reload narrows, and can restore what
+/// an earlier reload narrowed, but never widens past the start, so an agent that can write the
+/// grants file cannot widen a running session through it. Returns the capability and the
+/// scopes `fresh` asked for that only a restart would grant.
+#[cfg(feature = "embedded")]
+fn mcp_reloaded(
+    baseline: &ikigai_core::Capability,
+    fresh: &ikigai_core::Capability,
+) -> (ikigai_core::Capability, Vec<String>) {
+    let Some(asked) = fresh.scopes() else {
+        // A root reload (never produced: root sessions do not reload) keeps the baseline.
+        return (baseline.clone(), Vec::new());
+    };
+    let kept = baseline.attenuate(asked.iter().cloned());
+    let held = kept.scopes().cloned().unwrap_or_default();
+    let waiting = asked
+        .iter()
+        .filter(|scope| !held.contains(*scope))
+        .cloned()
+        .collect();
+    (kept, waiting)
+}
+
 /// Build the session capability from the union of named grants + explicit
 /// scopes. The grant is the ceiling.
 ///
-/// Root (unrestricted) ONLY when neither `--grant` nor `--scope` was given — that is
-/// the operator's stated choice, and the banner says so. A named grant that resolves to
-/// no scopes (misspelled, deleted, empty, or `grants.json` missing or unparseable) is
-/// an `Err` naming it: an unknown grant is "undecided", never "unrestricted", the same
-/// rule the served door's per-identity grants follow (`clients::authority`).
+/// Called only with at least one `--grant` or `--scope` ([`mcp_session`] refuses neither). A
+/// named grant that resolves to no scopes (misspelled, deleted, empty, or `grants.json` missing
+/// or unparseable) is an `Err` naming it: an unknown grant is "undecided", never
+/// "unrestricted", the same rule the served door's per-identity grants follow
+/// (`clients::authority`).
 #[cfg(feature = "embedded")]
 fn mcp_capability(grants: &[String], scopes: &[String]) -> Result<ikigai_core::Capability, String> {
     mcp_capability_in(grants, scopes, ikigai_embedded::grant_scopes)
@@ -2037,7 +2189,7 @@ fn mcp_capability_in(
     scopes_of: impl Fn(&str) -> Vec<String>,
 ) -> Result<ikigai_core::Capability, String> {
     if grants.is_empty() && scopes.is_empty() {
-        return Ok(ikigai_core::Capability::root());
+        return Err(MCP_NO_AUTHORITY.to_string());
     }
     let mut union: Vec<String> = scopes.to_vec();
     let mut undecided = Vec::new();
@@ -2081,43 +2233,54 @@ fn mcp_filter(grants: &[String], shows: &[String]) -> ikigai_mcp::ToolFilter {
 }
 
 /// MCP stdio mode: project the composed manifold as MCP tools, scoped to the
-/// session capability built from `--grant`/`--scope` (the ceiling). A poller
-/// watches the grants file; when the active grant's scopes change, it rebuilds
-/// the capability and emits `notifications/tools/list_changed` so a connected
-/// client's tool list morphs live — no restart. Broadening is safe here because
-/// it is the HUMAN editing the grant (root re-granting), never the client.
+/// session capability built from `--grant`/`--scope`/`--principal` (the ceiling), or root
+/// under an explicit `--root`; with none of them it refuses to start (ledger #1830).
+///
+/// A poller watches the grants file; when the session's grants change it rebuilds the
+/// capability and emits `notifications/tools/list_changed`, so a connected client's tool list
+/// morphs live. A reload NARROWS live (and can restore what an earlier one narrowed), but never
+/// widens past the authority the session started with: a widening is applied at the next
+/// start ([`mcp_reloaded`]), so an agent that can write the grants file cannot widen a running
+/// session through it. An agent session (`--principal`) additionally reads only a grants file
+/// its user cannot write at all.
 #[cfg(feature = "embedded")]
-fn mcp(grants: Vec<String>, scopes: Vec<String>, shows: Vec<String>, mounts: Mounts) {
+fn mcp(authority: McpAuthority, shows: Vec<String>, mounts: Mounts) {
     use ikigai_mcp::server::serve_concurrent;
     use std::io::Write;
     use std::sync::{Arc, Mutex, RwLock};
 
-    // A grant that names nothing refuses to start: running it would either be root (the
-    // old fail-open) or a session with no authority the operator did not ask for.
-    let capability = match mcp_capability(&grants, &scopes) {
-        Ok(capability) => Arc::new(RwLock::new(capability)),
+    if let Some(path) = &authority.grants_file {
+        ikigai_embedded::set_grants_path(path.clone());
+    }
+    // An unnamed authority, a grant that names nothing, or an agent outside its person's
+    // grant refuses to start: running would be root (the old fail-open) or a session with an
+    // authority the operator did not ask for.
+    let session = match mcp_session(&authority) {
+        Ok(session) => session,
         Err(e) => {
             eprintln!("ikigai mcp: refusing to start: {e}");
             std::process::exit(2);
         }
     };
+    let baseline = session.capability.clone();
+    let grants = session.grants.clone();
+    let capability = Arc::new(RwLock::new(session.capability));
     let filter = Arc::new(RwLock::new(mcp_filter(&grants, &shows)));
-    match capability.read().expect("cap lock").scopes() {
-        None => eprintln!("ikigai mcp: no --grant/--scope — running UNRESTRICTED (root)"),
-        Some(s) => eprintln!(
+    match (
+        &session.agent,
+        capability.read().expect("cap lock").scopes(),
+    ) {
+        (_, None) => eprintln!("ikigai mcp: --root given — serving UNRESTRICTED (root)"),
+        (Some(agent), Some(s)) => eprintln!(
+            "ikigai mcp: serving as {} (acting for {}) under {} scope(s)",
+            agent.principal,
+            agent.person,
+            s.len()
+        ),
+        (None, Some(s)) => eprintln!(
             "ikigai mcp: serving the manifold under {} scope(s)",
             s.len()
         ),
-    }
-    {
-        let f = filter.read().expect("filter lock");
-        if !f.show.is_empty() || !f.hide.is_empty() {
-            eprintln!(
-                "ikigai mcp: tool visibility — {} shown, {} hidden pattern(s)",
-                f.show.len(),
-                f.hide.len()
-            );
-        }
     }
     // No mount flags -> the machine's own topology (config home), the same rule as
     // every kernel-building mode. This is where federation pays off for an agent:
@@ -2141,16 +2304,27 @@ fn mcp(grants: Vec<String>, scopes: Vec<String>, shows: Vec<String>, mounts: Mou
         // The ceiling is `--grant`/`--scope`, which is also the tool list the client sees:
         // the manifold is projected under it, so an agent with no `urn:cap:host:posture`
         // in its grant is not even OFFERED this resource, let alone answered.
-        authority: Some(match capability.read().expect("cap lock").scopes() {
-            None => "root — no --grant/--scope was given (UNRESTRICTED)".to_string(),
-            Some(s) => format!("{} scope(s) from --grant/--scope", s.len()),
-        }),
+        authority: Some(
+            match (
+                &session.agent,
+                capability.read().expect("cap lock").scopes(),
+            ) {
+                (_, None) => "root — --root was given (UNRESTRICTED)".to_string(),
+                (Some(agent), Some(s)) => format!(
+                    "{} scope(s), as {} acting for {}",
+                    s.len(),
+                    agent.principal,
+                    agent.person
+                ),
+                (None, Some(s)) => format!("{} scope(s) from --grant/--scope", s.len()),
+            },
+        ),
         // The grants poller rebuilds the session capability when the file changes and emits
         // `tools/list_changed`, so the ceiling above is a startup READING of something this
         // door re-reads — exactly the over-claim `reloads` exists to prevent.
         reloads: vec![
-            "grants.json — the active grant's scopes are re-read while running, and the \
-             projected tool list is rebuilt live (no restart)"
+            "grants.json — the active grant's scopes are re-read while running: a narrowing \
+             rebuilds the projected tool list live, a widening waits for the next start"
                 .to_string(),
         ],
     });
@@ -2202,8 +2376,8 @@ fn mcp(grants: Vec<String>, scopes: Vec<String>, shows: Vec<String>, mounts: Mou
     let stdout = Arc::new(Mutex::new(std::io::stdout()));
 
     // The live grant-swap watcher (poll the grants file's mtime). Only meaningful
-    // when a named grant is in play; explicit --scope unions are fixed at launch.
-    if !grants.is_empty() {
+    // when a named grant or an agent is in play; explicit --scope unions are fixed at launch.
+    if !grants.is_empty() || session.agent.is_some() {
         if let Some(path) = ikigai_embedded::grants_path() {
             let capability = Arc::clone(&capability);
             let filter = Arc::clone(&filter);
@@ -2224,8 +2398,18 @@ fn mcp(grants: Vec<String>, scopes: Vec<String>, shows: Vec<String>, mounts: Mou
                     // renamed, or the file left unparseable) drops the session to NO
                     // authority until the file names it again. Keeping the last good grant
                     // instead would make deleting a grant a revocation that does not revoke.
-                    let fresh_cap = match mcp_capability(&grants, &scopes) {
-                        Ok(cap) => cap,
+                    let fresh_cap = match mcp_session(&authority) {
+                        Ok(fresh) => {
+                            let (kept, waiting) = mcp_reloaded(&baseline, &fresh.capability);
+                            if !waiting.is_empty() {
+                                eprintln!(
+                                    "ikigai mcp: the grant now adds {} — a widening takes \
+                                     effect at the next start, never in a running session",
+                                    waiting.join(", ")
+                                );
+                            }
+                            kept
+                        }
                         Err(e) => {
                             eprintln!(
                                 "ikigai mcp: {e} — the session now holds NO authority until \
@@ -2282,7 +2466,7 @@ fn mcp(grants: Vec<String>, scopes: Vec<String>, shows: Vec<String>, mounts: Mou
 }
 
 #[cfg(not(feature = "embedded"))]
-fn mcp(_grants: Vec<String>, _scopes: Vec<String>, _shows: Vec<String>, _mounts: Mounts) {
+fn mcp(_authority: McpAuthority, _shows: Vec<String>, _mounts: Mounts) {
     eprintln!("ikigai: mcp requires the embedded feature");
     std::process::exit(2);
 }
@@ -4505,8 +4689,9 @@ fn serve_ipc(path: Option<String>, mounts: Mounts) -> ! {
         clients: Vec::new(),
         surface: None,
         authority: Some(
-            "root — every request on this socket resolves as the owner; the socket's file \
-             permissions are the boundary"
+            "root, as the owner, naming no principal — only this user reaches the socket (its \
+             file permissions and the peer's UID are the boundary), and a principal a client \
+             supplies is removed"
                 .to_string(),
         ),
         reloads: Vec::new(),
@@ -4543,8 +4728,21 @@ fn serve_ipc(path: Option<String>, mounts: Mounts) -> ! {
             std::process::exit(1);
         }
     };
+    // ★ OWNER, explicitly (ledger #1830, row D12): a Unix socket admits only this user's UID,
+    // which names the owner and no party, so a principal is not meaningful here. Root, and a
+    // `principal` argument or carried principal scope a client supplies is removed.
+    eprintln!(
+        "ikigai: the socket admits only this user, as the owner: root authority, no \
+         principal (a client-supplied one is removed)"
+    );
+    // The banner stays LAST: it is the readiness signal, and a reader may stop at it.
     eprintln!("ikigai: serving on {}  (Ctrl-C to stop)", socket.display());
-    match ikigai_ipc::serve_shared_on(kernel, listener) {
+    match ikigai_ipc::serve_shared_on_admitted(
+        kernel,
+        listener,
+        ikigai_ipc::Limits::default(),
+        ikigai_ipc::Admission::owner(),
+    ) {
         Ok(()) => std::process::exit(0),
         Err(e) => {
             eprintln!("ikigai: serve error: {e}");
@@ -6825,5 +7023,50 @@ mod prefer_mount_capability_tests {
             "an insufficient capability is refused BY THE PEER: {refused:?}"
         );
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// `ikigai mcp`'s authority rules (ledger #1830): no root default, and a live reload that
+/// never widens past the session's start. The binary's own tests are `tests/mcp_principals.rs`.
+#[cfg(all(test, feature = "embedded"))]
+mod mcp_authority_tests {
+    use super::*;
+    use ikigai_core::Capability;
+
+    #[test]
+    fn naming_no_grant_and_no_scope_is_refused_never_root() {
+        let refused = mcp_capability_in(&[], &[], |_| Vec::new()).unwrap_err();
+        assert!(refused.contains("--root"), "{refused}");
+        let Err(refused) = mcp_session(&McpAuthority::default()) else {
+            panic!("no authority named must not serve");
+        };
+        assert!(refused.contains("--principal"), "{refused}");
+        let Ok(root) = mcp_session(&McpAuthority {
+            root: true,
+            ..McpAuthority::default()
+        }) else {
+            panic!("root by request");
+        };
+        assert!(root.capability.is_root());
+    }
+
+    #[test]
+    fn a_reload_narrows_restores_and_never_widens_past_the_start() {
+        let start = Capability::scoped(["urn:cap:a", "urn:cap:b"]);
+        let (narrowed, waiting) = mcp_reloaded(&start, &Capability::scoped(["urn:cap:a"]));
+        assert_eq!(narrowed, Capability::scoped(["urn:cap:a"]));
+        assert!(waiting.is_empty());
+        let (restored, _) = mcp_reloaded(&start, &start);
+        assert_eq!(restored, start);
+        let (kept, waiting) = mcp_reloaded(
+            &start,
+            &Capability::scoped(["urn:cap:a", "urn:cap:b", "urn:cap:c"]),
+        );
+        assert_eq!(kept, start);
+        assert_eq!(waiting, vec!["urn:cap:c".to_string()]);
+        // An agent session keeps its principal across a reload.
+        let agent = start.with_principal("urn:example:agent").unwrap();
+        let (reloaded, _) = mcp_reloaded(&agent, &agent);
+        assert_eq!(reloaded.principal(), Some("urn:example:agent"));
     }
 }

@@ -189,7 +189,7 @@ impl Session {
 ///     other => panic!("{other:?}"),
 /// }
 /// ```
-pub const PRINCIPAL_ARG: &str = "principal";
+pub use ikigai_resolve::PRINCIPAL_ARG;
 
 /// Who the mTLS handshake authenticated, in the two spellings a host needs.
 ///
@@ -875,30 +875,22 @@ async fn refuse(mut send: quinn::SendStream, mut recv: quinn::RecvStream, versio
     }
 }
 
-/// Put the connection's principal on `request` under [`PRINCIPAL_ARG`], removing whatever
-/// the client sent there first (in any form, inline or by reference), so the only principal
-/// an endpoint can see is the one the minter named. On EVERY verb, unlike `ikigai-web`, which
-/// stamps writes only: an HTTP read has no authenticated connection behind it in general,
-/// while every call on a QUIC connection does, and a host's access log wants who READ as
-/// much as who wrote. The cost is the one `ikigai-web` avoids: an argument is part of the
-/// cache key, so two clients reading the same resource under the same capability no longer
-/// share a cached answer. On a QUIC door they rarely did, since each enrolled client
-/// normally holds its own grant.
-fn stamp_principal(request: &mut Request, principal: Option<&str>) {
-    request.args.remove(PRINCIPAL_ARG);
-    if let Some(principal) = principal {
-        request.args.insert(
-            PRINCIPAL_ARG.to_string(),
-            ikigai_core::ArgRef::Inline(principal.as_bytes().to_vec()),
-        );
-    }
-}
+// Stamping the connection's principal on `request` (removing whatever the client sent under
+// [`PRINCIPAL_ARG`] first) is `ikigai_resolve::stamp_principal`, the one rule every door
+// that builds a request calls (ledger #1830). This door applies it on EVERY verb, unlike
+// `ikigai-web`, which stamps writes only: an HTTP read has no authenticated connection behind
+// it in general, while every call on a QUIC connection does, and a host's access log wants who
+// READ as much as who wrote. The cost is the one `ikigai-web` avoids: an argument is part of
+// the cache key, so two clients reading the same resource under the same capability no longer
+// share a cached answer. On a QUIC door they rarely did, since each enrolled client normally
+// holds its own grant.
 
 /// Everything the door does to a request before it resolves: the file namespace rooted at
-/// the session's segment ([`localize`]) and the principal stamped ([`stamp_principal`]).
+/// the session's segment ([`localize`]) and the principal stamped
+/// ([`ikigai_resolve::stamp_principal`]).
 fn admit(request: &mut Request, session: &Session) {
     localize(request, &session.file_segment);
-    stamp_principal(request, session.principal.as_deref());
+    ikigai_resolve::stamp_principal(request, session.principal.as_deref());
 }
 
 /// Transparently root the connection's `urn:file:` namespace at its segment: rewrite

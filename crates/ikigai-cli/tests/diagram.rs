@@ -111,6 +111,9 @@ fn the_arrangement_diagram_draws_a_declaration_file() {
 /// The MCP tool names `ikigai mcp` projects under `scopes` (none = root).
 fn mcp_tools(home: &Path, scopes: &[&str]) -> Vec<String> {
     let mut args = vec!["mcp"];
+    if scopes.is_empty() {
+        args.push("--root");
+    }
     for scope in scopes {
         args.extend(["--scope", scope]);
     }

@@ -10,8 +10,8 @@
 //! The rule now, pinned here end to end:
 //!
 //! 1. **At startup, a named grant that resolves to nothing refuses to start**, naming it.
-//!    Root stays reachable only by giving neither `--grant` nor `--scope`, which the banner
-//!    states as UNRESTRICTED.
+//!    Root is reachable only by asking for it with `--root` (ledger #1830; a bare `mcp`
+//!    refuses to start, `mcp_principals.rs`), which the banner states as UNRESTRICTED.
 //! 2. **Mid-session, a grant that stops resolving drops the session to NO authority** (and
 //!    re-emits `tools/list_changed`), never to root.
 //!
@@ -90,8 +90,8 @@ fn tool_count(line: &str) -> usize {
 
 fn root_count() -> usize {
     let home = scratch("root", GRANTS);
-    let out = one_shot(&home, &[]);
-    assert!(out.status.success(), "no flags serves root: {out:?}");
+    let out = one_shot(&home, &["--root"]);
+    assert!(out.status.success(), "--root serves root: {out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     tool_count(stdout.lines().next().expect("one response"))
 }
