@@ -37,6 +37,16 @@ Because the peer is the owner, a `cap`-attenuated `--connect` session carries it
 capability over `Call::IssueAs`; the server resolves under it (already ≤ root), so
 attenuation behaves over IPC exactly as it does for the embedded kernel.
 
+**A UID names the owner, not a party.** The plain `serve` family admits its peer as
+`Admission::owner()`: root, and NO principal. A name the client supplies never reaches an
+endpoint: a `principal` argument is removed, and so is a carried capability's
+`urn:cap:principal:<iri>` (under a root ceiling core's `clamp` would keep it, since root may
+act as anyone). `serve_shared_on_admitted` serves under `Admission::bounded(ceiling,
+principal)` instead: every call is clamped to the ceiling, and the principal, if given, is
+minted into every call and stamped as the argument. ⚠ Every door still admits only its own
+UID, so a bounded socket constrains a cooperating or confined client, never a same-user process
+that dials an owner socket instead.
+
 Each accepted connection is served on its own thread, answering calls against the
 kernel's own `Resolver` impl until the peer hangs up — so cache status is computed
 exactly as the embedded path computes it, and two clients sharing a server see each

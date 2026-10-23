@@ -47,6 +47,7 @@ const XSD_BOOLEAN: &str = "http://www.w3.org/2001/XMLSchema#boolean";
 // The local root as a declared arrangement (`--arrangement`, ledger #637): the registry
 // harvested from the root's own constructor list, the declaration read through a bootstrap
 // kernel, and `urn:iki:host:arrangement`, the root's arrangement as a declaration.
+pub mod agents;
 pub mod arrangement;
 // The spam filter (`urn:bayes:*`, ledger #1512): bound in the local root when the binary arms it
 // with a state directory and named models. One writer per state directory, so one open per
@@ -1080,9 +1081,35 @@ fn org_config() -> Option<(PathBuf, Vec<String>)> {
 /// second spelling produced and the edit that should have re-scoped a live session
 /// lands in a directory nobody is reading.
 pub fn grants_path() -> Option<PathBuf> {
+    if let Some(path) = GRANTS_PATH_OVERRIDE
+        .lock()
+        .expect("grants path lock")
+        .clone()
+    {
+        return Some(path);
+    }
     std::env::var_os("IKIGAI_GRANTS")
         .map(PathBuf::from)
         .or_else(|| crate::config::config_home().map(|dir| dir.join("grants.json")))
+}
+
+static GRANTS_PATH_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Point [`grants_path`] at `path`, ahead of `$IKIGAI_GRANTS` and the config home: the
+/// `ikigai mcp --grants <file>` flag (ledger #1830), which an agent session needs because its
+/// grants file must live where its user cannot write ([`agents::check_protected`]), and the
+/// config home is that user's. Process-global, like [`set_file_root`].
+pub fn set_grants_path(path: PathBuf) {
+    *GRANTS_PATH_OVERRIDE.lock().expect("grants path lock") = Some(path);
+}
+
+/// The scopes of one grant entry of a parsed grants document (either shape); empty for
+/// anything else. The reader [`grant_scopes`] and [`agents`] share.
+pub(crate) fn grant_entry_scopes(entry: &serde_json::Value) -> Vec<String> {
+    if entry.is_null() {
+        return Vec::new();
+    }
+    scopes_of(entry)
 }
 
 /// The scopes of a named MCP grant, from `~/.config/ikigai/grants.json`
@@ -1122,6 +1149,10 @@ fn visibility_of(entry: &serde_json::Value) -> (Vec<String>, Vec<String>) {
 /// Read one grant's JSON value from the grants file. `None` if there is no file,
 /// it doesn't parse, or the grant is absent.
 fn grant_entry(name: &str) -> Option<serde_json::Value> {
+    // The principals table is not a grant (ledger #1830).
+    if name == agents::PRINCIPALS_KEY {
+        return None;
+    }
     let path = grants_path()?;
     let text = std::fs::read_to_string(path).ok()?;
     let v = serde_json::from_str::<serde_json::Value>(&text).ok()?;

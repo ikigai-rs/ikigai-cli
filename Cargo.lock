@@ -3374,6 +3374,7 @@ version = "0.1.69"
 dependencies = [
  "futures",
  "ikigai-core",
+ "ikigai-resolve",
  "serde",
  "serde_json",
 ]

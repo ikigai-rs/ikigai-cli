@@ -9,7 +9,14 @@
 //! README): the socket lives in a `0700` per-user directory ([`default_socket_path`])
 //! and is itself `0600`, so other users can't reach it; and [`serve`] checks each
 //! peer's kernel-verified UID and refuses anyone but the server's own user.
-//! Capability-based authorization (finer than per-user) layers on later.
+//!
+//! **Who a connection is, and what it may do, is an [`Admission`]** (ledger #1830). Every
+//! door admits only its own UID, and the plain [`serve`] family admits that peer as
+//! [`Admission::owner`]: root authority and NO principal, because a UID is the owner, not a
+//! party the door can name. Under it a name the client supplies (a `principal` argument, or a
+//! carried capability's `urn:cap:principal:<iri>`) is removed before the kernel sees the
+//! request. [`serve_shared_on_admitted`] serves under a bounded admission instead: a scoped
+//! ceiling every carried capability is clamped to, and optionally a principal the door mints.
 //!
 //! Unix only — the module is empty elsewhere.
 #![cfg(unix)]
@@ -342,6 +349,19 @@ pub fn serve_shared_on_with(
     listener: UnixListener,
     limits: Limits,
 ) -> io::Result<()> {
+    serve_shared_on_admitted(kernel, listener, limits, Admission::owner())
+}
+
+/// [`serve_shared_on_with`] under an explicit [`Admission`] (ledger #1830): every connection
+/// the door accepts (still its own UID only) resolves under `admission`, so a socket can be
+/// served bounded by a grant, and naming a principal, rather than as the owner's root.
+pub fn serve_shared_on_admitted(
+    kernel: Arc<Kernel>,
+    listener: UnixListener,
+    limits: Limits,
+    admission: Admission,
+) -> io::Result<()> {
+    let admission = Arc::new(admission);
     let me = own_uid();
     let mut backoff = accept::Backoff::default();
     // The connections being served. Only this loop adds to it, so reading it and then adding
@@ -368,9 +388,10 @@ pub fn serve_shared_on_with(
         }
         let slot = Slot::take(&live);
         let kernel = Arc::clone(&kernel);
+        let admission = Arc::clone(&admission);
         let spawned = std::thread::Builder::new().spawn(move || {
             let _slot = slot;
-            serve_connection(&kernel, stream, &limits)
+            serve_connection(&kernel, stream, &limits, &admission)
         });
         match spawned {
             Ok(_) => backoff.succeeded(),
@@ -1294,12 +1315,12 @@ impl Resolver for IpcResolver {
 /// Serve one connection under the default [`Limits`] (the tests' entry point).
 #[cfg(test)]
 fn handle_connection(kernel: &Kernel, stream: UnixStream) {
-    serve_connection(kernel, stream, &Limits::default())
+    serve_connection(kernel, stream, &Limits::default(), &Admission::owner())
 }
 
 /// Serve one connection: the version hello first, then calls until the peer
 /// hangs up, falls silent past `limits` (see [`serve_shared_on_with`]), or sends a wire error.
-fn serve_connection(kernel: &Kernel, stream: UnixStream, limits: &Limits) {
+fn serve_connection(kernel: &Kernel, stream: UnixStream, limits: &Limits, admission: &Admission) {
     // Ignored on failure: a socket the peer already closed refuses `setsockopt` on macOS, and
     // the read below reports that death properly.
     let _ = stream.set_read_timeout(Some(limits.hello_timeout));
@@ -1315,7 +1336,7 @@ fn serve_connection(kernel: &Kernel, stream: UnixStream, limits: &Limits) {
             // EOF, a malformed frame, or silence past the idle timeout ends the session.
             Err(_) => return,
         };
-        let reply = dispatch(kernel, call).for_peer(peer_version);
+        let reply = dispatch(kernel, call, admission).for_peer(peer_version);
         if write_message(&mut stream, &reply).is_err() {
             return;
         }
@@ -1359,31 +1380,142 @@ fn answer_hello(stream: &mut &UnixStream) -> Option<u32> {
     }
 }
 
-/// Answer one [`Call`] against the local kernel, reusing its [`Resolver`] impl so
-/// the server computes cache status exactly as the embedded path does.
-fn dispatch(kernel: &Kernel, call: Call) -> Reply {
+/// Who a socket door admits, and what each admitted connection may do (ledger #1830).
+///
+/// A Unix socket door authenticates a UID (its own: every other is refused), never a party,
+/// so the honest default is [`Admission::owner`]: the owner's root authority, naming nobody.
+/// A [`bounded`](Admission::bounded) admission serves the same peers under a scoped ceiling and,
+/// when given one, a principal the door MINTS into every call's capability and stamps as the
+/// `principal` argument.
+///
+/// Either way a name the CLIENT supplies never reaches an endpoint: its `principal` argument is
+/// replaced ([`ikigai_resolve::stamp_principal`]), and a carried capability's principal is
+/// dropped under the owner's root ([`ikigai_resolve::without_principals`]; core's `clamp` keeps
+/// a carried name under a root ceiling, because root may act as anyone) or replaced by the
+/// ceiling's under a bounded one (core's `clamp` keeps the CEILING's principal).
+///
+/// ⚠ A bound here is as strong as the peer's inability to reach a door that admits it as the
+/// owner. Every door admits its own UID, so a client running as the owner can always dial an
+/// owner door instead: a bounded socket constrains a cooperating client, or one confined
+/// (a sandbox, a container) to this socket, and not a same-user process that chooses another.
+///
+/// ```
+/// use ikigai_core::Capability;
+/// use ikigai_ipc::Admission;
+///
+/// let owner = Admission::owner();
+/// assert!(owner.ceiling().is_root() && owner.principal().is_none());
+///
+/// let agent = Admission::bounded(
+///     Capability::scoped(["urn:cap:demo:read"]),
+///     Some("urn:example:agent".to_string()),
+/// )
+/// .unwrap();
+/// assert_eq!(agent.principal(), Some("urn:example:agent"));
+/// // A principal needs a scoped ceiling: root names nobody.
+/// assert!(Admission::bounded(Capability::root(), Some("urn:example:agent".into())).is_err());
+/// ```
+#[derive(Clone, Debug)]
+pub struct Admission {
+    ceiling: Capability,
+    principal: Option<String>,
+}
+
+impl Admission {
+    /// The owner of the socket: root authority, no principal. What [`serve`] and every other
+    /// door without an explicit admission serves.
+    pub fn owner() -> Admission {
+        Admission {
+            ceiling: Capability::root(),
+            principal: None,
+        }
+    }
+
+    /// Serve under `ceiling`, naming `principal` when given.
+    ///
+    /// # Errors
+    ///
+    /// A principal core cannot carry ([`ikigai_core::PrincipalError`]), and a principal on a
+    /// root ceiling, which names nobody.
+    pub fn bounded(
+        ceiling: Capability,
+        principal: Option<String>,
+    ) -> Result<Admission, ikigai_core::PrincipalError> {
+        if let Some(principal) = &principal {
+            ceiling.with_principal(principal)?;
+        }
+        Ok(Admission { ceiling, principal })
+    }
+
+    /// The ceiling every call is resolved under (or clamped to).
+    pub fn ceiling(&self) -> &Capability {
+        &self.ceiling
+    }
+
+    /// The principal the door mints, if any.
+    pub fn principal(&self) -> Option<&str> {
+        self.principal.as_deref()
+    }
+
+    /// The door's own authority: the ceiling with the principal minted.
+    fn authority(&self) -> Capability {
+        match &self.principal {
+            Some(principal) => self
+                .ceiling
+                .with_principal(principal)
+                .unwrap_or_else(|_| self.ceiling.clone()),
+            None => self.ceiling.clone(),
+        }
+    }
+
+    /// The capability a call carrying `carried` resolves under.
+    fn admit_capability(&self, carried: &Capability) -> Capability {
+        let authority = self.authority();
+        if authority.is_root() {
+            ikigai_resolve::without_principals(carried)
+        } else {
+            authority.clamp(carried)
+        }
+    }
+
+    /// The request as the kernel sees it: the client's `principal` argument replaced by the
+    /// door's.
+    fn admit_request(&self, mut request: Request) -> Request {
+        ikigai_resolve::stamp_principal(&mut request, self.principal.as_deref());
+        request
+    }
+}
+
+/// Answer one [`Call`] against the local kernel under `admission`, reusing its [`Resolver`]
+/// impl so the server computes cache status exactly as the embedded path does.
+fn dispatch(kernel: &Kernel, call: Call, admission: &Admission) -> Reply {
     match call {
-        Call::Issue(request) => match Resolver::issue(kernel, request) {
-            Ok((representation, status)) => Reply::Resolved(representation, status),
-            Err(error) => Reply::ErrorTyped(WireError::from(&error)),
-        },
-        // The peer is the owner (peercred-verified in `serve`), so the principal's
-        // entitlement is root and the carried capability is already ≤ root —
-        // resolving under it *is* the clamp. A future non-root IPC principal would
-        // intersect the carried capability with its entitlement here.
+        Call::Issue(request) => {
+            let request = admission.admit_request(request);
+            match Resolver::issue_as(kernel, request, &admission.authority()) {
+                Ok((representation, status)) => Reply::Resolved(representation, status),
+                Err(error) => Reply::ErrorTyped(WireError::from(&error)),
+            }
+        }
         Call::IssueAs(request, capability) => {
+            let request = admission.admit_request(request);
+            let capability = admission.admit_capability(&capability);
             match Resolver::issue_as(kernel, request, &capability) {
                 Ok((representation, status)) => Reply::Resolved(representation, status),
                 Err(error) => Reply::ErrorTyped(WireError::from(&error)),
             }
         }
         Call::IsCached(request) => {
-            Reply::Cached(Resolver::is_cached(kernel, &request, &Capability::root()))
+            let request = admission.admit_request(request);
+            Reply::Cached(Resolver::is_cached(
+                kernel,
+                &request,
+                &admission.authority(),
+            ))
         }
-        // The peer is the peercred-verified owner (root authority), so this lists the
-        // whole capability-scoped manifold — but it goes through the same cap filter
-        // as QUIC, not the raw catalog, so the two transports agree.
-        Call::Entries => Reply::Entries(Some(scoped_entries(kernel, &Capability::root()))),
+        // The manifold under the door's own authority, through the same cap filter as QUIC,
+        // not the raw catalog, so the two transports agree.
+        Call::Entries => Reply::Entries(Some(scoped_entries(kernel, &admission.authority()))),
         // Trace-over-the-wire: resolve with a PER-CALL collector
         // (`issue_traced_as`), ship the recorded spans back. Each connection's
         // trace records into its own scope, so concurrent traced calls no longer
@@ -1391,6 +1523,8 @@ fn dispatch(kernel: &Kernel, call: Call) -> Reply {
         // a future mount-stitch (re-parenting the subtree); a whole-session
         // `--connect` trace ignores it.
         Call::IssueTraced(request, capability, _ctx) => {
+            let request = admission.admit_request(request);
+            let capability = admission.admit_capability(&capability);
             let collector = Arc::new(SpanCollector::default());
             match ikigai_resolve::issue_traced_as(kernel, request, &capability, collector.clone()) {
                 Ok((representation, status)) => {
@@ -1405,6 +1539,8 @@ fn dispatch(kernel: &Kernel, call: Call) -> Reply {
         // core does not expose). The kernel narrows the retries to what the capability is
         // entitled to and drops them on a kernel with no retry budget.
         Call::IssueWith(request, capability, with) => {
+            let request = admission.admit_request(request);
+            let capability = admission.admit_capability(&capability);
             let context = with.issue_context(SystemClock.now());
             match with.trace {
                 Some(_ctx) => {
@@ -2742,7 +2878,7 @@ mod tests {
                     | Call::IssueWith(request, _, _) => request.verb != Verb::Meta,
                     Call::IsCached(_) | Call::Entries => false,
                 };
-                if write_message(&mut s, &dispatch(&kernel, call)).is_err() {
+                if write_message(&mut s, &dispatch(&kernel, call, &Admission::owner())).is_err() {
                     return;
                 }
                 if real {
@@ -3863,6 +3999,162 @@ mod call_deadline {
         let _canceled = peer(&path, Peer::Silent);
         let client = connect_with_timeout(&path, Some(STANDING)).unwrap();
         assert_eq!(client.call_timeout(), Some(STANDING));
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// D4 and D12 of the principal model (ledger #1830): what the owner socket does with a name
+/// the client supplies. Each test was written to FAIL on the door before this change.
+#[cfg(test)]
+mod principal_tests {
+    use super::*;
+    use ikigai_core::{ArgRef, Capability, EndpointSpace, Exact, FnEndpoint, Iri, ReprType, Verb};
+    use std::thread;
+
+    /// An endpoint that answers `<capability principal>|<principal argument>`, `-` for none.
+    fn whoami_kernel() -> Kernel {
+        let whoami = FnEndpoint::new("whoami", |inv: &ikigai_core::Invocation<'_>| {
+            let held = inv.capability.principal().unwrap_or("-").to_string();
+            let arg = inv.inline_str("principal").unwrap_or("-").to_string();
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("{held}|{arg}").into_bytes(),
+            ))
+        });
+        Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:test:whoami"), whoami),
+        ))
+    }
+
+    fn path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("ikp-{}-{name}.sock", std::process::id()))
+    }
+
+    fn serve(path: &Path) {
+        let listener = bind(path).unwrap();
+        thread::spawn(move || {
+            let _ = serve_on(whoami_kernel(), listener);
+        });
+    }
+
+    fn whoami() -> Request {
+        Request::new(Verb::Source, Iri::parse("urn:test:whoami").unwrap())
+    }
+
+    fn serve_admitted(path: &Path, admission: Admission) {
+        let listener = bind(path).unwrap();
+        thread::spawn(move || {
+            let _ = serve_shared_on_admitted(
+                Arc::new(whoami_kernel()),
+                listener,
+                Limits::default(),
+                admission,
+            );
+        });
+    }
+
+    /// A bounded admission MINTS its principal into every call, whatever the client carried
+    /// or sent, and the carried capability is clamped to its ceiling.
+    #[test]
+    fn a_bounded_admission_names_its_own_principal_on_every_call() {
+        let path = path("bounded");
+        serve_admitted(
+            &path,
+            Admission::bounded(
+                Capability::scoped(["urn:cap:demo:read"]),
+                Some("urn:example:agent".to_string()),
+            )
+            .unwrap(),
+        );
+        let client = connect(&path).unwrap();
+        let forged =
+            whoami().with_arg("principal", ArgRef::Inline(b"urn:example:mallory".to_vec()));
+        let named = "urn:example:agent|urn:example:agent";
+        let (plain, _) = client.issue(forged.clone()).unwrap();
+        assert_eq!(String::from_utf8_lossy(&plain.bytes), named);
+        let mallory = Capability::scoped(["urn:cap:demo:read"])
+            .with_principal("urn:example:mallory")
+            .unwrap();
+        let (carried, _) = client.issue_as(forged.clone(), &mallory).unwrap();
+        assert_eq!(String::from_utf8_lossy(&carried.bytes), named);
+        let (rooted, _) = client.issue_as(forged, &Capability::root()).unwrap();
+        assert_eq!(String::from_utf8_lossy(&rooted.bytes), named);
+        drop(client);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A bounded ceiling is a ceiling: a carried root, or a carried scope the ceiling does not
+    /// hold, cannot reach what the ceiling does not grant.
+    #[test]
+    fn a_bounded_admission_refuses_what_its_ceiling_does_not_grant() {
+        let guarded = FnEndpoint::new("guarded", |_inv: &ikigai_core::Invocation<'_>| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                b"ok".to_vec(),
+            ))
+        })
+        .with_description(
+            ikigai_core::Description::new("guarded")
+                .verb(Verb::Source)
+                .requires("urn:cap:demo:write"),
+        );
+        let kernel = Arc::new(Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:test:guarded"), guarded),
+        )));
+        let path = path("ceiling");
+        let listener = bind(&path).unwrap();
+        thread::spawn(move || {
+            let _ = serve_shared_on_admitted(
+                kernel,
+                listener,
+                Limits::default(),
+                Admission::bounded(Capability::scoped(["urn:cap:demo:read"]), None).unwrap(),
+            );
+        });
+        let client = connect(&path).unwrap();
+        let guarded = || Request::new(Verb::Source, Iri::parse("urn:test:guarded").unwrap());
+        assert!(
+            client.issue(guarded()).is_err(),
+            "the ceiling lacks the scope"
+        );
+        let widened = Capability::scoped(["urn:cap:demo:write"]);
+        assert!(client.issue_as(guarded(), &widened).is_err());
+        assert!(client.issue_as(guarded(), &Capability::root()).is_err());
+        drop(client);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// D4: a carried capability naming a principal must not name it at the owner door. The
+    /// door authenticated a UID, not a principal, so a name it did not mint never enters.
+    #[test]
+    fn a_carried_principal_never_reaches_an_endpoint_through_the_owner_socket() {
+        let path = path("carried");
+        serve(&path);
+        let client = connect(&path).unwrap();
+        let forged = Capability::scoped(["urn:cap:demo:read"])
+            .with_principal("urn:example:mallory")
+            .unwrap();
+        let (answer, _) = client.issue_as(whoami(), &forged).unwrap();
+        assert_eq!(String::from_utf8_lossy(&answer.bytes), "-|-");
+        drop(client);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// D12: a `principal` ARGUMENT the client sends is removed, as the QUIC door removes it.
+    #[test]
+    fn a_client_principal_argument_is_removed_at_the_owner_socket() {
+        let path = path("arg");
+        serve(&path);
+        let client = connect(&path).unwrap();
+        let forged =
+            whoami().with_arg("principal", ArgRef::Inline(b"urn:example:mallory".to_vec()));
+        let (plain, _) = client.issue(forged.clone()).unwrap();
+        assert_eq!(String::from_utf8_lossy(&plain.bytes), "-|-");
+        let (carried, _) = client
+            .issue_as(forged, &Capability::scoped(["urn:cap:demo:read"]))
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&carried.bytes), "-|-");
+        drop(client);
         let _ = std::fs::remove_file(&path);
     }
 }

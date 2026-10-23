@@ -838,6 +838,10 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
     for (k, v) in req_args {
         request = request.with_arg(k, ArgRef::Inline(v.into_bytes()));
     }
+    // `principal` is never the CLIENT's to name (ledger #1830): the door stamps the one its
+    // session capability carries (minted by `ikigai mcp --principal`), or removes it, the rule
+    // every door that builds a request applies.
+    ikigai_resolve::stamp_principal(&mut request, capability.principal());
     match block_on(kernel.issue(request, capability)) {
         Ok(repr) => tool_text(String::from_utf8_lossy(&repr.bytes).into_owned()),
         Err(e) => tool_error(kernel_failure(&e)),
@@ -2685,5 +2689,72 @@ mod concurrent_1695 {
             self.next += 1;
             Ok(line.len())
         }
+    }
+}
+
+/// D11 of the principal model (ledger #1830): a `principal` the MCP CLIENT supplies never
+/// reaches an endpoint. The door stamps the principal its capability carries, or none.
+#[cfg(test)]
+mod principal_tests {
+    use super::*;
+    use ikigai_core::{
+        ArgSpec, Description, EndpointSpace, Exact, FnEndpoint, ReprType, Representation, Verb,
+    };
+    use serde_json::json;
+    use std::sync::Arc;
+
+    /// A Source that DECLARES a `principal` input (as a host reading the stamp might), and
+    /// answers `<capability principal>|<principal argument>`, `-` for none.
+    fn kernel() -> Kernel {
+        let whoami = FnEndpoint::new("whoami", |inv: &ikigai_core::Invocation<'_>| {
+            let held = inv.capability.principal().unwrap_or("-").to_string();
+            let arg = inv.inline_str("principal").unwrap_or("-").to_string();
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                format!("{held}|{arg}").into_bytes(),
+            ))
+        })
+        .with_description(
+            Description::new("whoami")
+                .verb(Verb::Source)
+                .input(ArgSpec::new("principal").optional()),
+        );
+        Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:test:whoami"), whoami),
+        ))
+    }
+
+    fn answer(capability: &Capability) -> String {
+        let reply = handle(
+            &kernel(),
+            capability,
+            &ToolFilter::default(),
+            &json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "whoami__source",
+                    "arguments": { "principal": "urn:example:mallory" }
+                }
+            }),
+        )
+        .expect("a reply");
+        reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a text result: {reply}"))
+            .to_string()
+    }
+
+    #[test]
+    fn a_client_principal_argument_is_removed_when_the_session_names_nobody() {
+        assert_eq!(answer(&Capability::root()), "-|-");
+        assert_eq!(answer(&Capability::scoped(["urn:cap:demo:read"])), "-|-");
+    }
+
+    #[test]
+    fn the_session_principal_is_stamped_over_a_client_supplied_one() {
+        let agent = Capability::scoped(["urn:cap:demo:read"])
+            .with_principal("urn:example:agent")
+            .unwrap();
+        assert_eq!(answer(&agent), "urn:example:agent|urn:example:agent");
     }
 }

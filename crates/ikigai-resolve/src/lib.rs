@@ -35,6 +35,11 @@ pub use file_name::is_plain_file_name;
 mod home;
 pub use home::{expand_home, expand_home_str};
 
+// The one rule for a principal a client supplied (ledger #1830): every door that builds a
+// request removes it and stamps its own, here for the same reason as the two above.
+mod principal;
+pub use principal::{stamp_principal, without_principals, PRINCIPAL_ARG};
+
 /// How a resolution was served by the representation cache.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum CacheStatus {
