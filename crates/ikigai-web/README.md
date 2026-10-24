@@ -95,6 +95,41 @@ security and CORS headers). ⚠ The envelope is an HTTP concern carried through 
 transport-neutral kernel, so a CLI `source`, QUIC or MCP caller sees the envelope bytes as they
 are: use it on resources browsers call.
 
+### A form POST's success page
+
+A route can name a page IRI in `redirect` (RDF: `ik:redirect`). After a successful
+plain POST's Sink, the edge answers **303 See Other** with that page's same-origin
+path in `Location`, so following it or reloading the result is a GET. A request with
+`HX-Request: true` keeps the endpoint's in-place answer. Other methods and routes
+without `redirect` keep their existing behavior. A failed Sink or refused request
+never redirects, and an endpoint's explicit `Location` keeps its outcome.
+
+```json
+{ "routes": [
+  { "match": "/note", "target": "urn:note", "redirect": "urn:page:inspector" },
+  { "match": "/inspect", "target": "urn:page:inspector" }
+] }
+```
+
+The same field works in YAML. In Turtle, add `ik:redirect <urn:page:inspector>`
+(or a string literal for a template) to the write route. Captures expand once using
+the route's `{var}` / `{+var}` rules, including strict spellings in the redirect
+template. For example, `"redirect": "urn:page:note:{name}"` can return to a page
+route with target `urn:page:note:{name}`. Captured values are URL-encoded as single
+path segments when building `Location`.
+
+The edge prefers the first page route whose template can be inverted and whose
+path routes back to the page IRI under first-match routing. Without a page route,
+a `urn:` IRI can use the mechanical path (`urn:page:inspector` → `/page/inspector`),
+unless `routes_only` is set. An unaddressable destination is a configuration error
+(`500`) **before the Sink runs**. Redirects use the same route-table snapshot as
+the write, including on a hot-reloaded door. A successful POST on a redirect route
+carries `Vary: HX-Request`. Page IRIs and their captures become visible URLs; keep
+personal data out of them.
+
+Adding `Route::redirect` requires Rust callers constructing a `Route` to supply
+`redirect: None` to keep the previous behavior.
+
 ### Errors as pages, and HEAD
 
 Every refusal is a sentence. A client that names `text/html` in `Accept` and prefers it to

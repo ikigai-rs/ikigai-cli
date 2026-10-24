@@ -228,6 +228,7 @@ async fn the_adapters_own_refusals() {
     let routes = ikigai_web::RouteTable::new(vec![ikigai_web::Route {
         pattern: "/u/{name}".to_string(),
         iri_template: "urn:t:{name}".to_string(),
+        redirect: None,
         cap: None,
         cors: None,
         csp: None,

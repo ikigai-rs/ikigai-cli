@@ -28,7 +28,7 @@ use ikigai_web::{CorsPolicy, Route, RouteTable};
 /// list, or echo the requested headers, which is wider than what was authored.
 const ROUTE_QUERY: &str = r#"
 PREFIX ik: <https://ikigai-rs.dev/ns#>
-SELECT ?match ?target ?order ?csp ?corsCredentials ?corsMaxAge
+SELECT ?match ?target ?order ?csp ?redirect ?corsCredentials ?corsMaxAge
        (GROUP_CONCAT(DISTINCT STR(?cap); SEPARATOR="\n") AS ?caps)
        (COUNT(DISTINCT ?cap) AS ?capCount)
        (GROUP_CONCAT(DISTINCT STR(?corsOrigin); SEPARATOR="\n") AS ?corsOrigins)
@@ -43,6 +43,7 @@ WHERE {
          ik:target ?target .
   OPTIONAL { ?route ik:order ?order }
   OPTIONAL { ?route ik:csp   ?csp }
+  OPTIONAL { ?route ik:redirect ?redirect }
   OPTIONAL { ?route ik:cap   ?cap }
   OPTIONAL {
     ?route ik:cors ?cors .
@@ -53,7 +54,7 @@ WHERE {
     OPTIONAL { ?cors ik:corsMaxAge      ?corsMaxAge }
   }
 }
-GROUP BY ?route ?match ?target ?order ?csp ?corsCredentials ?corsMaxAge
+GROUP BY ?route ?match ?target ?order ?csp ?redirect ?corsCredentials ?corsMaxAge
 ORDER BY ?order
 "#;
 
@@ -191,6 +192,7 @@ fn routes_from_value(v: &serde_json::Value) -> Result<RouteTable, String> {
             Route {
                 pattern,
                 iri_template,
+                redirect: r.get("redirect").and_then(|x| x.as_str()).map(String::from),
                 cap: (!caps.is_empty()).then_some(caps),
                 cors,
                 csp: r.get("csp").and_then(|x| x.as_str()).map(String::from),
@@ -287,6 +289,7 @@ pub fn parse_route_solutions(json: &[u8]) -> Result<RouteTable, String> {
         routes.push(Route {
             pattern,
             iri_template,
+            redirect: val("redirect").map(String::from),
             cap: if caps.is_empty() { None } else { Some(caps) },
             cors,
             csp: val("csp").map(String::from),
@@ -393,7 +396,7 @@ mod tests {
     fn json_route_file_parses_directly() {
         let json = br#"{
           "routes": [
-            { "id": "api", "order": 20, "match": "/api/{what}", "target": "urn:kernel:{what}",
+            { "id": "api", "order": 20, "match": "/api/{what}", "target": "urn:kernel:{what}", "redirect": "urn:page:{what}",
               "cap": ["urn:cap:a", "urn:cap:b"],
               "cors": { "origin": ["https://app.example"], "maxAge": 600 } },
             { "id": "home", "order": 10, "match": "/", "target": "urn:host:info" }
@@ -406,6 +409,8 @@ mod tests {
         assert_eq!(table.routes[1].pattern, "/api/{what}");
         let api = &table.routes[1];
         assert_eq!(api.iri_template, "urn:kernel:{what}");
+        assert_eq!(api.redirect.as_deref(), Some("urn:page:{what}"));
+        assert!(table.routes[0].redirect.is_none());
         assert_eq!(
             api.cap.as_deref(),
             Some(&["urn:cap:a".to_string(), "urn:cap:b".to_string()][..])
@@ -425,6 +430,7 @@ routes:
     order: 20
     match: "/api/{what}"
     target: "urn:kernel:{what}"
+    redirect: "urn:page:{what}"
     cap: [urn:cap:a, urn:cap:b]
     cors:
       origin: [https://app.example]
@@ -439,6 +445,8 @@ routes:
         assert_eq!(table.routes[0].pattern, "/"); // order 10 first
         let api = &table.routes[1];
         assert_eq!(api.iri_template, "urn:kernel:{what}");
+        assert_eq!(api.redirect.as_deref(), Some("urn:page:{what}"));
+        assert!(table.routes[0].redirect.is_none());
         assert_eq!(
             api.cap.as_deref(),
             Some(&["urn:cap:a".to_string(), "urn:cap:b".to_string()][..])
@@ -493,6 +501,27 @@ routes:
             "urn:test:routes",
             &Capability::root(),
         ))
+    }
+
+    #[test]
+    fn a_redirect_page_iri_loads_from_turtle_as_an_iri_or_literal() {
+        let table = load_turtle(
+            r#"<urn:test:route:iri> a ik:Route ; ik:match "/note" ;
+                 ik:target "urn:note" ; ik:redirect <urn:page:inspector> .
+               <urn:test:route:literal> a ik:Route ; ik:match "/note/{name}" ;
+                 ik:target "urn:note:{name}" ; ik:redirect "urn:page:{name}" .
+               <urn:test:route:plain> a ik:Route ; ik:match "/plain" ;
+                 ik:target "urn:plain" ."#,
+        )
+        .expect("loads");
+        for (pattern, expected) in [
+            ("/note", Some("urn:page:inspector")),
+            ("/note/{name}", Some("urn:page:{name}")),
+            ("/plain", None),
+        ] {
+            let route = table.routes.iter().find(|r| r.pattern == pattern).unwrap();
+            assert_eq!(route.redirect.as_deref(), expected);
+        }
     }
 
     /// The sorted caps of the route matching `pattern`.

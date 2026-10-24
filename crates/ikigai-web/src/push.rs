@@ -989,6 +989,7 @@ mod tests {
             routes: crate::RouteTable::new(vec![crate::Route {
                 pattern: "/c/{name}".to_string(),
                 iri_template: "urn:test:cell:{name}".to_string(),
+                redirect: None,
                 cap: None,
                 cors: None,
                 csp: None,
