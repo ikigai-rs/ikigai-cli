@@ -195,6 +195,7 @@ async fn an_html_door_can_still_set_a_per_route_csp() {
         routes: RouteTable::new(vec![Route {
             pattern: "/gallery".into(),
             iri_template: "urn:test:note".into(),
+            redirect: None,
             cap: None,
             cors: None,
             csp: Some(route_csp.into()),

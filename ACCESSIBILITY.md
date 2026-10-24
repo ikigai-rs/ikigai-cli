@@ -49,6 +49,10 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
   back or restoring the tab shows the outcome again and never asks to post again. The outcome
   page is a `decide::page` like the others, says what happened in one sentence, and works with no
   script.
+- A web route can name a success page IRI with `redirect` (`ik:redirect` in RDF). A
+  successful plain form POST answers `303 See Other` to that page on the same origin, so
+  restoring or reloading the resulting page uses GET. `HX-Request: true` keeps its in-place
+  answer. The route supplies no HTML; the destination page owns its markup.
 - A message a script writes after the page loads goes into a status line that is a polite live
   region (`role=status aria-live=polite`), present and empty in the served markup before the
   script runs: the passkey pages' `#status` and `#pkstatus`. Its gray (`#666`) is 5.7:1 on white.
@@ -86,6 +90,11 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
   layout and editing. `no_color_takes_every_color_escape_out_of_the_frame` writes a frame through
   the crossterm backend and finds no color escape in the bytes under `NO_COLOR`, and finds some
   without it.
+- `crates/ikigai-web/tests/post_redirect_get.rs` sends raw HTTP form submissions and pins
+  the route's `303` and `Location`, follows the GET and reloads it without another Sink,
+  and checks the htmx answer, failed writes, page aliases, encoded captures, and refusals
+  before writing when a destination cannot be addressed. These are socket tests, not
+  browser or assistive technology tests.
 - No automated accessibility checker (axe or similar), no browser run and no assistive technology
   has been used on any of this output.
 

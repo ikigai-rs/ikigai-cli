@@ -63,6 +63,7 @@ mod entity;
 mod error_page;
 mod origin;
 pub mod push;
+mod redirect;
 mod source_limit;
 pub use entity::{
     with_headers, EndpointHeader, HeaderRefusal, HTTP_ENTITY, MAX_HEADER_BLOCK, MAX_HEADER_LINES,
@@ -755,7 +756,7 @@ impl EdgeConfig {
 /// ```
 /// use ikigai_web::{Route, RouteTable};
 /// let route = |pattern: &str, iri: &str| Route {
-///     pattern: pattern.into(), iri_template: iri.into(), cap: None, cors: None, csp: None,
+///     pattern: pattern.into(), iri_template: iri.into(), redirect: None, cap: None, cors: None, csp: None,
 /// };
 /// // `/u/alice` → `urn:user:alice`; `/u/alice:private` → 400, the variable refuses `:`.
 /// let strict = route("/u/{name}", "urn:user:{name}");
@@ -765,6 +766,10 @@ impl EdgeConfig {
 /// ```
 #[derive(Clone)]
 pub struct Route {
+    /// Page IRI template to redirect to after a successful non-htmx POST. Captures use
+    /// the same rules as `iri_template`. `None` keeps the endpoint's answer. The page is
+    /// addressed through this route table, or the mechanical `urn:` path default.
+    pub redirect: Option<String>,
     /// Path pattern; a `{var}` or `{+var}` segment captures exactly one path segment, a
     /// literal segment must match exactly.
     pub pattern: String,
@@ -791,6 +796,7 @@ pub struct RouteTable {
 /// threads cleanly through the async request path).
 #[derive(Clone)]
 struct Matched {
+    redirect: Option<String>,
     /// The expanded IRI template, or — when a strict `{var}` refused its value — the `400`
     /// body naming the variable. A refusal still MATCHED: the route's shape claimed the path,
     /// so no later route and no mechanical default may answer it instead.
@@ -875,7 +881,13 @@ impl RouteTable {
             }
             let refusal = binds.iter().find_map(|(var, val, raw)| {
                 // Raw only when the template agrees: a `{var}` spelling there is strict.
-                if *raw && !route.iri_template.contains(&format!("{{{var}}}")) {
+                if *raw
+                    && !route.iri_template.contains(&format!("{{{var}}}"))
+                    && !route
+                        .redirect
+                        .as_deref()
+                        .is_some_and(|t| t.contains(&format!("{{{var}}}")))
+                {
                     return None;
                 }
                 let delim = val.chars().find(|c| GEN_DELIMS.contains(c))?;
@@ -891,7 +903,9 @@ impl RouteTable {
                     Ok(expand(&route.iri_template, &pairs))
                 }
             };
+            let pairs: Vec<(&str, &str)> = binds.iter().map(|(n, v, _)| (*n, *v)).collect();
             return Some(Matched {
+                redirect: route.redirect.as_ref().map(|t| expand(t, &pairs)),
                 iri,
                 cap: route.cap.clone(),
                 cors: route.cors.clone(),
@@ -1612,7 +1626,7 @@ async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::
     }
     let matched = table.match_path(&req.path);
     let mut resp = finish(
-        respond(&shared, &req, matched.as_ref()).await,
+        respond(&shared, &req, matched.as_ref(), &table).await,
         &req,
         &shared.config,
     );
@@ -1636,7 +1650,12 @@ fn finish(resp: Resp, req: &HttpRequest, config: &EdgeConfig) -> Resp {
 
 /// The core adapter: method → verb (gated by `describe().verbs`), path → iri,
 /// query → args, body → piped `content`, Accept → conneg, resolved under the cap.
-async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) -> Resp {
+async fn respond(
+    shared: &Shared,
+    req: &HttpRequest,
+    matched: Option<&Matched>,
+    table: &RouteTable,
+) -> Resp {
     // Routes-only edge: an un-routed path is not part of the public surface — 404 before it
     // can reach the mechanical default (the exhaustive-allow-list posture).
     if shared.config.routes_only && matched.is_none() {
@@ -1780,6 +1799,30 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
         }
     }
 
+    // Resolve configuration before issuing the write: a bad destination must not leave
+    // a successful mutation behind an error page. htmx keeps the in-place answer.
+    let redirect = if req.method == "POST"
+        && !req
+            .header("hx-request")
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+    {
+        match matched.and_then(|m| m.redirect.as_deref()) {
+            Some(iri) => match redirect::page_path(table, iri, config.routes_only) {
+                Some(path) => Some(path),
+                None => {
+                    return Resp::text(
+                        500,
+                        "Internal Server Error",
+                        "route redirect has no page path",
+                    )
+                }
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+
     let cap = request_capability(shared, req, matched);
 
     // Write-side preconditions (optimistic concurrency): If-Match / If-None-Match are
@@ -1845,7 +1888,20 @@ async fn respond(shared: &Shared, req: &HttpRequest, matched: Option<&Matched>) 
             record_tombstone(shared, tombstone_key(&iri_str, req));
             write_resp(verb, served)
         }
-        Ok(Ok(served)) => write_resp(verb, served),
+        Ok(Ok(served)) => {
+            let mut resp = write_resp(verb, served);
+            if req.method == "POST" && matched.is_some_and(|m| m.redirect.is_some()) {
+                resp.add_vary("HX-Request");
+            }
+            // An explicit endpoint Location already chose the outcome; keep it.
+            if let Some(path) = redirect.filter(|_| matches!(resp.status, 200 | 204)) {
+                resp.status = 303;
+                resp.reason = "See Other";
+                resp.body.clear();
+                resp.headers.push(("Location".into(), path));
+            }
+            resp
+        }
         // A DELETE of an already-absent resource is idempotent (204) within the tombstone
         // window; otherwise it's a genuine 404, carrying the endpoint's own message.
         Err(e @ ikigai_core::Error::NotFound(_)) if verb == Verb::Delete => {
@@ -5932,6 +5988,7 @@ mod tests {
         let route = Route {
             pattern: "/doc".to_string(),
             iri_template: "urn:test:doc".to_string(),
+            redirect: None,
             cap: None,
             cors: Some(CorsPolicy {
                 allowed_origins: vec!["https://a.example".to_string()],
@@ -5969,6 +6026,7 @@ mod tests {
         Route {
             pattern: pattern.to_string(),
             iri_template: iri_template.to_string(),
+            redirect: None,
             cap: None,
             cors: None,
             csp: None,
@@ -6168,6 +6226,7 @@ mod tests {
             routes: RouteTable::new(vec![Route {
                 pattern: "/secret".to_string(),
                 iri_template: "urn:test:guarded".to_string(),
+                redirect: None,
                 cap: Some(vec!["urn:cap:test".to_string()]),
                 cors: None,
                 csp: None,
@@ -6208,6 +6267,7 @@ mod tests {
             routes: RouteTable::new(vec![Route {
                 pattern: "/page".to_string(),
                 iri_template: "urn:test:id:hello".to_string(),
+                redirect: None,
                 cap: None,
                 cors: None,
                 csp: Some("default-src 'none'".to_string()),
@@ -6659,6 +6719,7 @@ mod tests {
             routes: RouteTable::new(vec![Route {
                 pattern: "/api".to_string(),
                 iri_template: "urn:test:id:hello".to_string(),
+                redirect: None,
                 cap: None,
                 cors: Some(CorsPolicy {
                     allowed_origins: vec!["https://client.example".to_string()],
@@ -7958,6 +8019,7 @@ mod tests {
                 routes: RouteTable::new(vec![Route {
                     pattern: "/members/whoami".to_string(),
                     iri_template: "urn:test:c:whoami".to_string(),
+                    redirect: None,
                     cap: Some(vec!["urn:cap:member".to_string()]),
                     cors: None,
                     csp: None,
@@ -8007,6 +8069,7 @@ mod tests {
                 routes: RouteTable::new(vec![Route {
                     pattern: "/members/whoami".to_string(),
                     iri_template: "urn:test:c:whoami".to_string(),
+                    redirect: None,
                     cap: Some(vec!["urn:cap:member".to_string()]),
                     cors: None,
                     csp: None,
