@@ -1525,8 +1525,9 @@ ikigai-jsonld = "0.2.1" # 0.2.1 is a SECURITY floor: JSON-LD nesting past 64 is 
 # invisible to the selection funnel's deterministic first stage — `urn:kernel:actions`
 # narrows on `ik:class`, and this host is the thing that serves that manifold — so the three
 # operators could not be narrowed to before matching fell through to the LLM residual.
-# SHACL validation (urn:shacl:validate) — rudof's validator is native-only (gated off wasm),
-# so it's linked natively here; the browser serves the same resource via shacl-engine (JS).
+# SHACL validation (urn:shacl:validate) — rudof's validator is linked natively here.
+# The browser uses ikigai-shacl's lazy-loaded wasm module by default; shacl-engine (JS)
+# is available behind `?shacl=js`.
 ikigai-shacl = "0.3.6" # 0.3.6: `futures` is optional (on only under `module`), and the rudof-free subset
 # gains `sh:closed` and `sh:ignoredProperties`. Taken because `ikigai-layers` 0.2.9 asks for it; nothing in
 # this workspace calls the subset. DEFAULT FEATURES STAY ON, BY CHOICE: `urn:shacl:validate` on a cli host
