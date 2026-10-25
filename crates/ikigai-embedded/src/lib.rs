@@ -239,15 +239,11 @@ fn about() -> FnEndpoint {
 /// demonstrates the `uncacheable` cache outcome.
 fn host_info(nature: &'static str) -> FnEndpoint {
     FnEndpoint::new("host-info", move |_inv: &Invocation<'_>| {
-        let runtime = if cfg!(target_family = "wasm") {
-            "browser · wasm32".to_string()
-        } else {
-            format!(
-                "native · {}/{}",
-                std::env::consts::OS,
-                std::env::consts::ARCH
-            )
-        };
+        let runtime = format!(
+            "native · {}/{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
         let body = format!(
             "ikigai host\n  nature    {nature}\n  runtime   {runtime}\n  \
              space     ikigai-fn (toUpper · reverseList · wrap · split · greet · echo · compose)\n"
@@ -4778,8 +4774,9 @@ fn root_members(nature: &'static str) -> Vec<Arc<dyn Space>> {
         // JSON-LD operators (urn:jsonld:expand/compact/flatten) — linked natively (the heavy
         // json-ld tree is a browser-wasm concern, lazy-loaded there; native links it).
         Arc::new(ikigai_jsonld::space()) as Arc<dyn Space>,
-        // SHACL validation (urn:shacl:validate) — rudof's validator, native-only (wasm-gated
-        // upstream); the browser serves the same resource via shacl-engine (JS).
+        // SHACL validation (urn:shacl:validate) — rudof's validator, linked natively here.
+        // The browser uses ikigai-shacl's lazy-loaded wasm module by default, or
+        // shacl-engine (JS) behind `?shacl=js`.
         Arc::new(ikigai_shacl::space()) as Arc<dyn Space>,
         // Plans as resources (ledger #956): `urn:plan:eval` runs an ik:Process graph with
         // every step a sub-request under the CALLER's capability, `urn:plan:validate` applies
