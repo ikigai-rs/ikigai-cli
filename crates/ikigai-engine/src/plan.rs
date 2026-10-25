@@ -8,7 +8,7 @@
 //! * [`Engine::build_plan`] parses a spec and resolves it into a [`Plan`];
 //!   [`Plan::to_turtle`] renders that as a graph — the `plan <spec>` command.
 //! * [`Plan::from_turtle`] reads such a graph back and [`execute`] runs it — the
-//!   `run <spec>` command, which resolves a resource and executes what it holds, AND
+//!   `execute <spec>` command, which resolves a resource and executes what it holds, AND
 //!   `urn:plan:eval` (see `plan_space`), which runs the plan it is handed. **One runner**:
 //!   both call [`execute`], each through its own [`PlanHost`] — the REPL's session
 //!   ([`Engine`]) or the invocation that is serving the resource.
@@ -1749,7 +1749,7 @@ impl Engine {
         Ok(plan.to_turtle(Some(spec.trim())))
     }
 
-    /// `run <spec>` — resolve `<spec>` (the full `source` grammar) and execute the
+    /// `execute <spec>` — resolve `<spec>` (the full `source` grammar) and execute the
     /// `ik:Process` graph it returns. `sink` stores a plan; this runs a stored one, through
     /// the same runner `urn:plan:eval` uses. Parameters take their defaults: the text face
     /// has no spelling for supplying one yet.
@@ -1757,7 +1757,8 @@ impl Engine {
     pub(crate) async fn run_stored_plan(&self, spec: &str) -> Result<String, String> {
         if spec.trim().is_empty() {
             return Err(
-                "usage: run <spec> — resolve a resource and run the plan it holds".to_string(),
+                "usage: execute <spec> — resolve a resource and execute the plan it holds"
+                    .to_string(),
             );
         }
         let turtle = self.run_pipeline(spec).await?;
@@ -1770,11 +1771,11 @@ impl Engine {
 
     /// Without the reader there is no Turtle parser in this build, so say which feature is
     /// missing rather than pretending the command does not exist — a wasm host still
-    /// RENDERS plans, and a `run` that answers "unknown command" would read like a bug.
+    /// RENDERS plans, and an `execute` that answers "unknown command" would read like a bug.
     #[cfg(not(feature = "plan-reader"))]
     pub(crate) async fn run_stored_plan(&self, _spec: &str) -> Result<String, String> {
         Err(
-            "`run` needs the `plan-reader` feature of ikigai-engine — this build renders \
+            "`execute` needs the `plan-reader` feature of ikigai-engine — this build renders \
              plans (`plan <spec>`) but cannot read one back"
                 .to_string(),
         )

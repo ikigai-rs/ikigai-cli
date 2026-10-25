@@ -1,27 +1,31 @@
 # A pipeline is a resource: the engine's plan face
 
 The REPL grammar is a *text* face over a plan — a DAG of requests. `plan` renders that
-plan as a graph in the published process vocabulary, and `run` executes one that was
+plan as a graph in the published process vocabulary, and `execute` executes one that was
 stored. The point is not a new way to type a pipeline: it is that a workflow which is a
 **graph** is a file you can diff, sign, review in a pull request, and **refuse before it
 runs**. A shell pipeline can be none of those.
 
 ```
 plan <spec>     render a pipeline as an ik:Process graph (Turtle) instead of running it
-run  <spec>     resolve <spec> — the full `source` grammar — and RUN the graph it returns
+execute <spec>  resolve <spec> — the full `source` grammar — and EXECUTE the graph it returns
 ```
+
+`execute` was called `run` until ledger #104, when it was renamed because `urn:lisp:run`
+already names running a signed program. `run` still works for one release, and its answer ends
+with a line saying it is now `execute`.
 
 `<spec>` is what you would type after `source`, so `plan` and `source` take the same input
 and answer two different questions about it.
 
 ```sh
-# render, store, run — the whole loop
+# render, store, execute — the whole loop
 ikigai -c 'plan urn:iki:fn:toUpper hello | urn:iki:fn:toUpper' > ~/.ikigai/workspace/shout.ttl
-ikigai -c 'run urn:file:shout.ttl'
+ikigai -c 'execute urn:file:shout.ttl'
 ```
 
 From inside the REPL, `sink urn:file:shout.ttl content="…"` stores one (that spelling works
-as of #328; before it, a named `content=` was silently discarded). `run` takes a whole
+as of #328; before it, a named `content=` was silently discarded). `execute` takes a whole
 source pipeline, so a plan can come from anywhere the kernel can reach — a file, the store,
 a peer.
 
@@ -103,8 +107,8 @@ parser, which pulls `oxrdf` → `rand` → `getrandom`, and **getrandom does not
 wasm32-unknown-unknown** without a rustflag only the final consumer can set. So:
 
 * **`plan` costs nothing** and is always available.
-* **`run` is behind `ikigai-engine/plan-reader`**, off by default, enabled by `ikigai-cli`.
-  A build without it answers `run` by naming the missing feature rather than acting as if
+* **`execute` is behind `ikigai-engine/plan-reader`**, off by default, enabled by `ikigai-cli`.
+  A build without it answers `execute` by naming the missing feature rather than acting as if
   the command does not exist.
 
 The claim that this crate builds for wasm was a comment and nothing checked it; `ci.yml`

@@ -133,7 +133,8 @@ commands:
                              corridor `urn:ctx:time:<instant>` pins every clock it reaches
                              (also on `trace` and `cache`; in-process kernel only)
   plan <spec>                render a pipeline as an ik:Process graph (Turtle) instead of running it
-  run <spec>                 resolve <spec> and RUN the ik:Process graph it returns
+  execute <spec>             resolve <spec> and EXECUTE the ik:Process graph it returns
+                             (`run`, its old name, still works this release and says so)
   sink <iri> [k=v …] <content>  SINK into a resource: leading k=v name declared args, the rest is content
   source a | sink <iri> [k=v …]  pipeline write-terminal: store the piped value as the sink's content
   delete <iri> [k=v …]       DELETE a resource (the delete verb)
@@ -968,7 +969,10 @@ impl Engine {
             ":load" => output(self, self.run_load(rest).await),
             "source" | "src" => output(self, self.run_source_command(rest).await),
             "plan" => output(self, self.run_plan(rest).await),
-            "run" => output(self, self.run_stored_plan(rest).await),
+            "execute" => output(self, self.run_stored_plan(rest).await),
+            // `run` was this command's name until ledger #104 (it collided with `urn:lisp:run`,
+            // which runs a signed program). It still runs the plan for one release, and says so.
+            "run" => output(self, renamed_to_execute(self.run_stored_plan(rest).await)),
             "sink" => output(self, self.run_sink(rest).await),
             "delete" | "del" => output(self, self.run_delete(rest).await),
             "exists" => output(self, self.run_exists(rest).await),
@@ -994,7 +998,7 @@ impl Engine {
         not(feature = "plan-reader"),
         allow(
             dead_code,
-            reason = "read only by `run <spec>` in plan.rs, which is the plan-reader feature's; \
+            reason = "read only by `execute <spec>` in plan.rs, which is the plan-reader feature's; \
                       the `source` command reads `run_pipeline_staged`"
         )
     )]
@@ -3396,6 +3400,17 @@ fn unquote_whole(remainder: &str) -> Option<String> {
     let quoted = remainder.strip_prefix('"')?;
     let (value, after) = scan_quoted(quoted)?;
     (after == quoted.len()).then_some(value)
+}
+
+/// What the `run` alias says after its answer, success or refusal: the command is `execute`
+/// now (ledger #104), and the alias is kept for one release only.
+const RUN_RENAMED: &str = "note: `run` is now `execute` (ledger #104); `run` still works in this \
+                           release and is removed in the next";
+
+/// The answer of `run`, the alias, with [`RUN_RENAMED`] as its last line.
+fn renamed_to_execute(result: Result<String, String>) -> Result<String, String> {
+    let note = |s: String| format!("{}\n{RUN_RENAMED}", s.trim_end_matches('\n'));
+    result.map(note).map_err(note)
 }
 
 fn split_first_word(s: &str) -> (&str, &str) {
