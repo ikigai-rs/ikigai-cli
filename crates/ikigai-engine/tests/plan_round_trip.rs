@@ -79,7 +79,7 @@ fn fixture() -> (Engine, Log, Arc<Mutex<String>>) {
     let stored: Arc<Mutex<String>> = Arc::default();
 
     // The stored plan, resolved through the kernel like any resource — this is what
-    // `run <spec>` reads. It does NOT record, so the transcript holds only plan steps.
+    // `execute <spec>` reads. It does NOT record, so the transcript holds only plan steps.
     let plan_resource = {
         let stored = Arc::clone(&stored);
         FnEndpoint::new("plan-store", move |_: &Invocation<'_>| {
@@ -191,7 +191,7 @@ fn round_trip(spec: &str) -> String {
     conforms(&turtle, spec);
 
     *stored.lock().expect("stored") = turtle.clone();
-    let replayed = output(engine.eval("run urn:t:plan"))
+    let replayed = output(engine.eval("execute urn:t:plan"))
         .unwrap_or_else(|e| panic!("running the stored plan for `{spec}`: {e}\n{turtle}"));
 
     assert_eq!(
@@ -353,7 +353,7 @@ fn a_plan_carrying_named_results_runs_them_rather_than_dropping_them() {
     ik:ref <urn:plan:named:var:greeting> .
 "#
     .to_string();
-    let answer = output(engine.eval("run urn:t:plan")).expect("runs");
+    let answer = output(engine.eval("execute urn:t:plan")).expect("runs");
     assert_eq!(answer, "down(up(hi))");
     assert_eq!(
         drain(&log),
@@ -364,11 +364,36 @@ fn a_plan_carrying_named_results_runs_them_rather_than_dropping_them() {
     );
 }
 
+/// `run` was the command's name until ledger #104. For one release it still runs the plan,
+/// the same way `execute` does, and its answer ends by saying the command is `execute` now,
+/// whether the plan ran or was refused.
+#[test]
+fn run_still_executes_a_stored_plan_and_says_it_is_renamed() {
+    let (engine, _, stored) = fixture();
+    let spec = "urn:t:up hi | urn:t:down";
+    *stored.lock().expect("stored") =
+        output(engine.eval(&format!("plan {spec}"))).expect("renders");
+    let executed = output(engine.eval("execute urn:t:plan")).expect("execute runs");
+    let ran = output(engine.eval("run urn:t:plan")).expect("run still runs");
+    let note = "note: `run` is now `execute` (ledger #104); `run` still works in this release \
+                and is removed in the next";
+    assert_eq!(ran, format!("{executed}\n{note}"));
+    assert!(
+        !executed.contains("note:"),
+        "`execute` adds nothing: {executed}"
+    );
+
+    *stored.lock().expect("stored") = "<urn:a> <urn:b> \"not a plan\" .\n".to_string();
+    let refused = output(engine.eval("run urn:t:plan")).unwrap_err();
+    assert!(refused.contains("not a plan"), "{refused}");
+    assert!(refused.ends_with(note), "{refused}");
+}
+
 #[test]
 fn a_graph_that_is_not_a_plan_says_so() {
     let (engine, _, stored) = fixture();
     *stored.lock().expect("stored") = "<urn:a> <urn:b> \"not a plan\" .\n".to_string();
-    let err = output(engine.eval("run urn:t:plan")).unwrap_err();
+    let err = output(engine.eval("execute urn:t:plan")).unwrap_err();
     assert!(err.contains("not a plan"), "{err}");
 }
 
@@ -386,7 +411,7 @@ fn a_cycle_in_a_stored_plan_is_refused_rather_than_run() {
     ik:verb "Source" ; ik:resolves <urn:t:down> ; ik:pipeFrom <urn:plan:cycle:step:1> .
 "#
     .to_string();
-    let err = output(engine.eval("run urn:t:plan")).unwrap_err();
+    let err = output(engine.eval("execute urn:t:plan")).unwrap_err();
     assert!(err.contains("DAG"), "{err}");
 }
 

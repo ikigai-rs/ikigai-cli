@@ -14,7 +14,7 @@
 //! The bar, from the brief (ledger #956):
 //!
 //! * each fixture runs through `urn:plan:eval` with the same result, and the same requests,
-//!   as the REPL's `run` — one runner, two hosts;
+//!   as the REPL's `execute` — one runner, two hosts;
 //! * validation refuses a malformed plan: two feeds (the shapes catch it) and a cycle
 //!   through an `ik:ref` (the shapes cannot; the reader does);
 //! * `urn:plan:requires` derives the right scopes, and a run under a narrower capability is
@@ -125,7 +125,7 @@ fn world() -> World {
 
     let held = Arc::clone(&plan);
     let mut space = EndpointSpace::new()
-        // The stored plan — what `run urn:t:plan` reads. Not recorded: the transcript
+        // The stored plan — what `execute urn:t:plan` reads. Not recorded: the transcript
         // holds only what the PLAN asked for.
         .bind(
             Exact::new("urn:t:plan"),
@@ -303,11 +303,11 @@ impl World {
         std::mem::take(&mut *self.log.lock().expect("log"))
     }
 
-    /// The REPL's `run` over the plan stored at `urn:t:plan`, under `capability`.
+    /// The REPL's `execute` over the plan stored at `urn:t:plan`, under `capability`.
     fn run(&self, plan: &str, capability: Capability) -> Result<String, String> {
         *self.plan.lock().expect("plan") = plan.to_string();
         let engine = Engine::with_identity(Arc::clone(&self.kernel), capability);
-        output(engine.eval("run urn:t:plan"))
+        output(engine.eval("execute urn:t:plan"))
     }
 
     /// `urn:plan:eval` as a SUB-REQUEST would issue it — what `ikigai-script` does.
@@ -360,7 +360,7 @@ fn every_fixture_runs_the_same_through_eval_as_through_run() {
         let repl = world();
         let by_run = repl
             .run(&plan, Capability::root())
-            .unwrap_or_else(|e| panic!("{name} through `run`: {e}"));
+            .unwrap_or_else(|e| panic!("{name} through `execute`: {e}"));
         let run_transcript = repl.drain();
         assert!(
             run_transcript.len() > 3,
@@ -374,12 +374,12 @@ fn every_fixture_runs_the_same_through_eval_as_through_run() {
         assert_eq!(
             run_transcript,
             resource.drain(),
-            "{name}: urn:plan:eval issued different requests than `run`"
+            "{name}: urn:plan:eval issued different requests than `execute`"
         );
         assert_eq!(
             by_run,
             String::from_utf8(by_eval.bytes).expect("text"),
-            "{name}: urn:plan:eval answered differently than `run`"
+            "{name}: urn:plan:eval answered differently than `execute`"
         );
     }
 }
@@ -713,11 +713,11 @@ fn a_narrower_capability_is_refused_exactly_where_requires_said() {
             "the refused step was never entered: {transcript:#?}"
         );
 
-        // The REPL's `run` is refused at the same step: one runner.
+        // The REPL's `execute` is refused at the same step: one runner.
         let repl = world();
         let err = repl
             .run(&plan, capability.clone())
-            .expect_err("run refused too");
+            .expect_err("execute refused too");
         assert!(err.contains(expected) || err.contains("urn:cap:"), "{err}");
         assert_eq!(transcript, repl.drain(), "both stop at the same step");
     }

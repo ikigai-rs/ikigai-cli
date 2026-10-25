@@ -32,7 +32,7 @@ use super::{parse_spec, parse_target, take_as_of, Engine, Node, Pipeline};
 pub const COMMANDS: &[&str] = &[
     "source",
     "plan",
-    "run",
+    "execute",
     "sink",
     "delete",
     "exists",
