@@ -18,9 +18,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use futures::executor::block_on;
 use ikigai_core::{
-    ArgRef, Bindings, Capability, Description, Endpoint, Error, Expiry, Grammar, Invocation, Iri,
-    IssueContext, Kernel, Limit, Provenance, Representation, Request, Resolution, Resolved, Scope,
-    Space, SpaceEntry, TraceEvent, Tracer, UriTemplate, Verb,
+    ArgRef, Bindings, Capability, Clock, Description, Endpoint, Error, Expiry, Grammar, Invocation,
+    Iri, IssueContext, Kernel, Limit, Provenance, Representation, Request, Resolution, Resolved,
+    Scope, Space, SpaceEntry, Time, TraceEvent, Tracer, UriTemplate, Verb,
 };
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +39,11 @@ pub use home::{expand_home, expand_home_str};
 // request removes it and stamps its own, here for the same reason as the two above.
 mod principal;
 pub use principal::{stamp_principal, without_principals, PRINCIPAL_ARG};
+
+// The default clock a mount's bookkeeping reads (ledger #2194): native only, because
+// platform time is a runtime panic on wasm32-unknown-unknown. See `default_clock`.
+#[cfg(not(target_arch = "wasm32"))]
+mod native_clock;
 
 /// How a resolution was served by the representation cache.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -254,6 +259,8 @@ pub struct RemoteSpace {
     resolver: Arc<dyn Resolver>,
     names: RemoteNames,
     contracts: Arc<ContractMemo>,
+    /// What the contract memo measures its TTL on. See [`default_clock`].
+    clock: Option<Arc<dyn Clock>>,
 }
 
 impl RemoteSpace {
@@ -263,7 +270,17 @@ impl RemoteSpace {
             resolver,
             names: RemoteNames::new(),
             contracts: Arc::new(ContractMemo::new(CONTRACT_TTL)),
+            clock: default_clock(),
         }
+    }
+
+    /// Measure the contract TTL on `clock` (builder): give it the clock the host gave its
+    /// kernel. On a native target the default is a monotonic clock; on wasm32 there is none
+    /// (reading platform time there panics), so without this a browser host's space keeps
+    /// no contract memo and asks the peer on every describe (ledger #2194).
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = Some(clock);
+        self
     }
 
     /// How long this space trusts a contract it read from the peer (builder; default
@@ -298,6 +315,7 @@ impl Space for RemoteSpace {
             request: request.clone(),
             contract: None,
             contracts: Arc::clone(&self.contracts),
+            clock: self.clock.clone(),
         }
         .resolution(request)
     }
@@ -342,6 +360,9 @@ struct ForwardingEndpoint {
     /// The mount's memo of contracts its peer declared, shared by every endpoint the mount
     /// hands out, so a hot read does not forward a `Meta` per read. See [`ContractMemo`].
     contracts: Arc<ContractMemo>,
+    /// The mount's clock, which `health` and `contracts` are measured on. See
+    /// [`default_clock`].
+    clock: Option<Arc<dyn Clock>>,
 }
 
 /// What forwarding a `Meta` to the peer said about a mounted name.
@@ -363,6 +384,11 @@ enum Lookup {
 }
 
 impl ForwardingEndpoint {
+    /// What the mount's clock reads, if it has one.
+    fn now(&self) -> Option<Time> {
+        self.clock.as_ref().map(|clock| clock.now())
+    }
+
     /// The resolution a mount reports for `request` (the request as it ARRIVED, under the
     /// local name), with this endpoint as the hit.
     ///
@@ -385,14 +411,17 @@ impl ForwardingEndpoint {
     /// to be silent is not asked here either — [`DescribeHealth`] — and describes as
     /// [`unavailable`] exactly as before.
     fn resolution(mut self, request: &Request) -> Resolution {
-        let silent = self.health.as_ref().is_some_and(|h| h.failing().is_some());
+        let silent = self
+            .health
+            .as_ref()
+            .is_some_and(|h| h.failing(self.now()).is_some());
         if request.verb == Verb::Meta && !silent {
             // ★ A `Meta` is the "describe it NOW" operation, so it never takes the memo's
             // word for it — it refreshes the memo instead (see `ContractMemo`).
             let target = self.request.target.as_str().to_string();
             match self.lookup() {
                 Ok(description) => {
-                    self.contracts.put(&target, &description);
+                    self.contracts.put(&target, &description, self.now());
                     self.contract = Some(Contract::Read(Box::new(description)))
                 }
                 Err(Lookup::Unbound) => {
@@ -440,7 +469,7 @@ impl ForwardingEndpoint {
                 // Silence here is the same silence an enumeration would meet, so it counts
                 // against the same health — one row's timeout spares every later row.
                 if let Some(health) = &self.health {
-                    health.record(&error);
+                    health.record(&error, self.now());
                 }
                 Err(Lookup::Unavailable(format!(
                     "it refused the Meta request: {error}"
@@ -501,7 +530,8 @@ impl Endpoint for ForwardingEndpoint {
             Some(Contract::Read(description)) => return (**description).clone(),
             Some(Contract::Unavailable(reason)) => reason.clone(),
             None => {
-                if let Some(reason) = self.health.as_ref().and_then(|health| health.failing()) {
+                let now = self.now();
+                if let Some(reason) = self.health.as_ref().and_then(|health| health.failing(now)) {
                     return unavailable(
                         self.origin.as_deref(),
                         self.request.target.as_str(),
@@ -512,12 +542,12 @@ impl Endpoint for ForwardingEndpoint {
                 // resolution is a fresh endpoint core's floor memo has not seen: answer from
                 // the mount's own memo while it is fresh (ledger #1577).
                 let target = self.request.target.as_str();
-                if let Some(description) = self.contracts.get(target) {
+                if let Some(description) = self.contracts.get(target, now) {
                     return description;
                 }
                 match self.lookup() {
                     Ok(description) => {
-                        self.contracts.put(target, &description);
+                        self.contracts.put(target, &description, self.now());
                         return description;
                     }
                     // Asked off a `Meta` resolution — a floor or a routing read on a hit
@@ -654,8 +684,9 @@ const DESCRIBE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30
 /// a manifold read makes and one peer's silence should be learned once, not per row.
 #[derive(Default)]
 struct DescribeHealth {
-    /// `Some((when, why))` while the peer is considered undescribable.
-    failed: Mutex<Option<(std::time::Instant, String)>>,
+    /// `Some((when, why))` while the peer is considered undescribable, `when` read from the
+    /// clock of the mount that saw it go silent.
+    failed: Mutex<Option<(Time, String)>>,
 }
 
 /// One kernel's view of which of its PEERS can describe themselves — handed to every
@@ -691,14 +722,15 @@ impl PeerHealth {
 impl DescribeHealth {
     /// Why the peer is currently considered undescribable, if it is — clearing a record
     /// that has aged past [`DESCRIBE_COOLDOWN`] so the next call tries the peer again.
-    fn failing(&self) -> Option<String> {
+    /// With no clock (`now` is `None`) nothing is recorded, so nothing is failing.
+    fn failing(&self, now: Option<Time>) -> Option<String> {
         let mut failed = match self.failed.lock() {
             Ok(failed) => failed,
             // A poisoned lock must cost knowledge, never a describe: forget the record.
             Err(poisoned) => poisoned.into_inner(),
         };
         match &*failed {
-            Some((at, why)) if at.elapsed() < DESCRIBE_COOLDOWN => Some(why.clone()),
+            Some((at, why)) if within(*at, now, DESCRIBE_COOLDOWN) => Some(why.clone()),
             Some(_) => {
                 *failed = None;
                 None
@@ -712,19 +744,17 @@ impl DescribeHealth {
     /// the transport saying nothing came back; anything else — a `Denied`, an endpoint
     /// error, a contract that parsed badly — is the peer ANSWERING, and a peer that answers
     /// is not one to stop asking.
-    fn record(&self, error: &Error) {
+    ///
+    /// `now` is the mount's clock (see [`default_clock`]). With none — wasm32 with no clock
+    /// installed — a silence is not remembered and every describe asks the peer, which is
+    /// what a mount did before it kept this record; there is no cooldown to measure.
+    fn record(&self, error: &Error, now: Option<Time>) {
         if !matches!(error, Error::Timeout(_) | Error::Unavailable(_)) {
             return;
         }
-        // Native-and-wasm: `ikigai-resolve` builds for wasm, where `Instant::now` is
-        // provided by the browser shim the workspace already links. The kernel `Clock`
-        // is not in scope on this path — a mount's health is transport bookkeeping, not
-        // a resolution's notion of time — and this is a monotonic elapsed measure, which
-        // is what `Instant` is for. Bound to a `let` so the opt-out covers this call
-        // rather than widening over the whole method (an attribute on an assignment
-        // expression is not stable, E0658).
-        #[allow(clippy::disallowed_methods)]
-        let now = std::time::Instant::now();
+        let Some(now) = now else {
+            return;
+        };
         let mut failed = match self.failed.lock() {
             Ok(failed) => failed,
             Err(poisoned) => poisoned.into_inner(),
@@ -789,13 +819,32 @@ pub const CONTRACT_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 /// cliff. The same shape as core's floor memo bound, for the same reason (ledger #791).
 const CONTRACT_MEMO_BOUND: usize = 1024;
 
-/// A monotonic "now" for transport bookkeeping (see [`DescribeHealth::record`] for why it
-/// is `Instant` and not the kernel `Clock`). One function so the opt-out is stated once.
-fn monotonic_now() -> std::time::Instant {
-    // Native-and-wasm, as in `DescribeHealth::record`: the browser shim provides it.
-    #[allow(clippy::disallowed_methods)]
-    let now = std::time::Instant::now();
-    now
+/// The clock a mount's bookkeeping (its [`ContractMemo`] and its [`DescribeHealth`]) reads
+/// when its host installed none (ledger #2194): on a native target a monotonic one (the
+/// private `native_clock` module); on wasm32 none at all, because there is no platform time
+/// to read there without a host, and reading it anyway is a runtime panic. A mount with no
+/// clock keeps neither record — every describe asks the peer, the behavior before either
+/// existed — rather than guessing at time. A host installs one with
+/// [`MountedRemote::with_clock`] or [`RemoteSpace::with_clock`].
+fn default_clock() -> Option<Arc<dyn Clock>> {
+    #[cfg(not(target_arch = "wasm32"))]
+    let clock: Option<Arc<dyn Clock>> = Some(Arc::new(native_clock::Monotonic::new()));
+    #[cfg(target_arch = "wasm32")]
+    let clock: Option<Arc<dyn Clock>> = None;
+    clock
+}
+
+/// A duration in whole milliseconds, the resolution of a core [`Time`].
+fn millis(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Whether `now` is less than `window` after `at`. No clock reading is never within, and
+/// neither is a reading EARLIER than `at` (an injected wall clock that stepped back): both
+/// records then forget and ask the peer, which is the direction that cannot go stale.
+fn within(at: Time, now: Option<Time>, window: std::time::Duration) -> bool {
+    now.and_then(|now| now.as_millis().checked_sub(at.as_millis()))
+        .is_some_and(|elapsed| elapsed < millis(window))
 }
 
 /// The contracts a mount has read from its peer, per forwarded name, each trusted for
@@ -811,7 +860,7 @@ fn monotonic_now() -> std::time::Instant {
 /// on [`CONTRACT_TTL`].
 struct ContractMemo {
     ttl: std::time::Duration,
-    entries: Mutex<HashMap<String, (std::time::Instant, Description)>>,
+    entries: Mutex<HashMap<String, (Time, Description)>>,
 }
 
 impl ContractMemo {
@@ -822,20 +871,19 @@ impl ContractMemo {
         }
     }
 
-    fn lock(
-        &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<String, (std::time::Instant, Description)>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (Time, Description)>> {
         // A poisoned lock must cost knowledge, never a describe: keep using the map.
         self.entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// The contract read for `target` less than the TTL ago, if there is one.
-    fn get(&self, target: &str) -> Option<Description> {
+    /// The contract read for `target` less than the TTL ago by the mount's clock `now`, if
+    /// there is one.
+    fn get(&self, target: &str, now: Option<Time>) -> Option<Description> {
         let mut entries = self.lock();
         match entries.get(target) {
-            Some((at, description)) if at.elapsed() < self.ttl => Some(description.clone()),
+            Some((at, description)) if within(*at, now, self.ttl) => Some(description.clone()),
             Some(_) => {
                 entries.remove(target);
                 None
@@ -844,16 +892,21 @@ impl ContractMemo {
         }
     }
 
-    /// Remember the contract the peer just declared for `target`.
-    fn put(&self, target: &str, description: &Description) {
+    /// Remember the contract the peer just declared for `target`, read at `now` by the
+    /// mount's clock. With no clock (wasm32 with none installed, see [`default_clock`])
+    /// nothing is remembered: there is no TTL to measure, so every describe asks the peer,
+    /// as a zero TTL does.
+    fn put(&self, target: &str, description: &Description, now: Option<Time>) {
         if self.ttl.is_zero() {
             return;
         }
-        let now = monotonic_now();
+        let Some(now) = now else {
+            return;
+        };
         let mut entries = self.lock();
         if entries.len() >= CONTRACT_MEMO_BOUND && !entries.contains_key(target) {
             let ttl = self.ttl;
-            entries.retain(|_, (at, _)| at.elapsed() < ttl);
+            entries.retain(|_, (at, _)| within(*at, Some(now), ttl));
             let mut excess = entries
                 .len()
                 .saturating_sub(CONTRACT_MEMO_BOUND - CONTRACT_MEMO_BOUND / 4);
@@ -997,6 +1050,8 @@ pub struct MountedRemote {
     /// The contracts this mount has read from its peer, shared with every
     /// [`ForwardingEndpoint`] it hands out. See [`ContractMemo`].
     contracts: Arc<ContractMemo>,
+    /// What `health` and `contracts` are measured on. See [`default_clock`].
+    clock: Option<Arc<dyn Clock>>,
 }
 
 /// How a mount relates the local namespace to the remote one.
@@ -1031,6 +1086,7 @@ impl MountedRemote {
             names: RemoteNames::new(),
             health: Arc::new(DescribeHealth::default()),
             contracts: Arc::new(ContractMemo::new(CONTRACT_TTL)),
+            clock: default_clock(),
         }
     }
 
@@ -1050,6 +1106,7 @@ impl MountedRemote {
             names: RemoteNames::new(),
             health: Arc::new(DescribeHealth::default()),
             contracts: Arc::new(ContractMemo::new(CONTRACT_TTL)),
+            clock: default_clock(),
         }
     }
 
@@ -1071,6 +1128,24 @@ impl MountedRemote {
     pub fn contract_ttl(mut self, ttl: std::time::Duration) -> Self {
         self.contracts = Arc::new(ContractMemo::new(ttl));
         self
+    }
+
+    /// Measure the contract TTL and the describe cooldown on `clock` (builder): give it the
+    /// clock the host gave its kernel. On a native target the default is a monotonic clock;
+    /// on wasm32 there is none (reading platform time there panics), so without this a
+    /// browser host's mount keeps no contract memo and no cooldown, and asks the peer on
+    /// every describe (ledger #2194).
+    ///
+    /// Call it at construction, like [`sharing`](Self::sharing): a record already made was
+    /// stamped by the clock it replaces.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
+    /// What this mount's clock reads, if it has one.
+    fn now(&self) -> Option<Time> {
+        self.clock.as_ref().map(|clock| clock.now())
     }
 
     /// The one row a mount contributes when its peer did not answer an enumeration:
@@ -1118,7 +1193,7 @@ impl Space for MountedRemote {
                 Arc::new(MountUnavailable {
                     prefix: self.prefix.clone(),
                     origin: self.origin.clone(),
-                    reason: self.health.failing(),
+                    reason: self.health.failing(self.now()),
                 }),
                 Bindings::new(),
             ));
@@ -1163,6 +1238,7 @@ impl Space for MountedRemote {
             request: forwarded,
             contract: None,
             contracts: Arc::clone(&self.contracts),
+            clock: self.clock.clone(),
         }
         .resolution(request)
     }
@@ -1170,7 +1246,7 @@ impl Space for MountedRemote {
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
         // A peer already known to be silent is not asked again for the cooldown — a
         // manifold read must cost ONE deadline per unhealthy mount, not one per attempt.
-        if let Some(reason) = self.health.failing() {
+        if let Some(reason) = self.health.failing(self.now()) {
             return Some(vec![self.unenumerated(&reason)]);
         }
         let entries = match self.resolver.try_entries() {
@@ -1188,7 +1264,7 @@ impl Space for MountedRemote {
             // silent peer read like an empty one; instead the mount contributes exactly
             // one row, which says whose resources are missing and why.
             Err(error) => {
-                self.health.record(&error);
+                self.health.record(&error, self.now());
                 return Some(vec![self.unenumerated(&error.to_string())]);
             }
         };
@@ -3024,11 +3100,194 @@ mod tests {
     fn the_contract_memo_is_bounded() {
         let memo = ContractMemo::new(std::time::Duration::from_secs(3600));
         let description = Description::new("doc").verb(Verb::Source);
+        let now = Some(Time::from_millis(1_000));
         for n in 0..CONTRACT_MEMO_BOUND * 3 {
-            memo.put(&format!("urn:file:{n}"), &description);
+            memo.put(&format!("urn:file:{n}"), &description, now);
             assert!(memo.lock().len() <= CONTRACT_MEMO_BOUND, "after {n} puts");
         }
         let last = format!("urn:file:{}", CONTRACT_MEMO_BOUND * 3 - 1);
-        assert!(memo.get(&last).is_some(), "the newest contract is held");
+        assert!(
+            memo.get(&last, now).is_some(),
+            "the newest contract is held"
+        );
+    }
+
+    // ---- ledger #2194: the mount's bookkeeping reads an injected clock ----
+
+    /// A clock the test moves by hand, the way a host's clock moves under a mount.
+    #[derive(Clone)]
+    struct Stepped(Arc<std::sync::atomic::AtomicU64>);
+
+    impl Stepped {
+        fn at(millis: u64) -> Self {
+            Stepped(Arc::new(std::sync::atomic::AtomicU64::new(millis)))
+        }
+
+        fn advance(&self, by: std::time::Duration) {
+            self.0
+                .fetch_add(millis(by), std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Clock for Stepped {
+        fn now(&self) -> Time {
+            Time::from_millis(self.0.load(std::sync::atomic::Ordering::SeqCst))
+        }
+    }
+
+    /// ★ Ledger #2194: the contract TTL is measured on the clock the mount was given, not
+    /// on platform time, so a browser host can supply one and a test needs no sleep.
+    #[test]
+    fn the_contract_ttl_is_measured_on_the_mount_clock() {
+        let (_space, peer) = swappable_peer(None);
+        let wire = Counted::over(&peer);
+        let clock = Stepped::at(1_000);
+        let local = Kernel::new(Arc::new(
+            MountedRemote::overriding(wire.clone(), "urn:peer:", "test://peer")
+                .with_clock(Arc::new(clock.clone())),
+        ));
+        read_as(&local, "urn:peer:doc", &Capability::root()).unwrap();
+        assert_eq!(wire.metas(), 1);
+
+        clock.advance(CONTRACT_TTL - std::time::Duration::from_millis(1));
+        read_as(&local, "urn:peer:doc", &Capability::root()).unwrap();
+        assert_eq!(
+            wire.metas(),
+            1,
+            "a millisecond inside the TTL, the memo answers"
+        );
+
+        clock.advance(std::time::Duration::from_millis(1));
+        read_as(&local, "urn:peer:doc", &Capability::root()).unwrap();
+        assert_eq!(
+            wire.metas(),
+            2,
+            "at the TTL by the mount's clock, the peer is asked"
+        );
+    }
+
+    /// ★ Ledger #2194: a mount with NO clock — what every mount is on wasm32 unless its host
+    /// installs one, because platform time panics there — keeps no memo and asks the peer
+    /// on every describe, as a zero TTL does, instead of reading time it does not have.
+    /// Before, `ContractMemo::put` read `Instant::now()` under the default TTL, and a
+    /// mounted read in a browser panicked with "time not implemented on this platform".
+    #[test]
+    fn a_mount_with_no_clock_keeps_no_memo_and_still_reads() {
+        let (_space, peer) = swappable_peer(None);
+        let wire = Counted::over(&peer);
+        let mut mount = MountedRemote::overriding(wire.clone(), "urn:peer:", "test://peer");
+        mount.clock = None;
+        let local = Kernel::new(Arc::new(mount));
+        const N: usize = 3;
+        for _ in 0..N {
+            assert_eq!(
+                read_as(&local, "urn:peer:doc", &Capability::root())
+                    .unwrap()
+                    .bytes,
+                b"doc"
+            );
+        }
+        assert_eq!(
+            wire.metas(),
+            N,
+            "no clock, no memo: every read asks the peer"
+        );
+
+        // The same for a bare `RemoteSpace`.
+        let wire = Counted::over(&peer);
+        let mut space = RemoteSpace::new(wire.clone());
+        space.clock = None;
+        let local = Kernel::new(Arc::new(space));
+        for _ in 0..N {
+            read_as(&local, "urn:peer:doc", &Capability::root()).unwrap();
+        }
+        assert_eq!(wire.metas(), N);
+    }
+
+    /// A peer that never answers: every call times out, as a silent transport's does.
+    struct Silent(std::sync::atomic::AtomicUsize);
+
+    impl Resolver for Silent {
+        fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), Error> {
+            self.issue_as(request, &Capability::root())
+        }
+
+        fn issue_as(
+            &self,
+            _request: Request,
+            _capability: &Capability,
+        ) -> Result<(Representation, CacheStatus), Error> {
+            Err(Error::Timeout("no answer".into()))
+        }
+
+        fn is_cached(&self, _request: &Request, _capability: &Capability) -> bool {
+            false
+        }
+
+        fn entries(&self) -> Option<Vec<SpaceEntry>> {
+            None
+        }
+
+        fn try_entries(&self) -> Result<Option<Vec<SpaceEntry>>, Error> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(Error::Timeout("no answer".into()))
+        }
+    }
+
+    /// ★ Ledger #2194: the describe cooldown is measured on the mount's clock too, and a
+    /// mount with none records no silence (there is no cooldown to measure) rather than
+    /// reading platform time — the `DescribeHealth::record` half of the wasm panic.
+    #[test]
+    fn the_describe_cooldown_is_measured_on_the_mount_clock() {
+        let asked = |silent: &Silent| silent.0.load(std::sync::atomic::Ordering::SeqCst);
+
+        let silent = Arc::new(Silent(Default::default()));
+        let clock = Stepped::at(1_000);
+        let mount = MountedRemote::new(silent.clone(), "urn:peer:", "test://cooldown")
+            .with_clock(Arc::new(clock.clone()));
+        mount
+            .entries()
+            .expect("a silent peer contributes its status row");
+        mount
+            .entries()
+            .expect("a silent peer contributes its status row");
+        assert_eq!(
+            asked(&silent),
+            1,
+            "inside the cooldown the peer is not asked again"
+        );
+        clock.advance(DESCRIBE_COOLDOWN);
+        mount
+            .entries()
+            .expect("a silent peer contributes its status row");
+        assert_eq!(
+            asked(&silent),
+            2,
+            "past the cooldown by the mount's clock it is"
+        );
+
+        let silent = Arc::new(Silent(Default::default()));
+        let mut mount = MountedRemote::new(silent.clone(), "urn:peer:", "test://cooldown");
+        mount.clock = None;
+        mount
+            .entries()
+            .expect("a silent peer contributes its status row");
+        mount
+            .entries()
+            .expect("a silent peer contributes its status row");
+        assert_eq!(asked(&silent), 2, "no clock, no cooldown: every walk asks");
+    }
+
+    /// A clock that reads EARLIER than a record (an injected wall clock that stepped back)
+    /// never keeps the record alive: both records forget and ask the peer.
+    #[test]
+    fn a_clock_that_steps_back_expires_rather_than_extends() {
+        let window = std::time::Duration::from_secs(5);
+        let at = Time::from_millis(10_000);
+        assert!(within(at, Some(Time::from_millis(10_000)), window));
+        assert!(within(at, Some(Time::from_millis(14_999)), window));
+        assert!(!within(at, Some(Time::from_millis(15_000)), window));
+        assert!(!within(at, Some(Time::from_millis(9_999)), window));
+        assert!(!within(at, None, window));
     }
 }
