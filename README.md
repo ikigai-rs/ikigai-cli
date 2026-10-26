@@ -687,6 +687,16 @@ The banner names the limits in force (`rate limits per client: …`).
 > spellings share one cache entry and one golden thread. New callers should write
 > `urn:iki:foaf`; the catalog advertises only that.
 
+**Outbound HTTP response bodies are bounded.** The native transport shared by the
+`urn:http:*`, LLM, and meeting endpoints reads at most 16 MiB of decoded body data
+per response by default. Set `http.max_response_bytes = "16777216"` in the host's
+`config.toml` to change the byte limit; nonnegative integers allow `_` separators,
+zero allows only empty bodies, and an absent or malformed value uses the default.
+The setting is read when the kernel's transports are built. A body exactly at the
+limit is returned in full; one byte over is refused as `OverBudget`, never returned
+as a truncated success. The limit applies to error and redirect bodies too, and to
+chunked and compressed responses. HEAD reads no body.
+
 ## Lisp, s-expressions, and signing
 
 The embedded host mounts a family of modules that make **code, queries, and graphs
