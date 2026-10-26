@@ -2007,8 +2007,24 @@ age = { version = "0.11.1", default-features = false }
 # third-party crate: its dependencies are ikigai-core, serde and serde_json, already here.
 # ⚠ `"0.1.0"` is `<0.2.0`: raise it when the module reaches 0.2.
 ikigai-bayes = "0.1.0"
+# The resolver seam, the engine and the intray, from github.com/ikigai-rs/ikigai-engine (ledger
+# #2316, #2317). They were members here through 0.1.69 and left at 0.1.70, whose sources are
+# the ones this workspace carried, so they are registry crates now and no longer move with
+# this workspace's lockstep release. `"0.1.70"` is the first release from their own repo and
+# the floor; it is `<0.2.0`, which core's 0.2.0 sweep (ledger #2356) lifts.
+# - ikigai-resolve: the `Resolver` seam and `naming_entry` (the most specific catalog row
+#   names a target; the engine's trace labels use it).
+# - ikigai-intray: the intray / tuplespace (urn:space:{name}: out/rd), a dir-backed space under
+#   file_root. The scheduling booking-inbox drops into it. `ikigai-layers` takes the same
+#   registry crate, so the graph holds one intray without a `[patch]`.
+# - ikigai-engine: `plan-reader` is the `execute <spec>` half of the plan face. It is off by
+#   default so the engine still compiles to wasm32, and both hosts here (ikigai-cli and
+#   ikigai-embedded) are native and want it.
+ikigai-resolve = "0.1.70"
+ikigai-intray = "0.1.70"
+ikigai-engine = { version = "0.1.70", features = ["plan-reader"] }
 # ── Intra-workspace siblings: LOCKSTEP pins, not floors ───────────────────────
-# The seventeen members that take `version.workspace = true` are released TOGETHER, at one
+# The fifteen members that take `version.workspace = true` are released TOGETHER, at one
 # version, always. So every sibling pin below states the CURRENT workspace version rather
 # than the oldest published sibling whose API is actually called.
 #
@@ -2027,11 +2043,12 @@ ikigai-bayes = "0.1.0"
 # named, which is what a reader needs when asking whether an older sibling would compile at
 # all. They no longer set the number.
 #
-# ⚠ Consequence for the release ritual: a lockstep bump now edits SEVENTEEN sibling pins
-# across three manifests (this one, crates/ikigai-cli, crates/ikigai-embedded) on top of
-# `workspace.package.version`. `crates/ikigai-cli/tests/lockstep_pins.rs` is what makes those
-# seventeen non-optional rather than remembered — the drift that produced this defect ran for
-# eight releases and the only thing that ever noticed was a comment.
+# ⚠ Consequence for the release ritual: a lockstep bump now edits SIXTEEN sibling pins
+# across four manifests (this one, crates/ikigai-cli, crates/ikigai-embedded,
+# crates/ikigai-p2p) on top of `workspace.package.version`.
+# `crates/ikigai-cli/tests/lockstep_pins.rs` is what makes those sixteen non-optional rather
+# than remembered — the drift that produced this defect ran for eight releases and the only
+# thing that ever noticed was a comment.
 #
 # `ikigai-time` is the ONE exception; its own note below says why.
 
@@ -2043,9 +2060,6 @@ ikigai-view = { path = "crates/ikigai-view", version = "0.1.69" }
 # Timezone conversion (urn:tz:convert, IANA/DST-correct) + a zoned clock (urn:tz:now).
 # Published since 0.1.14 (#296); keeps the tzdata dependency out of the lean modules.
 ikigai-tz = { path = "crates/ikigai-tz", version = "0.1.69" }
-# The intray / tuplespace (urn:space:{name}: out/rd). Published since 0.1.14 (#296);
-# a dir-backed space under file_root. The scheduling booking-inbox drops into it.
-ikigai-intray = { path = "crates/ikigai-intray", version = "0.1.69" }
 # Outbound email (urn:email:send): a cap-gated Sink submitting over SMTP to a local MTA
 # that relays onward. Published since 0.1.14 (#296); the contact service and the
 # scheduling confirm-link both need it.
@@ -2066,12 +2080,11 @@ ikigai-intake = { path = "crates/ikigai-intake", version = "0.1.69" }
 ikigai-passkey = { path = "crates/ikigai-passkey", version = "0.1.69" }
 # Sibling workspace crates pinned to the current release: a published crate requires
 # its siblings at this version too, so ANY subset of the workspace can publish in
-# dependency order (resolve → wire → engine → …) and a crate never builds against an
+# dependency order (wire → ipc → … → cli) and a crate never builds against an
 # older, incompatible sibling on crates.io. ⚠ That lockstep is a property of the TREE
 # — `crates/ikigai-cli/tests/lockstep_pins.rs` enforces it here — and says nothing
 # about the REGISTRY, which only matches the tree after a full wave. The two parted for
 # weeks without anything saying so (ledger #494); `registry-drift` is what says so now.
-ikigai-resolve = { path = "crates/ikigai-resolve", version = "0.1.69" } # naming_entry: the most specific catalog row names a target (the engine's trace labels use it)
 ikigai-wire = { path = "crates/ikigai-wire", version = "0.1.69" } # v6 hello + ErrorTyped/WireError
 # API history — 0.1.16 = `Spawner::width()`: the scheduler answers how many tasks make progress AT ONCE
 # (1 for `single`), which is what the engine's fan-out routing sizes itself by. Core
@@ -2081,10 +2094,10 @@ ikigai-wire = { path = "crates/ikigai-wire", version = "0.1.69" } # v6 hello + E
 # rejected while argv is read instead of by spawning a threadpool to find out.
 ikigai-scheduler = { path = "crates/ikigai-scheduler", version = "0.1.69" }
 # ⚠⚠ EXEMPT from the lockstep above — deliberately, and this pin must NOT be raised to the
-# workspace version. ikigai-time is the eighteenth member and the only one that does not take
+# workspace version. ikigai-time is the sixteenth member and the only one that does not take
 # `version.workspace = true`: it declares its own `version` in its own manifest and is
 # published on its own line, because the Clock change below was a BREAKING API change that
-# earned a major bump the other seventeen had no reason to take (and 0.3.0 and 0.4.0 took
+# earned a major bump the other fifteen had no reason to take (and 0.3.0 and 0.4.0 took
 # two more). That line's version is therefore its current release; `0.1.17` would name a version of ikigai-time that does not exist on
 # crates.io and never will. That one, unlike a stale floor, is loud: cargo checks a path
 # dependency's declared version against the requirement, so `0.1.17` here stops the whole
@@ -2155,30 +2168,3 @@ ureq = "2"
 # ikigai-programs does (ikigai-programs PR #40).
 [profile.dev.package.steel-core]
 opt-level = 3
-
-# ── One ikigai-intray in the graph ────────────────────────────────────────────
-# `ikigai-layers` (a registry crate) depends on `ikigai-intray` FROM CRATES.IO, and intray is
-# a member of THIS workspace. Cargo treats a path package and a registry package as two
-# packages even at one version, so without this the workspace compiled TWO intrays (and,
-# through the registry one, two `ikigai-resolve`s): the host's served spaces on the in-tree
-# code and every tuplespace layer on the published code, a combination no release ships.
-# (`cargo tree -d` showed both; ledger #1188.)
-#
-# This is NOT a local path override in constitution rule 3's sense: it names a directory in
-# THIS repository, which exists on CI and in every clone, never a sibling checkout. And it
-# changes nothing a published build compiles: cargo ignores `[patch]` outside the root
-# workspace, so `cargo install ikigai-cli` resolves intray from crates.io for both edges, and
-# the lockstep release publishes intray at the same version as everything else here. In tree
-# it makes the build the one that ships: one intray, the workspace's.
-# ⚠ It holds only while the workspace's intray satisfies what `ikigai-layers` asks for
-# (`"0.1.47"`, `>=0.1.47, <0.2.0`). A layers release that needs a NEWER intray than this
-# workspace carries is a release-order problem, not something to patch around.
-# ⚠ A LOCKSTEP BUMP UNLOCKS INTRAY'S WHOLE SUBTREE through this patch (found preparing 0.1.51):
-# `cargo update --workspace` and even a plain `cargo metadata` after the version edit re-chose
-# edges under intray → store → oxigraph, and landed spareval on md-5 0.10 + sha2 0.10 beside
-# sha1 0.11: the mixed-digest graph field guide 9f describes (E0277 in spareval; that lock
-# was discarded, not compiled). Move ONLY the members'
-# `version` lines in Cargo.lock, confirm with `cargo metadata --locked`, and read `lock-diff`:
-# a bump's edges should be the members and nothing else.
-[patch.crates-io]
-ikigai-intray = { path = "crates/ikigai-intray" }

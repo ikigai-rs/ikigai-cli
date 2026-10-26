@@ -34,7 +34,8 @@ It chooses a transport by how it attaches; `serve` runs a kernel server and
 `ipc`. None of the three builds for WebAssembly: `ikigai-embedded` pulls `socket2`
 through `mdns-sd` and `lettre`, which has no wasm32 target. The wasm face is
 [ikigai-engine](https://crates.io/crates/ikigai-engine) on its own (ikigai-web-demo runs
-a kernel in a browser through it), and CI's `wasm-lib` job checks exactly that crate.
+a kernel in a browser through it), and its own repo,
+[ikigai-rs/ikigai-engine](https://github.com/ikigai-rs/ikigai-engine), checks that in CI.
 
 ## Architecture
 

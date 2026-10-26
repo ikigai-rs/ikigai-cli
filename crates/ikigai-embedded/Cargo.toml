@@ -31,7 +31,7 @@ store = ["dep:ikigai-store", "dep:ikigai-ledger"]
 [dependencies]
 # `declare` = `Topology::from_turtle`: this host reads a declared arrangement for its local root
 # (`--arrangement`, `arrangement = …`; ledger #637). Enabled HERE only, in the native host crate
-# that reads one — a wasm face (`ikigai-engine`'s wasm job) never selects this crate, so it never
+# that reads one — a wasm face (ikigai-engine, checked for wasm32 in its own repo's CI) never selects this crate, so it never
 # pulls the parser; one that did would need `--cfg getrandom_backend="wasm_js"` (see core's manifest).
 ikigai-core = { workspace = true, features = ["declare"] }
 # `clock_gettime` on the two clock pairs that measure machine sleep (see `HostSleepClock`).
@@ -59,9 +59,10 @@ ikigai-throttle = { workspace = true }
 ikigai-discovery = { path = "../ikigai-discovery", version = "0.1.69" }
 # The plan resources — `urn:plan:eval`, `urn:plan:validate`, `urn:plan:requires` — live beside
 # the runner they share with the REPL's `run` (ledger #956). `plan-reader` is the feature that
-# can read a plan graph back; this native host has no wasm constraint keeping it off. A path
-# sibling, so the version is the LOCKSTEP version (see `lockstep_pins.rs`).
-ikigai-engine = { path = "../ikigai-engine", version = "0.1.69", features = ["plan-reader"] }
+# can read a plan graph back; this native host has no wasm constraint keeping it off, and the
+# workspace entry turns it on. A registry crate since 0.1.70, from
+# github.com/ikigai-rs/ikigai-engine.
+ikigai-engine = { workspace = true }
 ikigai-fs = { workspace = true }
 ikigai-http = { workspace = true }
 ikigai-runbook = { workspace = true }
