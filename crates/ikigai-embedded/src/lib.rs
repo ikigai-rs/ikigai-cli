@@ -2255,7 +2255,28 @@ fn served_spaces(nature: &'static str, surface: ServedSurface) -> Vec<Arc<dyn Sp
 /// The native HTTP transport backing the `urn:http*` endpoints: a blocking `ureq`
 /// client. Runtime-free, so it runs under the CLI's `futures::block_on` without
 /// pulling in Tokio — the executor stays chosen at the edge.
-struct UreqTransport;
+struct UreqTransport {
+    max_response_bytes: usize,
+}
+
+const DEFAULT_HTTP_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+impl Default for UreqTransport {
+    fn default() -> Self {
+        Self {
+            max_response_bytes: http_response_budget(
+                config::get("http.max_response_bytes").as_deref(),
+            ),
+        }
+    }
+}
+
+// A malformed setting keeps the finite default; zero permits only an empty body.
+fn http_response_budget(setting: Option<&str>) -> usize {
+    setting
+        .and_then(|value| value.replace('_', "").parse().ok())
+        .unwrap_or(DEFAULT_HTTP_MAX_RESPONSE_BYTES)
+}
 
 /// What one HTTP exchange brings back: the status, the headers and the body.
 type Exchanged = (u16, Vec<(String, String)>, Vec<u8>);
@@ -2266,12 +2287,12 @@ impl UreqTransport {
     /// caller; it carries these into the structs ikigai-http, ikigai-llm and ikigai-meeting
     /// share.
     fn exchange(
+        &self,
         method: &str,
         url: &str,
         headers: &[(String, String)],
         body: &[u8],
-    ) -> std::result::Result<Exchanged, String> {
-        use std::io::Read;
+    ) -> Result<Exchanged> {
         // The HttpTransport contract (ikigai-http ≥ 0.1.7) forbids following
         // redirects here: the ENDPOINT follows them, re-running the net-capability
         // ACL against every hop — an auto-following agent would let a granted
@@ -2291,7 +2312,10 @@ impl UreqTransport {
         let resp = match outcome {
             Ok(resp) => resp,
             Err(ureq::Error::Status(_, resp)) => resp,
-            Err(e) => return Err(e.to_string()),
+            Err(e) => {
+                let detail = e.to_string();
+                return Err(ikigai_http::status::transport_error(&detail, url, &detail));
+            }
         };
         let status = resp.status();
         let response_headers = resp
@@ -2300,13 +2324,46 @@ impl UreqTransport {
             .filter_map(|name| resp.header(&name).map(|v| (name.clone(), v.to_string())))
             .collect();
         // A HEAD response carries headers only — no body to read.
-        let mut response_body = Vec::new();
-        if method != "HEAD" {
-            resp.into_reader()
-                .read_to_end(&mut response_body)
-                .map_err(|e| format!("reading response body: {e}"))?;
-        }
+        let response_body = if method == "HEAD" {
+            Vec::new()
+        } else {
+            read_http_body(resp.into_reader(), self.max_response_bytes).map_err(
+                |error| match error {
+                    Error::OverBudget { .. } => error,
+                    other => {
+                        let detail = other.to_string();
+                        ikigai_http::status::transport_error(&detail, url, &detail)
+                    }
+                },
+            )?
+        };
         Ok((status, response_headers, response_body))
+    }
+}
+
+/// Bound the decoded body, regardless of Content-Length or transfer encoding. Reading
+/// one extra byte distinguishes EOF at the bound from excess; excess is never returned
+/// as a successful, truncated representation. No allocation uses an origin's length.
+fn read_http_body(mut reader: impl std::io::Read, limit: usize) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut body = Vec::new();
+    reader
+        .by_ref()
+        .take(limit as u64)
+        .read_to_end(&mut body)
+        .map_err(|e| Error::Unavailable(format!("reading response body: {e}")))?;
+    let mut extra = [0];
+    loop {
+        match reader.read(&mut extra) {
+            Ok(0) => return Ok(body),
+            Ok(_) => {
+                return Err(Error::OverBudget {
+                    detail: format!("HTTP response body exceeds the {limit}-byte limit"),
+                })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(Error::Unavailable(format!("reading response body: {e}"))),
+        }
     }
 }
 
@@ -2316,12 +2373,30 @@ impl ikigai_http::HttpTransport for UreqTransport {
         &self,
         request: ikigai_http::HttpRequest,
     ) -> std::result::Result<ikigai_http::HttpResponse, String> {
-        let (status, headers, body) = Self::exchange(
+        let (status, headers, body) = match self.exchange(
             request.method.as_str(),
             &request.url,
             &request.headers,
             &request.body,
-        )?;
+        ) {
+            Ok(response) => response,
+            // HttpTransport 0.3 can only return String errors, which its callers classify
+            // as transient network faults. Carry a local budget refusal through their
+            // shared 413 -> OverBudget status table instead. Discard ALL origin headers
+            // and bytes (including redirects, cache directives and partial body data).
+            Err(Error::OverBudget { detail }) => (
+                413,
+                vec![
+                    ("content-type".into(), "text/plain; charset=utf-8".into()),
+                    (
+                        "x-ikigai-local-refusal".into(),
+                        "response-body-budget".into(),
+                    ),
+                ],
+                detail.into_bytes(),
+            ),
+            Err(error) => return Err(error.to_string()),
+        };
         Ok(ikigai_http::HttpResponse {
             status,
             headers,
@@ -2338,14 +2413,14 @@ impl ikigai_http::HttpTransport for UreqTransport {
 /// deprecated `urn:httpGet`…`urn:httpDelete` IRIs still resolve, to the same cache entry
 /// and golden thread as the new names, until ikigai-http 0.3 removes them.
 fn http_space() -> impl Space {
-    ikigai_http::space(Arc::new(UreqTransport))
+    ikigai_http::space(Arc::new(UreqTransport::default()))
 }
 
 /// The LLM module (`urn:llm:ask` + `urn:llm:<provider>:ask`) on the native ureq
 /// transport. Slice 0: an OpenAI-compatible backend defaulting to a local Ollama.
 /// (Mounted via a local path override until ikigai-llm is published.)
 fn llm_space() -> EndpointSpace {
-    ikigai_llm::space(Arc::new(UreqTransport), llm_registry())
+    ikigai_llm::space(Arc::new(UreqTransport::default()), llm_registry())
 }
 
 /// The meeting module (`urn:meeting:schedule` + `urn:meeting:zoom:schedule`) on the native ureq
@@ -2355,7 +2430,7 @@ fn llm_space() -> EndpointSpace {
 /// alongside the secret/sign/encrypt family.
 fn meeting_space() -> EndpointSpace {
     ikigai_meeting::space(
-        Arc::new(UreqTransport),
+        Arc::new(UreqTransport::default()),
         Arc::new(HostSecrets(ikigai_secret::default_backend())),
         ikigai_meeting::ZoomConfig::default(),
     )
@@ -11408,5 +11483,272 @@ mod contact_label_tests {
             read("urn:space:contact", &without),
             Err(Error::Denied(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod http_body_budget_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    fn response(body: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
+        raw_response(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            ),
+            body,
+        )
+    }
+
+    fn raw_response(headers: String, body: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            stream.write_all(headers.as_bytes()).unwrap();
+            // Refusing a body may close the connection before the server finishes writing.
+            let _ = stream.write_all(&body);
+        });
+        (url, server)
+    }
+
+    #[test]
+    fn native_http_refuses_a_body_over_the_default_budget() {
+        let (url, server) = response(vec![b'x'; 16 * 1024 * 1024 + 1]);
+        let result = UreqTransport {
+            max_response_bytes: DEFAULT_HTTP_MAX_RESPONSE_BYTES,
+        }
+        .exchange("GET", &url, &[], &[]);
+        server.join().unwrap();
+        assert!(
+            matches!(result, Err(Error::OverBudget { .. })),
+            "a response over the byte budget must be refused: {result:?}"
+        );
+    }
+
+    #[test]
+    fn native_http_reads_a_body_at_the_default_budget_in_full() {
+        let expected = vec![b'x'; DEFAULT_HTTP_MAX_RESPONSE_BYTES];
+        let (url, server) = response(expected.clone());
+        let (_, _, body) = UreqTransport {
+            max_response_bytes: DEFAULT_HTTP_MAX_RESPONSE_BYTES,
+        }
+        .exchange("GET", &url, &[], &[])
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn native_http_applies_configured_budget_to_every_body_framing() {
+        // Content-Length, chunked, and connection-close framing. The limit applies
+        // to body bytes, not HTTP chunks or the presence of a length header.
+        for framing in ["length", "chunked", "close"] {
+            for len in [4, 5] {
+                let expected = vec![b'x'; len];
+                let (headers, wire_body) = match framing {
+                    "length" => (format!("Content-Length: {len}\r\n"), expected.clone()),
+                    "chunked" => (
+                        "Transfer-Encoding: chunked\r\n".into(),
+                        format!("{len:x}\r\n{}\r\n0\r\n\r\n", "x".repeat(len)).into_bytes(),
+                    ),
+                    _ => (String::new(), expected.clone()),
+                };
+                let (url, server) = raw_response(
+                    format!("HTTP/1.1 200 OK\r\n{headers}Connection: close\r\n\r\n"),
+                    wire_body,
+                );
+                let result = UreqTransport {
+                    max_response_bytes: 4,
+                }
+                .exchange("GET", &url, &[], &[]);
+                server.join().unwrap();
+                if len == 4 {
+                    assert_eq!(result.unwrap().2, expected, "{framing}");
+                } else {
+                    assert!(
+                        matches!(result, Err(Error::OverBudget { .. })),
+                        "{framing}: {result:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_http_endpoint_returns_a_typed_budget_refusal() {
+        use ikigai_core::{ArgRef, Capability};
+        let (url, server) = response(b"abcde".to_vec());
+        let kernel = Kernel::new(Arc::new(ikigai_http::space(Arc::new(UreqTransport {
+            max_response_bytes: 4,
+        }))));
+        let request = Request::new(Verb::Source, Iri::parse("urn:http:get").unwrap())
+            .with_arg("url", ArgRef::Inline(url.into_bytes()));
+        let error =
+            futures::executor::block_on(kernel.issue(request, &Capability::root())).unwrap_err();
+        server.join().unwrap();
+        assert!(matches!(error, Error::OverBudget { .. }), "{error:?}");
+        assert!(!error.is_transient());
+    }
+
+    #[test]
+    fn a_local_refusal_discards_origin_headers_and_partial_body() {
+        use ikigai_http::HttpTransport;
+        for status in [200, 302, 500] {
+            let (url, server) = raw_response(format!(
+                "HTTP/1.1 {status} Test\r\nContent-Length: 5\r\nLocation: http://example.com/\r\nCache-Control: max-age=3600\r\nConnection: close\r\n\r\n"
+            ), b"abcde".to_vec());
+            let response = futures::executor::block_on(
+                UreqTransport {
+                    max_response_bytes: 4,
+                }
+                .send(ikigai_http::HttpRequest {
+                    method: ikigai_http::Method::Get,
+                    url,
+                    headers: vec![],
+                    body: vec![],
+                }),
+            )
+            .unwrap();
+            server.join().unwrap();
+            assert_eq!(response.status, 413);
+            assert_eq!(
+                response.header("x-ikigai-local-refusal"),
+                Some("response-body-budget")
+            );
+            assert!(response.header("location").is_none());
+            assert!(response.header("cache-control").is_none());
+            assert_eq!(
+                response.body,
+                b"HTTP response body exceeds the 4-byte limit"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_budget_accepts_only_empty_bodies_and_head_ignores_content_length() {
+        for len in [0, 1] {
+            let (url, server) = response(vec![b'x'; len]);
+            let result = UreqTransport {
+                max_response_bytes: 0,
+            }
+            .exchange("GET", &url, &[], &[]);
+            server.join().unwrap();
+            if len == 0 {
+                assert!(result.unwrap().2.is_empty());
+            } else {
+                assert!(matches!(result, Err(Error::OverBudget { .. })));
+            }
+        }
+        let (url, server) = raw_response(
+            "HTTP/1.1 200 OK\r\nContent-Length: 999999999\r\nConnection: close\r\n\r\n".into(),
+            vec![],
+        );
+        let result = UreqTransport {
+            max_response_bytes: 0,
+        }
+        .exchange("HEAD", &url, &[], &[]);
+        server.join().unwrap();
+        assert!(result.unwrap().2.is_empty());
+    }
+
+    #[test]
+    fn an_endless_reader_is_stopped_after_the_budget_and_one_probe_byte() {
+        let mut endless = std::io::repeat(b'x').take(1_000_000);
+        assert!(matches!(
+            read_http_body(&mut endless, 4),
+            Err(Error::OverBudget { .. })
+        ));
+        assert_eq!(endless.limit(), 1_000_000 - 5);
+    }
+
+    #[test]
+    fn body_budget_settings_keep_a_finite_default() {
+        assert_eq!(http_response_budget(None), DEFAULT_HTTP_MAX_RESPONSE_BYTES);
+        for bad in ["", "no", "-1", "18446744073709551616"] {
+            assert_eq!(
+                http_response_budget(Some(bad)),
+                DEFAULT_HTTP_MAX_RESPONSE_BYTES
+            );
+        }
+        assert_eq!(http_response_budget(Some("4")), 4);
+        assert_eq!(http_response_budget(Some("1_024")), 1024);
+        assert_eq!(http_response_budget(Some("0")), 0);
+    }
+
+    #[test]
+    fn native_http_budget_counts_decoded_gzip_bytes() {
+        // gzip("abcde"): the 25-byte wire body decodes to five bytes.
+        let gzip = vec![
+            31, 139, 8, 0, 0, 0, 0, 0, 2, 3, 75, 76, 74, 78, 73, 5, 0, 101, 216, 135, 133, 5, 0, 0,
+            0,
+        ];
+        for limit in [4, 5] {
+            let (url, server) = raw_response(format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Encoding: gzip\r\nConnection: close\r\n\r\n", gzip.len()), gzip.clone());
+            let result = UreqTransport {
+                max_response_bytes: limit,
+            }
+            .exchange("GET", &url, &[], &[]);
+            server.join().unwrap();
+            if limit == 5 {
+                assert_eq!(result.unwrap().2, b"abcde");
+            } else {
+                assert!(matches!(result, Err(Error::OverBudget { .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn the_probe_retries_interruptions_but_preserves_read_failures() {
+        struct ProbeReader {
+            first: bool,
+            failure: std::io::ErrorKind,
+        }
+        impl Read for ProbeReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if std::mem::take(&mut self.first) {
+                    Err(std::io::ErrorKind::Interrupted.into())
+                } else if self.failure == std::io::ErrorKind::Interrupted {
+                    buf[0] = b'x';
+                    Ok(1)
+                } else {
+                    Err(self.failure.into())
+                }
+            }
+        }
+        let error = read_http_body(
+            ProbeReader {
+                first: true,
+                failure: std::io::ErrorKind::Interrupted,
+            },
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::OverBudget { .. }));
+        for failure in [
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::ConnectionReset,
+        ] {
+            let error = read_http_body(
+                ProbeReader {
+                    first: true,
+                    failure,
+                },
+                0,
+            )
+            .unwrap_err();
+            assert!(matches!(error, Error::Unavailable(_)), "{error:?}");
+        }
     }
 }
