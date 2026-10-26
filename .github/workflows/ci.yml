@@ -12,31 +12,14 @@ jobs:
       features: "*"
       macos: true
       # `ikigai-engine` is documented as compiling to wasm32 — ikigai-web-demo runs the
-      # kernel in a browser — and until now nothing checked it. It does not hold for the
-      # whole workspace (quinn, tokio, the transports), so the job is scoped to the one
-      # member that claims it, under its DEFAULT features: the plan reader's Turtle stack
-      # pulls getrandom, which does not build for wasm32, and that is exactly why it is
-      # behind `plan-reader` rather than unconditional.
+      # kernel in a browser — and that check now runs in its own repo
+      # (github.com/ikigai-rs/ikigai-engine), with the crate. What stays here is the member the
+      # same demo takes from this workspace: `ikigai-time`, whose `urn:time:*` runs in the
+      # browser on a `Date.now()`-backed clock and whose wasm32 face is cfg-gated (no
+      # `ThreadTimer`, no `Instant`). It does not hold for the whole workspace (quinn, tokio,
+      # the transports), so the job is scoped to that one member.
       wasm-lib: true
-      wasm-packages: "ikigai-engine"
-  # The workspace's one rule for a request-derived name joined under a directory
-  # (`ikigai_resolve::is_plain_file_name`, ledger #1307) is the WINDOWS rule applied on every
-  # platform, and its premise (`Path::join("C:x")` REPLACES the base) only holds on Windows.
-  # This job is where that premise is observed rather than cited: the resolve crate's
-  # file-name tests, including the `cfg(windows)` one, on a Windows runner. Scoped to that
-  # one crate's lib tests on purpose: nothing else here is built on Windows yet (that is the
-  # Windows track), and ikigai-resolve needs only ikigai-core, so this stays cheap. The
-  # `home` filter adds the shared `~` rule's tests (ledger #1379), whose `~\x` case differs
-  # by platform.
-  # ⚠ Inline cargo beside the shared caller: ci-drift reads this repo as `caller+inline`.
-  windows-file-names:
-    name: file-name rule (Windows)
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked -p ikigai-resolve --lib -- file_name home
+      wasm-packages: "ikigai-time"
   # The native Windows PROBE (ledger #1162): what breaks when the whole workspace is built and
   # tested on Windows, and what the built binary does there. It REPORTS and does not gate:
   # every probe step carries `continue-on-error: true`, so a red step leaves the job (and the
@@ -47,7 +30,7 @@ jobs:
   # not pass.
   # The build takes the binary's install features (`quic,web`) and `--keep-going`, so one
   # failing crate does not hide the next one's errors; `--no-fail-fast` does the same for test.
-  # ⚠ Inline cargo beside the shared caller, like `windows-file-names` above.
+  # ⚠ Inline cargo beside the shared caller: ci-drift reads this repo as `caller+inline`.
   windows-probe:
     name: native build probe (Windows, non-gating)
     runs-on: windows-latest
