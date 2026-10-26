@@ -52,6 +52,13 @@
 //! - **server push**: with [`EdgeConfig::push`] set, one `GET` of the push path holds an
 //!   event stream open and tells the page when a golden thread its reads rest on is cut —
 //!   see [`push`].
+//! - **the connection is hyper's** (ledger #2236): HTTP/1.1 framing, a chunked request body,
+//!   `Expect: 100-continue` and the header read deadline. A client that names `keep-alive` in
+//!   its `Connection` header keeps the connection for its next request, until
+//!   [`EdgeConfig::header_timeout`] passes with no new request; any other client is answered
+//!   `Connection: close`, one request per connection, as before the move. What the door
+//!   answers is decided behind a seam that knows no HTTP version (the private `door` module),
+//!   so another listener can feed the same door.
 //!
 //! App logic — scheduling, forms, policy — stays in resources, compositions, and
 //! capabilities *above* this transport, exactly as the other transports (quic/ipc/mcp) keep
@@ -59,8 +66,10 @@
 #![forbid(unsafe_code)]
 
 mod accept;
+mod door;
 mod entity;
 mod error_page;
+mod h1;
 mod origin;
 pub mod push;
 mod redirect;
@@ -433,6 +442,9 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 /// dropped. Ten seconds is generous for any real client (a browser sends its headers in one
 /// write) and short enough that a slow-loris trickle holds a connection for seconds, not
 /// forever. [Overridable](EdgeConfig::header_timeout).
+///
+/// It is also the keep-alive idle limit: a kept connection with no new request after this long
+/// is closed, without an answer, since no request was started.
 pub const DEFAULT_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How long a client may take to deliver the body it declared, once the headers are in.
@@ -440,16 +452,21 @@ pub const DEFAULT_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// [`DEFAULT_MAX_BODY_BYTES`] at about 35 KB/s. [Overridable](EdgeConfig::body_timeout).
 pub const DEFAULT_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// How long writing the response may take. A client that stops reading would otherwise hold
-/// its connection (and its place under [`DEFAULT_MAX_CONNECTIONS`]) for as long as it
-/// liked. Past it the connection is dropped. [Overridable](EdgeConfig::write_timeout).
+/// How long a write to the client may make no progress. A client that stops reading would
+/// otherwise hold its connection (and its place under [`DEFAULT_MAX_CONNECTIONS`]) for as long
+/// as it liked. Past it the connection is dropped. [Overridable](EdgeConfig::write_timeout).
+///
+/// On the door's own connections it bounds each stall, not the whole answer: the deadline
+/// starts when the socket stops taking bytes and is cleared when it takes some.
+/// [`write_response`] and [`write_answer`] bound the whole write, as they always did.
 pub const DEFAULT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How many connections are served at once. A connection past the cap is answered `503`
 /// with `Retry-After` straight away, without its request being handled. Every current door
-/// (gonk, ttt-host, a LAN `serve --http`) serves a handful of people, and one request per
-/// connection means a connection lives only as long as one request; 256 is far above any of
-/// them and far below what exhausts a process's descriptors. [Overridable](EdgeConfig::max_connections).
+/// (gonk, ttt-host, a LAN `serve --http`) serves a handful of people. A connection lives as
+/// long as one request, or, kept alive, until it sits idle for [`DEFAULT_HEADER_TIMEOUT`]; a
+/// browser keeps about six. 256 is far above any of them and far below what exhausts a
+/// process's descriptors. [Overridable](EdgeConfig::max_connections).
 pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
 
 /// Edge response policy: security headers, CORS, and whether to trust a fronting proxy's
@@ -472,9 +489,10 @@ pub struct EdgeConfig {
     /// the host may swap it (e.g. when a watched route file changes) without a restart; each
     /// request reads whatever the handle currently holds. `None` → the static `routes`.
     pub live_routes: Option<LiveRoutes>,
-    /// The largest request body accepted, in bytes; a larger one is refused with `413`
-    /// before it is read. Default [`DEFAULT_MAX_BODY_BYTES`]. Raise it for a door that
-    /// takes genuinely large writes, lower it for one that only takes forms.
+    /// The largest request body accepted, in bytes; a larger one is refused with `413`,
+    /// before it is read when its `Content-Length` says so, and as soon as it passes the bound
+    /// when it is chunked. Never truncated. Default [`DEFAULT_MAX_BODY_BYTES`]. Raise it for a
+    /// door that takes genuinely large writes, lower it for one that only takes forms.
     pub max_body_bytes: usize,
     /// Routes-only: an un-routed path is **not** part of the public surface — it 404s instead
     /// of falling through to the mechanical `/noun/partition/key` → `urn:` default. This turns
@@ -1063,8 +1081,10 @@ pub async fn serve(kernel: Arc<Kernel>, cap_fn: CapFn, addr: SocketAddr) -> std:
 }
 
 /// Serve `kernel` over HTTP on `addr`, resolving each request under `cap_fn(request)` and
-/// applying `config` (security headers, CORS, proxy trust). One request per connection
-/// (`Connection: close`). Runs until the listener itself fails: a per-connection accept error
+/// applying `config` (security headers, CORS, proxy trust). Each connection is served by hyper's
+/// HTTP/1.1 server: one request per connection (`Connection: close`) unless the client names
+/// `keep-alive`, in which case the connection serves its next request too, until it sits idle
+/// for [`EdgeConfig::header_timeout`]. Runs until the listener itself fails: a per-connection accept error
 /// is skipped and descriptor exhaustion is backed off and retried (see the private `accept`
 /// module), so only a dead listener (`EBADF`, `EINVAL`, …) returns.
 pub async fn serve_with(
@@ -1102,8 +1122,8 @@ pub async fn serve_with_listener(
         tombstones: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
     // The connection cap. A permit is taken at accept and held until the connection's task
-    // ends, so the cap counts connections, not requests (the same thing here: one request
-    // per connection). `Semaphore::new` panics above `MAX_PERMITS`, hence the clamp.
+    // ends, so the cap counts connections, not requests (a kept-alive connection holds its
+    // permit while it idles). `Semaphore::new` panics above `MAX_PERMITS`, hence the clamp.
     let permits = Arc::new(tokio::sync::Semaphore::new(
         shared
             .config
@@ -1356,6 +1376,10 @@ async fn read_head<S: AsyncRead + Unpin>(sock: &mut S, buf: &mut Vec<u8>) -> std
 /// answers with [`write_response`], so the parsing and the bounds are this crate's in every
 /// door rather than a copy per door.
 ///
+/// ⚠ This reader is still the hand-written one, one request per connection: the routed door
+/// ([`serve_with_listener`]) moved onto hyper (ledger #2236) and takes chunked bodies and
+/// keep-alive, which this reader refuses (`501`) and does not offer.
+///
 /// ```
 /// use ikigai_web::{read_request, write_response, EdgeConfig, Response};
 /// use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1595,12 +1619,29 @@ fn is_head(raw: &[u8]) -> bool {
     tokens.next() == Some(&b"HEAD"[..]) && (tokens.next().is_some() || line.len() > 4)
 }
 
-async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::io::Result<()> {
-    let wt = shared.config.write_timeout;
-    let Some(req) = read_request(&mut sock, Some(peer), &shared.config).await? else {
-        return Ok(());
-    };
+/// Serve one accepted connection: hyper's HTTP/1.1 server around the door ([`h1`]).
+async fn handle(sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::io::Result<()> {
+    h1::serve_connection(sock, peer, shared).await
+}
 
+/// What the door answers one whole request with, before any HTTP version frames it.
+pub(crate) enum Reply {
+    /// A complete answer: status, headers and content (or the head alone, for `HEAD`).
+    Whole(Resp),
+    /// An answer whose content is not known when its head is sent: the push stream. `head`
+    /// carries the status and headers; each item of `events` is written as it arrives, and the
+    /// answer ends when the sender is dropped.
+    Stream {
+        head: Resp,
+        events: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    },
+}
+
+/// The door's logic for one request that has already arrived whole (the bounds and the
+/// deadlines of intake are [`door::exchange`]'s): admission, the push stream, routing,
+/// dispatch, the error page and the edge policy. It knows nothing about the connection or the
+/// HTTP version, so every listener answers through it.
+pub(crate) async fn answer(shared: &Shared, req: HttpRequest) -> Reply {
     // Resolve the route once; it drives the target IRI + per-route cap (in respond) and the
     // per-route CORS/CSP (in the policy layer). No match → the mechanical default throughout.
     // Read the current route table (hot-swappable); a cheap Arc clone, held only for the match.
@@ -1615,23 +1656,23 @@ async fn handle(mut sock: TcpStream, peer: IpAddr, shared: Arc<Shared>) -> std::
     if let Some(refusal) = shared.config.admit_fn.as_ref().and_then(|f| f(&req)) {
         let mut resp = finish(refusal_resp(&refusal), &req, &shared.config);
         apply_edge_policy(&mut resp, &shared.config, &req, None);
-        return write_within(&mut sock, resp, wt).await;
+        return Reply::Whole(resp);
     }
-    // The event stream is not a resource read: it holds the connection open and writes cut
+    // The event stream is not a resource read: it holds the answer open and sends cut
     // notices as they arrive, so it leaves the request/response path here, before routing.
     if let Some(push) = shared.config.push.as_ref() {
         if req.path == push.path {
-            return push::stream(sock, req, &shared, &table, push).await;
+            return push::open(&req, shared, &table, push);
         }
     }
     let matched = table.match_path(&req.path);
     let mut resp = finish(
-        respond(&shared, &req, matched.as_ref(), &table).await,
+        respond(shared, &req, matched.as_ref(), &table).await,
         &req,
         &shared.config,
     );
     apply_edge_policy(&mut resp, &shared.config, &req, matched.as_ref());
-    write_within(&mut sock, resp, wt).await
+    Reply::Whole(resp)
 }
 
 /// The last word on any answer to a parsed request, whichever path built it: an error body
@@ -3733,19 +3774,7 @@ fn parse_head(head: &[u8]) -> Result<HttpRequest, &'static str> {
         .map_err(|_| MALFORMED)?
         .to_string();
     let target = parts.next().ok_or(MALFORMED)?;
-    let (raw_path, query_str) = match target.iter().position(|b| *b == b'?') {
-        Some(q) => (&target[..q], &target[q + 1..]),
-        None => (target, &b""[..]),
-    };
-    let path = decode_path(raw_path)?;
-    let mut query = Vec::new();
-    for kv in query_str.split(|b| *b == b'&').filter(|s| !s.is_empty()) {
-        let (k, v) = match kv.iter().position(|b| *b == b'=') {
-            Some(eq) => (&kv[..eq], &kv[eq + 1..]),
-            None => (kv, &b""[..]),
-        };
-        query.push((decode_form(k)?, decode_form(v)?));
-    }
+    let (path, query) = parse_target(target)?;
     let rest = head.get(line_end + 2..).unwrap_or_default();
     let headers = String::from_utf8_lossy(rest)
         .split("\r\n")
@@ -3762,6 +3791,30 @@ fn parse_head(head: &[u8]) -> Result<HttpRequest, &'static str> {
         body: Vec::new(),
         peer: None,
     })
+}
+
+/// Decoded query pairs, in the order the target carried them.
+type Query = Vec<(String, String)>;
+
+/// The request target (path and query, as the request line carried it) as
+/// [`HttpRequest::path`] and [`HttpRequest::query`]: the path through [`decode_path`], the
+/// query as form pairs. Shared by the hand-written reader and the hyper door, so both decode a
+/// target the same way and refuse the same targets with `400`.
+fn parse_target(target: &[u8]) -> Result<(String, Query), &'static str> {
+    let (raw_path, query_str) = match target.iter().position(|b| *b == b'?') {
+        Some(q) => (&target[..q], &target[q + 1..]),
+        None => (target, &b""[..]),
+    };
+    let path = decode_path(raw_path)?;
+    let mut query = Vec::new();
+    for kv in query_str.split(|b| *b == b'&').filter(|s| !s.is_empty()) {
+        let (k, v) = match kv.iter().position(|b| *b == b'=') {
+            Some(eq) => (&kv[..eq], &kv[eq + 1..]),
+            None => (kv, &b""[..]),
+        };
+        query.push((decode_form(k)?, decode_form(v)?));
+    }
+    Ok((path, query))
 }
 
 /// The value of one ASCII hex digit, or `None`. Deliberately not `u8::from_str_radix`, which
@@ -3928,10 +3981,9 @@ async fn write<S: AsyncWrite + Unpin>(sock: &mut S, resp: Resp) -> std::io::Resu
     sock.flush().await
 }
 
-/// The status line and headers of `resp`, through the blank line. `content_length` is
-/// `None` only for a response whose body is delimited by the connection closing — the
-/// event stream ([`push`]), whose length is not known when its head is sent (RFC 9112
-/// §6.3, the last rule: no `Content-Length`, no transfer coding, `Connection: close`).
+/// The status line and headers of `resp`, through the blank line, as the hand-written writer
+/// ([`write`], behind [`write_response`] and the refusals of [`read_request`]) sends them; the
+/// hyper door frames the same [`header_fields`] itself.
 ///
 /// A `204` or a `304` never carries `Content-Length`, whatever `content_length` says (ledger
 /// #1597). Neither has content, and both end at the blank line (RFC 9112 §6.3, the first rule),
@@ -3941,31 +3993,43 @@ async fn write<S: AsyncWrite + Unpin>(sock: &mut S, resp: Resp) -> std::io::Resu
 /// no content to measure, and a wrong one (a `0`, as this used to send) misleads a cache that
 /// updates its stored response from the `304`'s headers. A HEAD of either is the same head.
 fn head_of(resp: &Resp, content_length: Option<usize>) -> String {
-    let content_length = content_length.filter(|_| !matches!(resp.status, 204 | 304));
     let mut head = format!("HTTP/1.1 {} {}\r\n", resp.status, resp.reason);
-    if !resp.content_type.is_empty() {
-        head.push_str(&format!("Content-Type: {}\r\n", resp.content_type));
-    }
-    if let Some(allow) = &resp.allow {
-        head.push_str(&format!("Allow: {allow}\r\n"));
-    }
-    if let Some(etag) = &resp.etag {
-        head.push_str(&format!("ETag: {etag}\r\n"));
-    }
-    if let Some(cc) = &resp.cache_control {
-        head.push_str(&format!("Cache-Control: {cc}\r\n"));
-    }
-    if !resp.vary.is_empty() {
-        head.push_str(&format!("Vary: {}\r\n", resp.vary.join(", ")));
-    }
-    for (name, value) in &resp.headers {
+    for (name, value) in header_fields(resp, content_length) {
         head.push_str(&format!("{name}: {value}\r\n"));
-    }
-    if let Some(length) = content_length {
-        head.push_str(&format!("Content-Length: {length}\r\n"));
     }
     head.push_str("Connection: close\r\n\r\n");
     head
+}
+
+/// The header fields of `resp`, in the order they are written, `Content-Length` last and never
+/// on a `204` or `304` (see [`head_of`]). No `Connection`: that is the connection's business, not
+/// the answer's, and HTTP/2 and HTTP/3 forbid it. One list for both writers, the hand-written
+/// [`head_of`] and the hyper door ([`door`]), so they cannot drift apart.
+fn header_fields(resp: &Resp, content_length: Option<usize>) -> Vec<(&str, String)> {
+    let content_length = content_length.filter(|_| !matches!(resp.status, 204 | 304));
+    let mut fields = Vec::new();
+    if !resp.content_type.is_empty() {
+        fields.push(("Content-Type", resp.content_type.clone()));
+    }
+    if let Some(allow) = &resp.allow {
+        fields.push(("Allow", allow.clone()));
+    }
+    if let Some(etag) = &resp.etag {
+        fields.push(("ETag", etag.clone()));
+    }
+    if let Some(cc) = &resp.cache_control {
+        fields.push(("Cache-Control", cc.clone()));
+    }
+    if !resp.vary.is_empty() {
+        fields.push(("Vary", resp.vary.join(", ")));
+    }
+    for (name, value) in &resp.headers {
+        fields.push((name.as_str(), value.clone()));
+    }
+    if let Some(length) = content_length {
+        fields.push(("Content-Length", length.to_string()));
+    }
+    fields
 }
 
 #[cfg(test)]
@@ -5191,8 +5255,13 @@ mod tests {
 
     // Pull the ETag value out of a raw response.
     fn etag_of_response(resp: &str) -> String {
+        // A header name is case-insensitive, and hyper writes this one `Etag` (ledger #2236).
         resp.lines()
-            .find_map(|l| l.strip_prefix("ETag: "))
+            .find_map(|l| {
+                l.split_once(':')
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("etag"))
+                    .map(|(_, value)| value)
+            })
             .unwrap_or("")
             .trim()
             .to_string()
@@ -5749,7 +5818,7 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
         assert!(resp.ends_with(r#"{"a":1,"b":3,"c":4}"#), "got: {resp}");
         assert!(
-            resp.contains("ETag: "),
+            resp.to_ascii_lowercase().contains("\r\netag: "),
             "PATCH should return a fresh ETag, got: {resp}"
         );
     }
@@ -6829,18 +6898,21 @@ mod tests {
 
     /// `chunked` carries its length in the body. Ignoring it meant `Content-Length` was
     /// absent, so the bound never applied AND the endpoint was handed the chunk framing as
-    /// if a person had typed it.
+    /// if a person had typed it. The hand-written door refused it (`501`); since the door moved
+    /// onto hyper (ledger #2236) it is taken, de-framed, under the same bound: the endpoint is
+    /// handed the content and never the framing.
     #[tokio::test]
-    async fn a_chunked_body_is_refused_rather_than_delivered_as_its_own_framing() {
+    async fn a_chunked_body_is_delivered_as_its_content_never_its_framing() {
         let addr = start().await;
         let out = roundtrip(
             addr,
             "PUT /test/writable HTTP/1.1\r\nHost: x\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
         )
         .await;
-        assert!(out.starts_with("HTTP/1.1 501 "), "got: {out}");
+        assert!(out.starts_with("HTTP/1.1 200 "), "got: {out}");
+        assert!(out.ends_with("\r\n\r\nhello"), "got: {out}");
         assert!(
-            !out.contains("hello"),
+            !out.contains("5\r\nhello"),
             "the chunk framing must not reach the endpoint as content, got: {out}"
         );
     }
@@ -7040,7 +7112,9 @@ mod tests {
              Content-Length: 5\r\n\r\nhello",
         )
         .await;
-        assert!(out.starts_with("HTTP/1.1 200 "), "got: {out}");
+        // hyper answers an HTTP/1.0 request in HTTP/1.0 (ledger #2236); the hand-written door
+        // wrote `HTTP/1.1` on every answer.
+        assert!(out.starts_with("HTTP/1.0 200 "), "got: {out}");
         assert!(!out.contains("100 Continue"), "got: {out}");
     }
 
@@ -7878,8 +7952,13 @@ mod tests {
         }
 
         fn etag(resp: &str) -> String {
+            // A header name is case-insensitive, and hyper writes this one `Etag` (ledger #2236).
             resp.lines()
-                .find_map(|l| l.strip_prefix("ETag: "))
+                .find_map(|l| {
+                    l.split_once(':')
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("etag"))
+                        .map(|(_, value)| value.trim())
+                })
                 .unwrap_or_else(|| panic!("no ETag: {resp}"))
                 .to_string()
         }

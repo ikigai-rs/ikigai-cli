@@ -307,9 +307,9 @@ data: {"thread":"urn:…","sequence":17,"invalidated":["urn:…"],"more":0,"path
   `Last-Event-ID`, sends `event: resync`, and the page refreshes everything it shows.
 - **Expiry is not a cut**: a deadline passing sends nothing. Revalidating on a deadline is the
   page's job, from the `max-age` its fragment was served with.
-- **Bounds**: a stream holds a slot under `max_connections`; every write is under
-  `write_timeout`; a heartbeat comment every 15 s; closed after 10 minutes with no event
-  (`EventSource` reconnects and resyncs).
+- **Bounds**: a stream holds a slot under `max_connections`; a write that stalls past
+  `write_timeout` drops it; a heartbeat comment every 15 s; closed after 10 minutes with no
+  event (`EventSource` reconnects and resyncs). Over HTTP/1.1 the stream is framed chunked.
 
 The page side is a few lines of plain `EventSource` that trigger htmx re-fetches; the event
 shape, the page script and the bounds are in the `push` module docs, where a doctest pins the
@@ -367,17 +367,23 @@ an over-bound request is **refused rather than trimmed to fit**:
 - **Bodies** cap at `max_body_bytes` (default 1 MiB, `--max-body <bytes>`). A
   `Content-Length` above the cap is refused with `413` *without reading the body*,
   so the refusal costs nothing.
-- **Framing must agree.** A `Content-Length` that will not parse is a `400`, not a
-  zero-length body; a body shorter than declared is a `400`, not a partial
+- **Framing is hyper's** (ledger #2236). A `Content-Length` that will not parse is a
+  `400`, not a zero-length body; a body shorter than declared is a `400`, not a partial
   submission; bytes past `Content-Length` are the next pipelined request and never
-  join this one; and a `Transfer-Encoding` this server does not implement is a
-  `501`, not an absent length.
+  join this one. A **chunked** body is taken under the same cap: it is refused with
+  `413` the moment it passes `max_body_bytes`, never cut to fit. A transfer coding that
+  does not end in `chunked` is a `400`. A request hyper cannot parse is answered by
+  hyper (`400`, `431`, `414`) and never reaches the door.
 - **Time.** The request line and headers must arrive within `header_timeout`
-  (default 10 s), the declared body within `body_timeout` (default 30 s), both
-  answered `408` when missed; the response must be taken within `write_timeout`
-  (default 30 s) or the connection is dropped. These are deadlines on the whole
-  read, not idle timeouts, so a slow-loris trickle of one byte at a time is cut off
-  on schedule.
+  (default 10 s), the body within `body_timeout` (default 30 s), both
+  answered `408` when missed; a write that makes no progress for `write_timeout`
+  (default 30 s) drops the connection. The header and body limits are deadlines on the
+  whole read, not idle timeouts, so a slow-loris trickle of one byte at a time is cut
+  off on schedule.
+- **Keep-alive is opt-in.** A client whose `Connection` header names `keep-alive` (a
+  browser does) keeps the connection for its next request, until it idles for
+  `header_timeout`, when it is closed without an answer. Any other client is answered
+  `Connection: close`, one request per connection.
 - **Connections.** At most `max_connections` (default 256) are served at once. One
   past the cap is answered `503` with `Retry-After: 1` without its request being
   handled, then closed after draining what it sent, so the answer arrives instead of

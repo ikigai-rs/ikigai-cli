@@ -14,9 +14,24 @@ ikigai-core = { workspace = true }
 # `ikigai_fn::html::html_text`: the error page escapes its status and message with the
 # ecosystem's one escaper (ledger #1868).
 ikigai-fn = { workspace = true }
-# Minimal async I/O for the accept loop + per-connection handler (hand-rolled HTTP/1.1,
-# mirroring ikigai-cms-web's serve_http — Apache fronts it, so parsing stays small).
+# The accept loop, the per-connection task and the deadlines. The HTTP/1.1 framing on each
+# connection is hyper's (ledger #2236); `read_request`/`write_response` stay hand-written for a
+# door with a router of its own (the layers front).
 tokio = { version = "1", features = ["net", "io-util", "rt", "rt-multi-thread", "macros", "time", "sync"] }
+# The door's HTTP/1.1 connection: framing, keep-alive, chunked request bodies, `Expect:
+# 100-continue`, the header read deadline. Floors are the versions this crate was moved onto
+# and tested with: `auto_date_header` and `ReasonPhrase::from_static` are recent, and all of it
+# was already in the workspace graph through reqwest. HTTP/1 only: HTTP/2 is a decision of its
+# own (the connection cap, the 408s and the deadlines mean different things there).
+hyper = { version = "1.11", features = ["server", "http1"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+# The version-independent seam (`door.rs`) speaks `http`'s request/response and `http-body`'s
+# `Body`, so another listener (HTTP/2, a QUIC HTTP/3 listener) feeds the same door logic.
+http = "1"
+http-body = "1"
+# `Limited` is the body bound: a body past `max_body_bytes` is an error, never a truncation.
+http-body-util = "0.1"
+bytes = "1"
 # Strong ETag = a content hash of the representation (type + bytes). Same hash family
 # core uses for content addressing; keeps the validator stable and collision-resistant.
 blake3 = "1"

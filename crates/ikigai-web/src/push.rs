@@ -91,9 +91,13 @@
 //! - A stream is one connection and holds its slot under
 //!   [`EdgeConfig::max_connections`](crate::EdgeConfig::max_connections) for as long as it is
 //!   open.
-//! - Every write (an event batch, a heartbeat) is bounded by
-//!   [`EdgeConfig::write_timeout`](crate::EdgeConfig::write_timeout); a client that stops
-//!   reading is dropped at it and its slot comes back.
+//! - Its length is not known when its head is sent, so HTTP/1.1 frames it chunked (since the
+//!   door moved onto hyper, ledger #2236; it was close-delimited before). `EventSource` reads
+//!   either. When the stream ends at its idle limit, the connection closes unless the client
+//!   asked to keep it.
+//! - A write that makes no progress (an event batch, a heartbeat) for
+//!   [`EdgeConfig::write_timeout`](crate::EdgeConfig::write_timeout) fails the connection; a
+//!   client that stops reading is dropped at it and its slot comes back.
 //! - A heartbeat comment every [`PushConfig::heartbeat`] keeps a proxy from closing an idle
 //!   connection and notices a client that has gone.
 //! - After [`PushConfig::idle_timeout`] with no event sent, the stream closes. `EventSource`
@@ -183,7 +187,8 @@
 //! send(addr, "PUT /sheet/cell/a1 HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\n\r\n6").await;
 //!
 //! // The stream says so, naming the thread, what it invalidated, and the page's own path.
-//! while !seen.contains("event: cut\n") || !seen.ends_with("\n\n") {
+//! let ended = |seen: &str| seen.find("event: cut\n").is_some_and(|at| seen[at..].contains("\n\n"));
+//! while !ended(&seen) {
 //!     let n = stream.read(&mut buf).await.unwrap();
 //!     seen.push_str(&String::from_utf8_lossy(&buf[..n]));
 //! }
@@ -199,13 +204,12 @@
 //! ```
 
 use crate::{
-    apply_edge_policy, error_resp, finish, head_of, iri_from_path, write_within, EdgeConfig,
-    ErrorBody, HttpRequest, Resp, RouteTable, Shared,
+    apply_edge_policy, error_resp, finish, iri_from_path, EdgeConfig, ErrorBody, HttpRequest,
+    Reply, Resp, RouteTable, Shared,
 };
+use bytes::Bytes;
 use ikigai_core::{CutBatch, CutEvent, Iri, ListenSpec, CAP_LISTEN, LISTEN_CAPACITY};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 /// Where the event stream is served when [`PushConfig::path`] is not set otherwise. Under a
 /// leading `_` so the mechanical `/noun/partition/key` mapping never wants it for a resource.
@@ -396,42 +400,22 @@ fn render(batch: &CutBatch, subs: &Subscriptions) -> String {
     out
 }
 
-/// Write `bytes` within the write deadline, or fail.
-async fn send(
-    sock: &mut (impl AsyncWriteExt + Unpin),
-    bytes: &[u8],
-    limit: Duration,
-) -> std::io::Result<()> {
-    let write = async {
-        sock.write_all(bytes).await?;
-        sock.flush().await
-    };
-    match tokio::time::timeout(limit, write).await {
-        Ok(done) => done,
-        Err(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "event write took too long",
-        )),
-    }
-}
-
-/// Serve one event stream on `sock` until the client goes, a write misses its deadline, or
-/// the stream sits idle past [`PushConfig::idle_timeout`].
-pub(crate) async fn stream(
-    mut sock: TcpStream,
-    req: HttpRequest,
+/// Open one event stream for `req`: a refusal, or the stream's head and a task that sends its
+/// events until the client goes (its answer is dropped), the connection fails a write deadline
+/// (the same), or the stream sits idle past [`PushConfig::idle_timeout`].
+pub(crate) fn open(
+    req: &HttpRequest,
     shared: &Shared,
     table: &RouteTable,
     push: &PushConfig,
-) -> std::io::Result<()> {
+) -> Reply {
     let config = &shared.config;
-    let wt = config.write_timeout;
     // Every refusal below is finished like any other answer: a page for a browser, and the
     // head alone for HEAD (ledger #117).
     let refuse = |resp: Resp| {
-        let mut resp = finish(resp, &req, config);
-        apply_edge_policy(&mut resp, config, &req, None);
-        resp
+        let mut resp = finish(resp, req, config);
+        apply_edge_policy(&mut resp, config, req, None);
+        Reply::Whole(resp)
     };
     match req.method.as_str() {
         "GET" => {}
@@ -440,26 +424,23 @@ pub(crate) async fn stream(
                 allow: Some("GET, OPTIONS".to_string()),
                 ..Resp::status(204, "No Content")
             };
-            return write_within(&mut sock, refuse(resp), wt).await;
+            return refuse(resp);
         }
         _ => {
             let resp = Resp {
                 allow: Some("GET, OPTIONS".to_string()),
                 ..Resp::text(405, "Method Not Allowed", "method not allowed")
             };
-            return write_within(&mut sock, refuse(resp), wt).await;
+            return refuse(resp);
         }
     }
-    let subs = match Subscriptions::parse(&req, config, table, push) {
+    let subs = match Subscriptions::parse(req, config, table, push) {
         Ok(subs) => subs,
-        Err(why) => {
-            let resp = Resp::text(400, "Bad Request", &why);
-            return write_within(&mut sock, refuse(resp), wt).await;
-        }
+        Err(why) => return refuse(Resp::text(400, "Bad Request", &why)),
     };
     // The capability this request's reads resolve under — never widened here (see the module
     // docs: adding `CAP_LISTEN` would move the listener into another cache partition).
-    let cap = (shared.cap_fn)(&req);
+    let cap = (shared.cap_fn)(req);
     let listener = match shared.kernel.listen(subs.listen_spec(push.queue), &cap) {
         Ok(listener) => listener,
         Err(e) => {
@@ -475,7 +456,7 @@ pub(crate) async fn stream(
             if config.error_body == ErrorBody::Text && matches!(e, ikigai_core::Error::Denied(_)) {
                 resp.body = format!("an event stream needs `{CAP_LISTEN}`").into_bytes();
             }
-            return write_within(&mut sock, refuse(resp), wt).await;
+            return refuse(resp);
         }
     };
 
@@ -489,46 +470,58 @@ pub(crate) async fn stream(
     // nginx buffers a proxied response unless told otherwise, which would hold every event.
     head.headers
         .push(("X-Accel-Buffering".to_string(), "no".to_string()));
-    apply_edge_policy(&mut head, config, &req, None);
-    let mut opening = head_of(&head, None);
-    opening.push_str(&format!(
+    apply_edge_policy(&mut head, config, req, None);
+    let mut opening = format!(
         "retry: {}\n\nevent: ready\nid: 0\ndata: {{}}\n\n",
         push.retry.as_millis()
-    ));
+    );
     // A reconnect: whatever was cut between the old stream and this one was heard by nobody.
     if req.header("last-event-id").is_some() {
         opening.push_str(&resync("reconnect", None));
     }
-    let (mut rd, mut wr) = sock.split();
-    send(&mut wr, opening.as_bytes(), wt).await?;
 
-    let mut heartbeat =
-        tokio::time::interval_at(tokio::time::Instant::now() + push.heartbeat, push.heartbeat);
-    let idle = tokio::time::sleep(push.idle_timeout);
-    tokio::pin!(idle);
-    let mut scratch = [0u8; 256];
-    loop {
-        tokio::select! {
-            batch = listener.wait() => {
-                let text = render(&batch, &subs);
-                if !text.is_empty() {
-                    send(&mut wr, text.as_bytes(), wt).await?;
-                    idle.as_mut().reset(tokio::time::Instant::now() + push.idle_timeout);
+    // One event batch in flight at a time: the sender waits for the connection to take the last
+    // one, so a slow reader holds the listener's bounded queue and one batch, never more. The
+    // connection's write deadline is what drops a reader that stopped: the answer is dropped,
+    // and with it the receiver, which ends this task.
+    let (events, receiver) = tokio::sync::mpsc::channel::<Bytes>(1);
+    let (heartbeat_every, idle_after) = (push.heartbeat, push.idle_timeout);
+    tokio::spawn(async move {
+        if events.send(Bytes::from(opening)).await.is_err() {
+            return;
+        }
+        let mut heartbeat = tokio::time::interval_at(
+            tokio::time::Instant::now() + heartbeat_every,
+            heartbeat_every,
+        );
+        let idle = tokio::time::sleep(idle_after);
+        tokio::pin!(idle);
+        loop {
+            tokio::select! {
+                batch = listener.wait() => {
+                    let text = render(&batch, &subs);
+                    if !text.is_empty() {
+                        if events.send(Bytes::from(text)).await.is_err() {
+                            break;
+                        }
+                        idle.as_mut().reset(tokio::time::Instant::now() + idle_after);
+                    }
                 }
-            }
-            _ = heartbeat.tick() => send(&mut wr, b": keepalive\n\n", wt).await?,
-            _ = &mut idle => break,
-            // A client sends nothing on a stream; a read returning is it hanging up (or
-            // sending bytes that mean nothing here, which are discarded).
-            read = rd.read(&mut scratch) => {
-                if matches!(read, Ok(0) | Err(_)) {
-                    break;
+                _ = heartbeat.tick() => {
+                    if events.send(Bytes::from_static(b": keepalive\n\n")).await.is_err() {
+                        break;
+                    }
                 }
+                _ = &mut idle => break,
+                // The client hung up (the connection noticed and dropped the answer).
+                _ = events.closed() => break,
             }
         }
+    });
+    Reply::Stream {
+        head,
+        events: receiver,
     }
-    let _ = wr.shutdown().await;
-    Ok(())
 }
 
 #[cfg(test)]
