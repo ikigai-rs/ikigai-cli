@@ -843,7 +843,7 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
     // every door that builds a request applies.
     ikigai_resolve::stamp_principal(&mut request, capability.principal());
     match block_on(kernel.issue(request, capability)) {
-        Ok(repr) => tool_text(String::from_utf8_lossy(&repr.bytes).into_owned()),
+        Ok(repr) => tool_representation(&target, repr),
         Err(e) => tool_error(kernel_failure(&e)),
     }
 }
@@ -875,6 +875,51 @@ pub fn kernel_failure(e: &ikigai_core::Error) -> String {
         text.push_str(&format!("; retry-after-ms: {millis}"));
     }
     text
+}
+
+/// Maximum raw body size of a successful MCP tool answer (8 MiB), before JSON escaping
+/// or base64 expansion. Larger answers are refused, never truncated. The kernel currently
+/// returns a complete representation, so this bounds serialization, not endpoint allocation.
+pub const MAX_TOOL_RESULT_BYTES: usize = 8 * 1024 * 1024;
+
+fn tool_representation(uri: &str, repr: ikigai_core::Representation) -> Value {
+    if repr.bytes.len() > MAX_TOOL_RESULT_BYTES {
+        return tool_error(format!(
+            "tool answer is {} bytes, exceeding the MCP limit of {MAX_TOOL_RESULT_BYTES} bytes; request a smaller answer",
+            repr.bytes.len()
+        ));
+    }
+    // A binary media type remains binary even if its bytes happen to be valid UTF-8.
+    // Invalid UTF-8 (including a mislabeled text answer) must never be replaced lossily.
+    let media = repr.repr_type.media_type.to_ascii_lowercase();
+    let textual = media.starts_with("text/")
+        || matches!(
+            media.as_str(),
+            "application/json"
+                | "application/xml"
+                | "application/javascript"
+                | "application/sparql-query"
+                | "application/n-triples"
+                | "application/n-quads"
+                | "application/trig"
+        )
+        || media.ends_with("+json")
+        || media.ends_with("+xml");
+    let utf8 = repr.repr_type.params.iter().all(|(key, value)| {
+        !key.eq_ignore_ascii_case("charset")
+            || value.eq_ignore_ascii_case("utf-8")
+            || (value.eq_ignore_ascii_case("us-ascii") && repr.bytes.is_ascii())
+    });
+    if textual && utf8 {
+        if let Ok(text) = std::str::from_utf8(&repr.bytes) {
+            return tool_text(text.to_owned());
+        }
+    }
+    json!({ "content": [{ "type": "resource", "resource": {
+        "uri": uri,
+        "mimeType": repr.repr_type.to_string(),
+        "blob": ikigai_http::base64::encode(&repr.bytes)
+    }}], "isError": false })
 }
 
 fn tool_text(text: String) -> Value {
@@ -1241,6 +1286,144 @@ mod tests {
                 .unwrap_or("")
                 .to_string(),
         )
+    }
+
+    fn representation_result(media_type: &str, bytes: Vec<u8>) -> Value {
+        let repr = Representation::new(ReprType::new(media_type), bytes);
+        let endpoint = FnEndpoint::new("answer", move |_| Ok(repr.clone()))
+            .with_description(Description::new("answer").verb(Verb::Source));
+        let kernel = Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:demo:answer"), endpoint),
+        ));
+        handle(
+            &kernel,
+            &Capability::root(),
+            &ToolFilter::default(),
+            &json!({"jsonrpc":"2.0","id":42,"method":"tools/call",
+                "params":{"name":"answer__source"}}),
+        )
+        .unwrap()["result"]
+            .clone()
+    }
+
+    #[test]
+    fn binary_tool_answers_are_lossless_embedded_blobs() {
+        let result = representation_result("application/octet-stream", vec![0, 255, 128, 65]);
+        assert_eq!(
+            result,
+            json!({"isError":false,"content":[{
+                "type":"resource", "resource":{
+                    "uri":"urn:demo:answer", "mimeType":"application/octet-stream",
+                    "blob":"AP+AQQ=="
+                }
+            }]})
+        );
+    }
+
+    #[test]
+    fn oversized_tool_answers_are_refused() {
+        for media_type in ["text/plain", "application/octet-stream"] {
+            let result = representation_result(media_type, vec![b'x'; 8 * 1024 * 1024 + 1]);
+            assert_eq!(result["isError"], true);
+            assert!(result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("8388608"));
+            assert!(result["content"][0].get("resource").is_none());
+        }
+    }
+
+    #[test]
+    fn utf8_tool_answers_keep_text_media_types() {
+        for media_type in [
+            "text/plain",
+            "text/turtle",
+            "application/json",
+            "application/ld+json",
+            "application/xml",
+            "application/rdf+xml",
+            "application/sparql-query",
+            "application/n-triples",
+            "application/n-quads",
+            "application/trig",
+            "APPLICATION/JSON",
+        ] {
+            let result = representation_result(media_type, "hello 🌍\n".as_bytes().to_vec());
+            assert_eq!(result, tool_text("hello 🌍\n".into()), "{media_type}");
+        }
+        assert_eq!(
+            representation_result("text/plain", vec![]),
+            tool_text(String::new())
+        );
+    }
+
+    #[test]
+    fn binary_and_mislabeled_text_tool_answers_preserve_every_byte() {
+        for (media_type, bytes) in [
+            ("application/octet-stream", b"ASCII binary".to_vec()),
+            ("image/png", vec![137, 80, 78, 71, 13, 10, 26, 10]),
+            ("text/plain", vec![255, 254, 0]),
+            ("application/json", vec![128]),
+            ("application/octet-stream", vec![]),
+            ("application/octet-stream", (0..=255).collect()),
+        ] {
+            let result = representation_result(media_type, bytes.clone());
+            assert_eq!(result["isError"], false);
+            let resource = &result["content"][0]["resource"];
+            assert_eq!(resource["mimeType"], media_type);
+            assert_eq!(
+                ikigai_http::base64::decode(resource["blob"].as_str().unwrap()).unwrap(),
+                bytes
+            );
+            assert!(result["content"][0].get("text").is_none());
+        }
+    }
+
+    #[test]
+    fn declared_charset_is_preserved_without_reinterpreting_bytes() {
+        let repr = Representation::new(
+            ReprType::new("text/plain").with_param("charset", "iso-8859-1"),
+            vec![0xc3, 0xa9], // Valid UTF-8, but the declared encoding means different text.
+        );
+        let result = tool_representation("urn:demo:answer", repr);
+        assert_eq!(
+            result["content"][0]["resource"]["mimeType"],
+            "text/plain;charset=iso-8859-1"
+        );
+        assert_eq!(result["content"][0]["resource"]["blob"], "w6k=");
+        for charset in ["UTF-8", "us-ascii"] {
+            let repr = Representation::new(
+                ReprType::new("text/plain").with_param("charset", charset),
+                b"hello".to_vec(),
+            );
+            assert_eq!(
+                tool_representation("urn:demo:answer", repr),
+                tool_text("hello".into())
+            );
+        }
+    }
+
+    #[test]
+    fn tool_answer_limit_is_inclusive_before_encoding() {
+        for media_type in ["text/plain", "application/octet-stream"] {
+            let bytes = vec![0; MAX_TOOL_RESULT_BYTES];
+            let result = representation_result(media_type, bytes.clone());
+            assert_eq!(result["isError"], false);
+            if media_type == "text/plain" {
+                assert_eq!(
+                    result["content"][0]["text"].as_str().unwrap().as_bytes(),
+                    bytes
+                );
+            } else {
+                assert_eq!(
+                    ikigai_http::base64::decode(
+                        result["content"][0]["resource"]["blob"].as_str().unwrap()
+                    )
+                    .unwrap(),
+                    bytes
+                );
+            }
+        }
     }
 
     /// ledger #1547: a LIST argument takes a JSON array, joined on the way in with its

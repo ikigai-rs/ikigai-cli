@@ -126,6 +126,19 @@ forbids.
   target into another endpoint's IRI (`alice:private` under `urn:x:user:{name}`,
   when `urn:x:user:alice:private` is bound elsewhere) is refused naming the
   argument (0.1.62+; before, the other endpoint answered).
+- **Tool answers** — valid UTF-8 text (including JSON, XML and RDF text media
+  types) remains MCP text content. Other answers, including invalid UTF-8 labeled
+  as text or text with another declared charset, are embedded resource content:
+  `resource.uri` is the invoked target IRI, `resource.mimeType` preserves the
+  representation type and parameters, and `resource.blob` is standard padded
+  base64. This uses MCP 2024-11-05's
+  [embedded resources](https://modelcontextprotocol.io/specification/2024-11-05/server/tools#embedded-resources)
+  and [binary resource content](https://modelcontextprotocol.io/specification/2024-11-05/server/resources#resource-contents).
+  Answers over `MAX_TOOL_RESULT_BYTES` (8 MiB of raw body bytes) return an
+  `isError: true` refusal, with no truncated payload. The check runs before text
+  conversion, base64 and JSON serialization; the kernel still allocates the
+  complete representation before this check. Embedded answers do not add a
+  `resources/read` service.
 - **Protocol errors per JSON-RPC 2.0 §5.1** — a line that is not JSON gets
   `-32700 Parse error` under `"id": null`; JSON that is not a valid Request (no
   `"jsonrpc": "2.0"`, no `method`, an `id` that is not a string, number or null, a
