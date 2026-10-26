@@ -35,6 +35,13 @@ its own crate for the browser build to reuse unchanged.
 
   `compose` (`$a{<iri>}` transclusion) markers assemble nested resources in one pull.
 
+- **Execution traces.** `trace <iri> [args]` resolves a resource and shows its
+  execution tree, including cache status, timing, authority and endpoint notes.
+  Default traces omit the `defaulted=` note so adding an optional input does not
+  change a pinned transcript. Use `trace --defaults <iri> [args]` to include the
+  omitted inputs that the kernel defaulted on each node. The flag names the
+  additional information explicitly; it does not change the request or its defaults.
+
 - **Cache-status tracking.** Each resolution reports `computed` / `cached` /
   `uncacheable`; a pipeline summarises its stages (`1 cached · 1 computed`). Pipe
   stages thread their `Provenance` downstream, so a transform is no more cacheable

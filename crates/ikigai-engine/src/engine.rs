@@ -154,7 +154,8 @@ commands:
   login [scope…] / logout    set the session identity to the minted `scope`s (the identity `cap
                              reset` returns to), or drop to the floor — auth-scheme-agnostic
                              (also `sink urn:host:login <scope…>` / `sink urn:host:logout`)
-  trace <iri> [args]         resolve a resource and show its path: client, transport, endpoint
+  trace [--defaults] <iri> [args]
+                            resolve a resource and show its path; --defaults includes defaulted inputs
   explain <iri> [verb] [scopes=…]  a DRY RUN of resolving it (nothing is invoked): rewrites, each
                              space in the chain and what it did, the door and bindings that would
                              answer, the scopes the capability lacks; plus whether it is cached
@@ -2000,15 +2001,25 @@ impl Engine {
     /// `compose` shows its `$a{…}` markers as the branches it fanned out — on
     /// distinct workers under `pool:N`, the same thread under the single-threaded
     /// default. Trace `urn:iki:fn:compose src=<shape>` to see the fan-out, not the bare
-    /// shape (sourcing the shape itself really is one resolution).
+    /// shape (sourcing the shape itself really is one resolution). `--defaults`
+    /// includes the kernel's `defaulted` notes; plain traces omit them so adding
+    /// an optional input does not change transcripts.
     async fn run_trace(&self, spec: &str) -> Result<String, String> {
+        let spec = spec.trim_start();
+        let (defaults, spec) = match spec.strip_prefix("--defaults") {
+            Some(rest) if rest.is_empty() || rest.starts_with(char::is_whitespace) => {
+                (true, rest.trim_start())
+            }
+            _ => (false, spec),
+        };
         let mut pipeline = parse_spec(spec)?;
         let scope = self.as_of_scope(take_as_of(&mut pipeline)?.as_ref())?;
-        self.in_scope(scope, self.trace_line(pipeline)).await
+        self.in_scope(scope, self.trace_line(pipeline, defaults))
+            .await
     }
 
     /// [`run_trace`](Self::run_trace) inside the line's chain.
-    async fn trace_line(&self, pipeline: Pipeline) -> Result<String, String> {
+    async fn trace_line(&self, pipeline: Pipeline, defaults: bool) -> Result<String, String> {
         let words = match pipeline {
             Pipeline {
                 first: Node::Source(words),
@@ -2076,7 +2087,14 @@ impl Engine {
                         preview_of(&text),
                     ));
                 } else {
-                    render_trace_tree(&events, &entries, scoped, Some(&representation), &mut out);
+                    render_trace_tree(
+                        &events,
+                        &entries,
+                        scoped,
+                        defaults,
+                        Some(&representation),
+                        &mut out,
+                    );
                 }
             }
             Err(error) => {
@@ -2086,7 +2104,7 @@ impl Engine {
                 // dropped here for a single error line.
                 let events = collector.take();
                 if !events.is_empty() {
-                    render_trace_tree(&events, &entries, scoped, None, &mut out);
+                    render_trace_tree(&events, &entries, scoped, defaults, None, &mut out);
                 }
                 // The real resolution aborted — surface where. A capability denial is
                 // the authority dimension made visible (`cap ✗`). The kernel's own
@@ -3048,6 +3066,7 @@ fn render_trace_tree(
     events: &[TraceEvent],
     entries: &[ikigai_core::SpaceEntry],
     scoped: bool,
+    defaults: bool,
     repr: Option<&Representation>,
     out: &mut Vec<String>,
 ) {
@@ -3072,6 +3091,7 @@ fn render_trace_tree(
             &children,
             entries,
             scoped,
+            defaults,
             None,
             repr,
             String::new(),
@@ -3091,6 +3111,7 @@ fn render_trace_event(
     children: &BTreeMap<u64, Vec<&TraceEvent>>,
     entries: &[ikigai_core::SpaceEntry],
     scoped: bool,
+    defaults: bool,
     parent_cap: Option<&Option<Vec<String>>>,
     root_repr: Option<&Representation>,
     prefix: String,
@@ -3136,14 +3157,16 @@ fn render_trace_event(
     };
     // Facts the endpoint attached to its own span (`Invocation::trace_note`) —
     // e.g. the LLM facade's resolved model, or the HTTP client's redirect hops.
-    let notes = if event.notes.is_empty() {
+    // Defaulted inputs are opt-in: optional additions must not churn transcripts.
+    let rendered: Vec<String> = event
+        .notes
+        .iter()
+        .filter(|(key, _)| defaults || key != ikigai_core::DEFAULTED_NOTE)
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    let notes = if rendered.is_empty() {
         String::new()
     } else {
-        let rendered: Vec<String> = event
-            .notes
-            .iter()
-            .map(|(key, value)| format!("{key}={value}"))
-            .collect();
         format!(" · {}", rendered.join(" "))
     };
     let mut line = format!(
@@ -3176,6 +3199,7 @@ fn render_trace_event(
             children,
             entries,
             scoped,
+            defaults,
             Some(&event.capability),
             None,
             child_prefix.clone(),
@@ -5445,6 +5469,87 @@ mod tests {
     }
 
     #[test]
+    fn trace_omits_defaulted_inputs_unless_requested() {
+        let make_engine = || {
+            let endpoint = FnEndpoint::new("optional", |inv: &Invocation<'_>| {
+                inv.trace_note("detail", "kept");
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    b"ok".to_vec(),
+                ))
+            })
+            .with_description(
+                Description::new("optional")
+                    .verb(Verb::Source)
+                    .verb(Verb::Meta)
+                    .input(ArgSpec::new("scheme").optional().default_value("light"))
+                    .input(ArgSpec::new("style").optional().default_value("wide")),
+            );
+            Engine::new(Kernel::with_meta_renderer(
+                Arc::new(EndpointSpace::new().bind(Exact::new("urn:test:optional"), endpoint)),
+                Arc::new(JsonRenderer),
+            ))
+        };
+        let plain = output(make_engine().eval("trace urn:test:optional")).unwrap();
+        assert!(!plain.contains("defaulted="), "{plain}");
+        assert!(plain.contains("detail=kept"), "{plain}");
+        let verbose = output(make_engine().eval("trace --defaults urn:test:optional")).unwrap();
+        assert!(verbose.contains("defaulted=scheme,style"), "{verbose}");
+        assert!(verbose.contains("detail=kept"), "{verbose}");
+        let partial =
+            output(make_engine().eval("trace --defaults urn:test:optional scheme=dark")).unwrap();
+        assert!(partial.contains("defaulted=style"), "{partial}");
+        assert!(!partial.contains("defaulted=scheme"), "{partial}");
+        let supplied = output(
+            make_engine().eval("trace --defaults urn:test:optional scheme=dark style=compact"),
+        )
+        .unwrap();
+        assert!(!supplied.contains("defaulted="), "{supplied}");
+    }
+
+    #[test]
+    fn trace_defaults_flag_applies_to_failed_children_too() {
+        let inner = FnEndpoint::new("inner", |_inv: &Invocation<'_>| {
+            Err(ikigai_core::Error::InvalidArgument {
+                name: "x".to_string(),
+                detail: "no".to_string(),
+            })
+        })
+        .with_description(
+            Description::new("inner")
+                .verb(Verb::Source)
+                .input(ArgSpec::new("scheme").optional().default_value("light")),
+        );
+        let outer = ikigai_core::AsyncFnEndpoint::new("outer", |inv| {
+            Box::pin(async move {
+                inv.issue(Request::new(
+                    Verb::Source,
+                    Iri::parse("urn:test:inner").unwrap(),
+                ))
+                .await
+            })
+        });
+        let engine = Engine::new(Kernel::new(Arc::new(
+            EndpointSpace::new()
+                .bind(Exact::new("urn:test:inner"), inner)
+                .bind(Exact::new("urn:test:outer"), outer),
+        )));
+        for (command, defaults) in [
+            ("trace urn:test:outer", false),
+            ("trace --defaults urn:test:outer", true),
+        ] {
+            let text = output(engine.eval(command)).unwrap();
+            let child = text
+                .lines()
+                .find(|line| line.contains("urn:test:inner"))
+                .unwrap();
+            assert_eq!(child.contains("defaulted=scheme"), defaults, "{text}");
+            assert!(child.contains("failed=invalid-argument"), "{text}");
+            assert!(text.lines().last().unwrap().contains("error:"), "{text}");
+        }
+    }
+
+    #[test]
     fn a_hop_that_changes_authority_is_annotated() {
         use ikigai_core::Time;
         // A root under full authority with a child resolved under a *narrower* one —
@@ -5472,7 +5577,7 @@ mod tests {
         ];
         let repr = Representation::new(ReprType::new("text/plain"), b"x".to_vec());
         let mut out = Vec::new();
-        render_trace_tree(&events, &[], false, Some(&repr), &mut out);
+        render_trace_tree(&events, &[], false, false, Some(&repr), &mut out);
 
         // The root stays uncluttered; the child, whose authority differs, names it.
         assert!(!out[0].contains("· cap"), "root uncluttered: {out:#?}");
@@ -5519,7 +5624,7 @@ mod tests {
             ),
         ];
         let mut out = Vec::new();
-        render_trace_tree(&events, &[], true, None, &mut out);
+        render_trace_tree(&events, &[], true, false, None, &mut out);
 
         assert!(out[1].contains("· cap ✓"), "allowed keeps ✓: {out:#?}");
         assert!(
@@ -5560,7 +5665,7 @@ mod tests {
         ];
         let repr = Representation::new(ReprType::new("text/plain"), b"assembled".to_vec());
         let mut out = Vec::new();
-        render_trace_tree(&events, &[], false, Some(&repr), &mut out);
+        render_trace_tree(&events, &[], false, false, Some(&repr), &mut out);
 
         // Root first, carrying the assembled result and its worker/timing.
         assert!(out[0].contains("urn:test:compose"), "{out:#?}");
