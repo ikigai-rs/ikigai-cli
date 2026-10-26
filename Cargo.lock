@@ -2631,6 +2631,7 @@ dependencies = [
  "http",
  "http-body",
  "httparse",
+ "httpdate",
  "itoa",
  "pin-project-lite",
  "smallvec",
@@ -3710,8 +3711,14 @@ name = "ikigai-web"
 version = "0.1.69"
 dependencies = [
  "blake3",
+ "bytes",
  "chrono",
  "futures",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "ikigai-core",
  "ikigai-fn",
  "libc",

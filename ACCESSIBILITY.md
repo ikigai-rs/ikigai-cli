@@ -117,6 +117,7 @@ Found by reading the source on 2026-10-15, not by testing:
 | 2026-10-17 | The embedded host's pages move their inline styles, unchanged in value, into one served stylesheet, `/decide/css` (ledger #1834). The door's CSP had been dropping the inline styles in a browser, so on the edge the column width, the button padding and the muted gray now apply where they did not. |
 | 2026-10-18 | The intake's redirect page drops its inline `<style>` (ledger #1866). The door's CSP had been dropping it in a browser already, so on the edge the page looks as it did: browser defaults, for the instant before the redirect. |
 | 2026-10-18 | A decision, contact-block or label POST answers `303 See Other` to an outcome page (Post/Redirect/Get, ledger #1879), so a phone that returns to the tab no longer asks to post again; the outcome page names no address or booking, and a second POST of the same link says "Already recorded". |
+| 2026-10-26 | The HTTP door moves onto hyper (ledger #2236). Its error pages are unchanged. A request hyper cannot parse (a malformed request line or header, an unreadable `Content-Length`, a transfer coding that does not end in `chunked`) is now answered by hyper with its status and no sentence, where the door's own `400` carried one (`malformed request`, `malformed Content-Length`); a refusal the door makes keeps its sentence and its page. |
 
 ## Contributing
 

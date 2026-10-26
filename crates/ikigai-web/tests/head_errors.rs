@@ -5,7 +5,9 @@
 //! paths of their own still sent their sentence to a HEAD: the admission refusal, the push
 //! stream's, every framing refusal `read_request` makes, and the busy door's `503`. One test
 //! per path; each sends a HEAD and asserts the status it expects and an empty body. Each but
-//! the two noted below failed before the fix by carrying the sentence as content.
+//! the two noted below failed before the fix by carrying the sentence as content. Since the door
+//! moved onto hyper (ledger #2236), the framing refusals are hyper's or `door.rs`'s, and two of
+//! these tests changed with it (each says how).
 mod common;
 
 use common::{send, split, start};
@@ -95,11 +97,14 @@ async fn an_unreadable_request_target() {
     );
 }
 
+/// Since the door moved onto hyper (ledger #2236) `chunked` is taken, so the framing refusal
+/// left is a coding that does not end in `chunked`, which leaves the body's length unknowable
+/// (RFC 9112 §6.3) and is hyper's own `400`. It was the door's `501` for any coding.
 #[tokio::test]
 async fn a_transfer_coding() {
     let addr = door(EdgeConfig::default()).await;
-    let raw = b"HEAD /t/page HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
-    assert_bodiless(&send(addr, raw).await, "501");
+    let raw = b"HEAD /t/page HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n";
+    assert_bodiless(&send(addr, raw).await, "400");
 }
 
 #[tokio::test]
@@ -120,15 +125,19 @@ async fn a_declared_length_over_the_bound() {
     assert_bodiless(&send(addr, raw).await, "413");
 }
 
+/// A body whose length is learned only as it arrives (chunked), past the bound. This replaced
+/// a test of bytes behind a head that declared `Content-Length: 1`, which the hand-written door
+/// counted as body; under HTTP/1.1 framing (hyper, ledger #2236) they are the next request,
+/// and the body is exactly the one declared byte.
 #[tokio::test]
-async fn bytes_past_the_bound_behind_the_head() {
-    // The declared length is within the bound; what already arrived behind the head is not.
+async fn a_chunked_body_past_the_bound() {
     let addr = door(EdgeConfig {
         max_body_bytes: 1,
         ..EdgeConfig::default()
     })
     .await;
-    let raw = b"HEAD /t/page HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\n\r\nabc";
+    let raw = b"HEAD /t/page HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n\
+                3\r\nabc\r\n0\r\n\r\n";
     assert_bodiless(&send(addr, raw).await, "413");
 }
 
