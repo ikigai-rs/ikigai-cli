@@ -4063,13 +4063,19 @@ fn llm_annotation_facts() -> Vec<(String, String, String)> {
 }
 
 /// The `urn:iki:fn:compose` shape behind the Jury runbook tab: one question, two
-/// `urn:llm:ask` markers — built against what's ACTUALLY installed. Sources
+/// `urn:llm:ollama:ask` markers — built against what's ACTUALLY installed. Sources
 /// `urn:llm:ollama:installed` with `supports=completion` (an embedder is often
 /// the smallest model installed, and a juror must be able to chat) and forks to
 /// the first two distinct models (two personas of one model when only one is
 /// pulled), so the demo is portable: no hardcoded model name. If the list can't
 /// be read the markers carry no `model=` and the backend's own
 /// default-resolution (and the gated conditional's offline note) take over.
+///
+/// ★ The markers ask `urn:llm:ollama:ask`, the provider the jurors were LISTED from, never
+/// the `urn:llm:ask` facade: the facade routes to the configured DEFAULT provider, and a
+/// default that is not Ollama (an mlx-lm server, say) receives an Ollama tag such as
+/// `qwen3-coder:30b-a3b-q8_0` and refuses it as a model name. The installed list, the
+/// liveness gate and the ask must all name the same provider.
 struct JuryShape;
 
 /// Total physical memory, best-effort — the machine attribute the jury's
@@ -4216,7 +4222,7 @@ impl Endpoint for JuryShape {
                 .map(|m| format!("&model={m}"))
                 .unwrap_or_default();
             format!(
-                "$a{{urn:llm:ask?system={system}&prompt=What is resource-oriented computing, \
+                "$a{{urn:llm:ollama:ask?system={system}&prompt=What is resource-oriented computing, \
                  in plain terms{model_arg}}}"
             )
         };
@@ -4293,7 +4299,7 @@ then re-run this step — no restart needed, liveness is a live fact.
 
 /// The gracefully-degrading Jury: ONE compose marker invoking `urn:iki:fn:conditional`
 /// on the liveness resource. When Ollama is up the conditional returns the jury
-/// shape and compose recursively expands its two `urn:llm:ask` markers (the fork);
+/// shape and compose recursively expands its two `urn:llm:ollama:ask` markers (the fork);
 /// when it's down the offline note is spliced in instead — the LLM branch is never
 /// invoked, so nothing errors. compose + conditional + up + ask, zero glue code.
 fn jury_gated_shape() -> FnEndpoint {
@@ -4308,18 +4314,18 @@ $a{urn:iki:fn:conditional?if=urn:llm:ollama:up&then=urn:demo:jury&else=urn:data:
 }
 
 /// A native-only runbook tab (like [`runbook_timer_demo`]): best-of-two-models as
-/// pure composition. Forks one question to two `urn:llm:ask` personas concurrently
-/// via `urn:iki:fn:compose` fan-out, then pipes both candidates into a third `urn:llm:ask`
-/// that judges. Needs a local Ollama (LLM is mounted natively). Cross-frontend
+/// pure composition. Forks one question to two `urn:llm:ollama:ask` personas concurrently
+/// via `urn:iki:fn:compose` fan-out, then pipes both candidates into a third
+/// `urn:llm:ollama:ask` that judges. Needs a local Ollama (LLM is mounted natively). Cross-frontend
 /// promotion into the shared runbook awaits the browser LLM face.
 fn runbook_jury_demo() -> FnEndpoint {
     FnEndpoint::new("runbook-jury", |_inv: &Invocation<'_>| {
         let json = serde_json::json!({
             "label": "Jury",
             "intro": "Best-of-two, as pure composition. urn:demo:jury is a urn:iki:fn:compose shape \
-                      with two urn:llm:ask markers — two personas of your local model. Sourcing \
+                      with two urn:llm:ollama:ask markers — two personas of your local model. Sourcing \
                       it forks both concurrently (fan-out) and inlines both answers; pipe that \
-                      into a third urn:llm:ask and it judges which is better. Watch the \
+                      into a third urn:llm:ollama:ask and it judges which is better. Watch the \
                       [N uncacheable] tag: the verdict depends on both upstream generations, so \
                       the cache-dependency graph propagates across compose AND the pipe. The \
                       gated form degrades gracefully: urn:iki:fn:conditional branches on the \
@@ -4347,7 +4353,7 @@ fn runbook_jury_demo() -> FnEndpoint {
                 },
                 {
                     "label": "let a third model pick the winner",
-                    "cmd": "source urn:iki:fn:compose src=urn:demo:jury | urn:llm:ask system=\"You are judging two candidate answers, A and B, to the question shown. Reply with the winner (A or B) and one short sentence why.\"",
+                    "cmd": "source urn:iki:fn:compose src=urn:demo:jury | urn:llm:ollama:ask system=\"You are judging two candidate answers, A and B, to the question shown. Reply with the winner (A or B) and one short sentence why.\"",
                     "note": "pipes both candidates into a judge; [2 uncacheable] = the verdict's two upstream deps (needs Ollama up)"
                 },
                 {
@@ -6950,6 +6956,58 @@ mod tests {
         assert_eq!(lines[1], "  nature    Odd (Label)");
         assert!(lines[2].starts_with("  runtime   native · "), "{body}");
         assert!(lines[3].starts_with("  space     "), "{body}");
+    }
+
+    /// ★ The jury asks the provider it listed its jurors from. Its markers once named the
+    /// `urn:llm:ask` facade, which routes to the DEFAULT provider: with an mlx-lm default the
+    /// fork sent an Ollama tag to mlx-lm and failed with "Repo id must use alphanumeric
+    /// chars". Installed list, gate and ask must all be `urn:llm:ollama:*`.
+    #[test]
+    fn the_jury_asks_the_provider_it_listed_its_jurors_from() {
+        let kernel = Kernel::new(Arc::new(
+            EndpointSpace::new()
+                .bind(
+                    Exact::new("urn:llm:ollama:installed"),
+                    FnEndpoint::new("installed-stub", |_inv: &Invocation<'_>| {
+                        Ok(Representation::new(
+                            ReprType::new("application/json"),
+                            br#"[{"model":"qwen3-coder:30b-a3b-q8_0","size":1000000000}]"#.to_vec(),
+                        ))
+                    }),
+                )
+                .bind(Exact::new("urn:demo:jury"), jury_shape())
+                .bind(Exact::new("urn:runbook:jury"), runbook_jury_demo()),
+        ));
+        let source = |iri: &str| {
+            let answer = block_on(kernel.issue(
+                Request::new(Verb::Source, Iri::parse(iri).expect("valid IRI")),
+                &Capability::root(),
+            ))
+            .expect("sources");
+            String::from_utf8(answer.bytes.to_vec()).expect("utf-8")
+        };
+
+        let shape = source("urn:demo:jury");
+        assert_eq!(
+            shape.matches("$a{urn:llm:ollama:ask?").count(),
+            2,
+            "{shape}"
+        );
+        assert_eq!(
+            shape.matches("&model=qwen3-coder:30b-a3b-q8_0}").count(),
+            2,
+            "{shape}"
+        );
+        assert!(
+            !shape.contains("$a{urn:llm:ask?"),
+            "the facade routes to the default: {shape}"
+        );
+
+        let runbook = source("urn:runbook:jury");
+        assert!(
+            runbook.contains("src=urn:demo:jury | urn:llm:ollama:ask system="),
+            "the judge asks Ollama too: {runbook}"
+        );
     }
 
     /// ★ The socket door reports the label `serve_ipc` passes, with and without mounts —
