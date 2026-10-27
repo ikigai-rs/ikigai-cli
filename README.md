@@ -958,7 +958,9 @@ denied.
 ## Crates
 The engine drives a `Resolver` — the seam in `ikigai-resolve` (`issue` / `is_cached`
 / `entries`) that a kernel implements, local or remote. `ikigai-engine` is the
-renderer-agnostic REPL engine over that seam; `ikigai-wire` is the postcard Call/Reply
+renderer-agnostic REPL engine over that seam. Both, and `ikigai-intray`, live in their own
+repo, [github.com/ikigai-rs/ikigai-engine](https://github.com/ikigai-rs/ikigai-engine), and
+this workspace takes them from crates.io. `ikigai-wire` is the postcard Call/Reply
 protocol the remote transports speak. The transports are feature-gated:
 
 | crate | `ikigai-cli` feature | targets |
@@ -971,7 +973,8 @@ protocol the remote transports speak. The transports are feature-gated:
 `ipc`. None of the three builds for WebAssembly: `ikigai-embedded` pulls `socket2`
 through `mdns-sd` and `lettre`, which has no wasm32 target. The wasm face is
 `ikigai-engine` on its own (ikigai-web-demo runs a kernel in a browser through it), and
-CI's `wasm-lib` job checks exactly that crate.
+that repo's CI checks it. Here, CI's `wasm-lib` job checks `ikigai-time`, the member the
+same demo runs in the browser.
 
 The modules and pieces the host composes, each published on crates.io from this workspace:
 
@@ -980,7 +983,6 @@ The modules and pieces the host composes, each published on crates.io from this 
 | `ikigai-discovery` | announce and find ikigai kernels on the local network over multicast DNS (`--announce`, `peer:<name>` targets, `urn:peer:list`) |
 | `ikigai-email` | `urn:email:send`: a capability-gated Sink that submits a message over SMTP, with typed transient/permanent failures |
 | `ikigai-intake` | public form intake: parse an untrusted urlencoded/JSON submission, validate it against declared fields, drop it into a tuplespace |
-| `ikigai-intray` | the intray as a tuplespace, `urn:space:{name}`: out (Sink), rd (Source), in (Delete), associative match by SPARQL `ASK` |
 | `ikigai-mcp` | `ikigai mcp`: the capability-scoped manifold projected as an MCP (Model Context Protocol) server |
 | `ikigai-passkey` | a minimal single-user WebAuthn (ES256) assertion verifier, the second factor on the edge's decision links |
 | `ikigai-scheduler` | the kernel's work scheduler: `single` or a threadpool (`pool`, `pool:N`) that parks rather than blocks on awaits |

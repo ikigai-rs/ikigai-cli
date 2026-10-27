@@ -11,7 +11,8 @@ A mount resolves nothing locally. `MountedRemote`/`RemoteSpace` always hit with 
 `ForwardingEndpoint`, and that endpoint has to answer `name()` — the *remote's*
 name for the target — without a wire round-trip on the resolve path. It answers by
 replaying the remote catalog's pattern STRINGS through a `UriTemplate` and taking a
-match (`RemoteNames::name_for`, `crates/ikigai-resolve/src/lib.rs`).
+match (`RemoteNames::name_for`, `crates/ikigai-resolve/src/lib.rs` in
+[github.com/ikigai-rs/ikigai-engine](https://github.com/ikigai-rs/ikigai-engine)).
 
 That is structurally unsound, and not by accident: **grammar semantics are not
 recoverable from a pattern string.** A `Grammar` is Rust code. ikigai-browse's

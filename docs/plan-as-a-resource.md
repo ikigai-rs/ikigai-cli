@@ -65,7 +65,8 @@ never executed, and dropped when the graph is read back.
 
 ## The bar: a round trip
 
-`crates/ikigai-engine/tests/plan_round_trip.rs` runs each spec, renders it, reads the
+[`crates/ikigai-engine/tests/plan_round_trip.rs`](https://github.com/ikigai-rs/ikigai-engine/blob/main/crates/ikigai-engine/tests/plan_round_trip.rs)
+(in github.com/ikigai-rs/ikigai-engine, where the engine lives) runs each spec, renders it, reads the
 graph back, runs *that*, and requires **the same execution** — the exact sequence of
 requests every endpoint received. Not the same syntax tree: a plan is the resolved form,
 so the two trees differ while the two runs do not. Every rendered graph is also validated
@@ -111,9 +112,10 @@ wasm32-unknown-unknown** without a rustflag only the final consumer can set. So:
   A build without it answers `execute` by naming the missing feature rather than acting as if
   the command does not exist.
 
-The claim that this crate builds for wasm was a comment and nothing checked it; `ci.yml`
+The claim that this crate builds for wasm was a comment and nothing checked it; CI
 now runs `cargo clippy -p ikigai-engine --lib --target wasm32-unknown-unknown` under
-default features, so it is a gate.
+default features, so it is a gate. That job runs in the engine's own repo,
+[github.com/ikigai-rs/ikigai-engine](https://github.com/ikigai-rs/ikigai-engine).
 
 ## Plans as resources: `urn:plan:eval`, `urn:plan:validate`, `urn:plan:requires`
 
