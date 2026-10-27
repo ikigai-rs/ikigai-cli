@@ -51,17 +51,17 @@ ikigai-core = { workspace = true }
 ikigai-engine = { workspace = true } # API history — 0.1.16 = with_width_routing + last_fan_out: the fan-out switch and the note the REPL prints
 ikigai-resolve = { workspace = true }
 serde_json = { workspace = true }
-ikigai-embedded = { path = "../ikigai-embedded", version = "0.1.69", optional = true } # API history — 0.1.16 = set_width_routing/width_routing: the --width-routing channel, beside set_scheduler_spec
-ikigai-mcp = { path = "../ikigai-mcp", version = "0.1.69" } # API history — 0.1.12 = row collapse: every same-named manifold row stays reachable
-ikigai-ipc = { path = "../ikigai-ipc", version = "0.1.69", optional = true } # API history — 0.1.13 = heal-on-use: a broken established connection redials
-ikigai-quic = { path = "../ikigai-quic", version = "0.1.69", optional = true } # API history — 0.1.14 = the
+ikigai-embedded = { path = "../ikigai-embedded", version = "0.2.0", optional = true } # API history — 0.1.16 = set_width_routing/width_routing: the --width-routing channel, beside set_scheduler_spec
+ikigai-mcp = { path = "../ikigai-mcp", version = "0.2.0" } # API history — 0.1.12 = row collapse: every same-named manifold row stays reachable
+ikigai-ipc = { path = "../ikigai-ipc", version = "0.2.0", optional = true } # API history — 0.1.13 = heal-on-use: a broken established connection redials
+ikigai-quic = { path = "../ikigai-quic", version = "0.2.0", optional = true } # API history — 0.1.14 = the
 # first published quic carrying `Minter`, `PeerIdentity` and `fingerprint_of_pem` (#286,
 # per-identity grants), all three named in main.rs. The pin read 0.1.6 — a version that
 # EXISTS on crates.io and does not have them, so the claim was false in the one direction a
 # resolver can actually take. No local build could ever have contradicted it.
 # mDNS announce/browse. Rides the `quic` feature: the only thing worth finding on the
 # network is a QUIC-served kernel.
-ikigai-discovery = { path = "../ikigai-discovery", version = "0.1.69", optional = true }
+ikigai-discovery = { path = "../ikigai-discovery", version = "0.2.0", optional = true }
 ikigai-wire = { workspace = true, optional = true }
 # Inbound HTTP face — published as `ikigai-web`; this workspace owns that crates.io name
 # (the standalone server repo of the same directory name publishes as `ikigai-web-server`).
@@ -93,8 +93,9 @@ mime_guess = "2.0"
 # same module (ledger #1866), so none carries a private copy. 0.2.1 is
 # the first release with the `auth` and `base64` modules, so 0.2.1 was this crate's floor; 0.3.0 is
 # the workspace's now (ledger #1546, the failure classes), and the two modules are unchanged in it.
-# Read the caret as a RANGE: `^0.3.0` is `<0.4.0`.
-ikigai-http = "0.3.0"
+# 0.4.0 = the core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x.
+# Read the caret as a RANGE: `^0.4.0` is `<0.5.0`.
+ikigai-http = "0.4.0"
 oxttl = { workspace = true }
 oxrdf = { workspace = true }
 # `layers save` refuses a file name that would arm something on the reader's machine, by the

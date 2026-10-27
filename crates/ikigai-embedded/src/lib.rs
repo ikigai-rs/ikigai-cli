@@ -2397,10 +2397,13 @@ impl ikigai_http::HttpTransport for UreqTransport {
             ),
             Err(error) => return Err(error.to_string()),
         };
+        // ikigai-http 0.4 takes an `HttpBody`. This transport still reads the body itself, inside
+        // its own `http.max_response_bytes` bound, so the buffer it hands over is never unbounded;
+        // the endpoint then collects it under ITS limit (8 MiB by default) as well.
         Ok(ikigai_http::HttpResponse {
             status,
             headers,
-            body,
+            body: body.into(),
         })
     }
 }
@@ -4789,7 +4792,7 @@ fn root_members(nature: &'static str) -> Vec<Arc<dyn Space>> {
         // Semantic-CMS transreptors (urn:cms:*): personal content (org bookmarks/
         // notes, library metadata) into one RDF graph on the dc:subject tag axis.
         Arc::new(ikigai_cms::space()) as Arc<dyn Space>,
-        // Dev-tooling platform seam (urn:system:exec + urn:repo:*) — git/gh/cargo
+        // Dev-tooling platform seam (urn:repo:*; no low-level exec since ikigai-repo 0.3) — git/gh/cargo
         // as capability-gated resources. Native subprocess seam; ikigai using the
         // tools that build ikigai.
         Arc::new(ikigai_repo::space()) as Arc<dyn Space>,
@@ -5047,12 +5050,24 @@ fn compose_mounts(mut spaces: Vec<Arc<dyn Space>>, mounts: Vec<MountSpec>) -> Ar
     // twice — plasma mounts `ikigai-gonk` under `urn:iki:store:` and `urn:iki:ledger:` —
     // costs one describe deadline on a manifold read rather than one per mount.
     let peers = ikigai_resolve::PeerHealth::default();
+    // ★ …and ONE CLOCK for every mount sharing that record (ikigai-resolve 0.2). Since 0.2 a
+    // mount stamps the silence it records on its own clock, and by default each mount makes
+    // its own, anchored at the wall clock to the millisecond when it is built. Two mounts built
+    // a moment apart can read a millisecond apart, and a reading EARLIER than the record's
+    // stamp counts as "not within the cooldown": the second mount forgot the first one's
+    // verdict and asked the silent peer again, one more describe deadline on a manifold read
+    // (3 of 120 isolated runs of ikigai-ipc's
+    // `two_mounts_of_one_silent_peer_cost_one_deadline_and_still_name_both`). One shared clock
+    // makes every stamp comparable. It is the wall clock, as this host gives its kernels: a
+    // step backward forgets the record and asks the peer, the direction that cannot go stale.
+    let clock: Arc<dyn ikigai_core::Clock> = Arc::new(SystemClock);
     let mut fronting: Vec<MountSpec> = Vec::new();
     for mount in mounts {
         if mount.kind == MountKind::Alias {
             spaces.push(Arc::new(
                 ikigai_resolve::MountedRemote::new(mount.resolver, mount.prefix, mount.origin)
-                    .sharing(&peers),
+                    .sharing(&peers)
+                    .with_clock(Arc::clone(&clock)),
             ));
         } else {
             fronting.push(mount);
@@ -5078,7 +5093,8 @@ fn compose_mounts(mut spaces: Vec<Arc<dyn Space>>, mounts: Vec<MountSpec>) -> Ar
     {
         let remote = Arc::new(
             ikigai_resolve::MountedRemote::overriding(resolver, prefix.clone(), origin)
-                .sharing(&peers),
+                .sharing(&peers)
+                .with_clock(Arc::clone(&clock)),
         ) as Arc<dyn Space>;
         ordered.push(match kind {
             // The failover pair must stay INSIDE the prefix. `Failover` resolves
@@ -11687,8 +11703,8 @@ mod http_body_budget_tests {
             assert!(response.header("location").is_none());
             assert!(response.header("cache-control").is_none());
             assert_eq!(
-                response.body,
-                b"HTTP response body exceeds the 4-byte limit"
+                response.body.as_bytes(),
+                Some(&b"HTTP response body exceeds the 4-byte limit"[..])
             );
         }
     }

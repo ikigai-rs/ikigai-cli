@@ -6759,8 +6759,8 @@ mod version_flag_tests {
 mod adapter_gate_tests {
     use super::*;
     use ikigai_core::{
-        ArgRef, Capability, Error, Iri, Kernel, Request, TraceEvent, Tracer, Verb, DENIED_NOTE,
-        FAILED_NOTE,
+        ArgRef, Capability, Error, Iri, Kernel, Request, TraceEvent, Tracer, Verb, DEFAULTED_NOTE,
+        DENIED_NOTE, FAILED_NOTE,
     };
     use ikigai_engine::Action;
     use std::path::{Path, PathBuf};
@@ -6993,9 +6993,16 @@ mod adapter_gate_tests {
         );
         let refusal = &after[before];
         assert_eq!(refusal.target, "urn:file:someone-else/secret.txt");
+        // Since ikigai-fs 0.2 the file Sink declares an optional `encoding` with a default
+        // (utf-8), and the kernel notes every declared default it fills (`DEFAULTED_NOTE`), so
+        // the event carries that note beside the refusal. Which gate refused is still told by
+        // `FAILED_NOTE` (never `DENIED_NOTE`) and by the timing asserted below.
         assert_eq!(
             refusal.notes,
-            vec![(FAILED_NOTE.to_string(), "denied".to_string())],
+            vec![
+                (FAILED_NOTE.to_string(), "denied".to_string()),
+                (DEFAULTED_NOTE.to_string(), "encoding".to_string()),
+            ],
             "the module refused (it ran and failed), not the floor: {refusal:?}"
         );
         assert!(

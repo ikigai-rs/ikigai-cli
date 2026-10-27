@@ -3707,13 +3707,20 @@ mod tests {
             // One `PeerHealth` for this kernel's mounts — what a composer hands every
             // mount it builds. Two mounts, one peer, one verdict.
             let peers = ikigai_resolve::PeerHealth::default();
+            // …and one clock, as the embedded host's composer gives them: since
+            // ikigai-resolve 0.2 a mount stamps the silence on its own clock, and two default
+            // clocks built a moment apart can read a millisecond apart, enough for the second
+            // mount to forget the first one's verdict (3 runs in 120 without it).
+            let clock: Arc<dyn ikigai_core::Clock> = Arc::new(ikigai_core::SystemClock);
             let mut mounts: Vec<Arc<dyn Space>> = Vec::new();
             for prefix in ["urn:one:", "urn:two:"] {
                 let client = connect_with_timeout(&path, Some(Duration::from_secs(30)))
                     .unwrap()
                     .with_describe_timeout(Some(BOUND));
                 mounts.push(Arc::new(
-                    MountedRemote::new(Arc::new(client), prefix, origin.clone()).sharing(&peers),
+                    MountedRemote::new(Arc::new(client), prefix, origin.clone())
+                        .sharing(&peers)
+                        .with_clock(Arc::clone(&clock)),
                 ));
             }
             let kernel = Kernel::new(Arc::new(Fallback::new(mounts)));

@@ -56,7 +56,7 @@ ikigai-throttle = { workspace = true }
 # mDNS announce/browse. The one sibling this host names by path rather than through
 # `[workspace.dependencies]`; the version is the LOCKSTEP version, not a floor (see the root
 # manifest for why, and `crates/ikigai-cli/tests/lockstep_pins.rs` for the check).
-ikigai-discovery = { path = "../ikigai-discovery", version = "0.1.69" }
+ikigai-discovery = { path = "../ikigai-discovery", version = "0.2.0" }
 # The plan resources — `urn:plan:eval`, `urn:plan:validate`, `urn:plan:requires` — live beside
 # the runner they share with the REPL's `run` (ledger #956). `plan-reader` is the feature that
 # can read a plan graph back; this native host has no wasm constraint keeping it off, and the
@@ -177,7 +177,9 @@ age = { workspace = true }
 # 0.10.0 (ledger #1546): the FAILURES check (declared failure classes = produced, core 0.1.108's
 # `ActionSpec::fails` over `Error::class()`), opt-in through `Suite::check_failures()` in 0.10 and the
 # default from 0.11.0; `Suite::fails_under` probes. ⚠ `^0.10.0` is also a ceiling below 0.11.0.
-ikigai-conformance = "0.10.0"
+# 0.11.0 (ledger #2356): the release on ikigai-core 0.2.0; DATATYPES and FAILURES run by default.
+# ⚠ `^0.11.0` is also a ceiling below 0.12.0.
+ikigai-conformance = "0.11.0"
 # The conformance fixture SEEDS the two edge verifying keys and one signing key, so the
 # decision faces are walked over real state instead of reporting "did not resolve". Same
 # version and features as the library dependency above: the fixture must write exactly the

@@ -27,4 +27,6 @@ futures = { workspace = true }
 # 0.10.0 (ledger #1546): the FAILURES check (declared failure classes = produced, core 0.1.108's
 # `ActionSpec::fails` over `Error::class()`), opt-in through `Suite::check_failures()` in 0.10 and the
 # default from 0.11.0; `Suite::fails_under` probes. ⚠ `^0.10.0` is also a ceiling below 0.11.0.
-ikigai-conformance = "0.10.0"
+# 0.11.0 (ledger #2356): the release on ikigai-core 0.2.0; DATATYPES and FAILURES run by default.
+# ⚠ `^0.11.0` is also a ceiling below 0.12.0.
+ikigai-conformance = "0.11.0"
