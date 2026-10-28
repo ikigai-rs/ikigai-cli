@@ -98,8 +98,8 @@ mime_guess = "2.0"
 # the first release with the `auth` and `base64` modules, so 0.2.1 was this crate's floor; 0.3.0 is
 # the workspace's now (ledger #1546, the failure classes), and the two modules are unchanged in it.
 # 0.4.0 = the core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x.
-# Read the caret as a RANGE: `^0.4.0` is `<0.5.0`.
-ikigai-http = "0.4.0"
+# 0.4.1 adds the configurable endpoint response budget; use the workspace minimum.
+ikigai-http = { workspace = true }
 oxttl = { workspace = true }
 oxrdf = { workspace = true }
 # `layers save` refuses a file name that would arm something on the reader's machine, by the
