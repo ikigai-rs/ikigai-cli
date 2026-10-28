@@ -1,7 +1,7 @@
 //! A consumer may close stdout before the first byte or after reading a prefix.
 #![cfg(all(feature = "embedded", unix))]
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -42,6 +42,13 @@ fn closed_stdout_exits_quietly() {
 
 #[test]
 fn line_repl_stops_when_consumer_closes_stdout() {
+    let expected = ikigai()
+        .args(["-c", "help"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(expected.status.success(), "{expected:?}");
+    assert!(!expected.stdout.is_empty());
     let mut child = ikigai()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -49,12 +56,13 @@ fn line_repl_stops_when_consumer_closes_stdout() {
         .unwrap();
     let mut input = child.stdin.take().unwrap();
     input.write_all(b"help\n").unwrap();
-    let mut output = BufReader::new(child.stdout.take().unwrap());
-    let mut first_line = String::new();
-    assert!(output.read_line(&mut first_line).unwrap() > 0);
+    let mut output = child.stdout.take().unwrap();
+    let mut first_response = vec![0; expected.stdout.len()];
+    output.read_exact(&mut first_response).unwrap();
+    assert_eq!(first_response, expected.stdout);
     drop(output);
-    // The first response was small enough to fit in the pipe. Only issue the
-    // next command after closing its reader, so the failed write is certain.
+    // Read the whole first response before closing its reader, so even a small
+    // pipe cannot fail during that response and race the next stdin write.
     input.write_all(b"help\n").unwrap();
     // Keep stdin open: a closed consumer must end the REPL without waiting for EOF.
     let deadline = Instant::now() + Duration::from_secs(10);
