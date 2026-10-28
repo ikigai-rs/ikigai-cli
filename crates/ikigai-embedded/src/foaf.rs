@@ -396,7 +396,7 @@ mod tests {
             let redirect = |to: &str| HttpResponse {
                 status: 302,
                 headers: vec![("location".to_string(), to.to_string())],
-                body: Vec::new(),
+                body: Vec::new().into(),
             };
             Ok(match request.url.as_str() {
                 IDENTIFIER => redirect(DOCUMENT),
@@ -407,12 +407,12 @@ mod tests {
                         ("content-type".to_string(), "text/xml".to_string()),
                         ("cache-control".to_string(), "max-age=3600".to_string()),
                     ],
-                    body: FIXTURE.as_bytes().to_vec(),
+                    body: FIXTURE.as_bytes().to_vec().into(),
                 },
                 _ => HttpResponse {
                     status: 404,
                     headers: Vec::new(),
-                    body: b"no such page".to_vec(),
+                    body: b"no such page".to_vec().into(),
                 },
             })
         }

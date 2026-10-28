@@ -162,7 +162,12 @@ const INHERITED: &[(&str, &str)] = &[
     ("compose", "ikigai-fn"),
     ("diagram-arrangement", "ikigai-diagram"),
     ("diagram-kernel", "ikigai-diagram"),
+    // ikigai-diagram 0.3: the two pictures above with the governor state drawn over them.
+    ("diagram-state", "ikigai-diagram"),
+    ("diagram-state-arrangement", "ikigai-diagram"),
     ("conditional", "ikigai-fn"),
+    // ikigai-fn 0.7: `urn:iki:fn:each`.
+    ("each", "ikigai-fn"),
     ("echo", "ikigai-fn"),
     ("greet", "ikigai-fn"),
     ("reverseList", "ikigai-fn"),
@@ -213,7 +218,6 @@ const INHERITED: &[(&str, &str)] = &[
     ("repo-pr-list", "ikigai-repo"),
     ("repo-pr-view", "ikigai-repo"),
     ("repo-status", "ikigai-repo"),
-    ("system-exec", "ikigai-repo"),
     ("sexpr-arrangement-from-rdf", "ikigai-sexpr"),
     ("sexpr-arrangement-to-rdf", "ikigai-sexpr"),
     ("sexpr-from-rdf", "ikigai-sexpr"),
@@ -258,7 +262,8 @@ const OWNER_ONLY: &[&str] = &[
     "calendars",
     "calendar-config",
     "eval",
-    "system-exec",
+    // `system-exec` (`urn:system:exec`) was on this list until ikigai-repo 0.3 stopped serving
+    // a low-level exec at all; only the fixed git/gh facades remain.
     "repo-status",
     "secret",
     "secret-generate",
@@ -271,6 +276,9 @@ const OWNER_ONLY: &[&str] = &[
     // `host-arrangement`, which says the same thing as a declaration.
     "diagram-arrangement",
     "diagram-kernel",
+    // ikigai-diagram 0.3: the same pictures with the governor state the caller may read.
+    "diagram-state",
+    "diagram-state-arrangement",
     // A plan is a request AMPLIFIER — one request, many steps, a map over a list — so the
     // door does not offer one until someone decides a public surface should (ledger #956).
     "plan-eval",
@@ -452,7 +460,7 @@ const PLAN: &str = "\
 /// report's `inherited:` line and is NOT walked: no check reads it and no probe fires it.
 /// That replaced two things this file used to carry by hand. One was the partition in
 /// `conforms` that tolerated every inherited finding and failed only on ours. The other was
-/// about thirty hazard opt-outs (`urn:system:exec`, the six HTTP verbs, the `gh` facades,
+/// about thirty hazard opt-outs (`urn:system:exec`, served until ikigai-repo 0.3, the six HTTP verbs, the `gh` facades,
 /// the inference endpoints, EventKit, the Keychain, Zoom) and a dozen fixtures for other
 /// crates' endpoints, which only existed so that walking a dependency would neither fire
 /// a hazard nor fail to call it. Each module's record is its own repo's conformance test.
