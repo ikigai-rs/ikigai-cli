@@ -52,6 +52,12 @@
 //! - **server push**: with [`EdgeConfig::push`] set, one `GET` of the push path holds an
 //!   event stream open and tells the page when a golden thread its reads rest on is cut —
 //!   see [`push`].
+//! - **streams** (ledger #2244): an answer is read through the kernel's body path and written
+//!   as it is read, framed by `Content-Length` when its length is known and chunked when not,
+//!   and a failure part-way ends it short rather than as a whole. A `GET` over a seekable body
+//!   with a strong validator answers one byte range (`206`, `416`, `If-Range`). An upload route
+//!   ([`serve_with_uploads`], [`Uploads`]) spills its body to disk as it arrives and issues the
+//!   Sink with `content=b3:…`.
 //! - **the connection is hyper's** (ledger #2236): HTTP/1.1 framing, a chunked request body,
 //!   `Expect: 100-continue` and the header read deadline. A client that names `keep-alive` in
 //!   its `Connection` header keeps the connection for its next request, until
@@ -74,6 +80,8 @@ mod origin;
 pub mod push;
 mod redirect;
 mod source_limit;
+mod stream;
+mod upload;
 pub use entity::{
     with_headers, EndpointHeader, HeaderRefusal, HTTP_ENTITY, MAX_HEADER_BLOCK, MAX_HEADER_LINES,
     MAX_HEADER_VALUE,
@@ -81,6 +89,7 @@ pub use entity::{
 pub use origin::{InvalidOrigin, OriginCheck};
 pub use push::{PushConfig, DEFAULT_PUSH_PATH};
 pub use source_limit::{source_key, SourceLimits, SourceRate, DEFAULT_MAX_SOURCES};
+pub use upload::{Uploads, DEFAULT_UPLOAD_GRACE, DEFAULT_UPLOAD_MIN_RATE};
 
 use ikigai_core::{ArgRef, Capability, FailureClass, Iri, Kernel, Request, Verb};
 use std::net::{IpAddr, SocketAddr};
@@ -874,29 +883,10 @@ impl RouteTable {
     fn match_path(&self, path: &str) -> Option<Matched> {
         let segs = path_segments(path);
         for route in &self.routes {
-            let pat: Vec<&str> = route
-                .pattern
-                .trim_matches('/')
-                .split('/')
-                .filter(|s| !s.is_empty())
-                .collect();
-            if pat.len() != segs.len() {
-                continue;
-            }
             // (name, value, raw in the pattern)
-            let mut binds: Vec<(&str, &str, bool)> = Vec::new();
-            let mut matched = true;
-            for (p, s) in pat.iter().zip(&segs) {
-                if let Some((var, raw)) = placeholder(p) {
-                    binds.push((var, s, raw));
-                } else if p != s {
-                    matched = false;
-                    break;
-                }
-            }
-            if !matched {
+            let Some(binds) = shape_binds(&route.pattern, &segs) else {
                 continue;
-            }
+            };
             let refusal = binds.iter().find_map(|(var, val, raw)| {
                 // Raw only when the template agrees: a `{var}` spelling there is strict.
                 if *raw
@@ -932,6 +922,29 @@ impl RouteTable {
         }
         None
     }
+}
+
+/// Whether a route `pattern`'s SHAPE fits a path split into `segs` (segment count and
+/// literals), and if so its captures as `(name, value, raw in the pattern)`. The one shape
+/// test: [`RouteTable`]'s match and an upload route's ([`Uploads::route`]) both read it.
+fn shape_binds<'a>(pattern: &'a str, segs: &'a [String]) -> Option<Vec<(&'a str, &'a str, bool)>> {
+    let pat: Vec<&str> = pattern
+        .trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    if pat.len() != segs.len() {
+        return None;
+    }
+    let mut binds = Vec::new();
+    for (p, s) in pat.into_iter().zip(segs) {
+        if let Some((var, raw)) = placeholder(p) {
+            binds.push((var, s.as_str(), raw));
+        } else if p != s {
+            return None;
+        }
+    }
+    Some(binds)
 }
 
 /// Outbound security response headers. Defaults are strict — safe for an API/data face; an
@@ -1065,6 +1078,9 @@ struct Shared {
     /// request (see [`tombstone_key`]). In-process only (lost on restart); a persistent
     /// ledger is a later step.
     tombstones: std::sync::Mutex<std::collections::HashMap<TombstoneKey, std::time::Instant>>,
+    /// The upload routes and the content store their spills are held in
+    /// ([`serve_with_uploads`]); `None` takes every body into memory, as before.
+    uploads: Option<Uploads>,
 }
 
 /// A DELETE tombstone's key: the target IRI and the query arguments, ordered by name.
@@ -1108,19 +1124,54 @@ pub async fn serve_with_listener(
     listener: TcpListener,
     config: EdgeConfig,
 ) -> std::io::Result<()> {
+    serve_shared(listener, shared(kernel, cap_fn, config, None)).await
+}
+
+/// Like [`serve_with_listener`], and an upload route (one [`Uploads`] names) takes a body
+/// larger than memory: the door spills it through the kernel's spill facility while it
+/// arrives, holds it in `uploads`' content store, and issues the Sink with `content=b3:…`
+/// ([`ArgRef::Content`]). See [`Uploads`] for the bounds and the capability a caller needs.
+///
+/// Refuses to start (`InvalidInput`) unless the kernel can carry it: it has a spill facility
+/// ([`Kernel::with_spill`]) and resolves a content id through the very store `uploads` puts
+/// into ([`Kernel::with_content_store`]). Either missing would refuse every upload at its
+/// first byte instead, so it is checked once, here.
+pub async fn serve_with_uploads(
+    kernel: Arc<Kernel>,
+    cap_fn: CapFn,
+    listener: TcpListener,
+    config: EdgeConfig,
+    uploads: Uploads,
+) -> std::io::Result<()> {
+    uploads.check(&kernel)?;
+    serve_shared(listener, shared(kernel, cap_fn, config, Some(uploads))).await
+}
+
+/// The state every connection shares.
+fn shared(
+    kernel: Arc<Kernel>,
+    cap_fn: CapFn,
+    config: EdgeConfig,
+    uploads: Option<Uploads>,
+) -> Arc<Shared> {
     // The live route handle: the config's own (so the host can hot-swap it), or a fresh
     // wrap of the static routes when no live handle was supplied.
     let routes = config
         .live_routes
         .clone()
         .unwrap_or_else(|| live_routes(config.routes.clone()));
-    let shared = Arc::new(Shared {
+    Arc::new(Shared {
         kernel,
         cap_fn,
         config,
         routes,
         tombstones: std::sync::Mutex::new(std::collections::HashMap::new()),
-    });
+        uploads,
+    })
+}
+
+/// The accept loop over `shared`, until the listener itself fails.
+async fn serve_shared(listener: TcpListener, shared: Arc<Shared>) -> std::io::Result<()> {
     // The connection cap. A permit is taken at accept and held until the connection's task
     // ends, so the cap counts connections, not requests (a kept-alive connection holds its
     // permit while it idles). `Semaphore::new` panics above `MAX_PERMITS`, hence the clamp.
@@ -1284,6 +1335,10 @@ struct Resp {
     /// is complete, so every path that builds a body builds GET's and none has to know the
     /// method.
     head_only: bool,
+    /// Content that streams instead of `body` (ledger #2244): read as it is written, framed by
+    /// `Content-Length` when its length is known and chunked when it is not. `None` for every
+    /// answer held in `body`.
+    stream: Option<stream::Sending>,
 }
 
 impl Resp {
@@ -1320,6 +1375,7 @@ impl Resp {
             refusal: None,
             class: None,
             head_only: false,
+            stream: None,
         }
     }
 
@@ -1642,22 +1698,42 @@ pub(crate) enum Reply {
 /// dispatch, the error page and the edge policy. It knows nothing about the connection or the
 /// HTTP version, so every listener answers through it.
 pub(crate) async fn answer(shared: &Shared, req: HttpRequest) -> Reply {
-    // Resolve the route once; it drives the target IRI + per-route cap (in respond) and the
-    // per-route CORS/CSP (in the policy layer). No match → the mechanical default throughout.
-    // Read the current route table (hot-swappable); a cheap Arc clone, held only for the match.
-    let table = shared
+    if let Some(refused) = refuse_admission(shared, &req) {
+        return Reply::Whole(refused);
+    }
+    answer_admitted(shared, req, None).await
+}
+
+/// The current route table (hot-swappable): a cheap `Arc` clone, held only for one request.
+fn route_table(shared: &Shared) -> Arc<RouteTable> {
+    shared
         .routes
         .read()
         .map(|g| Arc::clone(&g))
-        .unwrap_or_else(|_| Arc::new(RouteTable::default()));
-    // ADMISSION, ahead of every answer this door gives: the push stream, OPTIONS, the
-    // `?description` face and dispatch alike (ledger #879). Nothing below has run, so a
-    // refused request learns nothing about what is behind the door.
-    if let Some(refusal) = shared.config.admit_fn.as_ref().and_then(|f| f(&req)) {
-        let mut resp = finish(refusal_resp(&refusal), &req, &shared.config);
-        apply_edge_policy(&mut resp, &shared.config, &req, None);
-        return Reply::Whole(resp);
-    }
+        .unwrap_or_else(|_| Arc::new(RouteTable::default()))
+}
+
+/// ADMISSION, ahead of every answer this door gives: the push stream, OPTIONS, the
+/// `?description` face and dispatch alike (ledger #879), and an upload before a byte of it is
+/// spilled. Nothing below has run, so a refused request learns nothing about what is behind
+/// the door. `Some` is the finished refusal.
+fn refuse_admission(shared: &Shared, req: &HttpRequest) -> Option<Resp> {
+    let refusal = shared.config.admit_fn.as_ref().and_then(|f| f(req))?;
+    let mut resp = finish(refusal_resp(&refusal), req, &shared.config);
+    apply_edge_policy(&mut resp, &shared.config, req, None);
+    Some(resp)
+}
+
+/// [`answer`] once admission has passed. `content` is a spilled upload's content id
+/// ([`upload`]): a Sink is issued with `content=b3:…` instead of the request body.
+pub(crate) async fn answer_admitted(
+    shared: &Shared,
+    req: HttpRequest,
+    content: Option<ikigai_core::ContentId>,
+) -> Reply {
+    // Resolve the route once; it drives the target IRI + per-route cap (in respond) and the
+    // per-route CORS/CSP (in the policy layer). No match → the mechanical default throughout.
+    let table = route_table(shared);
     // The event stream is not a resource read: it holds the answer open and sends cut
     // notices as they arrive, so it leaves the request/response path here, before routing.
     if let Some(push) = shared.config.push.as_ref() {
@@ -1667,7 +1743,7 @@ pub(crate) async fn answer(shared: &Shared, req: HttpRequest) -> Reply {
     }
     let matched = table.match_path(&req.path);
     let mut resp = finish(
-        respond(shared, &req, matched.as_ref(), &table).await,
+        respond(shared, &req, matched.as_ref(), &table, content).await,
         &req,
         &shared.config,
     );
@@ -1696,6 +1772,7 @@ async fn respond(
     req: &HttpRequest,
     matched: Option<&Matched>,
     table: &RouteTable,
+    content: Option<ikigai_core::ContentId>,
 ) -> Resp {
     // Routes-only edge: an un-routed path is not part of the public surface — 404 before it
     // can reach the mechanical default (the exhaustive-allow-list posture).
@@ -1812,7 +1889,13 @@ async fn respond(
         request = request.with_arg(k, ArgRef::Inline(v.into_bytes()));
     }
     if verb == Verb::Sink {
-        request = request.with_arg("content", ArgRef::Inline(req.body.clone()));
+        // A spilled upload travels as its content id, resolved inside the Sink's own
+        // invocation (`Invocation::content_body`); any other body inline, as always.
+        let body = match content {
+            Some(id) => ArgRef::Content(id),
+            None => ArgRef::Inline(req.body.clone()),
+        };
+        request = request.with_arg("content", body);
         if let Some(ct) = req.header("content-type") {
             request = request.with_arg("content-type", ArgRef::Inline(ct.as_bytes().to_vec()));
         }
@@ -1885,7 +1968,32 @@ async fn respond(
         return apply_patch(config, kernel, request, &cap, req, shared).await;
     }
 
-    let answer = kernel.issue(request, &cap).await.map(|repr| {
+    // THROUGH THE BODY PATH (ledger #2244): the answer as the endpoint produced it, never
+    // collected on the way. A buffer, a small body, and an `HTTP_ENTITY` envelope settle into
+    // the whole-answer path below, exactly as before; anything else streams (`stream`).
+    let settled = match kernel.issue_body(request, &cap).await {
+        Ok(repr) => stream::settle(repr, verb == Verb::Source).await,
+        Err(e) => Err(e),
+    };
+    let answer = match settled {
+        Ok(stream::Settled::Whole(repr)) => Ok(repr),
+        Ok(stream::Settled::Streamed(repr)) if verb == Verb::Source => {
+            let freshness = Freshness {
+                self_contained: self_contained(&repr, &iri, declared),
+                shared: !shaped_by_credentials(shared, req, matched, &cap),
+            };
+            let vary = read_vary(explicit, &faces, matched, &cap);
+            return stream::read(req, repr, freshness, vary);
+        }
+        Ok(stream::Settled::Streamed(repr)) => {
+            if verb == Verb::Delete {
+                record_tombstone(shared, tombstone_key(&iri_str, req));
+            }
+            return post_redirect(stream::write(repr), req, matched, redirect);
+        }
+        Err(e) => Err(e),
+    };
+    let answer = answer.map(|repr| {
         // An endpoint's response headers, when it asked for any (ledger #117). Checked here,
         // after the endpoint ran: a refused header refuses the ANSWER, never the work, so a
         // Delete that ran is still remembered below. Whether the credentials shaped the
@@ -1910,39 +2018,18 @@ async fn respond(
                 self_contained: self_contained(repr, &iri, declared),
                 shared: served.shared,
             };
-            let mut vary: Vec<String> = Vec::new();
-            // `Accept` selected this face unless the client named it in the URL (`?as=`, which
-            // every cache keys on already) or the resource has exactly one face to give.
-            if explicit.is_none() && faces.served.len() != 1 {
-                vary.push("Accept".to_string());
-            }
-            // The headers a capability function reads identity from. The edge cannot see
-            // inside `cap_fn`, so it names them whenever `cap_fn` was consulted; a route that
-            // pins its capability makes the answer the same for every caller — unless the
-            // door named a principal, which it read off the same credentials.
-            if matched.and_then(|m| m.cap.as_ref()).is_none() || cap.principal().is_some() {
-                vary.extend(CREDENTIAL_HEADERS.iter().map(|(_, name)| name.to_string()));
-            }
-            read_resp(req, served, freshness, vary)
+            read_resp(
+                req,
+                served,
+                freshness,
+                read_vary(explicit, &faces, matched, &cap),
+            )
         }
         Ok(Ok(served)) if verb == Verb::Delete => {
             record_tombstone(shared, tombstone_key(&iri_str, req));
             write_resp(verb, served)
         }
-        Ok(Ok(served)) => {
-            let mut resp = write_resp(verb, served);
-            if req.method == "POST" && matched.is_some_and(|m| m.redirect.is_some()) {
-                resp.add_vary("HX-Request");
-            }
-            // An explicit endpoint Location already chose the outcome; keep it.
-            if let Some(path) = redirect.filter(|_| matches!(resp.status, 200 | 204)) {
-                resp.status = 303;
-                resp.reason = "See Other";
-                resp.body.clear();
-                resp.headers.push(("Location".into(), path));
-            }
-            resp
-        }
+        Ok(Ok(served)) => post_redirect(write_resp(verb, served), req, matched, redirect),
         // A DELETE of an already-absent resource is idempotent (204) within the tombstone
         // window; otherwise it's a genuine 404, carrying the endpoint's own message.
         Err(e @ ikigai_core::Error::NotFound(_)) if verb == Verb::Delete => {
@@ -1956,6 +2043,52 @@ async fn respond(
         // that refuses a verb it declares (`Unsupported`) carries `Allow`.
         Err(e) => error_resp_allowing(config, &e, Some(&allow)),
     }
+}
+
+/// The request headers that selected a read's answer, for its `Vary`.
+fn read_vary(
+    explicit: Option<&str>,
+    faces: &Faces,
+    matched: Option<&Matched>,
+    cap: &Capability,
+) -> Vec<String> {
+    let mut vary: Vec<String> = Vec::new();
+    // `Accept` selected this face unless the client named it in the URL (`?as=`, which
+    // every cache keys on already) or the resource has exactly one face to give.
+    if explicit.is_none() && faces.served.len() != 1 {
+        vary.push("Accept".to_string());
+    }
+    // The headers a capability function reads identity from. The edge cannot see
+    // inside `cap_fn`, so it names them whenever `cap_fn` was consulted; a route that
+    // pins its capability makes the answer the same for every caller — unless the
+    // door named a principal, which it read off the same credentials.
+    if matched.and_then(|m| m.cap.as_ref()).is_none() || cap.principal().is_some() {
+        vary.extend(CREDENTIAL_HEADERS.iter().map(|(_, name)| name.to_string()));
+    }
+    vary
+}
+
+/// A successful write's answer, after Post/Redirect/Get: a non-htmx `POST` to a route that
+/// names a page answers `303 See Other` to it (its content dropped), unless the endpoint's
+/// own `Location` already chose the outcome.
+fn post_redirect(
+    mut resp: Resp,
+    req: &HttpRequest,
+    matched: Option<&Matched>,
+    redirect: Option<String>,
+) -> Resp {
+    if req.method == "POST" && matched.is_some_and(|m| m.redirect.is_some()) {
+        resp.add_vary("HX-Request");
+    }
+    // An explicit endpoint Location already chose the outcome; keep it.
+    if let Some(path) = redirect.filter(|_| matches!(resp.status, 200 | 204)) {
+        resp.status = 303;
+        resp.reason = "See Other";
+        resp.body.clear();
+        resp.stream = None;
+        resp.headers.push(("Location".into(), path));
+    }
+    resp
 }
 
 /// The capability a request resolves under: a matched route's per-route ceiling (the
@@ -2164,12 +2297,18 @@ async fn check_write_precondition(
     cap: &Capability,
     req: &HttpRequest,
 ) -> Option<Resp> {
-    // Current state: Some(etag) if it exists and is readable, None if absent.
+    // Current state: `Some(validator)` if it exists and is readable, `None` if absent. The
+    // validator is the one a read of it hands out (`None` for a streamed body that has none),
+    // so it is read through the body path too and settled the way a read settles it.
     let current = match kernel
-        .issue(Request::new(Verb::Source, iri.clone()), cap)
+        .issue_body(Request::new(Verb::Source, iri.clone()), cap)
         .await
     {
-        Ok(repr) => Some(etag_of(&served_content(repr))),
+        Ok(repr) => match stream::settle(repr, true).await {
+            Ok(stream::Settled::Whole(repr)) => Some(Some(etag_of(&served_content(repr)))),
+            Ok(stream::Settled::Streamed(repr)) => Some(stream::validator_etag(&repr)),
+            Err(e) => return Some(error_resp(config, &e)),
+        },
         // Only an answer that SAYS the resource is absent is absent: the bound endpoint's
         // NotFound, or no endpoint bound at all.
         Err(ikigai_core::Error::NotFound(_) | ikigai_core::Error::Unresolved(_)) => None,
@@ -2185,15 +2324,17 @@ async fn check_write_precondition(
     // If-Match: the resource must exist and (for a list) match. `*` = must exist.
     if let Some(im) = req.header("if-match") {
         match &current {
-            Some(etag) if im.trim() == "*" || etag_list_contains(im, etag, Compare::Strong) => {}
+            Some(_) if im.trim() == "*" => {}
+            Some(Some(etag)) if etag_list_contains(im, etag, Compare::Strong) => {}
             _ => return failed("if-match precondition failed"),
         }
     }
     // If-None-Match: `*` = must NOT exist (create-only); a list must NOT match.
     if let Some(inm) = req.header("if-none-match") {
         let hit = match &current {
-            Some(etag) => inm.trim() == "*" || etag_list_contains(inm, etag, Compare::Weak),
-            None => false,
+            Some(_) if inm.trim() == "*" => true,
+            Some(Some(etag)) => etag_list_contains(inm, etag, Compare::Weak),
+            _ => false,
         };
         if hit {
             return failed("if-none-match precondition failed");
@@ -2363,15 +2504,7 @@ fn method_not_allowed(allow: String) -> Resp {
 fn read_resp(req: &HttpRequest, served: Served, freshness: Freshness, vary: Vec<String>) -> Resp {
     let repr = &served.repr;
     let etag = etag_of(repr);
-    // Native-only: `ikigai-web` is the inbound HTTP transport (a tokio TcpListener), so it has
-    // no wasm build and no kernel handle to take an injected Clock from here. Wall-clock now
-    // is what turns an `Expiry::At` deadline into a `max-age` a remote cache counts down.
-    #[allow(clippy::disallowed_methods)]
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let cc = Some(cache_control_of(repr.expiry, freshness, now));
+    let cc = Some(cache_control_of(repr.expiry, freshness, wall_clock_ms()));
     if let Some(inm) = req.header("if-none-match") {
         if if_none_match_hit(inm, &etag) {
             let mut resp = Resp {
@@ -2392,6 +2525,20 @@ fn read_resp(req: &HttpRequest, served: Served, freshness: Freshness, vary: Vec<
     };
     served.answer(&mut resp);
     resp
+}
+
+/// Wall-clock now, in milliseconds since the epoch: what turns an `Expiry::At` deadline into a
+/// `max-age` a remote cache counts down.
+///
+/// Native-only: `ikigai-web` is the inbound HTTP transport (a tokio TcpListener), so it has no
+/// wasm build and no kernel handle to take an injected Clock from here. The function is the
+/// smallest item the opt-out can sit on, and it reads the clock and nothing else.
+#[allow(clippy::disallowed_methods)]
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// A write response: a Sink or Delete returning no body → 204; otherwise 200 with whatever
@@ -2551,12 +2698,29 @@ fn private_cache_control(value: &str) -> String {
 }
 
 /// A strong ETag: a content hash over the representation's type + bytes (quoted, per
-/// RFC 9110). Changes iff the representation's content changes.
+/// RFC 9110). Changes iff the representation's content changes. See [`etag_from`].
 fn etag_of(repr: &ikigai_core::Representation) -> String {
+    etag_from(&repr.repr_type, &ikigai_core::ContentId::of(&repr.bytes))
+}
+
+/// The strong ETag of content `id` served as `repr_type`: a hash over the type's canonical
+/// form and the content id. One rule whatever the body's shape (ledger #2244), so a buffer
+/// and a streamed body of the same bytes and type carry the same tag, and a streamed body
+/// whose producer knows its content id ([`Replay::validator`](ikigai_core::Replay::validator),
+/// what a spill computes while it writes) has a tag without being read.
+///
+/// ```text
+/// "<hex of blake3(canonical type, 0x00, the 32-byte content id)>"
+/// ```
+///
+/// Before ledger #2244 the hash ran over the bytes themselves rather than their id, so every
+/// tag changed once with it: a cache revalidates each stored answer once (a `200` where it
+/// would have had a `304`) and is right from then on.
+fn etag_from(repr_type: &ikigai_core::ReprType, id: &ikigai_core::ContentId) -> String {
     let mut h = blake3::Hasher::new();
-    h.update(repr.repr_type.canonical().as_bytes());
-    h.update(&[0]); // domain separator between type and body
-    h.update(&repr.bytes);
+    h.update(repr_type.canonical().as_bytes());
+    h.update(&[0]); // domain separator between type and content
+    h.update(id.as_bytes());
     format!("\"{}\"", h.finalize().to_hex())
 }
 
@@ -2644,7 +2808,7 @@ fn cache_control_of(expiry: ikigai_core::Expiry, freshness: Freshness, now_ms: u
 /// write to this very IRI, so a resource that declares Sink or Delete is out; one that
 /// declares nothing cannot be said not to. And the thread names the CANONICAL target, so an
 /// aliased name compares unequal and is treated as threaded — the safe way to be wrong.
-fn self_contained(repr: &ikigai_core::Representation, iri: &Iri, declared: &[Verb]) -> bool {
+fn self_contained<B>(repr: &ikigai_core::Representation<B>, iri: &Iri, declared: &[Verb]) -> bool {
     repr.threads().iter().all(|t| t.as_str() == iri.as_str())
         && !declared.is_empty()
         && !declared.iter().any(|v| v.is_mutating())
@@ -2888,6 +3052,7 @@ fn reason_phrase(status: u16) -> &'static str {
         412 => "Precondition Failed",
         413 => "Payload Too Large",
         415 => "Unsupported Media Type",
+        416 => "Range Not Satisfiable",
         421 => "Misdirected Request",
         422 => "Unprocessable Content",
         429 => "Too Many Requests",
@@ -3520,7 +3685,7 @@ fn not_acceptable(faces: &Faces, explicit: Option<&str>, req: &HttpRequest) -> R
 }
 
 /// The representation's media type as a header value.
-fn media_type_of(repr: &ikigai_core::Representation) -> String {
+fn media_type_of<B>(repr: &ikigai_core::Representation<B>) -> String {
     repr.repr_type.to_string()
 }
 
@@ -3973,7 +4138,7 @@ async fn write_within<S: AsyncWrite + Unpin>(
 
 /// Write the response and close the connection.
 async fn write<S: AsyncWrite + Unpin>(sock: &mut S, resp: Resp) -> std::io::Result<()> {
-    let head = head_of(&resp, Some(resp.body.len()));
+    let head = head_of(&resp, Some(resp.body.len() as u64));
     sock.write_all(head.as_bytes()).await?;
     if !resp.head_only {
         sock.write_all(&resp.body).await?;
@@ -3992,7 +4157,7 @@ async fn write<S: AsyncWrite + Unpin>(sock: &mut S, resp: Resp) -> std::io::Resu
 /// rather than send that length: it is optional, a `304` built from an `If-None-Match` hit has
 /// no content to measure, and a wrong one (a `0`, as this used to send) misleads a cache that
 /// updates its stored response from the `304`'s headers. A HEAD of either is the same head.
-fn head_of(resp: &Resp, content_length: Option<usize>) -> String {
+fn head_of(resp: &Resp, content_length: Option<u64>) -> String {
     let mut head = format!("HTTP/1.1 {} {}\r\n", resp.status, resp.reason);
     for (name, value) in header_fields(resp, content_length) {
         head.push_str(&format!("{name}: {value}\r\n"));
@@ -4005,7 +4170,7 @@ fn head_of(resp: &Resp, content_length: Option<usize>) -> String {
 /// on a `204` or `304` (see [`head_of`]). No `Connection`: that is the connection's business, not
 /// the answer's, and HTTP/2 and HTTP/3 forbid it. One list for both writers, the hand-written
 /// [`head_of`] and the hyper door ([`door`]), so they cannot drift apart.
-fn header_fields(resp: &Resp, content_length: Option<usize>) -> Vec<(&str, String)> {
+fn header_fields(resp: &Resp, content_length: Option<u64>) -> Vec<(&str, String)> {
     let content_length = content_length.filter(|_| !matches!(resp.status, 204 | 304));
     let mut fields = Vec::new();
     if !resp.content_type.is_empty() {

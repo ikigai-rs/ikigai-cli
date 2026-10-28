@@ -680,6 +680,27 @@ change them (a bad line stops the door at start-up, naming it):
 
 The banner names the limits in force (`rate limits per client: …`).
 
+**Large answers stream, and upload routes spill to disk** (ledger #2244). An answer is
+written as it is read, framed by `Content-Length` when its length is known and chunked when
+it is not, and a `GET` of a seekable body with a strong validator answers byte ranges (`206`,
+`416`). On Unix the door installs a file-backed spill under the config home,
+`<config home>/spill/http-<port>` (made `0700`, never `TMPDIR`), so an **upload route** takes
+a body larger than memory: written to disk as it arrives, hashed while written, and handed to
+the Sink as `content=b3:…`. A caller spills only when its capability holds
+`urn:cap:stream:spill:<bytes>` (grant it with `--cap`); without one, an upload route takes the
+body into memory under `--max-body` like any route. The `config.toml` keys (a bad line stops
+the door at start-up, naming it):
+
+| key | default | what it does |
+|---|---|---|
+| `http.upload` | none | one line per route, `"<path pattern> <largest body in bytes>"`, the route grammar of `--routes` |
+| `http.upload_min_rate` | 16384 | bytes a second an upload must keep once its grace has passed; behind it, `408` and the spill removed |
+| `http.upload_grace` | 30 | seconds an upload may take before that rate applies |
+| `http.spill_ceiling` | 1073741824 | the most one request may spill, whatever its grant |
+| `http.spill_total` | 4294967296 | the most every upload in flight may hold at once; past it, `503` |
+
+The banner names the upload routes and the spill directory.
+
 > **Renamed in 0.1.20.** This shipped as a bare `urn:foaf` in 0.1.19 — an invented
 > top-level namespace rather than one we own. The old name still resolves, through an
 > `exact` rule in the host's alias table (`urn:kernel:aliases` lists it), so an existing
