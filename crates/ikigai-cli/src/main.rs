@@ -30,6 +30,8 @@ mod route_load;
 mod show;
 #[cfg(not(target_family = "wasm"))]
 mod tui;
+#[cfg(all(feature = "embedded", feature = "web"))]
+mod uploads;
 
 const USAGE: &str = "\
 ikigai — resource-resolution REPL
@@ -5089,10 +5091,30 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
     // carries `urn:iki:foaf` and the transreption chain it issues through (the `/foaf`
     // face on the public edge), which the QUIC composer does not. And it stays the PUBLIC
     // kernel — a mount widens reach, never authority.
-    let kernel = std::sync::Arc::new(ikigai_embedded::kernel_for_with_mounts(
-        "Remote (HTTP)",
-        resolved,
-    ));
+    let kernel = ikigai_embedded::kernel_for_with_mounts("Remote (HTTP)", resolved);
+    // THE SPILL AND THE UPLOAD ROUTES (ledger #2244), from the config home: a file-backed spill
+    // facility over a directory of this door's own, so an upload route takes a body larger than
+    // memory. A line that does not parse stops the door, naming it.
+    let upload_config = match uploads::uploads_from(
+        &[
+            ikigai_embedded::config::entries_under(uploads::ROUTE_KEY),
+            ikigai_embedded::config::entries_under("http.spill"),
+        ]
+        .concat(),
+    ) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!(
+                "ikigai: {e} (in {})",
+                ikigai_embedded::config::config_path().display()
+            );
+            std::process::exit(2);
+        }
+    };
+    let (kernel, spill) = install_spill(kernel, &upload_config, addr.port());
+    let upload_note =
+        uploads::describe(&upload_config, spill.as_ref().map(|(dir, _)| dir.as_path()));
+    let kernel = std::sync::Arc::new(kernel);
     // The door's ONE workspace watch: a stylesheet or context replaced on disk is served on
     // the next request, no unit restart (ledger #246: the edge kept rendering a replaced
     // `foaf.xsl` until `systemctl restart`). Held for as long as this function serves.
@@ -5266,7 +5288,7 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
     };
     let addr = listener.local_addr().unwrap_or(addr);
     eprintln!(
-        "ikigai: serving HTTP on {addr}  ({posture}; {route_note}; {cors_note}; {push_note}{proxy_note}; {limits_note}; terminate TLS at your proxy)  (Ctrl-C to stop)"
+        "ikigai: serving HTTP on {addr}  ({posture}; {route_note}; {cors_note}; {push_note}{proxy_note}; {limits_note}; {upload_note}; terminate TLS at your proxy)  (Ctrl-C to stop)"
     );
     // ★ The public door records its posture like any other — and `urn:host:posture` is
     // REACHABLE here (`GET /host/posture`) and REFUSED, because the public capability does
@@ -5294,15 +5316,111 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
             Vec::new()
         },
     });
-    match runtime.block_on(ikigai_web::serve_with_listener(
-        kernel, cap_fn, listener, config,
-    )) {
+    let served = match spill {
+        Some((_, store)) if !upload_config.routes.is_empty() => {
+            let uploads = upload_config.routes.iter().fold(
+                ikigai_web::Uploads::new(store)
+                    .min_rate(upload_config.min_rate, upload_config.grace),
+                |uploads, (pattern, max)| uploads.route(pattern.clone(), *max),
+            );
+            runtime.block_on(ikigai_web::serve_with_uploads(
+                kernel, cap_fn, listener, config, uploads,
+            ))
+        }
+        _ => runtime.block_on(ikigai_web::serve_with_listener(
+            kernel, cap_fn, listener, config,
+        )),
+    };
+    match served {
         Ok(()) => std::process::exit(0),
         Err(e) => {
             eprintln!("ikigai: HTTP serve error: {e}");
             std::process::exit(1);
         }
     }
+}
+
+/// The HTTP door's spill (ledger #2244): ikigai-fs's `FileSpill` over
+/// `<config home>/spill/http-<port>` (`http-0-<pid>` for an ephemeral port), made `0700` if it is
+/// missing, with `config`'s per-request ceiling, and the content store an upload is held in
+/// while its Sink runs. A directory of this door's own, because a `FileSpill` removes the spill
+/// files it finds in its directory when it opens it: two processes must never share one, and two
+/// doors cannot both hold one port. Only under a config home that exists; never `TMPDIR`.
+///
+/// A door with no upload routes serves without a spill when the directory cannot be made (and
+/// says why); one with upload routes refuses to start.
+#[cfg(all(feature = "embedded", feature = "web", unix))]
+fn install_spill(
+    kernel: ikigai_core::Kernel,
+    config: &uploads::UploadConfig,
+    port: u16,
+) -> (
+    ikigai_core::Kernel,
+    Option<(
+        std::path::PathBuf,
+        std::sync::Arc<ikigai_core::MemoryContentStore>,
+    )>,
+) {
+    use std::os::unix::fs::DirBuilderExt;
+    let Some(home) = ikigai_embedded::config::config_home().filter(|home| home.is_dir()) else {
+        if !config.routes.is_empty() {
+            eprintln!("ikigai: upload routes need a config home to spill under");
+            std::process::exit(2);
+        }
+        return (kernel, None);
+    };
+    let name = match port {
+        0 => format!("http-0-{}", std::process::id()),
+        port => format!("http-{port}"),
+    };
+    let dir = home.join("spill").join(name);
+    let spill = std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .map_err(|e| e.to_string())
+        .and_then(|()| ikigai_fs::FileSpill::new(&dir).map_err(|e| e.to_string()));
+    match spill {
+        Ok(spill) => {
+            let store = std::sync::Arc::new(ikigai_core::MemoryContentStore::new(config.total));
+            let kernel = kernel
+                .with_spill(std::sync::Arc::new(spill))
+                .with_stream_spill(0, config.ceiling)
+                .with_content_store(store.clone());
+            (kernel, Some((dir, store)))
+        }
+        Err(e) if config.routes.is_empty() => {
+            eprintln!("ikigai: serving without a spill ({}: {e})", dir.display());
+            (kernel, None)
+        }
+        Err(e) => {
+            eprintln!(
+                "ikigai: upload routes need a spill directory ({}: {e})",
+                dir.display()
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Off Unix there is no file-backed spill facility, so there are no upload routes either.
+#[cfg(all(feature = "embedded", feature = "web", not(unix)))]
+fn install_spill(
+    kernel: ikigai_core::Kernel,
+    config: &uploads::UploadConfig,
+    _port: u16,
+) -> (
+    ikigai_core::Kernel,
+    Option<(
+        std::path::PathBuf,
+        std::sync::Arc<ikigai_core::MemoryContentStore>,
+    )>,
+) {
+    if !config.routes.is_empty() {
+        eprintln!("ikigai: upload routes need a spill facility, which is Unix only");
+        std::process::exit(2);
+    }
+    (kernel, None)
 }
 
 #[cfg(not(all(feature = "embedded", feature = "web")))]

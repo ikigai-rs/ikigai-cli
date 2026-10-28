@@ -3034,6 +3034,7 @@ dependencies = [
  "ikigai-discovery",
  "ikigai-embedded",
  "ikigai-engine",
+ "ikigai-fs",
  "ikigai-http",
  "ikigai-intake",
  "ikigai-ipc",
@@ -3743,10 +3744,12 @@ dependencies = [
 name = "ikigai-web"
 version = "0.2.1"
 dependencies = [
+ "async-trait",
  "blake3",
  "bytes",
  "chrono",
  "futures",
+ "futures-core",
  "http",
  "http-body",
  "http-body-util",
@@ -3754,6 +3757,8 @@ dependencies = [
  "hyper-util",
  "ikigai-core",
  "ikigai-fn",
+ "ikigai-fs",
+ "ikigai-http",
  "libc",
  "serde_json",
  "tokio",

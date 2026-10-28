@@ -69,6 +69,9 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
 
 ## How it is tested
 
+- `crates/ikigai-web/tests/streams.rs` and `tests/uploads.rs` pin that a `416 Range Not
+  Satisfiable` and an upload's `413 Payload Too Large` are answered as the same page (`lang`,
+  `main`, `h1` naming the status) for a browser.
 - `crates/ikigai-web/tests/error_pages.rs` (7 tests) and the unit tests in `error_page.rs` pin the
   page's shape (`lang`, title, `main`, `h1`), escaping, which clients get a page, `Vary: Accept`,
   and that a JSON door and a success are left alone. `crates/ikigai-web/tests/door_error_page.rs`

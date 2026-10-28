@@ -13,16 +13,24 @@
 //! a QUIC server such as h3-quinn) adapts its request stream into an `http::Request<impl Body>`,
 //! calls [`exchange`], and frames the answer its own way: no second door.
 //!
+//! An answer that streams (ledger #2244, the private `stream` module) is framed by
+//! `Content-Length` when its length is known and chunked when it is not, and a producer that
+//! fails part-way ends it short: hyper then closes the connection without the final chunk, so
+//! a client sees the failure. An upload route (the private `upload` module) spills its body
+//! instead of reading it into memory.
+//!
 //! Two things in an answer are HTTP/1.1's, and harmless elsewhere: the status's reason phrase
 //! rides as hyper's `ReasonPhrase` extension (HTTP/2 and HTTP/3 send no reason phrase), and an
 //! answer that leaves the request body unread carries the [`Unread`] extension, which tells an
 //! HTTP/1.1 listener the connection cannot be reused.
 
-use crate::{answer, header_fields, parse_target, EdgeConfig, HttpRequest, Reply, Resp, Shared};
+use crate::stream::{Sending, StreamFailed};
+use crate::{
+    answer, header_fields, parse_target, upload, EdgeConfig, HttpRequest, Reply, Resp, Shared,
+};
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt, LengthLimitError, Limited};
-use std::convert::Infallible;
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -48,21 +56,28 @@ pub(crate) enum DoorBody {
     /// The push stream: each item as it arrives, until the sender is dropped. Its length is not
     /// known, so HTTP/1.1 frames it chunked.
     Stream(tokio::sync::mpsc::Receiver<Bytes>),
+    /// An endpoint's answer as it is read (ledger #2244): framed by its length when known,
+    /// chunked otherwise. A failure part-way is this body's error, and hyper ends the answer
+    /// short and closes the connection.
+    Streamed(Sending),
 }
 
 impl Body for DoorBody {
     type Data = Bytes;
-    type Error = Infallible;
+    type Error = StreamFailed;
 
     fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+    ) -> Poll<Option<Result<Frame<Bytes>, StreamFailed>>> {
         match self.get_mut() {
             DoorBody::Full(content) => Poll::Ready(content.take().map(|b| Ok(Frame::data(b)))),
             DoorBody::Stream(events) => events
                 .poll_recv(cx)
                 .map(|event| event.map(|b| Ok(Frame::data(b)))),
+            DoorBody::Streamed(sending) => sending
+                .poll_chunk(cx)
+                .map(|chunk| chunk.map(|c| c.map(Frame::data))),
         }
     }
 
@@ -75,6 +90,10 @@ impl Body for DoorBody {
             DoorBody::Full(None) => SizeHint::with_exact(0),
             DoorBody::Full(Some(content)) => SizeHint::with_exact(content.len() as u64),
             DoorBody::Stream(_) => SizeHint::default(),
+            DoorBody::Streamed(sending) => match sending.length() {
+                Some(length) => SizeHint::with_exact(length),
+                None => SizeHint::default(),
+            },
         }
     }
 }
@@ -87,41 +106,52 @@ pub(crate) async fn exchange<B>(
     peer: Option<IpAddr>,
 ) -> http::Response<DoorBody>
 where
-    B: Body,
-    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-{
-    match intake(&shared.config, req, peer).await {
-        Ok(req) => match answer(shared, req).await {
-            Reply::Whole(resp) => render(resp),
-            Reply::Stream { head, events } => framed(&head, None, DoorBody::Stream(events)),
-        },
-        Err(refused) => {
-            let mut out = render(*refused);
-            out.extensions_mut().insert(Unread);
-            out
-        }
-    }
-}
-
-/// Read one request into an [`HttpRequest`], under the door's bounds, exactly as the
-/// hand-written [`crate::read_request`] does, with the framing already settled by the listener.
-/// A refusal is the answer to send: `text/plain`, the head alone for `HEAD`, and no edge
-/// policy, since `read_request`'s refusals never carried one.
-async fn intake<B>(
-    config: &EdgeConfig,
-    req: http::Request<B>,
-    peer: Option<IpAddr>,
-) -> Result<HttpRequest, Box<Resp>>
-where
-    B: Body,
+    B: Body + Send + 'static,
+    B::Data: Send,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     let (parts, body) = req.into_parts();
-    let head = parts.method == http::Method::HEAD;
-    let refuse = |status: u16, reason: &'static str, why: &str| {
-        let resp = Resp::text(status, reason, why);
-        Box::new(if head { resp.into_head() } else { resp })
+    let head = match head_of(&parts, peer) {
+        Ok(head) => head,
+        Err(refused) => return unread(render(*refused)),
     };
+    // An upload route, for a caller that may spill: the body goes to disk as it arrives.
+    if let Some(plan) = upload::plan(shared, &head) {
+        return upload::exchange(shared, head, body, plan).await;
+    }
+    match read_body(&shared.config, head, body).await {
+        Ok(req) => reply(answer(shared, req).await),
+        Err(refused) => unread(render(*refused)),
+    }
+}
+
+/// A door's answer as an `http::Response`.
+pub(crate) fn reply(reply: Reply) -> http::Response<DoorBody> {
+    match reply {
+        Reply::Whole(resp) => render(resp),
+        Reply::Stream { head, events } => framed(&head, None, DoorBody::Stream(events)),
+    }
+}
+
+/// `out`, marked as given before the request body was read to its end ([`Unread`]).
+pub(crate) fn unread(mut out: http::Response<DoorBody>) -> http::Response<DoorBody> {
+    out.extensions_mut().insert(Unread);
+    out
+}
+
+/// A refusal decided on the request's head: `text/plain`, the head alone for `HEAD`.
+pub(crate) fn refusal(head: bool, status: u16, reason: &'static str, why: &str) -> Box<Resp> {
+    let resp = Resp::text(status, reason, why);
+    Box::new(if head { resp.into_head() } else { resp })
+}
+
+/// The request's head as an [`HttpRequest`] with no body yet, under the head bound, exactly
+/// as the hand-written [`crate::read_request`] reads it, with the framing already settled by
+/// the listener. A refusal is the answer to send: `text/plain`, the head alone for `HEAD`, and
+/// no edge policy, since `read_request`'s refusals never carried one.
+fn head_of(parts: &http::request::Parts, peer: Option<IpAddr>) -> Result<HttpRequest, Box<Resp>> {
+    let head = parts.method == http::Method::HEAD;
+    let refuse = |status, reason, why: &str| refusal(head, status, reason, why);
     let target = parts.uri.path_and_query().map_or("/", |pq| pq.as_str());
     let (path, query) =
         parse_target(target.as_bytes()).map_err(|why| refuse(400, "Bad Request", why))?;
@@ -142,18 +172,36 @@ where
             (name.as_str().to_string(), value)
         })
         .collect();
+    Ok(HttpRequest {
+        method: parts.method.as_str().to_string(),
+        path,
+        query,
+        headers,
+        body: Vec::new(),
+        peer,
+    })
+}
+
+/// Read the body of `req` into it, under the door's body bound and deadline.
+async fn read_body<B>(
+    config: &EdgeConfig,
+    mut req: HttpRequest,
+    body: B,
+) -> Result<HttpRequest, Box<Resp>>
+where
+    B: Body,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let head = req.method == "HEAD";
+    let refuse = |status, reason, why: &str| refusal(head, status, reason, why);
     let max = config.max_body_bytes;
     // REFUSE, DO NOT TRUNCATE, and decide on the declared length before reading a byte, so the
     // refusal costs nothing and a client holding its body back for `100 Continue` is never
     // invited (HTTP/1.1 sends the `100` only when the body is first read, below). A listener
     // that has already checked the framing (hyper refuses an unreadable `Content-Length` with
     // `400` itself) will never send an unparseable one here; another listener might.
-    if let Some(declared) = parts.headers.get(http::header::CONTENT_LENGTH) {
-        match declared
-            .to_str()
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-        {
+    if let Some(declared) = req.header("content-length") {
+        match declared.trim().parse::<u64>().ok() {
             None => return Err(refuse(400, "Bad Request", "malformed Content-Length")),
             Some(n) if n > max as u64 => {
                 return Err(refuse(413, "Payload Too Large", "request body too large"))
@@ -176,19 +224,23 @@ where
         Ok(Err(_)) => return Err(refuse(400, "Bad Request", "incomplete request body")),
         Ok(Ok(collected)) => collected.to_bytes().to_vec(),
     };
-    Ok(HttpRequest {
-        method: parts.method.as_str().to_string(),
-        path,
-        query,
-        headers,
-        body,
-        peer,
-    })
+    req.body = body;
+    Ok(req)
 }
 
-/// A whole answer as an `http::Response`: its content framed by length, or none for `HEAD`.
-fn render(mut resp: Resp) -> http::Response<DoorBody> {
-    let length = resp.body.len();
+/// An answer as an `http::Response`: its content framed by length (or chunked, for a stream
+/// of unknown length), or none for `HEAD`.
+pub(crate) fn render(mut resp: Resp) -> http::Response<DoorBody> {
+    if let Some(sending) = resp.stream.take() {
+        let length = sending.length();
+        let body = if resp.head_only {
+            DoorBody::Full(None)
+        } else {
+            DoorBody::Streamed(sending)
+        };
+        return framed(&resp, length, body);
+    }
+    let length = resp.body.len() as u64;
     let body = if resp.head_only || resp.body.is_empty() {
         DoorBody::Full(None)
     } else {
@@ -200,7 +252,7 @@ fn render(mut resp: Resp) -> http::Response<DoorBody> {
 /// `resp`'s status, reason and [`header_fields`] around `body`. `content_length` is `None` only
 /// for the push stream. A header field that cannot be framed (a byte HTTP forbids) is the
 /// door's own bug, answered `500` naming it rather than dropped from the answer in silence.
-fn framed(resp: &Resp, content_length: Option<usize>, body: DoorBody) -> http::Response<DoorBody> {
+fn framed(resp: &Resp, content_length: Option<u64>, body: DoorBody) -> http::Response<DoorBody> {
     let mut out = http::Response::new(body);
     *out.status_mut() =
         http::StatusCode::from_u16(resp.status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);

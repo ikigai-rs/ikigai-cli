@@ -279,6 +279,54 @@ transforms the current representation before it is Sunk. An unknown patch type i
 `client` and `principal` (above), so a patched resource records who wrote it and when. (Before
 0.1.62 it carried none of the three, and a patched resource was written anonymously.)
 
+## Streams: large answers, ranges and uploads
+
+Since ledger #2244 the door reads every answer through the kernel's body path
+(`Kernel::issue_body`) and writes it as it reads it, so a 1 GiB download holds about one
+chunk in memory. What is served whole and what streams depends only on the body's shape:
+
+| body | served |
+|---|---|
+| a buffer | whole, exactly as before (`ETag`, `304`, `Content-Length`) |
+| an `HTTP_ENTITY` envelope | whole |
+| a seekable or replayable body of known length up to 1 MiB, with no content id (a small file) | whole |
+| any other replayable body, or a one-shot stream | streamed |
+
+A streamed answer is framed by `Content-Length` when its length is known and chunked when
+it is not. **A failure part-way is visible**: a chunked answer ends without its final
+zero-length chunk, a measured one ends short, and the connection closes, so a client never
+reads a shorter body as the whole one.
+
+A streamed body has a strong `ETag` only when its producer knows its content id (a spill
+does, since it hashed while writing). The tag is the same one a buffer of those bytes and
+that type carries: since ledger #2244 every `ETag` is a hash of the type and the content id
+rather than the bytes themselves, so each tag a cache holds changes once (one `200` where a
+`304` would have been) and is stable after.
+
+**Ranges.** A `GET` over a body that is seekable, knows its length and has a strong
+validator says `Accept-Ranges: bytes` and answers one byte range with `206 Partial Content`
+and `Content-Range`, or `416 Range Not Satisfiable` (with `Content-Range: bytes */<length>`)
+past the end. `If-Range` is compared strongly against the `ETag`; a mismatch or a date
+answers the whole body. A request for several ranges gets the whole body with `200`
+(`multipart/byteranges` is not served), as does an unparseable `Range`. A buffer, a one-shot
+stream, or a body without a validator answers `200` with the whole body and no
+`Accept-Ranges`. The header grammar is `ikigai_http::range`.
+
+**Uploads.** `serve_with_uploads` takes an `Uploads`: upload routes, each a path pattern and
+its own `max_body_bytes`, and the content store their spills are held in (the store the
+kernel resolves content ids through, `Kernel::with_content_store`). A `POST` or `PUT` to an
+upload route, from a caller holding `urn:cap:stream:spill:<bytes>`, is written through the
+kernel's spill facility (`Kernel::with_spill`, e.g. ikigai-fs's `FileSpill`) as it arrives,
+hashed while written, and the Sink is issued with `content=b3:…`; it reads it with
+`Invocation::content_body`. Each bound refuses, never truncates: the route's own bound and
+the caller's grant on `Content-Length` (`413`, before a byte is read), a minimum rate after a
+grace (`408`, the spill removed; default 16 KiB/s after 30 s, `Uploads::min_rate`), and the
+store's bound on everything held at once (`503`). An upload route takes its body by
+`Content-Length`: `Transfer-Encoding` there is `501`. A caller with no spill grant is served
+as on any route, its body in memory under `max_body_bytes`. `examples/web_stream_rss.rs`
+measures both directions: a 1 GiB download streamed and a 1 GiB upload spilled each peak
+at about 9 MB resident, where held in memory they peak at 2.2 GB and 3.2 GB.
+
 ## Server push
 
 A page learns that something it shows changed by holding one **event stream** open instead of
@@ -371,7 +419,8 @@ an over-bound request is **refused rather than trimmed to fit**:
   `400`, not a zero-length body; a body shorter than declared is a `400`, not a partial
   submission; bytes past `Content-Length` are the next pipelined request and never
   join this one. A **chunked** body is taken under the same cap: it is refused with
-  `413` the moment it passes `max_body_bytes`, never cut to fit. A transfer coding that
+  `413` the moment it passes `max_body_bytes`, never cut to fit (an upload route refuses
+  a chunked body with `501`; see "Streams" above). A transfer coding that
   does not end in `chunked` is a `400`. A request hyper cannot parse is answered by
   hyper (`400`, `431`, `414`) and never reaches the door.
 - **Time.** The request line and headers must arrive within `header_timeout`

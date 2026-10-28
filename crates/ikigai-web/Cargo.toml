@@ -45,6 +45,13 @@ serde_json = { workspace = true }
 # no zone database needed here (the edge always stamps UTC).
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
+# The streams arc's HTTP half (ledger #2244): the one RFC 9110 `Range`, `Content-Range` and
+# `If-Range` grammar (`ikigai_http::range`, ledger #2243), so the door answers `206`/`416` without
+# a parser of its own. 0.4.0 is where the `range` module first ships.
+ikigai-http = { workspace = true }
+# A streamed body is futures-core's `Stream`; the door polls it frame by frame.
+futures-core = "0.3"
+
 # The accept loop classifies its errors by errno (EMFILE, ENFILE, ECONNABORTED, …), which
 # `io::ErrorKind` does not name: `EMFILE` has no kind of its own (ledger #720).
 [target.'cfg(unix)'.dependencies]
@@ -52,3 +59,8 @@ libc = { workspace = true }
 
 [dev-dependencies]
 futures = { workspace = true }
+# The upload tests spill through the real file-backed facility, as the `ikigai` binary does.
+ikigai-fs = { workspace = true }
+async-trait = "0.1"
+# `start_paused` and `advance`: the upload's minimum-rate deadline is tested on a paused clock.
+tokio = { version = "1", features = ["test-util"] }

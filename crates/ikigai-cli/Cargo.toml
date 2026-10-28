@@ -16,7 +16,7 @@ default = ["embedded", "ipc"]
 embedded = ["dep:ikigai-embedded"]
 ipc = ["dep:ikigai-ipc"]   # Unix only; the dep is empty elsewhere
 quic = ["dep:ikigai-quic", "dep:ikigai-discovery", "dep:ikigai-wire"] # opt-in; pulls quinn/rustls/tokio
-web = ["dep:ikigai-web", "dep:tokio", "dep:serde_yaml", "dep:tokio-rustls"] # opt-in inbound HTTP face; pulls Tokio (like quic). With `quic` too, it also opens a layer door's HTTPS front (`--layers-https`), whose TLS is tokio-rustls
+web = ["dep:ikigai-web", "dep:tokio", "dep:serde_yaml", "dep:tokio-rustls", "dep:ikigai-fs"] # opt-in inbound HTTP face; pulls Tokio (like quic). With `quic` too, it also opens a layer door's HTTPS front (`--layers-https`), whose TLS is tokio-rustls
 
 # The durable RDF store (`urn:iki:store:*`) and the work ledger that rides on it. Opt-in
 # like `quic` and `web`, and it implies `embedded` because the store is bound in the
@@ -67,6 +67,10 @@ ikigai-wire = { workspace = true, optional = true }
 # (the standalone server repo of the same directory name publishes as `ikigai-web-server`).
 # Gated behind `web`.
 ikigai-web = { workspace = true, optional = true }
+# The HTTP door's spill (ledger #2244): ikigai-fs's file-backed `FileSpill`, over a directory
+# under the config home, so an upload route can take a body larger than memory. Gated behind
+# `web`; `FileSpill` itself is Unix only.
+ikigai-fs = { workspace = true, optional = true }
 # A runtime for the `web` serve loop (ikigai-web is async). Feature-gated so the
 # default/wasm binary never pulls Tokio; matches the `quic` transport's posture.
 # net+time so the runtime's `enable_all()` has the io+time drivers on its own.
