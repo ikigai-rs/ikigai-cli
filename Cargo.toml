@@ -1007,7 +1007,10 @@ members = ["crates/*"]
 # 0.2.3: THE HTTP SPACE HONORS `http.max_response_bytes` (ledger #2479, PR #597). A FIX: `urn:http:*` is built
 # with ikigai-http 0.4.1's `space_with`, under the same configured byte budget as the native transport, so a
 # 12 MiB response under the 16 MiB default is answered instead of refused at the endpoint's own 8 MiB. The
-# floor is ikigai-http 0.4.1. A deploy change: rebuild --locked.
+# floor is ikigai-http 0.4.1. The lock moves (hand-minimal, no third-party edge moved): ikigai-core and
+# ikigai-vocab 0.2.2 -> 0.2.4 (the cache-key fix, ledger #2473), ikigai-http 0.4.2 (credentials stripped on a
+# cross-origin redirect, ledger #2459), ikigai-engine and ikigai-resolve 0.2.2 (pipes carry bodies, ledger
+# #2286), ikigai-text 0.4.1 (body-reading inputs, ledger #2468). A deploy change: rebuild --locked.
 #
 # 0.2.2: THE WEB DOOR STREAMS (ledger #2244, PR #595). ADDITIVE. Answers go through the body path:
 # `Content-Length` when the length is known, chunked when not (a producer failure ends with no final
