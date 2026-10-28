@@ -19,6 +19,7 @@ mod clipboard;
 mod front;
 #[cfg(feature = "embedded")]
 mod layer;
+mod output;
 #[cfg(feature = "quic")]
 mod quic;
 #[cfg(all(feature = "embedded", feature = "web"))]
@@ -32,6 +33,8 @@ mod show;
 mod tui;
 #[cfg(all(feature = "embedded", feature = "web"))]
 mod uploads;
+
+use output::{print, println};
 
 const USAGE: &str = "\
 ikigai — resource-resolution REPL

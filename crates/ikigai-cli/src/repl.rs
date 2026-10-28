@@ -3,7 +3,9 @@
 //! Used when stdout is not a terminal (piping, scripts, CI) or with `--plain`. `--quiet` is
 //! this REPL without its greeting, and without a prompt when stdin is not a terminal.
 
-use std::io::{self, Write};
+use std::io;
+
+use crate::output::{print, println};
 
 use ikigai_engine::{Action, CacheStats, Engine, HELP};
 
@@ -83,7 +85,6 @@ pub fn run(engine: Engine, topology: &[String], quiet: bool) -> i32 {
     loop {
         if prompting {
             print!("ikigai> ");
-            io::stdout().flush().ok();
         }
         line.clear();
         if stdin.read_line(&mut line).unwrap_or(0) == 0 {
@@ -100,7 +101,6 @@ pub fn run(engine: Engine, topology: &[String], quiet: bool) -> i32 {
             // scrollback and the kernel's state are untouched.
             Action::Clear => {
                 print!("\x1b[2J\x1b[H");
-                io::stdout().flush().ok();
             }
             Action::Output(entry) => {
                 match &entry.result {

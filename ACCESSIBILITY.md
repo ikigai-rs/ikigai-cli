@@ -69,6 +69,10 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
 
 ## How it is tested
 
+- `crates/ikigai-cli/tests/broken_pipe.rs` runs the binary with closed stdout and a
+  consumer that closes after reading a response: help, version, batches, and the line REPL
+  exit quietly on a broken pipe. On Linux it also checks that another stdout failure
+  produces an `ikigai:` diagnostic and a failing exit status.
 - `crates/ikigai-web/tests/streams.rs` and `tests/uploads.rs` pin that a `416 Range Not
   Satisfiable` and an upload's `413 Payload Too Large` are answered as the same page (`lang`,
   `main`, `h1` naming the status) for a browser.
