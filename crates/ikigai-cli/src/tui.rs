@@ -480,7 +480,7 @@ fn run_step(state: &mut State, engine: &Engine, idx: usize) {
                     .unwrap_or_default();
                 format!("{text}{tag}")
             }
-            Err(e) => format!("error: {e}"),
+            Err(e) => format!("error: {}", crate::restate_build_line(&e)),
         },
         Action::Help => HELP.to_string(),
         Action::Clear => {
@@ -1134,7 +1134,12 @@ fn submit(state: &mut State, engine: &Engine) -> bool {
             result: Ok(HELP.to_string()),
             cache: CacheStats::default(),
         }),
-        Action::Output(entry) => state.transcript.push(entry),
+        Action::Output(mut entry) => {
+            if let Err(err) = &mut entry.result {
+                *err = crate::restate_build_line(err).into_owned();
+            }
+            state.transcript.push(entry)
+        }
         // Drop the scrollback transcript; `state.history` (line recall) is untouched,
         // and the `clear` line itself was already pushed to it above.
         Action::Clear => state.transcript.clear(),

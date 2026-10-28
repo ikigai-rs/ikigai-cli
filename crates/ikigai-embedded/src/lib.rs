@@ -4864,6 +4864,13 @@ fn root_members(nature: &'static str) -> Vec<Arc<dyn Space>> {
         // JSON-LD operators (urn:jsonld:expand/compact/flatten) — linked natively (the heavy
         // json-ld tree is a browser-wasm concern, lazy-loaded there; native links it).
         Arc::new(ikigai_jsonld::space()) as Arc<dyn Space>,
+        // jq and CSV as resources (ledger #2481): `urn:json:query` runs a jq program over
+        // `src`, read through the kernel under the CALLER's capability, so binding it grants
+        // nothing a caller could not already read; `urn:json:from-csv`/`to-csv` are pure
+        // transreptors. Compose's `$j{<src> <program>}` is sugar for `urn:json:query`, so this
+        // is also what makes that marker resolve here. LOCAL root only, as decided at the hub
+        // (2026-10-28): the served doors serve what their routes and grants name, unchanged.
+        Arc::new(ikigai_json::space()) as Arc<dyn Space>,
         // SHACL validation (urn:shacl:validate) — rudof's validator, linked natively here.
         // The browser uses ikigai-shacl's lazy-loaded wasm module by default, or
         // shacl-engine (JS) behind `?shacl=js`.

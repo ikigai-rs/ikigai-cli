@@ -332,6 +332,50 @@ fn upgrade_command() -> String {
     command
 }
 
+/// The build line under an unresolved name, said as this binary can justify it (ledger
+/// #2481). ikigai-engine 0.2 words the line it hangs under an unresolved name (from
+/// [`upgrade_command`], ledger #288) as if the name were NEWER than this build: "a name newer
+/// than this build needs an upgrade". This build cannot know that. A name no release binds
+/// (until 0.2.3 that was `urn:json:query`) sent the reader to reinstall the binary they
+/// already had. So the faces replace the engine's sentence: this build binds no such name,
+/// and an upgrade helps only if a newer release exists, which `cargo search` shows.
+///
+/// ```text
+/// error: no endpoint resolved for urn:json:query
+///        this host is ikigai 0.2.2, and it binds no such name
+///        a newer release may bind it; if `cargo search ikigai-cli` names one past 0.2.2: cargo install --locked ikigai-cli
+/// ```
+///
+/// Only the exact sentence the engine builds from [`VERSION_LINE`] and [`upgrade_command`]
+/// is replaced, so a `--connect` engine (which names no build) and every other error pass
+/// through untouched.
+#[cfg(feature = "embedded")]
+fn restate_build_line(err: &str) -> std::borrow::Cow<'_, str> {
+    let upgrade = upgrade_command();
+    let engine = format!(
+        "this host is {VERSION_LINE}; a name newer than this build needs an upgrade: {upgrade}"
+    );
+    if !err.contains(&engine) {
+        return std::borrow::Cow::Borrowed(err);
+    }
+    // The engine's continuation indent (`SUGGESTION_INDENT`), which clears `error: `.
+    const INDENT: &str = "       ";
+    let version = env!("CARGO_PKG_VERSION");
+    std::borrow::Cow::Owned(err.replace(
+        &engine,
+        &format!(
+            "this host is {VERSION_LINE}, and it binds no such name\n{INDENT}a newer release \
+             may bind it; if `cargo search ikigai-cli` names one past {version}: {upgrade}"
+        ),
+    ))
+}
+
+/// Without `embedded` no engine names a build, so there is nothing to restate.
+#[cfg(not(feature = "embedded"))]
+fn restate_build_line(err: &str) -> std::borrow::Cow<'_, str> {
+    std::borrow::Cow::Borrowed(err)
+}
+
 use ikigai_engine::Engine;
 
 /// Per-role certificate-path overrides for QUIC, shared by `serve` and `--connect`.

@@ -191,6 +191,10 @@ const INHERITED: &[(&str, &str)] = &[
     ("http-put", "ikigai-http"),
     ("http-report", "ikigai-http"),
     ("ikigai-vocab", "ikigai-vocab"),
+    // ikigai-json 0.3 (ledger #2481): jq and the CSV pair, bound in the local root only.
+    ("json-from-csv", "ikigai-json"),
+    ("json-query", "ikigai-json"),
+    ("json-to-csv", "ikigai-json"),
     ("jsonld-compact", "ikigai-jsonld"),
     ("jsonld-expand", "ikigai-jsonld"),
     ("jsonld-flatten", "ikigai-jsonld"),
@@ -1007,6 +1011,57 @@ fn the_http_door_serves_no_owner_only_resource() {
         "decisions",
     ] {
         assert!(door.contains(id), "`{id}` is missing from the HTTP door");
+    }
+}
+
+/// `urn:json:*` (ikigai-json) is bound in the REPL's root and on no served door (ledger #2481).
+///
+/// Not owner-only by nature: `urn:json:query` reads `src` under the caller's capability, and
+/// the CSV pair is pure. It is pinned because the hub decided (2026-10-28) that binding it in the
+/// local root changes no served door: the HTTP door and the QUIC served kernel, with every face
+/// a grant can open, serve exactly what they served before. A door that should serve it is a
+/// separate decision, and this test is where that decision has to be made.
+#[test]
+fn the_json_space_is_bound_in_the_local_root_and_on_no_served_door() {
+    const JSON: [&str; 3] = ["json-query", "json-from-csv", "json-to-csv"];
+    let root: BTreeSet<String> = walked(&root_kernel()).into_values().collect();
+    for id in JSON {
+        assert!(root.contains(id), "`{id}` is not bound on the REPL root");
+    }
+    let every_face = ikigai_embedded::ServedSurface {
+        personal: false,
+        wire_eval: true,
+        llm: true,
+    };
+    let doors = [
+        ("the HTTP door", http_kernel()),
+        (
+            "the QUIC served kernel",
+            ikigai_embedded::served_kernel(
+                "conformance",
+                ikigai_embedded::ServedSurface::default(),
+            ),
+        ),
+        (
+            "the QUIC served kernel with every face open",
+            ikigai_embedded::served_kernel("conformance", every_face),
+        ),
+        (
+            "the calendar-only served kernel",
+            ikigai_embedded::served_kernel(
+                "conformance",
+                ikigai_embedded::ServedSurface {
+                    personal: true,
+                    ..every_face
+                },
+            ),
+        ),
+    ];
+    for (door, kernel) in doors {
+        let served: BTreeSet<String> = walked(&kernel).into_values().collect();
+        for id in JSON {
+            assert!(!served.contains(id), "`{id}` is bound on {door}");
+        }
     }
 }
 

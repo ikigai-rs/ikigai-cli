@@ -1004,6 +1004,20 @@ members = ["crates/*"]
 #
 # 0.1.36 was THE SECURITY RELEASE from the review-value experiment (ledger #723, #733, #741, #738).
 #
+# Unreleased, after 0.2.3: THE LOCAL ROOT BINDS `urn:json:*` (ledger #2481). ADDITIVE. ikigai-json 0.3.1's
+# space (`urn:json:query`, a jq program over any resource read under the caller's capability, and the CSV
+# pair `urn:json:from-csv`/`urn:json:to-csv`) is bound in the embedded host's local root, so `-c`, the REPL
+# and replays reach it, and so does compose's `$j{<src> <program>}`, which is sugar for `urn:json:query`.
+# Until now the binary bound none of it while the book's in-browser kernel did. THE SERVED DOORS DO NOT
+# CHANGE (decided at the hub, 2026-10-28): the HTTP door, `--routes-only` and the QUIC served kernels
+# serve exactly what they did, under every grant. The two faces that already serve the WHOLE local root,
+# the owner's IPC socket (`ikigai serve <sock>`) and `ikigai mcp`, reach the three names as they reach
+# every local-root binding, under the caller's ceiling; none declares a capability of its own, and
+# `urn:json:query` reads `src` under the caller's. And an unresolved name no longer says "a name newer
+# than this build needs an upgrade", which sent a reader to reinstall the binary they had when no release
+# bound the name: it says this build binds no such name, and that an upgrade helps only if `cargo search
+# ikigai-cli` names a newer release. The lock gains ikigai-json 0.3.1 and jaq. A deploy change: rebuild --locked.
+#
 # 0.2.3: THE HTTP SPACE HONORS `http.max_response_bytes` (ledger #2479, PR #597). A FIX: `urn:http:*` is built
 # with ikigai-http 0.4.1's `space_with`, under the same configured byte budget as the native transport, so a
 # 12 MiB response under the 16 MiB default is answered instead of refused at the endpoint's own 8 MiB. The
@@ -1567,6 +1581,11 @@ ikigai-jsonld = "0.3.0" # 0.3.0 = core 0.2.0 sweep (ledger #2356): the newest re
 # invisible to the selection funnel's deterministic first stage — `urn:kernel:actions`
 # narrows on `ik:class`, and this host is the thing that serves that manifold — so the three
 # operators could not be narrowed to before matching fell through to the LLM residual.
+# jq and CSV as resources (urn:json:query/from-csv/to-csv, ledger #2481): bound in the local root only.
+ikigai-json = "0.3.1" # 0.3.1 = the newest release, on ikigai-core 0.2.x. `"0.3.1"` is `<0.4.0`. The floor is
+# the newest release, by choice: this host calls only `space()`, which 0.3.0 has too. 0.3.1 changes one
+# thing beneath it: the jq sandbox reads its deadline from the invocation's clock on every target
+# (ledger #2196). 0.3.0 streams jq results as NDJSON and CSV incrementally, and needs core 0.2.1.
 # SHACL validation (urn:shacl:validate) — rudof's validator is linked natively here.
 # The browser uses ikigai-shacl's lazy-loaded wasm module by default; shacl-engine (JS)
 # is available behind `?shacl=js`.
