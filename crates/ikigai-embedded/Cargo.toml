@@ -95,6 +95,8 @@ serde = { workspace = true }
 ikigai-secret = { workspace = true }
 ikigai-xslt = { workspace = true }
 ikigai-jsonld = { workspace = true }
+# jq and CSV as resources (urn:json:*): the local root only, not the served kernels.
+ikigai-json = { workspace = true }
 ikigai-shacl = { workspace = true }
 # The layer host `serve quic://` links when the config home has a `layers/` directory
 # (`layers.rs`, ledger #1188). Bound beside `ikigai-shacl` above: admission composes

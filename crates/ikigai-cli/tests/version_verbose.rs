@@ -114,22 +114,36 @@ fn verbose_version_lists_the_linked_ikigai_crates_from_the_lock() {
 }
 
 /// An unresolved name names this build and the command that replaces it (ledger #288), the
-/// way an operator following newer docs than their binary hits it first.
+/// way an operator following newer docs than their binary hits it first. It says only what the
+/// build knows (ledger #2481): that it binds no such name, and that an upgrade helps only if a
+/// newer release exists. It never says the name is NEWER than this build: until 0.2.3 that
+/// sent a reader asking for `urn:json:query`, which no release bound, to reinstall the binary
+/// they had.
 #[test]
 fn an_unresolved_name_names_the_running_build() {
     let home = scratch("unresolved");
     let out = run(&home, &["-c", "source urn:iki:no-such:thing"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
+    let version = env!("CARGO_PKG_VERSION");
     assert!(
         stderr.contains("no endpoint resolved for urn:iki:no-such:thing"),
         "{stderr}"
     );
     assert!(
         stderr.contains(&format!(
-            "this host is ikigai {}; a name newer than this build needs an upgrade: \
-             cargo install --locked ikigai-cli",
-            env!("CARGO_PKG_VERSION")
+            "\n       this host is ikigai {version}, and it binds no such name\n"
         )),
         "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "\n       a newer release may bind it; if `cargo search ikigai-cli` names one past \
+             {version}: cargo install --locked ikigai-cli"
+        )),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("newer than this build"),
+        "the build cannot know the name is newer: {stderr}"
     );
 }

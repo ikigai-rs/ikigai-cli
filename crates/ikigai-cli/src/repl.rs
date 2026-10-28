@@ -25,7 +25,7 @@ pub fn run_commands(engine: Engine, commands: &[String]) -> i32 {
                 match &entry.result {
                     Ok(output) => println!("{output}"),
                     Err(err) => {
-                        eprintln!("error: {err}");
+                        eprintln!("error: {}", crate::restate_build_line(err));
                         code = 1;
                     }
                 }
@@ -106,7 +106,7 @@ pub fn run(engine: Engine, topology: &[String], quiet: bool) -> i32 {
                 match &entry.result {
                     Ok(out) => println!("{out}"),
                     Err(err) => {
-                        eprintln!("error: {err}");
+                        eprintln!("error: {}", crate::restate_build_line(err));
                         code = 1;
                     }
                 }
