@@ -19,7 +19,7 @@ use crate::Certs;
 /// `<config>/ikigai-cli/quic/`.
 fn dir() -> Result<PathBuf, String> {
     let config = ikigai_engine::config::path()
-        .ok_or("no config directory (set $XDG_CONFIG_HOME or $HOME)")?;
+        .ok_or("no config directory (set $XDG_CONFIG_HOME, $HOME or $USERPROFILE)")?;
     let parent = config
         .parent()
         .ok_or("config path has no parent directory")?;
