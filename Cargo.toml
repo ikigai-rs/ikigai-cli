@@ -1010,7 +1010,8 @@ members = ["crates/*"]
 # floor is ikigai-http 0.4.1. The lock moves (hand-minimal, no third-party edge moved): ikigai-core and
 # ikigai-vocab 0.2.2 -> 0.2.4 (the cache-key fix, ledger #2473), ikigai-http 0.4.2 (credentials stripped on a
 # cross-origin redirect, ledger #2459), ikigai-engine and ikigai-resolve 0.2.2 (pipes carry bodies, ledger
-# #2286), ikigai-text 0.4.1 (body-reading inputs, ledger #2468). A deploy change: rebuild --locked.
+# #2286), ikigai-text 0.4.1 (body-reading inputs, ledger #2468), ikigai-fs 0.2.3 (a piped `sink urn:file:…`
+# streams to disk, under a 64 MiB per-root ceiling, ledger #2469, #2493). A deploy change: rebuild --locked.
 #
 # 0.2.2: THE WEB DOOR STREAMS (ledger #2244, PR #595). ADDITIVE. Answers go through the body path:
 # `Content-Length` when the length is known, chunked when not (a producer failure ends with no final

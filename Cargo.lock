@@ -3242,9 +3242,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-fs"
-version = "0.2.2"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d8139614bad071e6034e7a3e6025c10d92cb62b303f14fe0b0c3eb852813a8e"
+checksum = "f4a4fc34534d65cc97358366253b01742b2ff9617644110e2d62ba7fc71f84a0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
