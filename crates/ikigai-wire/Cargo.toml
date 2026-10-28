@@ -12,3 +12,9 @@ ikigai-core = { workspace = true }
 ikigai-resolve = { workspace = true }
 serde = { workspace = true }
 postcard = { workspace = true }
+
+[dev-dependencies]
+# A one-shot body for the head tests (`Body::once` over `futures::stream::iter`).
+futures = { workspace = true }
+# The stream vectors file (`tests/vectors/stream_frames.json`).
+serde_json = { workspace = true }

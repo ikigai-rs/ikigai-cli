@@ -24,7 +24,10 @@ use ikigai_core::{
     Capability, Clock, Error, Iri, Kernel, Representation, Request, SpaceEntry, SystemClock, Tracer,
 };
 use ikigai_resolve::{scoped_entries, CacheStatus, Resolver, RunContext, SpanCollector};
-use ikigai_wire::{decode, encode, Call, Reply, TraceContext, PROTOCOL_VERSION};
+use ikigai_wire::{
+    decode, encode, encode_reply_for_peer, streams, Call, Reply, TraceContext, PROTOCOL_VERSION,
+    STREAM_MAGIC,
+};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::WebPkiSupportedAlgorithms;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
@@ -32,10 +35,15 @@ use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use tokio::runtime::{Handle, Runtime};
 
-/// The ALPN protocol ids, newest first — since v9, `ikigai/9`, `ikigai/8` then `ikigai/7`
+mod stream;
+pub use stream::{QuicStreamed, MAX_UPLOAD};
+// The caller's body for a streamed call ([`QuicResolver::issue_streamed`]).
+pub use ikigai_wire::Upload;
+
+/// The ALPN protocol ids, newest first — since v10, `ikigai/10` down to `ikigai/7`
 /// ([`ikigai_wire::alpns`]). The TLS handshake IS the version gate on this transport,
 /// and there is no hello frame on it: the NEGOTIATED id is the connection's version.
-/// Both sides list 9 first, so a v9 pair speaks 9 and a v8 or v7 peer (which offers or
+/// Both sides list 10 first, so a v10 pair speaks 10 and an older peer (which offers or
 /// accepts only its own ids) still finds its own. A peer outside the range fails the
 /// handshake at connect (mDNS TXT advertises the version pre-connect, which is where
 /// the human-readable hint lives).
@@ -836,8 +844,21 @@ async fn answer(
     version: u32,
     deadline: Option<tokio::time::Instant>,
 ) {
-    let Ok(bytes) = recv.read_to_end(MAX_MESSAGE).await else {
+    let Some(bytes) = read_call(&mut recv, version).await else {
         return;
+    };
+    let bytes = match bytes {
+        Opened::Plain(bytes) => bytes,
+        Opened::Frames => {
+            let answered = stream::answer_streamed(kernel, session, send, recv, version).await;
+            // As below: past the age bound, let the answer land before the door closes.
+            if let Some(send) = answered {
+                if deadline.is_some_and(|at| tokio::time::Instant::now() >= at) {
+                    let _ = tokio::time::timeout(REPLY_GRACE, send.stopped()).await;
+                }
+            }
+            return;
+        }
     };
     let reply = match decode::<Call>(&bytes) {
         Ok(call) => dispatch_off_worker(kernel, call, session),
@@ -845,7 +866,9 @@ async fn answer(
             "malformed call: {e}"
         ))),
     };
-    if let Ok(out) = encode(&reply.for_peer(version)) {
+    // Within one message's bound: an answer past it is a typed `OverBudget`, never a message
+    // the client's reader refuses (ledger #2242).
+    if let Ok(out) = encode_reply_for_peer(reply, version) {
         let _ = send.write_all(&out).await;
         let _ = send.finish();
     }
@@ -861,18 +884,49 @@ async fn answer(
 /// request is read to its end first (under the same message bound), so the client sees a
 /// reply to a call it finished sending, never a stream cut off mid-write.
 async fn refuse(mut send: quinn::SendStream, mut recv: quinn::RecvStream, version: u32) {
-    if recv.read_to_end(MAX_MESSAGE).await.is_err() {
+    let Some(opened) = read_call(&mut recv, version).await else {
         return;
-    }
+    };
     let reply = Reply::ErrorTyped(ikigai_wire::WireError::Unavailable(format!(
         "this connection already has {MAX_CALLS_PER_CONNECTION} calls in progress, the most a \
          door answers at once on one connection; the call was not run, retry it when one \
          finishes"
     )));
+    // A stream of frames is answered with one reply frame, its body left unread.
+    if let Opened::Frames = opened {
+        stream::refuse_streamed(send, recv, reply, version).await;
+        return;
+    }
     if let Ok(out) = encode(&reply.for_peer(version)) {
         let _ = send.write_all(&out).await;
         let _ = send.finish();
     }
+}
+
+/// How a call's stream opened: one plain message (read to its end), or a stream of frames
+/// (wire v10: it opened with [`STREAM_MAGIC`], read; the frames are still to come).
+enum Opened {
+    Plain(Vec<u8>),
+    Frames,
+}
+
+/// Read how a call's stream opened, at the connection's wire `version`: before v10 every
+/// stream is one plain message; from v10 the first four bytes decide, since a plain call
+/// starts with its tag (0 to 5) and a stream of frames with the magic. `None` when the
+/// stream fails or overruns the message bound.
+async fn read_call(recv: &mut quinn::RecvStream, version: u32) -> Option<Opened> {
+    if !streams(version) {
+        return recv.read_to_end(MAX_MESSAGE).await.ok().map(Opened::Plain);
+    }
+    let mut bytes = stream::read_prefix(recv).await.ok()?;
+    if bytes == STREAM_MAGIC {
+        return Some(Opened::Frames);
+    }
+    if bytes.len() == STREAM_MAGIC.len() {
+        let rest = recv.read_to_end(MAX_MESSAGE - bytes.len()).await.ok()?;
+        bytes.extend_from_slice(&rest);
+    }
+    Some(Opened::Plain(bytes))
 }
 
 // Stamping the connection's principal on `request` (removing whatever the client sent under
@@ -3383,10 +3437,10 @@ mod tests {
     /// with `no_application_protocol` before any connection exists. (Measured: the
     /// no-version branch in `dial` is therefore defensive; this is the gate that fires.)
     #[test]
-    fn a_server_outside_7_to_9_is_refused_at_the_handshake() {
+    fn a_server_outside_7_to_10_is_refused_at_the_handshake() {
         for alpns in [
             vec![b"ikigai/6".to_vec()],
-            vec![b"ikigai/10".to_vec()],
+            vec![b"ikigai/11".to_vec()],
             Vec::new(),
         ] {
             let (server_id, client_id) = (generate(), generate());

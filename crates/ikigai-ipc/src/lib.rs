@@ -43,9 +43,15 @@ use ikigai_core::{
 };
 use ikigai_resolve::{scoped_entries, CacheStatus, Resolver, RunContext, SpanCollector};
 use ikigai_wire::{
-    answer_to, decode_hello, read_frame, read_message, speaks, write_hello, write_message, Call,
-    Hello, Reply, TraceContext, WireError, PROTOCOL_VERSION,
+    answer_to, decode, decode_call_frame, decode_hello, read_frame, read_message, speaks, streams,
+    write_hello, write_message, Call, CallFrame, Hello, Reply, TraceContext, WireError,
+    PROTOCOL_VERSION,
 };
+
+mod stream;
+pub use stream::Streamed;
+// The caller's body for a streamed call ([`IpcResolver::issue_streamed`]).
+pub use ikigai_wire::Upload;
 // Re-exported so consumers (the CLI's mount plumbing) can pass a mode without
 // depending on ikigai-wire directly.
 pub use ikigai_wire::HelloMode;
@@ -379,6 +385,13 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 /// that sends NOTHING, which used to hold its thread for as long as it stayed open.
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The most of a caller's streamed body (wire v10, ledger #2242) a door takes by default:
+/// 64 MiB, what one frame carried before v10, so no call that crossed before is refused now.
+/// The door collects the body before it resolves (core gives a door no way to hand a body to
+/// a request but an inline value or a content store it holds), so this is memory the door
+/// holds for the call; [`Limits::with_max_upload`] changes it.
+pub const MAX_UPLOAD: usize = ikigai_core::DEFAULT_STREAM_MEMORY as usize;
+
 /// How long the door waits on each step of turning away a connection past the cap (its hello,
 /// then its first call). This runs on the accept loop itself, so it is short: a refusal must
 /// not hold up the door.
@@ -404,6 +417,7 @@ pub struct Limits {
     max_connections: usize,
     idle_timeout: Duration,
     hello_timeout: Duration,
+    max_upload: usize,
 }
 
 impl Default for Limits {
@@ -412,6 +426,7 @@ impl Default for Limits {
             max_connections: MAX_CONNECTIONS,
             idle_timeout: IDLE_TIMEOUT,
             hello_timeout: HELLO_TIMEOUT,
+            max_upload: MAX_UPLOAD,
         }
     }
 }
@@ -458,6 +473,24 @@ impl Limits {
     /// The timeout for a new connection's hello.
     pub fn hello_timeout(&self) -> Duration {
         self.hello_timeout
+    }
+
+    /// Take at most `bytes` of a caller's streamed body (wire v10): the door collects it
+    /// before it resolves, so this bounds what one call may make the door hold.
+    ///
+    /// ```
+    /// let limits = ikigai_ipc::Limits::default();
+    /// assert_eq!(limits.max_upload(), ikigai_ipc::MAX_UPLOAD);
+    /// assert_eq!(limits.with_max_upload(1024).max_upload(), 1024);
+    /// ```
+    pub fn with_max_upload(mut self, bytes: usize) -> Self {
+        self.max_upload = bytes;
+        self
+    }
+
+    /// The most of a caller's streamed body the door takes.
+    pub fn max_upload(&self) -> usize {
+        self.max_upload
     }
 }
 
@@ -736,14 +769,19 @@ fn refuse_over_capacity(stream: UnixStream, cap: usize) {
     let Some(version) = answer_hello(&mut stream) else {
         return;
     };
-    if read_message::<_, Call>(&mut stream).is_err() {
+    // Any first frame, a plain call or a streamed call's head: the refusal answers it either
+    // way (a streamed caller still writing its body meets the close, and reads this answer).
+    if read_frame(&mut stream).is_err() {
         return;
     }
     let refusal = Error::Unavailable(format!(
         "the kernel server is at its limit of {cap} connections; try again shortly"
     ));
-    let reply = Reply::ErrorTyped(WireError::from(&refusal)).for_peer(version);
-    let _ = write_message(&mut stream, &reply);
+    let _ = stream::write_reply(
+        &mut stream,
+        Reply::ErrorTyped(WireError::from(&refusal)),
+        version,
+    );
 }
 
 /// The default socket read/write deadline. Without it, a hung or vanished server
@@ -1634,13 +1672,28 @@ fn serve_connection(kernel: &Kernel, stream: UnixStream, limits: &Limits, admiss
     };
     let _ = stream.set_read_timeout(Some(limits.idle_timeout));
     loop {
-        let call: Call = match read_message(&mut stream) {
-            Ok(call) => call,
-            // EOF, a malformed frame, or silence past the idle timeout ends the session.
-            Err(_) => return,
+        // EOF, a malformed frame, or silence past the idle timeout ends the session.
+        let Ok(payload) = read_frame(&mut stream) else {
+            return;
         };
-        let reply = dispatch(kernel, call, admission).for_peer(peer_version);
-        if write_message(&mut stream, &reply).is_err() {
+        // A v10 peer may open a streamed exchange with a head (ledger #2242); an older one
+        // sends only plain calls, decoded exactly as before (a head from it is malformed).
+        let frame = if streams(peer_version) {
+            decode_call_frame(&payload)
+        } else {
+            decode::<Call>(&payload).map(CallFrame::Call)
+        };
+        let answered = match frame {
+            Ok(CallFrame::Call(call)) => {
+                stream::write_reply(&mut stream, dispatch(kernel, call, admission), peer_version)
+            }
+            Ok(CallFrame::Head(head)) => {
+                stream::answer_streamed(kernel, head, admission, &mut stream, peer_version, limits)
+            }
+            // A body frame with no head before it, or a payload that is no frame at all.
+            _ => return,
+        };
+        if answered.is_err() {
             return;
         }
     }
@@ -2736,7 +2789,7 @@ mod tests {
         let path = socket_path("mismatch");
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
-        // A future v9 server: answers the hello with its own version, closes.
+        // A future v11 server: answers the hello with its own version, closes.
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut s = &stream;
@@ -2744,7 +2797,7 @@ mod tests {
             write_hello(
                 &mut s,
                 &Hello {
-                    version: 10,
+                    version: 11,
                     mode: HelloMode::Verbatim,
                 },
             )
@@ -2755,7 +2808,7 @@ mod tests {
             Err(err) => err.to_string(),
             Ok(_) => panic!("a version mismatch must refuse the connection"),
         };
-        assert!(message.contains("v10"), "{message}");
+        assert!(message.contains("v11"), "{message}");
         assert!(
             message.contains(&format!("v{PROTOCOL_VERSION}")),
             "{message}"
@@ -2824,11 +2877,11 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A hello outside the spoken range (6 below, 10 above) gets OUR version, so the
+    /// A hello outside the spoken range (6 below, 11 above) gets OUR version, so the
     /// client can name both, and the connection closes without serving.
     #[test]
-    fn a_hello_outside_7_to_9_is_answered_9_and_refused() {
-        for (n, offered) in [6u32, 10].into_iter().enumerate() {
+    fn a_hello_outside_7_to_10_is_answered_10_and_refused() {
+        for (n, offered) in [6u32, 11].into_iter().enumerate() {
             let path = socket_path(&format!("v-out-{n}"));
             let server = serve_one(&path, kernel());
             let (stream, answer) = raw_hello(&path, offered);

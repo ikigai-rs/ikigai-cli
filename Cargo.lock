@@ -3302,6 +3302,8 @@ dependencies = [
 name = "ikigai-ipc"
 version = "0.2.0"
 dependencies = [
+ "async-trait",
+ "futures",
  "ikigai-core",
  "ikigai-resolve",
  "ikigai-wire",
@@ -3477,6 +3479,8 @@ dependencies = [
 name = "ikigai-quic"
 version = "0.2.0"
 dependencies = [
+ "async-trait",
+ "futures",
  "ikigai-core",
  "ikigai-resolve",
  "ikigai-wire",
@@ -3759,10 +3763,12 @@ dependencies = [
 name = "ikigai-wire"
 version = "0.2.0"
 dependencies = [
+ "futures",
  "ikigai-core",
  "ikigai-resolve",
  "postcard",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

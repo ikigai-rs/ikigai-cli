@@ -4,3 +4,5 @@
 # rewrite them. `text=auto` keeps the rest normalized to LF in the index.
 * text=auto
 crates/ikigai-mcp/tests/vectors/*.json text eol=lf
+# Wire v10 stream vectors (ledger #2242), pinned verbatim by the faces: LF on every checkout.
+crates/ikigai-wire/tests/vectors/*.json text eol=lf

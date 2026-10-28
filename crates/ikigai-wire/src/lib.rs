@@ -16,6 +16,15 @@ use ikigai_resolve::{CacheStatus, RunContext};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+pub mod stream;
+pub use stream::{
+    decode_body_frame, decode_call_frame, decode_reply_frame, encode_body_frame, encode_call_frame,
+    encode_reply_for_peer, encode_reply_frame, frame_limit, read_tagged_frame, refusal, streams,
+    tag, with_body_arg, write_body_frame, write_chunks, write_frame, BodyFrame, BodyHead,
+    BodyReader, BodyState, CallFrame, CallHead, Refusal, ReplyFrame, ReplyHead, Upload, MAX_CHUNK,
+    STREAMS_SINCE, STREAM_MAGIC,
+};
+
 /// Bumped when the on-wire shape changes incompatibly. v2 adds [`Call::IssueAs`]
 /// (capability-on-the-wire); v3 adds [`Call::IssueTraced`] /
 /// [`Reply::ResolvedTraced`] (trace-over-the-wire); v5 changes `TraceEvent`'s
@@ -43,7 +52,14 @@ use serde::{Deserialize, Serialize};
 /// milliseconds, never an instant, since peer clocks differ. A client sends it only to a
 /// v9 peer ([`Call::for_peer`]); a v7 or v8 peer that sends no context gets today's
 /// behavior.
-pub const PROTOCOL_VERSION: u32 = 9;
+/// **v10 streams a body** (ledger #2242), backward compatible like v8 and v9: a streamed
+/// call and a streamed reply, each a head, chunks of at most 256 KiB, then `End` or a typed
+/// `Abort`, appended to the [`Call`] and [`Reply`] discriminant spaces as tags 6 to 9 and
+/// built from new types ([`CallFrame`], [`ReplyFrame`]) so the enums keep their meaning;
+/// see the [`stream`] module. A v7 to v9 peer never sends a head, so it never
+/// meets a frame, and gets the collected answer or `OverBudget`
+/// ([`encode_reply_for_peer`]).
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// The oldest wire version this build still speaks. A hello (or ALPN id) in
 /// `MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION` is accepted and served AT THAT
@@ -62,8 +78,8 @@ const FAILURE_CLASSES_SINCE: u32 = 9;
 ///
 /// ```
 /// use ikigai_wire::{speaks, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
-/// assert!(speaks(7) && speaks(8) && speaks(9));
-/// assert!(!speaks(6) && !speaks(10));
+/// assert!(speaks(7) && speaks(8) && speaks(9) && speaks(10));
+/// assert!(!speaks(6) && !speaks(11));
 /// assert!(speaks(MIN_PROTOCOL_VERSION) && speaks(PROTOCOL_VERSION));
 /// ```
 pub fn speaks(version: u32) -> bool {
@@ -81,8 +97,9 @@ pub fn speaks(version: u32) -> bool {
 /// assert_eq!(answer_to(7), 7);
 /// assert_eq!(answer_to(8), 8);
 /// assert_eq!(answer_to(9), 9);
-/// assert_eq!(answer_to(6), 9);
-/// assert_eq!(answer_to(10), 9);
+/// assert_eq!(answer_to(10), 10);
+/// assert_eq!(answer_to(6), 10);
+/// assert_eq!(answer_to(11), 10);
 /// ```
 pub fn answer_to(offered: u32) -> u32 {
     if speaks(offered) {
@@ -103,13 +120,18 @@ pub fn alpn() -> Vec<u8> {
 }
 
 /// Every ALPN id this build offers and accepts, NEWEST FIRST: the TLS handshake
-/// is the version gate on QUIC, and the preference order is what makes a v9
-/// pair choose 9 while a v8 or v7 peer still finds its own.
+/// is the version gate on QUIC, and the preference order is what makes a v10
+/// pair choose 10 while a v9, v8 or v7 peer still finds its own.
 ///
 /// ```
 /// assert_eq!(
 ///     ikigai_wire::alpns(),
-///     vec![b"ikigai/9".to_vec(), b"ikigai/8".to_vec(), b"ikigai/7".to_vec()]
+///     vec![
+///         b"ikigai/10".to_vec(),
+///         b"ikigai/9".to_vec(),
+///         b"ikigai/8".to_vec(),
+///         b"ikigai/7".to_vec()
+///     ]
 /// );
 /// ```
 pub fn alpns() -> Vec<Vec<u8>> {
@@ -223,10 +245,12 @@ pub fn read_frame<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// The largest framed message accepted. Guards [`read_message`] against a bogus
-/// length header demanding a huge allocation; 64 MiB is far above any
-/// representation a REPL round-trips.
-const MAX_FRAME: usize = 64 * 1024 * 1024;
+/// The largest framed message accepted: the cap on any ONE frame. Guards [`read_message`]
+/// against a bogus length header demanding a huge allocation. Since v10 it bounds a frame,
+/// not an answer: a streamed body crosses as many chunk frames ([`MAX_CHUNK`] each), and the
+/// run's byte budget governs the total; a collected answer past it is refused with
+/// `OverBudget` ([`encode_reply_for_peer`]), never sent as a frame no reader accepts.
+pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 
 /// A trace context carried on a traced call, so a remote kernel can record into
 /// the caller's trace. `parent_span` is `None` for a whole-session `--connect`
@@ -841,7 +865,8 @@ mod tests {
         }
         assert_eq!(alpns().first(), Some(&alpn()), "newest first");
         assert_eq!(version_of_alpn(b"ikigai/6"), None);
-        assert_eq!(version_of_alpn(b"ikigai/10"), None);
+        assert_eq!(version_of_alpn(b"ikigai/10"), Some(10));
+        assert_eq!(version_of_alpn(b"ikigai/11"), None);
         assert_eq!(version_of_alpn(b"ikigai/0"), None);
         assert_eq!(version_of_alpn(b"ikigai/+8"), None);
         assert_eq!(version_of_alpn(b"h3"), None);
