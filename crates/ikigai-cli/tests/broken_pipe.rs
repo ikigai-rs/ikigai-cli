@@ -65,9 +65,12 @@ fn line_repl_stops_when_consumer_closes_stdout() {
     // pipe cannot fail during that response and race the next stdin write.
     input.write_all(b"help\n").unwrap();
     // Keep stdin open: a closed consumer must end the REPL without waiting for EOF.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // This Unix-only subprocess test cannot run on wasm; use a real timeout
+    // to reap a native child that fails to exit.
+    #[allow(clippy::disallowed_methods)]
+    let started = Instant::now();
     while child.try_wait().unwrap().is_none() {
-        if Instant::now() >= deadline {
+        if started.elapsed() >= Duration::from_secs(10) {
             child.kill().unwrap();
             let output = child.wait_with_output().unwrap();
             panic!("REPL did not stop after stdout closed: {output:?}");
