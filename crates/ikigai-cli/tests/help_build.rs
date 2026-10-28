@@ -63,3 +63,10 @@ fn help_names_the_transports_this_build_has_and_lacks() {
         );
     }
 }
+
+#[test]
+fn help_explains_replay_continuation_and_failure_status() {
+    let text = help();
+    assert!(text.contains("The line REPL continues after errors; exits 1 if any line failed,"));
+    assert!(text.contains("otherwise 0, at EOF or quit."));
+}

@@ -55,6 +55,7 @@ pub fn run_commands(engine: Engine, commands: &[String]) -> i32 {
 }
 
 /// Read-eval-print loop over the kernel until EOF or `quit`.
+/// Continues after errors and returns `1` if any line failed, otherwise `0`.
 ///
 /// `topology` is what this kernel composed — one line per mount. It goes to STDERR beside
 /// the version line, because a session that is silently resolving `urn:iki:ledger:` through
@@ -65,7 +66,8 @@ pub fn run_commands(engine: Engine, commands: &[String]) -> i32 {
 /// lines — and prompts only a person: when stdin is not a terminal there is no prompt at
 /// all, so what a piped session prints is its answers (and their `[cache]` notes), in order,
 /// and nothing a replay has to strip.
-pub fn run(engine: Engine, topology: &[String], quiet: bool) {
+pub fn run(engine: Engine, topology: &[String], quiet: bool) -> i32 {
+    let mut code = 0;
     let prompting = !quiet || stdin_is_a_terminal();
     if !quiet {
         println!(
@@ -103,7 +105,10 @@ pub fn run(engine: Engine, topology: &[String], quiet: bool) {
             Action::Output(entry) => {
                 match &entry.result {
                     Ok(out) => println!("{out}"),
-                    Err(err) => eprintln!("error: {err}"),
+                    Err(err) => {
+                        eprintln!("error: {err}");
+                        code = 1;
+                    }
                 }
                 // Cache outcome goes to stderr so stdout stays clean for pipes.
                 if let Some(label) = entry.cache.label() {
@@ -115,6 +120,7 @@ pub fn run(engine: Engine, topology: &[String], quiet: bool) {
             Action::Noop => {}
         }
     }
+    code
 }
 
 /// Report what a fan-out actually did — `[fan-out 10 → 1 wide]` — beside the cache
