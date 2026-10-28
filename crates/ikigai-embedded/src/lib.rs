@@ -2282,6 +2282,12 @@ fn http_response_budget(setting: Option<&str>) -> usize {
 type Exchanged = (u16, Vec<(String, String)>, Vec<u8>);
 
 impl UreqTransport {
+    /// Keep the endpoint collector and native reader on the same configured budget.
+    fn into_space(self) -> impl Space {
+        let max_response_bytes = self.max_response_bytes;
+        ikigai_http::space_with(Arc::new(self), max_response_bytes)
+    }
+
     /// One blocking exchange: the method as its token, the URL, the headers and the body
     /// out; the status, headers and body back. The `HttpTransport` impl below is the one
     /// caller; it carries these into the structs ikigai-http, ikigai-llm and ikigai-meeting
@@ -2399,7 +2405,7 @@ impl ikigai_http::HttpTransport for UreqTransport {
         };
         // ikigai-http 0.4 takes an `HttpBody`. This transport still reads the body itself, inside
         // its own `http.max_response_bytes` bound, so the buffer it hands over is never unbounded;
-        // the endpoint then collects it under ITS limit (8 MiB by default) as well.
+        // the HTTP space collects it under the same configured limit.
         Ok(ikigai_http::HttpResponse {
             status,
             headers,
@@ -2416,7 +2422,7 @@ impl ikigai_http::HttpTransport for UreqTransport {
 /// deprecated `urn:httpGet`…`urn:httpDelete` IRIs still resolve, to the same cache entry
 /// and golden thread as the new names, until ikigai-http 0.3 removes them.
 fn http_space() -> impl Space {
-    ikigai_http::space(Arc::new(UreqTransport::default()))
+    UreqTransport::default().into_space()
 }
 
 /// The LLM module (`urn:llm:ask` + `urn:llm:<provider>:ask`) on the native ureq
@@ -11597,6 +11603,19 @@ mod http_body_budget_tests {
     }
 
     #[test]
+    fn native_http_endpoint_accepts_twelve_mib_under_the_default_budget() {
+        use ikigai_core::{ArgRef, Capability};
+        let expected = vec![b'x'; 12 * 1024 * 1024];
+        let (url, server) = response(expected.clone());
+        let kernel = Kernel::new(Arc::new(http_space()));
+        let request = Request::new(Verb::Source, Iri::parse("urn:http:get").unwrap())
+            .with_arg("url", ArgRef::Inline(url.into_bytes()));
+        let result = futures::executor::block_on(kernel.issue(request, &Capability::root()));
+        server.join().unwrap();
+        assert_eq!(result.unwrap().bytes, expected);
+    }
+
+    #[test]
     fn native_http_refuses_a_body_over_the_default_budget() {
         let (url, server) = response(vec![b'x'; 16 * 1024 * 1024 + 1]);
         let result = UreqTransport {
@@ -11663,9 +11682,12 @@ mod http_body_budget_tests {
     fn native_http_endpoint_returns_a_typed_budget_refusal() {
         use ikigai_core::{ArgRef, Capability};
         let (url, server) = response(b"abcde".to_vec());
-        let kernel = Kernel::new(Arc::new(ikigai_http::space(Arc::new(UreqTransport {
-            max_response_bytes: 4,
-        }))));
+        let kernel = Kernel::new(Arc::new(
+            UreqTransport {
+                max_response_bytes: 4,
+            }
+            .into_space(),
+        ));
         let request = Request::new(Verb::Source, Iri::parse("urn:http:get").unwrap())
             .with_arg("url", ArgRef::Inline(url.into_bytes()));
         let error =

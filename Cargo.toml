@@ -1356,7 +1356,9 @@ ikigai-fs = "0.2.2" # 0.2.2 = core 0.2.0 sweep (ledger #2356): the newest releas
 # live mount is unchanged, so nothing else here moves.
 # 0.1.5 = path declared as Binding input (urn:file/orgfile rows in urn:kernel:actions)
 # Outbound HTTP-client module (urn:http:get…), linked as a published module crate.
-ikigai-http = "0.4.0" # 0.4.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.4.0"` is `<0.5.0`. Beneath it: 0.3.0 = the one status table on core 0.1.108's failure classes (ledger #1546,
+ikigai-http = "0.4.1" # 0.4.1 adds `space_with(transport, max_response_bytes)` so the host can
+# apply http.max_response_bytes at both the transport and endpoint (ledger #2479).
+# 0.4.0 = core 0.2.0 sweep (ledger #2356), on ikigai-core 0.2.x. Beneath it: 0.3.0 = the one status table on core 0.1.108's failure classes (ledger #1546,
 # `ikigai_http::status`): an origin's 401/403 is `Refused` (was `Denied`), 429 and a 503 with `Retry-After`
 # are `RetryAfter`, 500 and other 5xx are `Endpoint` (was `Unavailable`, so a backend's 500 is no longer
 # retried), 501 `Unsupported`, 409/412 `Conflict`, 413/414/431 `OverBudget`; each action declares
