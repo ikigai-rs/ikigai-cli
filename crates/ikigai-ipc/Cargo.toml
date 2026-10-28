@@ -12,6 +12,14 @@ ikigai-core = { workspace = true }
 ikigai-resolve = { workspace = true }
 ikigai-wire = { workspace = true }
 libc = { workspace = true }
+# Drives a streamed answer's body (a futures `Stream`, runtime-free in core) chunk by chunk
+# on the connection's own thread (wire v10, ledger #2242). Already in the graph through
+# ikigai-resolve; declared for `executor::block_on` and `StreamExt`.
+futures = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
+
+[dev-dependencies]
+# A test endpoint that answers with a streamed body (`Endpoint::invoke_body`).
+async-trait = "0.1"

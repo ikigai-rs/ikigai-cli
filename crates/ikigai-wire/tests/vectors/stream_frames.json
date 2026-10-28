@@ -1,0 +1,399 @@
+{
+  "about": "Wire v10 stream frames (ikigai-wire, ledger #2242), computed by crates/ikigai-wire/tests/stream_vectors.rs, which fails if this file differs from what the codec writes. Hex is lowercase. `payload` is a frame's bytes; `framed` adds the u32 big-endian length every frame carries on the IPC socket and on a QUIC stream of frames (which opens with `stream_magic`). Tags 6 to 9 are the same in both directions: head, chunk (a varint length, then the bytes, at most `max_chunk`), end, abort (a WireError). A body is whole only at END; a stream that stops without it is a failure, never a shorter body. Each abort is named by its error's failure class.",
+  "protocol_version": 10,
+  "max_chunk": 262144,
+  "stream_magic": "494b5753",
+  "frames": [
+    {
+      "name": "call/head/answer-only",
+      "direction": "call",
+      "value": {
+        "kind": "head",
+        "request": {
+          "verb": "Source",
+          "target": "urn:example:report",
+          "args": {}
+        },
+        "capability": "root",
+        "with": {
+          "trace": null,
+          "retries": null,
+          "time_left_ms": null
+        },
+        "body": null
+      },
+      "payload": "06001275726e3a6578616d706c653a7265706f7274000000000000",
+      "framed": "0000001b06001275726e3a6578616d706c653a7265706f7274000000000000"
+    },
+    {
+      "name": "call/head/with-body",
+      "direction": "call",
+      "value": {
+        "kind": "head",
+        "request": {
+          "verb": "Sink",
+          "target": "urn:example:upload",
+          "args": {}
+        },
+        "capability": "root",
+        "with": {
+          "trace": null,
+          "retries": 1,
+          "time_left_ms": 1500
+        },
+        "body": {
+          "arg": "content",
+          "len": 5
+        }
+      },
+      "payload": "06011275726e3a6578616d706c653a75706c6f6164000000010101dc0b0107636f6e74656e740105",
+      "framed": "0000002806011275726e3a6578616d706c653a75706c6f6164000000010101dc0b0107636f6e74656e740105"
+    },
+    {
+      "name": "reply/head",
+      "direction": "reply",
+      "value": {
+        "kind": "head",
+        "repr_type": "text/plain",
+        "params": {
+          "charset": "utf-8"
+        },
+        "expiry": "Never",
+        "status": "Miss",
+        "len": 11
+      },
+      "payload": "060a746578742f706c61696e010763686172736574057574662d380201010b",
+      "framed": "0000001f060a746578742f706c61696e010763686172736574057574662d380201010b"
+    },
+    {
+      "name": "reply/head/unknown-length",
+      "direction": "reply",
+      "value": {
+        "kind": "head",
+        "repr_type": "application/octet-stream",
+        "params": {},
+        "expiry": "Always",
+        "status": "Uncacheable",
+        "len": null
+      },
+      "payload": "06186170706c69636174696f6e2f6f637465742d73747265616d00000200",
+      "framed": "0000001e06186170706c69636174696f6e2f6f637465742d73747265616d00000200"
+    },
+    {
+      "name": "call/chunk",
+      "direction": "call",
+      "value": {
+        "kind": "chunk",
+        "utf8": "hello"
+      },
+      "payload": "070568656c6c6f",
+      "framed": "00000007070568656c6c6f"
+    },
+    {
+      "name": "call/chunk/empty",
+      "direction": "call",
+      "value": {
+        "kind": "chunk",
+        "utf8": ""
+      },
+      "payload": "0700",
+      "framed": "000000020700"
+    },
+    {
+      "name": "call/end",
+      "direction": "call",
+      "value": {
+        "kind": "end"
+      },
+      "payload": "08",
+      "framed": "0000000108"
+    },
+    {
+      "name": "call/abort/transient/timeout",
+      "direction": "call",
+      "value": {
+        "kind": "abort",
+        "error": {
+          "class": "transient",
+          "display": "timeout: the producer stalled"
+        }
+      },
+      "payload": "0906147468652070726f6475636572207374616c6c6564",
+      "framed": "000000170906147468652070726f6475636572207374616c6c6564"
+    },
+    {
+      "name": "call/abort/transient/unavailable",
+      "direction": "call",
+      "value": {
+        "kind": "abort",
+        "error": {
+          "class": "transient",
+          "display": "unavailable: the origin went away"
+        }
+      },
+      "payload": "090714746865206f726967696e2077656e742061776179",
+      "framed": "00000017090714746865206f726967696e2077656e742061776179"
+    },
+    {
+      "name": "call/abort/retry-after",
+      "direction": "call",
+      "value": {
+        "kind": "abort",
+        "error": {
+          "class": "retry-after",
+          "display": "retry after 2000 ms: rate-limited"
+        }
+      },
+      "payload": "090a01d00f0c726174652d6c696d69746564",
+      "framed": "00000012090a01d00f0c726174652d6c696d69746564"
+    },
+    {
+      "name": "call/abort/over-budget",
+      "direction": "call",
+      "value": {
+        "kind": "abort",
+        "error": {
+          "class": "over-budget",
+          "display": "over budget: the stream ran past its run's deadline (5000 ms)"
+        }
+      },
+      "payload": "090b307468652073747265616d2072616e2070617374206974732072756e277320646561646c696e65202835303030206d7329",
+      "framed": "00000033090b307468652073747265616d2072616e2070617374206974732072756e277320646561646c696e65202835303030206d7329"
+    },
+    {
+      "name": "call/abort/denied",
+      "direction": "call",
+      "value": {
+        "kind": "abort",
+        "error": {
+          "class": "denied",
+          "display": "denied: needs urn:cap:example"
+        }
+      },
+      "payload": "0904156e656564732075726e3a6361703a6578616d706c65",
+      "framed": "000000180904156e656564732075726e3a6361703a6578616d706c65"
+    },
+    {
+      "name": "call/abort/refused",
+      "direction": "call",
+      "value": {
+        "kind": "abort",
+        "error": {
+          "class": "refused",
+          "display": "refused: api.example.com answered 401"
+        }
+      },
+      "payload": "090c1c6170692e6578616d706c652e636f6d20616e73776572656420343031",
+      "framed": "0000001f090c1c6170692e6578616d706c652e636f6d20616e73776572656420343031"
+    },
+    {
+      "name": "call/abort/permanent",
+      "direction": "call",
+      "value": {
+        "kind": "abort",
+        "error": {
+          "class": "permanent",
+          "display": "conflict: changed while read"
+        }
+      },
+      "payload": "0908126368616e676564207768696c652072656164",
+      "framed": "000000150908126368616e676564207768696c652072656164"
+    },
+    {
+      "name": "call/abort/unknown",
+      "direction": "call",
+      "value": {
+        "kind": "abort",
+        "error": {
+          "class": "unknown",
+          "display": "endpoint error: the producer failed"
+        }
+      },
+      "payload": "0903137468652070726f6475636572206661696c6564",
+      "framed": "000000160903137468652070726f6475636572206661696c6564"
+    },
+    {
+      "name": "reply/chunk",
+      "direction": "reply",
+      "value": {
+        "kind": "chunk",
+        "utf8": "hello"
+      },
+      "payload": "070568656c6c6f",
+      "framed": "00000007070568656c6c6f"
+    },
+    {
+      "name": "reply/chunk/empty",
+      "direction": "reply",
+      "value": {
+        "kind": "chunk",
+        "utf8": ""
+      },
+      "payload": "0700",
+      "framed": "000000020700"
+    },
+    {
+      "name": "reply/end",
+      "direction": "reply",
+      "value": {
+        "kind": "end"
+      },
+      "payload": "08",
+      "framed": "0000000108"
+    },
+    {
+      "name": "reply/abort/transient/timeout",
+      "direction": "reply",
+      "value": {
+        "kind": "abort",
+        "error": {
+          "class": "transient",
+          "display": "timeout: the producer stalled"
+        }
+      },
+      "payload": "0906147468652070726f6475636572207374616c6c6564",
+      "framed": "000000170906147468652070726f6475636572207374616c6c6564"
+    },
+    {
+      "name": "reply/abort/transient/unavailable",
+      "direction": "reply",
+      "value": {
+        "kind": "abort",
+        "error": {
+          "class": "transient",
+          "display": "unavailable: the origin went away"
+        }
+      },
+      "payload": "090714746865206f726967696e2077656e742061776179",
+      "framed": "00000017090714746865206f726967696e2077656e742061776179"
+    },
+    {
+      "name": "reply/abort/retry-after",
+      "direction": "reply",
+      "value": {
+        "kind": "abort",
+        "error": {
+          "class": "retry-after",
+          "display": "retry after 2000 ms: rate-limited"
+        }
+      },
+      "payload": "090a01d00f0c726174652d6c696d69746564",
+      "framed": "00000012090a01d00f0c726174652d6c696d69746564"
+    },
+    {
+      "name": "reply/abort/over-budget",
+      "direction": "reply",
+      "value": {
+        "kind": "abort",
+        "error": {
+          "class": "over-budget",
+          "display": "over budget: the stream ran past its run's deadline (5000 ms)"
+        }
+      },
+      "payload": "090b307468652073747265616d2072616e2070617374206974732072756e277320646561646c696e65202835303030206d7329",
+      "framed": "00000033090b307468652073747265616d2072616e2070617374206974732072756e277320646561646c696e65202835303030206d7329"
+    },
+    {
+      "name": "reply/abort/denied",
+      "direction": "reply",
+      "value": {
+        "kind": "abort",
+        "error": {
+          "class": "denied",
+          "display": "denied: needs urn:cap:example"
+        }
+      },
+      "payload": "0904156e656564732075726e3a6361703a6578616d706c65",
+      "framed": "000000180904156e656564732075726e3a6361703a6578616d706c65"
+    },
+    {
+      "name": "reply/abort/refused",
+      "direction": "reply",
+      "value": {
+        "kind": "abort",
+        "error": {
+          "class": "refused",
+          "display": "refused: api.example.com answered 401"
+        }
+      },
+      "payload": "090c1c6170692e6578616d706c652e636f6d20616e73776572656420343031",
+      "framed": "0000001f090c1c6170692e6578616d706c652e636f6d20616e73776572656420343031"
+    },
+    {
+      "name": "reply/abort/permanent",
+      "direction": "reply",
+      "value": {
+        "kind": "abort",
+        "error": {
+          "class": "permanent",
+          "display": "conflict: changed while read"
+        }
+      },
+      "payload": "0908126368616e676564207768696c652072656164",
+      "framed": "000000150908126368616e676564207768696c652072656164"
+    },
+    {
+      "name": "reply/abort/unknown",
+      "direction": "reply",
+      "value": {
+        "kind": "abort",
+        "error": {
+          "class": "unknown",
+          "display": "endpoint error: the producer failed"
+        }
+      },
+      "payload": "0903137468652070726f6475636572206661696c6564",
+      "framed": "000000160903137468652070726f6475636572206661696c6564"
+    }
+  ],
+  "exchanges": [
+    {
+      "name": "v10/streamed-answer",
+      "transport": "ipc",
+      "peer_version": 10,
+      "about": "a read asking for a streamed answer, answered with a head, two chunks and END",
+      "client_writes": "0000001b06001275726e3a6578616d706c653a7265706f7274000000000000",
+      "server_writes": "0000001f060a746578742f706c61696e010763686172736574057574662d380201010b00000008070668656c6c6f20000000070705776f726c640000000108"
+    },
+    {
+      "name": "v10/streamed-answer/quic",
+      "transport": "quic",
+      "peer_version": 10,
+      "about": "the same exchange on one QUIC stream: the client's stream opens with the magic, then the same frames; each side then FINs its half",
+      "client_writes": "494b57530000001b06001275726e3a6578616d706c653a7265706f7274000000000000",
+      "server_writes": "0000001f060a746578742f706c61696e010763686172736574057574662d380201010b00000008070668656c6c6f20000000070705776f726c640000000108"
+    },
+    {
+      "name": "v10/streamed-answer/aborted",
+      "transport": "ipc",
+      "peer_version": 10,
+      "about": "the producer fails part-way: the answer ends in an ABORT carrying OverBudget, and the chunk before it is not a body",
+      "client_writes": "0000001b06001275726e3a6578616d706c653a7265706f7274000000000000",
+      "server_writes": "0000001f060a746578742f706c61696e010763686172736574057574662d380201010b00000008070668656c6c6f2000000033090b307468652073747265616d2072616e2070617374206974732072756e277320646561646c696e65202835303030206d7329"
+    },
+    {
+      "name": "v10/streamed-call",
+      "transport": "ipc",
+      "peer_version": 10,
+      "about": "a Sink whose content is the caller's body: a head announcing 5 bytes, one chunk, END; answered with one plain Reply frame",
+      "client_writes": "0000002506011275726e3a6578616d706c653a75706c6f616400000000000107636f6e74656e74010500000007070568656c6c6f0000000108",
+      "server_writes": "00000016000a746578742f706c61696e000673746f7265640002"
+    },
+    {
+      "name": "v9/collected-answer-over-budget",
+      "transport": "ipc",
+      "peer_version": 9,
+      "about": "a v9 peer sends a plain call and gets the collected answer; past one frame, a typed OverBudget",
+      "client_writes": "0000001703001275726e3a6578616d706c653a7265706f72740000",
+      "server_writes": "00000081050b7e74686520616e7377657220697320363731303838393720627974657320656e636f6465642c2070617374207468652036373130383836342d62797465206672616d65206120636f6c6c656374656420616e737765722074726176656c7320696e3b206120776972652076313020636c69656e742073747265616d73206974"
+    },
+    {
+      "name": "v8/collected-answer-over-budget",
+      "transport": "ipc",
+      "peer_version": 8,
+      "about": "the same for a v8 peer: the refusal as the Endpoint text a v8 peer has always received",
+      "client_writes": "0000001703001275726e3a6578616d706c653a7265706f72740000",
+      "server_writes": "0000008f05038b016f766572206275646765743a2074686520616e7377657220697320363731303838393720627974657320656e636f6465642c2070617374207468652036373130383836342d62797465206672616d65206120636f6c6c656374656420616e737765722074726176656c7320696e3b206120776972652076313020636c69656e742073747265616d73206974"
+    }
+  ]
+}

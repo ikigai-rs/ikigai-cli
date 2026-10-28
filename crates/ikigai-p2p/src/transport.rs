@@ -16,10 +16,13 @@ use tokio::sync::{mpsc, oneshot};
 
 pub use libp2p::{Multiaddr, PeerId};
 
-/// The libp2p protocol id the wire rides. The version is the wire's
-/// [`PROTOCOL_VERSION`](ikigai_wire::PROTOCOL_VERSION) — a mismatched peer fails protocol
-/// negotiation, just as a mismatched ALPN fails the QUIC handshake. (A `&'static str`
-/// because `StreamProtocol::new` wants one; a test pins it to the wire constant.)
+/// The libp2p protocol id the wire rides. The version is the newest wire version this
+/// transport SPEAKS — a mismatched peer fails protocol negotiation, just as a mismatched ALPN
+/// fails the QUIC handshake. (A `&'static str` because `StreamProtocol::new` wants one; a test
+/// pins it.) ⚠ It stays at 9, below the wire's [`PROTOCOL_VERSION`](ikigai_wire::PROTOCOL_VERSION)
+/// of 10: v10 is the stream frames, which this transport does not carry yet (it reads each
+/// message whole; ledger #2452), and a peer must never be told a version whose frames it
+/// would then be refused.
 pub const WIRE_PROTOCOL: &str = "/ikigai/wire/9";
 
 /// Every protocol id this node offers and accepts, NEWEST FIRST — the libp2p twin of
@@ -716,18 +719,19 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    /// The newest version without the v10 stream frames, which this transport does not
+    /// carry yet (ledger #2452). When it does, this becomes `PROTOCOL_VERSION` again.
+    const NEWEST_SPOKEN: u32 = ikigai_wire::STREAMS_SINCE - 1;
+
     #[test]
     fn the_protocol_id_carries_the_wire_version() {
-        assert_eq!(
-            WIRE_PROTOCOL,
-            format!("/ikigai/wire/{}", ikigai_wire::PROTOCOL_VERSION)
-        );
+        assert_eq!(WIRE_PROTOCOL, format!("/ikigai/wire/{NEWEST_SPOKEN}"));
+        assert!(ikigai_wire::speaks(NEWEST_SPOKEN));
     }
 
     #[test]
     fn the_protocol_list_is_the_spoken_range_newest_first() {
-        let spoken: Vec<String> = (ikigai_wire::MIN_PROTOCOL_VERSION
-            ..=ikigai_wire::PROTOCOL_VERSION)
+        let spoken: Vec<String> = (ikigai_wire::MIN_PROTOCOL_VERSION..=NEWEST_SPOKEN)
             .rev()
             .map(|v| format!("/ikigai/wire/{v}"))
             .collect();

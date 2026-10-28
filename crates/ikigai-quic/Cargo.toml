@@ -26,6 +26,10 @@ x509-parser = { version = "0.18", default-features = false }
 # toolchains, and a config key must outlive a Rust upgrade.
 sha2 = "0.10"
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "io-util", "time", "sync"] }
+# Drives a streamed answer's body (a futures `Stream`, runtime-free in core) and resolves a
+# streamed issue off the runtime's workers (wire v10, ledger #2242). Already in the graph
+# through ikigai-resolve.
+futures = { workspace = true }
 # For a dual-stack server socket (IPV6_V6ONLY off) — std can't set it. Already in
 # the tree via quinn; declared directly so `serve` can build the socket itself.
 socket2 = "0.6"
@@ -39,3 +43,7 @@ ring = "0.17"
 # drops their packets without resetting (ledger #1092). `from_key` is the API used; the floor
 # is the version this lock has always built (quinn 0.11.11 requires it), not a guess older.
 quinn-proto = { version = "0.11.17", default-features = false }
+
+[dev-dependencies]
+# A test endpoint that answers with a streamed body (`Endpoint::invoke_body`).
+async-trait = "0.1"
