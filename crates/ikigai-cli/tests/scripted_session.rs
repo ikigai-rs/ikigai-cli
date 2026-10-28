@@ -193,3 +193,54 @@ fn a_quiet_repl_on_a_pipe_prints_only_its_answers() {
     assert!(out.contains("ikigai> HI\n"), "the prompt:\n{out}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A replay keeps reading after an error, but success later must not erase the failure.
+#[test]
+fn a_replay_continues_after_an_error_and_exits_one() {
+    let home = scratch("replay-error");
+    let file = home.join("replay.iki");
+    std::fs::write(
+        &file,
+        "source urn:nothing:here\nsource urn:iki:fn:toUpper after the error\n",
+    )
+    .expect("replay file");
+    for args in [&["--quiet"][..], &["--plain"][..], &[][..]] {
+        let output = run(
+            ikigai(&home, args),
+            std::fs::File::open(&file).expect("open replay"),
+        );
+        assert!(stdout(&output).contains("AFTER THE ERROR"), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("error: no endpoint resolved for urn:nothing:here"),
+            "{output:?}"
+        );
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {output:?}");
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_quiet_replay_keeps_its_failure_status_at_quit_or_eof() {
+    let home = scratch("replay-quit");
+    for ending in [
+        "",
+        "\nhelp\n\nquit\nsource urn:iki:fn:toUpper unreachable\n",
+    ] {
+        let lines = format!("source urn:nothing:here\n{ending}");
+        let output = piped(ikigai(&home, &["--quiet"]), lines.as_bytes());
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(!stdout(&output).contains("UNREACHABLE"), "{output:?}");
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_quiet_replay_without_errors_exits_zero() {
+    let home = scratch("replay-success");
+    for lines in ["", "\n", "source urn:iki:fn:toUpper ok\nquit\n"] {
+        let output = piped(ikigai(&home, &["--quiet"]), lines.as_bytes());
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}

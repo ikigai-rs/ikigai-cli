@@ -43,6 +43,8 @@ usage:
                                lines on stderr) and, when stdin is not a terminal, no prompt:
                                a piped session prints its answers and nothing else, so it
                                replays cleanly. Implies --plain; a -c batch is already quiet
+                               The line REPL continues after errors; exits 1 if any line failed,
+                               otherwise 0, at EOF or quit.
   ikigai --demo                mount the interactive runbook (urn:runbook:*); off by default
   ikigai --connect [<target>]  attach the REPL to a kernel server (a Unix path, or quic://host:port)
   ikigai --mount <pfx>=<tgt>   compose a remote kernel at prefix <pfx> (<tgt> = Unix path or quic://host:port)
@@ -3359,10 +3361,10 @@ fn run_repl(engine: Engine, plain: bool, quiet: bool, commands: &[String], topol
             }
             return;
         }
-        repl::run(engine, topology, quiet);
+        std::process::exit(repl::run(engine, topology, quiet));
     }
     #[cfg(target_family = "wasm")]
-    repl::run(engine, topology, quiet);
+    std::process::exit(repl::run(engine, topology, quiet));
 }
 
 /// How long a content-less `sink` waits for stdin's FIRST byte (or its end) before calling
