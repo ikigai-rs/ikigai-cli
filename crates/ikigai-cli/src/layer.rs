@@ -29,6 +29,8 @@
 //! `ik:contentHash`, `ik:byteSize`, `ik:encoding`, `ik:content`), each optionally
 //! `ik:inReplyTo` or `ik:supersedes` an entry. The host stamps who, when and the sequence.
 
+use crate::output::println;
+
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
