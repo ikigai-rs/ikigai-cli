@@ -63,6 +63,7 @@ pub mod foaf;
 pub mod jsonl;
 pub mod layers;
 pub mod lisp;
+pub mod names;
 pub mod passkey;
 pub mod people;
 mod prg;
@@ -4631,14 +4632,21 @@ fn root_space_for(nature: &'static str, mounts: Vec<MountSpec>) -> Arc<dyn Space
     // drop. Around the ARRANGED root, so a declared arrangement is governed too, and after the
     // dump, which describes the arrangement rather than this host layer.
     let governed = lisp::govern(arranged, lisp::host_timeout(), lisp_doors());
-    compose_mounts(
+    let root = compose_mounts(
         vec![
             governed,
             Arc::new(arrangement::dump_space(dump)) as Arc<dyn Space>,
             demo_runbook(),
         ],
         mounts,
-    )
+    );
+    // The names layer (ledger #2515), when the REPL armed one: LAST, after the mounts too, so
+    // a binding adds names and never changes one the host serves. A host layer, like the
+    // runbook, and not part of the arrangement: its bindings change while the process runs.
+    match names::active() {
+        Some(layer) => layer.over(root),
+        None => root,
+    }
 }
 
 /// The interactive runbook (`urn:runbook:*`), **gated** by [`demo_flag`]: it resolves only
@@ -5291,6 +5299,10 @@ fn build_watched(mounts: Vec<MountSpec>, reactive: bool) -> Arc<Kernel> {
         .with_scheduler_reporter(Arc::new(scheduling::reporter()))
         .into_scheduled(sched);
     watch_root(Arc::clone(&kernel), file_root());
+    // Bind the names file's bindings and watch the file, when the REPL armed a names layer.
+    if let Some(layer) = names::active() {
+        layer.attach(&kernel);
+    }
     watch_org(Arc::clone(&kernel));
     watch_store(Arc::clone(&kernel));
     // Install the kernel handle the time transport fires its timed requests on, now

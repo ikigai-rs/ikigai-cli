@@ -140,6 +140,12 @@ usage:
                                dumps the running one to start from. REPL, -c, --daemon, mcp and
                                serve <socket>; refused by the served doors and --connect. A file that
                                is missing, malformed or does not build stops the start
+  ikigai --names <file>        the REPL's named requests (`<name> = <verb> <target> [key=value …]`
+                               per line, or the Turtle urn:names:to-rdf writes for a .ttl file),
+                               instead of the config home's `names` or `names.ttl`. Bound LAST in
+                               the local root, so a served name shadows a binding of it, and
+                               `source urn:iki:space:dynamic:names:status` reports which. `bind`
+                               and `unbind` write the file; an edit to it rebinds. REPL and -c
   ikigai --width-routing <on|off>
                                route a fan-out by the width it ACHIEVES: at 2+ concurrent
                                requests, append needs=batchAt<=W for targets that read it
@@ -888,6 +894,31 @@ fn arm_local_root() {
             eprintln!("ikigai: {e}");
             std::process::exit(2);
         }
+    }
+}
+
+/// Arm the names layer (ledger #2515) for the REPL's local root: `--names <file>`, else the
+/// config home's `names` or `names.ttl`. A config home holding both stops the start, naming
+/// them: a host has one names table, and picking one would hide the other.
+#[cfg(feature = "embedded")]
+fn arm_names() {
+    if let Err(e) = ikigai_embedded::names::arm() {
+        eprintln!("ikigai: {e}");
+        std::process::exit(2);
+    }
+}
+
+/// Refuse `--names` with `--connect`: the names layer is the LOCAL root's, and a client
+/// resolves on another kernel, so the flag would bind nothing.
+#[cfg(feature = "embedded")]
+fn refuse_names_flag() {
+    if let Some(path) = ikigai_embedded::names::names_flag() {
+        eprintln!(
+            "ikigai: --names `{}` binds names in the LOCAL kernel's root, and `--connect` \
+             resolves on another kernel",
+            path.display()
+        );
+        std::process::exit(2);
     }
 }
 
@@ -1747,6 +1778,15 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 repl.react = true;
             }
             #[cfg(feature = "embedded")]
+            "--names" => {
+                // The names file the REPL binds named requests from and `bind` writes (ledger
+                // #2515), instead of the config home's `names` / `names.ttl`.
+                let path = argv
+                    .next()
+                    .ok_or_else(|| "--names needs <file>".to_string())?;
+                ikigai_embedded::names::set_names_path(path);
+            }
+            #[cfg(feature = "embedded")]
             "layers" => {
                 // Everything after it is the subcommand's; connection flags come before it.
                 repl.layers = Some(layer::parse(argv.by_ref())?);
@@ -2015,8 +2055,10 @@ fn main() {
             };
             if args.connect.is_some() {
                 refuse_arrangement_flag("`--connect`, which resolves on another kernel,");
+                refuse_names_flag();
             } else {
                 arm_local_root();
+                arm_names();
                 arm_bayes(!args.quiet && args.commands.is_empty() && layers.is_none());
             }
             let (engine, topology) =
@@ -2632,9 +2674,17 @@ fn build_engine(
             // The same process scheduler that decides how wide a fan-out RUNS also
             // decides what it may route on — so the engine reads its achievable width
             // from this spawner, and routes on it only if the host turned that on.
+            // The names atom `bind` and `unbind` write, when the REPL armed a names layer.
+            let names = ikigai_embedded::names::active().map(|_| {
+                ikigai_core::Iri::parse(ikigai_embedded::names::RESOURCE).expect("a constant IRI")
+            });
+            let engine = match names {
+                Some(atom) => Engine::new(kernel).with_names_atom(atom),
+                None => Engine::new(kernel),
+            };
             Ok((
                 with_profiles(
-                    Engine::new(kernel)
+                    engine
                         .with_spawner(std::sync::Arc::new(ikigai_embedded::scheduler()))
                         .with_width_routing(ikigai_embedded::width_routing())
                         // `as-of=<instant>`: this host's time doors, pinned per line (ledger
