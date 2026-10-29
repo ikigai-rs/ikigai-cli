@@ -16,6 +16,13 @@
 //! One fixture: `tz-convert`'s minimal inputs (`x` for every string) are not a time zone, so
 //! the suite is handed a real instant and zone. One space declaration: `space()` is
 //! configuration-free, so it is self-named `urn:iki:space:tz`.
+//!
+//! BODIES (conformance 0.12.0) calls each endpoint's `invoke` and `invoke_body` directly, so
+//! the kernel is built from one shared `Arc` of the space and the suite is handed the same
+//! one. No argument is declared `reads_body`, so BODY-INPUTS has nothing to probe and no
+//! content store is installed. `tz-now` answers `Expiry::At`, so BODIES lists it unprobed by
+//! the suite's own reason (two independent calls to a clock cannot establish agreement); the
+//! test pins that as the ONLY unprobed action, so the wiring cannot silently fall off.
 
 use ikigai_conformance::{Check, Fixture, Suite};
 use ikigai_core::{FixedClock, Kernel, Verb};
@@ -26,8 +33,8 @@ const NOW: u64 = 1_790_512_496_000;
 
 #[test]
 fn conforms() {
-    let kernel =
-        Kernel::new(Arc::new(ikigai_tz::space())).with_clock(Arc::new(FixedClock::at(NOW)));
+    let space = Arc::new(ikigai_tz::space());
+    let kernel = Kernel::new(space.clone()).with_clock(Arc::new(FixedClock::at(NOW)));
     let report = Suite::new()
         .fixture(
             Fixture::new("tz-convert", Verb::Source)
@@ -47,11 +54,19 @@ fn conforms() {
         // `space()` reads nothing while it is built, so it names itself; the suite calls it
         // twice and holds both calls to the same name over the same doors.
         .self_named_space("tz", ikigai_tz::space)
+        .body_space(space)
         .run_blocking(&kernel);
     assert!(report.is_clean(), "{report}");
     assert_eq!(
         report.endpoints, 2,
         "both urn:tz:* doors are declared: {report}"
     );
+    // Everything deterministic was observed: the one unprobed action is the clock's BODIES.
+    let unprobed: Vec<(&str, Check)> = report
+        .unprobed
+        .iter()
+        .map(|u| (u.endpoint.as_str(), u.check))
+        .collect();
+    assert_eq!(unprobed, [("tz-now", Check::Bodies)], "{report}");
     assert_eq!(ikigai_core::space_iri("tz").as_str(), ikigai_tz::SPACE_ID);
 }

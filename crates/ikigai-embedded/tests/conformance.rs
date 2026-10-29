@@ -79,10 +79,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use ikigai_conformance::{rdf, Check, Fixture, Suite};
-use ikigai_core::{Kernel, Verb};
+use ikigai_core::{Kernel, Space, Verb};
 
 // ---------------------------------------------------------------------------
 // Who owns what.
@@ -425,6 +425,18 @@ fn root_kernel() -> Kernel {
 fn http_kernel() -> Kernel {
     fixture_home();
     ikigai_embedded::kernel_for("conformance")
+}
+
+/// [`root_kernel`] and [`http_kernel`] with the root each was built from, the same `Arc`, for
+/// `Suite::body_space` (see [`conforms`]).
+fn root_kernel_with_root() -> (Kernel, Arc<dyn Space>) {
+    fixture_home();
+    ikigai_embedded::kernel_with_root()
+}
+
+fn http_kernel_with_root() -> (Kernel, Arc<dyn Space>) {
+    fixture_home();
+    ikigai_embedded::kernel_for_with_root("conformance")
 }
 
 // ---------------------------------------------------------------------------
@@ -900,18 +912,22 @@ fn conforms() {
     for (label, kernel, suite) in [
         (
             "ikigai_embedded::kernel() — the REPL/TUI root",
-            root_kernel(),
+            root_kernel_with_root(),
             root_suite(),
         ),
         (
             "ikigai_embedded::kernel_for() — the HTTP door",
-            http_kernel(),
+            http_kernel_with_root(),
             door_suite(),
         ),
     ] {
+        let (kernel, root) = kernel;
         let ours = bound_from(&kernel, OWN);
         let theirs = bound_from(&kernel, INHERITED);
         let suite = ours.iter().fold(suite, |suite, id| suite.own(id.as_str()));
+        // BODIES (conformance 0.12.0) calls each endpoint's `invoke` and `invoke_body`
+        // directly, so it is handed the root this kernel was built from.
+        let suite = suite.body_space(root);
         let report = suite.run_blocking(&kernel);
         // The report does not say which kernel it walked, so the header is this file's own.
         eprintln!("--- {label} ---\n{report}");
@@ -929,6 +945,19 @@ fn conforms() {
             0,
             "every check runs over a composing host: {report}"
         );
+        // BODIES observed every deterministic Source: the only actions it leaves unprobed are
+        // the ones the suite itself calls volatile (a clock, host state, an answer that is not
+        // `Expiry::Never`). Without `body_space` each would read "the module space is
+        // unavailable" instead, so this is the line that keeps the wiring on.
+        for u in report.unprobed.iter().filter(|u| u.check == Check::Bodies) {
+            assert!(
+                u.reason
+                    .starts_with("uncacheable, time-varying, or volatile answer"),
+                "{label}: BODIES left {} unprobed for a reason other than volatility: {}\n{report}",
+                u.endpoint,
+                u.reason
+            );
+        }
     }
 }
 
