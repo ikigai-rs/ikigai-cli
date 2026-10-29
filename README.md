@@ -442,6 +442,25 @@ they FOLLOW, so two peers never share a certificate set. The config home's `moun
 (`mount = "override urn:x:=quic://host:4433 ~/certs/x"`) say the same thing for the whole
 machine.
 
+**A read through a mount is uncacheable here, whatever the peer declares** (ikigai-cli 0.1.64+, ledger #92, #2613).
+A peer endpoint's `cacheable: true` still holds on the peer: it sends `Never` over the wire, and
+its own cache answers every read made through the mount, so the endpoint runs once. What changes
+is the MOUNTING kernel: it stores no copy of a peer's answer, because a cut on the peer (a
+watcher, `urn:kernel:cut`, a write that reaches the peer another way) never crosses back to cut
+it here, and a stored copy would be served stale for the life of the process. So every read
+through `--mount`, `--override` or `--prefer` costs one round trip to the peer's cache, the cache
+note says `[uncacheable]`, and `why <iri>` (`urn:kernel:uncached`) names the mounted read
+`declared`: the mount's forwarding endpoint is what declared it. A cacheable local composite over
+a mounted read is uncacheable too, named `dependency <the mounted iri>`. Before cli 0.1.64 the
+peer's expiry crossed unchanged and a mounted read printed `[computed]`, then `[cached]`, even
+after the peer's state had moved on.
+
+```
+$ ikigai --plain --mount urn:ts:=/tmp/hello.sock -c 'source urn:ts:hello who=Ada' \
+         -c 'source urn:ts:hello who=Ada' -c 'source urn:kernel:uncached'
+  urn:ts:hello      ×2  declared  [root]
+```
+
 **Nothing mounts under `urn:kernel:`** (ikigai-cli 0.1.62+). Every kernel answers its own
 `urn:kernel:*` names itself, ahead of any mount, so a mount, override or prefer under that
 prefix would never apply: before 0.1.62 `--override urn:kernel:=quic://door` was accepted and

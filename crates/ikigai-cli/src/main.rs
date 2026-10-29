@@ -165,6 +165,10 @@ usage:
   <p> = <p1>,<p2>,…            several prefixes, ONE connection and one cert set: `--override
                                urn:layer:,urn:layers:,urn:collab:=quic://door:4434 --cert-dir <d>`
                                follows a layer door (a comma cannot appear inside a prefix)
+                               A read through any mount is `uncacheable` HERE, even when the
+                               peer's endpoint is cacheable: the peer's own cache answers it
+                               (one round trip), since a cut on the peer cannot reach a copy
+                               held here
   ikigai mcp --grant <n> | --scope <s> | --principal <iri> | --root  [--grants <f>] [--show <p>] [mounts…]
                                serve the manifold as MCP tools over stdio, under the named
                                authority: --grant/--scope (repeatable, unioned); --principal, an
