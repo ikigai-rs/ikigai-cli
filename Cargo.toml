@@ -1373,7 +1373,7 @@ ikigai-vocab = "0.2.5" # 0.2.5 = core 0.2.5's lockstep release (`ik:fixed`). Ben
 # CEILING. The lock alone was holding `ikigai-fn` at 0.2.0 and shipping a manifold that
 # contradicted itself. Refresh the lock when you touch these, and diff the lock FILE.
 # The reusable function library, linked in as a published module crate.
-ikigai-fn = "0.7.2" # 0.7.2 = `urn:iki:fn:html-to-text` (ledger #2528). Beneath it: 0.7.1 = `compose` takes template arguments by name (ledger #2498), a behavior floor the REPL grammar chapter teaches. 0.7.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.7.0"` is `<0.8.0`. Beneath it: 0.5.0 = `ikigai_fn::html` (`html_text`, `attr`, `url_segment`, `safe_href`), the one
+ikigai-fn = "0.8.0" # 0.8.0 = an unquoted `k=<iri>` in a compose marker is issued as a REFERENCE the kernel settles (ledger #2506); a minor, so `"0.7.x"` was a ceiling below it, and no marker this host ships writes a literal `=<…>`. Beneath it: 0.7.2 = `urn:iki:fn:html-to-text` (ledger #2528). Beneath it: 0.7.1 = `compose` takes template arguments by name (ledger #2498), a behavior floor the REPL grammar chapter teaches. 0.7.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.7.0"` is `<0.8.0`. Beneath it: 0.5.0 = `ikigai_fn::html` (`html_text`, `attr`, `url_segment`, `safe_href`), the one
 # escaper and link check every page this host builds from data calls (ledger #1868, replacing intake's
 # `html_escape`, ikigai-web's error-page escape and two `urlencode` copies). A floor by API. Behavior change
 # with it: compose's `$h{…}` (and `html_text`) maps a C0 control other than tab, LF and CR to U+FFFD.
@@ -1414,7 +1414,7 @@ ikigai-fn = "0.7.2" # 0.7.2 = `urn:iki:fn:html-to-text` (ledger #2528). Beneath 
 # at compile time. `urn:demo:*`, `urn:data:page` and `urn:host:info` deliberately did NOT move:
 # they are bound in several repos and a shared prefix cannot migrate one binder at a time.
 # Personal contexts (urn:personal:*), macOS-backed, linked as a published module.
-ikigai-personal = "0.8.0" # 0.8.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.8.0"` is `<0.9.0`. Beneath it: 0.7.1 = multi-day events block every spanned day (free/busy + booking); notes/URL/attendees on the graph face + description= Sink (detail preservation)
+ikigai-personal = "0.8.1" # 0.8.1 = on ikigai-http 0.5.0, so the binary links ONE ikigai-http instead of 0.4.3 beside 0.5.0. Beneath it: 0.8.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.8.0"` is `<0.9.0`. Beneath it: 0.7.1 = multi-day events block every spanned day (free/busy + booking); notes/URL/attendees on the graph face + description= Sink (detail preservation)
 # Capability-gated file/store module, linked as a published module crate.
 ikigai-fs = "0.3.0" # 0.3.0 = a directory also answers `as=text/uri-list` (full `urn:file:` IRIs, so a map can run every saved search), and a path takes exactly one canonical percent-encoding (a minor for that). Beneath it: 0.2.4 = vetted media types (`.geojson` is `application/geo+json`, ledger #2532) and directory listings (ledger #2524), both taught in the book. Beneath it: 0.2.2 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.2.2"` is `<0.3.0`. Beneath it: 0.1.8 is a SECURITY floor (audit round 3, ledger #856): the jail authorizes the
 # file it actually opens (no symlinks, canonical spellings, fails closed on a missing root).

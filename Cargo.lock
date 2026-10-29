@@ -3070,7 +3070,7 @@ dependencies = [
  "async-trait",
  "ikigai-a11y",
  "ikigai-core",
- "ikigai-fn",
+ "ikigai-fn 0.7.2",
  "ikigai-store",
  "notify",
  "oxigraph",
@@ -3100,7 +3100,7 @@ dependencies = [
  "ikigai-embedded",
  "ikigai-engine",
  "ikigai-fs",
- "ikigai-http 0.5.0",
+ "ikigai-http",
  "ikigai-intake",
  "ikigai-ipc",
  "ikigai-layers",
@@ -3171,7 +3171,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c0c8ee38dda32a37326f1209252edaf4ffb7833b49ac0ad80c510534c782f68e"
 dependencies = [
  "ikigai-core",
- "ikigai-fn",
+ "ikigai-fn 0.7.2",
  "oxrdf",
  "oxttl",
 ]
@@ -3215,9 +3215,9 @@ dependencies = [
  "ikigai-email",
  "ikigai-encrypt",
  "ikigai-engine",
- "ikigai-fn",
+ "ikigai-fn 0.8.0",
  "ikigai-fs",
- "ikigai-http 0.5.0",
+ "ikigai-http",
  "ikigai-intake",
  "ikigai-intray",
  "ikigai-json",
@@ -3308,6 +3308,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ikigai-fn"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a1a13849d373c2ad0aa9783460bf657f95639ff8b7053a6e292dbe278e9db23"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "html5ever",
+ "ikigai-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ikigai-fs"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3321,21 +3335,6 @@ dependencies = [
  "mime_guess",
  "rustix",
  "web-sys",
-]
-
-[[package]]
-name = "ikigai-http"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ca33d04af85cf027db214bfffe9f7d2333bda0361a87da476f1640b41b1b1d1"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "futures-io",
- "futures-util",
- "httpdate",
- "ikigai-core",
- "url",
 ]
 
 [[package]]
@@ -3361,7 +3360,7 @@ dependencies = [
  "chrono-tz",
  "futures",
  "ikigai-core",
- "ikigai-fn",
+ "ikigai-fn 0.8.0",
  "serde_json",
 ]
 
@@ -3493,7 +3492,7 @@ dependencies = [
  "eventsource-stream",
  "futures-util",
  "ikigai-core",
- "ikigai-http 0.5.0",
+ "ikigai-http",
  "serde",
  "serde_json",
  "url",
@@ -3505,7 +3504,7 @@ version = "0.2.6"
 dependencies = [
  "futures",
  "ikigai-core",
- "ikigai-http 0.5.0",
+ "ikigai-http",
  "ikigai-resolve",
  "serde",
  "serde_json",
@@ -3519,7 +3518,7 @@ checksum = "489b038522d19aafc1a52b6cb440cb3ccfef25154e91e5c13c193671116bd795"
 dependencies = [
  "async-trait",
  "ikigai-core",
- "ikigai-http 0.5.0",
+ "ikigai-http",
  "serde",
  "serde_json",
  "url",
@@ -3560,14 +3559,14 @@ dependencies = [
 
 [[package]]
 name = "ikigai-personal"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30e2e27a7b76c7afc5495ef12c41ab64cc40f00ae13c0ffa5c47d9f11a55c0eb"
+checksum = "66001e81337a67ff139acf92ac905aff6047dc166e3eab5dd8aeff87ec3ab560"
 dependencies = [
  "block2 0.6.2",
  "chrono",
  "ikigai-core",
- "ikigai-http 0.4.3",
+ "ikigai-http",
  "objc2 0.6.4",
  "objc2-event-kit",
  "objc2-foundation 0.3.2",
@@ -3643,7 +3642,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d45304a5424cfa6e710f3836d059494060d53f749614312edced358f8f6f0f6f"
 dependencies = [
  "ikigai-core",
- "ikigai-fn",
+ "ikigai-fn 0.7.2",
  "serde",
  "serde_json",
 ]
@@ -3856,9 +3855,9 @@ dependencies = [
  "hyper",
  "hyper-util",
  "ikigai-core",
- "ikigai-fn",
+ "ikigai-fn 0.8.0",
  "ikigai-fs",
- "ikigai-http 0.5.0",
+ "ikigai-http",
  "libc",
  "serde_json",
  "tokio",
