@@ -29,4 +29,7 @@ futures = { workspace = true }
 # default from 0.11.0; `Suite::fails_under` probes. ⚠ `^0.10.0` is also a ceiling below 0.11.0.
 # 0.11.0 (ledger #2356): the release on ikigai-core 0.2.0; DATATYPES and FAILURES run by default.
 # ⚠ `^0.11.0` is also a ceiling below 0.12.0.
-ikigai-conformance = "0.11.0"
+# 0.12.0 (ledger #2605, of the #2559 wave): BODIES and BODY-INPUTS run by default; `tests/conformance.rs` hands the suite
+# the same `Arc` of `space()` the kernel is built from (`Suite::body_space`); no argument is declared
+# `reads_body`. ⚠ `^0.12.0` is also a ceiling below 0.13.0.
+ikigai-conformance = "0.12.0"

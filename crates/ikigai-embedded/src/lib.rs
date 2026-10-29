@@ -5234,10 +5234,22 @@ fn subclass_axioms() -> Vec<(String, String)> {
 /// deadlines (`Expiry::At`) are honoured; without a clock those reads would stay
 /// uncacheable. The root is a [`Fallback`] over the local space then the HTTP space.
 pub fn kernel() -> Kernel {
-    Kernel::with_meta_renderer(root_space(), Arc::new(CliRenderer))
+    kernel_with_root().0
+}
+
+/// [`kernel`], and the root space it was built from: the same `Arc`, before the kernel's
+/// alias table wraps it.
+///
+/// Core keeps a kernel's root private, and `ikigai-conformance`'s BODIES check (0.12.0) calls
+/// each endpoint's `invoke` and `invoke_body` directly, so it needs the space the kernel
+/// resolves in (`Suite::body_space`). This is how `tests/conformance.rs` hands it over.
+pub fn kernel_with_root() -> (Kernel, Arc<dyn Space>) {
+    let root = root_space();
+    let kernel = Kernel::with_meta_renderer(Arc::clone(&root), Arc::new(CliRenderer))
         .with_clock(Arc::new(SystemClock))
         .with_subclass_axioms(subclass_axioms())
-        .with_aliases(alias_table())
+        .with_aliases(alias_table());
+    (kernel, root)
 }
 
 /// The local embedded kernel as a shared `Arc`, with a filesystem **watcher** over
@@ -6841,6 +6853,12 @@ pub fn kernel_for(nature: &'static str) -> Kernel {
     kernel_for_with_mounts(nature, Vec::new())
 }
 
+/// [`kernel_for`], and the root space it was built from: the same `Arc`, before the kernel's
+/// alias table wraps it. For `Suite::body_space`, as [`kernel_with_root`] is.
+pub fn kernel_for_with_root(nature: &'static str) -> (Kernel, Arc<dyn Space>) {
+    door_kernel(nature, Vec::new())
+}
+
 /// [`kernel_for`], composing remote kernels into the HTTP door's surface — the third
 /// face of THE HOST OWNS THE TOPOLOGY, beside [`served_kernel_with_mounts`] (QUIC) and
 /// [`trusted_kernel_with_mounts`] (IPC). `ikigai serve --http` took `--mount`/
@@ -6861,6 +6879,12 @@ pub fn kernel_for(nature: &'static str) -> Kernel {
 /// again. Promoting this door to a trusted kernel in order to reach a peer would hand
 /// every anonymous HTTP caller the operator's own authority.
 pub fn kernel_for_with_mounts(nature: &'static str, mounts: Vec<MountSpec>) -> Kernel {
+    door_kernel(nature, mounts).0
+}
+
+/// The HTTP door's kernel and its root, for [`kernel_for_with_mounts`] and
+/// [`kernel_for_with_root`].
+fn door_kernel(nature: &'static str, mounts: Vec<MountSpec>) -> (Kernel, Arc<dyn Space>) {
     let spaces: Vec<Arc<dyn Space>> = vec![
         Arc::new(served_space(nature)) as Arc<dyn Space>,
         // `urn:iki:foaf`, the negotiated FOAF face (see [`foaf`]), routed as `/foaf` on the
@@ -6875,7 +6899,8 @@ pub fn kernel_for_with_mounts(nature: &'static str, mounts: Vec<MountSpec>) -> K
         Arc::new(ikigai_xslt::space()) as Arc<dyn Space>,
         Arc::new(ikigai_jsonld::space()) as Arc<dyn Space>,
     ];
-    Kernel::with_meta_renderer(compose_mounts(spaces, mounts), Arc::new(CliRenderer))
+    let root = compose_mounts(spaces, mounts);
+    let kernel = Kernel::with_meta_renderer(Arc::clone(&root), Arc::new(CliRenderer))
         // ★ A CLOCK, and it is not decoration — this door was built without one until
         // 0.1.20 and that made every time-bounded result on it UNCACHEABLE.
         //
@@ -6898,7 +6923,8 @@ pub fn kernel_for_with_mounts(nature: &'static str, mounts: Vec<MountSpec>) -> K
         // ROOT and the mounts were composed into it above, so a `--prefer urn:fn:=…` mount
         // sits INSIDE the alias and never sees a `urn:fn:` request again — the rewrite
         // happens first. A mount over this family must name `urn:iki:fn:`.
-        .with_aliases(base_alias_table())
+        .with_aliases(base_alias_table());
+    (kernel, root)
 }
 
 #[cfg(test)]
