@@ -152,9 +152,10 @@ notify = "6"
 # it works under the CLI's `futures::block_on` without pulling Tokio).
 ureq = { workspace = true }
 async-trait = "0.1"
+# The names layer (`names.rs`) rebinds on its file watch's own thread, which has no executor.
+futures = { workspace = true }
 
 [dev-dependencies]
-futures = { workspace = true }
 # `tests/layer_door.rs` and `layers.rs`'s own tests mint a throwaway age identity, the key a layer
 # host (ikigai-layers 0.3.0) seals its state to, as `age-keygen -o` would.
 age = { workspace = true }
