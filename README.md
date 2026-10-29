@@ -718,6 +718,14 @@ limit is returned in full; one byte over is refused as `OverBudget`, never retur
 as a truncated success. The limit applies to error and redirect bodies too, and to
 chunked and compressed responses. HEAD reads no body.
 
+**Outbound HTTP requests name the host.** The same transport sends
+`User-Agent: ikigai/<version>` (for example `ikigai/0.2.4`) when a request names no
+`User-Agent` of its own. An operator who wants to be identifiable, say to a site that
+asks crawlers for a contact, sets `http.user_agent = "feeds-bot/1.0 (+https://example.org/bot)"`
+in `config.toml`; it is read when the kernel's transports are built. A blank value, or
+one that is not printable ASCII, keeps the default. A `User-Agent` passed in a request's
+own `headers` still wins over both.
+
 ## Lisp, s-expressions, and signing
 
 The embedded host mounts a family of modules that make **code, queries, and graphs

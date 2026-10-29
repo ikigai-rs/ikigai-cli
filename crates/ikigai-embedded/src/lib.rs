@@ -2257,6 +2257,9 @@ fn served_spaces(nature: &'static str, surface: ServedSurface) -> Vec<Arc<dyn Sp
 /// pulling in Tokio — the executor stays chosen at the edge.
 struct UreqTransport {
     max_response_bytes: usize,
+    /// The `User-Agent` sent when the caller names none: `http.user_agent`, else
+    /// `ikigai/<version>`. A `User-Agent` in the request's own headers still wins.
+    user_agent: String,
 }
 
 const DEFAULT_HTTP_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
@@ -2267,6 +2270,7 @@ impl Default for UreqTransport {
             max_response_bytes: http_response_budget(
                 config::get("http.max_response_bytes").as_deref(),
             ),
+            user_agent: http_user_agent(config::get("http.user_agent").as_deref()),
         }
     }
 }
@@ -2276,6 +2280,20 @@ fn http_response_budget(setting: Option<&str>) -> usize {
     setting
         .and_then(|value| value.replace('_', "").parse().ok())
         .unwrap_or(DEFAULT_HTTP_MAX_RESPONSE_BYTES)
+}
+
+/// The host's own name for itself on the wire, in place of the library's `ureq/<version>`.
+fn default_user_agent() -> String {
+    format!("ikigai/{}", env!("CARGO_PKG_VERSION"))
+}
+
+// The operator's string, trimmed. A blank one, or one that is not printable ASCII (a
+// CR or LF would split the header), keeps the default rather than reaching the wire.
+fn http_user_agent(setting: Option<&str>) -> String {
+    setting
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.bytes().all(|b| (b' '..=b'~').contains(&b)))
+        .map_or_else(default_user_agent, str::to_string)
 }
 
 /// What one HTTP exchange brings back: the status, the headers and the body.
@@ -2304,7 +2322,10 @@ impl UreqTransport {
         // ACL against every hop — an auto-following agent would let a granted
         // host 302 the request to an ungranted one. `redirects(0)` returns the
         // 3xx as-is.
-        let agent = ureq::builder().redirects(0).build();
+        let agent = ureq::builder()
+            .redirects(0)
+            .user_agent(&self.user_agent)
+            .build();
         let mut req = agent.request(method, url);
         for (name, value) in headers {
             req = req.set(name, value);
@@ -11609,6 +11630,88 @@ mod http_body_budget_tests {
         (url, server)
     }
 
+    /// Serve one empty 200 and hand back the request head the transport sent.
+    fn captured_request() -> (String, std::thread::JoinHandle<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        (url, server)
+    }
+
+    fn sent_user_agent(head: &str) -> Vec<&str> {
+        head.lines()
+            .filter_map(|line| line.split_once(':'))
+            .filter(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+            .map(|(_, value)| value.trim())
+            .collect()
+    }
+
+    #[test]
+    fn native_http_names_ikigai_as_the_default_user_agent() {
+        use ikigai_core::{ArgRef, Capability};
+        let (url, server) = captured_request();
+        let kernel = Kernel::new(Arc::new(http_space()));
+        let request = Request::new(Verb::Source, Iri::parse("urn:http:get").unwrap())
+            .with_arg("url", ArgRef::Inline(url.into_bytes()));
+        futures::executor::block_on(kernel.issue(request, &Capability::root())).unwrap();
+        let head = server.join().unwrap();
+        assert_eq!(
+            sent_user_agent(&head),
+            [format!("ikigai/{}", env!("CARGO_PKG_VERSION"))],
+            "{head}"
+        );
+    }
+
+    #[test]
+    fn native_http_sends_the_configured_user_agent_unless_the_request_names_one() {
+        let transport = UreqTransport {
+            max_response_bytes: DEFAULT_HTTP_MAX_RESPONSE_BYTES,
+            user_agent: http_user_agent(Some(" feeds-bot/1.0 (+https://example.org/bot) ")),
+        };
+        let (url, server) = captured_request();
+        transport.exchange("GET", &url, &[], &[]).unwrap();
+        let head = server.join().unwrap();
+        assert_eq!(
+            sent_user_agent(&head),
+            ["feeds-bot/1.0 (+https://example.org/bot)"],
+            "{head}"
+        );
+
+        let (url, server) = captured_request();
+        let own = [("User-Agent".to_string(), "per-request/2.0".to_string())];
+        transport.exchange("GET", &url, &own, &[]).unwrap();
+        let head = server.join().unwrap();
+        assert_eq!(sent_user_agent(&head), ["per-request/2.0"], "{head}");
+    }
+
+    #[test]
+    fn user_agent_settings_keep_the_ikigai_default() {
+        let default = format!("ikigai/{}", env!("CARGO_PKG_VERSION"));
+        assert_eq!(http_user_agent(None), default);
+        for bad in ["", "   ", "a\r\nX-Injected: 1", "bot\u{0}1", "caf\u{e9}/1"] {
+            assert_eq!(http_user_agent(Some(bad)), default, "{bad:?}");
+        }
+        assert_eq!(
+            http_user_agent(Some("bot/1 (ops@example.org)")),
+            "bot/1 (ops@example.org)"
+        );
+    }
+
     #[test]
     fn native_http_endpoint_accepts_twelve_mib_under_the_default_budget() {
         use ikigai_core::{ArgRef, Capability};
@@ -11627,6 +11730,7 @@ mod http_body_budget_tests {
         let (url, server) = response(vec![b'x'; 16 * 1024 * 1024 + 1]);
         let result = UreqTransport {
             max_response_bytes: DEFAULT_HTTP_MAX_RESPONSE_BYTES,
+            user_agent: default_user_agent(),
         }
         .exchange("GET", &url, &[], &[]);
         server.join().unwrap();
@@ -11642,6 +11746,7 @@ mod http_body_budget_tests {
         let (url, server) = response(expected.clone());
         let (_, _, body) = UreqTransport {
             max_response_bytes: DEFAULT_HTTP_MAX_RESPONSE_BYTES,
+            user_agent: default_user_agent(),
         }
         .exchange("GET", &url, &[], &[])
         .unwrap();
@@ -11670,6 +11775,7 @@ mod http_body_budget_tests {
                 );
                 let result = UreqTransport {
                     max_response_bytes: 4,
+                    user_agent: default_user_agent(),
                 }
                 .exchange("GET", &url, &[], &[]);
                 server.join().unwrap();
@@ -11692,6 +11798,7 @@ mod http_body_budget_tests {
         let kernel = Kernel::new(Arc::new(
             UreqTransport {
                 max_response_bytes: 4,
+                user_agent: default_user_agent(),
             }
             .into_space(),
         ));
@@ -11714,6 +11821,7 @@ mod http_body_budget_tests {
             let response = futures::executor::block_on(
                 UreqTransport {
                     max_response_bytes: 4,
+                    user_agent: default_user_agent(),
                 }
                 .send(ikigai_http::HttpRequest {
                     method: ikigai_http::Method::Get,
@@ -11744,6 +11852,7 @@ mod http_body_budget_tests {
             let (url, server) = response(vec![b'x'; len]);
             let result = UreqTransport {
                 max_response_bytes: 0,
+                user_agent: default_user_agent(),
             }
             .exchange("GET", &url, &[], &[]);
             server.join().unwrap();
@@ -11759,6 +11868,7 @@ mod http_body_budget_tests {
         );
         let result = UreqTransport {
             max_response_bytes: 0,
+            user_agent: default_user_agent(),
         }
         .exchange("HEAD", &url, &[], &[]);
         server.join().unwrap();
@@ -11801,6 +11911,7 @@ mod http_body_budget_tests {
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Encoding: gzip\r\nConnection: close\r\n\r\n", gzip.len()), gzip.clone());
             let result = UreqTransport {
                 max_response_bytes: limit,
+                user_agent: default_user_agent(),
             }
             .exchange("GET", &url, &[], &[]);
             server.join().unwrap();
