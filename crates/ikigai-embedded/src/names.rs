@@ -30,9 +30,10 @@ use std::sync::{Arc, OnceLock, RwLock, Weak};
 
 use async_trait::async_trait;
 use ikigai_core::{
-    Alias, AliasTable, ArgSpec, ContentId, Description, DynamicSpace, Endpoint, EndpointSpace,
-    Error, Exact, Fallback, Invocation, Iri, Kernel, Registry, ReprType, Representation, Request,
-    Resolution, Result, Scope, Space, SpaceEntry, Thread, Topology, TopologyRule, Verb,
+    ActionSpec, Alias, AliasTable, ArgSpec, ContentId, Description, DynamicSpace, Endpoint,
+    EndpointSpace, Error, Exact, Fallback, Invocation, Iri, Kernel, Registry, ReprType,
+    Representation, Request, Resolution, Result, Scope, Space, SpaceEntry, Thread, Topology,
+    TopologyRule, Verb,
 };
 use ikigai_engine::names::{names_to_turtle, parse_names, turtle_to_names, MEDIA_NAMES};
 use notify::{RecursiveMode, Watcher};
@@ -456,16 +457,25 @@ impl Endpoint for NamesFile {
                  the layer shadows a binding of it, and urn:iki:space:dynamic:names:status \
                  says which.",
             )
-            .verb(Verb::Source)
-            .verb(Verb::Sink)
-            .verb(Verb::Meta)
-            .input(
-                ArgSpec::new("content")
-                    .summary("the whole names file, for a Sink")
-                    .class("http://www.w3.org/2001/XMLSchema#string")
-                    .optional(),
+            // Per verb, so the Sink DECLARES the write capability it enforces: a flat
+            // `.requires()` would also gate the read, and none at all left the manifold
+            // offering the write to a narrowed session that is then refused.
+            .action(
+                ActionSpec::new(Verb::Source)
+                    .summary("read the names file")
+                    .output(format!("{MEDIA_NAMES};charset=utf-8")),
             )
-            .output(format!("{MEDIA_NAMES};charset=utf-8"))
+            .action(
+                ActionSpec::new(Verb::Sink)
+                    .summary("replace the names file and rebind")
+                    .requires(CAP_WRITE)
+                    .input(
+                        ArgSpec::new("content")
+                            .summary("the whole names file")
+                            .class("http://www.w3.org/2001/XMLSchema#string"),
+                    )
+                    .output("text/plain; charset=utf-8"),
+            )
     }
 }
 

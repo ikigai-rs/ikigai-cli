@@ -147,6 +147,29 @@ fn bind_persists_into_the_names_file() {
     assert!(!out.status.success(), "unbound, the name answers nothing");
 }
 
+/// The names file's Sink DECLARES the capability it enforces, so the action manifold offers the
+/// write to root and never to a session narrowed below it (declared = enforced).
+#[test]
+fn a_narrowed_session_is_not_offered_the_names_write() {
+    let home = scratch("manifold");
+    let sink = "host-names:sink:";
+    let actions = "source urn:kernel:actions as=text/turtle";
+    let root = answer(&run(&home, &["--quiet", "-c", actions]));
+    assert!(root.contains(sink), "root is offered the write:\n{root}");
+    let narrowed = answer(&run(
+        &home,
+        &["--quiet", "-c", "cap urn:cap:file:read", "-c", actions],
+    ));
+    assert!(
+        !narrowed.contains(sink),
+        "a narrowed session is not:\n{narrowed}"
+    );
+    assert!(
+        narrowed.contains("host-names:source:"),
+        "it may still read:\n{narrowed}"
+    );
+}
+
 /// A binding whose name the host already serves never answers, because the layer is LAST:
 /// the status door reports it, and the host's own answer is unchanged.
 #[test]
