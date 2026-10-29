@@ -2631,6 +2631,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "html5ever"
+version = "0.40.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "456a1a377e608e555d22ddab27ac0114bc7a7b4199078108e34c2aeae6c9b130"
+dependencies = [
+ "log",
+ "markup5ever",
+ "memchr",
+]
+
+[[package]]
 name = "http"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3072,7 +3083,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-cli"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "age",
  "async-trait",
@@ -3136,9 +3147,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-core"
-version = "0.2.4"
+version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbaca6561904dea6107a55ecd2a21a8fd7fa232dce6c092b16fbf9ca17a1f9c6"
+checksum = "3171e6a214fce5499d13f747b65db79242a7bd3af52656be23e7ba85628d4acf"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3167,7 +3178,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-discovery"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "if-addrs",
  "mdns-sd",
@@ -3175,7 +3186,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-email"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "async-trait",
  "futures",
@@ -3185,7 +3196,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-embedded"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "age",
  "async-trait",
@@ -3266,9 +3277,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-engine"
-version = "0.2.3"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c70d6d8e82d075f159e3b5379adfcd565bdc0f8fc1104dfc79d712909d9d87a4"
+checksum = "08a8e154d3eda70becc87e13032c2a3c2850d8b2f450ae07e2658731db706a72"
 dependencies = [
  "chrono",
  "futures",
@@ -3284,12 +3295,13 @@ dependencies = [
 
 [[package]]
 name = "ikigai-fn"
-version = "0.7.1"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6892edb569d679ec37d68eab6e3336a1435bf0def9a5143501376b076c871e48"
+checksum = "de8d2e81d55b68fd3c3c6267ae9c7462c981c7b6bd03d6405784618f75a4ffd9"
 dependencies = [
  "async-trait",
  "futures-util",
+ "html5ever",
  "ikigai-core",
  "serde",
  "serde_json",
@@ -3297,24 +3309,25 @@ dependencies = [
 
 [[package]]
 name = "ikigai-fs"
-version = "0.2.3"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f4a4fc34534d65cc97358366253b01742b2ff9617644110e2d62ba7fc71f84a0"
+checksum = "eac775166f22babd8efa301a8a22d49cfba3726e7491165b54dadb21a1d04900"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
  "futures-core",
  "getrandom 0.3.4",
  "ikigai-core",
+ "mime_guess",
  "rustix",
  "web-sys",
 ]
 
 [[package]]
 name = "ikigai-http"
-version = "0.4.2"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a560d538d26d30f6fe897ece9dba3b3962024f3acc2ec6c340d92a87b9d83a9e"
+checksum = "6ca33d04af85cf027db214bfffe9f7d2333bda0361a87da476f1640b41b1b1d1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3327,7 +3340,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-intake"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "async-trait",
  "chrono-tz",
@@ -3356,7 +3369,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-ipc"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "async-trait",
  "futures",
@@ -3445,9 +3458,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-lisp"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2cbc97c2c9043143c4fd6a99dacda11bddac03a27db80500ba6131fac6ca42b8"
+checksum = "60227a6ff328726fed93deb87a5ed3f88164ef7e9f5d9e1f2cea16098e8715e9"
 dependencies = [
  "async-trait",
  "ikigai-core",
@@ -3473,7 +3486,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-mcp"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "futures",
  "ikigai-core",
@@ -3510,7 +3523,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-p2p"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "futures",
  "ikigai-core",
@@ -3523,7 +3536,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-passkey"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "p256",
  "serde_json",
@@ -3549,7 +3562,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-quic"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "async-trait",
  "futures",
@@ -3570,9 +3583,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-rdf"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d36c8123e1c48ca9b95d6c597b686a4e31b802d8917e58e8a5e42cabe8a9f47"
+checksum = "2368189afbfb91bac8fa50c773427bcb1400de435a4042254b723d676d2eb747"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -3597,9 +3610,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-resolve"
-version = "0.2.3"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8a8342b7d5adc2fcb798cdfb02df30f2e3e083fdf01c64511d0330ebc33fe31"
+checksum = "f17a676fdc1c18d9c0a64ad0de9853d9bc6faebcc910689d4b1afdf2fcdf0b1e"
 dependencies = [
  "async-trait",
  "futures",
@@ -3622,7 +3635,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-scheduler"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "futures",
  "ikigai-core",
@@ -3646,9 +3659,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-sexpr"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "048f2bf48d24b5bab2ee165e6487e3e4af374fc537ab1dfc2fab159e47199b6b"
+checksum = "0a7060e87c111d68a1376c2b07e3d42e3a097427c127c7388e90324e398038d9"
 dependencies = [
  "async-trait",
  "getrandom 0.3.4",
@@ -3715,9 +3728,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-sparql"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc6f284b15f286f4b2b7a9c3007691b3347d66d073c330cd4a2ed45140575f2c"
+checksum = "1682cfcf9634f5b0b8cf038788d288c98f34d9d2fcb3dbdf883d57bae8a19623"
 dependencies = [
  "async-trait",
  "ikigai-core",
@@ -3725,6 +3738,7 @@ dependencies = [
  "ikigai-vocab",
  "oxigraph",
  "oxiri 0.2.11",
+ "serde_json",
  "spargebra",
 ]
 
@@ -3759,9 +3773,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-throttle"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fadf6cb469196337463b9d3fe98e0d0b0790647256f7c05ce9c352447fecac1"
+checksum = "ee5decd82a4b36e29c780218bde9712d3a8eeffdb73d50d7b1a1fc6012d92a0a"
 dependencies = [
  "async-lock",
  "async-trait",
@@ -3780,7 +3794,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-tz"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -3791,7 +3805,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-view"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3803,9 +3817,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-vocab"
-version = "0.2.4"
+version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fcabe4064bd73841b5a675824c2875897d137698a84792c995cad66982665f37"
+checksum = "1be88efaef7b7482643b176d6dec54af40e9cd52c57fdd68147802eac7cdfa4b"
 dependencies = [
  "ikigai-core",
  "serde_json",
@@ -3813,7 +3827,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-web"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3837,7 +3851,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-wire"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "futures",
  "ikigai-core",
@@ -3849,9 +3863,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-xslt"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29316c1a30b53985b53e31aba020adcc2b184cb87ec9183c174a5775547869f8"
+checksum = "d44ee6ff1d87df252085b48ce43eac6e212e20c4a367cb51c00ccc652833f06d"
 dependencies = [
  "async-trait",
  "ikigai-core",
@@ -5168,6 +5182,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "markup5ever"
+version = "0.40.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ab3dc68ac4a0f5719e560136778c1ee716e296030d75dbd4484e37e39e3a842"
+dependencies = [
+ "log",
+ "tendril",
+ "web_atoms",
+]
+
+[[package]]
 name = "match-lookup"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5464,6 +5489,12 @@ dependencies = [
  "log",
  "tokio",
 ]
+
+[[package]]
+name = "new_debug_unreachable"
+version = "1.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "nix"
@@ -6220,13 +6251,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "phf"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "010378780309880b08997fae13be7834dba947d36393bd372f2b1556deb2a2f6"
+dependencies = [
+ "phf_shared 0.14.0",
+ "serde",
+]
+
+[[package]]
 name = "phf_codegen"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aef8048c789fa5e851558d709946d6d79a8ff88c0440c587967f8e94bfb1216a"
 dependencies = [
- "phf_generator",
+ "phf_generator 0.11.3",
  "phf_shared 0.11.3",
+]
+
+[[package]]
+name = "phf_codegen"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41b585a510fb76fdebead6897982ef2a03a21d8e6cbcca904999742a4afc6ffe"
+dependencies = [
+ "phf_generator 0.14.0",
+ "phf_shared 0.14.0",
 ]
 
 [[package]]
@@ -6240,12 +6291,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "phf_generator"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aeb62e0959d5a1bebc965f4d15d9e2b7cea002b6b0f5ba8cde6cc26738467100"
+dependencies = [
+ "fastrand",
+ "phf_shared 0.14.0",
+]
+
+[[package]]
 name = "phf_macros"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f84ac04429c13a7ff43785d75ad27569f2951ce0ffd30a3321230db2fc727216"
 dependencies = [
- "phf_generator",
+ "phf_generator 0.11.3",
  "phf_shared 0.11.3",
  "proc-macro2",
  "quote",
@@ -6266,6 +6327,15 @@ name = "phf_shared"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06005508882fb681fd97892ecff4b7fd0fee13ef1aa569f8695dae7ab9099981"
+dependencies = [
+ "siphasher",
+]
+
+[[package]]
+name = "phf_shared"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6fd9027e2d9319be6349febd1db4e8d02aa544921200c9b777720ac34a3aa89"
 dependencies = [
  "siphasher",
 ]
@@ -6447,6 +6517,12 @@ checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
 dependencies = [
  "zerocopy",
 ]
+
+[[package]]
+name = "precomputed-hash"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
 
 [[package]]
 name = "prefix-trie"
@@ -8274,6 +8350,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "string_cache"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffa8a5dbe8b3f0bbe29d4c3225daafaeead63afdc1b65fc4c01a1384166038e6"
+dependencies = [
+ "new_debug_unreachable",
+ "parking_lot",
+ "phf_shared 0.14.0",
+ "precomputed-hash",
+]
+
+[[package]]
+name = "string_cache_codegen"
+version = "0.11.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "928dcdf75e47626b3617a976ec205d9f057584c371c1f23b782129268d0e6edc"
+dependencies = [
+ "phf_generator 0.14.0",
+ "phf_shared 0.14.0",
+ "proc-macro2",
+ "quote",
+]
+
+[[package]]
 name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8466,6 +8566,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tendril"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fed54709c5b3a53d09bb1c113ea4f5ceafd1e772ddcb0030a82e1d56c087b08"
+dependencies = [
+ "new_debug_unreachable",
+]
+
+[[package]]
 name = "termcolor"
 version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8496,7 +8605,7 @@ dependencies = [
  "fnv",
  "nom 7.1.3",
  "phf 0.11.3",
- "phf_codegen",
+ "phf_codegen 0.11.3",
 ]
 
 [[package]]
@@ -9274,6 +9383,18 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "web_atoms"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7572660c8890448ba236b7376f27e389c6a7e1c70195622faced601f855c0ada"
+dependencies = [
+ "phf 0.14.0",
+ "phf_codegen 0.14.0",
+ "string_cache",
+ "string_cache_codegen",
 ]
 
 [[package]]

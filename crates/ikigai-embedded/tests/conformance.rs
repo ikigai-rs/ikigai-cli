@@ -170,6 +170,8 @@ const INHERITED: &[(&str, &str)] = &[
     ("each", "ikigai-fn"),
     ("echo", "ikigai-fn"),
     ("greet", "ikigai-fn"),
+    // ikigai-fn 0.7.2: `urn:iki:fn:html-to-text` (ledger #2528).
+    ("html-to-text", "ikigai-fn"),
     ("reverseList", "ikigai-fn"),
     ("split", "ikigai-fn"),
     ("toUpper", "ikigai-fn"),
