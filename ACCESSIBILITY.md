@@ -24,8 +24,9 @@ how to report a barrier. It is not a conformance claim. Adapted from the
   `passkey.rs`, all through `decide::page`), and the contact intake's redirect page
   (`crates/ikigai-intake`).
 - **Terminal text**: the full-screen REPL (`tui.rs`, the default on an interactive terminal), the
-  line REPL (`--plain`, or when stdin is not a terminal), `-c` batches, `--quiet` output, usage
-  text and error lines.
+  line REPL (`--plain`, or when stdin is not a terminal), `-c` batches, scripts (`ikigai
+  <file>.iki`, and `script <iri>` in either REPL), `--quiet` output, usage text and error lines.
+  A script's failure is an `error:` line that names the failing line's number.
 - **Pictures**: `show <iri>` writes an SVG another crate drew (for example `urn:diagram:kernel`,
   from `ikigai-diagram`) to a file and opens it. The picture's accessibility is that crate's.
 

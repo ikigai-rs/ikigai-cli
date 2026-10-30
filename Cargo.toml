@@ -2136,9 +2136,11 @@ ikigai-bayes = "0.2.0" # 0.2.0 = core 0.2.0 sweep (ledger #2356): the newest rel
 # - ikigai-engine: `plan-reader` is the `execute <spec>` half of the plan face. It is off by
 #   default so the engine still compiles to wasm32, and both hosts here (ikigai-cli and
 #   ikigai-embedded) are native and want it.
-ikigai-resolve = "0.2.6" # 0.2.6 = lockstep with the engine floor below, which asks for `^0.2.6`. Beneath it: 0.2.5 = lockstep with the engine floor below. Beneath it: 0.2.3 = released in lockstep with the engine floor below. 0.2.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.2.1"` is `<0.3.0`. Beneath it: 0.1.70.
+ikigai-resolve = "0.2.8" # 0.2.8 = lockstep with the engine floor below, released with it. Beneath it: 0.2.6 = lockstep with the engine floor below, which asks for `^0.2.6`. Beneath it: 0.2.5 = lockstep with the engine floor below. Beneath it: 0.2.3 = released in lockstep with the engine floor below. 0.2.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.2.1"` is `<0.3.0`. Beneath it: 0.1.70.
 ikigai-intray = "0.2.1" # 0.2.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.2.1"` is `<0.3.0`. Beneath it: 0.1.70.
-# 0.2.6 = named requests E4 (ledger #2509): `bind` / `unbind`, `Engine::with_names_atom` and the names
+# 0.2.8 = scripts (ledger #2485): `ikigai_engine::script` (`Script::parse`/`bind`, `ScriptError`), which
+# `ikigai <file>.iki`, `--script` and the REPL's `script` command (ledger #2649) run; an API floor.
+# Beneath it, 0.2.6 = named requests E4 (ledger #2509): `bind` / `unbind`, `Engine::with_names_atom` and the names
 # text form (`ikigai_engine::names`), which the REPL's names layer (ledger #2515) reads and writes its
 # file with; an API floor. Beneath it, 0.2.5 = an unquoted `key=<iri>` sends a reference (ledger #2508), a map no longer runs once more on a
 # final newline (ledger #2523), and `urn:plan:eval` takes named plan parameters (ledger #2507); 0.2.4
@@ -2146,7 +2148,7 @@ ikigai-intray = "0.2.1" # 0.2.1 = core 0.2.0 sweep (ledger #2356): the newest re
 # arguments, instead of being sent as positional text (ledger #2502); a BEHAVIOR floor, so the binary
 # this book-taught front door ships cannot regress to the silent fallback. 0.2.1 = core 0.2.0 sweep
 # (ledger #2356); 0.1.70.
-ikigai-engine = { version = "0.2.6", features = ["plan-reader"] }
+ikigai-engine = { version = "0.2.8", features = ["plan-reader"] }
 # ── Intra-workspace siblings: LOCKSTEP pins, not floors ───────────────────────
 # The fifteen members that take `version.workspace = true` are released TOGETHER, at one
 # version, always. So every sibling pin below states the CURRENT workspace version rather

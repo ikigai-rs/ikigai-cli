@@ -1127,6 +1127,10 @@ fn submit(state: &mut State, engine: &Engine) -> bool {
         // Persist across sessions when history is on (a no-op otherwise).
         ikigai_embedded::append_history(&line);
     }
+    if let Some(invocation) = crate::script::command(&line) {
+        run_script(state, engine, &line, invocation);
+        return false;
+    }
     match engine.eval(&line) {
         Action::Quit => return true,
         Action::Help => state.transcript.push(Entry {
@@ -1146,6 +1150,41 @@ fn submit(state: &mut State, engine: &Engine) -> bool {
         Action::Noop => {}
     }
     false
+}
+
+/// The REPL's `script <iri> [key=value …]` (ledger #2649): each line that runs joins the
+/// transcript as if it had been typed, its parameters substituted. The failing line's error
+/// names its line number; a refusal that belongs to no line is an entry for the command.
+fn run_script(
+    state: &mut State,
+    engine: &Engine,
+    command: &str,
+    invocation: Result<crate::script::Invocation, String>,
+) {
+    let mut entries = Vec::new();
+    let ran = crate::script::run_command(engine, invocation, |_, line, action| {
+        entries.push(match action {
+            Action::Output(entry) => entry,
+            Action::Help => Entry {
+                input: line.to_string(),
+                result: Ok(HELP.to_string()),
+                cache: CacheStats::default(),
+            },
+            Action::Clear | Action::Quit | Action::Noop => return,
+        });
+    });
+    if let Err(error) = ran {
+        let message = crate::restate_build_line(&error.to_string()).into_owned();
+        match (error.line, entries.last_mut()) {
+            (Some(_), Some(failed)) => failed.result = Err(message),
+            _ => entries.push(Entry {
+                input: command.to_string(),
+                result: Err(message),
+                cache: CacheStats::default(),
+            }),
+        }
+    }
+    state.transcript.extend(entries);
 }
 
 /// Step through input history: `dir < 0` older, `dir > 0` newer.

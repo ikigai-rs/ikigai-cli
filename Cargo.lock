@@ -3289,9 +3289,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-engine"
-version = "0.2.6"
+version = "0.2.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6638c52bb8108cedc76b7f92ae2ff90053d465d636a78070f4b2f9c51f974d9c"
+checksum = "846151cb32e097b7e00eccf14cb67f0c502d6d513c6711c28e9d579398c22fd4"
 dependencies = [
  "chrono",
  "futures",
@@ -3622,9 +3622,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-resolve"
-version = "0.2.6"
+version = "0.2.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab9c1e47f45203854a1b7b1f0125e364a70500f1f3d36a693c03f57a79182ee8"
+checksum = "bcc412a64209fdf4c194880f8f6b775caf5b8b56fdaabf084a029398c19a2c4f"
 dependencies = [
  "async-trait",
  "futures",
