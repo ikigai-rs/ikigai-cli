@@ -79,12 +79,12 @@ Every directory above it must let the group's members search it as well.
 
 ### The trust model, plainly
 
-- **A process running as another account is bounded.** The operating system reports its UID,
+- **A process under another account is bounded.** The operating system reports its UID,
   the door maps that UID to a grant and a principal, and it holds no way to reach an owner
   door: the owner's sockets are `0600` in `0700` directories, and every owner door refuses its
   UID. This is what makes "a node on the same machine" boundable: run the node as its own
   account, name that account in the table, and it gets its grant and nothing more.
-- **A process running as the door's own user is the owner, and that cannot change.** To the
+- **The door's own user is the owner, and that cannot change.** To the
   operating system it IS the same principal: it can read the owner's files, dial the owner's
   other sockets, ptrace the door, or edit the table that bounds it. A table entry naming the
   door's own UID bounds only the clients that dial THIS socket, which is a cooperative bound,

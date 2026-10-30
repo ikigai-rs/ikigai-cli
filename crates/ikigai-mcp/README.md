@@ -10,9 +10,9 @@ MCP asks a server for three things, and ikigai already has all three:
 
 | MCP needs | ikigai provides |
 |-----------|-----------------|
-| a tool list | `urn:kernel:actions` — the capability-scoped action manifold |
-| a typed input schema per tool | `ArgSpec` contracts (`one_of` → enum, `class` → type, a typed `default`, `required`, a list → array, `needs` → `dependentRequired`, a closed argument set → `additionalProperties: false`) |
-| a way to call a tool safely | validate the arguments, then invoke through the kernel |
+| Tool list | `urn:kernel:actions` — the capability-scoped action manifold |
+| Typed input schema per tool | `ArgSpec` contracts (`one_of` → enum, `class` → type, a typed `default`, `required`, a list → array, `needs` → `dependentRequired`, a closed argument set → `additionalProperties: false`) |
+| Safe tool calls | validate the arguments, then invoke through the kernel |
 
 So this crate is a thin, runtime-free translator (newline-framed JSON-RPC over
 stdio — no tokio): each `ik:Action` becomes a tool, the tool name reverses to the
