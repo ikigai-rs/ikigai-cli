@@ -78,6 +78,7 @@ ikigai-browse = { workspace = true }
 # ikigai_sparql::Store, which is what src/browse.rs names). Not imported directly.
 oxigraph = { version = "0.5", default-features = false, features = ["rocksdb"] }
 ikigai-sniff = { workspace = true }
+ikigai-compress = { workspace = true }
 ikigai-sexpr = { workspace = true }
 # `urn:diagram:*` — the local root's arrangement as an SVG. Local root only; see `root_members`.
 ikigai-diagram = { workspace = true }

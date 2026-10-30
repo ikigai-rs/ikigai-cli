@@ -1514,6 +1514,7 @@ ikigai-sparql = "0.3.2" # 0.3.2 = a typed `bindings=` on the query endpoints (le
 # 0.1.6 = space_with_store (shared-store seam for browse/annotations)
 # Content sniffing + sniff-and-dispatch (urn:sniff, urn:transrept:auto).
 ikigai-sniff = "0.3.1" # 0.3.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.1"` is `<0.4.0`. Beneath it: 0.2.6 = the linkeddata lockstep line (ledger #11).
+ikigai-compress = "0.3.0" # 0.3.0 = core 0.2.x, the newest release. `"0.3.0"` is `<0.4.0`. gzip and zlib as endpoints and transreptors; the runbook's Bytes tab runs on it.
 # Beneath it, still true: 0.2.1 = the linkeddata lockstep line: `urn:iki:space:sniff` (ledger #987).
 # Beneath it, still true: 0.1.9 sniffs a leading `<urn:…>` subject as text/turtle. Below it
 # `angle_token_is_iri` tested for `://` — an AUTHORITY, not a scheme — so every Turtle

@@ -4918,6 +4918,14 @@ fn root_members(nature: &'static str) -> Vec<Arc<dyn Space>> {
         // `urn:transrept:auto` sniffs then routes them to the matching transreptor — so a
         // mislabeled fetch or a file read transrepts without asserting its input type.
         Arc::new(ikigai_sniff::space()) as Arc<dyn Space>,
+        // Bytes that are not text: `urn:compress:{gzip,zlib}` and `urn:decompress:{gzip,zlib}`,
+        // as endpoints and as transreptors, so `urn:transrept:auto` above routes a sniffed
+        // `application/gzip` to its decompressor. Decompression is bounded (`max-bytes`, 64 MiB
+        // by default, 1 GiB ceiling; the reader stops one byte past the limit), so a bomb costs
+        // its bound and never its expansion. The runbook's Bytes tab runs on these; without
+        // them its steps did not resolve, since the runbook links the module and the host
+        // did not. Local root only, like `urn:json:*`.
+        Arc::new(ikigai_compress::space()) as Arc<dyn Space>,
         // The ikigai vocabulary as a resolvable resource (urn:ikigai:vocab): the ns#
         // ontology Turtle (ik:Transreptor rdfs:subClassOf ik:Endpoint + property defs),
         // the same bytes served at https://ikigai-rs.dev/ns. Lists in the catalog.
