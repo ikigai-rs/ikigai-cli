@@ -344,13 +344,13 @@ ikigai serve quic://0.0.0.0:4434 --name layers
   the door at start. So the door binds the layer space alone, on a kernel with a clock, and
   offers no participant a `urn:shacl:validate` (an endpoint that declares no capability).
   `urn:layers:me` answers each participant who the door says it is.
-- **The state** (entries, tuples, receipts, feeds) lives in, first match wins:
+- **State location** (entries, tuples, receipts, feeds), first match wins:
   `--layers-state <dir>` on `serve`; `layers.state = "<dir>"` in `config.toml`
   (instance-scoped as `<name>.layers.state`; relative to the config home, a leading `~` to `$HOME`);
   else `~/.ikigai/layers/<name>` under the data home. No environment variable names it. One
   door per state directory: the host holds `<state>/host.lock` while it lives, and a second
   door over the same directory is refused with the holder's pid.
-- **The state is sealed at rest** (ikigai-cli 0.1.67+, ikigai-layers 0.3.0): every file the
+- **Encryption at rest** (ikigai-cli 0.1.67+, ikigai-layers 0.3.0): every file the
   host writes is age ciphertext sealed to the host's key, so the files, a backup of them or an
   image of the disk say nothing without it. The key is an age identity FILE
   (`age-keygen -o layers.key`), named by `--layers-key <file>` on `serve`, else
@@ -361,15 +361,15 @@ ikigai serve quic://0.0.0.0:4434 --name layers
   variable names it, and a path rather than the key itself lets a deployment hand the file over
   from an in-memory credential store (systemd's `LoadCredentialEncrypted`, as
   `--layers-key %d/<credential>`).
-- **State from before 0.1.67 is plaintext**, and a door refuses it, naming `--layers-reseal`.
+- **Legacy plaintext state** (from before 0.1.67) is refused by a door, naming `--layers-reseal`.
   Start the door ONCE with `--layers-reseal` beside the key: it seals every state file in place,
   file by file, then serves. Running it again is safe (it resumes a run that stopped part-way
   and changes nothing over sealed state); later starts leave it off. The same flag rotates the
   key: put the new identity first in the key file and keep the old one after it, start once with
   `--layers-reseal`, then drop the old line. A directory under the state directory that no layer
   definition names is not the host's state, and is neither read nor sealed.
-- The banner names each hosted layer and its model, where the state is and which of the three
-  channels chose it, the recipient (`age1…`, the public half) the state is sealed to and which
+- **Startup banner** names each hosted layer and its model, where the state is and which of the
+  three channels chose it, the recipient (`age1…`, the public half) the state is sealed to and which
   channel named the key, and the surface gains `+ layers`. `--layers-state`, `--layers-key` or
   `--layers-reseal` on a door that hosts no layer (no `layers/`, or not a QUIC door) is refused
   rather than ignored.
@@ -566,7 +566,7 @@ the tool is bound under. `ikigai mcp --scope … --override urn:layer:,urn:layer
 without the local kernel's capability-free ones (`about`, `echo`, `sparql-*`, …). It is
 relevance, never authority: the capability still decides what may be called.
 
-## The file root
+## File root
 
 The local file module (`urn:file:*`) is jailed to one directory, first match wins:
 
@@ -587,7 +587,7 @@ workspace edit. A door whose surface binds no `urn:file:` (the calendar-only QUI
 starts none. Through 0.1.63 the doors ran no watcher and served a replaced file's first-read
 bytes until the process restarted.
 
-## The spam filter (`ikigai-bayes`)
+## Spam filter (`ikigai-bayes`)
 
 The local root binds [`ikigai-bayes`](https://github.com/ikigai-rs/ikigai-bayes), a
 SpamBayes-style text classifier, when it is given a state directory and at least one model:
@@ -662,7 +662,7 @@ that shows a confirm page and a POST that only drops a tuple into `urn:space:con
   and drops a tuple, under the same ceiling as `urn:contact-block` (`urn:cap:space:out`).
   Training is the apply reactor's, under its own authority file.
 
-## The HTTP door
+## HTTP door
 
 `ikigai serve --http <port> --routes <file> --routes-only --cap <scope>…` serves the
 kernel over plain HTTP behind a reverse proxy (`crates/ikigai-web`): a route maps a
@@ -828,7 +828,7 @@ else never starts a background job just because a config file exists.
 filesystem watchers stay live, nothing is printed but their output — which is
 the shape a LaunchAgent/systemd unit wants.
 
-## The scheduler (how wide the fan-out actually is)
+## Scheduler (how wide the fan-out actually is)
 
 Every host in this workspace — REPL, `serve`, `mcp`, `--daemon` — drives one process
 **scheduler**, and it is what makes `( a ; b )` forks and `..` maps run *concurrently*.
@@ -916,7 +916,7 @@ $ ikigai -c 'source urn:test:items .. urn:llm:ask'
 and `urn:kernel:scheduler` carries `routing` (`by-width`/`off`) and `routing.by`
 (`flag`/`config`/`default`) beside the width itself.
 
-## The local root as a declared arrangement
+## Local root as a declared arrangement
 
 The local kernel's root — which spaces are consulted, in what order, with which doors bound to
 which endpoints — is an **arrangement**, and the host can run one from a file instead of the
@@ -969,7 +969,7 @@ reference is expanded — and one past a bound stops the start with exit 2 and a
 never an abort (core 0.1.84, ledger [#643](http://localhost:1060/l/default/item/643)). See
 [`docs/declared-arrangement.md`](docs/declared-arrangement.md).
 
-## The consolidated calendar (the embedded host's standing job)
+## Consolidated calendar (the embedded host's standing job)
 
 The embedded host wires the [`ikigai-personal`](https://github.com/ikigai-rs/ikigai-personal)
 calendar, the [`ikigai-org`](https://github.com/ikigai-rs/ikigai-org) agenda,

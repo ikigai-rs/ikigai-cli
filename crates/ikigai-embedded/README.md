@@ -13,13 +13,14 @@ way over a wire.
 The host assembles a `Space` from the published module crates and adds its own demo
 shapes (`urn:data:page` / `urn:data:about` compose templates, `urn:host:info`):
 
-- function endpoints — `ikigai-fn` (`toUpper`, `reverseList`, `wrap`, `split`,
+- Function endpoints — `ikigai-fn` (`toUpper`, `reverseList`, `wrap`, `split`,
   `greet`, `echo`, `compose`)
-- `ikigai-fs` (filesystem), `ikigai-http` (outbound HTTP client, native via `ureq`),
+- Standard modules — `ikigai-fs` (filesystem), `ikigai-http` (outbound HTTP client, native via
+  `ureq`),
   `ikigai-personal`, `ikigai-rdf`, `ikigai-sparql`, `ikigai-xslt`,
   and the `ikigai-runbook` demo (gated off by default)
-- a `CliRenderer` that adds an `application/json` projection of an endpoint's
-  `Description`, which the REPL reads to learn its parameter contract
+- Contract renderer — a `CliRenderer` that adds an `application/json` projection of an
+  endpoint's `Description`, which the REPL reads to learn its parameter contract
 
 ## Kernel builders
 
