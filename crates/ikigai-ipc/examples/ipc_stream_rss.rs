@@ -12,15 +12,20 @@
 //! `collected` (the same producer, the client collects the body), `buffered` (the server's
 //! answer is one 100 MiB buffer, the client collects it), `plain` (the pre-v10 call, which a
 //! 100 MiB answer cannot cross in one frame: refused with `OverBudget`).
+//!
+//! And `upload [MiB]` (ledger #2454): the client streams a caller's body of 100 MiB (or
+//! `MiB`), produced a piece at a time, to a Sink that reads `content` as a body and counts it,
+//! so the peak is what the door holds of an upload.
 
 use std::os::unix::net::UnixListener;
 use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use ikigai_core::{
-    Body, Bytes, Capability, Endpoint, EndpointSpace, Exact, Invocation, Iri, Kernel, ReprType,
-    Representation, Request, Verb,
+    ArgSpec, AsyncFnEndpoint, Body, Bytes, Capability, Description, Endpoint, EndpointSpace, Exact,
+    Invocation, Iri, Kernel, ReprType, Representation, Request, Verb,
 };
 use ikigai_resolve::{Resolver, RunContext};
 
@@ -58,6 +63,43 @@ impl Endpoint for Hundred {
     }
 }
 
+/// A Sink that reads its `content` as a body, a chunk at a time, and answers how many bytes
+/// it read: it holds no more of an upload than the chunk in hand.
+fn counter() -> AsyncFnEndpoint {
+    AsyncFnEndpoint::new("count", |inv| {
+        Box::pin(async move {
+            let mut chunks = inv.content_body("content").await?.into_stream();
+            let mut n = 0u64;
+            while let Some(chunk) = chunks.next().await {
+                n += chunk?.len() as u64;
+            }
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                n.to_string().into_bytes(),
+            ))
+        })
+    })
+    .with_description(
+        Description::new("count")
+            .verb(Verb::Sink)
+            .input(ArgSpec::new("content").reads_body()),
+    )
+}
+
+/// `total` bytes, made a piece at a time as they are read.
+struct Generated {
+    left: usize,
+}
+
+impl std::io::Read for Generated {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = buf.len().min(self.left);
+        buf[..n].fill(7);
+        self.left -= n;
+        Ok(n)
+    }
+}
+
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "streamed".into());
     let path = std::path::PathBuf::from(format!("/tmp/ikr{}", std::process::id()));
@@ -66,7 +108,8 @@ fn main() {
     let kernel = Kernel::new(Arc::new(
         EndpointSpace::new()
             .bind(Exact::new("urn:rss:lazy"), Hundred { lazy: true })
-            .bind(Exact::new("urn:rss:buffer"), Hundred { lazy: false }),
+            .bind(Exact::new("urn:rss:buffer"), Hundred { lazy: false })
+            .bind(Exact::new("urn:rss:count"), counter()),
     ))
     // Root may buffer the whole answer when a mode collects it on the server.
     .with_stream_memory(TOTAL as u64 * 2, TOTAL as u64 * 2);
@@ -105,6 +148,33 @@ fn main() {
             Ok((whole, _)) => format!("{} bytes in one frame", whole.bytes.len()),
             Err(error) => format!("refused: {error}"),
         },
+        "upload" => {
+            let total = std::env::args().nth(2).map_or(TOTAL, |mib| {
+                mib.parse::<usize>().expect("MiB") * 1024 * 1024
+            });
+            let mut body = Generated { left: total };
+            let upload = ikigai_wire::Upload {
+                arg: "content".into(),
+                body: &mut body,
+                len: Some(total as u64),
+            };
+            let sink = Request::new(Verb::Sink, Iri::parse("urn:rss:count").unwrap());
+            let answer = client
+                .issue_streamed(
+                    sink,
+                    &Capability::root(),
+                    &RunContext::default(),
+                    Some(upload),
+                )
+                .and_then(|answer| answer.collect(64));
+            match answer {
+                Ok((count, _)) => format!(
+                    "{total} bytes sent, the Sink counted {}",
+                    String::from_utf8_lossy(&count.bytes)
+                ),
+                Err(error) => format!("{total} bytes refused: {error}"),
+            }
+        }
         other => panic!("unknown mode {other}"),
     };
     println!("ipc {mode}: {outcome} in {:?}", started.elapsed());

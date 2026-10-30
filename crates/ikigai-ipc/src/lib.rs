@@ -385,11 +385,13 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 /// that sends NOTHING, which used to hold its thread for as long as it stayed open.
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The most of a caller's streamed body (wire v10, ledger #2242) a door takes by default:
-/// 64 MiB, what one frame carried before v10, so no call that crossed before is refused now.
-/// The door collects the body before it resolves (core gives a door no way to hand a body to
-/// a request but an inline value or a content store it holds), so this is memory the door
-/// holds for the call; [`Limits::with_max_upload`] changes it.
+/// The most of a caller's streamed body (wire v10, ledger #2242) a door holds in memory by
+/// default: 64 MiB, what one frame carried before v10. The door attaches the body to the
+/// request as it arrives (ledger #2454), so an endpoint that reads it as a body takes it a
+/// chunk at a time, at any size, and one that reads it as bytes has core collect it under the
+/// run's byte budget. What the door itself holds is the part an answer reads only after the
+/// request is resolved, read off the connection before the answer is written;
+/// [`Limits::with_max_upload`] changes the bound on that.
 pub const MAX_UPLOAD: usize = ikigai_core::DEFAULT_STREAM_MEMORY as usize;
 
 /// How long the door waits on each step of turning away a connection past the cap (its hello,
@@ -475,8 +477,10 @@ impl Limits {
         self.hello_timeout
     }
 
-    /// Take at most `bytes` of a caller's streamed body (wire v10): the door collects it
-    /// before it resolves, so this bounds what one call may make the door hold.
+    /// Hold at most `bytes` of a caller's streamed body (wire v10) in memory: the part an
+    /// answer reads only after the request is resolved, which the door reads off the
+    /// connection before it writes the answer. Past it the call is refused with
+    /// `OverBudget`. An upload the endpoint reads as it resolves is not held, at any size.
     ///
     /// ```
     /// let limits = ikigai_ipc::Limits::default();
@@ -488,7 +492,7 @@ impl Limits {
         self
     }
 
-    /// The most of a caller's streamed body the door takes.
+    /// The most of a caller's streamed body the door holds in memory.
     pub fn max_upload(&self) -> usize {
         self.max_upload
     }
