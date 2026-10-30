@@ -6,13 +6,16 @@
 //! exchange simply holds the connection until its END or ABORT; one abandoned part-way
 //! spends the connection, and the next call redials.
 
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::sync::{Arc, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use futures::executor::block_on;
 use futures::StreamExt;
-use ikigai_core::{Body, Bytes, Capability, Clock, Error, Kernel, Representation, Request};
+use ikigai_core::{
+    Body, BodyIssue, Bytes, Capability, Clock, Error, Expiry, Kernel, Representation, Request,
+};
 use ikigai_resolve::{CacheStatus, Resolver, RunContext, SpanCollector};
 use ikigai_wire::{
     decode_reply_frame, encode_call_frame, encode_reply_for_peer, encode_reply_frame, read_frame,
@@ -25,11 +28,18 @@ use crate::{wire_error, Admission, IpcResolver, Limits, Link};
 
 // --- the server half ----------------------------------------------------------------------
 
-/// Answer one streamed call from a v10 peer: read the caller's body (when the head announces
-/// one) under the door's upload bound, resolve, and write the answer as a head, chunks and
-/// END or ABORT, or as one plain [`Reply`] frame when it fails before its first byte or the
-/// caller is recording a trace (core records no trace for a streamed issue, so a traced
-/// call is answered collected).
+/// Answer one streamed call from a v10 peer: resolve it with the caller's body (when the
+/// head announces one) ATTACHED as a body read off the connection a chunk at a time
+/// ([`BodyIssue::attach`], ledger #2454), and write the answer as a head, chunks and END or
+/// ABORT, or as one plain [`Reply`] frame when it fails before its first byte or the caller
+/// is recording a trace (core records no trace for a streamed issue, so a traced call is
+/// answered collected).
+///
+/// An endpoint that reads its argument as a body takes the upload as it arrives, so an
+/// upload of any size crosses in the memory of a chunk; one that reads it as bytes has core
+/// collect it under the run's byte budget. Nothing of the answer is written before the
+/// upload is read to its END ([`Inflow::settle`]): a caller sends its whole body before it
+/// reads, so an answer written over an unread upload would stall both sides.
 ///
 /// `Err` means the connection can carry nothing more (the peer is gone, or broke the
 /// protocol); every failure of the CALL itself is written to the peer as a typed error.
@@ -47,48 +57,206 @@ pub(crate) fn answer_streamed(
         with,
         body,
     } = head;
-    let mut request = admission.admit_request(request);
+    let request = admission.admit_request(request);
     let capability = admission.admit_capability(&capability);
-    if let Some(body) = body {
-        // The body is the argument's value, so it is read whole before anything resolves.
-        // Past the bound the rest is read and thrown away, so the connection stays aligned
-        // for the next call, and the refusal is the answer.
-        let mut reader = BodyReader::new(&mut *stream, body.len);
-        let collected = match reader.collect_or_refuse(limits.max_upload()) {
-            Ok(Ok(bytes)) => with_body_arg(request, &body.arg, bytes),
-            Ok(Err(refused)) => Err(refused.into()),
-            Err(error) => return Err(error),
-        };
-        match collected {
-            Ok(with_body) => request = with_body,
-            Err(error) => return write_reply(stream, failed(&error), peer_version),
-        }
-    }
     let context = with.issue_context(ikigai_core::SystemClock.now());
+    let (inflow, issue) = match body {
+        Some(body) => {
+            let inflow = Inflow::new(stream.try_clone()?, body.len);
+            let issue = BodyIssue::new()
+                .with_context(context)
+                .attach(body.arg, inflow.body());
+            (Some(inflow), Ok(issue))
+        }
+        None => (None, Err(context)),
+    };
     if with.trace.is_some() {
         let collector = Arc::new(SpanCollector::default());
-        let reply = match ikigai_resolve::issue_traced_as_with_context(
-            kernel,
-            request,
-            &capability,
-            collector.clone(),
-            context,
-        ) {
+        let reply = match issue {
+            Err(context) => ikigai_resolve::issue_traced_as_with_context(
+                kernel,
+                request,
+                &capability,
+                collector.clone(),
+                context,
+            ),
+            Ok(issue) => {
+                block_on(kernel.issue_with(request, &capability, issue.traced(collector.clone())))
+                    .map(|representation| {
+                        let status = uploaded_status(&representation);
+                        (representation, status)
+                    })
+            }
+        };
+        let reply = match reply {
             Ok((representation, status)) => {
                 Reply::ResolvedTraced(representation, status, collector.take())
             }
             Err(error) => failed(&error),
         };
+        if let Some(inflow) = inflow {
+            if let Err(refused) = inflow.settle(None)? {
+                return write_reply(stream, failed(&refused), peer_version);
+            }
+        }
         return write_reply(stream, reply, peer_version);
     }
-    let was_cached = Kernel::is_cached(kernel, &request, &capability);
-    let answer = match block_on(kernel.issue_body_with_context(request, &capability, context)) {
+    // An attached body gives the request a content id of its own: never a cached answer.
+    let was_cached = inflow.is_none() && Kernel::is_cached(kernel, &request, &capability);
+    let issue = issue.unwrap_or_else(|context| BodyIssue::new().with_context(context));
+    let answer = block_on(kernel.issue_body_with(request, &capability, issue));
+    if let Some(inflow) = inflow {
+        // The answer may still read the upload; what it has not read yet is held for it,
+        // under the door's bound.
+        let held = answer.as_ref().is_ok().then_some(limits.max_upload());
+        if let Err(refused) = inflow.settle(held)? {
+            drop(answer);
+            return write_reply(stream, failed(&refused), peer_version);
+        }
+    }
+    let answer = match answer {
         Ok(answer) => answer,
         Err(error) => return write_reply(stream, failed(&error), peer_version),
     };
     let (head, body) = ReplyHead::of(answer, was_cached);
     write_frame(stream, &encode_reply_frame(&ReplyFrame::Head(head))?)?;
     pump(body, stream, peer_version)
+}
+
+/// The cache status of an answer resolved with a body attached: its content id is fresh, so
+/// it was never a hit.
+fn uploaded_status<B>(representation: &Representation<B>) -> CacheStatus {
+    if representation.expiry == Expiry::Always {
+        CacheStatus::Uncacheable
+    } else {
+        CacheStatus::Miss
+    }
+}
+
+/// A caller's body as it comes off the connection: the reader of its frames, shared between
+/// the door and the [`Body`] attached to the request ([`body`](Self::body)), which pulls
+/// chunks through it while the endpoint reads.
+struct Inflow(Arc<Mutex<Incoming>>);
+
+struct Incoming {
+    reader: BodyReader<UnixStream>,
+    /// What [`Inflow::settle`] read on behalf of a body that had not read it yet.
+    held: VecDeque<Bytes>,
+    /// How the body ended once it has: `Ok` at END, the caller's ABORT (or a broken
+    /// stream) as an error, handed to the body once, after the chunks it held.
+    ended: Option<Result<(), Error>>,
+    /// The connection itself failed while the body was read: it can carry nothing more.
+    broken: bool,
+}
+
+impl Incoming {
+    /// The body's next chunk; `None` after its END, and after an error it has handed over.
+    fn next(&mut self) -> Option<Result<Bytes, Error>> {
+        if let Some(chunk) = self.held.pop_front() {
+            return Some(Ok(chunk));
+        }
+        match self.ended.as_mut() {
+            Some(Ok(())) => return None,
+            Some(Err(_)) => {
+                let error = self.ended.replace(Ok(()));
+                return error.and_then(Result::err).map(Err);
+            }
+            None => {}
+        }
+        match self.read() {
+            Some(Ok(chunk)) => Some(Ok(chunk)),
+            Some(Err(error)) => {
+                self.ended = Some(Ok(()));
+                Some(Err(error))
+            }
+            None => None,
+        }
+    }
+
+    /// Read the next chunk off the connection, recording the END or the failure.
+    fn read(&mut self) -> Option<Result<Bytes, Error>> {
+        match self.reader.next_chunk() {
+            Ok(Some(chunk)) => Some(Ok(chunk)),
+            Ok(None) => {
+                self.ended = Some(Ok(()));
+                None
+            }
+            Err(error) => {
+                let error = match refusal(&error) {
+                    Some(aborted) => aborted.clone().into(),
+                    None => {
+                        self.broken = true;
+                        Error::Endpoint(format!("the caller's body broke off: {error}"))
+                    }
+                };
+                self.ended = Some(Err(error.clone()));
+                Some(Err(error))
+            }
+        }
+    }
+}
+
+impl Inflow {
+    fn new(stream: UnixStream, len: Option<u64>) -> Self {
+        Inflow(Arc::new(Mutex::new(Incoming {
+            reader: BodyReader::new(stream, len),
+            held: VecDeque::new(),
+            ended: None,
+            broken: false,
+        })))
+    }
+
+    /// The body attached to the request: one-shot, each chunk read off the connection when
+    /// it is pulled. The read blocks this connection's thread, which is the one resolving.
+    fn body(&self) -> Body {
+        let incoming = Arc::clone(&self.0);
+        Body::once(futures::stream::poll_fn(move |_| {
+            std::task::Poll::Ready(incoming.lock().expect("upload lock").next())
+        }))
+    }
+
+    /// Read the upload to its END once the request is resolved, so the connection is aligned
+    /// before the answer is written. When the attached body is gone (read whole, or dropped
+    /// unread) the rest is thrown away a chunk at a time; when the answer still holds it,
+    /// up to `hold` bytes are kept for it to read (`None`: nothing may be held), and past
+    /// that the call is refused with `OverBudget` and the rest thrown away.
+    ///
+    /// `Err` when the connection broke while the body was read: nothing more can be written.
+    fn settle(self, hold: Option<usize>) -> io::Result<Result<(), Error>> {
+        let still_read = Arc::strong_count(&self.0) > 1;
+        let mut incoming = self.0.lock().expect("upload lock");
+        let mut held = 0usize;
+        let mut refused = None;
+        while incoming.ended.is_none() {
+            let Some(Ok(chunk)) = incoming.read() else {
+                break;
+            };
+            if !still_read || refused.is_some() {
+                continue;
+            }
+            held += chunk.len();
+            match hold {
+                Some(hold) if held <= hold => incoming.held.push_back(chunk),
+                _ => {
+                    incoming.held.clear();
+                    refused = Some(Error::OverBudget {
+                        detail: format!(
+                            "the answer reads the caller's body after it is resolved, and \
+                             more of it is left than the {}-byte bound this door holds",
+                            hold.unwrap_or(0)
+                        ),
+                    });
+                }
+            }
+        }
+        if incoming.broken {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the caller's body broke off",
+            ));
+        }
+        Ok(refused.map_or(Ok(()), Err))
+    }
 }
 
 /// Write `body` as chunk frames, then END, or an ABORT carrying the producer's error the
@@ -303,7 +471,8 @@ impl IpcResolver {
     /// v10, ledger #2242): its head now, its body read chunk by chunk ([`Streamed`]), so an
     /// answer of any size crosses in the memory of one chunk. With an `upload`, the
     /// caller's own body is sent the same way as the value of its argument (`content` for a
-    /// Sink); the server collects it, under its upload bound, before it resolves.
+    /// Sink); the server attaches it to the request as it arrives, so an endpoint that reads
+    /// it as a body takes it a chunk at a time.
     ///
     /// Against a peer older than v10 this is the collected exchange that peer has always
     /// served, presented as a body: the upload goes inline in one frame (refused with
@@ -550,6 +719,48 @@ mod tests {
 
     const BIG: usize = 1_000_010;
 
+    /// A Sink that reads `content` as a body, a chunk at a time, and answers how many bytes
+    /// it read (`stream_count`), or answers the body itself, unread until the answer is
+    /// (`stream_pass`).
+    struct BodyReading {
+        pass: bool,
+    }
+
+    #[async_trait]
+    impl Endpoint for BodyReading {
+        async fn invoke(&self, inv: &Invocation<'_>) -> ikigai_core::Result<Representation> {
+            let body = self.invoke_body(inv).await?;
+            let bytes = inv.collect(body.bytes).await?;
+            Ok(Representation::new(body.repr_type, bytes.to_vec()))
+        }
+
+        async fn invoke_body(
+            &self,
+            inv: &Invocation<'_>,
+        ) -> ikigai_core::Result<Representation<Body>> {
+            let body = inv.content_body("content").await?;
+            let kind = ReprType::new("application/octet-stream");
+            if self.pass {
+                return Ok(Representation::from_body(kind, body));
+            }
+            let mut chunks = body.into_stream();
+            let mut n = 0u64;
+            while let Some(chunk) = chunks.next().await {
+                n += chunk?.len() as u64;
+            }
+            Ok(Representation::from_body(
+                kind,
+                Body::from(n.to_string().into_bytes()),
+            ))
+        }
+
+        fn describe(&self) -> ikigai_core::Description {
+            ikigai_core::Description::new("body")
+                .verb(Verb::Sink)
+                .input(ikigai_core::ArgSpec::new("content").reads_body())
+        }
+    }
+
     fn kernel() -> Kernel {
         let size = FnEndpoint::new("size", |inv: &ikigai_core::Invocation<'_>| {
             let n = inv.inline_arg("content")?.len();
@@ -581,7 +792,15 @@ mod tests {
                     },
                 )
                 .bind(Exact::new("urn:test:size"), size)
-                .bind(Exact::new("urn:test:echo"), echo),
+                .bind(Exact::new("urn:test:echo"), echo)
+                .bind(
+                    Exact::new("urn:test:stream_count"),
+                    BodyReading { pass: false },
+                )
+                .bind(
+                    Exact::new("urn:test:stream_pass"),
+                    BodyReading { pass: true },
+                ),
         ))
     }
 
@@ -600,11 +819,16 @@ mod tests {
 
     /// Serve ONE connection on `path` under `limits`, returning the handle to join.
     fn serve_one(path: &Path, limits: Limits) -> thread::JoinHandle<()> {
+        serve_one_on(path, limits, kernel())
+    }
+
+    /// [`serve_one`] on a kernel of the test's own.
+    fn serve_one_on(path: &Path, limits: Limits, kernel: Kernel) -> thread::JoinHandle<()> {
         let _ = std::fs::remove_file(path);
         let listener = UnixListener::bind(path).unwrap();
         thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            serve_connection(&kernel(), stream, &limits, &Admission::owner());
+            serve_connection(&kernel, stream, &limits, &Admission::owner());
         })
     }
 
@@ -677,9 +901,12 @@ mod tests {
     /// chunk; past the door's upload bound it is refused, the connection kept aligned for
     /// the next call.
     #[test]
-    fn a_streamed_call_carries_the_body_and_the_door_bounds_it() {
+    fn a_streamed_call_carries_the_body_and_the_run_bounds_what_core_collects() {
         let path = socket_path("up");
-        let server = serve_one(&path, Limits::default().with_max_upload(600_000));
+        // The upload is attached as a body (ledger #2454): an endpoint that reads its
+        // argument as bytes has core collect it under the run's byte budget.
+        let bounded = kernel().with_stream_memory(600_000, 600_000);
+        let server = serve_one_on(&path, Limits::default(), bounded);
         let client = connect(&path).unwrap();
         let data = pattern(500_000);
         let mut reader = &data[..];
@@ -727,8 +954,91 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// An endpoint that reads its argument as a body takes the upload as it arrives: the
+    /// door collects none of it, so an upload far past the door's bound (and the run's)
+    /// crosses whole. Before ledger #2454 the door collected it and refused it here.
+    #[test]
+    fn an_upload_streams_to_a_body_reader_past_every_collecting_bound() {
+        let path = socket_path("us");
+        let bounded = kernel().with_stream_memory(600_000, 600_000);
+        let server = serve_one_on(&path, Limits::default().with_max_upload(600_000), bounded);
+        let client = connect(&path).unwrap();
+        for total in [5_000_000usize, 0, 3] {
+            let data = pattern(total);
+            let mut reader = &data[..];
+            let upload = Upload {
+                arg: "content".into(),
+                body: &mut reader,
+                len: Some(total as u64),
+            };
+            let answer = client
+                .issue_streamed(
+                    sink("urn:test:stream_count"),
+                    &Capability::root(),
+                    &RunContext::default(),
+                    Some(upload),
+                )
+                .unwrap();
+            let counted = answer.collect(64).unwrap().0.bytes;
+            assert_eq!(counted, total.to_string().into_bytes());
+        }
+        drop(client);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An answer that reads the upload only after it is resolved (here, the upload itself)
+    /// is not written over an unread upload, which would stall a caller still sending: the
+    /// door reads the rest first and holds it for the answer, up to its bound, and past that
+    /// refuses the call with the connection still aligned.
+    #[test]
+    fn an_answer_reading_the_upload_late_gets_what_the_door_held_up_to_its_bound() {
+        let path = socket_path("ul");
+        let server = serve_one(&path, Limits::default().with_max_upload(600_000));
+        let client = connect(&path).unwrap();
+        let data = pattern(500_000);
+        let mut reader = &data[..];
+        let answer = client
+            .issue_streamed(
+                sink("urn:test:stream_pass"),
+                &Capability::root(),
+                &RunContext::default(),
+                Some(Upload::content(&mut reader)),
+            )
+            .unwrap();
+        assert_eq!(answer.collect(usize::MAX).unwrap().0.bytes, data);
+
+        let too_big = pattern(700_000);
+        let mut reader = &too_big[..];
+        let error = client
+            .issue_streamed(
+                sink("urn:test:stream_pass"),
+                &Capability::root(),
+                &RunContext::default(),
+                Some(Upload::content(&mut reader)),
+            )
+            .map(|_| ())
+            .unwrap_err();
+        assert!(matches!(error, Error::OverBudget { .. }), "{error:?}");
+        let mut small = &b"four"[..];
+        let answer = client
+            .issue_streamed(
+                sink("urn:test:stream_count"),
+                &Capability::root(),
+                &RunContext::default(),
+                Some(Upload::content(&mut small)),
+            )
+            .unwrap();
+        assert_eq!(answer.collect(16).unwrap().0.bytes, b"4");
+        drop(client);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// A reader that announces one length and gives another is aborted, never ended short:
-    /// the door answers with the typed error and runs nothing.
+    /// the door answers with the typed error. A Sink that reads its argument as bytes never
+    /// runs (core collects the body first); one that reads it as a body gets the error in
+    /// place of the rest.
     #[test]
     fn an_upload_shorter_than_it_announced_is_refused() {
         let path = socket_path("sh");

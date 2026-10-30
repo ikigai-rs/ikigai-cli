@@ -9,11 +9,14 @@
 //! reader that drops an answer part-way stops the producer, whose Drop releases what it
 //! holds.
 
+use std::collections::VecDeque;
 use std::io::{self, Read};
 use std::sync::Arc;
 
 use futures::StreamExt;
-use ikigai_core::{Body, Bytes, Capability, Clock, Error, Kernel, Representation, Request};
+use ikigai_core::{
+    Body, BodyIssue, Bytes, Capability, Clock, Error, Expiry, Kernel, Representation, Request,
+};
 use ikigai_resolve::{CacheStatus, Resolver, RunContext, SpanCollector};
 use ikigai_wire::{
     decode_call_frame, decode_reply_frame, encode_call_frame, encode_reply_for_peer,
@@ -24,10 +27,13 @@ use ikigai_wire::{
 
 use crate::{admit, drive, other, quic_error, QuicResolver, Session, CANCELED};
 
-/// The most of a caller's streamed body a QUIC door takes: 64 MiB, what one message
-/// carried before v10, so no call that crossed before is refused now. The door collects
-/// the body before it resolves (core gives a door no way to hand a body to a request but an
-/// inline value or a content store it holds).
+/// The most of a caller's streamed body a QUIC door holds in memory: 64 MiB, what one message
+/// carried before v10. The door attaches the body to the request as it arrives (ledger
+/// #2454), so an endpoint that reads it as a body takes it a chunk at a time, at any size,
+/// and one that reads it as bytes has core collect it under the run's byte budget. What the
+/// door itself holds is the part an answer reads only after the request is resolved, read
+/// off the stream before the answer is written; past this the call is refused with
+/// `OverBudget`.
 pub const MAX_UPLOAD: usize = ikigai_core::DEFAULT_STREAM_MEMORY as usize;
 
 /// How much of a body a peer older than v10 takes, inline in one message: the message's
@@ -98,8 +104,11 @@ fn framed(payload: &[u8]) -> io::Result<Vec<u8>> {
 // --- the server half ----------------------------------------------------------------------
 
 /// Answer one stream of frames from a v10 peer (it opened with [`STREAM_MAGIC`], already
-/// read): its head, its body when it announces one (collected under [`MAX_UPLOAD`]), then
-/// the answer, streamed. A failure before the answer's first byte, and a TRACED call (core
+/// read): its head, then the answer, streamed. A body the head announces is ATTACHED to the
+/// request as it arrives ([`BodyIssue::attach`], ledger #2454), so an endpoint that reads its
+/// argument as a body takes the upload a chunk at a time; nothing of the answer is written
+/// before the upload is read to its END ([`Inflow::settle`]), since a caller sends its whole
+/// body before it reads. A failure before the answer's first byte, and a TRACED call (core
 /// records no trace for a streamed issue), is one plain reply frame.
 ///
 /// Returns the send half once the answer is written and finished, so the door can let it
@@ -118,7 +127,7 @@ pub(crate) async fn answer_streamed(
                 let malformed = Error::Endpoint(
                     "malformed call: a stream of frames must open with a head".into(),
                 );
-                return reply(send, recv, failed(&malformed), version).await;
+                return reply(send, Some(recv), failed(&malformed), version).await;
             }
         },
         _ => return None,
@@ -131,44 +140,97 @@ pub(crate) async fn answer_streamed(
     } = head;
     admit(&mut request, session);
     let capability = session.authority().clamp(&capability);
-    if let Some(body) = body {
-        let collected = match collect_upload(&mut recv, body.len, MAX_UPLOAD).await {
-            Ok(Ok(bytes)) => with_body_arg(request, &body.arg, bytes),
-            Ok(Err(refused)) => Err(refused.into()),
-            // The stream broke while the body arrived: nobody is left to answer.
-            Err(_) => return None,
-        };
-        request = match collected {
-            Ok(request) => request,
-            Err(error) => return reply(send, recv, failed(&error), version).await,
-        };
-    }
     let context = with.issue_context(ikigai_core::SystemClock.now());
+    let mut recv = Some(recv);
+    let mut inflow = None;
+    let mut issue = Err(context);
+    if let Some(body) = body {
+        let mut recv = recv.take().expect("held");
+        if resolves_off_worker() {
+            let attached = Inflow::new(recv, body.len);
+            let context = issue.expect_err("nothing attached yet");
+            issue = Ok(BodyIssue::new()
+                .with_context(context)
+                .attach(body.arg, attached.body()));
+            inflow = Some(attached);
+        } else {
+            // A resolution on the runtime's only thread could not wait on the stream it
+            // blocks: the body is collected first, as before ledger #2454.
+            let collected = match collect_upload(&mut recv, body.len, MAX_UPLOAD).await {
+                Ok(Ok(bytes)) => with_body_arg(request, &body.arg, bytes),
+                Ok(Err(refused)) => Err(refused.into()),
+                Err(_) => return None,
+            };
+            request = match collected {
+                Ok(request) => request,
+                Err(error) => return reply(send, Some(recv), failed(&error), version).await,
+            };
+        }
+    }
     if with.trace.is_some() {
         let answer = off_worker(|| {
             let collector = Arc::new(SpanCollector::default());
-            match ikigai_resolve::issue_traced_as_with_context(
-                kernel,
-                request,
-                &capability,
-                collector.clone(),
-                context,
-            ) {
+            let resolved = match issue {
+                Err(context) => ikigai_resolve::issue_traced_as_with_context(
+                    kernel,
+                    request,
+                    &capability,
+                    collector.clone(),
+                    context,
+                ),
+                Ok(issue) => futures::executor::block_on(kernel.issue_with(
+                    request,
+                    &capability,
+                    issue.traced(collector.clone()),
+                ))
+                .map(|representation| {
+                    let status = uploaded_status(&representation);
+                    (representation, status)
+                }),
+            };
+            match resolved {
                 Ok((representation, status)) => {
                     Reply::ResolvedTraced(representation, status, collector.take())
                 }
                 Err(error) => failed(&error),
             }
         });
-        let answer = answer.unwrap_or_else(|panic| failed(&panic));
+        let mut answer = answer.unwrap_or_else(|panic| failed(&panic));
+        if let Some(inflow) = inflow {
+            match inflow.settle(None).await {
+                Ok(Ok(())) => {}
+                Ok(Err(refused)) => answer = failed(&refused),
+                Err(_) => return None,
+            }
+            recv = inflow.into_recv();
+        }
         return reply(send, recv, answer, version).await;
     }
+    let attached = inflow.is_some();
     let resolved = off_worker(|| {
-        let was_cached = Kernel::is_cached(kernel, &request, &capability);
-        futures::executor::block_on(kernel.issue_body_with_context(request, &capability, context))
+        // An attached body gives the request a content id of its own: never a cached answer.
+        let was_cached = !attached && Kernel::is_cached(kernel, &request, &capability);
+        let issue = issue.unwrap_or_else(|context| BodyIssue::new().with_context(context));
+        futures::executor::block_on(kernel.issue_body_with(request, &capability, issue))
             .map(|answer| ReplyHead::of(answer, was_cached))
     });
-    let (head, body) = match resolved.and_then(|answer| answer) {
+    let mut resolved = resolved.and_then(|answer| answer);
+    if let Some(inflow) = inflow {
+        // The answer may still read the upload; what it has not read yet is held for it,
+        // under the door's bound.
+        let hold = resolved.is_ok().then_some(MAX_UPLOAD);
+        match inflow.settle(hold).await {
+            Ok(Ok(())) => {}
+            Ok(Err(refused)) => resolved = Err(refused),
+            Err(_) => return None,
+        }
+        if let Err(error) = &resolved {
+            // A refused answer is already dropped, and with it its hold on the stream.
+            let failure = failed(error);
+            return reply(send, inflow.into_recv(), failure, version).await;
+        }
+    }
+    let (head, body) = match resolved {
         Ok(split) => split,
         Err(error) => return reply(send, recv, failed(&error), version).await,
     };
@@ -179,6 +241,179 @@ pub(crate) async fn answer_streamed(
     pump(body, &mut send, version).await.ok()?;
     send.finish().ok()?;
     Some(send)
+}
+
+/// Whether a resolution here runs off the runtime's workers ([`off_worker`]), so that a body
+/// it reads off a stream can wait for the runtime to deliver it.
+fn resolves_off_worker() -> bool {
+    tokio::runtime::Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+}
+
+/// The cache status of an answer resolved with a body attached: its content id is fresh, so
+/// it was never a hit.
+fn uploaded_status<B>(representation: &Representation<B>) -> CacheStatus {
+    if representation.expiry == Expiry::Always {
+        CacheStatus::Uncacheable
+    } else {
+        CacheStatus::Miss
+    }
+}
+
+/// A caller's body as it comes off the call's stream: the receive half and the state of its
+/// frames, shared between the door and the [`Body`] attached to the request
+/// ([`body`](Self::body)), which pulls chunks through it while the endpoint reads.
+struct Inflow(Arc<tokio::sync::Mutex<Incoming>>);
+
+struct Incoming {
+    recv: quinn::RecvStream,
+    state: BodyState,
+    /// What [`Inflow::settle`] read on behalf of a body that had not read it yet.
+    held: VecDeque<Bytes>,
+    /// How the body ended once it has: `Ok` at END, the caller's ABORT (or a broken
+    /// stream) as an error, handed to the body once, after the chunks it held.
+    ended: Option<Result<(), Error>>,
+    /// The stream itself failed while the body was read: nobody is left to answer.
+    broken: bool,
+}
+
+impl Incoming {
+    /// The body's next chunk; `None` after its END, and after an error it has handed over.
+    async fn next(&mut self) -> Option<Result<Bytes, Error>> {
+        if let Some(chunk) = self.held.pop_front() {
+            return Some(Ok(chunk));
+        }
+        match self.ended.as_mut() {
+            Some(Ok(())) => return None,
+            Some(Err(_)) => {
+                let error = self.ended.replace(Ok(()));
+                return error.and_then(Result::err).map(Err);
+            }
+            None => {}
+        }
+        match self.read().await {
+            Some(Ok(chunk)) => Some(Ok(chunk)),
+            Some(Err(error)) => {
+                self.ended = Some(Ok(()));
+                Some(Err(error))
+            }
+            None => None,
+        }
+    }
+
+    /// Read the next chunk off the stream, recording the END or the failure.
+    async fn read(&mut self) -> Option<Result<Bytes, Error>> {
+        let fed = loop {
+            let payload = match read_frame(&mut self.recv).await {
+                Ok(Some(payload)) => payload,
+                Ok(None) => break Err(self.state.ended_early()),
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                    break Err(self.state.ended_early())
+                }
+                Err(error) => break Err(error),
+            };
+            match self.state.feed(payload) {
+                // An empty chunk carries nothing; read on.
+                Ok(Some(chunk)) if chunk.is_empty() => continue,
+                other => break other,
+            }
+        };
+        match fed {
+            Ok(Some(chunk)) => Some(Ok(chunk)),
+            Ok(None) => {
+                self.ended = Some(Ok(()));
+                None
+            }
+            Err(error) => {
+                let error = match refusal(&error) {
+                    Some(aborted) => aborted.clone().into(),
+                    None => {
+                        self.broken = true;
+                        Error::Endpoint(format!("the caller's body broke off: {error}"))
+                    }
+                };
+                self.ended = Some(Err(error.clone()));
+                Some(Err(error))
+            }
+        }
+    }
+}
+
+impl Inflow {
+    fn new(recv: quinn::RecvStream, len: Option<u64>) -> Self {
+        Inflow(Arc::new(tokio::sync::Mutex::new(Incoming {
+            recv,
+            state: BodyState::new(len),
+            held: VecDeque::new(),
+            ended: None,
+            broken: false,
+        })))
+    }
+
+    /// The body attached to the request: one-shot, each chunk read off the stream when it
+    /// is pulled, delivered by the runtime while the resolution waits off its workers.
+    fn body(&self) -> Body {
+        Body::once(futures::stream::unfold(
+            Arc::clone(&self.0),
+            |incoming| async move {
+                let next = incoming.lock().await.next().await;
+                next.map(|chunk| (chunk, incoming))
+            },
+        ))
+    }
+
+    /// Read the upload to its END once the request is resolved, before the answer is
+    /// written. When the attached body is gone (read whole, or dropped unread) the rest is
+    /// not read: the receive half is stopped instead. When the answer still holds it, up to
+    /// `hold` bytes are kept for it to read (`None`: nothing may be held), and past that
+    /// the call is refused with `OverBudget` and the receive half stopped.
+    ///
+    /// `Err` when the stream broke while the body was read: nobody is left to answer.
+    async fn settle(&self, hold: Option<usize>) -> io::Result<Result<(), Error>> {
+        let still_read = Arc::strong_count(&self.0) > 1;
+        let mut incoming = self.0.lock().await;
+        let mut held = 0usize;
+        let mut refused = None;
+        while incoming.ended.is_none() {
+            if !still_read {
+                let _ = incoming.recv.stop(0u32.into());
+                break;
+            }
+            let Some(Ok(chunk)) = incoming.read().await else {
+                break;
+            };
+            held += chunk.len();
+            match hold {
+                Some(hold) if held <= hold => incoming.held.push_back(chunk),
+                _ => {
+                    incoming.held.clear();
+                    let _ = incoming.recv.stop(0u32.into());
+                    refused = Some(Error::OverBudget {
+                        detail: format!(
+                            "the answer reads the caller's body after it is resolved, and \
+                             more of it is left than the {}-byte bound this door holds",
+                            hold.unwrap_or(0)
+                        ),
+                    });
+                    break;
+                }
+            }
+        }
+        if incoming.broken {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the caller's body broke off",
+            ));
+        }
+        Ok(refused.map_or(Ok(()), Err))
+    }
+
+    /// The receive half back, once nothing else holds the body.
+    fn into_recv(self) -> Option<quinn::RecvStream> {
+        Arc::try_unwrap(self.0)
+            .ok()
+            .map(|incoming| incoming.into_inner().recv)
+    }
 }
 
 /// Write `body` as chunk frames, then END, or an ABORT carrying the producer's error the
@@ -301,11 +536,13 @@ fn failed(error: &Error) -> Reply {
 /// finish, and stop reading whatever the caller is still sending.
 async fn reply(
     mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+    recv: Option<quinn::RecvStream>,
     reply: Reply,
     version: u32,
 ) -> Option<quinn::SendStream> {
-    let _ = recv.stop(0u32.into());
+    if let Some(mut recv) = recv {
+        let _ = recv.stop(0u32.into());
+    }
     let frame = encode_reply_for_peer(reply, version)
         .and_then(|p| framed(&p))
         .ok()?;
@@ -322,7 +559,7 @@ pub(crate) async fn refuse_streamed(
     refusal: Reply,
     version: u32,
 ) {
-    let _ = reply(send, recv, refusal, version).await;
+    let _ = reply(send, Some(recv), refusal, version).await;
 }
 
 // --- the client half ----------------------------------------------------------------------
@@ -525,8 +762,9 @@ impl QuicResolver {
     /// Resolve `request` under `capability` as part of `run`, with the answer STREAMED (wire
     /// v10, ledger #2242) on the call's own QUIC stream: its head now, its body frame by
     /// frame ([`QuicStreamed`]). With an `upload`, the caller's own body is sent the same way
-    /// as the value of its argument (`content` for a Sink); the server collects it, under its
-    /// upload bound ([`MAX_UPLOAD`]), before it resolves.
+    /// as the value of its argument (`content` for a Sink); the server attaches it to the
+    /// request as it arrives, so an endpoint that reads it as a body takes it a chunk at a
+    /// time.
     ///
     /// Against a peer older than v10 this is the collected exchange that peer has always
     /// served, presented as a body: the upload goes inline (refused with `OverBudget` past
@@ -841,6 +1079,48 @@ mod tests {
         }
     }
 
+    /// A Sink that reads `content` as a body, a chunk at a time, and answers how many bytes
+    /// it read (`stream_count`), or answers the body itself, unread until the answer is
+    /// (`stream_pass`).
+    struct BodyReading {
+        pass: bool,
+    }
+
+    #[async_trait]
+    impl Endpoint for BodyReading {
+        async fn invoke(&self, inv: &Invocation<'_>) -> ikigai_core::Result<Representation> {
+            let body = self.invoke_body(inv).await?;
+            let bytes = inv.collect(body.bytes).await?;
+            Ok(Representation::new(body.repr_type, bytes.to_vec()))
+        }
+
+        async fn invoke_body(
+            &self,
+            inv: &Invocation<'_>,
+        ) -> ikigai_core::Result<Representation<Body>> {
+            let body = inv.content_body("content").await?;
+            let kind = ReprType::new("application/octet-stream");
+            if self.pass {
+                return Ok(Representation::from_body(kind, body));
+            }
+            let mut chunks = body.into_stream();
+            let mut n = 0u64;
+            while let Some(chunk) = chunks.next().await {
+                n += chunk?.len() as u64;
+            }
+            Ok(Representation::from_body(
+                kind,
+                Body::from(n.to_string().into_bytes()),
+            ))
+        }
+
+        fn describe(&self) -> ikigai_core::Description {
+            ikigai_core::Description::new("body")
+                .verb(Verb::Sink)
+                .input(ikigai_core::ArgSpec::new("content").reads_body())
+        }
+    }
+
     fn kernel(dropped: Arc<AtomicBool>) -> Kernel {
         let echo = FnEndpoint::new("echo", |inv: &Invocation<'_>| {
             Ok(Representation::new(
@@ -868,7 +1148,15 @@ mod tests {
                 )
                 .bind(Exact::new("urn:test:endless"), generate(None, None))
                 .bind(Exact::new("urn:test:echo"), echo)
-                .bind(Exact::new("urn:test:huge"), huge),
+                .bind(Exact::new("urn:test:huge"), huge)
+                .bind(
+                    Exact::new("urn:test:stream_count"),
+                    BodyReading { pass: false },
+                )
+                .bind(
+                    Exact::new("urn:test:stream_pass"),
+                    BodyReading { pass: true },
+                ),
         ))
     }
 
@@ -975,8 +1263,8 @@ mod tests {
         server.join().unwrap();
     }
 
-    /// The caller's body crosses as chunks and is the Sink's `content`; a body that announces
-    /// more than the door's bound is refused at once, its bytes never read.
+    /// The caller's body crosses as chunks and is the Sink's `content`; a Sink that reads it
+    /// as bytes has core collect it under the run's byte budget, and past that it is refused.
     #[test]
     fn a_streamed_call_carries_the_body_and_an_announced_overrun_is_refused() {
         let (server_id, client_id) = pair();
@@ -1018,6 +1306,90 @@ mod tests {
             .map(|_| ())
             .unwrap_err();
         assert!(matches!(error, Error::OverBudget { .. }), "{error:?}");
+        drop(client);
+        server.join().unwrap();
+    }
+
+    /// An endpoint that reads its argument as a body takes the upload as it arrives: the
+    /// door collects none of it, so an upload past the door's bound crosses whole. Before
+    /// ledger #2454 the door collected it and refused it here.
+    #[test]
+    fn an_upload_streams_to_a_body_reader_past_the_door_bound() {
+        let (server_id, client_id) = pair();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (addr, server) = serve(&server_id, &client_id, alpn_protocols(), dropped);
+        let client = connect(addr, &client_id, &server_id.cert_pem).unwrap();
+        let total = MAX_UPLOAD as u64 + 1;
+        for len in [Some(total), None] {
+            let mut zeros = io::repeat(0).take(total);
+            let upload = Upload {
+                arg: "content".into(),
+                body: &mut zeros,
+                len,
+            };
+            let (counted, _) = client
+                .issue_streamed(
+                    sink("urn:test:stream_count"),
+                    &Capability::root(),
+                    &RunContext::default(),
+                    Some(upload),
+                )
+                .unwrap()
+                .collect(64)
+                .unwrap();
+            assert_eq!(counted.bytes, total.to_string().into_bytes());
+        }
+        drop(client);
+        server.join().unwrap();
+    }
+
+    /// An answer that reads the upload only after it is resolved (here, the upload itself)
+    /// is not written over an unread upload: the door reads the rest first and holds it for
+    /// the answer, up to its bound, and past that refuses the call.
+    #[test]
+    fn an_answer_reading_the_upload_late_gets_what_the_door_held_up_to_its_bound() {
+        let (server_id, client_id) = pair();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (addr, server) = serve(&server_id, &client_id, alpn_protocols(), dropped);
+        let client = connect(addr, &client_id, &server_id.cert_pem).unwrap();
+        let data = pattern(5_000_000);
+        let mut reader = &data[..];
+        let (passed, _) = client
+            .issue_streamed(
+                sink("urn:test:stream_pass"),
+                &Capability::root(),
+                &RunContext::default(),
+                Some(Upload::content(&mut reader)),
+            )
+            .unwrap()
+            .collect(usize::MAX)
+            .unwrap();
+        assert_eq!(passed.bytes, data);
+
+        let mut endless = io::repeat(0).take(MAX_UPLOAD as u64 + 1);
+        let error = client
+            .issue_streamed(
+                sink("urn:test:stream_pass"),
+                &Capability::root(),
+                &RunContext::default(),
+                Some(Upload::content(&mut endless)),
+            )
+            .map(|_| ())
+            .unwrap_err();
+        assert!(matches!(error, Error::OverBudget { .. }), "{error:?}");
+        // The connection serves the next call.
+        let mut small = &b"four"[..];
+        let (counted, _) = client
+            .issue_streamed(
+                sink("urn:test:stream_count"),
+                &Capability::root(),
+                &RunContext::default(),
+                Some(Upload::content(&mut small)),
+            )
+            .unwrap()
+            .collect(16)
+            .unwrap();
+        assert_eq!(counted.bytes, b"4");
         drop(client);
         server.join().unwrap();
     }
