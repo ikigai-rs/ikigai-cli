@@ -3134,6 +3134,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ikigai-compress"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6be20a76f80d8a74f890021b1b06086ab722686a73d5b2ad9b274eb1fa8154e6"
+dependencies = [
+ "flate2",
+ "ikigai-core",
+]
+
+[[package]]
 name = "ikigai-conformance"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3209,6 +3219,7 @@ dependencies = [
  "ikigai-bayes",
  "ikigai-browse",
  "ikigai-cms",
+ "ikigai-compress",
  "ikigai-conformance",
  "ikigai-core",
  "ikigai-diagram",

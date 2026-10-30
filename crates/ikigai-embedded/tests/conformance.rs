@@ -235,6 +235,10 @@ const INHERITED: &[(&str, &str)] = &[
     ("decrypt", "ikigai-encrypt"),
     ("sniff", "ikigai-sniff"),
     ("transrept-auto", "ikigai-sniff"),
+    ("compress-gzip", "ikigai-compress"),
+    ("compress-zlib", "ikigai-compress"),
+    ("decompress-gzip", "ikigai-compress"),
+    ("decompress-zlib", "ikigai-compress"),
     ("sparql-ask", "ikigai-sparql"),
     ("sparql-construct", "ikigai-sparql"),
     ("sparql-describe", "ikigai-sparql"),
@@ -1091,6 +1095,60 @@ fn the_json_space_is_bound_in_the_local_root_and_on_no_served_door() {
     for (door, kernel) in doors {
         let served: BTreeSet<String> = walked(&kernel).into_values().collect();
         for id in JSON {
+            assert!(!served.contains(id), "`{id}` is bound on {door}");
+        }
+    }
+}
+
+/// ★ **`urn:compress:*` and `urn:decompress:*` are the LOCAL root's, and no served door's**
+/// (2026-10-30). Bound so the runbook's Bytes tab runs on this host (`tests/compress_space.rs` in
+/// ikigai-cli), as `urn:json:*` was, and pinned the same way: decompression is bounded
+/// (`max-bytes`, 64 MiB by default), but a door that should offer a decompressor to remote
+/// callers is a separate decision, and this test is where that decision has to be made.
+#[test]
+fn the_compress_space_is_bound_in_the_local_root_and_on_no_served_door() {
+    const COMPRESS: [&str; 4] = [
+        "compress-gzip",
+        "compress-zlib",
+        "decompress-gzip",
+        "decompress-zlib",
+    ];
+    let root: BTreeSet<String> = walked(&root_kernel()).into_values().collect();
+    for id in COMPRESS {
+        assert!(root.contains(id), "`{id}` is not bound on the REPL root");
+    }
+    let every_face = ikigai_embedded::ServedSurface {
+        personal: false,
+        wire_eval: true,
+        llm: true,
+    };
+    let doors = [
+        ("the HTTP door", http_kernel()),
+        (
+            "the QUIC served kernel",
+            ikigai_embedded::served_kernel(
+                "conformance",
+                ikigai_embedded::ServedSurface::default(),
+            ),
+        ),
+        (
+            "the QUIC served kernel with every face open",
+            ikigai_embedded::served_kernel("conformance", every_face),
+        ),
+        (
+            "the calendar-only served kernel",
+            ikigai_embedded::served_kernel(
+                "conformance",
+                ikigai_embedded::ServedSurface {
+                    personal: true,
+                    ..every_face
+                },
+            ),
+        ),
+    ];
+    for (door, kernel) in doors {
+        let served: BTreeSet<String> = walked(&kernel).into_values().collect();
+        for id in COMPRESS {
             assert!(!served.contains(id), "`{id}` is bound on {door}");
         }
     }
