@@ -147,6 +147,40 @@ fn bind_persists_into_the_names_file() {
     assert!(!out.status.success(), "unbound, the name answers nothing");
 }
 
+/// Repeating the same batch from the same empty names table must not count the
+/// watch notification for `bind` as another installation.
+#[test]
+fn bind_install_count_is_repeatable() {
+    let home = scratch("install-count");
+    let mut counts = Vec::new();
+    for _ in 0..50 {
+        std::fs::write(config(&home).join("names"), "").expect("reset the names table");
+        let stdout = answer(&run(
+            &home,
+            &[
+                "--quiet",
+                "-c",
+                "bind urn:quakes:count = source urn:json:query src=<urn:file:quakes.json> q=<urn:file:count.jq>",
+                "-c",
+                "source urn:quakes:count",
+                "-c",
+                &format!("source {STATUS}"),
+            ],
+        ));
+        let count = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("installs: "))
+            .expect("status reports installs")
+            .parse::<u64>()
+            .expect("a numeric install count");
+        counts.push(count);
+        assert_eq!(
+            count, 2,
+            "initial empty table and bind only: {counts:?}\n{stdout}"
+        );
+    }
+}
+
 /// The names file's Sink DECLARES the capability it enforces, so the action manifold offers the
 /// write to root and never to a session narrowed below it (declared = enforced).
 #[test]

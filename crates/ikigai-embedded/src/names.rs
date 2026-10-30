@@ -152,6 +152,8 @@ struct Shared {
     /// A served door's layer ([`served`]): the bindings alone, and what the status door would
     /// say is said on stderr.
     served: bool,
+    /// Serialize file writes and reloads, including the digest check and installation.
+    update: futures::lock::Mutex<()>,
     /// The bindings.
     dynamic: Arc<DynamicSpace>,
     /// What is served ahead of the layer, for the shadow report: the root without it.
@@ -183,6 +185,7 @@ impl NamesLayer {
         let shared = Arc::new(Shared {
             path,
             served,
+            update: futures::lock::Mutex::new(()),
             dynamic: Arc::clone(&dynamic),
             ahead: RwLock::new(None),
             kernel: OnceLock::new(),
@@ -327,6 +330,13 @@ impl Shared {
     /// whatever happens, so the atom's next read is the file's. A file that does not read
     /// keeps the names in force and is recorded for the status door.
     async fn reload(&self) {
+        let update = self.update.lock().await;
+        self.reload_locked(&update).await;
+    }
+
+    /// A watcher notification and a Sink can describe the same change. Hold the update
+    /// lock from before reading through installation so only one installs that digest.
+    async fn reload_locked(&self, _update: &futures::lock::MutexGuard<'_, ()>) {
         let Some(kernel) = self.kernel() else {
             return;
         };
@@ -460,10 +470,13 @@ impl Endpoint for NamesFile {
                     name: "content".to_string(),
                     detail: e.to_string(),
                 })?;
+                // Lock before truncating the file: the watcher must never install an
+                // intermediate empty table, or race this write's own reload.
+                let update = self.shared.update.lock().await;
                 self.shared.write(text).map_err(|e| {
                     Error::Endpoint(format!("the names file could not be written: {e}"))
                 })?;
-                self.shared.reload().await;
+                self.shared.reload_locked(&update).await;
                 if let Some(why) = self.shared.refusal() {
                     return Err(Error::Endpoint(why));
                 }
