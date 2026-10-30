@@ -28,7 +28,7 @@ use crate::stream::{Sending, StreamFailed};
 use crate::{
     answer, header_fields, parse_target, upload, EdgeConfig, HttpRequest, Reply, Resp, Shared,
 };
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt, LengthLimitError, Limited};
 use std::net::IpAddr;
@@ -111,7 +111,7 @@ where
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     let (parts, body) = req.into_parts();
-    let head = match head_of(&parts, peer) {
+    let mut head = match head_of(&parts, peer) {
         Ok(head) => head,
         Err(refused) => return unread(render(*refused)),
     };
@@ -119,9 +119,18 @@ where
     if let Some(plan) = upload::plan(shared, &head) {
         return upload::exchange(shared, head, body, plan).await;
     }
-    match read_body(&shared.config, head, body).await {
-        Ok(req) => reply(answer(shared, req).await),
-        Err(refused) => unread(render(*refused)),
+    match read_body(&shared.config, &mut head, body).await {
+        Ok(()) => reply(answer(shared, head).await),
+        Err(refused) => {
+            let mut resp = *refused;
+            if resp.status == 413 {
+                // Intake has not admitted this caller. Use only the built-in page and
+                // global policy: no route lookup or host hook that may assume identity.
+                resp = crate::error_page::negotiate_builtin(resp, &head);
+                crate::apply_edge_policy(&mut resp, &shared.config, &head, None);
+            }
+            unread(render(resp))
+        }
     }
 }
 
@@ -183,11 +192,7 @@ fn head_of(parts: &http::request::Parts, peer: Option<IpAddr>) -> Result<HttpReq
 }
 
 /// Read the body of `req` into it, under the door's body bound and deadline.
-async fn read_body<B>(
-    config: &EdgeConfig,
-    mut req: HttpRequest,
-    body: B,
-) -> Result<HttpRequest, Box<Resp>>
+async fn read_body<B>(config: &EdgeConfig, req: &mut HttpRequest, body: B) -> Result<(), Box<Resp>>
 where
     B: Body,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -213,7 +218,24 @@ where
     // `Limited` fails the read the moment the body passes `max`, and that failure is a `413`,
     // never the first `max` bytes handed on. The whole body is read under its own deadline, for
     // the reason the head is: a client that trickles it would otherwise hold the connection.
-    let read = tokio::time::timeout(config.body_timeout, Limited::new(body, max).collect()).await;
+    let read = tokio::time::timeout(config.body_timeout, async {
+        let mut body = std::pin::pin!(Limited::new(body, max));
+        let mut bytes = Vec::new();
+        while let Some(frame) = body.frame().await {
+            if let Ok(mut data) = frame?.into_data() {
+                // Copy incoming data directly into one growing buffer and release each frame.
+                // Collecting frames, then consolidating to Bytes and Vec retains whole bodies.
+                while data.has_remaining() {
+                    let chunk = data.chunk();
+                    bytes.extend_from_slice(chunk);
+                    let n = chunk.len();
+                    data.advance(n);
+                }
+            }
+        }
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(bytes)
+    })
+    .await;
     let body = match read {
         Err(_) => return Err(refuse(408, "Request Timeout", "request body took too long")),
         Ok(Err(e)) if e.downcast_ref::<LengthLimitError>().is_some() => {
@@ -222,10 +244,10 @@ where
         // The client hung up part-way, or broke the framing: a PARTIAL submission, which the
         // endpoint must never be handed as if it were whole.
         Ok(Err(_)) => return Err(refuse(400, "Bad Request", "incomplete request body")),
-        Ok(Ok(collected)) => collected.to_bytes().to_vec(),
+        Ok(Ok(bytes)) => bytes,
     };
     req.body = body;
-    Ok(req)
+    Ok(())
 }
 
 /// An answer as an `http::Response`: its content framed by length (or chunked, for a stream
@@ -276,4 +298,52 @@ fn framed(resp: &Resp, content_length: Option<u64>, body: DoorBody) -> http::Res
             resp.reason.as_bytes(),
         ));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct HeldFrame {
+        bytes: [u8; 2],
+        released: Arc<AtomicUsize>,
+    }
+
+    impl AsRef<[u8]> for HeldFrame {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl Drop for HeldFrame {
+        fn drop(&mut self) {
+            self.released.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn intake_releases_each_frame_before_reading_the_next() {
+        let released = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&released);
+        let frames = futures::stream::iter((0..4).map(move |i| {
+            assert_eq!(counter.load(Ordering::SeqCst), i, "intake retained a frame");
+            Ok::<_, std::convert::Infallible>(Frame::data(Bytes::from_owner(HeldFrame {
+                bytes: [i as u8; 2],
+                released: Arc::clone(&counter),
+            })))
+        }));
+        let (parts, ()) = http::Request::new(()).into_parts();
+        let mut req = head_of(&parts, None).unwrap_or_else(|_| panic!("valid head refused"));
+        let config = EdgeConfig {
+            max_body_bytes: 8,
+            ..EdgeConfig::default()
+        };
+        read_body(&config, &mut req, http_body_util::StreamBody::new(frames))
+            .await
+            .unwrap_or_else(|_| panic!("bounded body refused"));
+        assert_eq!(released.load(Ordering::SeqCst), 4);
+        assert_eq!(req.body, [0, 0, 1, 1, 2, 2, 3, 3]);
+    }
 }

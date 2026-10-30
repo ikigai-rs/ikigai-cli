@@ -25,12 +25,24 @@ use ikigai_fn::html::html_text;
 /// select the body too. Only the body and its type change: the status and every header the
 /// answer already carries (`Retry-After`, `Allow`) are the ones it was built with, and the
 /// edge policy (the door's CSP among it) is applied after this, to whichever page it is.
-pub(crate) fn negotiate(mut resp: Resp, req: &HttpRequest, config: &EdgeConfig) -> Resp {
+pub(crate) fn negotiate(resp: Resp, req: &HttpRequest, config: &EdgeConfig) -> Resp {
+    negotiate_with_hook(resp, req, config.error_page.as_ref())
+}
+
+/// A pre-admission refusal must not call a host page hook that may assume authentication.
+pub(crate) fn negotiate_builtin(resp: Resp, req: &HttpRequest) -> Resp {
+    negotiate_with_hook(resp, req, None)
+}
+
+fn negotiate_with_hook(
+    mut resp: Resp,
+    req: &HttpRequest,
+    hook: Option<&crate::ErrorPageFn>,
+) -> Resp {
     if resp.status < 400 || bare_media(&resp.content_type) != "text/plain" {
         return resp;
     }
     resp.add_vary("Accept");
-    let hook = config.error_page.as_ref();
     if hook.is_some() {
         resp.add_vary("Sec-Fetch-Mode");
         resp.add_vary("HX-Request");

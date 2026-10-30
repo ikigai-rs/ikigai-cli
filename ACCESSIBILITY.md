@@ -77,7 +77,11 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
 - `crates/ikigai-web/tests/streams.rs` and `tests/uploads.rs` pin that a `416 Range Not
   Satisfiable` and an upload's `413 Payload Too Large` are answered as the same page (`lang`,
   `main`, `h1` naming the status) for a browser.
-- `crates/ikigai-web/tests/error_pages.rs` (7 tests) and the unit tests in `error_page.rs` pin the
+- `crates/ikigai-web/tests/error_pages.rs` also pins an ordinary intake's pre-admission
+  `413 Payload Too Large`: declared and chunked bodies negotiate the built-in page, with
+  global security headers, without admission, identity, capability or custom page hooks;
+  plain clients keep the sentence, and `HEAD` carries the matching length without content.
+- `crates/ikigai-web/tests/error_pages.rs` and the unit tests in `error_page.rs` pin the
   page's shape (`lang`, title, `main`, `h1`), escaping, which clients get a page, `Vary: Accept`,
   and that a JSON door and a success are left alone. `crates/ikigai-web/tests/door_error_page.rs`
   pins that a door's own page keeps the status and headers, is served under the door's CSP, and

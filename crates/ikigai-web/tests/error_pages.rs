@@ -148,3 +148,53 @@ async fn a_success_is_not_a_page() {
     assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
     assert_eq!(split(&resp).1, "{}");
 }
+
+/// Intake refuses before admission or authentication, for declared and streamed lengths.
+#[tokio::test]
+async fn an_ordinary_oversize_body_negotiates_a_page_before_admission() {
+    let config = EdgeConfig {
+        max_body_bytes: 3,
+        admit_fn: Some(Arc::new(|_| panic!("oversize intake reached admission"))),
+        principal_fn: Some(Arc::new(|_| panic!("oversize intake reached identity"))),
+        error_page: Some(Arc::new(|_, _| panic!("oversize intake reached host page"))),
+        ..EdgeConfig::default()
+    };
+    let addr = start(
+        kernel(),
+        config,
+        Arc::new(|_| panic!("oversize intake reached capability")),
+    )
+    .await;
+    for framing in [
+        "Content-Length: 4\r\nExpect: 100-continue\r\n\r\n",
+        "Transfer-Encoding: chunked\r\n\r\n2\r\nab\r\n2\r\ncd\r\n0\r\n\r\n",
+    ] {
+        for accept in [BROWSER, "text/plain", "*/*"] {
+            let mut content_length = None;
+            for method in ["PUT", "HEAD"] {
+                let request = format!("{method} /t/hostile HTTP/1.1\r\nHost: x\r\nAccept: {accept}\r\nSec-Fetch-Mode: navigate\r\nAuthorization: Bearer ignored\r\nCookie: session=ignored\r\n{framing}");
+                let resp = send(addr, request.as_bytes()).await;
+                assert!(resp.starts_with("HTTP/1.1 413 Payload Too Large"), "{resp}");
+                assert_eq!(header(&resp, "x-content-type-options"), Some("nosniff"));
+                assert!(header(&resp, "content-security-policy").is_some(), "{resp}");
+                assert_eq!(header(&resp, "connection"), Some("close"));
+                assert!(header(&resp, "vary").unwrap_or_default().contains("Accept"));
+                if method == "HEAD" {
+                    assert!(split(&resp).1.is_empty(), "{resp}");
+                    assert_eq!(header(&resp, "content-length"), content_length.as_deref());
+                } else {
+                    content_length = header(&resp, "content-length").map(str::to_owned);
+                    if accept == BROWSER {
+                        assert_page(&resp, "413 Payload Too Large");
+                    } else {
+                        assert_eq!(
+                            header(&resp, "content-type"),
+                            Some("text/plain; charset=utf-8")
+                        );
+                        assert_eq!(split(&resp).1, "request body too large");
+                    }
+                }
+            }
+        }
+    }
+}
