@@ -308,6 +308,35 @@ OS GUI shortcuts (⌘C etc.), so terminal-native editing *is* readline/Emacs. Th
 demo space is composed in `ikigai-embedded`; a real host binds its own
 endpoints there.
 
+## Scripts
+
+A `.iki` file is the lines a person would type, run in order. A line whose first non-blank
+character is `#` is a comment, so a shebang is one; `# @param <name>` declares a parameter
+(`# @param <name> = <default>` gives it a default), and a line uses it as `{name}`:
+
+```bash
+#!/usr/bin/env -S ikigai --quiet --script
+# @param who
+# @param greeting = hello
+source urn:iki:fn:toUpper "{greeting}, {who}"
+```
+
+```bash
+ikigai greet.iki who=brian            # HELLO, BRIAN
+ikigai --script greet who=brian       # the same, for a file of any name
+chmod +x greet.iki && ./greet.iki who=brian   # the shebang runs `ikigai --quiet --script`
+```
+
+A script stops at its first failing line: it prints `error: line N: …` to stderr and exits
+1, and no later line runs. A parameter the script does not declare, or one with no default
+that is left out, is refused before any line runs, with exit 2. Flags go before the file;
+every word after it is a `name=value` parameter. Answers go to stdout and each line's notes
+(`[cache]` and the like) to stderr, as in a `-c` batch; `--quiet` prints only the answers.
+
+In the REPL (or a `-c` batch), `script <iri> [name=value …]` runs a script stored in the
+workspace, for example `script urn:file:refresh.iki since=2026-10-01`. The command is
+`script`, not `run`: `run` is still the old name of `execute`, which runs a stored plan.
+
 ## Hosting layers on the QUIC door
 
 When the config home has a **`layers/` directory**, `ikigai serve quic://…` hosts

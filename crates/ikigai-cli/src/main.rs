@@ -27,6 +27,7 @@ mod rate_limits;
 mod repl;
 #[cfg(feature = "web")]
 mod route_load;
+mod script;
 #[cfg(all(feature = "embedded", not(target_family = "wasm")))]
 mod show;
 #[cfg(not(target_family = "wasm"))]
@@ -241,6 +242,15 @@ usage:
                                statement (a newline does not split it): repeat -c for more
   ikigai -e '<sexpr>' ...       evaluate a Lisp s-expression (urn:lisp:eval), then exit
   ikigai --load <uri> [--cap <s>]  read a script resource and evaluate it as Lisp (--cap narrows first)
+  ikigai <file>.iki [k=v ...]   run a script of REPL lines with those parameters, then exit. `#`
+                               starts a comment; `# @param <name> [= <default>]` declares a
+                               parameter, used as `{name}`. Stops at the first failing line:
+                               `error: line N: ...` on stderr, exit 1 (2 when the parameters are
+                               refused). Answers on stdout, notes on stderr; --quiet: answers only.
+                               Flags go before the file: every word after it is a parameter
+  ikigai --script <file> [k=v ...]  the same, for a file of any name; a shebang line runs one:
+                               #!/usr/bin/env -S ikigai --quiet --script
+                               In the REPL, `script <iri> [k=v ...]` runs a stored one
   ikigai -h | --help           show this help
   ikigai -V | --version        print `ikigai <x.y.z>` on one line and exit — answered in
                                every mode, before anything is built or connected
@@ -568,6 +578,9 @@ struct ReplArgs {
     /// a tool, not a demo. Only meaningful for the embedded (non-`--connect`) kernel.
     demo: bool,
     commands: Vec<String>,
+    /// `ikigai <file>.iki [key=value …]` or `--script <file> [key=value …]` (ledger #2649): run
+    /// that script with those parameters, then exit.
+    script: Option<ScriptFile>,
     /// `None` = the embedded in-process kernel; `Some` = attach to a server, with
     /// `Some(None)` meaning the default Unix socket.
     connect: Option<Option<String>>,
@@ -588,6 +601,13 @@ struct ReplArgs {
     /// or a `-c` batch. Everything after `layers` on the command line is its own.
     #[cfg(feature = "embedded")]
     layers: Option<layer::Command>,
+}
+
+/// A script file the command line names, and the parameters given after it.
+#[derive(Clone, Debug)]
+struct ScriptFile {
+    path: String,
+    params: std::collections::BTreeMap<String, String>,
 }
 
 /// One `--mount`: where it binds, what it connects to, and the certificates for
@@ -1874,16 +1894,36 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 }
                 repl.commands.push(command);
             }
+            // `--script <file>` (the shebang's flag: the kernel appends the file's path), or a
+            // `<file>.iki` named directly. Every word after the file is one of its
+            // parameters, so flags go before it.
+            "--script" => {
+                let path = argv
+                    .next()
+                    .ok_or_else(|| "--script needs <file>".to_string())?;
+                repl.script = Some(script_file(path, argv.by_ref())?);
+            }
+            path if !path.starts_with('-') && path.ends_with(".iki") => {
+                repl.script = Some(script_file(path.to_string(), argv.by_ref())?);
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
     // Both postures at once is a startup error, not a precedence rule (see `Mounts`) — for
     // the REPL, the one-shot `-c`, and `--daemon`, which share this parse.
     repl.mounts.refuse_conflict()?;
-    #[cfg(feature = "embedded")]
-    if repl.layers.is_some() && (daemon || repl.react || !repl.commands.is_empty()) {
+    if repl.script.is_some() && (daemon || !repl.commands.is_empty()) {
         return Err(
-            "`layers` runs one command and exits: drop -c/-e/--load, --daemon and --react"
+            "a script runs on its own: drop -c/-e/--load and --daemon beside it".to_string(),
+        );
+    }
+    #[cfg(feature = "embedded")]
+    if repl.layers.is_some()
+        && (daemon || repl.react || !repl.commands.is_empty() || repl.script.is_some())
+    {
+        return Err(
+            "`layers` runs one command and exits: drop -c/-e/--load, a script, --daemon and \
+             --react"
                 .to_string(),
         );
     }
@@ -1893,6 +1933,12 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
         }));
     }
     Ok(Some(Mode::Repl(repl)))
+}
+
+/// The script `path` names and its parameters, the rest of the command line.
+fn script_file(path: String, rest: impl Iterator<Item = String>) -> Result<ScriptFile, String> {
+    let params = script::params(rest).map_err(|e| format!("{path}: {e}"))?;
+    Ok(ScriptFile { path, params })
 }
 
 #[cfg(feature = "embedded")]
@@ -2105,7 +2151,12 @@ fn main() {
             } else {
                 arm_local_root();
                 arm_names();
-                arm_bayes(!args.quiet && args.commands.is_empty() && layers.is_none());
+                arm_bayes(
+                    !args.quiet
+                        && args.commands.is_empty()
+                        && args.script.is_none()
+                        && layers.is_none(),
+                );
             }
             let (engine, topology) =
                 build_engine(args.connect, args.mounts, &args.certs, args.react).unwrap_or_else(
@@ -2116,6 +2167,16 @@ fn main() {
                 );
             if let Some(prepared) = layers {
                 std::process::exit(layer::run(&engine, prepared));
+            }
+            if let Some(file) = &args.script {
+                // Read before anything runs: a file that is not there is the caller's mistake,
+                // and no line of it has run.
+                let text = std::fs::read_to_string(&file.path).unwrap_or_else(|e| {
+                    eprintln!("ikigai: cannot read the script {}: {e}", file.path);
+                    std::process::exit(2);
+                });
+                prepare_batch(&engine);
+                std::process::exit(repl::run_script(engine, &text, &file.params, args.quiet));
             }
             run_repl(engine, args.plain, args.quiet, &args.commands, &topology);
         }
@@ -3455,41 +3516,7 @@ fn run_repl(engine: Engine, plain: bool, quiet: bool, commands: &[String], topol
         engine.set_picture_hint(std::io::stdout().is_terminal());
     }
     if !commands.is_empty() {
-        // A batch fed on a NON-TTY stdin (`printf %s "$v" | ikigai -c 'sink urn:secret:x'`)
-        // routes that stdin to the first content-less `sink` — so a secret is piped in, never
-        // placed on the command line — or to the first `source` stage left with one REQUIRED
-        // argument and no value for it (`cat q.rq | ikigai -c 'source …:graph-select graph=G'`,
-        // ledger #1166), or to the first content-less `delete` whose contract declares
-        // `content` (a claim's release note, ledger #1230). A TTY stdin is left alone (nothing
-        // to read, no block).
-        #[cfg(not(target_family = "wasm"))]
-        {
-            use std::io::IsTerminal;
-            if !std::io::stdin().is_terminal() {
-                // LAZILY. Reading stdin to EOF here blocks whenever stdin is a non-TTY that
-                // never closes — an inherited pipe from an editor, a harness, launchd — so
-                // `ikigai -c 'source …' > file` hung waiting for input no command wanted.
-                // `is_terminal()` cannot tell "a pipe with data" from "a pipe nobody will
-                // write to"; the only safe moment to block is when a content-less `sink`
-                // has actually asked for the content.
-                //
-                // And even then, not forever (ledger #1088): an agent's backgrounded shell
-                // hands a `sink urn:iki:ledger:close item=N` an inherited pipe nobody writes,
-                // and the read waited on it for good. So the reader waits [`STDIN_GRACE`] for
-                // the FIRST byte (or EOF); a stdin silent that long is idle, and the sink goes
-                // without `content` rather than with an empty one.
-                //
-                // And the probe (ledger #1305): a `source` or `delete` fetches its target's
-                // contract only to learn whether stdin should fill an argument, so a stdin
-                // already at its end with nothing (`/dev/null`, as a harness or an agent's
-                // shell hands it, or a closed empty pipe) is told apart WITHOUT reading it,
-                // and no contract is fetched, or cached, for its sake.
-                engine.set_piped_input_probed(
-                    || read_stdin_unless_idle(STDIN_GRACE),
-                    stdin_ended_empty,
-                );
-            }
-        }
+        prepare_batch(&engine);
         std::process::exit(repl::run_commands(engine, commands));
     }
     #[cfg(not(target_family = "wasm"))]
@@ -3508,6 +3535,50 @@ fn run_repl(engine: Engine, plain: bool, quiet: bool, commands: &[String], topol
     }
     #[cfg(target_family = "wasm")]
     std::process::exit(repl::run(engine, topology, quiet));
+}
+
+/// Ready the engine for a run with no prompt (a `-c` batch or a script): a picture is named
+/// to a person at a terminal, and a non-TTY stdin feeds the first command that wants it.
+#[cfg(feature = "embedded")]
+fn prepare_batch(engine: &Engine) {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        use std::io::IsTerminal;
+        engine.set_picture_hint(std::io::stdout().is_terminal());
+    }
+    // A batch fed on a NON-TTY stdin (`printf %s "$v" | ikigai -c 'sink urn:secret:x'`)
+    // routes that stdin to the first content-less `sink` — so a secret is piped in, never
+    // placed on the command line — or to the first `source` stage left with one REQUIRED
+    // argument and no value for it (`cat q.rq | ikigai -c 'source …:graph-select graph=G'`,
+    // ledger #1166), or to the first content-less `delete` whose contract declares
+    // `content` (a claim's release note, ledger #1230). A TTY stdin is left alone (nothing
+    // to read, no block).
+    #[cfg(not(target_family = "wasm"))]
+    {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            // LAZILY. Reading stdin to EOF here blocks whenever stdin is a non-TTY that
+            // never closes — an inherited pipe from an editor, a harness, launchd — so
+            // `ikigai -c 'source …' > file` hung waiting for input no command wanted.
+            // `is_terminal()` cannot tell "a pipe with data" from "a pipe nobody will
+            // write to"; the only safe moment to block is when a content-less `sink`
+            // has actually asked for the content.
+            //
+            // And even then, not forever (ledger #1088): an agent's backgrounded shell
+            // hands a `sink urn:iki:ledger:close item=N` an inherited pipe nobody writes,
+            // and the read waited on it for good. So the reader waits [`STDIN_GRACE`] for
+            // the FIRST byte (or EOF); a stdin silent that long is idle, and the sink goes
+            // without `content` rather than with an empty one.
+            //
+            // And the probe (ledger #1305): a `source` or `delete` fetches its target's
+            // contract only to learn whether stdin should fill an argument, so a stdin
+            // already at its end with nothing (`/dev/null`, as a harness or an agent's
+            // shell hands it, or a closed empty pipe) is told apart WITHOUT reading it,
+            // and no contract is fetched, or cached, for its sake.
+            engine
+                .set_piped_input_probed(|| read_stdin_unless_idle(STDIN_GRACE), stdin_ended_empty);
+        }
+    }
 }
 
 /// How long a content-less `sink` waits for stdin's FIRST byte (or its end) before calling

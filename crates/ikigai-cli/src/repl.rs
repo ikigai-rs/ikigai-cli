@@ -3,11 +3,14 @@
 //! Used when stdout is not a terminal (piping, scripts, CI) or with `--plain`. `--quiet` is
 //! this REPL without its greeting, and without a prompt when stdin is not a terminal.
 
+use std::collections::BTreeMap;
 use std::io;
 
 use crate::output::{print, println};
 
-use ikigai_engine::{Action, CacheStats, Engine, HELP};
+use ikigai_engine::{Action, CacheStats, Engine, ScriptError, HELP};
+
+use crate::script;
 
 /// Execute each command non-interactively, then return a process exit code
 /// (`1` if any command errored, else `0`). Output goes to stdout, errors to
@@ -22,6 +25,12 @@ pub fn run_commands(engine: Engine, commands: &[String]) -> i32 {
     let mut total = CacheStats::default();
     let mut ran = 0u32;
     for command in commands {
+        if let Some(invocation) = script::command(command) {
+            if run_stored_script(&engine, invocation).is_err() {
+                code = 1;
+            }
+            continue;
+        }
         match engine.eval(command) {
             Action::Output(entry) => {
                 match &entry.result {
@@ -94,6 +103,12 @@ pub fn run(engine: Engine, topology: &[String], quiet: bool) -> i32 {
             }
             break;
         }
+        if let Some(invocation) = script::command(&line) {
+            if run_stored_script(&engine, invocation).is_err() {
+                code = 1;
+            }
+            continue;
+        }
         match engine.eval(&line) {
             Action::Quit => break,
             Action::Help => println!("{HELP}"),
@@ -121,6 +136,74 @@ pub fn run(engine: Engine, topology: &[String], quiet: bool) -> i32 {
         }
     }
     code
+}
+
+/// Run a script file from the shell (`ikigai <file>.iki [key=value …]`, ledger #2649) and
+/// return the process exit code: `0` when every line ran, `1` at the first line that failed,
+/// and `2` when the script ran no line because its parameters were refused (a name it does not
+/// declare, or one with no default left out).
+///
+/// Each answer goes to stdout as its line finishes; a failure goes to stderr once, as
+/// `error: line N: …`. Without `quiet` each line's cache, fan-out and contract notes go to
+/// stderr as in a `-c` batch; `--quiet` prints only the answers, as a replay does.
+pub fn run_script(
+    engine: Engine,
+    text: &str,
+    params: &BTreeMap<String, String>,
+    quiet: bool,
+) -> i32 {
+    let ran = script::run(&engine, text, params, |_, _, action| {
+        show(&engine, action, quiet)
+    });
+    match ran {
+        Ok(()) => 0,
+        Err(error) => {
+            report_script_error(&error);
+            if error.line.is_some() {
+                1
+            } else {
+                2
+            }
+        }
+    }
+}
+
+/// The REPL's `script <iri> [key=value …]` (and the same line in a `-c` batch): run the
+/// script stored at `<iri>` as [`run_script`] runs a file, and report where it stopped. Its
+/// lines keep their notes, as every line the REPL runs does.
+fn run_stored_script(
+    engine: &Engine,
+    invocation: Result<script::Invocation, String>,
+) -> Result<(), ScriptError> {
+    script::run_command(engine, invocation, |_, _, action| {
+        show(engine, action, false)
+    })
+    .inspect_err(report_script_error)
+}
+
+/// Print one script line's answer. A failing line's error is not printed here: the script's
+/// own error says it once, with the line's number.
+fn show(engine: &Engine, action: Action, quiet: bool) {
+    match action {
+        Action::Output(entry) => {
+            if let Ok(out) = &entry.result {
+                println!("{out}");
+            }
+            if !quiet {
+                if let Some(label) = entry.cache.label() {
+                    eprintln!("[{label}]");
+                }
+                report_fan_out(engine);
+                report_contract_notes(engine);
+            }
+        }
+        Action::Help => println!("{HELP}"),
+        Action::Clear | Action::Quit | Action::Noop => {}
+    }
+}
+
+fn report_script_error(error: &ScriptError) {
+    eprintln!("error: {}", crate::restate_build_line(&error.to_string()));
 }
 
 /// Report what a fan-out actually did — `[fan-out 10 → 1 wide]` — beside the cache

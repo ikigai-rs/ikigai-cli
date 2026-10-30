@@ -17,6 +17,7 @@ ikigai                              # full-screen TUI REPL on a terminal
 ikigai --plain                      # line REPL (also used automatically when piped)
 ikigai --quiet                      # line REPL, no banner or topology lines; no prompt on a piped stdin
 ikigai -c 'source urn:iki:fn:toUpper hi'  # run a command and exit (repeatable; composes in a shell)
+ikigai refresh.iki since=2026-10-01      # run a script of REPL lines with parameters; stops at the first failing line
 ```
 
 ## Transports
