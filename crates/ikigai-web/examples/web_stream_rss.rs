@@ -21,6 +21,17 @@
 //! - `upload-collected`: the same 1 GiB to an ordinary route whose bound admits it, taken into
 //!   memory as every upload was before ledger #2244; the Sink reads it as inline content.
 
+//! Ordinary intake measurement (ledger #2477, 2026-10-30): Linux x86_64, rustc 1.99.0,
+//! release build, `/usr/bin/time -v target/release/examples/web_stream_rss upload-collected`.
+//! On base `83a7355a39932190eeb6ad0fea0e4379d18ea094`, maximum RSS was 2,949,224 KiB;
+//! after copying incoming frames directly into one Vec it was 2,102,756 KiB (29% lower).
+//! Both returned `200` and the Sink counted 1,073,741,824 bytes. These are single-process,
+//! single-run measurements, not a portable memory ceiling. Intake now keeps one growing
+//! buffer rather than retained frames plus consolidation buffers. Dispatch still clones
+//! that buffer into inline content while preserving the original request for host hooks,
+//! so this whole-exchange example still peaks near twice the body size.
+//!
+
 use async_trait::async_trait;
 use ikigai_core::{
     cap_stream_spill, ArgRef, AsyncFnEndpoint, Body, ByteStream, Bytes, Description, Endpoint,

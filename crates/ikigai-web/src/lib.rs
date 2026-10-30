@@ -363,6 +363,8 @@ pub struct ErrorView<'a> {
 ///
 /// It is asked only when all of these hold, so a JSON client, a script and curl never see
 /// the door's HTML:
+/// - the answer is past ordinary in-memory intake (its pre-admission `413` uses only the
+///   built-in page, without calling this hook);
 /// - the answer is an error (`>= 400`) whose body is the sentence (`text/plain`); a door
 ///   answering [`ErrorBody::Json`] keeps its JSON;
 /// - `Accept` names `text/html` over `text/plain` (the rule of [`EdgeConfig::error_body`]);
@@ -502,6 +504,8 @@ pub struct EdgeConfig {
     /// before it is read when its `Content-Length` says so, and as soon as it passes the bound
     /// when it is chunked. Never truncated. Default [`DEFAULT_MAX_BODY_BYTES`]. Raise it for a
     /// door that takes genuinely large writes, lower it for one that only takes forms.
+    /// An ordinary intake's `413` negotiates the built-in error page and carries global edge
+    /// policy, before admission and without identity, capability or custom error-page hooks.
     pub max_body_bytes: usize,
     /// Routes-only: an un-routed path is **not** part of the public surface — it 404s instead
     /// of falling through to the mechanical `/noun/partition/key` → `urn:` default. This turns
