@@ -79,7 +79,7 @@ Every directory above it must let the group's members search it as well.
 
 ### The trust model, plainly
 
-- **Another account is bounded.** The operating system reports its UID,
+- **A process under another account is bounded.** The operating system reports its UID,
   the door maps that UID to a grant and a principal, and it holds no way to reach an owner
   door: the owner's sockets are `0600` in `0700` directories, and every owner door refuses its
   UID. This is what makes "a node on the same machine" boundable: run the node as its own
