@@ -3084,7 +3084,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-cli"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "age",
  "async-trait",
@@ -3158,9 +3158,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-core"
-version = "0.2.8"
+version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67b9c5bb6f78ece4d365ca1ac5a48f49670cc4451bc7b2d585199cbea7ccfb38"
+checksum = "5f283c45c0f0bc3eed7e2d72ab3dc7b822a0ea14e785808dd1ed4f82063b1e76"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3189,7 +3189,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-discovery"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "if-addrs",
  "mdns-sd",
@@ -3197,7 +3197,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-email"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "async-trait",
  "futures",
@@ -3207,7 +3207,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-embedded"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "age",
  "async-trait",
@@ -3289,9 +3289,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-engine"
-version = "0.2.8"
+version = "0.2.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "846151cb32e097b7e00eccf14cb67f0c502d6d513c6711c28e9d579398c22fd4"
+checksum = "f53a64de043c40646186f8f90c2e29b91c4aa591fd6027ba73721ef1fa237946"
 dependencies = [
  "chrono",
  "futures",
@@ -3352,7 +3352,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-intake"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "async-trait",
  "chrono-tz",
@@ -3381,7 +3381,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-ipc"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "async-trait",
  "futures",
@@ -3498,7 +3498,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-mcp"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "futures",
  "ikigai-core",
@@ -3535,7 +3535,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-p2p"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "futures",
  "ikigai-core",
@@ -3548,7 +3548,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-passkey"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "p256",
  "serde_json",
@@ -3574,7 +3574,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-quic"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "async-trait",
  "futures",
@@ -3622,9 +3622,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-resolve"
-version = "0.2.8"
+version = "0.2.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bcc412a64209fdf4c194880f8f6b775caf5b8b56fdaabf084a029398c19a2c4f"
+checksum = "b19d49135d49ed399c567c1a1c778329157deda5c92e89e0ceefe9fff7996ae7"
 dependencies = [
  "async-trait",
  "futures",
@@ -3647,7 +3647,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-scheduler"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "futures",
  "ikigai-core",
@@ -3806,7 +3806,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-tz"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -3817,7 +3817,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-view"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3829,9 +3829,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-vocab"
-version = "0.2.6"
+version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1be88efaef7b7482643b176d6dec54af40e9cd52c57fdd68147802eac7cdfa4b"
+checksum = "84c3f88ca0e1f3c3740709d07903971cc4cf9c7fb12c2a971b8190f374c06f13"
 dependencies = [
  "ikigai-core",
  "serde_json",
@@ -3839,7 +3839,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-web"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3863,7 +3863,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-wire"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "futures",
  "ikigai-core",
