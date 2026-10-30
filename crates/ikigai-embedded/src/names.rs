@@ -22,8 +22,17 @@
 //! - **A file that does not read keeps the names in force**, as a refused declaration does in
 //!   a dynamic space, and the status door says why. A file that is removed binds nothing.
 //!
-//! Armed only by the processes that run the REPL (the REPL itself, `-c`): the served doors, the
-//! daemon and MCP build their roots without it.
+//! Armed only by the processes that run the REPL (the REPL itself, `-c`): the daemon, MCP and
+//! the served doors build their roots without it.
+//!
+//! **A served door, by the operator's option** (named requests C2, ledger #2516): `serve --http
+//! … --names <file>` places a layer from [`served`] LAST in the HTTP door's root, so a route
+//! target such as `urn:quakes:page` resolves in that one process, with no second process and
+//! no mount. It is the bindings ALONE: the atom ([`RESOURCE`]) and the status door are not on
+//! the door's surface, so a caller can neither read nor write the file and is never told where
+//! it lives. The file is the operator's, edited on disk (the watch rebinds); a refusal of the
+//! file and a shadowed binding are said on the door's stderr instead. Without the option the
+//! door serves no names, and its config home's `names` is not read.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock, Weak};
@@ -105,7 +114,7 @@ pub fn arm() -> std::result::Result<Option<Arc<NamesLayer>>, String> {
             config_home_file(&home)?
         }
     };
-    let _ = ACTIVE.set(Arc::new(NamesLayer::new(path)));
+    let _ = ACTIVE.set(Arc::new(NamesLayer::new(path, false)));
     Ok(ACTIVE.get().cloned())
 }
 
@@ -140,6 +149,9 @@ pub struct NamesLayer {
 struct Shared {
     /// The names file.
     path: PathBuf,
+    /// A served door's layer ([`served`]): the bindings alone, and what the status door would
+    /// say is said on stderr.
+    served: bool,
     /// The bindings.
     dynamic: Arc<DynamicSpace>,
     /// What is served ahead of the layer, for the shadow report: the root without it.
@@ -152,8 +164,17 @@ struct Shared {
     refusal: RwLock<Option<String>>,
 }
 
+/// **A names layer for a served door** (ledger #2516): the bindings of the names file `path`
+/// (the text form, or Turtle for a `.ttl` file), and nothing else on the surface. Not the
+/// process's [`active`] layer: the door places it with [`NamesLayer::over`] and binds it with
+/// [`NamesLayer::attach`] itself, so a REPL-shaped kernel built in the same process (the route
+/// loader's) never takes it.
+pub fn served(path: impl Into<PathBuf>) -> Arc<NamesLayer> {
+    Arc::new(NamesLayer::new(path.into(), true))
+}
+
 impl NamesLayer {
-    fn new(path: PathBuf) -> Self {
+    fn new(path: PathBuf, served: bool) -> Self {
         let dynamic = Arc::new(DynamicSpace::new(
             SPACE_NAME,
             Iri::parse(RESOURCE).expect("a constant IRI"),
@@ -161,6 +182,7 @@ impl NamesLayer {
         ));
         let shared = Arc::new(Shared {
             path,
+            served,
             dynamic: Arc::clone(&dynamic),
             ahead: RwLock::new(None),
             kernel: OnceLock::new(),
@@ -173,8 +195,13 @@ impl NamesLayer {
                 shared: Arc::clone(&shared),
             },
         );
+        let spaces: Vec<Arc<dyn Space>> = if served {
+            vec![dynamic]
+        } else {
+            vec![Arc::new(door) as Arc<dyn Space>, dynamic]
+        };
         NamesLayer {
-            spaces: Fallback::new(vec![Arc::new(door) as Arc<dyn Space>, dynamic]),
+            spaces: Fallback::new(spaces),
             shared,
             watch: OnceLock::new(),
         }
@@ -202,7 +229,8 @@ impl NamesLayer {
             return;
         }
         futures::executor::block_on(self.shared.reload());
-        if let Some(why) = self.shared.refusal() {
+        // A served layer's reload has said it already, and names no door it does not serve.
+        if let Some(why) = self.shared.refusal().filter(|_| !self.shared.served) {
             eprintln!(
                 "ikigai: {why}; no names are bound from it until it reads (`source \
                  {}` reports it)",
@@ -231,8 +259,12 @@ impl NamesLayer {
 
 impl Space for NamesLayer {
     fn resolve(&self, request: &Request, scope: &Scope) -> Resolution {
+        let status = &request.target == self.status_iri();
+        if status && self.shared.served {
+            return Resolution::Miss;
+        }
         let resolution = self.spaces.resolve(request, scope);
-        if &request.target != self.status_iri() {
+        if !status {
             return resolution;
         }
         let shared = Arc::clone(&self.shared);
@@ -240,7 +272,11 @@ impl Space for NamesLayer {
     }
 
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
-        self.spaces.entries()
+        let mut entries = self.spaces.entries()?;
+        if self.shared.served {
+            entries.retain(|entry| entry.pattern != self.status_iri().as_str());
+        }
+        Some(entries)
     }
 
     fn topology(&self) -> Topology {
@@ -300,17 +336,11 @@ impl Shared {
                 .map_err(|e| format!("the names file `{}`: {e}", self.path.display()))
         }) {
             Ok(rules) => rules,
-            Err(why) => {
-                *self.refusal.write().unwrap_or_else(|p| p.into_inner()) = Some(why);
-                return;
-            }
+            Err(why) => return self.refuse(why),
         };
         let topology = match bindings(&rules) {
             Ok(topology) => topology,
-            Err(why) => {
-                *self.refusal.write().unwrap_or_else(|p| p.into_inner()) = Some(why);
-                return;
-            }
+            Err(why) => return self.refuse(why),
         };
         let digest = ContentId::of(topology.to_turtle().as_bytes());
         let result = if self.dynamic.status().in_force.as_ref() == Some(&digest) {
@@ -324,10 +354,28 @@ impl Shared {
         match result {
             Ok(()) => {
                 *self.refusal.write().unwrap_or_else(|p| p.into_inner()) = None;
-                *self.shadowed.write().unwrap_or_else(|p| p.into_inner()) = self.shadows(&rules);
+                let shadowed = self.shadows(&rules);
+                if self.served {
+                    for name in &shadowed {
+                        eprintln!(
+                            "ikigai: names: {name} is served ahead of the names layer, so its \
+                             binding never answers"
+                        );
+                    }
+                }
+                *self.shadowed.write().unwrap_or_else(|p| p.into_inner()) = shadowed;
             }
-            Err(why) => *self.refusal.write().unwrap_or_else(|p| p.into_inner()) = Some(why),
+            Err(why) => self.refuse(why),
         }
+    }
+
+    /// Record why the file did not read, keeping the names in force. A served layer says it on
+    /// stderr: its status door is not on the surface.
+    fn refuse(&self, why: String) {
+        if self.served {
+            eprintln!("ikigai: {why}; the names in force are the last that read");
+        }
+        *self.refusal.write().unwrap_or_else(|p| p.into_inner()) = Some(why);
     }
 
     /// The bindings whose name a space ahead of the layer answers, so the binding never does.

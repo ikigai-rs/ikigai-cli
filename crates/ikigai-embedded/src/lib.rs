@@ -6864,7 +6864,7 @@ pub fn kernel_for(nature: &'static str) -> Kernel {
 /// [`kernel_for`], and the root space it was built from: the same `Arc`, before the kernel's
 /// alias table wraps it. For `Suite::body_space`, as [`kernel_with_root`] is.
 pub fn kernel_for_with_root(nature: &'static str) -> (Kernel, Arc<dyn Space>) {
-    door_kernel(nature, Vec::new())
+    door_kernel(nature, Vec::new(), None)
 }
 
 /// [`kernel_for`], composing remote kernels into the HTTP door's surface — the third
@@ -6887,12 +6887,30 @@ pub fn kernel_for_with_root(nature: &'static str) -> (Kernel, Arc<dyn Space>) {
 /// again. Promoting this door to a trusted kernel in order to reach a peer would hand
 /// every anonymous HTTP caller the operator's own authority.
 pub fn kernel_for_with_mounts(nature: &'static str, mounts: Vec<MountSpec>) -> Kernel {
-    door_kernel(nature, mounts).0
+    door_kernel(nature, mounts, None).0
 }
 
-/// The HTTP door's kernel and its root, for [`kernel_for_with_mounts`] and
-/// [`kernel_for_with_root`].
-fn door_kernel(nature: &'static str, mounts: Vec<MountSpec>) -> (Kernel, Arc<dyn Space>) {
+/// [`kernel_for_with_mounts`], with a names layer ([`names::served`], ledger #2516) placed LAST
+/// in the root, after the mounts too, as the REPL places its own: a binding adds names to the
+/// door and never changes one it serves. `serve --http --names <file>`. The caller binds the
+/// layer's names with [`names::NamesLayer::attach`] once the kernel is the `Arc` it serves, and
+/// the forward a name performs resolves under the request's capability, so the layer widens
+/// reach exactly as far as the bindings name and authority not at all.
+pub fn kernel_for_with_names(
+    nature: &'static str,
+    mounts: Vec<MountSpec>,
+    names: &Arc<names::NamesLayer>,
+) -> Kernel {
+    door_kernel(nature, mounts, Some(names)).0
+}
+
+/// The HTTP door's kernel and its root, for [`kernel_for_with_mounts`],
+/// [`kernel_for_with_names`] and [`kernel_for_with_root`].
+fn door_kernel(
+    nature: &'static str,
+    mounts: Vec<MountSpec>,
+    names: Option<&Arc<names::NamesLayer>>,
+) -> (Kernel, Arc<dyn Space>) {
     let spaces: Vec<Arc<dyn Space>> = vec![
         Arc::new(served_space(nature)) as Arc<dyn Space>,
         // `urn:iki:foaf`, the negotiated FOAF face (see [`foaf`]), routed as `/foaf` on the
@@ -6908,6 +6926,10 @@ fn door_kernel(nature: &'static str, mounts: Vec<MountSpec>) -> (Kernel, Arc<dyn
         Arc::new(ikigai_jsonld::space()) as Arc<dyn Space>,
     ];
     let root = compose_mounts(spaces, mounts);
+    let root = match names {
+        Some(layer) => layer.over(root),
+        None => root,
+    };
     let kernel = Kernel::with_meta_renderer(Arc::clone(&root), Arc::new(CliRenderer))
         // ★ A CLOCK, and it is not decoration — this door was built without one until
         // 0.1.20 and that made every time-bounded result on it UNCACHEABLE.

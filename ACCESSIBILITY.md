@@ -128,6 +128,7 @@ Found by reading the source on 2026-10-15, not by testing:
 | 2026-10-28 | The line under an unresolved name in the REPLs and `-c` (ledger #2481) becomes two plain lines indented under `error:`: this build binds no such name, and an upgrade may help only if `cargo search ikigai-cli` names a newer release. It no longer says the name is newer than the build. No color is added. |
 | 2026-10-29 | The REPL's names layer (ledger #2515) adds terminal text under the same rules: `source urn:iki:space:dynamic:names:status` appends plain lines (`names file:`, `not read:`, `shadowed: <name> …`) to the dynamic space's status, a names file that does not read is said once on stderr starting with `ikigai:`, and a config home holding both `names` and `names.ttl` stops the start with an `ikigai:` line naming both. No color is added. |
 | 2026-10-29 | The usage text gains four plain lines under the mount flags (ledger #2613): a read through any mount is `uncacheable` here even when the peer's endpoint is cacheable, and why. No color is added. |
+| 2026-10-30 | `serve --http … --names <file>` (ledger #2516) adds terminal text under the same rules: the usage text gains plain lines for the option, the door's banner says `names from <file>`, a names file that does not read and a binding a served name shadows are said on stderr starting with `ikigai:`, and `--names` on another door stops the start with an `ikigai:` line. The door's pages are unchanged: a name answers as its target does. No color is added. |
 
 ## Contributing
 
