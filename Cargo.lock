@@ -3063,14 +3063,15 @@ dependencies = [
 
 [[package]]
 name = "ikigai-browse"
-version = "0.20.0"
+version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7e92ebed316bdc54d4f8b1e86e12eb91380bb60b613649b75f3350d47b7e58c"
+checksum = "2177c924d413fb1d8f46ddc417292c2544c2f9293d623113a49afd1146ed5fe3"
 dependencies = [
  "async-trait",
+ "futures-core",
  "ikigai-a11y",
  "ikigai-core",
- "ikigai-fn 0.7.2",
+ "ikigai-fn",
  "ikigai-store",
  "notify",
  "oxigraph",
@@ -3166,12 +3167,12 @@ dependencies = [
 
 [[package]]
 name = "ikigai-diagram"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0c8ee38dda32a37326f1209252edaf4ffb7833b49ac0ad80c510534c782f68e"
+checksum = "5f0d20ffe2912099222ab82c60dfa86fb51a16ef10c77862de05b9a20269f05f"
 dependencies = [
  "ikigai-core",
- "ikigai-fn 0.7.2",
+ "ikigai-fn",
  "oxrdf",
  "oxttl",
 ]
@@ -3215,7 +3216,7 @@ dependencies = [
  "ikigai-email",
  "ikigai-encrypt",
  "ikigai-engine",
- "ikigai-fn 0.8.0",
+ "ikigai-fn",
  "ikigai-fs",
  "ikigai-http",
  "ikigai-intake",
@@ -3295,20 +3296,6 @@ dependencies = [
 
 [[package]]
 name = "ikigai-fn"
-version = "0.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de8d2e81d55b68fd3c3c6267ae9c7462c981c7b6bd03d6405784618f75a4ffd9"
-dependencies = [
- "async-trait",
- "futures-util",
- "html5ever",
- "ikigai-core",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "ikigai-fn"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a1a13849d373c2ad0aa9783460bf657f95639ff8b7053a6e292dbe278e9db23"
@@ -3360,7 +3347,7 @@ dependencies = [
  "chrono-tz",
  "futures",
  "ikigai-core",
- "ikigai-fn 0.8.0",
+ "ikigai-fn",
  "serde_json",
 ]
 
@@ -3637,12 +3624,12 @@ dependencies = [
 
 [[package]]
 name = "ikigai-runbook"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d45304a5424cfa6e710f3836d059494060d53f749614312edced358f8f6f0f6f"
+checksum = "b74e42313fac9bcbb01711a15b8ee55237544cd5b31f33fa59eb192ff5771bc0"
 dependencies = [
  "ikigai-core",
- "ikigai-fn 0.7.2",
+ "ikigai-fn",
  "serde",
  "serde_json",
 ]
@@ -3855,7 +3842,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "ikigai-core",
- "ikigai-fn 0.8.0",
+ "ikigai-fn",
  "ikigai-fs",
  "ikigai-http",
  "libc",
