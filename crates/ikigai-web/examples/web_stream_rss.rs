@@ -20,7 +20,7 @@
 //!   `<spill dir>` (which must exist) as it arrives and the Sink reads it back as a body.
 //! - `upload-collected`: the same 1 GiB to an ordinary route whose bound admits it, taken into
 //!   memory as every upload was before ledger #2244; the Sink reads it as inline content.
-
+//!
 //! Ordinary intake measurement (ledger #2477, 2026-10-30): Linux x86_64, rustc 1.99.0,
 //! release build, `/usr/bin/time -v target/release/examples/web_stream_rss upload-collected`.
 //! On base `83a7355a39932190eeb6ad0fea0e4379d18ea094`, maximum RSS was 2,949,224 KiB;
