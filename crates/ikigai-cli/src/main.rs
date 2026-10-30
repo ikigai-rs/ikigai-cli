@@ -119,7 +119,12 @@ usage:
                                 --passkey-rp-id <domain> [--passkey-origin <url>]: the WebAuthn
                                 relying party the passkey endpoints serve (origin defaults to
                                 https://<domain>). No default: without it nothing can enroll, and
-                                an edge with a passkey enrolled refuses every gated decision]
+                                an edge with a passkey enrolled refuses every gated decision;
+                                --names <file>: serve that names file's named requests LAST in
+                                the door's surface, so a route target such as urn:quakes:page
+                                resolves here (a name resolves under the request's capability;
+                                the file is never served; an edit rebinds). Without it the door
+                                serves no names, and the config home's `names` is not read]
   ikigai --daemon              headless: timers, the watcher, and the standing sync — for launchd
   ikigai --name <instance>     name this instance (scopes <name>.* config properties; defaults
                                repl / daemon / serve by mode)
@@ -146,6 +151,7 @@ usage:
                                the local root, so a served name shadows a binding of it, and
                                `source urn:iki:space:dynamic:names:status` reports which. `bind`
                                and `unbind` write the file; an edit to it rebinds. REPL and -c
+                               (`serve --http … --names <file>` serves one on the HTTP door)
   ikigai --width-routing <on|off>
                                route a fan-out by the width it ACHIEVES: at 2+ concurrent
                                requests, append needs=batchAt<=W for targets that read it
@@ -487,6 +493,11 @@ enum Mode {
         /// so it can never fall back to a shared `--cap` ceiling or to per-client workspaces
         /// because the file went missing (ledger #1826: the booking airlock).
         require_enrollment: bool,
+        /// `--names <file>` (absolute once parsed): the named requests `serve --http` places
+        /// LAST in its surface (ledger #2516), so a route target such as `urn:quakes:page`
+        /// resolves in this one process. `None`: the door serves no names, whatever the config
+        /// home holds. Refused by the other doors.
+        names: Option<std::path::PathBuf>,
     },
     /// Serve the capability-scoped manifold as an MCP (Model Context Protocol)
     /// server over stdio. `grants`/`scopes` union into the session capability —
@@ -787,6 +798,8 @@ struct HttpDoor<'a> {
     /// `--mount`/`--override`/`--prefer`, the machine's topology from the config home, or
     /// nothing at all under `--no-config-mounts`.
     mounts: Mounts,
+    /// `--names <file>`: the named requests placed LAST in the surface. `None`: no names.
+    names: Option<&'a std::path::Path>,
 }
 
 /// Whether a `serve`/`--connect` target names a QUIC endpoint.
@@ -1334,9 +1347,25 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
         let mut layers_reseal = false;
         let mut layers_https: Option<String> = None;
         let mut require_enrollment = false;
+        let mut names: Option<std::path::PathBuf> = None;
         while let Some(arg) = argv.next() {
             if arg == "--require-enrollment" {
                 require_enrollment = true;
+                continue;
+            }
+            if arg == "--names" {
+                // Taken against the working directory NOW, as the REPL's `--names` is.
+                let path = std::path::PathBuf::from(
+                    argv.next()
+                        .ok_or_else(|| "--names needs <file>".to_string())?,
+                );
+                names = Some(if path.is_relative() {
+                    std::env::current_dir()
+                        .map(|cwd| cwd.join(&path))
+                        .unwrap_or(path)
+                } else {
+                    path
+                });
                 continue;
             }
             if arg == "--layers-https" {
@@ -1600,6 +1629,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
             layers_reseal,
             layers_https,
             require_enrollment,
+            names,
         }));
     }
 
@@ -1962,6 +1992,7 @@ fn main() {
             layers_reseal,
             layers_https,
             require_enrollment,
+            names,
         } => match (http, target.as_deref()) {
             // Enrollment is the QUIC door's (it is the door that authenticates certificates), so
             // the flag on any other door would require nothing.
@@ -1990,6 +2021,16 @@ fn main() {
                 );
                 std::process::exit(2);
             }
+            // The names layer is placed in the HTTP door's surface only (ledger #2516): the
+            // REPL's own `--names` is a different reading of the same flag, and the QUIC and
+            // IPC doors would bind nothing from it.
+            (None, _) if names.is_some() => {
+                eprintln!(
+                    "ikigai: --names on `serve` places the names layer in `serve --http`'s \
+                     surface, and this door is not the HTTP door"
+                );
+                std::process::exit(2);
+            }
             // The inbound HTTP face takes precedence over IPC/QUIC when `--http` is given.
             (Some(bind), _) => {
                 refuse_arrangement_flag("the HTTP door (`serve --http`), a served posture,");
@@ -2004,6 +2045,7 @@ fn main() {
                     max_body,
                     push,
                     mounts,
+                    names: names.as_deref(),
                 })
             }
             (None, Some(t)) if is_quic(t) => {
@@ -5124,6 +5166,7 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
         max_body,
         push,
         mounts,
+        names,
     } = door;
     use std::net::SocketAddr;
     let addr: SocketAddr = if let Ok(port) = bind.parse::<u16>() {
@@ -5194,7 +5237,14 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
     // carries `urn:iki:foaf` and the transreption chain it issues through (the `/foaf`
     // face on the public edge), which the QUIC composer does not. And it stays the PUBLIC
     // kernel — a mount widens reach, never authority.
-    let kernel = ikigai_embedded::kernel_for_with_mounts("Remote (HTTP)", resolved);
+    // THE NAMES LAYER (ledger #2516), only when the operator names a file: the bindings alone,
+    // last in the root, so a route target such as `urn:quakes:page` resolves here without a
+    // second process and a mount. Bound once the kernel is the `Arc` it serves, below.
+    let names = names.map(ikigai_embedded::names::served);
+    let kernel = match &names {
+        Some(layer) => ikigai_embedded::kernel_for_with_names("Remote (HTTP)", resolved, layer),
+        None => ikigai_embedded::kernel_for_with_mounts("Remote (HTTP)", resolved),
+    };
     // THE SPILL AND THE UPLOAD ROUTES (ledger #2244), from the config home: a file-backed spill
     // facility over a directory of this door's own, so an upload route takes a body larger than
     // memory. A line that does not parse stops the door, naming it.
@@ -5218,6 +5268,10 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
     let upload_note =
         uploads::describe(&upload_config, spill.as_ref().map(|(dir, _)| dir.as_path()));
     let kernel = std::sync::Arc::new(kernel);
+    // Bind the file's names in this kernel and watch the file: an edit rebinds, no restart.
+    if let Some(layer) = &names {
+        layer.attach(&kernel);
+    }
     // The door's ONE workspace watch: a stylesheet or context replaced on disk is served on
     // the next request, no unit restart (ledger #246: the edge kept rendering a replaced
     // `foaf.xsl` until `systemctl restart`). Held for as long as this function serves.
@@ -5357,6 +5411,10 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
     } else {
         route_note
     };
+    let route_note = match &names {
+        Some(layer) => format!("{route_note}, names from {}", layer.path().display()),
+        None => route_note,
+    };
     let cors_note = if cors_origins.is_empty() {
         "CORS closed".to_string()
     } else {
@@ -5409,15 +5467,18 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
         clients: Vec::new(),
         surface: Some(route_note.clone()),
         authority: Some(posture.clone()),
-        reloads: if routes_watched {
-            vec![
+        reloads: routes_watched
+            .then(|| {
                 "the route table — the watched route resource is re-queried when the file \
                  changes and swapped live, so the route count above is the startup reading"
-                    .to_string(),
-            ]
-        } else {
-            Vec::new()
-        },
+                    .to_string()
+            })
+            .into_iter()
+            .chain(names.is_some().then(|| {
+                "the names file — an edit to it rebinds the names it holds, without a restart"
+                    .to_string()
+            }))
+            .collect(),
     });
     let served = match spill {
         Some((_, store)) if !upload_config.routes.is_empty() => {
