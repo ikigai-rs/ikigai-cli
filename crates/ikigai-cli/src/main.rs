@@ -1963,6 +1963,12 @@ fn main() {
             eprintln!("ikigai: {e}");
             std::process::exit(2);
         }
+        // `http.timeout` likewise (ledger #2692): a bad value stops the host here, rather
+        // than leaving the outbound transport on a bound nobody asked for.
+        if let Err(e) = ikigai_embedded::configure_http() {
+            eprintln!("ikigai: {e}");
+            std::process::exit(2);
+        }
     }
 
     // The default instance name follows the mode; an explicit --name (already

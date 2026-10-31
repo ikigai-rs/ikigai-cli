@@ -2262,9 +2262,16 @@ struct UreqTransport {
     /// The `User-Agent` sent when the caller names none: `http.user_agent`, else
     /// `ikigai/<version>`. A `User-Agent` in the request's own headers still wins.
     user_agent: String,
+    /// How long connecting, and each read or write on the socket, may wait: `http.timeout`,
+    /// else [`DEFAULT_HTTP_TIMEOUT`]. A server that accepts and never answers is refused as
+    /// `Timeout` instead of holding the caller (ledger #2692).
+    timeout: std::time::Duration,
 }
 
 const DEFAULT_HTTP_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// The transport's wait bound when `http.timeout` is unset.
+const DEFAULT_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl Default for UreqTransport {
     fn default() -> Self {
@@ -2273,8 +2280,58 @@ impl Default for UreqTransport {
                 config::get("http.max_response_bytes").as_deref(),
             ),
             user_agent: http_user_agent(config::get("http.user_agent").as_deref()),
+            timeout: configured_http_timeout(),
         }
     }
+}
+
+/// `http.timeout` read as a whole number of seconds, at least 1, with TOML's `_` separators
+/// allowed; absent, [`DEFAULT_HTTP_TIMEOUT`]. Anything else is an error, never the default.
+fn http_timeout(setting: Option<&str>) -> std::result::Result<std::time::Duration, String> {
+    let Some(value) = setting else {
+        return Ok(DEFAULT_HTTP_TIMEOUT);
+    };
+    let digits: String = value.chars().filter(|c| *c != '_').collect();
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!(
+            "`http.timeout = {value}` is not a whole number (the value is a count of seconds)"
+        ));
+    }
+    match digits.parse::<u64>() {
+        Ok(0) => Err(format!(
+            "`http.timeout = {value}`: the least it can be is 1"
+        )),
+        Ok(secs) => Ok(std::time::Duration::from_secs(secs)),
+        Err(_) => Err(format!("`http.timeout = {value}` is too large")),
+    }
+}
+
+/// `http.timeout` from the config home, its error naming the file.
+fn http_timeout_setting() -> std::result::Result<std::time::Duration, String> {
+    http_timeout(config::get("http.timeout").as_deref()).map_err(|e| {
+        format!(
+            "{e} (in {}; see `http.timeout` in ikigai-cli's README)",
+            config::config_path().display()
+        )
+    })
+}
+
+/// **Check the config home's `http.timeout`.** The binary calls this before any mode runs and
+/// exits on an error, so a bad line stops the host at start-up rather than reading as the
+/// default.
+pub fn configure_http() -> std::result::Result<(), String> {
+    http_timeout_setting().map(drop)
+}
+
+/// The transport's bound. A host that embeds this crate without the binary's start-up check
+/// cannot be stopped here, so an invalid `http.timeout` is reported once on stderr and the
+/// default stands (as `lisp::host_timeout` does for `lisp.*`).
+fn configured_http_timeout() -> std::time::Duration {
+    http_timeout_setting().unwrap_or_else(|e| {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| eprintln!("ikigai: {e}; the default of 30 s stands"));
+        DEFAULT_HTTP_TIMEOUT
+    })
 }
 
 // A malformed setting keeps the finite default; zero permits only an empty body.
@@ -2324,9 +2381,14 @@ impl UreqTransport {
         // ACL against every hop — an auto-following agent would let a granted
         // host 302 the request to an ungranted one. `redirects(0)` returns the
         // 3xx as-is.
+        // No wait is unbounded: connecting, and every read or write on the socket, gives up
+        // after `timeout`, and ureq reports that as an io `TimedOut`.
         let agent = ureq::builder()
             .redirects(0)
             .user_agent(&self.user_agent)
+            .timeout_connect(self.timeout)
+            .timeout_read(self.timeout)
+            .timeout_write(self.timeout)
             .build();
         let mut req = agent.request(method, url);
         for (name, value) in headers {
@@ -2343,6 +2405,9 @@ impl UreqTransport {
             Err(ureq::Error::Status(_, resp)) => resp,
             Err(e) => {
                 let detail = e.to_string();
+                if timed_out(&e) {
+                    return Err(Error::Timeout(detail));
+                }
                 return Err(ikigai_http::status::transport_error(&detail, url, &detail));
             }
         };
@@ -2358,7 +2423,7 @@ impl UreqTransport {
         } else {
             read_http_body(resp.into_reader(), self.max_response_bytes).map_err(
                 |error| match error {
-                    Error::OverBudget { .. } => error,
+                    Error::OverBudget { .. } | Error::Timeout(_) => error,
                     other => {
                         let detail = other.to_string();
                         ikigai_http::status::transport_error(&detail, url, &detail)
@@ -2368,6 +2433,22 @@ impl UreqTransport {
         };
         Ok((status, response_headers, response_body))
     }
+}
+
+/// Whether a ureq failure is one of the transport's own timeouts, by the io error beneath it
+/// rather than by its wording.
+fn timed_out(error: &ureq::Error) -> bool {
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        if cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+        {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
 }
 
 /// Bound the decoded body, regardless of Content-Length or transfer encoding. Reading
@@ -2380,7 +2461,7 @@ fn read_http_body(mut reader: impl std::io::Read, limit: usize) -> Result<Vec<u8
         .by_ref()
         .take(limit as u64)
         .read_to_end(&mut body)
-        .map_err(|e| Error::Unavailable(format!("reading response body: {e}")))?;
+        .map_err(body_read_error)?;
     let mut extra = [0];
     loop {
         match reader.read(&mut extra) {
@@ -2391,8 +2472,18 @@ fn read_http_body(mut reader: impl std::io::Read, limit: usize) -> Result<Vec<u8
                 })
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(Error::Unavailable(format!("reading response body: {e}"))),
+            Err(e) => return Err(body_read_error(e)),
         }
+    }
+}
+
+/// A body that stops arriving is a `Timeout`, and the bytes read so far are dropped with it.
+fn body_read_error(e: std::io::Error) -> Error {
+    let detail = format!("reading response body: {e}");
+    if e.kind() == std::io::ErrorKind::TimedOut {
+        Error::Timeout(detail)
+    } else {
+        Error::Unavailable(detail)
     }
 }
 
@@ -2451,9 +2542,20 @@ fn http_space() -> impl Space {
 /// The LLM module (`urn:llm:ask` + `urn:llm:<provider>:ask`) on the native ureq
 /// transport. Slice 0: an OpenAI-compatible backend defaulting to a local Ollama.
 /// (Mounted via a local path override until ikigai-llm is published.)
+///
+/// Its transport waits at least [`LLM_HTTP_TIMEOUT_FLOOR`]: a non-streamed answer arrives in
+/// one piece after the whole generation, so the 30 s `http.timeout` default would refuse a
+/// legitimate one (the booking handler's `urn:llm:ask` path has taken 37 s). A longer
+/// `http.timeout` raises it.
 fn llm_space() -> EndpointSpace {
-    ikigai_llm::space(Arc::new(UreqTransport::default()), llm_registry())
+    let mut transport = UreqTransport::default();
+    transport.timeout = transport.timeout.max(LLM_HTTP_TIMEOUT_FLOOR);
+    ikigai_llm::space(Arc::new(transport), llm_registry())
 }
+
+/// The least the LLM transport waits: the 300 s default of `lisp.timeout`, the governor its
+/// slowest caller (a stored handler) already runs under.
+const LLM_HTTP_TIMEOUT_FLOOR: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// The meeting module (`urn:meeting:schedule` + `urn:meeting:zoom:schedule`) on the native ureq
 /// transport. Reads the Zoom Server-to-Server OAuth credentials from the keystore through a
@@ -11763,6 +11865,7 @@ mod http_body_budget_tests {
         let transport = UreqTransport {
             max_response_bytes: DEFAULT_HTTP_MAX_RESPONSE_BYTES,
             user_agent: http_user_agent(Some(" feeds-bot/1.0 (+https://example.org/bot) ")),
+            timeout: DEFAULT_HTTP_TIMEOUT,
         };
         let (url, server) = captured_request();
         transport.exchange("GET", &url, &[], &[]).unwrap();
@@ -11793,6 +11896,100 @@ mod http_body_budget_tests {
         );
     }
 
+    /// A server that accepts, reads the request head, writes `prefix` (perhaps nothing) and
+    /// then holds the connection open without another byte until the returned sender drops.
+    fn stalled_server(
+        prefix: &'static [u8],
+    ) -> (
+        String,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            stream.write_all(prefix).unwrap();
+            let _ = held.recv();
+        });
+        (url, release, server)
+    }
+
+    fn one_second_transport() -> UreqTransport {
+        UreqTransport {
+            max_response_bytes: DEFAULT_HTTP_MAX_RESPONSE_BYTES,
+            user_agent: default_user_agent(),
+            timeout: std::time::Duration::from_secs(1),
+        }
+    }
+
+    /// Ledger #2692: a server that accepts and never answers is refused as `Timeout` once the
+    /// transport's bound passes, instead of holding the caller for as long as it likes.
+    // Native-only (a socket and a thread): the wall clock only bounds the refusal.
+    #[allow(clippy::disallowed_methods)]
+    #[test]
+    fn native_http_times_out_on_a_server_that_never_answers() {
+        let (url, release, server) = stalled_server(b"");
+        let started = std::time::Instant::now();
+        let result = one_second_transport().exchange("GET", &url, &[], &[]);
+        let waited = started.elapsed();
+        drop(release);
+        server.join().unwrap();
+        assert!(matches!(result, Err(Error::Timeout(_))), "{result:?}");
+        assert!(waited < std::time::Duration::from_secs(20), "{waited:?}");
+    }
+
+    /// A body that stops halfway is a `Timeout` too, through the endpoint, and the half that
+    /// arrived is never handed back as the representation.
+    #[test]
+    fn native_http_endpoint_refuses_a_stalled_body_as_timeout_without_the_partial_body() {
+        use ikigai_core::{ArgRef, Capability};
+        let (url, release, server) =
+            stalled_server(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhalf_");
+        let kernel = Kernel::new(Arc::new(one_second_transport().into_space()));
+        let request = Request::new(Verb::Source, Iri::parse("urn:http:get").unwrap())
+            .with_arg("url", ArgRef::Inline(url.into_bytes()));
+        let result = futures::executor::block_on(kernel.issue(request, &Capability::root()));
+        drop(release);
+        server.join().unwrap();
+        let error = result.expect_err("a stalled body must not read as a success");
+        assert!(matches!(error, Error::Timeout(_)), "{error:?}");
+        assert!(error.is_transient());
+    }
+
+    #[test]
+    fn http_timeout_settings_are_whole_seconds_or_an_error() {
+        assert_eq!(http_timeout(None), Ok(DEFAULT_HTTP_TIMEOUT));
+        assert_eq!(DEFAULT_HTTP_TIMEOUT, std::time::Duration::from_secs(30));
+        assert_eq!(
+            http_timeout(Some("5")),
+            Ok(std::time::Duration::from_secs(5))
+        );
+        assert_eq!(
+            http_timeout(Some("1_200")),
+            Ok(std::time::Duration::from_secs(1200))
+        );
+        for bad in [
+            "",
+            "0",
+            "-1",
+            "1.5",
+            "30s",
+            "ten",
+            "_",
+            "99999999999999999999999",
+        ] {
+            assert!(http_timeout(Some(bad)).is_err(), "{bad:?}");
+        }
+    }
+
     #[test]
     fn native_http_endpoint_accepts_twelve_mib_under_the_default_budget() {
         use ikigai_core::{ArgRef, Capability};
@@ -11812,6 +12009,7 @@ mod http_body_budget_tests {
         let result = UreqTransport {
             max_response_bytes: DEFAULT_HTTP_MAX_RESPONSE_BYTES,
             user_agent: default_user_agent(),
+            timeout: DEFAULT_HTTP_TIMEOUT,
         }
         .exchange("GET", &url, &[], &[]);
         server.join().unwrap();
@@ -11828,6 +12026,7 @@ mod http_body_budget_tests {
         let (_, _, body) = UreqTransport {
             max_response_bytes: DEFAULT_HTTP_MAX_RESPONSE_BYTES,
             user_agent: default_user_agent(),
+            timeout: DEFAULT_HTTP_TIMEOUT,
         }
         .exchange("GET", &url, &[], &[])
         .unwrap();
@@ -11857,6 +12056,7 @@ mod http_body_budget_tests {
                 let result = UreqTransport {
                     max_response_bytes: 4,
                     user_agent: default_user_agent(),
+                    timeout: DEFAULT_HTTP_TIMEOUT,
                 }
                 .exchange("GET", &url, &[], &[]);
                 server.join().unwrap();
@@ -11880,6 +12080,7 @@ mod http_body_budget_tests {
             UreqTransport {
                 max_response_bytes: 4,
                 user_agent: default_user_agent(),
+                timeout: DEFAULT_HTTP_TIMEOUT,
             }
             .into_space(),
         ));
@@ -11903,6 +12104,7 @@ mod http_body_budget_tests {
                 UreqTransport {
                     max_response_bytes: 4,
                     user_agent: default_user_agent(),
+                    timeout: DEFAULT_HTTP_TIMEOUT,
                 }
                 .send(ikigai_http::HttpRequest {
                     method: ikigai_http::Method::Get,
@@ -11934,6 +12136,7 @@ mod http_body_budget_tests {
             let result = UreqTransport {
                 max_response_bytes: 0,
                 user_agent: default_user_agent(),
+                timeout: DEFAULT_HTTP_TIMEOUT,
             }
             .exchange("GET", &url, &[], &[]);
             server.join().unwrap();
@@ -11950,6 +12153,7 @@ mod http_body_budget_tests {
         let result = UreqTransport {
             max_response_bytes: 0,
             user_agent: default_user_agent(),
+            timeout: DEFAULT_HTTP_TIMEOUT,
         }
         .exchange("HEAD", &url, &[], &[]);
         server.join().unwrap();
@@ -11993,6 +12197,7 @@ mod http_body_budget_tests {
             let result = UreqTransport {
                 max_response_bytes: limit,
                 user_agent: default_user_agent(),
+                timeout: DEFAULT_HTTP_TIMEOUT,
             }
             .exchange("GET", &url, &[], &[]);
             server.join().unwrap();
