@@ -137,6 +137,8 @@ Found by reading the source on 2026-10-15, not by testing:
 
 | 2026-10-30 | Config-home startup jobs (ledger #2678) report a refused file as a plain `ikigai: <path>/jobs:<line>: …` line on stderr and stop startup with exit 2. A refused live edit says it keeps the previous jobs. The daemon banner says “timers + watchers” when no standing sync is configured, since declared jobs can still run. Binary tests pin the startup and live-edit diagnostics; no assistive technology testing was performed. |
 
+| 2026-10-31 | A refused `cap` stops a `-c` batch and blocks subsequent evaluation in both REPLs until an explicit valid narrowing or reset (ledger #2717). The plain `error:` diagnostic names how to resume; no color is added. Binary tests cover batches, stdin replay, and scripts; a TUI unit test covers command and scratch evaluation. No assistive technology testing was performed. |
+
 ## Contributing
 
 Read this file before changing any output listed above. A change to an HTML page keeps the rules
