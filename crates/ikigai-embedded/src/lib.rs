@@ -76,6 +76,8 @@ mod startup_jobs;
 // of one recorded fact, which is what keeps them from drifting into two spellings of it.
 pub mod posture;
 pub mod scheduling;
+#[cfg(unix)]
+pub mod spill;
 // The durable RDF store (`urn:iki:store:*`) and — with it — the work ledger. Behind the
 // `store` feature because a host that does not want a dataset should not carry one, and
 // opt-in from the config home on top of that: see the module note for the one-writer
@@ -5426,8 +5428,16 @@ fn build_watched(mounts: Vec<MountSpec>, reactive: bool) -> Arc<Kernel> {
         // urn:annotation=…"` line stops matching the moment this table ships. See
         // [`alias_table`].
         .with_aliases(alias_table())
-        .with_scheduler_reporter(Arc::new(scheduling::reporter()))
-        .into_scheduled(sched);
+        .with_scheduler_reporter(Arc::new(scheduling::reporter()));
+    // The spill `urn:stream:spill` writes through, when the REPL armed one (ledger #2724).
+    #[cfg(unix)]
+    let kernel = match spill::active() {
+        Some(spill) => kernel
+            .with_spill(spill)
+            .with_stream_spill(0, ikigai_core::DEFAULT_STREAM_SPILL),
+        None => kernel,
+    };
+    let kernel = kernel.into_scheduled(sched);
     watch_root(Arc::clone(&kernel), file_root());
     // Bind the names file's bindings and watch the file, when the REPL armed a names layer.
     if let Some(layer) = names::active() {

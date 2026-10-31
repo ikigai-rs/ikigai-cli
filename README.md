@@ -777,6 +777,13 @@ the door at start-up, naming it):
 
 The banner names the upload routes and the spill directory.
 
+The REPL, a `-c` batch and a script spill too (ledger #2724): on Unix their kernel writes
+`| urn:stream:spill` through a file-backed spill under `<config home>/spill/repl-<pid>`,
+made `0700` at the first spill (a batch that never spills leaves nothing), and answers the body
+as one that can be read again, at most 1 GiB a request. That first spill also removes the
+`repl-<pid>` directories processes that have gone left behind. Without a config home the step
+is refused as unsupported, as before; it never spills to `TMPDIR`.
+
 > **Renamed in 0.1.20.** This shipped as a bare `urn:foaf` in 0.1.19 — an invented
 > top-level namespace rather than one we own. The old name still resolves, through an
 > `exact` rule in the host's alias table (`urn:kernel:aliases` lists it), so an existing
