@@ -108,6 +108,96 @@ fn an_edit_through_the_kernel_is_followed_by_the_next_closure() {
     );
 }
 
+/// One OWL 2 RL page's steps run in order in ONE process (`-c` per step), as the TUI's demo
+/// tab runs them, so a file one step writes is read by the next and the engine's cache tally
+/// is the page's. The steps are read from the page's own JSON face, so a step the runbook adds
+/// later runs here too. Returns stdout, stderr (each step's tally and any error, in order) and
+/// whether the batch succeeded.
+fn run_page(home: &Path, page: &str) -> (String, String, bool) {
+    let json = run(
+        home,
+        &[
+            "--quiet",
+            "--demo",
+            "-c",
+            &format!("source urn:runbook:{page} as=application/json"),
+        ],
+    );
+    let (stdout, stderr) = text(&json);
+    assert!(json.status.success(), "the {page} page: {stdout}\n{stderr}");
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).expect("the page's JSON");
+    let steps = json["steps"].as_array().expect("the page lists steps");
+    assert!(!steps.is_empty(), "the {page} page lists no steps");
+    let mut args = vec!["--quiet".to_string(), "--demo".to_string()];
+    for step in steps {
+        args.push("-c".to_string());
+        args.push(
+            step["cmd"]
+                .as_str()
+                .expect("a step has a command")
+                .to_string(),
+        );
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = run(home, &args);
+    let (stdout, stderr) = text(&out);
+    assert!(
+        !stderr.contains("no endpoint resolved"),
+        "a step of the {page} page did not resolve on this host: {stderr}"
+    );
+    (stdout, stderr, out.status.success())
+}
+
+/// Every step of the five OWL 2 RL pages that should answer does, on this host: the runbook
+/// pages a demo on bug shows (ledger #2641). Their answers are checked in the runbook's own
+/// `tests/reasoning_demos.rs` over the engine; this checks that the binary binds everything
+/// they name and that none of them errs.
+#[test]
+fn every_step_of_the_answering_owl_pages_answers() {
+    for page in ["selection", "vocabularies", "typing", "topics", "thread"] {
+        let home = scratch(page);
+        let (stdout, stderr, ok) = run_page(&home, page);
+        assert!(
+            ok && !stderr.contains("error"),
+            "the {page} page: stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}
+
+/// The Thread page's point, as the page runs: reasoning over each of two graphs again is all
+/// cached, and after an edit to ONE of them only that one recomputes.
+#[test]
+fn the_thread_page_recomputes_only_what_the_edit_cut() {
+    let home = scratch("thread-page");
+    let (stdout, stderr, ok) = run_page(&home, "thread");
+    assert!(ok, "stdout: {stdout}\nstderr: {stderr}");
+    let again = stderr
+        .find("[3 cached]")
+        .unwrap_or_else(|| panic!("the second read over both graphs was not all cached: {stderr}"));
+    assert!(
+        stderr[again..].contains("[2 cached · 1 computed]"),
+        "after the edit, more or less than the edited graph recomputed: {stderr}"
+    );
+}
+
+/// The Reasoner bounds page: its two bounded steps are refused as over budget, each naming its
+/// bound, and nothing else on the page errs.
+#[test]
+fn the_bounds_page_refuses_at_both_bounds() {
+    let home = scratch("bounds-page");
+    let (stdout, stderr, ok) = run_page(&home, "bounds");
+    assert!(!ok, "the bounds page reasoned past a bound: {stdout}");
+    let errors: Vec<&str> = stderr.lines().filter(|l| l.contains("error")).collect();
+    assert_eq!(
+        errors,
+        [
+            "error: over budget: OWL RL closure exceeds 100000 triples",
+            "error: over budget: OWL RL input exceeds 1000 triples",
+        ],
+        "stderr: {stderr}"
+    );
+}
+
 /// Past the input bound (1,000 triples by default) the reasoner refuses as OverBudget before it
 /// reasons, and never truncates.
 #[test]

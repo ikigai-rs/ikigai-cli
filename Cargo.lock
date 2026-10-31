@@ -3663,9 +3663,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-runbook"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b74e42313fac9bcbb01711a15b8ee55237544cd5b31f33fa59eb192ff5771bc0"
+checksum = "eb17729e66489dde74b489239cbad1810a6a8a8377a562459848c557c1935b5d"
 dependencies = [
  "ikigai-core",
  "ikigai-fn",
