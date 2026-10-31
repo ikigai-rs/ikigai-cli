@@ -56,10 +56,42 @@ fn line_repl_stops_when_consumer_closes_stdout() {
         .unwrap();
     let mut input = child.stdin.take().unwrap();
     input.write_all(b"help\n").unwrap();
-    let mut output = child.stdout.take().unwrap();
-    let mut first_response = vec![0; expected.stdout.len()];
-    output.read_exact(&mut first_response).unwrap();
-    assert_eq!(first_response, expected.stdout);
+    // The first response is read on its own thread under a deadline (ledger #2725): with
+    // stdin held open, a response shorter than the reference (or never flushed) would block
+    // `read_exact` forever, and the macOS CI job once timed out here with nothing to show.
+    let output = child.stdout.take().unwrap();
+    let want = expected.stdout.len();
+    let (sent, received) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut output = output;
+        let mut first_response = Vec::with_capacity(want);
+        let mut chunk = [0; 4096];
+        while first_response.len() < want {
+            match output.read(&mut chunk[..(want - first_response.len()).min(4096)]) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => first_response.extend_from_slice(&chunk[..n]),
+            }
+        }
+        let _ = sent.send((first_response, output));
+    });
+    let (first_response, output) = match received.recv_timeout(Duration::from_secs(10)) {
+        Ok(read) => read,
+        Err(_) => {
+            child.kill().unwrap();
+            let stderr = child.wait_with_output().unwrap().stderr;
+            panic!(
+                "the first `help` response did not arrive within 10s (expected {want} bytes); \
+                 stderr: {}",
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+    };
+    assert_eq!(
+        first_response,
+        expected.stdout,
+        "the REPL's first `help` response ({} bytes) differs from `-c help` ({want} bytes)",
+        first_response.len()
+    );
     drop(output);
     // Read the whole first response before closing its reader, so even a small
     // pipe cannot fail during that response and race the next stdin write.
