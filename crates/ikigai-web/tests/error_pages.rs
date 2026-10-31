@@ -186,12 +186,21 @@ async fn an_ordinary_oversize_body_negotiates_a_page_before_admission() {
                     content_length = header(&resp, "content-length").map(str::to_owned);
                     if accept == BROWSER {
                         assert_page(&resp, "413 Payload Too Large");
+                        assert!(
+                            split(&resp).1.contains(
+                                "request body too large: this route takes at most 3 bytes"
+                            ),
+                            "{resp}"
+                        );
                     } else {
                         assert_eq!(
                             header(&resp, "content-type"),
                             Some("text/plain; charset=utf-8")
                         );
-                        assert_eq!(split(&resp).1, "request body too large");
+                        assert_eq!(
+                            split(&resp).1,
+                            "request body too large: this route takes at most 3 bytes"
+                        );
                     }
                 }
             }
