@@ -67,6 +67,7 @@ pub mod names;
 pub mod passkey;
 pub mod people;
 mod prg;
+mod startup_jobs;
 // `urn:host:posture` — what THIS PROCESS composed at startup (mounts, trusted client
 // certificates, surface, ceiling), and the one place the startup banner's mount and client
 // lines are rendered. A module rather than another block in this file because the doors in
@@ -5341,6 +5342,10 @@ fn build_watched(mounts: Vec<MountSpec>, reactive: bool) -> Arc<Kernel> {
     // module's tests if brought into scope.
     let registry = time_registry();
     registry.set_resolver(Arc::clone(&kernel) as Arc<dyn ikigai_resolve::Resolver>);
+    if let Err(e) = startup_jobs::start(registry.clone()) {
+        eprintln!("ikigai: {e}");
+        std::process::exit(2);
+    }
     // The reactive tuplespace: watch file_root/spaces and fire each reactive space's handler
     // on a drop (inbox → outbox/error). Like the scheduler, it holds the kernel as a Resolver
     // installed now that the kernel exists. What each handler runs under is decided by the

@@ -2252,7 +2252,7 @@ fn daemon(mounts: Mounts) {
             every.as_secs()
         ),
         None => eprintln!(
-            "ikigai: daemon up — instance \"{name}\": no \"{name}.derive_every\" in calendar.json — IDLE (Ctrl-C to stop)"
+            "ikigai: daemon up — instance \"{name}\": no \"{name}.derive_every\" in calendar.json — timers + watchers (Ctrl-C to stop)"
         ),
     }
     // Catch up immediately: the interval timer waits a full period before its
