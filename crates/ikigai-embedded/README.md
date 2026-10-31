@@ -16,7 +16,8 @@ shapes (`urn:data:page` / `urn:data:about` compose templates, `urn:host:info`):
 - Function endpoints — `ikigai-fn` (`toUpper`, `reverseList`, `wrap`, `split`,
   `greet`, `echo`, `compose`)
 - Standard modules — `ikigai-fs` (filesystem), `ikigai-http` (outbound HTTP client, native via
-  `ureq`),
+  `ureq`, bounded by the config home's `http.timeout`, 30 s by default; a host calls
+  `configure_http()` at start-up to stop on a bad value),
   `ikigai-personal`, `ikigai-rdf`, `ikigai-sparql`, `ikigai-xslt`,
   and the `ikigai-runbook` demo (gated off by default)
 - Contract renderer — a `CliRenderer` that adds an `application/json` projection of an

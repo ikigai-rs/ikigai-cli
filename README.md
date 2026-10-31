@@ -797,6 +797,18 @@ in `config.toml`; it is read when the kernel's transports are built. A blank val
 one that is not printable ASCII, keeps the default. A `User-Agent` passed in a request's
 own `headers` still wins over both.
 
+**Outbound HTTP requests time out.** The same transport gives up on connecting, and on
+any single read or write of the socket, after 30 seconds by default, so a server that
+accepts the connection and never answers cannot hold a REPL line, a river rebuild or a
+scheduled job. Set `http.timeout = 10` in `config.toml` to change the bound; the value is
+a whole number of seconds, at least 1, and `_` separators are allowed. A bad value stops
+every mode at start-up, naming the key and the file, rather than reading as the default.
+A request past the bound is refused as a transient `Timeout`, never as a partial body:
+the bytes that arrived before the stall are dropped. The bound is on each wait, not on
+the whole exchange, so a large body that keeps arriving is read in full. The LLM
+endpoints wait at least 300 seconds (a longer `http.timeout` raises that), because a
+non-streamed answer arrives in one piece only after the model has finished.
+
 ## Lisp, s-expressions, and signing
 
 The embedded host mounts a family of modules that make **code, queries, and graphs
