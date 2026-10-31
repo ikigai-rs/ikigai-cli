@@ -11,16 +11,19 @@ use crate::output::{print, println};
 use ikigai_engine::{Action, CacheStats, Engine, ScriptError, HELP};
 
 use crate::script;
+use crate::session::Session;
 
 /// Execute each command non-interactively, then return a process exit code
 /// (`1` if any command errored, else `0`). Output goes to stdout, errors to
-/// stderr — so `ikigai -c '…'` composes in a shell. A `quit` ends the batch.
+/// stderr, so `ikigai -c '…'` composes in a shell. A refused `cap` stops the batch
+/// immediately. A `quit` ends the batch.
 ///
 /// Across a multi-command batch, the cache outcomes are tallied and a one-line
 /// summary is printed at the end (to stderr) — so `ikigai -c … -c …`, especially
 /// `--connect`'d to a server with a warm cache, shows how much of the batch was
 /// served from cache rather than recomputed.
 pub fn run_commands(engine: Engine, commands: &[String]) -> i32 {
+    let engine = Session::new(engine);
     let mut code = 0;
     let mut total = CacheStats::default();
     let mut ran = 0u32;
@@ -28,6 +31,9 @@ pub fn run_commands(engine: Engine, commands: &[String]) -> i32 {
         if let Some(invocation) = script::command(command) {
             if run_stored_script(&engine, invocation).is_err() {
                 code = 1;
+                if engine.is_refusing() {
+                    break;
+                }
             }
             continue;
         }
@@ -38,6 +44,9 @@ pub fn run_commands(engine: Engine, commands: &[String]) -> i32 {
                     Err(err) => {
                         eprintln!("error: {}", crate::restate_build_line(err));
                         code = 1;
+                        if engine.is_refusing() {
+                            break;
+                        }
                     }
                 }
                 // Cache outcome goes to stderr so stdout stays clean for pipes.
@@ -78,6 +87,7 @@ pub fn run_commands(engine: Engine, commands: &[String]) -> i32 {
 /// all, so what a piped session prints is its answers (and their `[cache]` notes), in order,
 /// and nothing a replay has to strip.
 pub fn run(engine: Engine, topology: &[String], quiet: bool) -> i32 {
+    let engine = Session::new(engine);
     let mut code = 0;
     let prompting = !quiet || stdin_is_a_terminal();
     if !quiet {
@@ -152,6 +162,7 @@ pub fn run_script(
     params: &BTreeMap<String, String>,
     quiet: bool,
 ) -> i32 {
+    let engine = Session::new(engine);
     let ran = script::run(&engine, text, params, |_, _, action| {
         show(&engine, action, quiet)
     });
@@ -172,7 +183,7 @@ pub fn run_script(
 /// script stored at `<iri>` as [`run_script`] runs a file, and report where it stopped. Its
 /// lines keep their notes, as every line the REPL runs does.
 fn run_stored_script(
-    engine: &Engine,
+    engine: &Session,
     invocation: Result<script::Invocation, String>,
 ) -> Result<(), ScriptError> {
     script::run_command(engine, invocation, |_, _, action| {
@@ -183,7 +194,7 @@ fn run_stored_script(
 
 /// Print one script line's answer. A failing line's error is not printed here: the script's
 /// own error says it once, with the line's number.
-fn show(engine: &Engine, action: Action, quiet: bool) {
+fn show(engine: &Session, action: Action, quiet: bool) {
     match action {
         Action::Output(entry) => {
             if let Ok(out) = &entry.result {
@@ -214,7 +225,7 @@ fn report_script_error(error: &ScriptError) {
 /// from outside the process that is indistinguishable from a slow server. When a width
 /// hint was applied the note names the term, so the routing decision is visible rather
 /// than inferred from which backend happened to answer.
-fn report_fan_out(engine: &Engine) {
+fn report_fan_out(engine: &Session) {
     if let Some(fan_out) = engine.last_fan_out() {
         eprintln!("[{fan_out}]");
     }
@@ -224,7 +235,7 @@ fn report_fan_out(engine: &Engine) {
 /// `[contract unavailable for …]` line each, on stderr beside the cache and fan-out notes.
 /// Without a contract the engine routes a value to `in` and leaves an undeclared
 /// `key=value` as text; that still works, and this is what says it happened.
-fn report_contract_notes(engine: &Engine) {
+fn report_contract_notes(engine: &Session) {
     for note in engine.last_contract_notes() {
         eprintln!("[{note}]");
     }

@@ -28,6 +28,7 @@ mod repl;
 #[cfg(feature = "web")]
 mod route_load;
 mod script;
+mod session;
 #[cfg(all(feature = "embedded", not(target_family = "wasm")))]
 mod show;
 #[cfg(not(target_family = "wasm"))]

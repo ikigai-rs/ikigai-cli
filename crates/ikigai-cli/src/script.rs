@@ -5,8 +5,8 @@
 //! file order, `#` comments (so a `#!` shebang is one), `# @param <name> [= <default>]`
 //! declarations used as `{name}`, and stop at the first failing line. [`run`] parses and binds
 //! with the engine's [`Script`] and then evaluates each line itself rather than calling
-//! [`Engine::run_script`], so each answer is shown as its line finishes, with that line's
-//! fan-out and contract notes, instead of all at once at the end. It stops where
+//! [`ikigai_engine::Engine::run_script`], so each answer is shown as its line finishes,
+//! with that line's fan-out and contract notes, instead of all at once at the end. It stops where
 //! `run_script` stops: at the first line whose answer is an error, or at `quit`.
 //!
 //! The REPL command is `script`, not `run`: the engine still reads `run` as the old name of
@@ -14,7 +14,9 @@
 
 use std::collections::BTreeMap;
 
-use ikigai_engine::{Action, Engine, Script, ScriptError};
+use ikigai_engine::{Action, Script, ScriptError};
+
+use crate::session::Session;
 
 /// The REPL command that runs a stored script.
 pub const COMMAND: &str = "script";
@@ -119,7 +121,7 @@ pub fn params(args: impl IntoIterator<Item = String>) -> Result<BTreeMap<String,
 /// handed to `each` with its line number and the line as it ran (parameters substituted); the
 /// run stops after the first line whose answer is an error, which is the `Err`, or at `quit`.
 pub fn run(
-    engine: &Engine,
+    engine: &Session,
     text: &str,
     supplied: &BTreeMap<String, String>,
     mut each: impl FnMut(usize, &str, Action),
@@ -148,7 +150,7 @@ pub fn run(
 
 /// Read the script stored at `iri` through the engine (`source <iri>`), under the session's
 /// capability, as any other read from the REPL is.
-pub fn read(engine: &Engine, iri: &str) -> Result<String, String> {
+pub fn read(engine: &Session, iri: &str) -> Result<String, String> {
     match engine.eval(&format!("source {iri}")) {
         Action::Output(entry) => entry
             .result
@@ -160,7 +162,7 @@ pub fn read(engine: &Engine, iri: &str) -> Result<String, String> {
 /// The REPL's `script <iri> [key=value …]`: read the script and [`run`] it. The refusal of a
 /// malformed command or an unreadable script belongs to no line (`line: None`).
 pub fn run_command(
-    engine: &Engine,
+    engine: &Session,
     invocation: Result<Invocation, String>,
     each: impl FnMut(usize, &str, Action),
 ) -> Result<(), ScriptError> {
