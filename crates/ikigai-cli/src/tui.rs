@@ -484,7 +484,7 @@ fn demo_position(state: &State, width: u16, height: u16) -> (u16, usize) {
 }
 
 /// Browse every step, including runbooks longer than the number row.
-fn demo_key(state: &mut State, engine: &Engine, key: KeyCode, width: u16, height: u16) {
+fn demo_key(state: &mut State, engine: &Session, key: KeyCode, width: u16, height: u16) {
     let Some(demo) = demo_index(state.tab).and_then(|i| state.demos.get(i)) else {
         return;
     };
