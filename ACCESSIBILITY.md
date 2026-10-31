@@ -154,6 +154,8 @@ Found by reading the source on 2026-10-15, not by testing:
 
 | 2026-10-31 | A refused `cap` stops a `-c` batch and blocks subsequent evaluation in both REPLs until an explicit valid narrowing or reset (ledger #2717). The plain `error:` diagnostic names how to resume; no color is added. Binary tests cover batches, stdin replay, and scripts; a TUI unit test covers command and scratch evaluation. No assistive technology testing was performed. |
 
+| 2026-10-31 | An alias mount deeper than one segment forwards names unchanged (ledger #2735). The usage text gains three plain lines under `--mount` stating the rule, and the startup banner's and `urn:host:posture`'s `mount` line for such a mount ends `[names forwarded unchanged under <prefix>]`. A unit test pins the line; no color is added and no assistive technology testing was performed. |
+
 | 2026-10-30 | Full-screen runbook pages (ledger #2694) gain scrolling with a visible line range, an Up/Down and Enter step picker, persistent page headings, and a tab strip that keeps the selected demo visible. Tested with the ratatui backend and a Linux PTY at 100×40 on scratch data; no assistive technology testing. |
 
 ## Contributing

@@ -499,6 +499,13 @@ they FOLLOW, so two peers never share a certificate set. The config home's `moun
 (`mount = "override urn:x:=quic://host:4433 ~/certs/x"`) say the same thing for the whole
 machine.
 
+An alias mount at a whole first segment (`--mount urn:quakes:=…`) strips it: the peer
+receives `urn:quakes:regions` as `urn:regions`. An alias mount DEEPER than one segment
+(`--mount urn:quakes:near:=…`, ledger #2735) forwards the name UNCHANGED: the peer receives
+`urn:quakes:near:37.5:137.2` and serves the same name the reader uses. For a name under both,
+the deeper mount wins, whatever order they were declared in. The startup banner's line for
+such a mount ends `[names forwarded unchanged under <prefix>]`.
+
 **A read through a mount is uncacheable here, whatever the peer declares** (ikigai-cli 0.1.64+, ledger #92, #2613).
 A peer endpoint's `cacheable: true` still holds on the peer: it sends `Never` over the wire, and
 its own cache answers every read made through the mount, so the endpoint runs once. What changes

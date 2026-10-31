@@ -5193,7 +5193,8 @@ fn compose_mounts(mut spaces: Vec<Arc<dyn Space>>, mounts: Vec<MountSpec>) -> Ar
         }
     }
     // ALIAS mounts are tried after every local space. `MountedRemote` rewrites
-    // `<prefix>rest` → `urn:rest` before forwarding (so the remote, which serves
+    // `<prefix>rest` → `urn:rest` (a first-segment prefix; a deeper one forwards the IRI
+    // unchanged, below) before forwarding (so the remote, which serves
     // `urn:*`, resolves it and a `trace` stitches its execution under this mount
     // node) AND surfaces the remote's catalog back re-prefixed + tagged with its
     // origin, so a federated `list` shows where each mounted resource resolves.
@@ -5223,17 +5224,38 @@ fn compose_mounts(mut spaces: Vec<Arc<dyn Space>>, mounts: Vec<MountSpec>) -> Ar
     // makes every stamp comparable. It is the wall clock, as this host gives its kernels: a
     // step backward forgets the record and asks the peer, the direction that cannot go stale.
     let clock: Arc<dyn ikigai_core::Clock> = Arc::new(SystemClock);
+    // A DEEPER alias mount (`urn:quakes:near:`, ledger #2735) forwards the IRI unchanged,
+    // so it is the override-mode space, still tried after every local one; and it goes
+    // ahead of every first-segment alias, longest prefix first, so for a name under both
+    // it wins whatever the declaration order. First-segment aliases keep their declared
+    // order among themselves, as before. (No first-segment prefix can sit under a deeper
+    // one, so putting every deeper mount first never takes a name from one.)
     let mut fronting: Vec<MountSpec> = Vec::new();
+    let mut deeper: Vec<MountSpec> = Vec::new();
+    let mut first_segment: Vec<MountSpec> = Vec::new();
     for mount in mounts {
-        if mount.kind == MountKind::Alias {
-            spaces.push(Arc::new(
-                ikigai_resolve::MountedRemote::new(mount.resolver, mount.prefix, mount.origin)
-                    .sharing(&peers)
-                    .with_clock(Arc::clone(&clock)),
-            ));
-        } else {
+        if mount.kind != MountKind::Alias {
             fronting.push(mount);
+        } else if alias_forwards_unchanged(&mount.prefix) {
+            deeper.push(mount);
+        } else {
+            first_segment.push(mount);
         }
+    }
+    deeper.sort_by_key(|mount| std::cmp::Reverse(mount.prefix.len()));
+    for mount in deeper {
+        spaces.push(Arc::new(
+            ikigai_resolve::MountedRemote::overriding(mount.resolver, mount.prefix, mount.origin)
+                .sharing(&peers)
+                .with_clock(Arc::clone(&clock)),
+        ));
+    }
+    for mount in first_segment {
+        spaces.push(Arc::new(
+            ikigai_resolve::MountedRemote::new(mount.resolver, mount.prefix, mount.origin)
+                .sharing(&peers)
+                .with_clock(Arc::clone(&clock)),
+        ));
     }
     if fronting.is_empty() {
         return Arc::new(Fallback::new(spaces));
@@ -5278,6 +5300,21 @@ fn compose_mounts(mut spaces: Vec<Arc<dyn Space>>, mounts: Vec<MountSpec>) -> Ar
     Arc::new(Fallback::new(ordered))
 }
 
+/// Whether an ALIAS mount at `prefix` forwards the IRI UNCHANGED (ledger #2735).
+///
+/// A prefix that takes one whole segment after `urn:` (`urn:quakes:`) is a local name for
+/// a remote namespace: `<prefix>rest` is rewritten to `urn:rest` before forwarding, as it
+/// always was. A prefix DEEPER than one segment (`urn:quakes:near:`) names a family inside
+/// the reader's own namespace, so the peer receives the name the reader used
+/// (`urn:quakes:near:37.5:137.2`) and serves that same name. Deeper means: after `urn:`
+/// and without its trailing colons, the prefix still holds a colon. A prefix outside
+/// `urn:` keeps the rewrite.
+pub fn alias_forwards_unchanged(prefix: &str) -> bool {
+    prefix
+        .strip_prefix("urn:")
+        .is_some_and(|rest| rest.trim_end_matches(':').contains(':'))
+}
+
 /// One remote mount: where it binds, a label for the catalog, the connected
 /// resolver, and whether it OVERRIDES the local namespace.
 pub struct MountSpec {
@@ -5319,7 +5356,9 @@ impl Space for PrefixGuard {
 pub enum MountKind {
     /// `--mount`: the prefix is a LOCAL ALIAS for a remote namespace. IRIs are
     /// rewritten (`<prefix>rest` → `urn:rest`) and the mount is tried AFTER the
-    /// local spaces, so it only ever catches what this kernel lacks.
+    /// local spaces, so it only ever catches what this kernel lacks. A prefix deeper
+    /// than one segment (`urn:quakes:near:`) forwards the IRI unchanged instead, and
+    /// wins over a shallower alias for names under it (see [`alias_forwards_unchanged`]).
     Alias,
     /// `--override`: the SAME namespace, served remotely. IRIs forward unchanged
     /// and the mount is composed BEFORE the local spaces. If the remote is down,
@@ -8847,6 +8886,109 @@ mod tests {
             "the urn:llm: mount must not see a urn:iki:fn: request"
         );
         assert!(override_calls.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    }
+
+    /// A peer that answers every request with its own label and the IRI it RECEIVED, so a
+    /// test can see both which mount a name went to and the name that crossed the wire.
+    struct EchoPeer(&'static str);
+
+    #[async_trait::async_trait]
+    impl ikigai_resolve::Resolver for EchoPeer {
+        fn issue(
+            &self,
+            request: Request,
+        ) -> std::result::Result<(Representation, ikigai_resolve::CacheStatus), ikigai_core::Error>
+        {
+            Ok((
+                Representation::new(
+                    ReprType::new("text/plain"),
+                    format!("{} {}", self.0, request.target.as_str()).into_bytes(),
+                ),
+                ikigai_resolve::CacheStatus::Uncacheable,
+            ))
+        }
+
+        fn is_cached(&self, _request: &Request, _capability: &Capability) -> bool {
+            false
+        }
+
+        fn entries(&self) -> Option<Vec<SpaceEntry>> {
+            None
+        }
+    }
+
+    fn echo_alias(prefix: &str, label: &'static str) -> MountSpec {
+        MountSpec {
+            prefix: prefix.to_string(),
+            origin: format!("test://{label}"),
+            resolver: Arc::new(EchoPeer(label)),
+            kind: MountKind::Alias,
+        }
+    }
+
+    /// ★ Ledger #2735: an alias mount DEEPER than one segment forwards the name unchanged.
+    /// It used to strip the prefix like a first-segment mount, so a peer at
+    /// `urn:quakes:near:` received `urn:37.5:137.2`, a name no peer can sensibly serve.
+    #[test]
+    fn a_deeper_alias_mount_forwards_the_name_unchanged() {
+        let space = root_space_with_mounts(vec![echo_alias("urn:quakes:near:", "near")]);
+        assert_eq!(
+            probe(&space, "urn:quakes:near:37.5:137.2").expect("the mount answers"),
+            "near urn:quakes:near:37.5:137.2"
+        );
+    }
+
+    /// A whole-first-segment alias mount keeps today's rewrite: `<prefix>rest` → `urn:rest`.
+    #[test]
+    fn a_first_segment_alias_mount_still_strips_its_prefix() {
+        let space = root_space_with_mounts(vec![echo_alias("urn:quakes:", "quakes")]);
+        assert_eq!(
+            probe(&space, "urn:quakes:regions").expect("the mount answers"),
+            "quakes urn:regions"
+        );
+    }
+
+    /// For a name under both, the deeper mount wins, whichever was declared first; a name
+    /// under only the shallower one still goes there, stripped.
+    #[test]
+    fn a_deeper_alias_mount_takes_precedence_over_a_shallower_one() {
+        for mounts in [
+            vec![
+                echo_alias("urn:quakes:", "quakes"),
+                echo_alias("urn:quakes:near:", "near"),
+            ],
+            vec![
+                echo_alias("urn:quakes:near:", "near"),
+                echo_alias("urn:quakes:", "quakes"),
+            ],
+        ] {
+            let space = root_space_with_mounts(mounts);
+            assert_eq!(
+                probe(&space, "urn:quakes:near:37.5:137.2").expect("the deeper mount answers"),
+                "near urn:quakes:near:37.5:137.2"
+            );
+            assert_eq!(
+                probe(&space, "urn:quakes:regions").expect("the shallower mount answers"),
+                "quakes urn:regions"
+            );
+        }
+    }
+
+    /// The classification itself: one segment after `urn:` strips, more forwards unchanged.
+    #[test]
+    fn which_alias_prefixes_forward_unchanged() {
+        for deep in ["urn:quakes:near:", "urn:a:b:c:", "urn:quakes:near"] {
+            assert!(alias_forwards_unchanged(deep), "{deep}");
+        }
+        for shallow in [
+            "urn:quakes:",
+            "urn:quakes-py:",
+            "urn:quakes",
+            "urn:",
+            "urn:a::",
+        ] {
+            assert!(!alias_forwards_unchanged(shallow), "{shallow}");
+        }
     }
 
     /// A mount target that is up and lists a catalog, so entry provenance can be

@@ -220,13 +220,35 @@ pub const MOUNTS_DECLINED: &str =
     "declined (--no-config-mounts) — the config home's `mount` lines are not read";
 
 /// One mount, named.
+///
+/// An alias mount whose prefix is deeper than one segment says so on its line (ledger
+/// #2735): `alias` alone reads as "the prefix is stripped", and for `urn:quakes:near:` the
+/// peer receives the name unchanged, which is what an operator reading a peer's log needs
+/// to know.
 fn mount_line(mount: &ComposedMount) -> String {
+    let unchanged: Vec<&str> = if mount.mode == "alias" {
+        mount
+            .prefix
+            .split(',')
+            .filter(|prefix| crate::alias_forwards_unchanged(prefix))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let unchanged = if unchanged.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "  [names forwarded unchanged under {}]",
+            unchanged.join(", ")
+        )
+    };
     let certs = match &mount.cert_dir {
         Some(dir) => format!("  [certs {dir}]"),
         None => String::new(),
     };
     format!(
-        "mount   {} {} -> {}{certs}",
+        "mount   {} {} -> {}{unchanged}{certs}",
         mount.mode, mount.prefix, mount.target
     )
 }
@@ -595,6 +617,32 @@ mod tests {
         assert_eq!(
             lines[1],
             "mount   alias urn:cal: -> quic://bug.local:4433  [certs /tmp/quic-bug]"
+        );
+    }
+
+    /// A deeper alias mount's line says the peer receives the names unchanged; a
+    /// first-segment alias's line is as it was (ledger #2735).
+    #[test]
+    fn a_deeper_alias_mount_says_its_names_forward_unchanged() {
+        let mount = |prefix: &str| ComposedMount {
+            mode: "alias",
+            prefix: prefix.to_string(),
+            target: "/tmp/quakes.sock".to_string(),
+            cert_dir: None,
+        };
+        assert_eq!(
+            mount_line(&mount("urn:quakes:near:")),
+            "mount   alias urn:quakes:near: -> /tmp/quakes.sock  \
+             [names forwarded unchanged under urn:quakes:near:]"
+        );
+        assert_eq!(
+            mount_line(&mount("urn:quakes:")),
+            "mount   alias urn:quakes: -> /tmp/quakes.sock"
+        );
+        assert_eq!(
+            mount_line(&mount("urn:quakes:,urn:quakes:near:")),
+            "mount   alias urn:quakes:,urn:quakes:near: -> /tmp/quakes.sock  \
+             [names forwarded unchanged under urn:quakes:near:]"
         );
     }
 
