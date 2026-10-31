@@ -118,7 +118,8 @@ icu_properties = { version = "2.3", default-features = false, features = ["compi
 # The full-screen TUI is native-only (crossterm). The browser frontend (ratzilla)
 # lands in a later slice; on wasm the binary falls back to the line REPL.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-ratatui = "0.30.1"
+# Count wrapped runbook rows with the same algorithm used to render them.
+ratatui = { version = "0.30.1", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29.0"
 
 # `poll` and `FIONREAD` on stdin, so a `-c` batch can tell a stdin that is already at its end
