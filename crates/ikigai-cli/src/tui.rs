@@ -484,7 +484,7 @@ fn demo_position(state: &State, width: u16, height: u16) -> (u16, usize) {
 }
 
 /// Browse every step, including runbooks longer than the number row.
-fn demo_key(state: &mut State, engine: &Engine, key: KeyCode, width: u16, height: u16) {
+fn demo_key(state: &mut State, engine: &Session, key: KeyCode, width: u16, height: u16) {
     let Some(demo) = demo_index(state.tab).and_then(|i| state.demos.get(i)) else {
         return;
     };
@@ -1654,7 +1654,7 @@ fn demo_lines(demo: &DemoData, out: &str) -> Vec<Line<'static>> {
             step.label.clone().bold(),
         ]));
         lines.push(Line::from(format!("     {}", step.cmd).cyan()));
-        lines.push(Line::from(format!("     — {}", step.note).dim()));
+        lines.push(Line::from(format!("     — {}", step.note)));
     }
     if !out.is_empty() {
         lines.push(Line::from(""));
@@ -1711,6 +1711,7 @@ fn transcript_lines(transcript: &[Entry]) -> Vec<Line<'static>> {
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Modifier;
     use ratatui::Terminal;
 
     fn render(width: u16, height: u16, state: &State) {
@@ -2012,6 +2013,52 @@ mod tests {
         (0..height)
             .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect())
             .collect()
+    }
+
+    fn assert_runbook_note_has_normal_intensity(no_color: bool) {
+        let note = "This note carries the page content.";
+        let state = State {
+            no_color,
+            tab: TAB_DEMO_BASE,
+            demos: vec![DemoData {
+                label: "Example".into(),
+                intro: "Introduction".into(),
+                steps: vec![StepData {
+                    label: "Read the content".into(),
+                    cmd: "source urn:test:1".into(),
+                    note: note.into(),
+                }],
+            }],
+            ..State::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let buf = terminal.backend().buffer();
+        let mut found = false;
+        for y in 0..40 {
+            let row: String = (0..100).map(|x| buf[(x, y)].symbol()).collect();
+            if let Some(start) = row.find(note) {
+                found = true;
+                let start = row[..start].chars().count();
+                for x in start..start + note.len() {
+                    assert!(
+                        !buf[(x as u16, y)].modifier.contains(Modifier::DIM),
+                        "note cell ({x}, {y}) is dim with no_color={no_color}"
+                    );
+                }
+            }
+        }
+        assert!(found, "the runbook note must be visible");
+    }
+
+    #[test]
+    fn runbook_note_has_normal_intensity_with_color() {
+        assert_runbook_note_has_normal_intensity(false);
+    }
+
+    #[test]
+    fn runbook_note_has_normal_intensity_with_no_color() {
+        assert_runbook_note_has_normal_intensity(true);
     }
 
     #[test]

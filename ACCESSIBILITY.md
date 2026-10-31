@@ -10,7 +10,7 @@ how to report a barrier. It is not a conformance claim. Adapted from the
 | Status | Evaluation in progress. No conformance claim. |
 | Owner | the maintainers of this repository |
 | Report a barrier | [a GitHub issue](https://github.com/ikigai-rs/ikigai-cli/issues/new?labels=accessibility) with the `accessibility` label; anything security-sensitive through [private vulnerability reporting](https://github.com/ikigai-rs/ikigai-cli/security/advisories/new) |
-| Last reviewed | 2026-10-30 |
+| Last reviewed | 2026-10-31 |
 
 ## What it emits that people read
 
@@ -63,7 +63,8 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
   green output, red error) repeat what the text already says.
 - A set, non-empty `NO_COLOR` ([no-color.org](https://no-color.org)) removes every color from the
   full-screen REPL. Bold, dim and the reverse that marks the selected tab stay; they are emphasis,
-  not color. The other faces write no color.
+  not color. Runbook content, including step notes, is never dim; faint styling is reserved
+  for chrome such as hints and separators on those pages. The other faces write no color.
 - Full-screen runbook pages keep the page name above a scrollable body. `PgUp`/`PgDn`
   scroll wrapped text, with a visible line range; `Up`/`Down` select any step and `Enter`
   runs it. `1`–`9` and `0` remain shortcuts for steps 1–10. The selected step has a `>`
@@ -106,7 +107,8 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
 - The full-screen REPL is rendered against ratatui's test backend in `tui.rs`'s tests, mostly for
   layout and editing. `no_color_takes_every_color_escape_out_of_the_frame` writes a frame through
   the crossterm backend and finds no color escape in the bytes under `NO_COLOR`, and finds some
-  without it.
+  without it. The runbook note tests render a step through the test backend and check every
+  note cell for normal intensity, with and without `NO_COLOR`.
 - Runbook regression tests in `tui.rs` render at 100×40 with eighteen synthetic pages
   and twelve steps, including wrapped prose and output. They check the selected tab and
   page heading, distinct step numbers, the line range, scrolling to the answer, and
@@ -155,6 +157,8 @@ Found by reading the source on 2026-10-15, not by testing:
 | 2026-10-31 | A refused `cap` stops a `-c` batch and blocks subsequent evaluation in both REPLs until an explicit valid narrowing or reset (ledger #2717). The plain `error:` diagnostic names how to resume; no color is added. Binary tests cover batches, stdin replay, and scripts; a TUI unit test covers command and scratch evaluation. No assistive technology testing was performed. |
 
 | 2026-10-30 | Full-screen runbook pages (ledger #2694) gain scrolling with a visible line range, an Up/Down and Enter step picker, persistent page headings, and a tab strip that keeps the selected demo visible. Tested with the ratatui backend and a Linux PTY at 100×40 on scratch data; no assistive technology testing. |
+
+| 2026-10-31 | Full-screen runbook step notes (ledger #2734) use normal intensity because they carry page content. Ratatui test-backend regressions check note cells with and without `NO_COLOR`; color behavior is unchanged. No assistive technology testing was performed. |
 
 ## Contributing
 
