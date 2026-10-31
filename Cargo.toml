@@ -1479,7 +1479,7 @@ ikigai-http = "0.5.0" # 0.5.0 = conditional revalidation (ledger #2535): a stale
 # Interactive runbook module (urn:runbook:*) — Linked Data demo tab since 0.1.3;
 # 0.1.5 adds the JSON-LD demo tab (expand/flatten/compact), which works here because
 # the CLI links its own pipe-fixed ikigai-engine.
-ikigai-runbook = "0.3.0" # 0.3.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.0"` is `<0.4.0`. Beneath it: 0.2.1 = the 0.2 line names its `space()` `urn:iki:space:runbook` (ledger #987), so
+ikigai-runbook = "0.3.2" # 0.3.2 = the OWL 2 RL pages (ledger #2641): Selection through the reasoner, then Two vocabularies, Domain & range, Topics, The thread and Reasoner bounds, all over `urn:reason:*`, which this host binds (`ikigai-reason` above); `tests/reason_space.rs` runs every step of those pages through the binary. `"0.3.2"` is `<0.4.0`. Beneath it: 0.3.0 = core 0.2.0 sweep (ledger #2356). Beneath that: 0.2.1 = the 0.2 line names its `space()` `urn:iki:space:runbook` (ledger #987), so
 # `answered_by`, `urn:kernel:topology` and `urn:diagram:*` show that name where this host mounts
 # it plain, and the cache partitions under it. Under 0.x the old caret was a CEILING below the
 # named release. 0.2.1 REFUSES an `as` outside `PAGE_FACES` as `InvalidArgument` naming `as` (it
