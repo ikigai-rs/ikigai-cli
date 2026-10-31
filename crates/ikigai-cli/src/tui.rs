@@ -30,6 +30,8 @@ use crate::clipboard;
 use ikigai_engine::config::Keybindings;
 use ikigai_engine::{Action, CacheStats, Engine, Entry, HELP};
 
+use crate::session::Session;
+
 /// How many transcript lines PgUp/PgDn move.
 const SCROLL_STEP: u16 = 5;
 
@@ -56,6 +58,7 @@ fn demo_index(tab: usize) -> Option<usize> {
 /// moment it is no longer useful. Ledger #418: the REPL had no mount line at all, so an
 /// interactive session could not see the topology its answers came through.
 pub fn run(engine: Engine, keys: Keybindings, topology: &[String]) -> io::Result<()> {
+    let engine = Session::new(engine);
     let mut terminal = ratatui::init();
     let result = event_loop(&mut terminal, &engine, keys, topology);
     ratatui::restore();
@@ -238,7 +241,7 @@ impl State {
 
 fn event_loop(
     terminal: &mut DefaultTerminal,
-    engine: &Engine,
+    engine: &Session,
     keys: Keybindings,
     topology: &[String],
 ) -> io::Result<()> {
@@ -403,7 +406,7 @@ fn event_loop(
 /// Load the runbook demos into `state` by enumerating `urn:runbook:*` and sourcing
 /// each as `application/json`. Called the first time the demo turns on; a parse or
 /// resolve failure simply skips that page rather than aborting the TUI.
-fn load_demos(state: &mut State, engine: &Engine) {
+fn load_demos(state: &mut State, engine: &Session) {
     let Some(entries) = engine.entries() else {
         return;
     };
@@ -459,7 +462,7 @@ fn load_demos(state: &mut State, engine: &Engine) {
 
 /// Run step `idx` of the demo on the current tab, capturing its output (or error)
 /// into `demo_out` for display on the page.
-fn run_step(state: &mut State, engine: &Engine, idx: usize) {
+fn run_step(state: &mut State, engine: &Session, idx: usize) {
     // Which demo this tab shows (via the shared offset — see `demo_index`).
     let Some(demo) = demo_index(state.tab).and_then(|i| state.demos.get(i)) else {
         return;
@@ -956,7 +959,7 @@ fn scratch_eval_src(text: &str, cursor: usize, mark: Option<usize>) -> String {
 /// (either scheme) and the emacs `C-c C-c` chord — then the key is decoded by the
 /// active scheme and applied to the buffer, with `Enter` alone inserting a newline
 /// (this is an editor, not the REPL input line).
-fn scratch_key(state: &mut State, engine: &Engine, key: KeyEvent) -> bool {
+fn scratch_key(state: &mut State, engine: &Session, key: KeyEvent) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let emacs = matches!(state.keys, Keybindings::Emacs | Keybindings::Native);
@@ -1045,7 +1048,7 @@ fn scratch_edit(state: &mut State, action: Edit) {
 /// Evaluate the Scratch buffer (or its marked region) through the engine's Lisp path
 /// (`urn:lisp:eval`), pushing the result to the transcript and keeping it for the
 /// in-place readout beneath the buffer.
-fn eval_scratch(state: &mut State, engine: &Engine) {
+fn eval_scratch(state: &mut State, engine: &Session) {
     let src = scratch_eval_src(&state.scratch, state.scratch_cursor, state.scratch_mark);
     if src.trim().is_empty() {
         return;
@@ -1115,7 +1118,7 @@ fn word_right(s: &str, cursor: usize) -> usize {
 }
 
 /// Evaluate the current input line; returns `true` if the REPL should quit.
-fn submit(state: &mut State, engine: &Engine) -> bool {
+fn submit(state: &mut State, engine: &Session) -> bool {
     let line = std::mem::take(&mut state.input);
     state.cursor = 0;
     state.mark = None;
@@ -1157,7 +1160,7 @@ fn submit(state: &mut State, engine: &Engine) -> bool {
 /// names its line number; a refusal that belongs to no line is an entry for the command.
 fn run_script(
     state: &mut State,
-    engine: &Engine,
+    engine: &Session,
     command: &str,
     invocation: Result<crate::script::Invocation, String>,
 ) {
@@ -1209,7 +1212,7 @@ fn recall(state: &mut State, dir: i32) {
 /// The current `HH:MM` from the cacheable `urn:time:now` (plain variant), or empty on
 /// error. Sourced through the engine so the tab-bar clock is a real resolved resource
 /// (cached within the minute), not a direct clock read.
-fn clock_text(engine: &Engine) -> String {
+fn clock_text(engine: &Session) -> String {
     match engine.eval("source urn:time:now") {
         Action::Output(out) => out.result.unwrap_or_default().trim().to_string(),
         _ => String::new(),
@@ -2356,7 +2359,7 @@ mod tests {
 
     /// A minimal engine whose `urn:lisp:eval` echoes its `in` argument — enough to
     /// observe that a key routed through `scratch_key` reaches the eval path.
-    fn echo_lisp_engine() -> Engine {
+    fn echo_lisp_engine() -> Session {
         use ikigai_core::{
             EndpointSpace, Exact, FnEndpoint, Invocation, Kernel, ReprType, Representation,
         };
@@ -2368,7 +2371,7 @@ mod tests {
             ))
         });
         let space = EndpointSpace::new().bind(Exact::new("urn:lisp:eval"), eval);
-        Engine::new(Kernel::new(std::sync::Arc::new(space)))
+        Session::new(Engine::new(Kernel::new(std::sync::Arc::new(space))))
     }
 
     #[test]
@@ -2392,6 +2395,33 @@ mod tests {
                 "result also appended to the transcript"
             );
         }
+    }
+
+    #[test]
+    fn a_refused_cap_blocks_tui_commands_and_scratch_until_recovery() {
+        let engine = echo_lisp_engine();
+        let mut state = State {
+            input: "cap invalid-profile".into(),
+            scratch: "(+ 1 2)".into(),
+            ..State::default()
+        };
+        assert!(!submit(&mut state, &engine));
+        assert!(state.transcript.last().unwrap().result.is_err());
+        eval_scratch(&mut state, &engine);
+        assert!(state
+            .scratch_result
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap_err()
+            .contains("session is refusing"));
+        state.input = "(+ 1 2)".into();
+        assert!(!submit(&mut state, &engine));
+        assert!(state.transcript.last().unwrap().result.is_err());
+        state.input = "cap reset".into();
+        assert!(!submit(&mut state, &engine));
+        eval_scratch(&mut state, &engine);
+        assert_eq!(state.scratch_result, Some(Ok("ok: (+ 1 2)".into())));
     }
 
     #[test]

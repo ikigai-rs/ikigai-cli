@@ -24,6 +24,11 @@ cargo run --bin ikigai -- --daemon  # headless kernel: timers + watchers, no REP
 `-c '<command>'` runs a command non-interactively and exits — repeat it to run
 several in order (`-c '…' -c '…'`). Output goes to stdout, errors to stderr, and
 the exit code is non-zero if any command failed, so it composes in a shell.
+A refused `cap` stops the batch immediately, including when it occurs in a stored
+script. In either REPL, a refused `cap` blocks further evaluation until a valid
+`cap <scope or profile>` or `cap reset`; displaying `cap` alone does not resume it.
+A valid narrowing uses the capability held before the refusal. `cap reset` returns
+to the session identity, within any sealed ceiling.
 
 A `-c` batch is not quite a REPL session: its non-terminal stdin can feed the first
 command that needs a value (a content-less `sink`, or a `source` left with one required
