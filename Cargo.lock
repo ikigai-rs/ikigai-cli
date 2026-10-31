@@ -1363,6 +1363,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "datafrog"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0afaad2b26fa326569eb264b1363e8ae3357618c43982b3f285f0774ce76b69"
+
+[[package]]
 name = "decoded-char"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1502,6 +1508,12 @@ dependencies = [
  "redox_users",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "disjoint-sets"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ccbbca7d6a247007ca2535c616d4bb4a5fcad176ef0218671f96b88c52c3d34"
 
 [[package]]
 name = "dispatch2"
@@ -3243,6 +3255,7 @@ dependencies = [
  "ikigai-passkey",
  "ikigai-personal",
  "ikigai-rdf",
+ "ikigai-reason",
  "ikigai-repo",
  "ikigai-resolve",
  "ikigai-runbook",
@@ -3595,9 +3608,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-rdf"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2368189afbfb91bac8fa50c773427bcb1400de435a4042254b723d676d2eb747"
+checksum = "32a9e56913dc1cb4f5cadadcefff6be1f7db88589a3caf3af5a59b7f7bedf771"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -3607,6 +3620,21 @@ dependencies = [
  "oxrdfio",
  "oxttl",
  "quick-xml 0.37.5",
+]
+
+[[package]]
+name = "ikigai-reason"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d4f310caa8dfea5a4de85d0bb331183ba6c1bd2ae70666e912872951380045f"
+dependencies = [
+ "async-trait",
+ "getrandom 0.3.4",
+ "ikigai-core",
+ "ikigai-rdf",
+ "oxrdf",
+ "oxrdfio",
+ "reasonable",
 ]
 
 [[package]]
@@ -6774,6 +6802,15 @@ checksum = "5b7e17688d7e871b907a1d869d01a72e13da2f235e47edd88e003610f26ec7a8"
 
 [[package]]
 name = "quick-xml"
+version = "0.36.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7649a7b4df05aed9ea7ec6f628c67c9953a43869b8bc50929569b2999d443fe"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "quick-xml"
 version = "0.37.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "331e97a1af0bf59823e6eadffe373d7b27f485be8748f71471c662c1f269b7fb"
@@ -7146,6 +7183,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "reasonable"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4a008c08bfd0d95385a600ed3647ab54b77d836fbe0e0da1d7f5763f1090092"
+dependencies = [
+ "datafrog",
+ "disjoint-sets",
+ "log",
+ "oxrdf",
+ "quick-xml 0.36.2",
+ "rio_api",
+ "rio_turtle",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7284,6 +7337,23 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rio_api"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f6196ea9fb6791ce3dcd1cfc0d7f1074972aec0572db73dfb7396fcd9c3bc76"
+
+[[package]]
+name = "rio_turtle"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eefbe56cb005507d4517649f5d113b874e29b8559a7b7a263655aeb81570246c"
+dependencies = [
+ "oxilangtag",
+ "oxiri 0.2.11",
+ "rio_api",
 ]
 
 [[package]]

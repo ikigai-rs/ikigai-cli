@@ -1534,6 +1534,11 @@ ikigai-sparql = "0.3.2" # 0.3.2 = a typed `bindings=` on the query endpoints (le
 # 0.1.6 = space_with_store (shared-store seam for browse/annotations)
 # Content sniffing + sniff-and-dispatch (urn:sniff, urn:transrept:auto).
 ikigai-sniff = "0.3.1" # 0.3.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.1"` is `<0.4.0`. Beneath it: 0.2.6 = the linkeddata lockstep line (ledger #11).
+# `rdf-12` is REQUIRED here, not optional: ikigai-shacl turns on `oxigraph/rdf-12` and so `oxrdf/rdf-12`
+# for the whole workspace (feature unification), and `reasonable` 0.4.4 does not compile against that
+# oxrdf unless it is built with its own `rdf-12` (E0004, `TermRef::Triple` not covered; measured
+# 2026-10-30). ikigai-reason's `rdf-12` feature forwards to it.
+ikigai-reason = { version = "0.3.3", features = ["rdf-12"] } # 0.3.3 = its first published release: `urn:reason:closure` and `urn:reason:inferred`, OWL 2 RL forward chaining, pure and cacheable, bounded (1,000 input triples, 100,000 closure triples, refused as OverBudget, never truncated). The runbook's OWL 2 RL pages run on it (ledger #2641).
 ikigai-compress = "0.3.0" # 0.3.0 = core 0.2.x, the newest release. `"0.3.0"` is `<0.4.0`. gzip and zlib as endpoints and transreptors; the runbook's Bytes tab runs on it.
 # Beneath it, still true: 0.2.1 = the linkeddata lockstep line: `urn:iki:space:sniff` (ledger #987).
 # Beneath it, still true: 0.1.9 sniffs a leading `<urn:…>` subject as text/turtle. Below it

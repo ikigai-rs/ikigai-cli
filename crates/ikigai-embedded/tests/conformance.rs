@@ -239,6 +239,8 @@ const INHERITED: &[(&str, &str)] = &[
     ("compress-zlib", "ikigai-compress"),
     ("decompress-gzip", "ikigai-compress"),
     ("decompress-zlib", "ikigai-compress"),
+    ("reason-closure", "ikigai-reason"),
+    ("reason-inferred", "ikigai-reason"),
     ("sparql-ask", "ikigai-sparql"),
     ("sparql-construct", "ikigai-sparql"),
     ("sparql-describe", "ikigai-sparql"),
@@ -1149,6 +1151,55 @@ fn the_compress_space_is_bound_in_the_local_root_and_on_no_served_door() {
     for (door, kernel) in doors {
         let served: BTreeSet<String> = walked(&kernel).into_values().collect();
         for id in COMPRESS {
+            assert!(!served.contains(id), "`{id}` is bound on {door}");
+        }
+    }
+}
+
+/// ★ **`urn:reason:*` is the LOCAL root's, and no served door's** (2026-10-30). Bound so the
+/// runbook's OWL 2 RL pages run on this host (`tests/reason_space.rs` in ikigai-cli), and pinned
+/// like compress: the reasoner is pure and bounded, but a door that should offer reasoning to
+/// remote callers (CPU spent for a stranger, up to 100,000 closure triples a call) is a separate
+/// decision, and this test is where that decision has to be made.
+#[test]
+fn the_reason_space_is_bound_in_the_local_root_and_on_no_served_door() {
+    const REASON: [&str; 2] = ["reason-closure", "reason-inferred"];
+    let root: BTreeSet<String> = walked(&root_kernel()).into_values().collect();
+    for id in REASON {
+        assert!(root.contains(id), "`{id}` is not bound on the REPL root");
+    }
+    let every_face = ikigai_embedded::ServedSurface {
+        personal: false,
+        wire_eval: true,
+        llm: true,
+    };
+    let doors = [
+        ("the HTTP door", http_kernel()),
+        (
+            "the QUIC served kernel",
+            ikigai_embedded::served_kernel(
+                "conformance",
+                ikigai_embedded::ServedSurface::default(),
+            ),
+        ),
+        (
+            "the QUIC served kernel with every face open",
+            ikigai_embedded::served_kernel("conformance", every_face),
+        ),
+        (
+            "the calendar-only served kernel",
+            ikigai_embedded::served_kernel(
+                "conformance",
+                ikigai_embedded::ServedSurface {
+                    personal: true,
+                    ..every_face
+                },
+            ),
+        ),
+    ];
+    for (door, kernel) in doors {
+        let served: BTreeSet<String> = walked(&kernel).into_values().collect();
+        for id in REASON {
             assert!(!served.contains(id), "`{id}` is bound on {door}");
         }
     }
