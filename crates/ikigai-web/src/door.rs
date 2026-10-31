@@ -209,7 +209,11 @@ where
         match declared.trim().parse::<u64>().ok() {
             None => return Err(refuse(400, "Bad Request", "malformed Content-Length")),
             Some(n) if n > max as u64 => {
-                return Err(refuse(413, "Payload Too Large", "request body too large"))
+                return Err(refuse(
+                    413,
+                    "Payload Too Large",
+                    &format!("request body too large: this route takes at most {max} bytes"),
+                ))
             }
             Some(_) => {}
         }
@@ -239,7 +243,11 @@ where
     let body = match read {
         Err(_) => return Err(refuse(408, "Request Timeout", "request body took too long")),
         Ok(Err(e)) if e.downcast_ref::<LengthLimitError>().is_some() => {
-            return Err(refuse(413, "Payload Too Large", "request body too large"))
+            return Err(refuse(
+                413,
+                "Payload Too Large",
+                &format!("request body too large: this route takes at most {max} bytes"),
+            ))
         }
         // The client hung up part-way, or broke the framing: a PARTIAL submission, which the
         // endpoint must never be handed as if it were whole.
