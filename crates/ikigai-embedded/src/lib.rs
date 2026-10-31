@@ -4926,6 +4926,14 @@ fn root_members(nature: &'static str) -> Vec<Arc<dyn Space>> {
         // them its steps did not resolve, since the runbook links the module and the host
         // did not. Local root only, like `urn:json:*`.
         Arc::new(ikigai_compress::space()) as Arc<dyn Space>,
+        // OWL 2 RL forward chaining: `urn:reason:closure` (input plus entailments) and
+        // `urn:reason:inferred` (entailments only), pure and cacheable on their graphs'
+        // threads, so an edit to one input recomputes only the closures that read it. Bounded
+        // at 1,000 input triples and 100,000 closure triples, refused as OverBudget past either,
+        // never truncated. The runbook's OWL 2 RL pages (Selection's reasoned steps, Two
+        // vocabularies, Domain & range, Topics, The thread, Reasoner bounds) run on these; the
+        // runbook links the module only for its own tests. Local root only, like compress.
+        Arc::new(ikigai_reason::space()) as Arc<dyn Space>,
         // The ikigai vocabulary as a resolvable resource (urn:ikigai:vocab): the ns#
         // ontology Turtle (ik:Transreptor rdfs:subClassOf ik:Endpoint + property defs),
         // the same bytes served at https://ikigai-rs.dev/ns. Lists in the catalog.
