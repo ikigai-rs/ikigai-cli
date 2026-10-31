@@ -54,6 +54,7 @@ pub mod arrangement;
 // process; see the module note.
 pub mod bayes;
 mod browse;
+pub mod cache;
 pub mod clients;
 pub mod config;
 pub mod contactblock;
@@ -1792,15 +1793,18 @@ pub fn calendar_server_space(nature: &'static str) -> EndpointSpace {
         )
 }
 
+// Every host surface uses the same representation cache policy. Keep configuration here so
+// new surfaces cannot accidentally inherit a different capacity.
+fn host_kernel(root: Arc<dyn Space>) -> Kernel {
+    cache::apply(Kernel::with_meta_renderer(root, Arc::new(CliRenderer)))
+}
+
 /// The kernel a calendar-federation server runs. See [`calendar_server_space`].
 pub fn calendar_server_kernel() -> Kernel {
-    Kernel::with_meta_renderer(
-        Arc::new(calendar_server_space("Calendar (QUIC)")),
-        Arc::new(CliRenderer),
-    )
-    // Built over `base_space`, so it binds `urn:iki:fn:*` and a remote caller holding the
-    // old spelling needs the rewrite. See [`base_alias_table`].
-    .with_aliases(base_alias_table())
+    host_kernel(Arc::new(calendar_server_space("Calendar (QUIC)")))
+        // Built over `base_space`, so it binds `urn:iki:fn:*` and a remote caller holding the
+        // old spelling needs the rewrite. See [`base_alias_table`].
+        .with_aliases(base_alias_table())
 }
 
 /// The wire-eval L1 posture: `urn:lisp:eval` behind the wall-clock [`Timeout`]
@@ -2072,21 +2076,16 @@ mod codekey_tests {
 /// `urn:cap:lisp`: a trusted peer ships s-exprs that compose with this machine's
 /// calendar resources, under the clamp, the governor, and the worker ceiling.
 pub fn calendar_server_kernel_with_eval() -> Kernel {
-    Kernel::with_meta_renderer(
-        with_wire_eval(Arc::new(calendar_server_space("Calendar (QUIC)"))),
-        Arc::new(CliRenderer),
-    )
+    host_kernel(with_wire_eval(Arc::new(calendar_server_space(
+        "Calendar (QUIC)",
+    ))))
     .with_aliases(base_alias_table())
 }
 
 /// [`kernel_for`] plus the governed wire-eval binding — the default served
 /// surface for an operator whose `--cap` ceiling grants `urn:cap:lisp`.
 pub fn kernel_for_with_eval(nature: &'static str) -> Kernel {
-    Kernel::with_meta_renderer(
-        with_wire_eval(Arc::new(served_space(nature))),
-        Arc::new(CliRenderer),
-    )
-    .with_aliases(base_alias_table())
+    host_kernel(with_wire_eval(Arc::new(served_space(nature)))).with_aliases(base_alias_table())
 }
 
 /// Which optional faces a served kernel carries. Each is decided by the
@@ -2225,7 +2224,7 @@ pub fn served_kernel_hosting(
     } else {
         composed
     };
-    let kernel = Kernel::with_meta_renderer(served_root(surface, root), Arc::new(CliRenderer))
+    let kernel = host_kernel(served_root(surface, root))
         // ⚠ Same ordering caveat as `build_watched`: `with_aliases` wraps the ROOT and the
         // mounts were composed into it above, so a `--prefer urn:fn:=…` mount sits INSIDE
         // the alias and never sees a `urn:fn:` request again — the rewrite happens first.
@@ -5262,7 +5261,7 @@ pub fn kernel() -> Kernel {
 /// resolves in (`Suite::body_space`). This is how `tests/conformance.rs` hands it over.
 pub fn kernel_with_root() -> (Kernel, Arc<dyn Space>) {
     let root = root_space();
-    let kernel = Kernel::with_meta_renderer(Arc::clone(&root), Arc::new(CliRenderer))
+    let kernel = host_kernel(Arc::clone(&root))
         .with_clock(Arc::new(SystemClock))
         .with_subclass_axioms(subclass_axioms())
         .with_aliases(alias_table());
@@ -5316,7 +5315,7 @@ fn build_watched(mounts: Vec<MountSpec>, reactive: bool) -> Arc<Kernel> {
     // run is indistinguishable from a slow server. The runbook is mounted but gated by
     // `demo_flag()` (off by default).
     let sched = Arc::new(scheduler());
-    let kernel = Kernel::with_meta_renderer(root_space_with_mounts(mounts), Arc::new(CliRenderer))
+    let kernel = host_kernel(root_space_with_mounts(mounts))
         .with_clock(Arc::new(SystemClock))
         .with_subclass_axioms(subclass_axioms())
         // ⚠ Order of composition, not of calls: `with_aliases` wraps the ROOT, and
@@ -6848,7 +6847,7 @@ pub fn trusted_kernel_with_mounts(nature: &'static str, mounts: Vec<MountSpec>) 
     // discarded and the door reported the root's hard-coded `Embedded (Native)`; before PR 244
     // it served `local_space(nature)` and reported what it was passed, as this does again.
     let space = root_space_for(nature, mounts);
-    Kernel::with_meta_renderer(with_wire_eval(space), Arc::new(CliRenderer))
+    host_kernel(with_wire_eval(space))
         .with_clock(Arc::new(SystemClock))
         .with_subclass_axioms(subclass_axioms())
         // Same caveat as `build_watched`: `mounts` are inside this wrap and see the
@@ -6943,7 +6942,7 @@ fn door_kernel(
         Some(layer) => layer.over(root),
         None => root,
     };
-    let kernel = Kernel::with_meta_renderer(Arc::clone(&root), Arc::new(CliRenderer))
+    let kernel = host_kernel(Arc::clone(&root))
         // ★ A CLOCK, and it is not decoration — this door was built without one until
         // 0.1.20 and that made every time-bounded result on it UNCACHEABLE.
         //

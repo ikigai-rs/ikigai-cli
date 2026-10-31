@@ -252,6 +252,29 @@ why urn:test:volatile
   reasons     declared = the endpoint answered uncacheable; …
 ```
 
+**Representation cache capacity.** Every host kernel (the embedded host, REPL, daemon,
+MCP, and served doors) reads these optional flat keys from the config home's `config.toml`
+at startup:
+
+```toml
+cache.max_entries = 32_768
+cache.max_bytes = 536_870_912
+```
+
+Omitting a key keeps its default: **4,096 entries and 64 MiB**. The policy remains LRU;
+both bounds apply, so increase both for a large working set. Values are nonnegative whole
+numbers of entries or bytes, with optional `_` digit separators; zero sets that bound
+to zero. A malformed value, unknown `cache.*` key, or duplicate cache key stops startup
+with an error naming the config file. Restart to apply changes. `source urn:kernel:cache`
+reports the bounds actually in use; a connected client sees the server's cache.
+
+For feed sizing, the 2026-10-30 scale measurement found about **220 KB and six cache entries
+per mapped feed**. Budget room for the rest of the host's working set as well. In that
+workload the default cache began thrashing between 300 and 350 feeds: sequential river
+reads evicted entries needed next and refetched every origin. A 512 MiB byte bound moved
+the measured cliff to about 2,400 feeds, and 1 GiB to about 4,900, with a sufficiently large
+entry bound. These are workload measurements, not guaranteed capacities.
+
 In the TUI the input line is a real editor with **Emacs / readline keybindings**:
 
 | keys | action |
