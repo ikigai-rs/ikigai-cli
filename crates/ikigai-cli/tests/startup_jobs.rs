@@ -124,6 +124,8 @@ impl Host {
         }
     }
 
+    #[allow(clippy::disallowed_methods)]
+    // Native-only subprocess watchdog: this Unix binary test never runs on wasm.
     fn wait_for(&mut self, test: impl Fn(&str) -> bool) -> String {
         let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
@@ -165,6 +167,8 @@ fn declared_job_runs_after_each_restart() {
 }
 
 #[test]
+#[allow(clippy::disallowed_methods)]
+// Native-only subprocess watchdog: this Unix binary test never runs on wasm.
 fn live_creation_replacement_invalid_edit_and_removal() {
     let home = home("live");
     let mut host = Host::start(&home);
