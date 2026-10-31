@@ -162,7 +162,10 @@ usage:
                                An explicit provider= or needs= always wins
                                that set it — the DEFAULT `single` runs every fan-out serially
   ikigai --mount <p>=<t>       graft a remote namespace at prefix <p> (ALIAS: <p>rest → urn:rest
-                               on the remote, tried after local; --cert-dir after it is ITS cert set)
+                               on the remote, tried after local; --cert-dir after it is ITS cert set).
+                               A <p> deeper than one segment (urn:quakes:near:) forwards the name
+                               UNCHANGED: the peer gets urn:quakes:near:37.5:137.2, the name you
+                               used, and that mount wins over a shallower --mount for names under it
   ikigai --override <p>=<t>    the SAME namespace, served remotely: IRIs forward unchanged and win
                                over local. <p> may be a whole IRI, so a single resource can be
                                rerouted; the most specific override wins
@@ -3015,7 +3018,7 @@ fn resolve_mount(mount: Mount) -> Result<Vec<ikigai_embedded::MountSpec>, String
                 entries_failed: std::sync::Mutex::new(None),
             })
         } else {
-            connect_mount(&target, &certs, kind)?
+            connect_mount(&target, &certs, kind, alias_hello(kind, &prefixes))?
         };
     Ok(prefixes
         .into_iter()
@@ -3026,6 +3029,19 @@ fn resolve_mount(mount: Mount) -> Result<Vec<ikigai_embedded::MountSpec>, String
             kind,
         })
         .collect())
+}
+
+/// Whether a mount's connection says `HelloMode::Alias` (names arrive prefix-stripped) to
+/// its peer. Only an alias mount does, and only when at least one of its prefixes takes a
+/// whole first segment: a deeper alias prefix forwards the name unchanged (ledger #2735,
+/// [`ikigai_embedded::alias_forwards_unchanged`]), so a connection serving only deeper
+/// prefixes speaks verbatim, and a prefix-canonical peer lists the full names the mount
+/// claims. One connection carries one hello, so a list that mixes the two speaks alias.
+fn alias_hello(kind: ikigai_embedded::MountKind, prefixes: &[&str]) -> bool {
+    kind == ikigai_embedded::MountKind::Alias
+        && !prefixes
+            .iter()
+            .all(|prefix| ikigai_embedded::alias_forwards_unchanged(prefix))
 }
 
 /// [`resolve_mount`] for a mount that names ONE prefix, the tests' common case.
@@ -3084,6 +3100,7 @@ impl LazyResolver {
             &self.target,
             &self.certs,
             ikigai_embedded::MountKind::Prefer,
+            false,
         )
         .map_err(|e| ikigai_core::Error::Unavailable(format!("{}: {e}", self.target)))?;
         *self.inner.lock().unwrap() = Some(std::sync::Arc::clone(&resolver));
@@ -3208,6 +3225,7 @@ fn connect_mount(
     target: &str,
     certs: &Certs,
     kind: ikigai_embedded::MountKind,
+    alias_hello: bool,
 ) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
     // The connect error names the flag the operator actually wrote: a down
     // prefer-mount peer surfacing at first use as `--mount: connect …` sent the
@@ -3223,7 +3241,7 @@ fn connect_mount(
     if is_quic(target) {
         connect_mount_quic(target, certs, flag)
     } else {
-        connect_mount_ipc(target, kind, flag)
+        connect_mount_ipc(target, alias_hello, flag)
     }
 }
 
@@ -3481,16 +3499,17 @@ fn connect_mount_quic(
 #[cfg(all(feature = "embedded", feature = "ipc", unix))]
 fn connect_mount_ipc(
     socket: &str,
-    kind: ikigai_embedded::MountKind,
+    alias_hello: bool,
     flag: &'static str,
 ) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
     // The hello declares how this mount will address the peer, so a
     // prefix-canonical peer (ikigai-python) lists its entries in the form the
-    // mount expects — alias mounts strip and re-prefix, the others forward
-    // IRIs unchanged.
-    let mode = match kind {
-        ikigai_embedded::MountKind::Alias => ikigai_ipc::HelloMode::Alias,
-        _ => ikigai_ipc::HelloMode::Verbatim,
+    // mount expects — a first-segment alias mount strips and re-prefixes, the
+    // others forward IRIs unchanged (see [`alias_hello`]).
+    let mode = if alias_hello {
+        ikigai_ipc::HelloMode::Alias
+    } else {
+        ikigai_ipc::HelloMode::Verbatim
     };
     let mut resolver = ikigai_ipc::connect_as(std::path::Path::new(socket), mode)
         .map_err(|e| format!("{flag}: connect {socket}: {e}"))?
@@ -3506,7 +3525,7 @@ fn connect_mount_ipc(
 #[cfg(all(feature = "embedded", not(all(feature = "ipc", unix))))]
 fn connect_mount_ipc(
     _socket: &str,
-    _kind: ikigai_embedded::MountKind,
+    _alias_hello: bool,
     flag: &'static str,
 ) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
     Err(format!(
@@ -5727,6 +5746,26 @@ mod mount_posture_tests {
         args.iter().map(|s| s.to_string()).collect()
     }
 
+    /// The hello a mount's connection sends (ledger #2735): `alias` only for an alias mount
+    /// with a whole-first-segment prefix, since a deeper alias prefix forwards names
+    /// unchanged and its peer must list the full names.
+    #[test]
+    fn only_a_first_segment_alias_mount_says_alias_in_its_hello() {
+        use ikigai_embedded::MountKind::{Alias, Override, Prefer};
+        assert!(alias_hello(Alias, &["urn:quakes:"]));
+        assert!(!alias_hello(Alias, &["urn:quakes:near:"]));
+        assert!(!alias_hello(
+            Alias,
+            &["urn:quakes:near:", "urn:quakes:far:"]
+        ));
+        assert!(
+            alias_hello(Alias, &["urn:quakes:", "urn:quakes:near:"]),
+            "one connection, one hello: a mixed list keeps the first-segment form"
+        );
+        assert!(!alias_hello(Override, &["urn:quakes:"]));
+        assert!(!alias_hello(Prefer, &["urn:quakes:"]));
+    }
+
     fn mount(kind: ikigai_embedded::MountKind) -> Mount {
         Mount {
             prefix: "urn:x:".to_string(),
@@ -6715,8 +6754,12 @@ mod mount_flag_tests {
         assert!(err.contains("--prefer: connect"), "{err}");
         assert!(!err.contains("--mount:"), "{err}");
         // The eager kinds keep their own spellings.
-        let Err(err) = connect_mount(absent, &Certs::default(), ikigai_embedded::MountKind::Alias)
-        else {
+        let Err(err) = connect_mount(
+            absent,
+            &Certs::default(),
+            ikigai_embedded::MountKind::Alias,
+            true,
+        ) else {
             panic!("nothing listens at the absent socket");
         };
         assert!(err.contains("--mount: connect"), "{err}");

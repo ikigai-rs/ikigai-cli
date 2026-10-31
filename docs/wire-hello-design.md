@@ -35,10 +35,12 @@ negotiated must not be needed to negotiate it):
     client hello payload:  "IKWH" + u32 BE version + u8 mode [+ future bytes]
     server hello payload:  "IKWH" + u32 BE version           [+ future bytes]
 
-    mode: 0 = verbatim (a plain client, --connect, --override/--prefer:
-              IRIs arrive canonical, entries wanted canonical)
-          1 = alias    (an alias mount: IRIs arrive prefix-stripped,
-              entries wanted prefix-stripped)
+    mode: 0 = verbatim (a plain client, --connect, --override/--prefer, or
+              an alias mount whose every prefix is deeper than one segment,
+              `--mount urn:quakes:near:=…`, ledger #2735: IRIs arrive
+              canonical, entries wanted canonical)
+          1 = alias    (an alias mount at a whole first segment: IRIs arrive
+              prefix-stripped, entries wanted prefix-stripped)
 
 Readers parse the prefix they know and IGNORE trailing bytes — that is the
 extension mechanism, so future fields never need a new negotiation scheme.
