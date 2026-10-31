@@ -10,7 +10,7 @@ how to report a barrier. It is not a conformance claim. Adapted from the
 | Status | Evaluation in progress. No conformance claim. |
 | Owner | the maintainers of this repository |
 | Report a barrier | [a GitHub issue](https://github.com/ikigai-rs/ikigai-cli/issues/new?labels=accessibility) with the `accessibility` label; anything security-sensitive through [private vulnerability reporting](https://github.com/ikigai-rs/ikigai-cli/security/advisories/new) |
-| Last reviewed | 2026-10-15 |
+| Last reviewed | 2026-10-30 |
 
 ## What it emits that people read
 
@@ -64,6 +64,11 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
 - A set, non-empty `NO_COLOR` ([no-color.org](https://no-color.org)) removes every color from the
   full-screen REPL. Bold, dim and the reverse that marks the selected tab stay; they are emphasis,
   not color. The other faces write no color.
+- Full-screen runbook pages keep the page name above a scrollable body. `PgUp`/`PgDn`
+  scroll wrapped text, with a visible line range; `Up`/`Down` select any step and `Enter`
+  runs it. `1`–`9` and `0` remain shortcuts for steps 1–10. The selected step has a `>`
+  marker as well as reverse emphasis. Running a step reveals its answer, and the demo tab
+  strip moves to keep the selected tab visible.
 - `--plain` is a line-oriented REPL with no full-screen redraw, so a screen reader or braille
   display reads it as ordinary terminal output; `--quiet` prints only the answers. (Not yet tested
   with either; see below.)
@@ -102,6 +107,15 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
   layout and editing. `no_color_takes_every_color_escape_out_of_the_frame` writes a frame through
   the crossterm backend and finds no color escape in the bytes under `NO_COLOR`, and finds some
   without it.
+- Runbook regression tests in `tui.rs` render at 100×40 with eighteen synthetic pages
+  and twelve steps, including wrapped prose and output. They check the selected tab and
+  page heading, distinct step numbers, the line range, scrolling to the answer, and
+  selection/evaluation of every step through the same key handler the event loop uses.
+  On 2026-10-30, a Linux PTY at 100×40 also ran `ikigai --demo` with a scratch config
+  home and file root: runbook scrolling and Lisp step eleven were checked before and
+  after the fix, along with selected-tab visibility and page headings. This checkout
+  serves six Selection steps and eleven Lisp steps; it has no “The thread” page.
+  No assistive technology was used.
 - `crates/ikigai-web/tests/post_redirect_get.rs` sends raw HTTP form submissions and pins
   the route's `303` and `Location`, follows the GET and reloads it without another Sink,
   and checks the htmx answer, failed writes, page aliases, encoded captures, and refusals
@@ -139,6 +153,8 @@ Found by reading the source on 2026-10-15, not by testing:
 | 2026-10-30 | The outbound HTTP transport times out (ledger #2692). A bad `http.timeout` stops startup with exit 2 and one plain `ikigai: \`http.timeout = …\` …` line on stderr naming the key, what it must be and the config file. A request past the bound reads as the REPL's existing `error: timeout: …` line. Binary tests pin both; no color is added and no assistive technology testing was performed. |
 
 | 2026-10-31 | A refused `cap` stops a `-c` batch and blocks subsequent evaluation in both REPLs until an explicit valid narrowing or reset (ledger #2717). The plain `error:` diagnostic names how to resume; no color is added. Binary tests cover batches, stdin replay, and scripts; a TUI unit test covers command and scratch evaluation. No assistive technology testing was performed. |
+
+| 2026-10-30 | Full-screen runbook pages (ledger #2694) gain scrolling with a visible line range, an Up/Down and Enter step picker, persistent page headings, and a tab strip that keeps the selected demo visible. Tested with the ratatui backend and a Linux PTY at 100×40 on scratch data; no assistive technology testing. |
 
 ## Contributing
 

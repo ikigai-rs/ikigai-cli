@@ -174,15 +174,16 @@ struct State {
     history_pos: Option<usize>,
     /// Lines scrolled up from the bottom; `0` = pinned to the latest output.
     scroll_back: u16,
-    /// Active tab: `0` = the REPL, `1` = the Docs page (the catalog as text),
-    /// `2..=demos.len()+1` = a runbook demo page. Only non-zero when the demo is on
-    /// (tabs are shown).
+    /// Active tab: REPL and Scratch always, plus Docs, Control, and runbooks
+    /// starting at `TAB_DEMO_BASE` while the demo is on.
     tab: usize,
     /// The runbook demos, lazily loaded the first time the demo turns on (sourced
     /// as `application/json`). Empty ⇒ no tab bar; the REPL renders as before.
     demos: Vec<DemoData>,
     /// Output of the last step run on the current demo page, shown beneath it.
     demo_out: String,
+    /// Step selected by the runbook picker (Up/Down, Enter).
+    demo_step: usize,
     /// The Docs page text — the kernel's own catalog (`urn:kernel:catalog`) as
     /// Turtle, the text analog of the browser demo's rendered Catalog page. Loaded
     /// alongside the demos when the demo turns on.
@@ -329,6 +330,7 @@ fn event_loop(
                 KeyCode::Tab => {
                     state.tab = (state.tab + 1) % state.tab_count();
                     state.demo_out.clear();
+                    state.demo_step = 0;
                     state.scroll_back = 0; // each tab opens fresh
                     continue;
                 }
@@ -336,6 +338,7 @@ fn event_loop(
                     let n = state.tab_count();
                     state.tab = (state.tab + n - 1) % n;
                     state.demo_out.clear();
+                    state.demo_step = 0;
                     state.scroll_back = 0;
                     continue;
                 }
@@ -373,20 +376,14 @@ fn event_loop(
                     }
                 }
                 t if t >= TAB_DEMO_BASE => {
-                    // A demo page is a browse view: number keys run steps, no text entry.
-                    match key.code {
-                        KeyCode::Char(c @ '1'..='9') => {
-                            run_step(&mut state, engine, c as usize - '1' as usize);
-                        }
-                        // `0` runs the tenth step, so a ten-step demo (ZeroTrust) is
-                        // fully reachable from the number row.
-                        KeyCode::Char('0') => run_step(&mut state, engine, 9),
-                        KeyCode::Esc => {
-                            state.tab = TAB_REPL;
-                            state.demo_out.clear();
-                        }
-                        _ => {}
-                    }
+                    let size = terminal.size()?;
+                    demo_key(
+                        &mut state,
+                        engine,
+                        key.code,
+                        size.width,
+                        size.height.saturating_sub(6),
+                    );
                 }
                 _ => {
                     // The REPL tab: the normal line editor.
@@ -458,6 +455,81 @@ fn load_demos(state: &mut State, engine: &Session) {
         Action::Output(out) => out.result.unwrap_or_else(|e| format!("error: {e}")),
         _ => String::new(),
     };
+}
+
+/// The heading stays visible while the wrapped page body scrolls.
+fn runbook_areas(area: Rect) -> (Rect, Rect) {
+    let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
+    (parts[0], parts[1])
+}
+
+fn demo_paragraph(demo: &DemoData, out: &str, selected: usize) -> Paragraph<'static> {
+    let mut lines = demo_lines(demo, out);
+    if let Some(line) = lines.get_mut(3 + selected * 3) {
+        line.spans.insert(0, Span::raw("> "));
+        *line = line.clone().reversed();
+    }
+    Paragraph::new(lines).wrap(Wrap { trim: false })
+}
+
+fn demo_position(state: &State, width: u16, height: u16) -> (u16, usize) {
+    let Some(demo) = demo_index(state.tab).and_then(|i| state.demos.get(i)) else {
+        return (0, 0);
+    };
+    let total = demo_paragraph(demo, &state.demo_out, state.demo_step).line_count(width);
+    let max = total
+        .saturating_sub(usize::from(height))
+        .min(usize::from(u16::MAX)) as u16;
+    (state.scroll_back.min(max), total)
+}
+
+/// Browse every step, including runbooks longer than the number row.
+fn demo_key(state: &mut State, engine: &Engine, key: KeyCode, width: u16, height: u16) {
+    let Some(demo) = demo_index(state.tab).and_then(|i| state.demos.get(i)) else {
+        return;
+    };
+    state.scroll_back = demo_position(state, width, height).0;
+    let run = match key {
+        KeyCode::PageDown => {
+            state.scroll_back = state.scroll_back.saturating_add(height.max(1));
+            None
+        }
+        KeyCode::PageUp => {
+            state.scroll_back = state.scroll_back.saturating_sub(height.max(1));
+            None
+        }
+        KeyCode::Up | KeyCode::Down if !demo.steps.is_empty() => {
+            state.demo_step = if key == KeyCode::Up {
+                state.demo_step.saturating_sub(1)
+            } else {
+                (state.demo_step + 1).min(demo.steps.len() - 1)
+            };
+            // Count wrapped rows before the selected step, using the renderer's wrapping.
+            let mut lines = demo_lines(demo, "");
+            lines.truncate(3 + state.demo_step * 3);
+            state.scroll_back = Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .line_count(width)
+                .min(usize::from(u16::MAX)) as u16;
+            None
+        }
+        KeyCode::Enter => Some(state.demo_step),
+        KeyCode::Char(c @ '1'..='9') => Some(c as usize - '1' as usize),
+        KeyCode::Char('0') => Some(9),
+        KeyCode::Esc => {
+            state.tab = TAB_REPL;
+            state.demo_out.clear();
+            state.scroll_back = 0;
+            None
+        }
+        _ => None,
+    };
+    if let Some(idx) = run.filter(|&i| i < demo.steps.len()) {
+        state.demo_step = idx;
+        run_step(state, engine, idx);
+        // Reveal the answer immediately; PgUp can return to the steps.
+        state.scroll_back = u16::MAX;
+    }
 }
 
 /// Run step `idx` of the demo on the current tab, capturing its output (or error)
@@ -1317,17 +1389,27 @@ fn draw_frame(frame: &mut Frame, state: &State) {
             height: 1,
             ..chunks[0]
         };
-        let demo_titles: Vec<Line> = state
-            .demos
+        // Keep the selected tab in view by dropping leading tabs only as needed.
+        let selected = demo_index(state.tab);
+        let mut start = 0;
+        if let Some(selected) = selected {
+            let mut used = Line::from(state.demos[selected].label.as_str()).width() + 2;
+            start = selected;
+            while start > 0 {
+                let previous = Line::from(state.demos[start - 1].label.as_str()).width() + 3;
+                if used + previous > usize::from(demo_row.width) {
+                    break;
+                }
+                used += previous;
+                start -= 1;
+            }
+        }
+        let demo_titles: Vec<Line> = state.demos[start..]
             .iter()
             .map(|d| Line::from(d.label.clone()))
             .collect();
         let demo_tabs = Tabs::new(demo_titles)
-            .select(if state.tab >= TAB_DEMO_BASE {
-                state.tab - TAB_DEMO_BASE
-            } else {
-                state.demos.len() // out of range ⇒ no highlight
-            })
+            .select(selected.map(|i| i - start).unwrap_or(state.demos.len()))
             .highlight_style(Style::new().reversed())
             .divider(" ");
         frame.render_widget(demo_tabs, demo_row);
@@ -1355,8 +1437,11 @@ fn draw_frame(frame: &mut Frame, state: &State) {
         let scroll_y = state.scroll_back.min(max);
         frame.render_widget(Paragraph::new(lines).scroll((scroll_y, 0)), chunks[1]);
     } else if let Some(demo) = demo_index(state.tab).and_then(|i| state.demos.get(i)) {
-        let page = Paragraph::new(demo_lines(demo, &state.demo_out)).wrap(Wrap { trim: false });
-        frame.render_widget(page, chunks[1]);
+        let (heading, body) = runbook_areas(chunks[1]);
+        frame.render_widget(Paragraph::new(demo.label.clone().bold()), heading);
+        let page = demo_paragraph(demo, &state.demo_out, state.demo_step);
+        let (offset, _) = demo_position(state, body.width, body.height);
+        frame.render_widget(page.scroll((offset, 0)), body);
     }
 
     // Bottom row: the editable request line on the REPL tab; a keybinding hint on the
@@ -1395,10 +1480,23 @@ fn draw_frame(frame: &mut Frame, state: &State) {
         .block(Block::default().borders(Borders::ALL).title(title));
         frame.render_widget(hint, chunks[2]);
     } else {
+        let (_, body) = runbook_areas(chunks[1]);
+        let (offset, total) = demo_position(state, body.width, body.height);
+        let first = if total == 0 {
+            0
+        } else {
+            usize::from(offset) + 1
+        };
+        let last = (usize::from(offset) + usize::from(body.height)).min(total);
         let hint = Paragraph::new(
-            "1–9 run a step · Tab/⇧Tab switch · Esc back to REPL · Ctrl-C exit".dim(),
+            "Up/Down pick · Enter run · 1–9/0 run · PgUp/PgDn scroll · Tab switch · Esc back · Ctrl-C exit"
+                .dim(),
         )
-        .block(Block::default().borders(Borders::ALL).title(" runbook "));
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            " runbook · step {}/{} · lines {first}–{last}/{total} ",
+            state.demo_step + 1,
+            demo_index(state.tab).and_then(|i| state.demos.get(i)).map_or(0, |d| d.steps.len()),
+        )));
         frame.render_widget(hint, chunks[2]);
     }
 }
@@ -1550,10 +1648,9 @@ fn demo_lines(demo: &DemoData, out: &str) -> Vec<Line<'static>> {
         Line::from("steps:".bold()),
     ];
     for (i, step) in demo.steps.iter().enumerate() {
-        // The leading digit IS the key that runs the step: 1–9, then 0 for a tenth.
-        let key = if i < 9 { (b'1' + i as u8) as char } else { '0' };
+        let number = i + 1;
         lines.push(Line::from(vec![
-            format!("  {key}. ").bold(),
+            format!("  {number}. ").bold(),
             step.label.clone().bold(),
         ]));
         lines.push(Line::from(format!("     {}", step.cmd).cyan()));
@@ -1887,6 +1984,112 @@ mod tests {
             "demo tabs row1: {row1:?}"
         );
         assert!(!row0.contains("Basics"), "demo tabs NOT on row0: {row0:?}");
+    }
+
+    fn long_runbook_state() -> State {
+        let mut state = State::default();
+        for i in 0..18 {
+            state.demos.push(DemoData {
+                label: format!("Runbook {i:02}"),
+                intro: "Intro that wraps. ".repeat(20),
+                steps: (1..=12)
+                    .map(|n| StepData {
+                        label: format!("step {n}"),
+                        cmd: format!("source urn:test:{n}"),
+                        note: "A note that wraps over multiple terminal rows. ".repeat(3),
+                    })
+                    .collect(),
+            });
+        }
+        state.tab = TAB_DEMO_BASE + 17;
+        state
+    }
+
+    fn frame_text(state: &State, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| draw(f, state)).unwrap();
+        let buf = terminal.backend().buffer();
+        (0..height)
+            .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn runbook_names_its_page_and_keeps_selected_tab_visible() {
+        let state = long_runbook_state();
+        let rows = frame_text(&state, 100, 40);
+        assert!(rows[1].contains("Runbook 17"), "{}", rows[1]);
+        assert!(rows[2].contains("Runbook 17"), "{}", rows[2]);
+    }
+
+    #[test]
+    fn runbook_scroll_reaches_wrapped_output_and_reports_position() {
+        let mut state = long_runbook_state();
+        state.demo_out = "answer at the end\ncache tally: cached".into();
+        let before = frame_text(&state, 100, 40);
+        assert!(!before.join("\n").contains("cache tally: cached"));
+        state.scroll_back = u16::MAX;
+        let after = frame_text(&state, 100, 40);
+        assert!(after.join("\n").contains("cache tally: cached"));
+        assert!(after[37].contains("lines "), "{}", after[37]);
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn runbook_steps_have_distinct_numbers_after_ten() {
+        let state = long_runbook_state();
+        let lines = demo_lines(&state.demos[0], "");
+        let text = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("10. "));
+        assert!(text.contains("11. "));
+        assert!(text.contains("12. "));
+    }
+
+    #[test]
+    fn runbook_picker_runs_every_step_and_reveals_its_answer() {
+        let engine = echo_lisp_engine();
+        let mut state = long_runbook_state();
+        for (i, step) in state.demos[17].steps.iter_mut().enumerate() {
+            step.cmd = format!("source urn:lisp:eval step{}", i + 1);
+        }
+        for n in 1..=12 {
+            assert_eq!(state.demo_step, n - 1);
+            demo_key(&mut state, &engine, KeyCode::Enter, 100, 34);
+            assert!(
+                state.demo_out.contains(&format!("ok: step{n}")),
+                "{}",
+                state.demo_out
+            );
+            assert!(frame_text(&state, 100, 40)
+                .join("\n")
+                .contains(&format!("ok: step{n}")));
+            demo_key(&mut state, &engine, KeyCode::Down, 100, 34);
+        }
+        assert_eq!(state.demo_step, 11); // Down at the last step stays there.
+        demo_key(&mut state, &engine, KeyCode::Up, 100, 34);
+        assert_eq!(state.demo_step, 10);
+        assert!(frame_text(&state, 100, 40)
+            .join("\n")
+            .contains(">   11. step 11"));
+        demo_key(&mut state, &engine, KeyCode::Enter, 100, 34);
+        let bottom = demo_position(&state, 100, 34).0;
+        demo_key(&mut state, &engine, KeyCode::PageDown, 100, 34);
+        demo_key(&mut state, &engine, KeyCode::PageUp, 100, 34);
+        assert_eq!(state.scroll_back, bottom.saturating_sub(34));
+        for _ in 0..20 {
+            demo_key(&mut state, &engine, KeyCode::PageUp, 100, 34);
+        }
+        assert_eq!(state.scroll_back, 0);
+        demo_key(&mut state, &engine, KeyCode::Char('0'), 100, 34);
+        assert_eq!(state.demo_step, 9);
+        assert!(state.demo_out.contains("ok: step10"));
+        demo_key(&mut state, &engine, KeyCode::Esc, 100, 34);
+        assert_eq!(state.tab, TAB_REPL);
+        assert_eq!(state.scroll_back, 0);
     }
 
     fn state_with(input: &str, cursor: usize) -> State {
