@@ -28,6 +28,9 @@ pub(crate) fn apply(kernel: Kernel) -> Kernel {
     kernel.with_cache_policy(Arc::new(Lru::with_bound(*bound)))
 }
 
+// Not `config::entries_under_in`, on purpose: that reader skips a line with no `=` and strips
+// quotes, so `cache.max_entries` alone or `cache.max_bytes = "12"` would silently become a
+// default or a valid value. A cache bound must fail loud on those, as the tests below pin.
 fn bound_from(text: &str) -> Result<CacheBound, String> {
     let mut bound = CacheBound::default();
     let mut seen = Vec::new();
