@@ -2155,6 +2155,10 @@ fn main() {
             } else {
                 arm_local_root();
                 arm_names();
+                // The spill `urn:stream:spill` writes through (ledger #2724), as `serve --http`
+                // installs its own.
+                #[cfg(unix)]
+                ikigai_embedded::spill::arm();
                 arm_bayes(
                     !args.quiet
                         && args.commands.is_empty()
