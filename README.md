@@ -857,6 +857,52 @@ else never starts a background job just because a config file exists.
 filesystem watchers stay live, nothing is printed but their output — which is
 the shape a LaunchAgent/systemd unit wants.
 
+## Startup jobs
+
+The time transport's registry is in memory. `persistent` exempts a job from cancel-all;
+by itself it does not restore the job after a restart. To declare recurring host jobs,
+put a `jobs` file in the config home (`--config-home <dir>`, else `$XDG_CONFIG_HOME/ikigai` or `~/.config/ikigai`): one JSON object per line, with blank
+lines and whole-line `#` comments allowed. For example:
+
+```json
+{"instance":"clock-worker","target":"urn:time:now","method":"Source","every":"1s","scopes":[]}
+```
+
+Run `ikigai --daemon --name clock-worker` with that config home. Each fresh start registers
+the job again, and the first tick runs after the interval. The daemon, local REPL/`-c`, and
+local MCP host read this file; served HTTP/QUIC/IPC surfaces and `--connect` clients do not
+run it. Each entry must name the instance that runs it (`--name`, otherwise `daemon`,
+`repl`, or `mcp`). Use one running process per worker name to avoid duplicate work.
+`source urn:time:jobs` in that local host lists its registrations and run results.
+
+All five fields are required. `method` is `Source`, `Sink`, `Delete`, `Exists`, or `Meta`;
+`every` uses the same duration grammar as `urn:time:schedule` (`500ms`, `30s`, `5m`, `2h`,
+or seconds without a unit). `target` is an IRI, not a command line. To schedule a pipeline,
+bind it as a named request in the host's arrangement and target that name; a REPL can also
+use its `names` file. The target and its dependencies must be present in that host's root.
+A judge or feed refresh uses the same declaration with its target, method, and interval.
+
+**The operator chooses the job's capability in `scopes`.** Every tick runs with exactly
+those scope IRIs, clamped to the registry's ceiling, never the root capability by default.
+`[]` grants no capabilities; it suffices for the public clock above. For a protected target,
+list the scopes its action and the requests it issues require. The job does not inherit the
+REPL's, MCP session's, or another job's grants. No declaration can request the root capability.
+The file is trusted host configuration: keep it in the operator-controlled config home,
+never in a workspace an untrusted caller can write.
+
+A malformed declaration (including an unknown field, missing scopes, bad method, IRI, or
+interval) stops startup with exit 2 and an `ikigai: <path>/jobs:<line>: …` diagnostic.
+The entire file is validated, including entries for other instances, before any declared
+job is registered. An absent file declares no jobs; other read errors stop startup.
+
+An existing config directory is watched for live edits, including creating, replacing,
+or removing `jobs`. Prefer an atomic file replacement when editing. A valid changed file replaces this file's registrations and resets their
+timers; removal cancels them. An invalid edit keeps the previous registrations and reports
+its line on stderr. Cancellation stops future ticks; a request already running can finish.
+These jobs are persistent for cancel-all, and can still be canceled explicitly through the
+time transport. Restarting or changing the file registers them again. Run counts, outputs,
+and missed ticks are not restored or replayed after a restart.
+
 ## Scheduler (how wide the fan-out actually is)
 
 Every host in this workspace — REPL, `serve`, `mcp`, `--daemon` — drives one process
