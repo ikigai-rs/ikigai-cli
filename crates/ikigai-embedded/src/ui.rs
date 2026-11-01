@@ -1,6 +1,7 @@
 //! Shared UI resources, with an optional published, read-only override directory.
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 use ikigai_core::{
     Capability, Description, Endpoint, EndpointSpace, Error, Fallback, Invocation, Kernel,
@@ -38,24 +39,38 @@ pub(super) fn space() -> impl Space {
             },
         )));
     }
-    ReadOnlyUi(Fallback::new(spaces))
+    ReadOnlyUi {
+        inner: Fallback::new(spaces),
+        endpoints: Mutex::new(HashMap::new()),
+    }
 }
 
-struct ReadOnlyUi(Fallback);
+struct ReadOnlyUi {
+    inner: Fallback,
+    // Keep one adapter per endpoint so harvesting and rebuilding a declared arrangement
+    // preserve endpoint identity, just as resolving the built-in arrangement does.
+    endpoints: Mutex<HashMap<usize, Arc<dyn Endpoint>>>,
+}
 
 impl Space for ReadOnlyUi {
     fn resolve(&self, request: &Request, scope: &Scope) -> Resolution {
-        self.0
-            .resolve(request, scope)
-            .map_endpoint(|endpoint| Arc::new(ReadOnlyEndpoint(endpoint)))
+        self.inner.resolve(request, scope).map_endpoint(|endpoint| {
+            let key = Arc::as_ptr(&endpoint) as *const () as usize;
+            let mut endpoints = self.endpoints.lock().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(
+                endpoints
+                    .entry(key)
+                    .or_insert_with(|| Arc::new(ReadOnlyEndpoint(endpoint))),
+            )
+        })
     }
 
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
-        self.0.entries()
+        self.inner.entries()
     }
 
     fn topology(&self) -> ikigai_core::Topology {
-        self.0.topology()
+        self.inner.topology()
     }
 }
 
