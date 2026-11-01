@@ -167,10 +167,7 @@ fn get(port: u16, path: &str) -> (String, String) {
         .read_to_string(&mut raw)
         .expect("the response is read");
     let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
-    (
-        head.lines().next().unwrap_or_default().to_string(),
-        body.to_string(),
-    )
+    (head.to_string(), body.to_string())
 }
 
 /// The item's test: `curl /quakes` answers the composed page from the names file.
@@ -304,6 +301,12 @@ fn a_named_page_composes_the_shared_ui_shell() {
     let port = bound_port(&banner);
     let (status, page) = get(port, "/quakes");
     assert!(status.contains(" 200 "), "{status}\n{page}");
+    assert!(
+        status
+            .to_ascii_lowercase()
+            .contains("content-type: text/html"),
+        "{status}"
+    );
     for expected in [
         "<html lang=\"en\"",
         "<title>Quakes &amp; more</title>",
@@ -319,6 +322,17 @@ fn a_named_page_composes_the_shared_ui_shell() {
     for asset in ["tokens.css", "shell.js", "htmx"] {
         let (status, bytes) = get(port, &format!("/ui/{asset}"));
         assert!(status.contains(" 200 "), "{asset}: {status}\n{bytes}");
+        let kind = if asset == "tokens.css" {
+            "text/css"
+        } else {
+            "text/javascript"
+        };
+        assert!(
+            status
+                .to_ascii_lowercase()
+                .contains(&format!("content-type: {kind}")),
+            "{asset}: {status}"
+        );
         assert!(!bytes.is_empty());
         if asset == "htmx" {
             use base64::Engine;

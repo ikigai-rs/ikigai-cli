@@ -18,5 +18,10 @@ fn repl_sources_the_shared_tokens() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("--"));
+    let css = String::from_utf8_lossy(&output.stdout);
+    assert!(css.contains(":root {"), "{css}");
+    assert!(
+        !css.contains("$h{"),
+        "the palette markers were composed: {css}"
+    );
 }

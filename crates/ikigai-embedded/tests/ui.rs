@@ -19,6 +19,8 @@ fn source(kernel: &Kernel, iri: &str) -> String {
 }
 
 #[test]
+// A native filesystem watcher test: this wall clock bounds notification delivery only.
+#[allow(clippy::disallowed_methods)]
 fn the_http_surface_sources_the_shared_shell_and_watches_read_only_overrides() {
     let home = std::env::temp_dir().join(format!("iki-ui-door-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&home);

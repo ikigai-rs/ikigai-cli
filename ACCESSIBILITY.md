@@ -131,7 +131,11 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
   It checks the served htmx bytes against the shell's SRI hash. The fixture can be exported
   through ikigai-ui's test kit for its shared browser/axe checker in
   light, dark and more-contrast media. This evaluates the fixture, not arbitrary author views
-  or overrides. `crates/ikigai-embedded/tests/ui.rs` checks the override directory's read-only
+  or overrides. On 2026-11-01 the exported page passed the shared checker at ikigai-ui
+  commit `8d418991263e417d5616fd770407877b9ab207cc` on Linux, using Chromium 156.0.8078.4,
+  Playwright 1.64.0 and axe 4.13.0: 14 rules passed in each of the three media settings,
+  with zero failures and no page or console errors.
+  `crates/ikigai-embedded/tests/ui.rs` checks the override directory's read-only
   boundary, file jail and golden-thread invalidation after an editor change.
 - The other output above has had no automated accessibility checker or browser evaluation.
   No assistive technology has been used on any of this output.
