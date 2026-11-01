@@ -121,9 +121,10 @@ fn a_peers_cacheable_answer_is_uncacheable_through_the_mount_and_says_why() {
         .find(|line| line.split_whitespace().next() == Some("urn:ts:hello"))
         .unwrap_or_else(|| panic!("no `urn:ts:hello` row in urn:kernel:uncached: {seen}"));
     assert!(row.contains("×2"), "computed on both reads: {row}");
+    // Since resolve 0.2.12 (engine PR 25) the reason is the mount itself: the answer is a peer's.
     assert!(
-        row.contains("declared"),
-        "named as the mount's own answer: {row}"
+        row.contains("mounted"),
+        "named as an answer that came through the mount: {row}"
     );
 
     let _ = std::fs::remove_dir_all(&home);
