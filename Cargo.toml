@@ -2091,7 +2091,7 @@ ikigai-store = { version = "0.3.1", features = ["persistent"] }
 # `ClaimKind` `#[non_exhaustive]`. Nothing here names `ClaimKind`, matches on it, or names a ledger `count`, and
 # `store::grants_for` issues the same lists (write:{ledger} still covers about), so this host compiles and
 # behaves unchanged; `tests/ledger.rs` runs against it.
-ikigai-ledger = "0.14.0" # 0.14.0 = close timestamps, daily counts and the explicit backfill Sink (ledger PR 50, 51). Beneath it: 0.13.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.13.1"` is `<0.14.0`. Beneath it: 0.11.0.
+ikigai-ledger = "0.14.2" # 0.14.2 = the concurrency fixes (ledger #2764, #2765, #2766, #2779, #2780): one close and one reopen per item, and a delete or purge that leaves nothing behind; a BEHAVIOR floor for the binary. Beneath it: 0.14.0 = close timestamps, daily counts and the explicit backfill Sink (ledger PR 50, 51). Beneath it: 0.13.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.13.1"` is `<0.14.0`. Beneath it: 0.11.0.
 # The layer host (`urn:layer:{layer}`, `urn:layers:*`, `urn:collab:{name}`), linked by `serve
 # quic://` when the config home has a `layers/` directory (ledger #1188). 0.2.2 is a true FLOOR,
 # not a lock preference (ledger #1295): since 0.2.1 the host validates every write itself, and
@@ -2164,8 +2164,10 @@ ikigai-bayes = "0.2.0" # 0.2.0 = core 0.2.0 sweep (ledger #2356): the newest rel
 # - ikigai-engine: `plan-reader` is the `execute <spec>` half of the plan face. It is off by
 #   default so the engine still compiles to wasm32, and both hosts here (ikigai-cli and
 #   ikigai-embedded) are native and want it.
-ikigai-resolve = "0.2.11" # 0.2.11 = lockstep with the engine floor below, released with it. Beneath it: 0.2.8 = lockstep with the engine floor below, released with it. Beneath it: 0.2.6 = lockstep with the engine floor below, which asks for `^0.2.6`. Beneath it: 0.2.5 = lockstep with the engine floor below. Beneath it: 0.2.3 = released in lockstep with the engine floor below. 0.2.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.2.1"` is `<0.3.0`. Beneath it: 0.1.70.
-ikigai-intray = "0.2.1" # 0.2.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.2.1"` is `<0.3.0`. Beneath it: 0.1.70.
+ikigai-resolve = "0.2.12" # 0.2.12 = lockstep with the engine floor below, released with it. Beneath it: 0.2.11 = lockstep with the engine floor below, released with it. Beneath it: 0.2.8 = lockstep with the engine floor below, released with it. Beneath it: 0.2.6 = lockstep with the engine floor below, which asks for `^0.2.6`. Beneath it: 0.2.5 = lockstep with the engine floor below. Beneath it: 0.2.3 = released in lockstep with the engine floor below. 0.2.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.2.1"` is `<0.3.0`. Beneath it: 0.1.70.
+ikigai-intray = "0.2.12" # 0.2.12 = the intray race fixes (ledger #2786, #2812, #2813): a dead letter per failed pass, a retry that keeps a newer note, a stalled take that never delivers twice; a BEHAVIOR floor for the binary. Beneath it: 0.2.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.2.1"` is `<0.3.0`. Beneath it: 0.1.70.
+# 0.2.12 = the fixed vocabulary shapes for a fork's join bindings (engine PR 24), which `bind urn:river:all`
+# (ledger #2659, #2824) needs, a BEHAVIOR floor; also captures inside fixed references (engine PR 26). Beneath it,
 # 0.2.11 = the mapped fork, the fork as a branch and a fork that binds a name (ledger #2654), and an
 # unreached Sink or Delete refused at validation (ledger #2655); a BEHAVIOR floor, which the Book's live
 # RSS river (ledger #2659) runs through this binary. Beneath it,
@@ -2179,7 +2181,7 @@ ikigai-intray = "0.2.1" # 0.2.1 = core 0.2.0 sweep (ledger #2356): the newest re
 # arguments, instead of being sent as positional text (ledger #2502); a BEHAVIOR floor, so the binary
 # this book-taught front door ships cannot regress to the silent fallback. 0.2.1 = core 0.2.0 sweep
 # (ledger #2356); 0.1.70.
-ikigai-engine = { version = "0.2.11", features = ["plan-reader"] }
+ikigai-engine = { version = "0.2.12", features = ["plan-reader"] }
 # ── Intra-workspace siblings: LOCKSTEP pins, not floors ───────────────────────
 # The fifteen members that take `version.workspace = true` are released TOGETHER, at one
 # version, always. So every sibling pin below states the CURRENT workspace version rather

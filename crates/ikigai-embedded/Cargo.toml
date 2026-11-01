@@ -187,7 +187,7 @@ age = { workspace = true }
 # 0.12.0 (ledger #2605, of the #2559 wave): BODIES and BODY-INPUTS run by default; both kernels are handed to the suite
 # with the root they were built from (`kernel_with_root`, `kernel_for_with_root`, for
 # `Suite::body_space`); no argument is declared `reads_body`. ⚠ `^0.12.0` is also a ceiling below 0.13.0.
-ikigai-conformance = "0.12.0"
+ikigai-conformance = "0.13.0"
 # The conformance fixture SEEDS the two edge verifying keys and one signing key, so the
 # decision faces are walked over real state instead of reporting "did not resolve". Same
 # version and features as the library dependency above: the fixture must write exactly the
