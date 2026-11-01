@@ -365,6 +365,13 @@ In the REPL (or a `-c` batch), `script <iri> [name=value …]` runs a script sto
 workspace, for example `script urn:file:refresh.iki since=2026-10-01`. The command is
 `script`, not `run`: `run` is still the old name of `execute`, which runs a stored plan.
 
+## Pages without Rust
+
+The REPL and general served surface bind the shared `urn:iki:ui:*` resources: the page shell,
+tokens, shell script and pinned htmx. A named compose request can fill the shell with your
+view, and `<config home>/ui/` supplies read-only, watched overrides. See
+[the shared UI recipe](docs/shared-ui.md) for a complete names file and HTTP routes.
+
 ## Hosting layers on the QUIC door
 
 When the config home has a **`layers/` directory**, `ikigai serve quic://…` hosts

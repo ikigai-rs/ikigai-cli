@@ -141,6 +141,8 @@ dirs = "6.0"
 toml = "0.8"
 
 [dev-dependencies]
+# Export the HTTP regression fixture for the shared axe workflow.
+ikigai-ui = { workspace = true, features = ["testkit"] }
 # `block_on` for the one assertion the adapter cannot make: issuing the step's request at
 # the KERNEL, under the session's own capability, to see the TYPED `Denied` — the engine's
 # `Entry.result` is `Result<String, String>`, so the taxonomy reaches a face as prose only.

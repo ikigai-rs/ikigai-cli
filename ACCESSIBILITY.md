@@ -23,6 +23,9 @@ how to report a barrier. It is not a conformance claim. Adapted from the
   links and the passkey enrollment page (`crates/ikigai-embedded`: `decide.rs`, `contactblock.rs`,
   `passkey.rs`, all through `decide::page`), and the contact intake's redirect page
   (`crates/ikigai-intake`).
+- **Shared UI compositions**: the REPL and general served surface bind ikigai-ui artifacts
+  and its page-shell template (`urn:iki:ui:*`). Author-provided views can compose that shell;
+  the existing embedded-host pages above are unchanged. See [the recipe](docs/shared-ui.md).
 - **Terminal text**: the full-screen REPL (`tui.rs`, the default on an interactive terminal), the
   line REPL (`--plain`, or when stdin is not a terminal), `-c` batches, scripts (`ikigai
   <file>.iki`, and `script <iri>` in either REPL), `--quiet` output, usage text and error lines.
@@ -123,8 +126,15 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
   and checks the htmx answer, failed writes, page aliases, encoded captures, and refusals
   before writing when a destination cannot be addressed. These are socket tests, not
   browser or assistive technology tests.
-- No automated accessibility checker (axe or similar), no browser run and no assistive technology
-  has been used on any of this output.
+- `crates/ikigai-cli/tests/names_served.rs` serves a named page over ikigai-ui's shell and
+  checks its landmarks, skip link, live status region, escaped title and same-origin assets.
+  It checks the served htmx bytes against the shell's SRI hash. The fixture can be exported
+  through ikigai-ui's test kit for its shared browser/axe checker in
+  light, dark and more-contrast media. This evaluates the fixture, not arbitrary author views
+  or overrides. `crates/ikigai-embedded/tests/ui.rs` checks the override directory's read-only
+  boundary, file jail and golden-thread invalidation after an editor change.
+- The other output above has had no automated accessibility checker or browser evaluation.
+  No assistive technology has been used on any of this output.
 
 ## Known limitations
 
@@ -161,6 +171,8 @@ Found by reading the source on 2026-10-15, not by testing:
 | 2026-10-30 | Full-screen runbook pages (ledger #2694) gain scrolling with a visible line range, an Up/Down and Enter step picker, persistent page headings, and a tab strip that keeps the selected demo visible. Tested with the ratatui backend and a Linux PTY at 100×40 on scratch data; no assistive technology testing. |
 
 | 2026-10-31 | Full-screen runbook step notes (ledger #2734) use normal intensity because they carry page content. Ratatui test-backend regressions check note cells with and without `NO_COLOR`; color behavior is unchanged. No assistive technology testing was performed. |
+
+| 2026-11-01 | The local root and general served surface bind ikigai-ui's shared shell and artifacts (ledger #2822), with read-only config-home overrides. A named-page HTTP fixture can be exported for the shared axe checker; the existing embedded pages and REPL text are unchanged. No assistive technology testing was performed. |
 
 ## Contributing
 

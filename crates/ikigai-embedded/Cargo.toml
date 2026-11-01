@@ -83,6 +83,7 @@ ikigai-reason = { workspace = true }
 ikigai-sexpr = { workspace = true }
 # `urn:diagram:*` — the local root's arrangement as an SVG. Local root only; see `root_members`.
 ikigai-diagram = { workspace = true }
+ikigai-ui = { workspace = true }
 ikigai-sign = { workspace = true }
 # Public-key encryption (urn:encrypt:encrypt/decrypt, age/X25519) — dual of sign, embedded-only.
 ikigai-encrypt = { workspace = true }

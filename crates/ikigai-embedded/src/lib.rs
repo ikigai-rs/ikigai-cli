@@ -69,6 +69,7 @@ pub mod passkey;
 pub mod people;
 mod prg;
 mod startup_jobs;
+mod ui;
 // `urn:host:posture` — what THIS PROCESS composed at startup (mounts, trusted client
 // certificates, surface, ceiling), and the one place the startup banner's mount and client
 // lines are rendered. A module rather than another block in this file because the doors in
@@ -1655,7 +1656,14 @@ fn local_space(nature: &'static str) -> EndpointSpace {
 /// segment (the client cert's principal), so a remote peer gets an **isolated** workspace
 /// and the capability path-ACL refuses any other segment. The personal space stays OFF
 /// the wire — owner-only, no per-tenant story yet.
-fn served_space(nature: &'static str) -> EndpointSpace {
+fn served_space(nature: &'static str) -> impl Space {
+    Fallback::new(vec![
+        Arc::new(ui::space()),
+        Arc::new(served_endpoints(nature)),
+    ])
+}
+
+fn served_endpoints(nature: &'static str) -> EndpointSpace {
     base_space(nature)
         .bind(
             UriTemplate::parse(ikigai_fs::FILE_TEMPLATE).expect("FILE_TEMPLATE is valid"),
@@ -4895,6 +4903,7 @@ fn root_members(nature: &'static str) -> Vec<Arc<dyn Space>> {
     };
     let mut spaces: Vec<Arc<dyn Space>> = vec![
         Arc::new(local_space(nature)) as Arc<dyn Space>,
+        Arc::new(ui::space()) as Arc<dyn Space>,
         Arc::new(http_space()) as Arc<dyn Space>,
         Arc::new(llm_space()) as Arc<dyn Space>,
         // Video-conference scheduling (urn:meeting:schedule + urn:meeting:zoom:schedule). Reads
@@ -6612,6 +6621,7 @@ pub struct WorkspaceWatch {
     root: PathBuf,
     /// Held for the watch's lifetime: dropping it ends the platform watch.
     _watcher: notify::RecommendedWatcher,
+    _ui_watcher: Option<notify::RecommendedWatcher>,
 }
 
 impl WorkspaceWatch {
@@ -6622,6 +6632,7 @@ impl WorkspaceWatch {
         // is what becomes the `urn:file:<rel>` thread.
         let root = root.canonicalize().unwrap_or(root);
         let prefix = root.clone();
+        let ui_watcher = ui::watch(kernel.clone())?;
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             // A watcher error names no path, so there is nothing to cut; a kernel already
             // dropped has no cache left to invalidate.
@@ -6637,6 +6648,7 @@ impl WorkspaceWatch {
         Ok(Self {
             root,
             _watcher: watcher,
+            _ui_watcher: ui_watcher,
         })
     }
 
@@ -6709,6 +6721,10 @@ fn react_to_file_event(kernel: &Kernel, root: &Path, event: &notify::Event) {
 /// A read that fails cuts nothing, and says so: the staleness it leaves is what a rescan is
 /// for, so it must not be silent.
 fn cached_file_threads(kernel: &Kernel) -> Vec<String> {
+    cached_threads(kernel, "urn:file:")
+}
+
+fn cached_threads(kernel: &Kernel, prefix: &str) -> Vec<String> {
     const THREAD_NAME: &str = "https://ikigai-rs.dev/ns#threadName";
     let request = Request::new(
         Verb::Source,
@@ -6732,7 +6748,7 @@ fn cached_file_threads(kernel: &Kernel) -> Vec<String> {
             continue;
         }
         if let oxrdf::Term::Literal(name) = &quad.object {
-            if name.value().starts_with("urn:file:") {
+            if name.value().starts_with(prefix) {
                 threads.push(name.value().to_string());
             }
         }
