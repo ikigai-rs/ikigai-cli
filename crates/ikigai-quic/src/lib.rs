@@ -3507,22 +3507,28 @@ mod reconnect_tests {
             .with_arg("in", ArgRef::Inline(text.as_bytes().to_vec()))
     }
 
-    /// Serve exactly one connection on `server_cfg` at `addr`, then return — the caller
+    /// Serve exactly one connection on `server_cfg` over `socket`, then return — the caller
     /// spawns this again to simulate a server that went away and came back. With `stop`, the
     /// server goes away when it fires, closing its endpoint; without, when the client leaves.
+    ///
+    /// `socket` is a CLONE of a socket the test keeps (ledger #2897): this instance's endpoint
+    /// closes its own descriptor when it goes away, and the port stays the test's. Binding the
+    /// address afresh per instance left a window in which another socket could take the port,
+    /// and the next instance then failed with `AddrInUse` (field guide 9h).
     ///
     /// ⚠ The server must be TOLD to go away (ledger #1359). This used to wait for the
     /// connection to idle out, and since cli 0.1.56 a client pings, so a connection between
     /// two live peers never idles out: the first server would have served for ever.
     fn serve_one(
         server_cfg: quinn::ServerConfig,
-        addr: SocketAddr,
+        socket: std::net::UdpSocket,
         stop: Option<tokio::sync::oneshot::Receiver<()>>,
     ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
             let rt = Runtime::new().unwrap();
             rt.block_on(async move {
-                let endpoint = quinn::Endpoint::server(server_cfg, addr).unwrap();
+                let endpoint =
+                    endpoint_on(server_cfg, socket, quinn::EndpointConfig::default()).unwrap();
                 let session = Session {
                     capability: Capability::root(),
                     file_segment: String::new(),
@@ -3564,7 +3570,6 @@ mod reconnect_tests {
 
         // A FIXED port, so the second server instance is reachable at the same address the
         // resolver already knows — exactly the "same edge, restarted" case.
-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let cfg = || {
             server_config(
                 &server_id,
@@ -3573,17 +3578,23 @@ mod reconnect_tests {
             )
             .unwrap()
         };
-        // Bind once to claim a concrete port, then hand that port to the servers.
-        let probe = Runtime::new()
-            .unwrap()
-            .block_on(async { quinn::Endpoint::server(cfg(), addr).unwrap() });
-        let port = probe.local_addr().unwrap();
-        drop(probe);
+        // ★ Bind ONCE and keep the socket for the whole test (ledger #2897); each instance
+        // serves on a clone. The port is never released, so nothing else can take it between
+        // instances. It used to be bound by a probe and released, then bound again per
+        // instance: under load another socket took the port in one of those gaps and the
+        // next instance failed with `AddrInUse`.
+        let socket = bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = socket.local_addr().unwrap();
+        let instance = || {
+            let clone = socket.try_clone().unwrap();
+            clone.set_nonblocking(true).unwrap(); // per-descriptor on some platforms (Windows)
+            clone
+        };
 
         // First server instance. A SHORT idle timeout, explicitly: this test is about the
         // reconnect, not about sitting out the generous production default.
         let (go_away, stop) = tokio::sync::oneshot::channel();
-        let first = serve_one(cfg(), port, Some(stop));
+        let first = serve_one(cfg(), instance(), Some(stop));
         let client = connect_with(
             port,
             &client_id,
@@ -3597,11 +3608,19 @@ mod reconnect_tests {
         go_away.send(()).unwrap();
         first.join().unwrap();
 
+        // While no server runs, the port is still the test's: a stranger cannot take it, so
+        // the restart below cannot find it taken. This is the property the fix rests on.
+        assert_eq!(
+            std::net::UdpSocket::bind(port).map_err(|e| e.kind()).err(),
+            Some(io::ErrorKind::AddrInUse),
+            "the test keeps the port while the server is away"
+        );
+
         // It comes back at the same address, and the resolver — which never restarted —
-        // must recover on its own rather than fail forever.
-        let second = serve_one(cfg(), port, None);
-        // Give the new instance a moment to bind.
-        thread::sleep(std::time::Duration::from_millis(200));
+        // must recover on its own rather than fail forever. No wait for a bind: the socket is
+        // already bound, and a dial that arrives before the endpoint reads it waits in the
+        // socket's queue.
+        let second = serve_one(cfg(), instance(), None);
         assert_eq!(
             client.issue(upper("two")).unwrap().0.bytes,
             b"TWO",
