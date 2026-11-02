@@ -165,6 +165,7 @@ const INHERITED: &[(&str, &str)] = &[
     ("ui-template-tokens", "ikigai-ui"),
     ("ui-tokens-css", "ikigai-ui"),
     ("ui-palette", "ikigai-ui"),
+    ("ui-theme-chooser", "ikigai-ui"),
     ("bookmarks", "ikigai-cms"),
     ("compose", "ikigai-fn"),
     ("diagram-arrangement", "ikigai-diagram"),

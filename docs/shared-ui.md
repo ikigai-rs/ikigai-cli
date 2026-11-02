@@ -1,6 +1,6 @@
 # A page over the shared UI shell
 
-The REPL and the general served surface bind `ikigai-ui` 0.3.0. Try:
+The REPL and the general served surface bind `ikigai-ui` 0.4.0. Try:
 
 ```text
 source urn:iki:ui:tokens.css
@@ -22,7 +22,18 @@ urn:iki:ui:title:quakes:home = source urn:file:title.txt
 urn:iki:ui:header:quakes = source urn:file:header.html
 urn:iki:ui:head:quakes = source urn:file:head.html
 urn:iki:ui:main:quakes:home = source urn:file:page.html
+urn:iki:ui:chooser:quakes:auto = source urn:iki:ui:theme-chooser:auto
 ```
+
+The last line puts ikigai-ui's theme chooser in the page's header, after `header.html`. The
+shell reads `urn:iki:ui:chooser:{family}:{theme}` there, so a page composed over it must name one:
+without that line `/quakes` answers `404` naming `urn:iki:ui:chooser:quakes:auto`. Bind it to
+`urn:iki:ui:theme-chooser:{theme}` with the same theme the composition fixes, or to an empty file
+for no chooser. With the shell script a viewer's choice applies at once and is kept in that
+browser only. Without script, the chooser's Apply button asks for `/quakes?theme=…`, and this page
+refuses it with a `400` (``invalid argument `theme`: fixed by <urn:quakes:page> to auto``),
+because the composition fixes `theme`. A page built with ikigai-ui's `pages()` in Rust takes
+`theme=` from the request and has no such gap.
 
 The shell uses `$h` for the title and theme, and `$r` for trusted header, head and main markup.
 Escape untrusted values in your view before producing that markup. An XSLT view can supply the
@@ -46,7 +57,8 @@ ikigai serve --http 8080 --names /absolute/path/to/names \
 ```
 
 The page links `/ui/tokens.css`, `/ui/shell.js` and `/ui/htmx`. The shell supplies landmarks,
-a skip link, a polite status region, shared themes, focus and refusal behavior, and vendored
+a skip link, one polite status region (the only `role="status"` or `aria-live` on the page),
+the theme chooser, shared themes, focus and refusal behavior, and vendored
 htmx with its SRI hash. Keep the asset route when authoring your own route table; `--routes-only`
 serves only paths you explicitly route. The calendar-only and layer surfaces keep their own
 restricted resource sets.
