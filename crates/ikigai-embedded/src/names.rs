@@ -408,7 +408,8 @@ impl Shared {
             .collect()
     }
 
-    /// Watch the file's directory, and reload on every change to the file.
+    /// Watch the file's directory, and reload on every change to the file and on every
+    /// rescan ([`may_change`]).
     fn watch(self: &Arc<Self>) -> Option<notify::RecommendedWatcher> {
         let dir = self.path.parent()?.to_path_buf();
         let name = self.path.file_name()?.to_os_string();
@@ -417,7 +418,7 @@ impl Shared {
             let (Ok(event), Some(shared)) = (res, shared.upgrade()) else {
                 return;
             };
-            if event.paths.iter().any(|p| p.file_name() == Some(&name)) {
+            if may_change(&event, &name) {
                 futures::executor::block_on(shared.reload());
             }
         })
@@ -438,6 +439,22 @@ impl Shared {
         }
         std::fs::write(&self.path, bytes).map_err(|e| format!("{}: {e}", self.path.display()))
     }
+}
+
+/// Whether watcher `event` may report a change to the names file `name`: an event naming the
+/// file, or a RESCAN.
+///
+/// ★ A rescan says the watcher DROPPED events and names no file that changed: FSEvents
+/// reports `MustScanSubDirs` on the directory to rescan, and inotify reports `IN_Q_OVERFLOW`
+/// with no path at all; `notify` delivers both flagged [`Flag::Rescan`]. An edit of the names
+/// file made while events were dropped sends nothing else, so ignoring the rescan kept the old
+/// bindings in force until the file changed again (ledger #2870; the workspace watcher's own
+/// rescan rule is ledger #1534). A reload the file did not need costs one read of it and one cut
+/// of the atom's thread: an unchanged table is not installed again.
+///
+/// [`Flag::Rescan`]: notify::event::Flag::Rescan
+fn may_change(event: &notify::Event, name: &std::ffi::OsStr) -> bool {
+    event.need_rescan() || event.paths.iter().any(|p| p.file_name() == Some(name))
 }
 
 /// The bindings as the arrangement the dynamic space binds: an alias over no doors, each
@@ -618,5 +635,30 @@ mod tests {
         let both = config_home_file(&dir).unwrap_err();
         assert!(both.contains("both"), "{both}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A RESCAN names no file, yet may stand for an edit of the names file (ledger #2870):
+    /// the watcher dropped events, so the edit's own notification never comes, and ignoring
+    /// the rescan left the old bindings in force until the file changed again.
+    #[test]
+    fn a_rescan_may_change_the_names_file() {
+        use notify::event::{Event, EventKind, Flag, ModifyKind};
+        let dir = PathBuf::from("/config/ikigai");
+        let name = std::ffi::OsStr::new(TEXT_FILE);
+        let edit = Event::new(EventKind::Modify(ModifyKind::Any)).add_path(dir.join("names"));
+        assert!(may_change(&edit, name), "an edit of the file");
+        let other = Event::new(EventKind::Modify(ModifyKind::Any)).add_path(dir.join("config"));
+        assert!(!may_change(&other, name), "a sibling's edit");
+        // FSEvents' form: `MustScanSubDirs` names the directory to rescan.
+        let fsevents = Event::new(EventKind::Other)
+            .set_flag(Flag::Rescan)
+            .add_path(dir.clone());
+        assert!(
+            may_change(&fsevents, name),
+            "FSEvents' rescan of the directory"
+        );
+        // inotify's form: `IN_Q_OVERFLOW` names nothing at all.
+        let inotify = Event::new(EventKind::Other).set_flag(Flag::Rescan);
+        assert!(may_change(&inotify, name), "inotify's queue overflow");
     }
 }
