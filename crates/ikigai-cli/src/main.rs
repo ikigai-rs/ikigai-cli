@@ -3648,9 +3648,12 @@ fn read_stdin_unless_idle(grace: std::time::Duration) -> Option<Vec<u8>> {
     match first.recv_timeout(grace) {
         Ok(()) => done.recv().ok(),
         Err(_) => {
+            // The engine names the missing argument and how to supply it. Stdin can
+            // fill a Source's declared input as well as a Sink's `content`, so the
+            // host cannot prescribe one argument name here.
             eprintln!(
                 "ikigai: nothing arrived on stdin within {}s, so the command that asked for it \
-                 was sent without it (pipe the value in, or name it with content=…)",
+                 was sent without it",
                 grace.as_secs()
             );
             None

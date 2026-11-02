@@ -146,3 +146,34 @@ fn a_producer_inside_the_grace_still_delivers() {
         "late but whole"
     );
 }
+
+/// A Source routes stdin to its required `in` argument, not a Sink's `content`.
+#[test]
+fn an_idle_source_does_not_suggest_an_unrelated_content_argument() {
+    let home = scratch("source-idle");
+    let mut held = None;
+    let ran = run(&home, "source urn:iki:fn:toUpper", |stdin| {
+        held = Some(stdin)
+    });
+    drop(held);
+    assert!(
+        !ran.status.success(),
+        "a required input was missing: {}",
+        ran.stderr
+    );
+    assert!(
+        ran.stderr.contains("nothing arrived on stdin"),
+        "{}",
+        ran.stderr
+    );
+    assert!(
+        !ran.stderr.contains("content=…"),
+        "the Source requires in, not content: {}",
+        ran.stderr
+    );
+    assert!(
+        ran.stderr.contains("pipe a value in or pass in=…"),
+        "the engine names the missing argument in its hint: {}",
+        ran.stderr
+    );
+}
