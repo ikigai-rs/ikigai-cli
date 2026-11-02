@@ -279,6 +279,7 @@ fn a_named_page_composes_the_shared_ui_shell() {
         "urn:iki:ui:header:quakes = source urn:file:header.html\n",
         "urn:iki:ui:head:quakes = source urn:file:head.html\n",
         "urn:iki:ui:main:quakes:home = source urn:file:page.html\n",
+        "urn:iki:ui:chooser:quakes:auto = source urn:iki:ui:theme-chooser:auto\n",
     )).unwrap();
     std::fs::write(home.join("files/title.txt"), "Quakes & more").unwrap();
     std::fs::write(
@@ -313,11 +314,18 @@ fn a_named_page_composes_the_shared_ui_shell() {
         "Skip to content",
         "role=\"status\" aria-live=\"polite\"",
         "<main id=\"main\"",
+        "<label for=\"ui-theme\">Theme</label>",
+        "<option value=\"auto\" selected>Auto (system)</option>",
         "<h1>Quakes</h1>",
         "integrity=\"sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+\"",
     ] {
         assert!(page.contains(expected), "missing {expected}: {page}");
     }
+    // One announcing region per page (ikigai-ui 0.4.0, D13), and the chooser in the header.
+    assert_eq!(page.matches("role=\"status\"").count(), 1, "{page}");
+    assert_eq!(page.matches("aria-live=").count(), 1, "{page}");
+    let header = &page[page.find("<header>").unwrap()..page.find("</header>").unwrap()];
+    assert!(header.contains("id=\"ui-theme\""), "{header}");
     let mut assets = Vec::new();
     for asset in ["tokens.css", "shell.js", "htmx"] {
         let (status, bytes) = get(port, &format!("/ui/{asset}"));

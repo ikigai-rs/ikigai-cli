@@ -10,7 +10,7 @@ how to report a barrier. It is not a conformance claim. Adapted from the
 | Status | Evaluation in progress. No conformance claim. |
 | Owner | the maintainers of this repository |
 | Report a barrier | [a GitHub issue](https://github.com/ikigai-rs/ikigai-cli/issues/new?labels=accessibility) with the `accessibility` label; anything security-sensitive through [private vulnerability reporting](https://github.com/ikigai-rs/ikigai-cli/security/advisories/new) |
-| Last reviewed | 2026-10-31 |
+| Last reviewed | 2026-11-01 |
 
 ## What it emits that people read
 
@@ -138,14 +138,18 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
   before writing when a destination cannot be addressed. These are socket tests, not
   browser or assistive technology tests.
 - `crates/ikigai-cli/tests/names_served.rs` serves a named page over ikigai-ui's shell and
-  checks its landmarks, skip link, live status region, escaped title and same-origin assets.
+  checks its landmarks, skip link, escaped title and same-origin assets, that the page holds
+  exactly one live status region (one `role="status"`, one `aria-live`), and that its header
+  holds the theme chooser with a visible "Theme" label and the page's theme selected.
   It checks the served htmx bytes against the shell's SRI hash. The fixture can be exported
   through ikigai-ui's test kit for its shared browser/axe checker in
   light, dark and more-contrast media. This evaluates the fixture, not arbitrary author views
-  or overrides. On 2026-11-01 the exported page passed the shared checker at ikigai-ui
-  commit `8d418991263e417d5616fd770407877b9ab207cc` on Linux, using Chromium 156.0.8078.4,
-  Playwright 1.64.0 and axe 4.13.0: 14 rules passed in each of the three media settings,
-  with zero failures and no page or console errors.
+  or overrides. On 2026-11-01, with ikigai-ui 0.4.0, the exported page passed the shared
+  checker at ikigai-ui `v0.4.0` (its `axe/` is unchanged at commit
+  `adc0394bc6196ac417fddc06bcbd350af8c01b67`, where it was run) on macOS 27.0.1, using Node
+  26.12.0, Chromium 156.0.8078.4, Playwright 1.64.0 and axe 4.13.0: 19 rules passed in each of
+  the light, dark and more-contrast media settings, with zero failures. (At ikigai-ui 0.3.0,
+  before the chooser, 14 rules had passed.)
   `crates/ikigai-embedded/tests/ui.rs` checks the override directory's read-only
   boundary, file jail and golden-thread invalidation after an editor change.
 - The other output above has had no automated accessibility checker or browser evaluation.
@@ -156,6 +160,11 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
 Found by reading the source on 2026-10-15, not by testing:
 
 - The full-screen REPL redraws the whole terminal; use `--plain` with a screen reader.
+- On a page composed over ikigai-ui's shell from a `names` file ([the recipe](docs/shared-ui.md)),
+  the composition fixes `theme`, so the theme chooser's Apply button, which only a browser
+  without script uses, is answered with a `400` naming the fixed argument rather than the page
+  in the chosen theme. With the shell script the choice applies at once. Found by a socket test
+  on 2026-11-01.
 - Nothing above has been tried with a screen reader, magnifier or braille display.
 
 ## Change history
@@ -189,6 +198,7 @@ Found by reading the source on 2026-10-15, not by testing:
 
 | 2026-11-01 | The local root and general served surface bind ikigai-ui's shared shell and artifacts (ledger #2822), with read-only config-home overrides. A named-page HTTP fixture can be exported for the shared axe checker; the existing embedded pages and REPL text are unchanged. No assistive technology testing was performed. |
 | 2026-11-01 | Percent-decoding moves onto `ikigai_fn::html` (ledger #1878). The door's `400` for a malformed or non-UTF-8 request target now names the byte offset (it said only `malformed percent-escape` or `not UTF-8 once decoded`). The intake and the embedded host's form pages now refuse such a form body with a `400` naming the offset, where they kept a malformed escape literally and replaced invalid UTF-8 with U+FFFD. An intake configured with a redirect that is not a link target is refused at load (`try_submit`) with a sentence naming the intake and the redirect, where it was silently ignored. Unit tests pin each sentence; no assistive technology testing was performed. |
+| 2026-11-01 | The served shell moves to ikigai-ui 0.4.0 (ledger #2854). Every page over it holds one announcing status region (`role="status"`, `aria-live="polite"`; ikigai-ui's notes are tied by `aria-describedby` and carry no role), and a theme chooser in its `<header>` after the page's own header: a GET form with a visible "Theme" label, a native select of Auto (system), Light, Dark and High contrast in words, and an Apply button the shell script hides. A `names`-file page must now name its chooser (`urn:iki:ui:chooser:{family}:{theme}`); the recipe says how. The socket test pins the one region and the chooser; the shared axe checker passed 19 rules in light, dark and more-contrast media. No assistive technology testing was performed. |
 
 ## Contributing
 
