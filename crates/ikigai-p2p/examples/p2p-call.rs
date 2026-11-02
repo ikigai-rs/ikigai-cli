@@ -2,7 +2,7 @@
 //! `docs/design/p2p-mobility-design.md`.
 //!
 //! ```text
-//! p2p-call --key bug-p2p.key \
+//! p2p-call --key bug [--keystore <dir>] \
 //!          --relay /ip4/<edge public IP>/udp/4001/quic-v1/p2p/<relay PeerId> \
 //!          --peer <plasma PeerId> \
 //!          [--calls 12] [--interval-secs 10] [--iri urn:demo:cal]
@@ -15,16 +15,17 @@
 use std::time::{Duration, Instant};
 
 use ikigai_core::{Iri, Request, Verb};
-use ikigai_p2p::{
-    circuit_addr, load_or_generate_keypair, spawn_peer, Multiaddr, Path, PeerConfig, PeerId, Report,
-};
+use ikigai_p2p::{circuit_addr, spawn_peer, Multiaddr, Path, PeerConfig, PeerId, Report};
 use ikigai_wire::{Call, Reply};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+#[path = "support/keystore.rs"]
+mod keystore;
+
 fn main() -> Result<(), BoxError> {
     let flags = Flags::parse()?;
-    let keypair = load_or_generate_keypair(std::path::Path::new(&flags.one("key")?))?;
+    let keypair = keystore::keypair(&flags.one("key")?, flags.all("keystore").pop())?;
     let me = keypair.public().to_peer_id();
     // Printed before anything else can fail: this id goes in the relay's `--allow` and the
     // served host's clients.json, so a first run with only `--key` is how an operator learns it.

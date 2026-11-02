@@ -4,8 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{AsyncReadExt, AsyncWriteExt, StreamExt};
-use ikigai_core::Kernel;
+use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request, Verb};
 use ikigai_quic::Session;
+use ikigai_resolve::Resolver;
 use ikigai_wire::{decode, encode, Call, Reply, WireError};
 use libp2p::identity::Keypair;
 use libp2p::multiaddr::Protocol;
@@ -675,44 +676,71 @@ fn denied(why: &str) -> Reply {
     Reply::ErrorTyped(WireError::Denied(why.to_string()))
 }
 
-/// Read a libp2p keypair from `path` (protobuf encoding), or generate an Ed25519 one and
-/// write it there, owner-readable only. The PeerId — the thing an operator enrols — is a
-/// function of this key, so a lost key file is a changed identity.
-pub fn load_or_generate_keypair(path: &std::path::Path) -> io::Result<Keypair> {
-    match std::fs::read(path) {
-        Ok(bytes) => Keypair::from_protobuf_encoding(&bytes).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{}: {e}", path.display()),
-            )
-        }),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+/// The node's libp2p identity, held as a SECRET: read `secret` through `resolver` under
+/// `capability`, or, when that resource answers [`NotFound`](ikigai_core::Error::NotFound),
+/// generate an Ed25519 keypair and Sink its protobuf encoding there (as `content`). The PeerId,
+/// the thing an operator enrolls, is a function of this key, so a lost secret is a changed
+/// identity.
+///
+/// `secret` is normally `urn:secret:{name}` from `ikigai-secret`, so the host decides where the
+/// key lives (the Keychain, the file keystore, a remote kernel) and this crate reaches no disk
+/// of its own (Hypothesis H, ledger #2419): `capability` needs that name's read scope, and its
+/// write scope for the first run, which stores the key. Before this the function read and wrote
+/// a key FILE at a path; the bytes stored are the same protobuf encoding, so an existing key
+/// file stored as the secret's value is the same identity.
+///
+/// Only the resource's own `NotFound` mints a key. A denial, an unbound IRI or any other failure
+/// is returned as an error, never answered with a new identity; bytes that do not decode are
+/// [`InvalidData`](io::ErrorKind::InvalidData). ⚠ Two first runs racing on one name would each
+/// store a key and the later Sink replaces the earlier (the file version refused the second with
+/// `create_new`): one node per name.
+///
+/// Blocking (it calls [`Resolver::issue_as`]): call it before entering an async context, as the
+/// trial binaries do.
+pub fn load_or_generate_keypair(
+    resolver: &dyn Resolver,
+    capability: &Capability,
+    secret: &Iri,
+) -> io::Result<Keypair> {
+    let read = Request::new(Verb::Source, secret.clone());
+    match resolver.issue_as(read, capability) {
+        Ok((representation, _)) => {
+            Keypair::from_protobuf_encoding(&representation.bytes).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{}: not a libp2p keypair: {e}", secret.as_str()),
+                )
+            })
+        }
+        Err(ikigai_core::Error::NotFound(_)) => {
             let keypair = Keypair::generate_ed25519();
             let bytes = keypair
                 .to_protobuf_encoding()
                 .map_err(|e| io::Error::other(e.to_string()))?;
-            write_private(path, &bytes)?;
+            let store =
+                Request::new(Verb::Sink, secret.clone()).with_arg("content", ArgRef::Inline(bytes));
+            resolver
+                .issue_as(store, capability)
+                .map_err(|e| secret_error(secret, "store", &e))?;
             Ok(keypair)
         }
-        Err(e) => Err(e),
+        Err(e) => Err(secret_error(secret, "read", &e)),
     }
 }
 
-#[cfg(unix)]
-fn write_private(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(bytes)
-}
-
-#[cfg(not(unix))]
-fn write_private(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
-    std::fs::write(path, bytes)
+/// A failed request for the keypair's secret, as an [`io::Error`] that names the IRI.
+fn secret_error(secret: &Iri, what: &str, error: &ikigai_core::Error) -> io::Error {
+    let kind = match error {
+        ikigai_core::Error::Denied(_) => io::ErrorKind::PermissionDenied,
+        _ => io::ErrorKind::Other,
+    };
+    io::Error::new(
+        kind,
+        format!(
+            "could not {what} the keypair secret {}: {error}",
+            secret.as_str()
+        ),
+    )
 }
 
 #[cfg(test)]
@@ -780,21 +808,90 @@ mod tests {
         );
     }
 
+    /// A file keystore in a fresh private directory, its `urn:secret:*` space in a kernel,
+    /// and the directory (removed by the caller).
+    fn keystore(test: &str) -> (Arc<ikigai_secret::FileBackend>, Kernel, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ikigai-p2p-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let backend = Arc::new(ikigai_secret::FileBackend::new(&dir));
+        let kernel = Kernel::new(Arc::new(ikigai_secret::space(backend.clone())));
+        (backend, kernel, dir)
+    }
+
+    fn node_secret() -> Iri {
+        Iri::parse("urn:secret:p2p-node").unwrap()
+    }
+
+    fn read_write() -> Capability {
+        Capability::scoped([
+            "urn:cap:secret:read:p2p-node",
+            "urn:cap:secret:write:p2p-node",
+        ])
+    }
+
     #[test]
-    fn a_keypair_file_is_the_identity_and_survives_a_reload() {
-        let dir = std::env::temp_dir().join(format!("ikigai-p2p-key-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("p2p.key");
-        let _ = std::fs::remove_file(&path);
-        let first = load_or_generate_keypair(&path)
+    fn a_keypair_secret_is_the_identity_and_survives_a_reload() {
+        use ikigai_secret::Backend;
+        let (backend, kernel, dir) = keystore("reload");
+        let first = load_or_generate_keypair(&kernel, &read_write(), &node_secret()).unwrap();
+        // What the first run stored is the keypair's protobuf encoding, the bytes the key FILE
+        // held before ledger #2419, so the resource answers what the file did.
+        let stored = backend
+            .get("p2p-node")
             .unwrap()
-            .public()
-            .to_peer_id();
-        let again = load_or_generate_keypair(&path)
-            .unwrap()
-            .public()
-            .to_peer_id();
-        assert_eq!(first, again, "a reload must not mint a new PeerId");
+            .expect("the first run stores the key");
+        assert_eq!(stored, first.to_protobuf_encoding().unwrap());
+        let again = load_or_generate_keypair(&kernel, &read_write(), &node_secret()).unwrap();
+        assert_eq!(
+            first.public().to_peer_id(),
+            again.public().to_peer_id(),
+            "a reload must not mint a new PeerId"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_key_file_stored_as_the_secret_is_the_same_identity() {
+        use ikigai_secret::Backend;
+        let (backend, kernel, dir) = keystore("import");
+        let old = Keypair::generate_ed25519();
+        backend
+            .set("p2p-node", &old.to_protobuf_encoding().unwrap())
+            .unwrap();
+        let read_only = Capability::scoped(["urn:cap:secret:read:p2p-node"]);
+        let loaded = load_or_generate_keypair(&kernel, &read_only, &node_secret()).unwrap();
+        assert_eq!(loaded.public().to_peer_id(), old.public().to_peer_id());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn only_the_secrets_own_absence_mints_a_key() {
+        use ikigai_secret::Backend;
+        let (backend, kernel, dir) = keystore("refuse");
+        // Absent, and no write grant: the new key cannot be stored, so none is returned.
+        let read_only = Capability::scoped(["urn:cap:secret:read:p2p-node"]);
+        let err = load_or_generate_keypair(&kernel, &read_only, &node_secret()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        assert_eq!(backend.get("p2p-node").unwrap(), None, "nothing is stored");
+        // Present, but no read grant: a denial, never a new identity over the old one.
+        backend.set("p2p-node", b"kept").unwrap();
+        let write_only = Capability::scoped(["urn:cap:secret:write:p2p-node"]);
+        let err = load_or_generate_keypair(&kernel, &write_only, &node_secret()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        assert_eq!(
+            backend.get("p2p-node").unwrap().as_deref(),
+            Some(&b"kept"[..])
+        );
+        // Present and readable but not a keypair: refused as data, and left alone.
+        let err = load_or_generate_keypair(&kernel, &read_write(), &node_secret()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert_eq!(
+            backend.get("p2p-node").unwrap().as_deref(),
+            Some(&b"kept"[..])
+        );
+        // An IRI nothing serves: unresolved, not absent, so no key is minted either.
+        let unbound = Iri::parse("urn:nothing:p2p-node").unwrap();
+        assert!(load_or_generate_keypair(&kernel, &Capability::root(), &unbound).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -3557,6 +3557,8 @@ dependencies = [
  "ikigai-core",
  "ikigai-embedded",
  "ikigai-quic",
+ "ikigai-resolve",
+ "ikigai-secret",
  "ikigai-wire",
  "libp2p",
  "tokio",

@@ -117,8 +117,13 @@ pub fn serve_shared(kernel: Arc<Kernel>, path: &Path) -> io::Result<()> {
 pub fn bind(path: &Path) -> io::Result<UnixListener> {
     let _held = bind_lock(path)?;
     clear_stale(path)?;
+    // ambient: net: binds the socket path a host's door was given (`ikigai serve <path>` or its default, gonk's socket door), never a request name
+    #[allow(clippy::disallowed_methods)]
     let listener = UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    // ambient: fs: sets the mode of the socket this call just bound, at that same path, to 0600; no other path
+    #[allow(clippy::disallowed_methods)]
+    let restricted = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    restricted?;
     Ok(listener)
 }
 
@@ -150,6 +155,8 @@ pub fn bind_shared(path: &Path, gid: u32) -> io::Result<UnixListener> {
         Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
         _ => PathBuf::from("."),
     };
+    // ambient: fs: reads the owner and mode of the parent directory of the socket path a shared door was given (`ikigai serve` when its principals table admits other accounts), to refuse an unsafe one
+    #[allow(clippy::disallowed_methods)]
     let meta = std::fs::metadata(&dir).map_err(|e| {
         io::Error::new(
             e.kind(),
@@ -168,9 +175,14 @@ pub fn bind_shared(path: &Path, gid: u32) -> io::Result<UnixListener> {
     }
     let _held = bind_lock(path)?;
     clear_stale(path)?;
+    // ambient: net: binds the shared door's socket path (`ikigai serve` when its principals table admits other accounts), never a request name
+    #[allow(clippy::disallowed_methods)]
     let listener = UnixListener::bind(path)?;
     std::os::unix::fs::chown(path, None, Some(gid))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
+    // ambient: fs: sets the mode of the socket this call just bound, at that same path, to 0660; no other path
+    #[allow(clippy::disallowed_methods)]
+    let restricted = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660));
+    restricted?;
     Ok(listener)
 }
 
@@ -268,6 +280,8 @@ fn bind_lock(path: &Path) -> io::Result<std::fs::File> {
     let mut name = path.as_os_str().to_owned();
     name.push(".lock");
     let lock_path = PathBuf::from(name);
+    // ambient: fs: opens (creating 0600) only `<socket>.lock` beside the socket path a host's door was given, to order binders of that one path
+    #[allow(clippy::disallowed_methods)]
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -295,7 +309,10 @@ fn bind_lock(path: &Path) -> io::Result<std::fs::File> {
 /// an error. Called under [`bind_lock`].
 fn clear_stale(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::FileTypeExt;
-    let kind = match std::fs::symlink_metadata(path) {
+    // ambient: fs: asks what is at the socket path a host's door was given (a socket, a link or something else), before it may be replaced
+    #[allow(clippy::disallowed_methods)]
+    let found = std::fs::symlink_metadata(path);
+    let kind = match found {
         Ok(meta) => meta.file_type(),
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
@@ -309,7 +326,10 @@ fn clear_stale(path: &Path) -> io::Result<()> {
             ),
         ));
     }
-    match UnixStream::connect(path) {
+    // ambient: net: dials that same socket path to learn whether a live server still answers there; nothing is sent
+    #[allow(clippy::disallowed_methods)]
+    let probed = UnixStream::connect(path);
+    match probed {
         Ok(probe) => {
             let who = peer_pid(&probe).map_or_else(
                 || "a process whose id could not be read".to_string(),
@@ -335,7 +355,10 @@ fn clear_stale(path: &Path) -> io::Result<()> {
                 io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
             ) =>
         {
-            match std::fs::remove_file(path) {
+            // ambient: fs: removes only that socket path, and only a socket or link nobody answers on (checked just above, under the bind lock)
+            #[allow(clippy::disallowed_methods)]
+            let removed = std::fs::remove_file(path);
+            match removed {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
                 Err(e) => Err(io::Error::new(
@@ -951,6 +974,8 @@ fn hello_at(
 }
 
 fn dial(path: &Path, timeout: Option<Duration>) -> io::Result<UnixStream> {
+    // ambient: net: dials the kernel server's socket path a client host named (`ikigai --connect`/`--mount`, gonk and ikigai-web mounts), the transport's one job
+    #[allow(clippy::disallowed_methods)]
     let stream = UnixStream::connect(path)?;
     stream.set_read_timeout(timeout)?;
     stream.set_write_timeout(timeout)?;
@@ -1945,8 +1970,14 @@ pub fn default_socket_path() -> Option<PathBuf> {
             tmp.join(format!("ikigai-{}", own_uid()))
         });
     let dir = base.join("ikigai");
-    std::fs::create_dir_all(&dir).ok()?;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok()?;
+    // ambient: fs: creates only `<runtime-dir>/ikigai`, the per-user socket directory, for `ikigai serve`/`ikigai --connect` when no socket path is given
+    #[allow(clippy::disallowed_methods)]
+    let made = std::fs::create_dir_all(&dir);
+    made.ok()?;
+    // ambient: fs: sets that same per-user socket directory to 0700, so only this user can reach the socket
+    #[allow(clippy::disallowed_methods)]
+    let restricted = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    restricted.ok()?;
     Some(dir.join("kernel.sock"))
 }
 
