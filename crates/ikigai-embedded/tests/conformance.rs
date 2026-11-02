@@ -96,6 +96,7 @@ use ikigai_core::{Kernel, Space, Verb};
 /// nothing else would say so.
 const OWN: &[(&str, &str)] = &[
     // ikigai-embedded's own endpoints.
+    ("ui-directory", "ikigai-embedded"),
     ("about", "ikigai-embedded"),
     ("agent-select", "ikigai-embedded"),
     ("alias-demo", "ikigai-embedded"),
@@ -158,6 +159,12 @@ const OWN: &[(&str, &str)] = &[
 /// have; those releases are simply not on crates.io yet). Listed rather than matched by
 /// prefix so that a module quietly gaining an endpoint is visible in a diff.
 const INHERITED: &[(&str, &str)] = &[
+    ("ui-htmx", "ikigai-ui"),
+    ("ui-shell-js", "ikigai-ui"),
+    ("ui-template-shell", "ikigai-ui"),
+    ("ui-template-tokens", "ikigai-ui"),
+    ("ui-tokens-css", "ikigai-ui"),
+    ("ui-palette", "ikigai-ui"),
     ("bookmarks", "ikigai-cms"),
     ("compose", "ikigai-fn"),
     ("diagram-arrangement", "ikigai-diagram"),
@@ -314,7 +321,9 @@ fn fixture_home() -> &'static Path {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("config/ikigai")).expect("config home");
+        std::fs::create_dir_all(dir.join("config/ikigai/ui"))
+            .expect("config home and UI overrides");
+        std::fs::write(dir.join("config/ikigai/ui/fixture.txt"), "UI fixture").unwrap();
         std::fs::create_dir_all(dir.join("workspace")).expect("workspace");
         std::fs::create_dir_all(dir.join("org")).expect("org dir");
         std::fs::write(
@@ -491,6 +500,7 @@ const PLAN: &str = "\
 /// The opt-outs that remain below are for endpoints this workspace OWNS.
 fn base() -> Suite {
     Suite::new()
+        .fixture(Fixture::new("ui-directory", Verb::Source).binding("path", "fixture.txt"))
         // FAILURES (conformance 0.10.0, ledger #1546): declared failure classes = produced. Opted
         // into here because this walk asserts that NO check is skipped, and the default from
         // 0.11.0 anyway. An action that declares nothing is listed, never a finding.

@@ -1579,6 +1579,8 @@ ikigai-sexpr = "0.3.1" # 0.3.1 = the `(name …)` arrangement form for a named r
 # of=<iri>`, both `image/svg+xml`. Bound in the LOCAL root only (`root_members`), never in a
 # served posture. 0.1.0 is the first release and the one API called (`space()`); its core
 # floor is 0.1.83, beneath this workspace's 0.1.84, so the host still links one `ikigai-core`.
+# Shared read-only UI artifacts and the compose shell, in local and served hosts.
+ikigai-ui = "0.3.0"
 ikigai-diagram = "0.3.0" # 0.3.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.0"` is `<0.4.0`. Beneath it: 0.2.0 = names its `space()` `urn:iki:space:diagram` (ledger #987), so `answered_by`,
 # `urn:kernel:topology` and `urn:diagram:*` show that name where this host mounts it plain, and
 # the cache partitions under it. Under 0.x the old caret was a CEILING below the named release.

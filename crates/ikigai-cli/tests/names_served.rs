@@ -167,10 +167,7 @@ fn get(port: u16, path: &str) -> (String, String) {
         .read_to_string(&mut raw)
         .expect("the response is read");
     let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
-    (
-        head.lines().next().unwrap_or_default().to_string(),
-        body.to_string(),
-    )
+    (head.to_string(), body.to_string())
 }
 
 /// The item's test: `curl /quakes` answers the composed page from the names file.
@@ -270,4 +267,99 @@ fn another_door_refuses_the_option() {
         stderr.contains("--names") && stderr.contains("is not the HTTP door"),
         "{stderr}"
     );
+}
+
+/// A reader supplies only named content; the shared shell supplies the landmarks and assets.
+#[test]
+fn a_named_page_composes_the_shared_ui_shell() {
+    let home = scratch("ui-shell");
+    std::fs::write(config(&home).join("names"), concat!(
+        "urn:quakes:page = source urn:iki:fn:compose src=<urn:iki:ui:template:shell> family=quakes name=home theme=auto\n",
+        "urn:iki:ui:title:quakes:home = source urn:file:title.txt\n",
+        "urn:iki:ui:header:quakes = source urn:file:header.html\n",
+        "urn:iki:ui:head:quakes = source urn:file:head.html\n",
+        "urn:iki:ui:main:quakes:home = source urn:file:page.html\n",
+    )).unwrap();
+    std::fs::write(home.join("files/title.txt"), "Quakes & more").unwrap();
+    std::fs::write(
+        home.join("files/header.html"),
+        "<nav aria-label=\"Site\"><a href=\"/quakes\">Quakes</a></nav>",
+    )
+    .unwrap();
+    std::fs::write(home.join("files/head.html"), "").unwrap();
+    std::fs::write(
+        home.join("files/page.html"),
+        "<h1>Quakes</h1><p>North: 4.5</p>",
+    )
+    .unwrap();
+    let routes = serde_json::json!({"routes": [
+        {"match": "/quakes", "target": "urn:quakes:page"},
+        {"match": "/ui/{name}", "target": "urn:iki:ui:{name}"}
+    ]});
+    std::fs::write(home.join("files/routes.json"), routes.to_string()).unwrap();
+    let (_door, banner) = start(&home, &["--names", "config/ikigai/names", "--routes-only"]);
+    let port = bound_port(&banner);
+    let (status, page) = get(port, "/quakes");
+    assert!(status.contains(" 200 "), "{status}\n{page}");
+    assert!(
+        status
+            .to_ascii_lowercase()
+            .contains("content-type: text/html"),
+        "{status}"
+    );
+    for expected in [
+        "<html lang=\"en\"",
+        "<title>Quakes &amp; more</title>",
+        "Skip to content",
+        "role=\"status\" aria-live=\"polite\"",
+        "<main id=\"main\"",
+        "<h1>Quakes</h1>",
+        "integrity=\"sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+\"",
+    ] {
+        assert!(page.contains(expected), "missing {expected}: {page}");
+    }
+    let mut assets = Vec::new();
+    for asset in ["tokens.css", "shell.js", "htmx"] {
+        let (status, bytes) = get(port, &format!("/ui/{asset}"));
+        assert!(status.contains(" 200 "), "{asset}: {status}\n{bytes}");
+        let kind = if asset == "tokens.css" {
+            "text/css"
+        } else {
+            "text/javascript"
+        };
+        assert!(
+            status
+                .to_ascii_lowercase()
+                .contains(&format!("content-type: {kind}")),
+            "{asset}: {status}"
+        );
+        assert!(!bytes.is_empty());
+        if asset == "htmx" {
+            use base64::Engine;
+            use sha2::Digest;
+            let sri = format!(
+                "sha384-{}",
+                base64::engine::general_purpose::STANDARD
+                    .encode(sha2::Sha384::digest(bytes.as_bytes()))
+            );
+            assert_eq!(
+                sri,
+                ikigai_ui::HTMX_INTEGRITY,
+                "the served bytes match the shell's SRI"
+            );
+        }
+        assets.push((format!("ui/{asset}"), bytes));
+    }
+    if let Some(dir) = std::env::var_os("IKIGAI_UI_AXE_SITE") {
+        let mut files = vec![("quakes.html", "text/html", page.as_bytes())];
+        for (path, bytes) in &assets {
+            let kind = if path.ends_with(".css") {
+                "text/css"
+            } else {
+                "text/javascript"
+            };
+            files.push((path.as_str(), kind, bytes.as_bytes()));
+        }
+        ikigai_ui::testkit::site::write(std::path::Path::new(&dir), &files).unwrap();
+    }
 }
