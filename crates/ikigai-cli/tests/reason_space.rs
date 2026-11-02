@@ -114,6 +114,12 @@ fn an_edit_through_the_kernel_is_followed_by_the_next_closure() {
 /// later runs here too. Returns stdout, stderr (each step's tally and any error, in order) and
 /// whether the batch succeeded.
 fn run_page(home: &Path, page: &str) -> (String, String, bool) {
+    let steps = page_steps(home, page);
+    run_steps(home, page, &steps)
+}
+
+/// The commands of one runbook page, in order, read from the page's own JSON face.
+fn page_steps(home: &Path, page: &str) -> Vec<String> {
     let json = run(
         home,
         &[
@@ -128,17 +134,25 @@ fn run_page(home: &Path, page: &str) -> (String, String, bool) {
     let json: serde_json::Value = serde_json::from_str(stdout.trim()).expect("the page's JSON");
     let steps = json["steps"].as_array().expect("the page lists steps");
     assert!(!steps.is_empty(), "the {page} page lists no steps");
-    let mut args = vec!["--quiet".to_string(), "--demo".to_string()];
-    for step in steps {
-        args.push("-c".to_string());
-        args.push(
+    steps
+        .iter()
+        .map(|step| {
             step["cmd"]
                 .as_str()
                 .expect("a step has a command")
-                .to_string(),
-        );
+                .to_string()
+        })
+        .collect()
+}
+
+/// `steps` of `page`, in order, in ONE process (`-c` per step). Returns stdout, stderr and
+/// whether the batch succeeded, as [`run_page`] does.
+fn run_steps(home: &Path, page: &str, steps: &[String]) -> (String, String, bool) {
+    let mut args = vec!["--quiet", "--demo"];
+    for step in steps {
+        args.push("-c");
+        args.push(step);
     }
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let out = run(home, &args);
     let (stdout, stderr) = text(&out);
     assert!(
@@ -166,10 +180,30 @@ fn every_step_of_the_answering_owl_pages_answers() {
 
 /// The Thread page's point, as the page runs: reasoning over each of two graphs again is all
 /// cached, and after an edit to ONE of them only that one recomputes.
+///
+/// ★ The first step (writing the file) runs in its OWN process, before the rest, as a reader
+/// at the TUI runs it: one keypress per step, seconds apart (ledger #2745). The host's
+/// workspace watcher also reports the kernel's OWN write, a few milliseconds later and on its
+/// own thread, and cuts the file's thread again. A batch runs step 3 in less time than that,
+/// so under load the late cut landed after step 3 had cached the file's closure, and step 4
+/// recomputed it: `[2 cached · 1 computed]` where `[3 cached]` was expected (6 runs in 200
+/// under file churn on macOS; CI saw it on Linux and macOS). The second process's watcher
+/// starts after the write, so inotify cannot report it; FSEvents could only if its backlog
+/// outlasted the second process's startup. The edit in step 5 stays in the same process
+/// as the reads around it, which is the page's point; its own late report can only cut the
+/// closure step 6 recomputes anyway.
 #[test]
 fn the_thread_page_recomputes_only_what_the_edit_cut() {
     let home = scratch("thread-page");
-    let (stdout, stderr, ok) = run_page(&home, "thread");
+    let steps = page_steps(&home, "thread");
+    let (write, reads) = steps.split_first().expect("the Thread page lists steps");
+    assert!(
+        write.contains("sink urn:file:"),
+        "the Thread page's first step is no longer the file write this test runs on its own: {write}"
+    );
+    let (stdout, stderr, ok) = run_steps(&home, "thread", std::slice::from_ref(write));
+    assert!(ok, "the write: stdout: {stdout}\nstderr: {stderr}");
+    let (stdout, stderr, ok) = run_steps(&home, "thread", reads);
     assert!(ok, "stdout: {stdout}\nstderr: {stderr}");
     let again = stderr
         .find("[3 cached]")
