@@ -1113,6 +1113,8 @@ pub async fn serve_with(
     addr: SocketAddr,
     config: EdgeConfig,
 ) -> std::io::Result<()> {
+    // ambient: net: binds the HTTP listen address a host passed (ikigai-name's server; most hosts bind first and call serve_with_listener), the transport's one job
+    #[allow(clippy::disallowed_methods)]
     let listener = TcpListener::bind(addr).await?;
     serve_with_listener(kernel, cap_fn, listener, config).await
 }

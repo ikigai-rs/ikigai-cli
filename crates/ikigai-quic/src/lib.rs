@@ -443,6 +443,8 @@ pub fn serve_bounded(
 /// either family reaches it (the `.local`-resolves-to-both-families-and-picks-IPv6 timeout).
 /// A specific address is bound as given, single-family.
 pub fn bind(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
+    // ambient: net: opens and binds the UDP socket for the address a host's QUIC door was given (`ikigai serve quic://…`, gonk's QUIC door), the transport's one job
+    #[allow(clippy::disallowed_methods)]
     let udp = if addr.ip().is_unspecified() {
         use socket2::{Domain, Protocol, Socket, Type};
         let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
@@ -631,6 +633,8 @@ fn serve_config_on(
 /// The server endpoint over a bound socket, under `endpoint_config` (see
 /// [`endpoint_config`]): what `quinn::Endpoint::server` would build is a RANDOM
 /// stateless-reset key per process. Must run inside the Tokio runtime that drives it.
+// ambient: net: wraps the UDP socket the host's door already bound with `bind` (it opens no socket of its own), so the door can serve it
+#[allow(clippy::disallowed_methods)]
 fn endpoint_on(
     config: quinn::ServerConfig,
     socket: std::net::UdpSocket,
@@ -1156,6 +1160,8 @@ pub fn connect_with(
         }
         .parse()
         .expect("valid bind address");
+        // ambient: net: the client's own ephemeral UDP socket, to dial the peer a client host named (`ikigai --connect`/`--mount quic://…`, gonk's mounts)
+        #[allow(clippy::disallowed_methods)]
         let mut endpoint = quinn::Endpoint::client(bind)?;
         endpoint.set_default_client_config(config);
         let connection = dial(&endpoint, addr).await?;

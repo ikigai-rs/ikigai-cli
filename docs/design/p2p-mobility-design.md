@@ -258,21 +258,28 @@ cargo build --release --locked -p ikigai-p2p --features p2p --examples
 ```
 
 **2. Mint the identities.** Each binary prints its PeerId as soon as it loads its key, then exits
-on the missing flags:
+on the missing flags. A key is a SECRET, `urn:secret:{--key}`, in the file keystore at
+`--keystore` (default `$IKIGAI_SECRETS`, else `~/.ikigai/secrets`); the library reads it through a
+kernel the binary binds, never as a file of its own (Hypothesis H, ledger #2419):
 
 ```sh
 # edge
-target/release/examples/p2p-relay --key ~/p2p-trial/relay.key    # → relay PeerId: <RELAY>
+target/release/examples/p2p-relay --key relay --keystore ~/p2p-trial/keys   # → relay PeerId: <RELAY>
 # plasma
-target/release/examples/p2p-serve --key ~/p2p-trial/plasma.key   # → this peer: <PLASMA>
+target/release/examples/p2p-serve --key plasma --keystore ~/p2p-trial/keys  # → this peer: <PLASMA>
 # bug
-target/release/examples/p2p-call  --key ~/p2p-trial/bug.key      # → this peer: <BUG>
+target/release/examples/p2p-call  --key bug --keystore ~/p2p-trial/keys     # → this peer: <BUG>
 ```
+
+`--key` used to name a key FILE. The stored bytes are the same protobuf encoding, so an identity
+minted that way is kept by copying its file into the keystore under the name:
+`mkdir -m 700 ~/p2p-trial/keys && cp ~/p2p-trial/plasma.key ~/p2p-trial/keys/plasma` (a name of
+lowercase letters, digits, `-`, `_` and `.` is its own file name in the store).
 
 **3. edge: run the relay.**
 
 ```sh
-target/release/examples/p2p-relay --key ~/p2p-trial/relay.key \
+target/release/examples/p2p-relay --key relay --keystore ~/p2p-trial/keys \
   --listen   /ip4/0.0.0.0/udp/4001/quic-v1 \
   --external /ip4/<EDGE_PUBLIC_IP>/udp/4001/quic-v1 \
   --allow <PLASMA> --allow <BUG> \
@@ -285,7 +292,7 @@ target/release/examples/p2p-relay --key ~/p2p-trial/relay.key \
 mkdir -p ~/p2p-trial
 echo '{"freebusy": ["urn:cap:demo:freebusy"]}' > ~/p2p-trial/grants.json
 echo '{"clients": {"<BUG>": {"grant": "freebusy", "label": "bug over p2p"}}}' > ~/p2p-trial/clients.json
-target/release/examples/p2p-serve --key ~/p2p-trial/plasma.key \
+target/release/examples/p2p-serve --key plasma --keystore ~/p2p-trial/keys \
   --relay /ip4/<EDGE_PUBLIC_IP>/udp/4001/quic-v1/p2p/<RELAY> \
   --clients ~/p2p-trial/clients.json --grants ~/p2p-trial/grants.json
 ```
@@ -294,7 +301,7 @@ target/release/examples/p2p-serve --key ~/p2p-trial/plasma.key \
 the Verizon network:
 
 ```sh
-target/release/examples/p2p-call --key ~/p2p-trial/bug.key \
+target/release/examples/p2p-call --key bug --keystore ~/p2p-trial/keys \
   --relay /ip4/<EDGE_PUBLIC_IP>/udp/4001/quic-v1/p2p/<RELAY> \
   --peer <PLASMA> --calls 12 --interval-secs 10
 ```

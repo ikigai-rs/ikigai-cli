@@ -2,7 +2,7 @@
 //! `docs/design/p2p-mobility-design.md`.
 //!
 //! ```text
-//! p2p-serve --key plasma-p2p.key \
+//! p2p-serve --key plasma [--keystore <dir>] \
 //!           --relay /ip4/<edge public IP>/udp/4001/quic-v1/p2p/<relay PeerId> \
 //!           [--listen /ip4/0.0.0.0/udp/0/quic-v1] \
 //!           [--clients scratch/clients.json --grants scratch/grants.json]
@@ -21,12 +21,13 @@ use std::time::Instant;
 use ikigai_core::{
     Capability, EndpointSpace, Exact, FnEndpoint, Invocation, Kernel, ReprType, Representation,
 };
-use ikigai_p2p::{
-    circuit_addr, load_or_generate_keypair, spawn_peer, Multiaddr, PeerConfig, PeerId, PeerMinter,
-};
+use ikigai_p2p::{circuit_addr, spawn_peer, Multiaddr, PeerConfig, PeerId, PeerMinter};
 use ikigai_quic::Session;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+#[path = "support/keystore.rs"]
+mod keystore;
 
 fn main() -> Result<(), BoxError> {
     let flags = Flags::parse()?;
@@ -39,7 +40,7 @@ fn main() -> Result<(), BoxError> {
     if let Some(grants) = flags.all("grants").pop() {
         std::env::set_var("IKIGAI_GRANTS", grants);
     }
-    let keypair = load_or_generate_keypair(std::path::Path::new(&flags.one("key")?))?;
+    let keypair = keystore::keypair(&flags.one("key")?, flags.all("keystore").pop())?;
     let me = keypair.public().to_peer_id();
     // Printed before anything else can fail: this is the id the relay's `--allow` and the
     // caller's `--peer` need, so a first run with only `--key` is how an operator learns it.

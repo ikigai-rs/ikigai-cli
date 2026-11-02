@@ -2,7 +2,7 @@
 //! `docs/design/p2p-mobility-design.md` for the whole procedure.
 //!
 //! ```text
-//! p2p-relay --key relay.key \
+//! p2p-relay --key relay [--keystore <dir>] \
 //!           --listen /ip4/0.0.0.0/udp/4001/quic-v1 \
 //!           --external /ip4/<edge public IP>/udp/4001/quic-v1 \
 //!           --allow <plasma PeerId> --allow <bug PeerId> \
@@ -15,13 +15,16 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
-use ikigai_p2p::{load_or_generate_keypair, run_relay, Multiaddr, PeerId, RelayAddrs, RelayPolicy};
+use ikigai_p2p::{run_relay, Multiaddr, PeerId, RelayAddrs, RelayPolicy};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+#[path = "support/keystore.rs"]
+mod keystore;
+
 fn main() -> Result<(), BoxError> {
     let flags = Flags::parse()?;
-    let keypair = load_or_generate_keypair(std::path::Path::new(&flags.one("key")?))?;
+    let keypair = keystore::keypair(&flags.one("key")?, flags.all("keystore").pop())?;
     let relay_id = keypair.public().to_peer_id();
     // Printed before anything else can fail, so a first run that only mints the key still
     // tells the operator the PeerId the peers' `--relay` addresses must end in.
