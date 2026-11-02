@@ -177,6 +177,49 @@ async fn a_slow_second_request_on_a_kept_connection_is_cut_off_with_408() {
     trickle.abort();
 }
 
+/// A client still sending when the `408` arrives reads the answer and then the end of the
+/// stream, never a reset (ledger #2855). Without the door's lingering close, the byte sent after
+/// the answer reached a closed socket, TCP answered it with a reset, and on macOS the read for
+/// the end failed with `ECONNRESET` every time; the slow-loris test above lost the same race
+/// whenever a trickled byte landed just after the door hung up.
+#[tokio::test]
+async fn a_client_still_sending_after_the_408_reads_the_end_not_a_reset() {
+    let addr = door(EdgeConfig {
+        header_timeout: short(300),
+        ..EdgeConfig::default()
+    })
+    .await;
+    let mut sock = TcpStream::connect(addr).await.unwrap();
+    sock.write_all(b"GET /t/page HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n")
+        .await
+        .unwrap();
+    read_answer(&mut sock).await;
+    sock.write_all(b"HEAD /t/page HTTP/1.1\r\nX").await.unwrap();
+    // The 408 is the head alone, so it ends at the blank line.
+    let mut head = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !head.ends_with(b"\r\n\r\n") {
+        let n = tokio::time::timeout(Duration::from_secs(10), sock.read(&mut buf))
+            .await
+            .expect("the deadline must cut the request off")
+            .unwrap();
+        assert!(n > 0, "the door closed early: {head:?}");
+        head.extend_from_slice(&buf[..n]);
+    }
+    let head = String::from_utf8_lossy(&head).into_owned();
+    assert!(
+        head.starts_with("HTTP/1.1 408 Request Timeout\r\n"),
+        "{head}"
+    );
+    // Long enough for a door that does not linger to have closed; then one more byte of the
+    // request, and time for any reset it provokes to come back.
+    tokio::time::sleep(short(100)).await;
+    sock.write_all(b"X").await.unwrap();
+    tokio::time::sleep(short(50)).await;
+    let rest = until_closed(&mut sock).await;
+    assert_eq!(rest, "", "nothing follows the 408");
+}
+
 #[tokio::test]
 async fn a_chunked_body_under_the_bound_is_delivered_whole() {
     let addr = door(EdgeConfig {

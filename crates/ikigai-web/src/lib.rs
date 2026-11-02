@@ -1292,11 +1292,35 @@ pub async fn refuse_busy<S: AsyncRead + AsyncWrite + Unpin>(
     let _ = tokio::time::timeout_at(deadline, first_line).await;
     let method = if is_head(&seen) { "HEAD" } else { "" };
     write_answer(&mut sock, method, busy, config).await?;
+    linger(&mut sock, deadline, LINGER_BYTES.saturating_sub(seen.len())).await;
+    Ok(())
+}
+
+/// The most a lingering close ([`linger`]) reads and discards before it gives up and closes.
+const LINGER_BYTES: usize = 64 * 1024;
+
+/// The lingering close, for a connection the door hangs up on after answering it: shut down the
+/// write half (the client reads the answer and then the end of the stream), then read and
+/// discard whatever the client still sends until it hangs up, `deadline` passes, or `budget`
+/// bytes have been read; the caller then drops the socket.
+///
+/// Closing a socket with unread bytes in its receive buffer, or one that bytes reach after it
+/// closed, makes TCP answer with a reset. A client still sending when the door answered (a slow
+/// request cut off with `408`, a request refused at the cap) then reads the reset where the end of
+/// the stream belonged: on macOS a read that comes after it fails with `ECONNRESET`, so the
+/// answer it already holds is lost to a client reading to the end (measured, ledger #2855).
+/// Draining keeps the socket open, and its receive buffer empty, while the client takes the
+/// answer and hangs up.
+async fn linger<S: AsyncRead + AsyncWrite + Unpin>(
+    sock: &mut S,
+    deadline: tokio::time::Instant,
+    budget: usize,
+) {
     let _ = sock.shutdown().await;
     let drain = async {
         let mut tmp = [0u8; 1024];
-        let mut drained = seen.len();
-        while drained < 64 * 1024 {
+        let mut drained = 0;
+        while drained < budget {
             match sock.read(&mut tmp).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => drained += n,
@@ -1304,7 +1328,6 @@ pub async fn refuse_busy<S: AsyncRead + AsyncWrite + Unpin>(
         }
     };
     let _ = tokio::time::timeout_at(deadline, drain).await;
-    Ok(())
 }
 
 /// The response the adapter builds before writing it to the socket.
