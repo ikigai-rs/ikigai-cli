@@ -79,7 +79,7 @@ impl Endpoint for DecisionLog {
                     )));
                 }
                 let arg = |name: &str| crate::decide::param(inv, name);
-                let action = arg("action");
+                let action = arg("action")?;
                 if !matches!(action.as_str(), "approve" | "decline" | "block") {
                     return Err(Error::InvalidArgument {
                         name: "action".to_string(),
@@ -89,10 +89,10 @@ impl Endpoint for DecisionLog {
                 let record = format!(
                     "{{\"action\":{},\"id\":{},\"name\":{},\"email\":{},\"when\":{},\"at\":{}}}\n",
                     json_str(&action),
-                    json_str(&arg("id")),
-                    json_str(&arg("name")),
-                    json_str(&arg("email")),
-                    json_str(&arg("when")),
+                    json_str(&arg("id")?),
+                    json_str(&arg("name")?),
+                    json_str(&arg("email")?),
+                    json_str(&arg("when")?),
                     json_str(&now_rfc3339()),
                 );
                 crate::jsonl::append(&self.path, &record, "decisions")?;

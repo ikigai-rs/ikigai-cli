@@ -9,9 +9,10 @@
 //! ONE audited place:
 //!
 //! - **The body is parsed, never trusted.** `application/x-www-form-urlencoded` or JSON,
-//!   sniffed from the payload. Percent-decoding works over **bytes**, not `&str` offsets —
-//!   slicing a `&str` at a computed offset panics when a `%` precedes a multibyte
-//!   character, which is a real defect found in a sibling decoder.
+//!   sniffed from the payload. Percent-decoding is `ikigai_fn::html::percent_decode`, over
+//!   **bytes** and STRICT: a malformed escape or a value that is not UTF-8 once decoded is
+//!   refused with its byte offset ([`form_pairs`]), never passed on as a literal `%` or a
+//!   U+FFFD the submitter did not type.
 //! - **Fields are declared.** Anything not declared is DROPPED rather than carried
 //!   through, so a submitter cannot smuggle an extra key into the tuple the handler reads.
 //! - **Every field is BOUNDED.** A value longer than the field allows is refused here, in
@@ -187,8 +188,9 @@ pub struct IntakeConfig {
     /// an open redirect. It is checked and escaped all the same, with the ecosystem's one rule
     /// (`ikigai_fn::html::safe_href`, then `attr`; ledger #1868): an `http(s)://` URL or a
     /// same-origin `/path`. Anything else (`javascript:`, `data:`, `//host`, a relative
-    /// `thanks.html`) is not a link target, and the answer is the plain `received` body, as if
-    /// no redirect were configured.
+    /// `thanks.html`) is not a link target: [`try_submit`] refuses such a configuration with a
+    /// sentence naming it, and an endpoint built with [`submit`] answers the plain `received`
+    /// body, as if no redirect were configured.
     pub redirect: Option<String>,
     /// Reject a submission whose `email_field` is on the `urn:decisions` blocklist, at the
     /// door — before the tuple is ever dropped, so a blocked sender's message never reaches a
@@ -221,9 +223,56 @@ pub fn token_shaped(token: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// Build the intake endpoint described by `config`.
+/// Build the intake endpoint described by `config`, as written.
+///
+/// A `redirect` that `ikigai_fn::html::safe_href` refuses is kept and then ignored on every
+/// submission (the answer is the plain `received` body). A host loading a configuration should
+/// call [`try_submit`], which refuses that configuration instead of serving it silently changed.
 pub fn submit(config: IntakeConfig) -> IntakeEndpoint {
     IntakeEndpoint { config }
+}
+
+/// Build the intake endpoint described by `config`, refusing a configuration that cannot be
+/// served as written: a `redirect` that `ikigai_fn::html::safe_href` refuses (a script or data
+/// URL, another host's `//` target, a relative `thanks.html`). The refusal is an
+/// `InvalidArgument` on `redirect` whose sentence names the intake and the redirect.
+///
+/// ```
+/// use ikigai_intake::{try_submit, IntakeConfig};
+/// let config = IntakeConfig {
+///     id: "contact".into(),
+///     space: "urn:space:contact".into(),
+///     fields: Vec::new(),
+///     email_field: None,
+///     honeypot: None,
+///     requires: "urn:cap:contact:submit".into(),
+///     clients: None,
+///     attests: Vec::new(),
+///     redirect: Some("thanks.html".into()),
+///     check_blocked: false,
+/// };
+/// let err = try_submit(config).err().expect("a relative redirect is refused");
+/// assert_eq!(
+///     err.to_string(),
+///     "invalid argument `redirect`: the intake `contact` has redirect `thanks.html`, which is \
+///      not a link target: use an http(s):// URL or a same-origin /path"
+/// );
+/// ```
+pub fn try_submit(config: IntakeConfig) -> Result<IntakeEndpoint> {
+    if let Some(redirect) = &config.redirect {
+        if ikigai_fn::html::safe_href(redirect).is_none() {
+            return Err(Error::InvalidArgument {
+                name: "redirect".to_string(),
+                detail: format!(
+                    "the intake `{}` has redirect `{}`, which is not a link target: use an \
+                     http(s):// URL or a same-origin /path",
+                    config.id,
+                    redirect.escape_debug()
+                ),
+            });
+        }
+    }
+    Ok(submit(config))
 }
 
 /// The response to a submission the endpoint accepted (a real one, or a honeypot hit that must
@@ -276,45 +325,67 @@ pub struct IntakeEndpoint {
     config: IntakeConfig,
 }
 
-/// Percent-decode `+`-style form encoding over BYTES. Decoding over `&str` byte offsets
-/// panics when a `%` precedes a multibyte character; bytes cannot land mid-codepoint, and
-/// the final `from_utf8_lossy` handles anything malformed.
-fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b'%' if i + 2 < bytes.len() => {
-                let hex = |b: u8| match b {
-                    b'0'..=b'9' => Some(b - b'0'),
-                    b'a'..=b'f' => Some(b - b'a' + 10),
-                    b'A'..=b'F' => Some(b - b'A' + 10),
-                    _ => None,
-                };
-                match (hex(bytes[i + 1]), hex(bytes[i + 2])) {
-                    (Some(hi), Some(lo)) => {
-                        out.push((hi << 4) | lo);
-                        i += 3;
-                    }
-                    // Not a valid escape — keep the '%' literally.
-                    _ => {
-                        out.push(bytes[i]);
-                        i += 1;
-                    }
-                }
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
+/// Decode an `application/x-www-form-urlencoded` body into `(field, value)` pairs, STRICTLY.
+///
+/// Each key and value goes through `ikigai_fn::html::percent_decode` with `+` as a space (the
+/// ecosystem's one decoder, ledger #1878), which works over bytes, so a `%` before a multibyte
+/// character cannot split it. A malformed escape (`%`, `%4`, `%zz`) or a value that is not UTF-8
+/// once decoded is REFUSED as an `InvalidArgument` on `content`, whose sentence names the byte
+/// offset in `body`: a submission is never passed on with a literal `%` or a U+FFFD the
+/// submitter did not type. Whitespace around the body is ignored, empty pairs are skipped, and
+/// a pair with no `=` is a key with an empty value.
+///
+/// ```
+/// use ikigai_core::Error;
+/// let pairs = ikigai_intake::form_pairs("name=Ada+L&note=1%2B1").unwrap();
+/// assert_eq!(pairs, [("name".into(), "Ada L".into()), ("note".into(), "1+1".into())]);
+///
+/// let Err(Error::InvalidArgument { name, detail }) = ikigai_intake::form_pairs("note=100%") else {
+///     panic!("a stray `%` is refused");
+/// };
+/// assert_eq!(name, "content");
+/// assert_eq!(
+///     detail,
+///     "malformed percent-escape at byte 8 of the form body: a `%` must be followed by two hex digits"
+/// );
+/// ```
+pub fn form_pairs(body: &str) -> Result<Vec<(String, String)>> {
+    use ikigai_fn::html::{percent_decode, PercentDecodeError};
+    let lead = body.len() - body.trim_start().len();
+    let trimmed = body.trim();
+    // `at` is where `part` starts in `body`; `what` says which half of a pair it is.
+    let decode = |part: &str, at: usize, what: &str| {
+        percent_decode(part, true).map_err(|e| Error::InvalidArgument {
+            name: "content".to_string(),
+            detail: match e {
+                PercentDecodeError::MalformedEscape { offset } => format!(
+                    "malformed percent-escape at byte {} of the form body: a `%` must be \
+                     followed by two hex digits",
+                    at + offset
+                ),
+                PercentDecodeError::InvalidUtf8(_) => format!(
+                    "the {what} at byte {at} of the form body is not UTF-8 once percent-decoded"
+                ),
+            },
+        })
+    };
+    let mut pairs = Vec::new();
+    let mut at = lead;
+    for pair in trimmed.split('&') {
+        let start = at;
+        at += pair.len() + 1;
+        if pair.is_empty() {
+            continue;
         }
+        pairs.push(match pair.split_once('=') {
+            Some((k, v)) => (
+                decode(k, start, "name")?,
+                decode(v, start + k.len() + 1, "value")?,
+            ),
+            None => (decode(pair, start, "name")?, String::new()),
+        });
     }
-    String::from_utf8_lossy(&out).into_owned()
+    Ok(pairs)
 }
 
 /// Resolve `template` for `token`, returning `(id, attested fields)` — or `None` for any
@@ -382,14 +453,7 @@ fn parse_body(body: &str) -> Result<Vec<(String, String)>> {
             })
             .collect());
     }
-    Ok(trimmed
-        .split('&')
-        .filter(|pair| !pair.is_empty())
-        .map(|pair| match pair.split_once('=') {
-            Some((k, v)) => (percent_decode(k), percent_decode(v)),
-            None => (percent_decode(pair), String::new()),
-        })
-        .collect())
+    form_pairs(body)
 }
 
 /// Render a value as an s-expression string literal. A quote or backslash would otherwise
@@ -1069,6 +1133,38 @@ mod tests {
         assert!(page.contains("<a href=\"/thanks\">"), "{page}");
     }
 
+    /// Ledger #1878: a redirect that is not a link target is refused when the configuration
+    /// is loaded, with a sentence naming the intake and the redirect, rather than kept and
+    /// silently ignored on every submission.
+    #[test]
+    fn try_submit_refuses_a_redirect_that_is_not_a_link_target() {
+        for (hostile, shown) in [
+            ("javascript:alert(1)", "javascript:alert(1)"),
+            ("java\tscript:alert(1)", "java\\tscript:alert(1)"),
+            ("//evil.example/", "//evil.example/"),
+            ("thanks.html", "thanks.html"),
+        ] {
+            let mut cfg = config();
+            cfg.redirect = Some(hostile.to_string());
+            let Err(Error::InvalidArgument { name, detail }) = try_submit(cfg) else {
+                panic!("{hostile:?} must be refused at load");
+            };
+            assert_eq!(name, "redirect");
+            assert_eq!(
+                detail,
+                format!(
+                    "the intake `contact` has redirect `{shown}`, which is not a link target: \
+                     use an http(s):// URL or a same-origin /path"
+                )
+            );
+        }
+        for safe in [None, Some("https://x.example/thanks"), Some("/thanks")] {
+            let mut cfg = config();
+            cfg.redirect = safe.map(str::to_string);
+            assert!(try_submit(cfg).is_ok(), "{safe:?}");
+        }
+    }
+
     /// A stand-in client registry: one known token, and a record of what was asked for.
     struct Registry {
         asked: Arc<Mutex<Vec<String>>>,
@@ -1507,10 +1603,73 @@ mod tests {
     }
 
     #[test]
-    fn percent_decoding_survives_multibyte_after_an_escape() {
-        // Decoding over &str offsets panics here; over bytes it cannot.
-        assert_eq!(percent_decode("%41é"), "Aé");
-        assert_eq!(percent_decode("a%2Fb+c"), "a/b c");
-        assert_eq!(percent_decode("100%"), "100%", "a stray % stays literal");
+    fn a_form_body_decodes_plus_as_space_and_keeps_an_escaped_plus() {
+        let (k, dropped) = kernel();
+        block_on(k.issue(
+            post("name=%41%C3%A9+Z&email=a%40x.example&message=1%2B1+is+2"),
+            &cap(),
+        ))
+        .unwrap();
+        let tuple = dropped.lock().unwrap()[0].clone();
+        // A multibyte character right after an escape (decoding over `&str` offsets panics
+        // there), `+` as a space, and `%2B` as a literal plus.
+        assert!(tuple.contains(r#"(name "Aé Z")"#), "{tuple}");
+        assert!(tuple.contains(r#"(message "1+1 is 2")"#), "{tuple}");
+    }
+
+    /// Ledger #1878: a malformed escape or invalid UTF-8 in a submission is refused with the
+    /// byte offset it was found at, never kept as a literal `%` or replaced with U+FFFD and
+    /// dropped into the tuple as if the submitter had typed it.
+    #[test]
+    fn a_malformed_form_body_is_refused_with_its_byte_offset() {
+        for (body, detail) in [
+            (
+                "name=A%zz&email=a%40x.example&message=hi",
+                "malformed percent-escape at byte 6 of the form body: a `%` must be followed by two hex digits",
+            ),
+            (
+                "name=A&email=a%40x.example&message=100%",
+                "malformed percent-escape at byte 38 of the form body: a `%` must be followed by two hex digits",
+            ),
+            (
+                "name=A&email=a%40x.example&message=%FFhi",
+                "the value at byte 35 of the form body is not UTF-8 once percent-decoded",
+            ),
+            (
+                "na%e=A&email=a%40x.example&message=hi",
+                "malformed percent-escape at byte 2 of the form body: a `%` must be followed by two hex digits",
+            ),
+        ] {
+            let (k, dropped) = kernel();
+            let err = block_on(k.issue(post(body), &cap())).unwrap_err();
+            match err {
+                Error::InvalidArgument {
+                    name,
+                    detail: got,
+                } => {
+                    assert_eq!(name, "content", "{body:?}");
+                    assert_eq!(got, detail, "{body:?}");
+                }
+                other => panic!("{body:?}: expected InvalidArgument, got {other:?}"),
+            }
+            assert!(dropped.lock().unwrap().is_empty(), "nothing dropped: {body:?}");
+        }
+    }
+
+    #[test]
+    fn form_pairs_names_offsets_in_the_body_it_was_given() {
+        assert_eq!(
+            form_pairs("  a=1&&b&c=%2B+ \n").unwrap(),
+            [
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), String::new()),
+                ("c".to_string(), "+ ".to_string()),
+            ]
+        );
+        let err = form_pairs("  a=%G1").unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument { ref detail, .. } if detail.contains("at byte 4 ")),
+            "{err:?}"
+        );
     }
 }

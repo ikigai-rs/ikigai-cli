@@ -862,10 +862,10 @@ pub fn require_passkey(inv: &Invocation<'_>) -> Result<()> {
 
     // Pull the four assertion fields the glue-JS attaches, all base64url.
     let (id_b64, auth_b64, client_b64, sig_b64) = (
-        param(inv, "pk_id"),
-        param(inv, "pk_auth"),
-        param(inv, "pk_client"),
-        param(inv, "pk_sig"),
+        param(inv, "pk_id")?,
+        param(inv, "pk_auth")?,
+        param(inv, "pk_client")?,
+        param(inv, "pk_sig")?,
     );
     if id_b64.is_empty() || auth_b64.is_empty() || client_b64.is_empty() || sig_b64.is_empty() {
         return Err(denied());
@@ -1275,7 +1275,7 @@ impl Endpoint for PasskeyRegister {
                 // The proof the enroller saw what only the person at the box has. Checked before
                 // anything else in the request is looked at, and refused with one sentence
                 // whether it is missing or wrong.
-                let code = param(inv, "code");
+                let code = param(inv, "code")?;
                 if code.is_empty() || code_digest(&code) != window.code_sha256 {
                     eprintln!(
                         "ikigai passkey: REFUSED a registration: {} enrollment code",
@@ -1287,7 +1287,7 @@ impl Endpoint for PasskeyRegister {
                             .to_string(),
                     ));
                 }
-                let (id_b64, spki_b64) = (param(inv, "id"), param(inv, "spki"));
+                let (id_b64, spki_b64) = (param(inv, "id")?, param(inv, "spki")?);
                 if id_b64.is_empty() || spki_b64.is_empty() {
                     return Err(Error::InvalidArgument {
                         name: "id/spki".to_string(),
