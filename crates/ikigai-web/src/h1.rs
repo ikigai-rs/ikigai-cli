@@ -16,13 +16,15 @@
 //!   how long a kept connection idles. hyper closes a timed-out connection without a word; the
 //!   door then answers `408` itself when a request had been started (or when the connection
 //!   never carried one, as the hand-written door always did), and closes in silence when a kept
-//!   connection merely went idle.
+//!   connection merely went idle. After a `408` the door lingers (half-closes and drains for a
+//!   bounded time), so a client still sending its request reads the answer and the end of the
+//!   stream, not a reset (ledger #2855).
 //! - **The write deadline** ([`EdgeConfig::write_timeout`]) bounds each stall: a write that
 //!   makes no progress for that long fails the connection, so a client that stops reading gives
 //!   its slot back. hyper has no write deadline of its own.
 
 use crate::door::{self, DoorBody, Unread, MAX_HEAD};
-use crate::{refused, EdgeConfig, Resp, Shared};
+use crate::{linger, refused, EdgeConfig, Resp, Shared, LINGER_BYTES};
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use std::convert::Infallible;
@@ -37,6 +39,11 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// How many bytes of a request still arriving are kept to decide whether it is a `HEAD`.
 const KEPT: usize = 16;
+
+/// The longest the door lingers after a `408` ([`linger`]), or the header deadline when that is
+/// shorter. A client that reads the answer hangs up at once and ends the linger; this bounds the
+/// one that does not, so a slow-loris holds its slot at most this much longer.
+const LINGER: Duration = Duration::from_secs(2);
 
 /// Serve one connection until the client closes it, the door closes it, or a deadline passes.
 pub(crate) async fn serve_connection<S>(
@@ -88,12 +95,14 @@ where
     };
     match served {
         Err(e) if e.is_timeout() => match tracker.owed() {
-            // A request was under way, or none ever came: say why the door is hanging up.
+            // A request was under way, or none ever came: say why the door is hanging up, then
+            // linger, since a client cut off mid-request is usually still sending it.
             Some(started) => {
                 let resp = Resp::text(408, "Request Timeout", "request headers took too long");
-                refused(&mut sock, resp, &started, config.write_timeout)
-                    .await
-                    .map(|_| ())
+                refused(&mut sock, resp, &started, config.write_timeout).await?;
+                let deadline = tokio::time::Instant::now() + config.header_timeout.min(LINGER);
+                linger(&mut sock, deadline, LINGER_BYTES).await;
+                Ok(())
             }
             // A kept connection went idle between requests: close it without a word.
             None => Ok(()),
