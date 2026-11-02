@@ -187,68 +187,33 @@ pub(crate) fn parse_signing_key(bytes: &[u8]) -> std::result::Result<SigningKey,
 // `ikigai_fn::html::url_segment` (ledger #1868), under the name this module's callers use.
 pub(crate) use ikigai_fn::html::url_segment as urlencode;
 
-/// Percent-decode a form value over BYTES.
-///
-/// Over bytes, not `&str` offsets: slicing a `&str` at a computed offset panics when a `%`
-/// precedes a multibyte character — the same defect `ikigai-intake` documents.
-pub(crate) fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b'%' if i + 2 < bytes.len() => {
-                let hex = |b: u8| match b {
-                    b'0'..=b'9' => Some(b - b'0'),
-                    b'a'..=b'f' => Some(b - b'a' + 10),
-                    b'A'..=b'F' => Some(b - b'A' + 10),
-                    _ => None,
-                };
-                match (hex(bytes[i + 1]), hex(bytes[i + 2])) {
-                    (Some(hi), Some(lo)) => {
-                        out.push((hi << 4) | lo);
-                        i += 3;
-                    }
-                    _ => {
-                        out.push(bytes[i]);
-                        i += 1;
-                    }
-                }
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 /// One parameter, from the query string OR — on a form POST — the urlencoded body.
 ///
 /// A browser submitting `<form method=post>` puts its fields in the BODY, which the HTTP
 /// face hands over as the piped `content`; a GET puts them in the query, which arrives as
 /// named args. The same resource answers both, so it looks in both places.
-pub(crate) fn param(inv: &Invocation<'_>, name: &str) -> String {
+///
+/// The body is decoded STRICTLY by [`ikigai_intake::form_pairs`] (over the ecosystem's one
+/// decoder, `ikigai_fn::html::percent_decode`; ledger #1878): a malformed escape or a value
+/// that is not UTF-8 once decoded, anywhere in the body, is an `InvalidArgument` on `content`
+/// (a `400` at the door) whose sentence names the byte offset, never a literal `%` or a U+FFFD
+/// handed to the caller as if it had been sent.
+pub(crate) fn param(inv: &Invocation<'_>, name: &str) -> Result<String> {
     if let Ok(v) = inv.inline_str(name) {
         let v = v.trim();
         if !v.is_empty() {
-            return v.to_string();
+            return Ok(v.to_string());
         }
     }
     if let Ok(body) = inv.inline_str("content") {
-        for pair in body.trim().split('&') {
-            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-            if percent_decode(k) == name {
-                return percent_decode(v).trim().to_string();
-            }
+        if let Some((_, v)) = ikigai_intake::form_pairs(body)?
+            .into_iter()
+            .find(|(k, _)| k == name)
+        {
+            return Ok(v.trim().to_string());
         }
     }
-    String::new()
+    Ok(String::new())
 }
 
 /// One `(name "value")` field out of a tuple, unescaping `\"` and `\\`.
@@ -584,13 +549,13 @@ impl Endpoint for CalendarRequest {
         // The page a decision POST redirected to (Post/Redirect/Get, ledger #1879): no token,
         // so nothing to verify, and nothing in it but the outcome word.
         if inv.request.verb == Verb::Source {
-            let word = param(inv, prg::OUTCOME);
+            let word = param(inv, prg::OUTCOME)?;
             if !word.is_empty() {
                 return Ok(outcome_page(&action, &word));
             }
         }
-        let (id, token) = (param(inv, "id"), param(inv, "t"));
-        let exp: i64 = param(inv, "exp").parse().unwrap_or(0);
+        let (id, token) = (param(inv, "id")?, param(inv, "t")?);
+        let exp: i64 = param(inv, "exp")?.parse().unwrap_or(0);
 
         let key = verifying_key_at(&self.key_path)?;
         let now = now_secs();

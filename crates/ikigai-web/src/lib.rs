@@ -1504,7 +1504,7 @@ where
         };
     let mut req = match parse_head(&buf[..header_end]) {
         Ok(r) => r,
-        Err(why) => return refused(sock, Resp::text(400, "Bad Request", why), &buf, wt).await,
+        Err(why) => return refused(sock, Resp::text(400, "Bad Request", &why), &buf, wt).await,
     };
     // THE FRAMING IS SETTLED BEFORE A BODY BYTE IS READ. Everything here decides how much
     // an anonymous client may make this process hold and hand onward, and this door is
@@ -3930,7 +3930,7 @@ fn xsd_to_json_type(class: &str) -> &'static str {
 /// conversion turns one invalid byte into a three-byte U+FFFD, and a decoder that then slices
 /// the string by byte offset splits that character and panics (ledger #80). The refusal
 /// names what was wrong; every refusal is a `400`.
-fn parse_head(head: &[u8]) -> Result<HttpRequest, &'static str> {
+fn parse_head(head: &[u8]) -> Result<HttpRequest, String> {
     const MALFORMED: &str = "malformed request";
     let line_end = head
         .windows(2)
@@ -3968,94 +3968,78 @@ type Query = Vec<(String, String)>;
 /// The request target (path and query, as the request line carried it) as
 /// [`HttpRequest::path`] and [`HttpRequest::query`]: the path through [`decode_path`], the
 /// query as form pairs. Shared by the hand-written reader and the hyper door, so both decode a
-/// target the same way and refuse the same targets with `400`.
-fn parse_target(target: &[u8]) -> Result<(String, Query), &'static str> {
-    let (raw_path, query_str) = match target.iter().position(|b| *b == b'?') {
-        Some(q) => (&target[..q], &target[q + 1..]),
-        None => (target, &b""[..]),
+/// target the same way and refuse the same targets with `400`, in a sentence that names the
+/// byte offset in the target where the problem is.
+fn parse_target(target: &[u8]) -> Result<(String, Query), String> {
+    let (raw_path, query_str, query_at) = match target.iter().position(|b| *b == b'?') {
+        Some(q) => (&target[..q], &target[q + 1..], q + 1),
+        None => (target, &b""[..], target.len()),
     };
     let path = decode_path(raw_path)?;
     let mut query = Vec::new();
-    for kv in query_str.split(|b| *b == b'&').filter(|s| !s.is_empty()) {
+    let mut at = query_at;
+    for kv in query_str.split(|b| *b == b'&') {
+        let start = at;
+        at += kv.len() + 1;
+        if kv.is_empty() {
+            continue;
+        }
         let (k, v) = match kv.iter().position(|b| *b == b'=') {
             Some(eq) => (&kv[..eq], &kv[eq + 1..]),
             None => (kv, &b""[..]),
         };
-        query.push((decode_form(k)?, decode_form(v)?));
+        query.push((
+            decode_text(k, true, start, "query name")?,
+            decode_text(v, true, start + k.len() + 1, "query value")?,
+        ));
     }
     Ok((path, query))
 }
 
-/// The value of one ASCII hex digit, or `None`. Deliberately not `u8::from_str_radix`, which
-/// accepts a leading sign and so decoded `%+1` as byte 1 (ledger #591).
-fn hex_digit(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// Percent-decode `raw` as BYTES. A `%` must be followed by exactly two hex digits; anything
-/// else (`%`, `%4`, `%zz`, `%+1`, `%` before a non-ASCII byte) is refused rather than passed
-/// through, since a server that guesses at a malformed escape and a proxy in front of it that
-/// guesses differently disagree about what was asked for. `plus_is_space` is form encoding,
-/// and only a query string is form-encoded.
-fn percent_decode(raw: &[u8], plus_is_space: bool) -> Result<Vec<u8>, &'static str> {
-    let mut out = Vec::with_capacity(raw.len());
-    let mut i = 0;
-    while i < raw.len() {
-        match raw[i] {
-            b'%' => {
-                let hi = raw.get(i + 1).copied().and_then(hex_digit);
-                let lo = raw.get(i + 2).copied().and_then(hex_digit);
-                match (hi, lo) {
-                    (Some(hi), Some(lo)) => out.push(hi << 4 | lo),
-                    _ => return Err("malformed percent-escape"),
-                }
-                i += 3;
-            }
-            b'+' if plus_is_space => {
-                out.push(b' ');
-                i += 1;
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// Percent-decode, then validate UTF-8 once, over the whole decoded value.
-fn decode_utf8(raw: &[u8], plus_is_space: bool) -> Result<String, &'static str> {
-    String::from_utf8(percent_decode(raw, plus_is_space)?).map_err(|_| "not UTF-8 once decoded")
-}
-
-/// A query key or value: `application/x-www-form-urlencoded`, so `+` is a space.
-fn decode_form(raw: &[u8]) -> Result<String, &'static str> {
-    decode_utf8(raw, true)
+/// Percent-decode one part of the request target with the ecosystem's one strict decoder
+/// (`ikigai_fn::html::percent_decode_bytes`, ledger #1878), then validate UTF-8 once, over the
+/// whole decoded value. Over BYTES, because the target may carry raw non-UTF-8 bytes; a `%`
+/// must be followed by exactly two hex digits (`%`, `%4`, `%zz`, `%+1`, `%` before a non-ASCII
+/// byte are refused, never passed through), since a server that guesses at a malformed escape
+/// and a proxy in front of it that guesses differently disagree about what was asked for.
+/// `plus_is_space` is form encoding, and only a query string is form-encoded. `at` is where
+/// `raw` starts in the target, so the refusal names an offset in what the client sent.
+fn decode_text(raw: &[u8], plus_is_space: bool, at: usize, what: &str) -> Result<String, String> {
+    use ikigai_fn::html::{percent_decode_bytes, PercentDecodeError};
+    let bytes = percent_decode_bytes(raw, plus_is_space).map_err(|e| match e {
+        PercentDecodeError::MalformedEscape { offset } => format!(
+            "malformed percent-escape at byte {} of the request target: a `%` must be followed \
+             by two hex digits",
+            at + offset
+        ),
+        // The byte form never checks UTF-8; that is done once, below, over the whole value.
+        other => other.to_string(),
+    })?;
+    String::from_utf8(bytes).map_err(|_| {
+        format!("the {what} at byte {at} of the request target is not UTF-8 once percent-decoded")
+    })
 }
 
 /// The path, split on `/` FIRST and each segment decoded on its own (RFC 3986 §2.2: an
 /// encoded delimiter is data). `+` stays `+`. The decoded segments are re-joined into the one
 /// string [`HttpRequest::path`] carries, with a `/` or `%` inside a segment kept escaped so
 /// [`path_segments`] can split it back without a client-encoded slash becoming a separator.
-fn decode_path(raw: &[u8]) -> Result<String, &'static str> {
+/// `raw` starts the request target, so an offset in a refusal is an offset in the target.
+fn decode_path(raw: &[u8]) -> Result<String, String> {
     let mut out = String::with_capacity(raw.len());
+    let mut at = 0;
     for (n, seg) in raw.split(|b| *b == b'/').enumerate() {
         if n > 0 {
             out.push('/');
         }
-        for c in decode_utf8(seg, false)?.chars() {
+        for c in decode_text(seg, false, at, "path segment")?.chars() {
             match c {
                 '%' => out.push_str("%25"),
                 '/' => out.push_str("%2F"),
                 c => out.push(c),
             }
         }
+        at += seg.len() + 1;
     }
     Ok(out)
 }
@@ -7622,25 +7606,68 @@ mod tests {
             b"% 1",
         ];
         for bad in cases {
-            assert!(percent_decode(bad, false).is_err(), "path form: {bad:?}");
-            assert!(percent_decode(bad, true).is_err(), "form form: {bad:?}");
+            assert!(
+                decode_text(bad, false, 0, "x").is_err(),
+                "path form: {bad:?}"
+            );
+            assert!(
+                decode_text(bad, true, 0, "x").is_err(),
+                "form form: {bad:?}"
+            );
         }
+    }
+
+    /// Ledger #1878: a refusal names the byte offset in the request target where the bad
+    /// escape starts, or where the part that is not UTF-8 starts, in the path, a query name
+    /// and a query value alike. (The private decoder this replaced refused the same targets
+    /// with a bare `malformed percent-escape` or `not UTF-8 once decoded`.)
+    #[test]
+    fn a_refused_target_names_the_byte_offset() {
+        let escape = |at: usize| {
+            format!(
+                "malformed percent-escape at byte {at} of the request target: a `%` must be \
+                 followed by two hex digits"
+            )
+        };
+        let utf8 = |what: &str, at: usize| {
+            format!(
+                "the {what} at byte {at} of the request target is not UTF-8 once percent-decoded"
+            )
+        };
+        for (target, why) in [
+            (&b"/a/b%zz"[..], escape(4)),
+            (b"/100%", escape(4)),
+            (b"/p?k=v&x%4=1", escape(8)),
+            (b"/p?k=v&x=1%", escape(10)),
+            (b"/a/%FF", utf8("path segment", 3)),
+            (b"/a/\xff", utf8("path segment", 3)),
+            (b"/p?k=%C3", utf8("query value", 5)),
+            (b"/p?a=1&%FF=2", utf8("query name", 7)),
+        ] {
+            assert_eq!(parse_target(target).unwrap_err(), why, "{target:?}");
+        }
+        // Both readers carry the sentence into the 400.
+        assert_eq!(
+            parse_head(b"GET /p?q=%G1 HTTP/1.1\r\nHost: x").err(),
+            Some(escape(5))
+        );
     }
 
     #[test]
     fn the_decoder_works_on_bytes_and_validates_utf8_once() {
-        assert_eq!(decode_utf8(b"caf%C3%A9", false).unwrap(), "caf\u{e9}");
+        let text = |raw: &[u8], plus| decode_text(raw, plus, 0, "x");
+        assert_eq!(text(b"caf%C3%A9", false).unwrap(), "caf\u{e9}");
         // One character split between an escape and a raw byte is still one character: the
         // UTF-8 check runs over the decoded whole, not per escape.
-        assert_eq!(decode_utf8(b"caf%C3\xa9", false).unwrap(), "caf\u{e9}");
-        assert_eq!(decode_utf8(b"caf\xc3\xa9", false).unwrap(), "caf\u{e9}");
-        assert!(decode_utf8(b"%FF", false).is_err());
-        assert!(decode_utf8(b"\xff", false).is_err());
-        assert!(decode_utf8(b"%C3", false).is_err(), "a truncated sequence");
-        assert_eq!(decode_utf8(b"%4a%4A", false).unwrap(), "JJ");
-        assert_eq!(decode_utf8(b"a+b", false).unwrap(), "a+b");
-        assert_eq!(decode_utf8(b"a+b", true).unwrap(), "a b");
-        assert_eq!(decode_utf8(b"a%2Bb", true).unwrap(), "a+b");
+        assert_eq!(text(b"caf%C3\xa9", false).unwrap(), "caf\u{e9}");
+        assert_eq!(text(b"caf\xc3\xa9", false).unwrap(), "caf\u{e9}");
+        assert!(text(b"%FF", false).is_err());
+        assert!(text(b"\xff", false).is_err());
+        assert!(text(b"%C3", false).is_err(), "a truncated sequence");
+        assert_eq!(text(b"%4a%4A", false).unwrap(), "JJ");
+        assert_eq!(text(b"a+b", false).unwrap(), "a+b");
+        assert_eq!(text(b"a+b", true).unwrap(), "a b");
+        assert_eq!(text(b"a%2Bb", true).unwrap(), "a+b");
     }
 
     #[test]
@@ -7705,8 +7732,10 @@ mod tests {
     fn every_byte_pair_after_a_percent_decodes_or_is_refused() {
         for hi in 0..=255u8 {
             for lo in 0..=255u8 {
-                let expect = match (hex_digit(hi), hex_digit(lo)) {
-                    (Some(h), Some(l)) if (h << 4 | l) < 0x80 => Some(char::from(h << 4 | l)),
+                // Not `u8::from_str_radix`, which accepts a leading sign (ledger #591).
+                let hex = |b: u8| char::from(b).to_digit(16);
+                let expect = match (hex(hi), hex(lo)) {
+                    (Some(h), Some(l)) if (h << 4 | l) < 0x80 => char::from_u32(h << 4 | l),
                     _ => None,
                 };
                 for place in 0..3 {

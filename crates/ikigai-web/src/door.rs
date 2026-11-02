@@ -163,7 +163,7 @@ fn head_of(parts: &http::request::Parts, peer: Option<IpAddr>) -> Result<HttpReq
     let refuse = |status, reason, why: &str| refusal(head, status, reason, why);
     let target = parts.uri.path_and_query().map_or("/", |pq| pq.as_str());
     let (path, query) =
-        parse_target(target.as_bytes()).map_err(|why| refuse(400, "Bad Request", why))?;
+        parse_target(target.as_bytes()).map_err(|why| refuse(400, "Bad Request", &why))?;
     let head_size = target.len()
         + parts
             .headers

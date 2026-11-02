@@ -597,15 +597,15 @@ impl Endpoint for ContactBlock {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         // The page a block POST redirected to (Post/Redirect/Get, ledger #1879).
         if inv.request.verb == Verb::Source {
-            let word = param(inv, prg::OUTCOME);
+            let word = param(inv, prg::OUTCOME)?;
             if !word.is_empty() {
                 return Ok(block_outcome(&word));
             }
         }
-        let email = param(inv, "email");
-        let enquiry = param(inv, "id");
-        let token = param(inv, "t");
-        let exp: i64 = param(inv, "exp").parse().unwrap_or(0);
+        let email = param(inv, "email")?;
+        let enquiry = param(inv, "id")?;
+        let token = param(inv, "t")?;
+        let exp: i64 = param(inv, "exp")?.parse().unwrap_or(0);
 
         let key = verifying_key_at(&self.key_path)?;
         if !block_valid(&email, &enquiry, exp, &token, &key, now_secs()) {
@@ -778,15 +778,15 @@ impl Endpoint for ContactLabel {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         // The page a label POST redirected to (Post/Redirect/Get, ledger #1879).
         if inv.request.verb == Verb::Source {
-            let word = param(inv, prg::OUTCOME);
+            let word = param(inv, prg::OUTCOME)?;
             if !word.is_empty() {
                 return Ok(label_outcome(&word));
             }
         }
-        let label = param(inv, "label");
-        let enquiry = param(inv, "id");
-        let token = param(inv, "t");
-        let exp: i64 = param(inv, "exp").parse().unwrap_or(0);
+        let label = param(inv, "label")?;
+        let enquiry = param(inv, "id")?;
+        let token = param(inv, "t")?;
+        let exp: i64 = param(inv, "exp")?.parse().unwrap_or(0);
 
         let key = verifying_key_at(&self.key_path)?;
         if !label_valid(&label, &enquiry, exp, &token, &key, now_secs()) {
@@ -1287,7 +1287,10 @@ mod endpoint_tests {
         q.split('&')
             .map(|pair| {
                 let (k, v) = pair.split_once('=').unwrap();
-                (k.to_string(), crate::decide::percent_decode(v))
+                (
+                    k.to_string(),
+                    ikigai_fn::html::percent_decode(v, true).unwrap(),
+                )
             })
             .collect()
     }

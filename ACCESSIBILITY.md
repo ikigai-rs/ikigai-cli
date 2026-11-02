@@ -41,6 +41,14 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
 - An error page has `<html lang="en">`, a `<title>` and one `<h1>` naming the status, a `<main>`,
   and the message as escaped text; no style, no script. Its status code is the same as the text
   answer's, and both carry `Vary: Accept`.
+- A request whose percent-encoding is malformed or does not decode to UTF-8 is a `400` whose
+  sentence names the byte offset in what the client sent, in words. From the door: "malformed
+  percent-escape at byte N of the request target: a % must be followed by two hex digits" (the
+  `%` is in backquotes in the sentence), or "the path segment (query name, query value) at byte N
+  of the request target is not UTF-8 once percent-decoded". For a form body the intake or an
+  embedded-host page reads, the same words about "the form body", after "invalid argument
+  `content`:". A browser gets the same sentence on the error page. Nothing is passed on with a
+  literal `%` or a U+FFFD the client did not send.
 - An embedded-host page (`decide::page`) and the intake's redirect page have `<html lang="en">`
   and one `<main>` holding the heading and the content, and the viewport meta, so they read on
   a phone. An embedded-host page keeps a 32rem column, and its look is one linked same-origin
@@ -121,6 +129,9 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
   after the fix, along with selected-tab visibility and page headings. This checkout
   serves six Selection steps and eleven Lisp steps; it has no “The thread” page.
   No assistive technology was used.
+- `crates/ikigai-web/src/lib.rs`'s `a_refused_target_names_the_byte_offset`, the intake's
+  `a_malformed_form_body_is_refused_with_its_byte_offset` and `people.rs`'s
+  `a_form_body_is_decoded_strictly` pin the percent-decoding sentences above word for word.
 - `crates/ikigai-web/tests/post_redirect_get.rs` sends raw HTTP form submissions and pins
   the route's `303` and `Location`, follows the GET and reloads it without another Sink,
   and checks the htmx answer, failed writes, page aliases, encoded captures, and refusals
@@ -177,6 +188,7 @@ Found by reading the source on 2026-10-15, not by testing:
 | 2026-10-31 | Full-screen runbook step notes (ledger #2734) use normal intensity because they carry page content. Ratatui test-backend regressions check note cells with and without `NO_COLOR`; color behavior is unchanged. No assistive technology testing was performed. |
 
 | 2026-11-01 | The local root and general served surface bind ikigai-ui's shared shell and artifacts (ledger #2822), with read-only config-home overrides. A named-page HTTP fixture can be exported for the shared axe checker; the existing embedded pages and REPL text are unchanged. No assistive technology testing was performed. |
+| 2026-11-01 | Percent-decoding moves onto `ikigai_fn::html` (ledger #1878). The door's `400` for a malformed or non-UTF-8 request target now names the byte offset (it said only `malformed percent-escape` or `not UTF-8 once decoded`). The intake and the embedded host's form pages now refuse such a form body with a `400` naming the offset, where they kept a malformed escape literally and replaced invalid UTF-8 with U+FFFD. An intake configured with a redirect that is not a link target is refused at load (`try_submit`) with a sentence naming the intake and the redirect, where it was silently ignored. Unit tests pin each sentence; no assistive technology testing was performed. |
 
 ## Contributing
 

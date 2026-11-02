@@ -105,7 +105,7 @@ impl Endpoint for PeopleLedger {
                     )));
                 }
                 let arg = |name: &str| crate::decide::param(inv, name);
-                let email = arg("email");
+                let email = arg("email")?;
                 // The address is the whole point of the ledger — a record without one can
                 // never be reached, so reject it rather than store a dead entry.
                 if email.is_empty() {
@@ -116,10 +116,10 @@ impl Endpoint for PeopleLedger {
                 }
                 let record = format!(
                     "{{\"name\":{},\"email\":{},\"source\":{},\"note\":{},\"at\":{}}}\n",
-                    json_str(&arg("name")),
+                    json_str(&arg("name")?),
                     json_str(&email),
-                    json_str(&arg("source")),
-                    json_str(&arg("note")),
+                    json_str(&arg("source")?),
+                    json_str(&arg("note")?),
                     json_str(&now_rfc3339()),
                 );
                 append(&self.path, &record, "people")?;
@@ -316,6 +316,59 @@ mod tests {
         assert!(matches!(err, Error::InvalidArgument { .. }), "{err:?}");
         // Nothing was written.
         assert_eq!(read(&k, None), "");
+    }
+
+    fn post(k: &Kernel, body: &str) -> Result<()> {
+        block_on(
+            k.issue(
+                Request::new(Verb::Sink, Iri::parse("urn:people").unwrap())
+                    .with_arg("content", ArgRef::Inline(body.into())),
+                &Capability::scoped([CAP_PEOPLE_WRITE]),
+            ),
+        )
+        .map(|_| ())
+    }
+
+    /// Ledger #1878: a form body goes through `decide::param`, which decodes it strictly. `+`
+    /// is a space and `%2B` a plus; a malformed escape or invalid UTF-8 anywhere in the body is
+    /// refused with its byte offset, and nothing is written (the private decoder this replaced
+    /// kept `%zz` literally and turned `%FF` into U+FFFD, and recorded both).
+    #[test]
+    fn a_form_body_is_decoded_strictly() {
+        let k = kernel("form");
+        post(&k, "name=Ada+L%C3%B6&email=ada%2Bx%40x.example&source=form").unwrap();
+        assert!(
+            read(&k, None).contains("Ada Lö <ada+x@x.example>"),
+            "{}",
+            read(&k, None)
+        );
+
+        let k = kernel("form-bad");
+        for (body, detail) in [
+            (
+                "name=A%zz&email=a%40x.example",
+                "malformed percent-escape at byte 6 of the form body: a `%` must be followed by \
+                 two hex digits",
+            ),
+            (
+                "email=a%40x.example&note=100%",
+                "malformed percent-escape at byte 28 of the form body: a `%` must be followed \
+                 by two hex digits",
+            ),
+            (
+                "email=a%40x.example&name=%FF",
+                "the value at byte 25 of the form body is not UTF-8 once percent-decoded",
+            ),
+        ] {
+            match post(&k, body).unwrap_err() {
+                Error::InvalidArgument { name, detail: got } => {
+                    assert_eq!(name, "content", "{body:?}");
+                    assert_eq!(got, detail, "{body:?}");
+                }
+                other => panic!("{body:?}: expected InvalidArgument, got {other:?}"),
+            }
+        }
+        assert_eq!(read(&k, None), "", "nothing was recorded");
     }
 
     #[test]

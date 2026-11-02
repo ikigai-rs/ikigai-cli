@@ -1687,14 +1687,8 @@ fn served_endpoints(nature: &'static str) -> EndpointSpace {
         // un-routed path (a direct POST to some other space) is a 404, and grant a ceiling
         // of exactly {contact:submit, booking:submit, space:out}. Route table = the surface
         // allowlist, capability = the authority ceiling; a bug in one still leaves the other.
-        .bind(
-            Exact::new("urn:contact:submit"),
-            ikigai_intake::submit(contact_intake()),
-        )
-        .bind(
-            Exact::new("urn:booking:submit"),
-            ikigai_intake::submit(booking_intake()),
-        )
+        .bind(Exact::new("urn:contact:submit"), contact_submit())
+        .bind(Exact::new("urn:booking:submit"), booking_submit())
         .bind(
             UriTemplate::parse(ikigai_intray::SPACE_TEMPLATE).expect("SPACE_TEMPLATE is valid"),
             ikigai_intray::SpaceEndpoint::new(file_root().join("spaces")),
@@ -4965,19 +4959,19 @@ fn root_members(nature: &'static str) -> Vec<Arc<dyn Space>> {
         // urlencoded/JSON body, keeps only these declared fields, escapes them into a
         // tuple, and drops it into the reactive `contact` space — where the handler emails
         // it on. Field names match the form on bosatsu.net, `_honey` included.
-        Arc::new(ikigai_core::EndpointSpace::new().bind(
-            Exact::new("urn:contact:submit"),
-            ikigai_intake::submit(contact_intake()),
-        )) as Arc<dyn Space>,
+        Arc::new(
+            ikigai_core::EndpointSpace::new()
+                .bind(Exact::new("urn:contact:submit"), contact_submit()),
+        ) as Arc<dyn Space>,
         // The booking front door (urn:booking:submit): the visitor offers THEIR hours and
         // zone; the reactive `bookings` space fires schedule.scm, which finds a mutually
         // free slot. Brian's freebusy never leaves the machine — the visitor never sees a
         // calendar, only proposes availability. These field summaries are what a generated
         // form renders as labels, so the UI and the validation cannot drift apart.
-        Arc::new(ikigai_core::EndpointSpace::new().bind(
-            Exact::new("urn:booking:submit"),
-            ikigai_intake::submit(booking_intake()),
-        )) as Arc<dyn Space>,
+        Arc::new(
+            ikigai_core::EndpointSpace::new()
+                .bind(Exact::new("urn:booking:submit"), booking_submit()),
+        ) as Arc<dyn Space>,
         // Neutral s-expr → SPARQL transreptor (urn:sparql:from-sexpr, text/x-sexpr →
         // application/sparql-query): pipe an s-expr query in, feed the emitted SPARQL to
         // urn:sparql:select. A pure transreptor (no lisp engine); safe in the shared space.
@@ -6221,12 +6215,12 @@ impl Endpoint for ClientIssue {
 
         // Named argument first, urlencoded `content` second — so this Sink is drivable by a
         // pipe and by a form POST, not only by a hand-written argument list.
-        let arg = |name: &str| {
-            let value = crate::decide::param(inv, name);
-            (!value.is_empty()).then_some(value)
+        let arg = |name: &str| -> Result<Option<String>> {
+            let value = crate::decide::param(inv, name)?;
+            Ok((!value.is_empty()).then_some(value))
         };
-        let name = arg("name").ok_or_else(|| Error::MissingArgument("name".to_string()))?;
-        let id = arg("id").unwrap_or_else(|| slug(&name));
+        let name = arg("name")?.ok_or_else(|| Error::MissingArgument("name".to_string()))?;
+        let id = arg("id")?.unwrap_or_else(|| slug(&name));
         if id.is_empty() {
             return Err(Error::InvalidArgument {
                 name: "id".to_string(),
@@ -6238,13 +6232,13 @@ impl Endpoint for ClientIssue {
         record.insert("id".to_string(), serde_json::Value::String(id.clone()));
         record.insert("name".to_string(), serde_json::Value::String(name.clone()));
         for field in ["email", "organisation", "note"] {
-            if let Some(value) = arg(field) {
+            if let Some(value) = arg(field)? {
                 record.insert(field.to_string(), serde_json::Value::String(value));
             }
         }
         // An hour outside 0..=23 would silently produce a window nobody can book in.
         for field in ["earliest", "latest"] {
-            if let Some(value) = arg(field) {
+            if let Some(value) = arg(field)? {
                 let hour: u8 = value.parse().ok().filter(|h| *h <= 23).ok_or_else(|| {
                     Error::InvalidArgument {
                         name: field.to_string(),
@@ -6268,7 +6262,7 @@ impl Endpoint for ClientIssue {
         let mut link = format!("{}?k={}", booking_url(), token);
         // Pre-fill what we already know, so the client types as little as possible. These
         // are convenience only — they are editable, unlike the token.
-        for (param, value) in [("name", Some(name.clone())), ("email", arg("email"))] {
+        for (param, value) in [("name", Some(name.clone())), ("email", arg("email")?)] {
             if let Some(value) = value {
                 link.push_str(&format!("&{param}={}", urlencode(&value)));
             }
@@ -6277,8 +6271,8 @@ impl Endpoint for ClientIssue {
         // Sending is opt-in and never the default: minting a link is local and reversible,
         // putting it in someone's inbox is neither.
         let mut sent = String::new();
-        if arg("send").is_some_and(|v| matches!(v.as_str(), "yes" | "true" | "1")) {
-            let to = arg("email").ok_or_else(|| Error::InvalidArgument {
+        if arg("send")?.is_some_and(|v| matches!(v.as_str(), "yes" | "true" | "1")) {
+            let to = arg("email")?.ok_or_else(|| Error::InvalidArgument {
                 name: "send".to_string(),
                 detail: "nothing to send to — this client has no `email`".to_string(),
             })?;
@@ -6391,6 +6385,19 @@ impl Endpoint for ClientIssue {
             )
             .output("text/plain; charset=utf-8")
     }
+}
+
+/// The contact intake, loaded through `try_submit` so a configured redirect that is not a link
+/// target stops the host at startup with a sentence naming it (ledger #1878) instead of being
+/// ignored on every submission. The configuration is this file's constant, so a refusal is a
+/// defect in this file, and the tests that build either space reach it first.
+fn contact_submit() -> ikigai_intake::IntakeEndpoint {
+    ikigai_intake::try_submit(contact_intake()).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// The booking intake, loaded the way [`contact_submit`] loads the contact intake.
+fn booking_submit() -> ikigai_intake::IntakeEndpoint {
+    ikigai_intake::try_submit(booking_intake()).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// The public contact form's accepted fields. Each `summary` is human-facing on purpose:
