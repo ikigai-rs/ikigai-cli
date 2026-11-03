@@ -49,6 +49,8 @@ const XSD_BOOLEAN: &str = "http://www.w3.org/2001/XMLSchema#boolean";
 // kernel, and `urn:iki:host:arrangement`, the root's arrangement as a declaration.
 pub mod agents;
 pub mod arrangement;
+#[cfg(all(feature = "ipc", unix))]
+pub mod socket;
 // The spam filter (`urn:bayes:*`, ledger #1512): bound in the local root when the binary arms it
 // with a state directory and named models. One writer per state directory, so one open per
 // process; see the module note.
@@ -1075,29 +1077,37 @@ fn org_config() -> Option<(PathBuf, Vec<String>)> {
     Some((dir, files))
 }
 
-/// Where MCP grants are read from: `$IKIGAI_GRANTS` else `grants.json` in the
+/// Where grants are read from: `--grants` else `grants.json` in the
 /// [config home](crate::config::config_home). Exposed so a host can WATCH it (the
 /// live grant-swap: edit the file, the connected client's tool list morphs).
 ///
 /// A watcher makes the config home's ONE spelling load-bearing: watch the path a
 /// second spelling produced and the edit that should have re-scoped a live session
 /// lands in a directory nobody is reading.
-pub fn grants_path() -> Option<PathBuf> {
+///
+/// # Errors
+///
+/// A set `IKIGAI_GRANTS` is refused, including an empty value. Unset it and
+/// pass `--grants <file>` instead; it must never silently select another file.
+pub fn grants_path() -> std::result::Result<Option<PathBuf>, String> {
+    if std::env::var_os("IKIGAI_GRANTS").is_some() {
+        return Err(
+            "IKIGAI_GRANTS is no longer supported; move its path to --grants <file>.".into(),
+        );
+    }
     if let Some(path) = GRANTS_PATH_OVERRIDE
         .lock()
         .expect("grants path lock")
         .clone()
     {
-        return Some(path);
+        return Ok(Some(path));
     }
-    std::env::var_os("IKIGAI_GRANTS")
-        .map(PathBuf::from)
-        .or_else(|| crate::config::config_home().map(|dir| dir.join("grants.json")))
+    Ok(crate::config::config_home().map(|dir| dir.join("grants.json")))
 }
 
 static GRANTS_PATH_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
-/// Point [`grants_path`] at `path`, ahead of `$IKIGAI_GRANTS` and the config home: the
+/// Point [`grants_path`] at `path`, ahead of the config home: the
 /// `ikigai mcp --grants <file>` flag (ledger #1830), which an agent session needs because its
 /// grants file must live where its user cannot write ([`agents::check_protected`]), and the
 /// config home is that user's. Process-global, like [`set_file_root`].
@@ -1115,7 +1125,7 @@ pub(crate) fn grant_entry_scopes(entry: &serde_json::Value) -> Vec<String> {
 }
 
 /// The scopes of a named MCP grant, from `~/.config/ikigai/grants.json`
-/// (env override `IKIGAI_GRANTS`). A grant is a NAMED UNION of capability scopes —
+/// (override with `--grants <file>`). A grant is a NAMED UNION of capability scopes —
 /// the union of affordances an MCP session may see. Two shapes are accepted, so a
 /// grant can also carry a *visibility* profile (see [`grant_visibility`]): the
 /// original scopes-only array `"<grant>": ["urn:cap:…", …]`, or an object
@@ -1155,7 +1165,7 @@ fn grant_entry(name: &str) -> Option<serde_json::Value> {
     if name == agents::PRINCIPALS_KEY {
         return None;
     }
-    let path = grants_path()?;
+    let path = grants_path().ok()??;
     let text = std::fs::read_to_string(path).ok()?;
     let v = serde_json::from_str::<serde_json::Value>(&text).ok()?;
     let entry = &v[name];

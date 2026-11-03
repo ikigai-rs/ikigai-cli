@@ -3,8 +3,8 @@
 //! server's minter calls with a certificate fingerprint — and an edit to that file revokes
 //! the peer on its NEXT CALL over a connection that stays up.
 //!
-//! Its own test binary on purpose: it points `IKIGAI_CLIENTS`/`IKIGAI_GRANTS` at scratch
-//! files, and environment variables are process-global.
+//! Its own test binary on purpose: the `IKIGAI_CLIENTS` and grants-path overrides
+//! are process-global.
 #![cfg(feature = "p2p")]
 
 use std::sync::Arc;
@@ -81,7 +81,7 @@ async fn a_peer_id_is_authorized_by_the_same_clients_json_and_an_edit_revokes_it
     )
     .unwrap();
     std::env::set_var("IKIGAI_CLIENTS", &clients);
-    std::env::set_var("IKIGAI_GRANTS", &grants);
+    ikigai_embedded::set_grants_path(grants);
 
     let server_key = Keypair::generate_ed25519();
     let client_key = Keypair::generate_ed25519();

@@ -380,7 +380,7 @@ mod tests {
         let Some(home) = config_home() else {
             return; // no HOME and no XDG_CONFIG_HOME: nothing to be a sibling of.
         };
-        let grants = crate::grants_path();
+        let grants = crate::grants_path().unwrap();
         let clients = crate::clients::clients_path();
         assert_eq!(config_path().parent(), Some(home.as_path()));
         assert_eq!(

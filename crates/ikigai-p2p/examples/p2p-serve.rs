@@ -31,15 +31,15 @@ mod keystore;
 
 fn main() -> Result<(), BoxError> {
     let flags = Flags::parse()?;
-    // ⚠ Spike-only plumbing: the flags are carried to the grant reader through its existing
-    // override variables, set here while the process is still single-threaded (before the
-    // runtime exists). A real `serve --p2p` would pass paths, not environment.
+    // Spike-only clients override, set before the runtime exists. The grants flag
+    // uses the host's explicit path override, shared with the CLI.
     if let Some(clients) = flags.all("clients").pop() {
         std::env::set_var("IKIGAI_CLIENTS", clients);
     }
     if let Some(grants) = flags.all("grants").pop() {
-        std::env::set_var("IKIGAI_GRANTS", grants);
+        ikigai_embedded::set_grants_path(grants.into());
     }
+    let _ = ikigai_embedded::grants_path()?;
     let keypair = keystore::keypair(&flags.one("key")?, flags.all("keystore").pop())?;
     let me = keypair.public().to_peer_id();
     // Printed before anything else can fail: this is the id the relay's `--allow` and the
