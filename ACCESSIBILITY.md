@@ -215,3 +215,5 @@ adds it): what you were doing, what happened, and your terminal or browser and a
 technology, if you are comfortable sharing them. Anything security-sensitive goes through
 [private vulnerability reporting](https://github.com/ikigai-rs/ikigai-cli/security/advisories/new).
 **We acknowledge a report within 7 days**, and promise nothing further.
+
+| 2026-11-02 | `--grants <file>` becomes a global host flag. A set `IKIGAI_GRANTS` stops startup with a plain `ikigai:` diagnostic naming the variable and replacement flag. Binary regression tests cover the refusal and the socket host's flag; no assistive technology testing was performed. |

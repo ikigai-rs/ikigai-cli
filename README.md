@@ -1190,3 +1190,15 @@ that output.
 
 ## License
 MIT OR Apache-2.0. See `LICENSE-MIT` / `LICENSE-APACHE`. See `ACKNOWLEDGEMENTS.md`.
+
+### Grants configuration in 0.3.0
+
+`IKIGAI_GRANTS` is no longer supported. A set variable stops host startup with a
+migration message; unset it and pass `--grants <file>` instead. The flag works for
+all local hosts, including `ikigai serve <socket>` and `ikigai mcp`. Without it,
+grants are read from `<config home>/grants.json`. No `grants.path` config key is
+introduced. The grants file's existing account protection checks still apply.
+
+Socket hosts can reuse the account-to-admission policy through
+`ikigai_embedded::socket` with the `ipc` feature enabled. `grants_path()` now
+returns `Result<Option<PathBuf>, String>` so hosts can report retired configuration.

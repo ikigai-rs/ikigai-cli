@@ -31,7 +31,6 @@ mod accept;
 
 use std::io;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2030,41 +2029,18 @@ fn peer_uid(_stream: &UnixStream) -> Option<u32> {
 /// `None` where it cannot be read.
 #[cfg(target_os = "linux")]
 fn peer_pid(stream: &UnixStream) -> Option<i32> {
-    let mut cred = libc::ucred {
-        pid: 0,
-        uid: 0,
-        gid: 0,
-    };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: a valid fd and correctly-sized out-params for SO_PEERCRED.
-    let rc = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut cred as *mut libc::ucred).cast(),
-            &mut len,
-        )
-    };
-    (rc == 0 && cred.pid > 0).then_some(cred.pid)
+    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+    getsockopt(stream, PeerCredentials)
+        .ok()
+        .map(|cred| cred.pid())
+        .filter(|pid| *pid > 0)
 }
 
 /// The connected peer's process id (macOS: `LOCAL_PEERPID`).
 #[cfg(target_vendor = "apple")]
 fn peer_pid(stream: &UnixStream) -> Option<i32> {
-    let mut pid: libc::pid_t = 0;
-    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
-    // SAFETY: a valid fd and a correctly-sized out-param for LOCAL_PEERPID.
-    let rc = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_LOCAL,
-            libc::LOCAL_PEERPID,
-            (&mut pid as *mut libc::pid_t).cast(),
-            &mut len,
-        )
-    };
-    (rc == 0 && pid > 0).then_some(pid)
+    use nix::sys::socket::{getsockopt, sockopt::LocalPeerPid};
+    getsockopt(stream, LocalPeerPid).ok().filter(|pid| *pid > 0)
 }
 
 /// Elsewhere the peer's process id is not read; the refusal says so.
