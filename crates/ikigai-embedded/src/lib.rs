@@ -2135,7 +2135,8 @@ pub struct ServedSurface {
     /// machine's inference. Bounded by construction — the llm module only reaches
     /// its configured providers, and `require_net` still checks the provider host
     /// against the grant, so `--cap urn:cap:net:localhost` means "use my local
-    /// models, nothing else". The general HTTP client stays embedded-only, so this
+    /// models, nothing else". A provider naming an API-key secret also requires
+    /// `urn:cap:llm:use:<provider>`. The general HTTP client stays embedded-only, so this
     /// grants no arbitrary outbound access. (`urn:llm:config` redacts API keys.)
     ///
     /// Without one, `urn:llm:` is LIMITED on the served root, like `urn:personal:` — AND the
@@ -2564,8 +2565,9 @@ fn http_space() -> impl Space {
 }
 
 /// The LLM module (`urn:llm:ask` + `urn:llm:<provider>:ask`) on the native ureq
-/// transport. Slice 0: an OpenAI-compatible backend defaulting to a local Ollama.
-/// (Mounted via a local path override until ikigai-llm is published.)
+/// transport, defaulting to a local Ollama. Named provider keys are read through
+/// [`HostSecrets`] on the host's authority; callers need the provider's
+/// `urn:cap:llm:use:<provider>` scope, never raw-secret read access.
 ///
 /// Its transport waits at least [`LLM_HTTP_TIMEOUT_FLOOR`]: a non-streamed answer arrives in
 /// one piece after the whole generation, so the 30 s `http.timeout` default would refuse a
@@ -2574,7 +2576,11 @@ fn http_space() -> impl Space {
 fn llm_space() -> EndpointSpace {
     let mut transport = UreqTransport::default();
     transport.timeout = transport.timeout.max(LLM_HTTP_TIMEOUT_FLOOR);
-    ikigai_llm::space(Arc::new(transport), llm_registry())
+    ikigai_llm::space_with_secrets(
+        Arc::new(transport),
+        Arc::new(HostSecrets(ikigai_secret::default_backend())),
+        llm_registry(),
+    )
 }
 
 /// The least the LLM transport waits: the 300 s default of `lisp.timeout`, the governor its
@@ -4101,11 +4107,18 @@ fn peers_turtle(peers: &[ikigai_discovery::Peer]) -> String {
     out
 }
 
-/// Bridges the keystore to `ikigai_meeting::SecretReader`: resolve a secret by name from the same
-/// backend the `urn:secret:*` space reads. (Per-invocation secret-cap gating is a later refinement;
-/// today the embedded-only reachability of the meeting endpoint plus its net-cap check are the
-/// authority boundary.)
+/// Bridges the keystore to the LLM and meeting readers, using the same backend as
+/// `urn:secret:*`. The LLM checks `urn:cap:llm:use:<provider>` before calling the reader.
+/// The meeting endpoint is embedded-only and checks its net capability.
 struct HostSecrets(Arc<dyn ikigai_secret::Backend>);
+
+impl ikigai_llm::SecretReader for HostSecrets {
+    fn read(&self, name: &str) -> ikigai_core::Result<Vec<u8>> {
+        self.0.get(name)?.ok_or_else(|| {
+            ikigai_core::Error::NotFound(format!("secret `{name}` is not in the keystore"))
+        })
+    }
+}
 
 impl ikigai_meeting::SecretReader for HostSecrets {
     fn read(&self, name: &str) -> ikigai_core::Result<Vec<u8>> {
