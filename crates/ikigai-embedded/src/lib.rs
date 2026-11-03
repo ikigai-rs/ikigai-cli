@@ -9437,6 +9437,9 @@ mod tests {
     /// a watch must neither keep a kernel alive nor keep a process (or a test) running. The
     /// end-to-end half, a door serving a changed file fresh, is `tests/served_watch.rs` in
     /// `ikigai-cli`, through the real binary.
+    // Native watcher callbacks may briefly own the kernel; bound the wait for their
+    // completion with real wall-clock time, independent of the kernel's injected clock.
+    #[allow(clippy::disallowed_methods)]
     #[test]
     fn watch_workspace_starts_only_for_a_kernel_that_binds_files_and_holds_it_weakly() {
         let door = Arc::new(kernel_for("Test (HTTP)"));
@@ -9448,10 +9451,17 @@ mod tests {
             file_root().canonicalize().unwrap(),
             "the watch is over the workspace the door's file module is jailed to"
         );
-        assert_eq!(
-            Arc::strong_count(&door),
-            1,
-            "the watch holds the kernel weakly, so dropping the door's handle frees it"
+        let weak_door = Arc::downgrade(&door);
+        drop(door);
+        // A callback may already have upgraded its weak reference. Let that temporary
+        // owner finish, but keep the watch alive: it must not retain the kernel itself.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while weak_door.upgrade().is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            weak_door.upgrade().is_none(),
+            "the live watch must release the kernel after the door's last strong owner drops"
         );
         drop(watch);
 
