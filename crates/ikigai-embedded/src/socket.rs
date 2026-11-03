@@ -105,6 +105,34 @@ pub fn shared_socket_from(
     }))
 }
 
+/// The account a socket client also accepts a server from (`ipc.server_user` in the config
+/// home's `config.toml`), beside its own, or `None` when it accepts only its own.
+///
+/// # Errors
+///
+/// A name the system does not know: a typo must not read as "no account named".
+pub fn server_uid() -> Result<Option<u32>, String> {
+    server_uid_from(crate::config::get("ipc.server_user"))
+}
+
+/// [`server_uid`] over the configured value, a user name or a numeric UID.
+///
+/// # Errors
+///
+/// As [`server_uid`].
+pub fn server_uid_from(user: Option<String>) -> Result<Option<u32>, String> {
+    let Some(user) = user else {
+        return Ok(None);
+    };
+    let user = user.trim().trim_matches('"');
+    match user.parse::<u32>() {
+        Ok(uid) => Ok(Some(uid)),
+        Err(_) => ikigai_ipc::uid_of_user(user)
+            .map(Some)
+            .map_err(|e| format!("ipc.server_user: {e}")),
+    }
+}
+
 /// The socket door's reading of the principals table's accounts (ledger #2139).
 #[cfg(test)]
 mod shared_socket_tests {
@@ -184,6 +212,18 @@ mod shared_socket_tests {
             "{refused}"
         );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn the_server_user_is_a_name_or_a_uid_and_a_typo_is_refused() {
+        assert_eq!(server_uid_from(None), Ok(None));
+        assert_eq!(server_uid_from(Some("502".to_string())), Ok(Some(502)));
+        assert_eq!(server_uid_from(Some("\"0\"".to_string())), Ok(Some(0)));
+        let refused = server_uid_from(Some("no-such-ikigai-account-2966".to_string()))
+            .err()
+            .unwrap();
+        assert!(refused.contains("ipc.server_user"), "{refused}");
+        assert!(refused.contains("no user named"), "{refused}");
     }
 
     #[test]
