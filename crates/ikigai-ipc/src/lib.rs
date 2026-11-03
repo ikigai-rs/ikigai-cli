@@ -4834,14 +4834,37 @@ mod server_uid_tests {
     fn impostor(path: &Path) -> thread::JoinHandle<Vec<u8>> {
         let _ = std::fs::remove_file(path);
         let listener = UnixListener::bind(path).unwrap();
+        listener.set_nonblocking(true).unwrap();
         thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut received = Vec::new();
-            let _ = stream.read_to_end(&mut received);
-            received
+            for _ in 0..500 {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    // A client that hung up before this accept: Darwin reports it here (EINVAL),
+                    // where Linux hands over the closed connection. Nothing can have arrived: a
+                    // client that sent its hello is still waiting for the answer.
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::InvalidInput | io::ErrorKind::ConnectionAborted
+                        ) =>
+                    {
+                        return Vec::new();
+                    }
+                    Err(e) => panic!("the impostor's accept failed: {e}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut received = Vec::new();
+                let _ = stream.read_to_end(&mut received);
+                return received;
+            }
+            Vec::new()
         })
     }
 
