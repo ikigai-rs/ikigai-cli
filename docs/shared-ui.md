@@ -17,23 +17,61 @@ A page can use the shared shell without Rust. Put its content in your workspace:
 Bind the content and the composition in a `names` file:
 
 ```text
-urn:quakes:page = source urn:iki:fn:compose src=<urn:iki:ui:template:shell> family=quakes name=home theme=auto
+urn:quakes:page = source urn:iki:fn:compose src=<urn:iki:ui:template:shell> family=quakes name=home
+  input theme default=auto one-of="auto" one-of="light" one-of="dark" one-of="high-contrast"
 urn:iki:ui:title:quakes:home = source urn:file:title.txt
 urn:iki:ui:header:quakes = source urn:file:header.html
 urn:iki:ui:head:quakes = source urn:file:head.html
 urn:iki:ui:main:quakes:home = source urn:file:page.html
-urn:iki:ui:chooser:quakes:auto = source urn:iki:ui:theme-chooser:auto
 ```
 
-The last line puts ikigai-ui's theme chooser in the page's header, after `header.html`. The
-shell reads `urn:iki:ui:chooser:{family}:{theme}` there, so a page composed over it must name one:
-without that line `/quakes` answers `404` naming `urn:iki:ui:chooser:quakes:auto`. Bind it to
-`urn:iki:ui:theme-chooser:{theme}` with the same theme the composition fixes, or to an empty file
-for no chooser. With the shell script a viewer's choice applies at once and is kept in that
-browser only. Without script, the chooser's Apply button asks for `/quakes?theme=…`, and this page
-refuses it with a `400` (``invalid argument `theme`: fixed by <urn:quakes:page> to auto``),
-because the composition fixes `theme`. A page built with ikigai-ui's `pages()` in Rust takes
-`theme=` from the request and has no such gap.
+**This needs ikigai-ui 0.4.1 or later.** A binary built with this repository's `Cargo.lock`
+(`--locked`) still has 0.4.0, where `/quakes` answers `404` naming
+`urn:iki:ui:chooser:quakes:auto`. On 0.4.0, add this line. On 0.4.1 it is never reached and does
+no harm:
+
+```text
+urn:iki:ui:chooser:quakes:{theme} = source urn:iki:ui:theme-chooser:{theme}
+```
+
+The shell puts ikigai-ui's theme chooser in the page's header, after `header.html`, with nothing
+to bind. With the shell script a viewer's choice applies at once and is kept in that browser only.
+Without script, the chooser's Apply button asks for `/quakes?theme=…`, which the `theme` input
+accepts:
+
+```text
+$ curl -si 'http://127.0.0.1:8080/quakes?theme=dark'
+HTTP/1.1 200 OK
+Content-Type: text/html; charset=utf-8
+...
+<html lang="en" data-theme="dark">
+...
+<form class="ui-theme" method="get">
+...
+<option value="dark" selected>Dark</option>
+```
+
+That is this recipe through the real HTTP door, sent once by hand with ikigai-ui 0.4.1 on
+2026-11-03. A request with no `theme` renders `auto`. A value that is not a theme is refused:
+`?theme=sepia` answers `404` with
+`not found: urn:iki:ui:chooser:quakes:sepia: not a theme (the themes are: auto, light, dark, high-contrast)`.
+That refusal comes from the chooser, not from `one-of`, which the door did not enforce.
+
+Do not write `theme=auto` on the binding's own line. That fixes the argument, and Apply is then
+refused with a `400` (``invalid argument `theme`: fixed by <urn:quakes:page> to auto``).
+
+To turn the chooser off for every theme, put an empty `empty.html` in your workspace and bind the
+family's override to it. Bind it to your own markup to replace the chooser instead:
+
+```text
+urn:iki:ui:chooser-override:quakes:{theme} = source urn:file:empty.html
+```
+
+Bind the override, not `urn:iki:ui:chooser:quakes:{theme}`: from 0.4.1, ikigai-ui's space answers
+that name first, so a binding of it in a names file is never reached and the chooser stays. On
+0.4.0 the override is not read and the page answers `404`. There, bind
+`urn:iki:ui:chooser:quakes:{theme}` to `empty.html` instead, which also stops refusing unknown
+themes (`?theme=sepia` renders).
 
 The shell uses `$h` for the title and theme, and `$r` for trusted header, head and main markup.
 Escape untrusted values in your view before producing that markup. An XSLT view can supply the
@@ -88,8 +126,9 @@ and compositions over it. Removing an override restores the compiled artifact. C
 directory before starting the host; creating it afterward requires restarting. A custom host
 constructing a kernel directly must hold `watch_workspace`'s handle to observe editor changes.
 
-`crates/ikigai-cli/tests/names_served.rs` serves this example and its assets through HTTP.
-Export that served page and its assets with ikigai-ui's test kit:
+`crates/ikigai-cli/tests/names_served.rs` serves this page and its assets through HTTP in its
+earlier form, with `theme=auto` fixed on the binding and the chooser named. It does not run the
+`theme` input above. Export that served page and its assets with ikigai-ui's test kit:
 
 ```sh
 IKIGAI_UI_AXE_SITE="$PWD/target/ui-axe-site" cargo test -p ikigai-cli --locked \
