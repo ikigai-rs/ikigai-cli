@@ -31,8 +31,7 @@ fn an_enrolled_client_receives_the_legacy_grants_refusal() {
         std::env::set_var("IKIGAI_GRANTS", value);
         let expected = ikigai_embedded::grants_path().unwrap_err();
         let error = ikigai_embedded::clients::authorize(fingerprint, &Capability::root())
-            .err()
-            .expect("legacy environment must refuse authorization");
+            .expect_err("legacy environment must refuse authorization");
         assert_eq!(error, expected);
         for name in ["reader", "missing", "principals"] {
             assert_eq!(ikigai_embedded::grant_scopes(name).unwrap_err(), expected);
