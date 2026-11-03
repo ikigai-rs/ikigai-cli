@@ -1131,8 +1131,14 @@ pub(crate) fn grant_entry_scopes(entry: &serde_json::Value) -> Vec<String> {
 /// original scopes-only array `"<grant>": ["urn:cap:…", …]`, or an object
 /// `"<grant>": { "scopes": ["urn:cap:…", …], "show": […], "hide": […] }`.
 /// Unknown grant / no file / neither shape ⇒ empty.
-pub fn grant_scopes(name: &str) -> Vec<String> {
-    grant_entry(name).map(|e| scopes_of(&e)).unwrap_or_default()
+///
+/// # Errors
+///
+/// Returns the configuration refusal from [`grants_path`].
+pub fn grant_scopes(name: &str) -> std::result::Result<Vec<String>, String> {
+    Ok(grant_entry(name)?
+        .map(|e| scopes_of(&e))
+        .unwrap_or_default())
 }
 
 /// The visibility profile of a named MCP grant — the `show`/`hide` glob lists from
@@ -1140,10 +1146,14 @@ pub fn grant_scopes(name: &str) -> Vec<String> {
 /// grant's *authority* ([`grant_scopes`]): visibility narrows the projected tool
 /// list to what's worth showing, without changing what the session may call.
 /// Returns `(show, hide)`.
-pub fn grant_visibility(name: &str) -> (Vec<String>, Vec<String>) {
-    grant_entry(name)
+///
+/// # Errors
+///
+/// Returns the configuration refusal from [`grants_path`].
+pub fn grant_visibility(name: &str) -> std::result::Result<(Vec<String>, Vec<String>), String> {
+    Ok(grant_entry(name)?
         .map(|e| visibility_of(&e))
-        .unwrap_or_default()
+        .unwrap_or_default())
 }
 
 /// Scopes of one grant entry: the object form nests them under `"scopes"`; the
@@ -1160,19 +1170,20 @@ fn visibility_of(entry: &serde_json::Value) -> (Vec<String>, Vec<String>) {
 
 /// Read one grant's JSON value from the grants file. `None` if there is no file,
 /// it doesn't parse, or the grant is absent.
-fn grant_entry(name: &str) -> Option<serde_json::Value> {
+fn grant_entry(name: &str) -> std::result::Result<Option<serde_json::Value>, String> {
+    // Refuse retired configuration even for reserved or absent grant names.
+    let path = grants_path()?;
     // The principals table is not a grant (ledger #1830).
     if name == agents::PRINCIPALS_KEY {
-        return None;
+        return Ok(None);
     }
-    let path = grants_path().ok()??;
-    let text = std::fs::read_to_string(path).ok()?;
-    let v = serde_json::from_str::<serde_json::Value>(&text).ok()?;
-    let entry = &v[name];
-    if entry.is_null() {
-        return None;
-    }
-    Some(entry.clone())
+    let entry = (|| {
+        let text = std::fs::read_to_string(path?).ok()?;
+        let v = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+        let entry = &v[name];
+        (!entry.is_null()).then(|| entry.clone())
+    })();
+    Ok(entry)
 }
 
 /// The string members of a JSON array value (non-arrays and non-strings dropped).

@@ -201,6 +201,10 @@ Found by reading the source on 2026-10-15, not by testing:
 | 2026-11-01 | The served shell moves to ikigai-ui 0.4.0 (ledger #2854). Every page over it holds one announcing status region (`role="status"`, `aria-live="polite"`; ikigai-ui's notes are tied by `aria-describedby` and carry no role), and a theme chooser in its `<header>` after the page's own header: a GET form with a visible "Theme" label, a native select of Auto (system), Light, Dark and High contrast in words, and an Apply button the shell script hides. A `names`-file page must now name its chooser (`urn:iki:ui:chooser:{family}:{theme}`); the recipe says how. The socket test pins the one region and the chooser; the shared axe checker passed 19 rules in light, dark and more-contrast media. No assistive technology testing was performed. |
 | 2026-11-02 | The idle-stdin warning (ledger #2437) drops its hard-coded `content=…` advice. The engine's following missing-argument diagnostic already names the required input and how to supply it (for example, `in=…` for a Source). A binary regression holds stdin open and silent and pins that the output gives the correct `in=…` hint without conflicting `content=…` advice. No color is added; no assistive technology testing was performed. |
 
+| 2026-11-02 | `--grants <file>` becomes a global host flag. A set `IKIGAI_GRANTS` stops startup with a plain `ikigai:` diagnostic naming the variable and replacement flag. Binary regression tests cover the refusal and the socket host's flag; no assistive technology testing was performed. |
+
+| 2026-11-02 | The global `--grants` parser names `<file>` in missing-value refusals (ledger #2952). Library grant lookups preserve the `IKIGAI_GRANTS` refusal instead of reporting an unknown grant. Library and binary regression tests pin these diagnostics; no color is added and no assistive technology testing was performed. |
+
 ## Contributing
 
 Read this file before changing any output listed above. A change to an HTML page keeps the rules
@@ -215,5 +219,3 @@ adds it): what you were doing, what happened, and your terminal or browser and a
 technology, if you are comfortable sharing them. Anything security-sensitive goes through
 [private vulnerability reporting](https://github.com/ikigai-rs/ikigai-cli/security/advisories/new).
 **We acknowledge a report within 7 days**, and promise nothing further.
-
-| 2026-11-02 | `--grants <file>` becomes a global host flag. A set `IKIGAI_GRANTS` stops startup with a plain `ikigai:` diagnostic naming the variable and replacement flag. Binary regression tests cover the refusal and the socket host's flag; no assistive technology testing was performed. |

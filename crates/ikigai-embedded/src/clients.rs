@@ -374,7 +374,7 @@ fn authority_in(
     enrolment: &Enrolment,
     fingerprint: &str,
     ceiling: &Capability,
-    scopes_of: impl Fn(&str) -> Vec<String>,
+    scopes_of: impl Fn(&str) -> Result<Vec<String>, String>,
 ) -> Result<(String, Capability), String> {
     // ★ The order is the rule (ledger #1825): an entry of its own FIRST, and only then the
     // grant it names or the default. Asking for a grant first let the default answer for a
@@ -390,7 +390,7 @@ fn authority_in(
     let Some(grant) = enrolment.grant_for(fingerprint) else {
         return Err("no grant is configured for this certificate".to_string());
     };
-    let scopes = scopes_of(grant);
+    let scopes = scopes_of(grant)?;
     // The footgun, refused: an unknown or empty grant is not "unrestricted", it is
     // "undecided", and an undecided client gets nothing.
     if scopes.is_empty() {
@@ -411,8 +411,8 @@ mod tests {
     use super::*;
 
     /// The grants a test's `grants.json` would hold.
-    fn grants(name: &str) -> Vec<String> {
-        match name {
+    fn grants(name: &str) -> Result<Vec<String>, String> {
+        Ok(match name {
             "contacts-ro" => vec!["urn:cap:personal:contacts:read".to_string()],
             "everything" => vec![
                 "urn:cap:personal:contacts:read".to_string(),
@@ -420,7 +420,7 @@ mod tests {
             ],
             // A grant NAMED in clients.json but absent from grants.json.
             _ => vec![],
-        }
+        })
     }
 
     const FP: &str = "6f1c00000000000000000000000000000000000000000000000000000000abcd";
