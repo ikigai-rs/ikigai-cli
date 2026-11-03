@@ -57,7 +57,11 @@ The cache indicator then reflects the *server's* cache, so two clients sharing a
 server see each other's `cached` results. The socket lives in a `0700` per-user
 directory and is `0600`; the server checks each peer's kernel-verified UID and
 refuses other users — no certificates, because the OS already authenticates a
-local peer.
+local peer. The client checks the server the same way, before it sends anything: a socket
+served by another user is refused, so another account that binds a path first, such as one
+under `/tmp`, does not receive your requests. To attach to a door another account serves for
+you, set `ipc.server_user = "<user or uid>"` in the config home; that one account is then
+accepted on every socket this client dials, beside your own.
 
 Across a **network**, the same `serve` / `--connect` work over QUIC (built with
 `--features quic`), authenticated by **mutually-pinned TLS certificates**:

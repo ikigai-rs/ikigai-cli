@@ -32,6 +32,11 @@ No CA, no TLS — the operating system already authenticates a local peer:
 - **`serve`** additionally checks each peer's **kernel-verified UID** (`SO_PEERCRED`
   on Linux, `getpeereid` on macOS/BSD, read through the `nix` crate) and refuses any
   connection that isn't the server's own user — defense in depth over the directory mode.
+- **`connect`** checks the same thing from the other end: before writing anything, on every
+  dial and redial, it reads the server's kernel-verified UID and refuses a server that isn't
+  this user. A path says nothing about who listens on it, so another local user who binds a
+  path first (one under `/tmp`, say) gets `PermissionDenied` naming both users, and not the
+  client's calls. A server whose UID cannot be read is refused too.
 
 Because the peer is the owner, a `cap`-attenuated `--connect` session carries its
 capability over `Call::IssueAs`; the server resolves under it (already ≤ root), so
@@ -76,6 +81,12 @@ sudo mkdir /var/run/ikigai && sudo chown brian:ikigai /var/run/ikigai && sudo ch
 ```
 
 Every directory above it must let the group's members search it as well.
+
+A client under the admitted account dials with **`connect_trusting(path, timeout, mode,
+server_uid)`**, naming the door's account: its server is not the client's own user, so a plain
+`connect` refuses it. The `ikigai` binary reads `ipc.server_user` (a user name or UID) from its
+config home for this, for `--connect` and for socket mounts alike. That one account is trusted
+on every socket path this client dials, beside its own.
 
 ### The trust model, plainly
 

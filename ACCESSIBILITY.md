@@ -201,6 +201,8 @@ Found by reading the source on 2026-10-15, not by testing:
 | 2026-11-02 | The global `--grants` parser names `<file>` in missing-value refusals (ledger #2952). Library grant lookups preserve the `IKIGAI_GRANTS` refusal instead of reporting an unknown grant. Library and binary regression tests pin these diagnostics; no color is added and no assistive technology testing was performed. |
 | 2026-11-03 | The `names`-file recipe in `docs/shared-ui.md` declares a `theme` input instead of fixing `theme`, so a no-script Apply is answered with the page in the chosen theme, and it names the override for turning the chooser off (ledger #2955). Docs only, so no output changed. One `GET /quakes?theme=dark` was sent through the door with `curl` and ikigai-ui 0.4.1. No test covers it, and no browser, axe or assistive technology testing was performed. |
 
+| 2026-11-03 | A socket client refuses a server run by another account before sending anything (ledger #2966). `--connect` and a socket mount stop with a plain `ikigai:` line that names the socket, both user ids, that nothing was sent and the `ipc.server_user` setting; an unknown `ipc.server_user` is refused by name. No color is added. Unit tests in `ikigai-ipc` and a binary test pin the sentences; no assistive technology testing was performed. |
+
 ## Contributing
 
 Read this file before changing any output listed above. A change to an HTML page keeps the rules

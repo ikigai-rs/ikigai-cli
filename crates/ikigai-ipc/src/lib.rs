@@ -871,18 +871,53 @@ pub fn connect_with_timeout(path: &Path, timeout: Option<Duration>) -> io::Resul
 /// redialing at 7 (see the private `handshake`). A peer outside the spoken
 /// range errors naming BOTH versions; a peer that hangs up on the hello
 /// predates v6 entirely and is refused with that diagnosis.
+///
+/// Before anything is written, the server's kernel-verified UID must be this user's; a socket
+/// served by another account is refused with [`PermissionDenied`](io::ErrorKind::PermissionDenied).
+/// To dial a door run by another account, [`connect_trusting`] names that account.
 pub fn connect_with(
     path: &Path,
     timeout: Option<Duration>,
     mode: HelloMode,
 ) -> io::Result<IpcResolver> {
-    let link = handshake(path, timeout, mode)?;
+    connect_checked(path, timeout, mode, ServerCheck::own_only())
+}
+
+/// [`connect_with`], also accepting a server run by `server_uid`: a door another account
+/// serves (`bind_shared`, `serve_shared_on_admissions`) that this account is admitted to. A
+/// server run by this user is still accepted, and every other UID is refused, on the first
+/// dial and on every redial.
+pub fn connect_trusting(
+    path: &Path,
+    timeout: Option<Duration>,
+    mode: HelloMode,
+    server_uid: u32,
+) -> io::Result<IpcResolver> {
+    connect_checked(
+        path,
+        timeout,
+        mode,
+        ServerCheck {
+            trusted: Some(server_uid),
+            ..ServerCheck::own_only()
+        },
+    )
+}
+
+fn connect_checked(
+    path: &Path,
+    timeout: Option<Duration>,
+    mode: HelloMode,
+    check: ServerCheck,
+) -> io::Result<IpcResolver> {
+    let link = handshake(path, timeout, mode, check)?;
     Ok(IpcResolver {
         path: path.to_path_buf(),
         timeout,
         describe_timeout: Some(DEFAULT_DESCRIBE_TIMEOUT),
         call_timeout: timeout,
         mode,
+        check,
         stream: Mutex::new(Some(link)),
         tracer: Mutex::new(None),
     })
@@ -900,14 +935,19 @@ pub fn connect_with(
 /// than the offer that this build still [speaks] is therefore a request to come back
 /// at that version: dial again, offer it, and serve at it. That is per-connection
 /// negotiation, not a flag day — nothing on the next connection remembers it.
-fn handshake(path: &Path, timeout: Option<Duration>, mode: HelloMode) -> io::Result<Link> {
-    match hello_at(path, timeout, mode, PROTOCOL_VERSION)? {
+fn handshake(
+    path: &Path,
+    timeout: Option<Duration>,
+    mode: HelloMode,
+    check: ServerCheck,
+) -> io::Result<Link> {
+    match hello_at(path, timeout, mode, PROTOCOL_VERSION, check)? {
         (stream, answer) if answer == PROTOCOL_VERSION => Ok(Link {
             stream,
             version: answer,
         }),
         (_, answer) if answer < PROTOCOL_VERSION && speaks(answer) => {
-            match hello_at(path, timeout, mode, answer)? {
+            match hello_at(path, timeout, mode, answer, check)? {
                 (stream, again) if again == answer => Ok(Link {
                     stream,
                     version: again,
@@ -936,8 +976,10 @@ fn hello_at(
     timeout: Option<Duration>,
     mode: HelloMode,
     version: u32,
+    check: ServerCheck,
 ) -> io::Result<(UnixStream, u32)> {
     let stream = dial(path, timeout)?;
+    check.server_of(&stream, path)?;
     let mut writer = &stream;
     write_hello(&mut writer, &Hello { version, mode })?;
     match read_frame(&mut &stream) {
@@ -981,6 +1023,60 @@ fn dial(path: &Path, timeout: Option<Duration>) -> io::Result<UnixStream> {
     Ok(stream)
 }
 
+/// Whose server this client will talk to: this user's, and `trusted` if named.
+///
+/// ★ A path says nothing about who listens on it. Another local user who binds the path first
+/// (a socket path a host was told to use under `/tmp`, say) would otherwise receive every
+/// call and its arguments, and answer them. The UID comes from the connected socket, so no
+/// swap of the path can slip between this check and the first byte written, and it is read
+/// again on every redial.
+#[derive(Clone, Copy)]
+struct ServerCheck {
+    /// One more UID to accept ([`connect_trusting`]).
+    trusted: Option<u32>,
+    /// How the server's UID is read: [`peer_uid`], outside the tests.
+    read_uid: fn(&UnixStream) -> Option<u32>,
+}
+
+impl ServerCheck {
+    fn own_only() -> Self {
+        Self {
+            trusted: None,
+            read_uid: peer_uid,
+        }
+    }
+
+    /// Refuse `stream` unless the server on the other end is one this client accepts. A server
+    /// whose UID cannot be read is refused too, as the door refuses such a peer.
+    fn server_of(&self, stream: &UnixStream, path: &Path) -> io::Result<()> {
+        let own = own_uid();
+        let server = (self.read_uid)(stream);
+        if server == Some(own) || (server.is_some() && server == self.trusted) {
+            return Ok(());
+        }
+        let expected = match self.trusted {
+            Some(trusted) => {
+                format!("this user (id {own}) or the trusted server user (id {trusted})")
+            }
+            None => format!("this user (id {own})"),
+        };
+        let found = match server {
+            Some(uid) => format!("is served by user id {uid}, not {expected}"),
+            None => {
+                format!("is served by a user that could not be read, so it may not be {expected}")
+            }
+        };
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing the socket at {}: it {found}, so nothing was sent to it. If you meant \
+                 that server, name its user as `ipc.server_user` in the ikigai config",
+                path.display()
+            ),
+        ))
+    }
+}
+
 /// A [`Resolver`] backed by a kernel server over a Unix socket.
 ///
 /// The connection **heals on use**: an ESTABLISHED connection that breaks —
@@ -1020,6 +1116,8 @@ pub struct IpcResolver {
     /// The hello mode every (re)dial declares — a redialed alias mount must
     /// re-present itself as one.
     mode: HelloMode,
+    /// Whose server this client accepts, on the first dial and on every redial.
+    check: ServerCheck,
     /// The live connection, or `None` after a failure that spent it — the peer gone
     /// ([`is_dead_connection`]) or a deadline missed mid-exchange
     /// ([`missed_a_deadline`]) — in which case the next call redials. The mutex also
@@ -1445,9 +1543,14 @@ impl IpcResolver {
     /// timeouts back: a hello cut short by the deadline must not shorten later calls.
     fn redial(&self, deadline: Option<&Deadline>) -> io::Result<Link> {
         let Some(deadline) = deadline else {
-            return handshake(&self.path, self.timeout, self.mode);
+            return handshake(&self.path, self.timeout, self.mode, self.check);
         };
-        let link = handshake(&self.path, Some(deadline.arm(self.timeout)?), self.mode)?;
+        let link = handshake(
+            &self.path,
+            Some(deadline.arm(self.timeout)?),
+            self.mode,
+            self.check,
+        )?;
         // Ignored for the reason in `Bounded::arm_read`: a peer that hung up right after the
         // hello makes these fail, and the exchange is about to say so properly.
         let _ = link.stream.set_read_timeout(self.timeout);
@@ -4697,5 +4800,209 @@ mod uid_admission_tests {
         log.record(&Refused::Unreadable);
         assert_eq!(log.counts.get(&Some(7)), Some(&5));
         assert_eq!(log.counts.get(&None), Some(&1));
+    }
+}
+
+#[cfg(test)]
+mod server_uid_tests {
+    use super::*;
+    use ikigai_core::{EndpointSpace, Exact, FnEndpoint, Iri, ReprType, Verb};
+    use std::io::Read;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+
+    fn path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("ikc-{}-{name}.sock", std::process::id()))
+    }
+
+    /// Another account's UID: anything but ours.
+    fn other_uid() -> u32 {
+        own_uid().wrapping_add(1)
+    }
+
+    fn reads_other_uid(_: &UnixStream) -> Option<u32> {
+        Some(other_uid())
+    }
+
+    fn reads_nothing(_: &UnixStream) -> Option<u32> {
+        None
+    }
+
+    /// Listen on `path` as an impostor would, returning everything the one client that dials
+    /// sends it before hanging up.
+    fn impostor(path: &Path) -> thread::JoinHandle<Vec<u8>> {
+        let _ = std::fs::remove_file(path);
+        let listener = UnixListener::bind(path).unwrap();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Ignored: Darwin answers EINVAL on a socket whose peer already hung up, as a refused
+            // client has. The read below still returns whatever arrived, and then EOF.
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut received = Vec::new();
+            let _ = stream.read_to_end(&mut received);
+            received
+        })
+    }
+
+    fn kernel() -> Kernel {
+        let echo = FnEndpoint::new("echo", |_: &ikigai_core::Invocation<'_>| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                b"up".to_vec(),
+            ))
+        });
+        Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:test:echo"), echo),
+        ))
+    }
+
+    fn echo() -> Request {
+        Request::new(Verb::Source, Iri::parse("urn:test:echo").unwrap())
+    }
+
+    fn check(read_uid: fn(&UnixStream) -> Option<u32>, trusted: Option<u32>) -> ServerCheck {
+        ServerCheck { trusted, read_uid }
+    }
+
+    fn dial_as(path: &Path, check: ServerCheck) -> io::Result<IpcResolver> {
+        connect_checked(
+            path,
+            Some(Duration::from_secs(5)),
+            HelloMode::Verbatim,
+            check,
+        )
+    }
+
+    /// The finding itself: a server run by another account learns nothing, not even the hello,
+    /// and the refusal names the path and both users in a plain sentence.
+    #[test]
+    fn a_server_run_by_another_account_is_refused_before_anything_is_sent() {
+        let path = path("other");
+        let served = impostor(&path);
+        let refused = dial_as(&path, check(reads_other_uid, None))
+            .err()
+            .expect("another account's server must be refused");
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        let said = refused.to_string();
+        assert!(said.contains(&*path.to_string_lossy()), "{said}");
+        assert!(said.contains(&format!("user id {}", other_uid())), "{said}");
+        assert!(
+            said.contains(&format!("this user (id {})", own_uid())),
+            "{said}"
+        );
+        assert!(said.contains("nothing was sent"), "{said}");
+        assert!(said.contains("ipc.server_user"), "{said}");
+        assert_eq!(served.join().unwrap(), Vec::<u8>::new());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Fail closed: a server whose UID cannot be read is not assumed to be ours.
+    #[test]
+    fn a_server_whose_user_cannot_be_read_is_refused_before_anything_is_sent() {
+        let path = path("unread");
+        let served = impostor(&path);
+        let refused = dial_as(&path, check(reads_nothing, Some(other_uid())))
+            .err()
+            .expect("an unreadable server must be refused");
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            refused.to_string().contains("could not be read"),
+            "{refused}"
+        );
+        assert_eq!(served.join().unwrap(), Vec::<u8>::new());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Naming one account does not open the door to a third.
+    #[test]
+    fn a_server_run_by_neither_this_user_nor_the_trusted_one_is_refused() {
+        let path = path("third");
+        let served = impostor(&path);
+        let trusted = other_uid().wrapping_add(1);
+        let refused = dial_as(&path, check(reads_other_uid, Some(trusted)))
+            .err()
+            .expect("a third account's server must be refused");
+        let said = refused.to_string();
+        assert!(
+            said.contains(&format!("trusted server user (id {trusted})")),
+            "{said}"
+        );
+        assert_eq!(served.join().unwrap(), Vec::<u8>::new());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The configured account is served, and so, through the real `SO_PEERCRED`, is this user.
+    #[test]
+    fn the_trusted_account_and_this_user_are_both_accepted() {
+        for (name, read_uid, trusted) in [
+            (
+                "trusted",
+                reads_other_uid as fn(&UnixStream) -> Option<u32>,
+                other_uid(),
+            ),
+            (
+                "own",
+                peer_uid as fn(&UnixStream) -> Option<u32>,
+                other_uid(),
+            ),
+        ] {
+            let path = path(name);
+            let listener = bind(&path).unwrap();
+            thread::spawn(move || {
+                let _ = serve_on(kernel(), listener);
+            });
+            let client = dial_as(&path, check(read_uid, Some(trusted))).unwrap();
+            let (answer, _) = client.issue(echo()).unwrap();
+            assert_eq!(&answer.bytes[..], b"up", "{name}");
+            drop(client);
+            let _ = std::fs::remove_file(&path);
+        }
+        let path = path("public");
+        let listener = bind(&path).unwrap();
+        thread::spawn(move || {
+            let _ = serve_on(kernel(), listener);
+        });
+        let client = connect_trusting(&path, None, HelloMode::Verbatim, other_uid()).unwrap();
+        assert_eq!(&client.issue(echo()).unwrap().0.bytes[..], b"up");
+        drop(client);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    static SERVER_LEFT: AtomicBool = AtomicBool::new(false);
+
+    fn reads_own_until_the_server_left(stream: &UnixStream) -> Option<u32> {
+        if SERVER_LEFT.load(Ordering::SeqCst) {
+            reads_other_uid(stream)
+        } else {
+            peer_uid(stream)
+        }
+    }
+
+    /// The server goes away under a standing connection and another account takes the path:
+    /// healing on use must not deliver the call to it.
+    #[test]
+    fn a_redial_is_checked_too() {
+        let path = path("redial");
+        let listener = bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_connection(&kernel(), stream);
+        });
+        let client = dial_as(&path, check(reads_own_until_the_server_left, None)).unwrap();
+        assert_eq!(&client.issue(echo()).unwrap().0.bytes[..], b"up");
+        // The connection is gone, so the door's side closes and the next call redials.
+        drop(client.stream.lock().unwrap().take());
+        server.join().unwrap();
+
+        SERVER_LEFT.store(true, Ordering::SeqCst);
+        let served = impostor(&path);
+        let refused = client.issue(echo()).unwrap_err();
+        assert!(
+            refused.to_string().contains("refusing the socket"),
+            "{refused}"
+        );
+        assert_eq!(served.join().unwrap(), Vec::<u8>::new());
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -3532,9 +3532,13 @@ fn connect_mount_ipc(
     } else {
         ikigai_ipc::HelloMode::Verbatim
     };
-    let mut resolver = ikigai_ipc::connect_as(std::path::Path::new(socket), mode)
-        .map_err(|e| format!("{flag}: connect {socket}: {e}"))?
-        .with_describe_timeout(describe_timeout(ikigai_ipc::DEFAULT_DESCRIBE_TIMEOUT));
+    let mut resolver = dial_ipc(
+        std::path::Path::new(socket),
+        Some(ikigai_ipc::DEFAULT_TIMEOUT),
+        mode,
+    )
+    .map_err(|e| format!("{flag}: connect {socket}: {e}"))?
+    .with_describe_timeout(describe_timeout(ikigai_ipc::DEFAULT_DESCRIBE_TIMEOUT));
     if let Some(bound) = call_timeout() {
         resolver = resolver.with_call_timeout(bound);
     }
@@ -5060,6 +5064,21 @@ fn serve_ipc(path: Option<String>, mounts: Mounts) -> ! {
     }
 }
 
+/// Dial a socket, accepting a server run by this user or by `ipc.server_user` from the config
+/// home (a door another account serves), and no one else.
+#[cfg(all(feature = "embedded", feature = "ipc", unix))]
+fn dial_ipc(
+    socket: &std::path::Path,
+    timeout: Option<std::time::Duration>,
+    mode: ikigai_ipc::HelloMode,
+) -> Result<ikigai_ipc::IpcResolver, String> {
+    match ikigai_embedded::socket::server_uid()? {
+        Some(uid) => ikigai_ipc::connect_trusting(socket, timeout, mode, uid),
+        None => ikigai_ipc::connect_with(socket, timeout, mode),
+    }
+    .map_err(|e| e.to_string())
+}
+
 #[cfg(all(feature = "embedded", feature = "ipc", unix))]
 fn connect_ipc(path: Option<String>) -> Result<Engine, String> {
     let socket = ipc_socket(path);
@@ -5071,7 +5090,7 @@ fn connect_ipc(path: Option<String>) -> Result<Engine, String> {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .map(std::time::Duration::from_secs)
         .unwrap_or(ikigai_ipc::DEFAULT_TIMEOUT);
-    let mut resolver = ikigai_ipc::connect_with_timeout(&socket, Some(timeout))
+    let mut resolver = dial_ipc(&socket, Some(timeout), ikigai_ipc::HelloMode::Verbatim)
         .map_err(|e| format!("connect {}: {e}", socket.display()))?
         .with_describe_timeout(describe_timeout(ikigai_ipc::DEFAULT_DESCRIBE_TIMEOUT));
     if let Some(bound) = call_timeout() {
