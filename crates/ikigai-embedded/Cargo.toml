@@ -9,6 +9,8 @@ repository.workspace = true
 
 [features]
 default = []
+# Shared Unix socket admission policy for hosts using ikigai-ipc.
+ipc = ["dep:ikigai-ipc"]
 # The durable RDF store (`urn:iki:store:*`) and, riding on it, the work ledger. Opt-in
 # twice over: this feature has to be on for the code to exist, and a `store = true` line
 # in the config home has to name THIS instance for a dataset to be opened. See
@@ -29,6 +31,7 @@ default = []
 store = ["dep:ikigai-store", "dep:ikigai-ledger"]
 
 [dependencies]
+ikigai-ipc = { path = "../ikigai-ipc", version = "0.2.9", optional = true }
 # `declare` = `Topology::from_turtle`: this host reads a declared arrangement for its local root
 # (`--arrangement`, `arrangement = …`; ledger #637). Enabled HERE only, in the native host crate
 # that reads one — a wasm face (ikigai-engine, checked for wasm32 in its own repo's CI) never selects this crate, so it never

@@ -3246,6 +3246,7 @@ dependencies = [
  "ikigai-http",
  "ikigai-intake",
  "ikigai-intray",
+ "ikigai-ipc",
  "ikigai-json",
  "ikigai-jsonld",
  "ikigai-layers",

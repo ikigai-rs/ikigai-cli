@@ -14,7 +14,7 @@ path = "src/main.rs"
 [features]
 default = ["embedded", "ipc"]
 embedded = ["dep:ikigai-embedded"]
-ipc = ["dep:ikigai-ipc"]   # Unix only; the dep is empty elsewhere
+ipc = ["dep:ikigai-ipc", "ikigai-embedded?/ipc"]   # Unix only; the dep is empty elsewhere
 quic = ["dep:ikigai-quic", "dep:ikigai-discovery", "dep:ikigai-wire"] # opt-in; pulls quinn/rustls/tokio
 web = ["dep:ikigai-web", "dep:tokio", "dep:serde_yaml", "dep:tokio-rustls", "dep:ikigai-fs"] # opt-in inbound HTTP face; pulls Tokio (like quic). With `quic` too, it also opens a layer door's HTTPS front (`--layers-https`), whose TLS is tokio-rustls
 

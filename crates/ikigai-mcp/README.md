@@ -59,7 +59,7 @@ Wire it into an MCP host, e.g. Claude Desktop's `claude_desktop_config.json`:
 ## Grants — capability as a named union
 
 A **grant** is a named union of capability scopes, in
-`~/.config/ikigai/grants.json` (or `$IKIGAI_GRANTS`):
+`grants.json` in the config home (or `ikigai mcp --grants <file>`):
 
 ```json
 { "booking-agent": ["urn:cap:personal:calendar:read:freebusy"],

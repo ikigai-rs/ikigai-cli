@@ -77,6 +77,8 @@ mod ui;
 // of one recorded fact, which is what keeps them from drifting into two spellings of it.
 pub mod posture;
 pub mod scheduling;
+#[cfg(all(feature = "ipc", unix))]
+pub mod socket;
 #[cfg(unix)]
 pub mod spill;
 // The durable RDF store (`urn:iki:store:*`) and — with it — the work ledger. Behind the
@@ -1075,8 +1077,11 @@ fn org_config() -> Option<(PathBuf, Vec<String>)> {
     Some((dir, files))
 }
 
-/// Where MCP grants are read from: `$IKIGAI_GRANTS` else `grants.json` in the
-/// [config home](crate::config::config_home). Exposed so a host can WATCH it (the
+/// Where grants are read from: an explicit [`set_grants_path`] override, then
+/// `grants.path` in `config.toml`, else `grants.json` in the
+/// [config home](crate::config::config_home). Relative configured paths resolve against
+/// that home. `IKIGAI_GRANTS` is deprecated and no longer read; migrate to the setting
+/// or `ikigai mcp --grants <file>`. Exposed so a host can WATCH it (the
 /// live grant-swap: edit the file, the connected client's tool list morphs).
 ///
 /// A watcher makes the config home's ONE spelling load-bearing: watch the path a
@@ -1090,14 +1095,19 @@ pub fn grants_path() -> Option<PathBuf> {
     {
         return Some(path);
     }
-    std::env::var_os("IKIGAI_GRANTS")
-        .map(PathBuf::from)
-        .or_else(|| crate::config::config_home().map(|dir| dir.join("grants.json")))
+    if let Some(path) = crate::config::get("grants.path").map(PathBuf::from) {
+        return if path.is_absolute() {
+            Some(path)
+        } else {
+            crate::config::config_home().map(|dir| dir.join(path))
+        };
+    }
+    crate::config::config_home().map(|dir| dir.join("grants.json"))
 }
 
 static GRANTS_PATH_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
-/// Point [`grants_path`] at `path`, ahead of `$IKIGAI_GRANTS` and the config home: the
+/// Point [`grants_path`] at `path`, ahead of `grants.path` and the config home: the
 /// `ikigai mcp --grants <file>` flag (ledger #1830), which an agent session needs because its
 /// grants file must live where its user cannot write ([`agents::check_protected`]), and the
 /// config home is that user's. Process-global, like [`set_file_root`].
@@ -1114,8 +1124,8 @@ pub(crate) fn grant_entry_scopes(entry: &serde_json::Value) -> Vec<String> {
     scopes_of(entry)
 }
 
-/// The scopes of a named MCP grant, from `~/.config/ikigai/grants.json`
-/// (env override `IKIGAI_GRANTS`). A grant is a NAMED UNION of capability scopes —
+/// The scopes of a named MCP grant, from [`grants_path`].
+/// A grant is a NAMED UNION of capability scopes —
 /// the union of affordances an MCP session may see. Two shapes are accepted, so a
 /// grant can also carry a *visibility* profile (see [`grant_visibility`]): the
 /// original scopes-only array `"<grant>": ["urn:cap:…", …]`, or an object

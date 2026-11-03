@@ -32,13 +32,13 @@ mod keystore;
 fn main() -> Result<(), BoxError> {
     let flags = Flags::parse()?;
     // ⚠ Spike-only plumbing: the flags are carried to the grant reader through its existing
-    // override variables, set here while the process is still single-threaded (before the
-    // runtime exists). A real `serve --p2p` would pass paths, not environment.
+    // path override and legacy clients variable, set before the runtime exists.
+    // A real `serve --p2p` would pass both paths directly.
     if let Some(clients) = flags.all("clients").pop() {
         std::env::set_var("IKIGAI_CLIENTS", clients);
     }
     if let Some(grants) = flags.all("grants").pop() {
-        std::env::set_var("IKIGAI_GRANTS", grants);
+        ikigai_embedded::set_grants_path(grants.into());
     }
     let keypair = keystore::keypair(&flags.one("key")?, flags.all("keystore").pop())?;
     let me = keypair.public().to_peer_id();

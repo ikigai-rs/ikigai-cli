@@ -325,6 +325,12 @@ directory. **The flag wins**: when both it and `XDG_CONFIG_HOME` are set, the en
 not read for the config home. It moves the config home only; the data home (`~/.ikigai`)
 stays put.
 
+Grants default to `grants.json` in that config home. To use a protected file elsewhere,
+set `grants.path = "/absolute/path/grants.json"` in `config.toml`; relative paths resolve
+against the config home. `ikigai mcp --grants <file>` takes precedence over this setting.
+`IKIGAI_GRANTS` is deprecated and no longer read: migrate it to `grants.path` or the
+MCP flag. Socket hosts and other grant readers use the same path policy.
+
 ```toml
 keybindings = "emacs"   # "emacs" (default) · "vi" · "native"
 ```
