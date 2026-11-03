@@ -372,7 +372,7 @@ mod tests {
     fn the_config_home_files_are_siblings() {
         // An explicit override relocates its file BY DESIGN — the escape hatch for CI and
         // containers is not a divergence.
-        if get("grants.path").is_some() || std::env::var_os("IKIGAI_CLIENTS").is_some() {
+        if super::get("grants.path").is_some() || std::env::var_os("IKIGAI_CLIENTS").is_some() {
             return;
         }
         let Some(home) = config_home() else {
