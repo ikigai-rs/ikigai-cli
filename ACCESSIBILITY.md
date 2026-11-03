@@ -152,6 +152,8 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
   before the chooser, 14 rules had passed.)
   `crates/ikigai-embedded/tests/ui.rs` checks the override directory's read-only
   boundary, file jail and golden-thread invalidation after an editor change.
+- `crates/ikigai-ipc/src/lib.rs`'s `who_is_refused` pins, word for word, the sentence that
+  refuses a socket server under another UID, which reaches the terminal as an `ikigai:` line.
 - The other output above has had no automated accessibility checker or browser evaluation.
   No assistive technology has been used on any of this output.
 

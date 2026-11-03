@@ -871,14 +871,91 @@ pub fn connect_with_timeout(path: &Path, timeout: Option<Duration>) -> io::Resul
 /// redialing at 7 (see the private `handshake`). A peer outside the spoken
 /// range errors naming BOTH versions; a peer that hangs up on the hello
 /// predates v6 entirely and is refused with that diagnosis.
+///
+/// The server must run as this user; [`connect_expecting`] names another account as well. Every
+/// dial checks that before it sends anything, so a call's arguments never reach a server under
+/// any other UID.
 pub fn connect_with(
     path: &Path,
     timeout: Option<Duration>,
     mode: HelloMode,
 ) -> io::Result<IpcResolver> {
-    let link = handshake(path, timeout, mode)?;
+    connect_expecting(path, timeout, mode, None)
+}
+
+/// [`connect_with`], also accepting a server that runs as `server_uid`: how a client under its
+/// own account reaches a door another account runs ([`bind_shared`]). This user's own server is
+/// always accepted, since a process under this UID can already reach all this user can.
+///
+/// The UID is the kernel's answer for the process that called `listen` on the socket
+/// (`SO_PEERCRED` on Linux, `getpeereid` on macOS/BSD), so nothing the server sends can change it
+/// and a socket's path, mode or owner on disk plays no part.
+///
+/// # Errors
+///
+/// As [`connect_with`], and [`PermissionDenied`](io::ErrorKind::PermissionDenied) naming the UIDs
+/// when the server runs as any other UID or its UID cannot be read. A redial that meets such a
+/// server fails the same way, on the call that made it.
+pub fn connect_expecting(
+    path: &Path,
+    timeout: Option<Duration>,
+    mode: HelloMode,
+    server_uid: Option<u32>,
+) -> io::Result<IpcResolver> {
+    connect_trusting(
+        path,
+        timeout,
+        mode,
+        ExpectedServer {
+            own: own_uid(),
+            named: server_uid,
+        },
+    )
+}
+
+/// The UIDs a client will talk to: its own, and the one it was told to expect, if any.
+#[derive(Clone, Copy, Debug)]
+struct ExpectedServer {
+    own: u32,
+    named: Option<u32>,
+}
+
+impl ExpectedServer {
+    /// Why a server reported as running under `peer` must not be spoken to, as the sentence that
+    /// refuses it; `None` when it may. An unreadable UID is refused, as the door refuses one.
+    fn refusal(self, path: &Path, peer: Option<u32>) -> Option<String> {
+        let at = path.display();
+        let Some(peer) = peer else {
+            return Some(format!(
+                "refusing the kernel server at {at}: this system did not say which user runs \
+                 it, so nothing was sent to it"
+            ));
+        };
+        if peer == self.own || self.named == Some(peer) {
+            return None;
+        }
+        let expected = match self.named {
+            Some(named) => format!("this user (uid {}) or uid {named}", self.own),
+            None => format!("this user (uid {})", self.own),
+        };
+        Some(format!(
+            "refusing the kernel server at {at}: it runs as uid {peer}, not {expected}, so \
+             another user may have taken this path and nothing was sent to it; if that account \
+             is meant to serve here, name it as `ipc.server_user` in the host's config"
+        ))
+    }
+}
+
+fn connect_trusting(
+    path: &Path,
+    timeout: Option<Duration>,
+    mode: HelloMode,
+    expected: ExpectedServer,
+) -> io::Result<IpcResolver> {
+    let link = handshake(path, timeout, mode, expected)?;
     Ok(IpcResolver {
         path: path.to_path_buf(),
+        expected,
         timeout,
         describe_timeout: Some(DEFAULT_DESCRIBE_TIMEOUT),
         call_timeout: timeout,
@@ -900,14 +977,19 @@ pub fn connect_with(
 /// than the offer that this build still [speaks] is therefore a request to come back
 /// at that version: dial again, offer it, and serve at it. That is per-connection
 /// negotiation, not a flag day — nothing on the next connection remembers it.
-fn handshake(path: &Path, timeout: Option<Duration>, mode: HelloMode) -> io::Result<Link> {
-    match hello_at(path, timeout, mode, PROTOCOL_VERSION)? {
+fn handshake(
+    path: &Path,
+    timeout: Option<Duration>,
+    mode: HelloMode,
+    expected: ExpectedServer,
+) -> io::Result<Link> {
+    match hello_at(path, timeout, mode, PROTOCOL_VERSION, expected)? {
         (stream, answer) if answer == PROTOCOL_VERSION => Ok(Link {
             stream,
             version: answer,
         }),
         (_, answer) if answer < PROTOCOL_VERSION && speaks(answer) => {
-            match hello_at(path, timeout, mode, answer)? {
+            match hello_at(path, timeout, mode, answer, expected)? {
                 (stream, again) if again == answer => Ok(Link {
                     stream,
                     version: again,
@@ -931,13 +1013,20 @@ fn version_mismatch(theirs: u32, ours: u32) -> io::Error {
 
 /// Dial `path`, offer wire `version`, and return the stream with the version the
 /// server answered. Whether that answer is acceptable is the caller's decision.
+///
+/// The server's UID is checked first, here, so that the first dial, the downgrade's second one
+/// and every redial all check it, and nothing at all is written to a server `expected` refuses.
 fn hello_at(
     path: &Path,
     timeout: Option<Duration>,
     mode: HelloMode,
     version: u32,
+    expected: ExpectedServer,
 ) -> io::Result<(UnixStream, u32)> {
     let stream = dial(path, timeout)?;
+    if let Some(refusal) = expected.refusal(path, peer_uid(&stream)) {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, refusal));
+    }
     let mut writer = &stream;
     write_hello(&mut writer, &Hello { version, mode })?;
     match read_frame(&mut &stream) {
@@ -1009,6 +1098,8 @@ struct Link {
 pub struct IpcResolver {
     /// The server's socket path, kept so a broken connection can be redialed.
     path: PathBuf,
+    /// Who may answer on that path, kept because a redial can meet a different server.
+    expected: ExpectedServer,
     /// The I/O deadline every (re)dial installs on its stream.
     timeout: Option<Duration>,
     /// The shorter deadline a SELF-DESCRIPTION call runs under (see
@@ -1445,9 +1536,14 @@ impl IpcResolver {
     /// timeouts back: a hello cut short by the deadline must not shorten later calls.
     fn redial(&self, deadline: Option<&Deadline>) -> io::Result<Link> {
         let Some(deadline) = deadline else {
-            return handshake(&self.path, self.timeout, self.mode);
+            return handshake(&self.path, self.timeout, self.mode, self.expected);
         };
-        let link = handshake(&self.path, Some(deadline.arm(self.timeout)?), self.mode)?;
+        let link = handshake(
+            &self.path,
+            Some(deadline.arm(self.timeout)?),
+            self.mode,
+            self.expected,
+        )?;
         // Ignored for the reason in `Bounded::arm_read`: a peer that hung up right after the
         // hello makes these fail, and the exchange is about to say so properly.
         let _ = link.stream.set_read_timeout(self.timeout);
@@ -4697,5 +4793,195 @@ mod uid_admission_tests {
         log.record(&Refused::Unreadable);
         assert_eq!(log.counts.get(&Some(7)), Some(&5));
         assert_eq!(log.counts.get(&None), Some(&1));
+    }
+}
+
+/// The client's check of who it is talking to (ledger #2966). A test cannot serve as another
+/// account without root, so it serves as this one and tells the client it is someone else: the
+/// UID compared is still the kernel's answer about a real listening socket.
+#[cfg(test)]
+mod expected_server_tests {
+    use super::*;
+    use ikigai_core::{builtins, ArgRef, EndpointSpace, Exact, Iri, Verb};
+    use std::io::Read;
+    use std::thread;
+
+    fn path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("ikx-{}-{name}.sock", std::process::id()))
+    }
+
+    fn upper() -> Request {
+        Request::new(Verb::Source, Iri::parse("urn:test:upper").unwrap())
+            .with_arg("in", ArgRef::Inline(b"secret argument".to_vec()))
+    }
+
+    fn kernel() -> Kernel {
+        Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),
+        ))
+    }
+
+    fn foreign() -> u32 {
+        own_uid().wrapping_add(1)
+    }
+
+    /// Everything the first client on `listener` writes before it hangs up.
+    fn record_first_client(listener: UnixListener) -> thread::JoinHandle<Vec<u8>> {
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut heard = Vec::new();
+            let _ = stream.read_to_end(&mut heard);
+            heard
+        })
+    }
+
+    #[test]
+    fn a_server_under_another_uid_is_refused_before_anything_is_sent() {
+        let socket = path("refused");
+        let _ = std::fs::remove_file(&socket);
+        let heard = record_first_client(UnixListener::bind(&socket).unwrap());
+        let expected = ExpectedServer {
+            own: foreign(),
+            named: None,
+        };
+
+        let refused = connect_trusting(
+            &socket,
+            Some(Duration::from_secs(2)),
+            HelloMode::Verbatim,
+            expected,
+        )
+        .err()
+        .expect("a server under another uid is refused");
+
+        assert_eq!(heard.join().unwrap(), Vec::<u8>::new());
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        let said = refused.to_string();
+        assert!(
+            said.contains(&format!("it runs as uid {}", own_uid())),
+            "{said}"
+        );
+        assert!(
+            said.contains(&format!("not this user (uid {})", foreign())),
+            "{said}"
+        );
+        assert!(said.contains("nothing was sent"), "{said}");
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    #[test]
+    fn a_named_server_is_accepted_and_answers() {
+        let socket = path("named");
+        let _ = std::fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_connection(&kernel(), stream);
+        });
+        let expected = ExpectedServer {
+            own: foreign(),
+            named: Some(own_uid()),
+        };
+
+        let client = connect_trusting(
+            &socket,
+            Some(Duration::from_secs(5)),
+            HelloMode::Verbatim,
+            expected,
+        )
+        .expect("the named uid is accepted");
+        let (answer, _) = client.issue(upper()).unwrap();
+
+        assert_eq!(answer.bytes, b"SECRET ARGUMENT");
+        drop(client);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    #[test]
+    fn naming_another_account_still_accepts_this_users_own_server() {
+        let socket = path("own");
+        let _ = std::fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_connection(&kernel(), stream);
+        });
+
+        let client = connect_expecting(
+            &socket,
+            Some(Duration::from_secs(5)),
+            HelloMode::Verbatim,
+            Some(foreign()),
+        )
+        .expect("this user's own server is always accepted");
+
+        drop(client);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    /// The window the review did not name: a server that bounces leaves its path free, and a
+    /// client that heals on use redials whatever holds that path next.
+    #[test]
+    fn a_redial_that_meets_another_uid_is_refused_and_the_call_is_not_replayed() {
+        let socket = path("redial");
+        let _ = std::fs::remove_file(&socket);
+        let first = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = first.accept().unwrap();
+            handle_connection(&kernel(), stream);
+        });
+        let mut client =
+            connect_with(&socket, Some(Duration::from_secs(5)), HelloMode::Verbatim).unwrap();
+        client.issue(upper()).unwrap();
+        // The first server is gone, and what holds the path now is not who the client expects.
+        client.stream.lock().unwrap().take();
+        server.join().unwrap();
+        std::fs::remove_file(&socket).unwrap();
+        let heard = record_first_client(UnixListener::bind(&socket).unwrap());
+        client.expected.own = foreign();
+
+        let refused = client.issue(upper()).expect_err("the redial is refused");
+
+        assert!(
+            refused.to_string().contains("refusing the kernel server"),
+            "{refused}"
+        );
+        drop(client);
+        assert_eq!(heard.join().unwrap(), Vec::<u8>::new());
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    #[test]
+    fn who_is_refused() {
+        let at = Path::new("/tmp/k.sock");
+        let own = ExpectedServer {
+            own: 501,
+            named: None,
+        };
+        let shared = ExpectedServer {
+            own: 501,
+            named: Some(502),
+        };
+
+        assert_eq!(own.refusal(at, Some(501)), None);
+        assert_eq!(shared.refusal(at, Some(501)), None);
+        assert_eq!(shared.refusal(at, Some(502)), None);
+        assert!(own.refusal(at, Some(502)).is_some());
+        // Root is another account like any other: it is not expected unless it is named.
+        assert!(own.refusal(at, Some(0)).is_some());
+        assert_eq!(
+            shared.refusal(at, Some(503)).unwrap(),
+            "refusing the kernel server at /tmp/k.sock: it runs as uid 503, not this user \
+             (uid 501) or uid 502, so another user may have taken this path and nothing was \
+             sent to it; if that account is meant to serve here, name it as \
+             `ipc.server_user` in the host's config"
+        );
+        assert_eq!(
+            own.refusal(at, None).unwrap(),
+            "refusing the kernel server at /tmp/k.sock: this system did not say which user \
+             runs it, so nothing was sent to it"
+        );
     }
 }

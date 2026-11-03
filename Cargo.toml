@@ -7,6 +7,8 @@ members = ["crates/*"]
 # grants_path, grant_scopes and grant_visibility return Result so library hosts can report
 # a refused configuration through client authorization as well as startup.
 # Shared socket admission is available through ikigai-embedded's optional ipc feature.
+# A socket client refuses a server under another UID before it sends anything (ledger #2966):
+# `ipc.server_user` (or `ikigai_ipc::connect_expecting`) names a door another account runs.
 # 0.1.32 is WEB PUSH (ledger #618): `EdgeConfig.push` (off by default) serves a server-sent-events
 # stream at `/_ikigai/push` — one core cut listener (core 0.1.82's `Kernel::listen`) per stream, under
 # exactly that session's capability plus `urn:cap:kernel:listen` (403 without it); `cut` events name

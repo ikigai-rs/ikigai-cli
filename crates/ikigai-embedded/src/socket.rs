@@ -105,6 +105,56 @@ pub fn shared_socket_from(
     }))
 }
 
+/// The account a socket client accepts as its server besides its own (`ipc.server_user` in the
+/// config home's `config.toml`, a user name or a UID), or `None` when it names none: the client
+/// then talks only to its own user's servers ([`ikigai_ipc::connect_expecting`], ledger #2966).
+///
+/// # Errors
+///
+/// A name no account has. It is not read as "none": the operator meant to name someone.
+pub fn expected_server() -> Result<Option<u32>, String> {
+    expected_server_from(crate::config::get("ipc.server_user"))
+}
+
+/// [`expected_server`] over the configured value, so the reading is testable without a config
+/// home.
+///
+/// # Errors
+///
+/// As [`expected_server`].
+pub fn expected_server_from(value: Option<String>) -> Result<Option<u32>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let account = value.trim().trim_matches('"');
+    match account.parse::<u32>() {
+        Ok(uid) => Ok(Some(uid)),
+        Err(_) => ikigai_ipc::uid_of_user(account)
+            .map(Some)
+            .map_err(|e| format!("ipc.server_user: {e}")),
+    }
+}
+
+/// The client's reading of `ipc.server_user` (ledger #2966).
+#[cfg(test)]
+mod expected_server_tests {
+    use super::*;
+
+    #[test]
+    fn a_server_user_is_a_uid_or_a_name_and_an_unknown_name_is_refused() {
+        assert_eq!(expected_server_from(None), Ok(None));
+        assert_eq!(expected_server_from(Some("502".to_string())), Ok(Some(502)));
+        assert_eq!(
+            expected_server_from(Some("\"root\"".to_string())),
+            Ok(Some(0))
+        );
+        assert_eq!(
+            expected_server_from(Some("\"no-such-account\"".to_string())),
+            Err("ipc.server_user: no user named `no-such-account`".to_string())
+        );
+    }
+}
+
 /// The socket door's reading of the principals table's accounts (ledger #2139).
 #[cfg(test)]
 mod shared_socket_tests {
