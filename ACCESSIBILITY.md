@@ -160,11 +160,14 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
 Found by reading the source on 2026-10-15, not by testing:
 
 - The full-screen REPL redraws the whole terminal; use `--plain` with a screen reader.
-- On a page composed over ikigai-ui's shell from a `names` file ([the recipe](docs/shared-ui.md)),
-  the composition fixes `theme`, so the theme chooser's Apply button, which only a browser
-  without script uses, is answered with a `400` naming the fixed argument rather than the page
-  in the chosen theme. With the shell script the choice applies at once. Found by a socket test
-  on 2026-11-01.
+- On a page composed over ikigai-ui's shell from a `names` file that fixes `theme` on its binding,
+  the theme chooser's Apply button, which only a browser without script uses, is answered with a
+  `400` naming the fixed argument rather than the page in the chosen theme. With the shell script
+  the choice applies at once. Found by a socket test on 2026-11-01. [The recipe](docs/shared-ui.md)
+  now declares a `theme` input instead. Its `GET /quakes?theme=dark` was sent once through the door
+  with `curl` on 2026-11-03, with ikigai-ui 0.4.1: not by a test, in a browser or through the axe
+  checker. This repository's `Cargo.lock` still holds ikigai-ui 0.4.0, which also needs the
+  chooser line the recipe gives.
 - Nothing above has been tried with a screen reader, magnifier or braille display.
 
 ## Change history
@@ -196,6 +199,7 @@ Found by reading the source on 2026-10-15, not by testing:
 | 2026-11-02 | The idle-stdin warning (ledger #2437) drops its hard-coded `content=…` advice. The engine's following missing-argument diagnostic already names the required input and how to supply it (for example, `in=…` for a Source). A binary regression holds stdin open and silent and pins that the output gives the correct `in=…` hint without conflicting `content=…` advice. No color is added; no assistive technology testing was performed. |
 | 2026-11-02 | `--grants <file>` becomes a global host flag. A set `IKIGAI_GRANTS` stops startup with a plain `ikigai:` diagnostic naming the variable and replacement flag. Binary regression tests cover the refusal and the socket host's flag; no assistive technology testing was performed. |
 | 2026-11-02 | The global `--grants` parser names `<file>` in missing-value refusals (ledger #2952). Library grant lookups preserve the `IKIGAI_GRANTS` refusal instead of reporting an unknown grant. Library and binary regression tests pin these diagnostics; no color is added and no assistive technology testing was performed. |
+| 2026-11-03 | The `names`-file recipe in `docs/shared-ui.md` declares a `theme` input instead of fixing `theme`, so a no-script Apply is answered with the page in the chosen theme, and it names the override for turning the chooser off (ledger #2955). Docs only, so no output changed. One `GET /quakes?theme=dark` was sent through the door with `curl` and ikigai-ui 0.4.1. No test covers it, and no browser, axe or assistive technology testing was performed. |
 
 ## Contributing
 
