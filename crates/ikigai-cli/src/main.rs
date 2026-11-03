@@ -3532,9 +3532,15 @@ fn connect_mount_ipc(
     } else {
         ikigai_ipc::HelloMode::Verbatim
     };
-    let mut resolver = ikigai_ipc::connect_as(std::path::Path::new(socket), mode)
-        .map_err(|e| format!("{flag}: connect {socket}: {e}"))?
-        .with_describe_timeout(describe_timeout(ikigai_ipc::DEFAULT_DESCRIBE_TIMEOUT));
+    let expected = ikigai_embedded::socket::expected_server()?;
+    let mut resolver = ikigai_ipc::connect_expecting(
+        std::path::Path::new(socket),
+        Some(ikigai_ipc::DEFAULT_TIMEOUT),
+        mode,
+        expected,
+    )
+    .map_err(|e| format!("{flag}: connect {socket}: {e}"))?
+    .with_describe_timeout(describe_timeout(ikigai_ipc::DEFAULT_DESCRIBE_TIMEOUT));
     if let Some(bound) = call_timeout() {
         resolver = resolver.with_call_timeout(bound);
     }
@@ -5071,9 +5077,15 @@ fn connect_ipc(path: Option<String>) -> Result<Engine, String> {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .map(std::time::Duration::from_secs)
         .unwrap_or(ikigai_ipc::DEFAULT_TIMEOUT);
-    let mut resolver = ikigai_ipc::connect_with_timeout(&socket, Some(timeout))
-        .map_err(|e| format!("connect {}: {e}", socket.display()))?
-        .with_describe_timeout(describe_timeout(ikigai_ipc::DEFAULT_DESCRIBE_TIMEOUT));
+    let expected = ikigai_embedded::socket::expected_server()?;
+    let mut resolver = ikigai_ipc::connect_expecting(
+        &socket,
+        Some(timeout),
+        ikigai_ipc::HelloMode::Verbatim,
+        expected,
+    )
+    .map_err(|e| format!("connect {}: {e}", socket.display()))?
+    .with_describe_timeout(describe_timeout(ikigai_ipc::DEFAULT_DESCRIBE_TIMEOUT));
     if let Some(bound) = call_timeout() {
         resolver = resolver.with_call_timeout(bound);
     }

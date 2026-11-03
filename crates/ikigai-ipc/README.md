@@ -32,6 +32,16 @@ No CA, no TLS — the operating system already authenticates a local peer:
 - **`serve`** additionally checks each peer's **kernel-verified UID** (`SO_PEERCRED`
   on Linux, `getpeereid` on macOS/BSD, read through the `nix` crate) and refuses any
   connection that isn't the server's own user — defense in depth over the directory mode.
+- **`connect`** checks the server the same way before it sends anything: it refuses, with
+  `PermissionDenied` and a sentence naming the UIDs, a server under any UID but its own, or one
+  whose UID cannot be read. A path you name yourself can sit in a directory another user can
+  write, and `$TMPDIR`/`/tmp` plus the uid can be created first by another user, so a client
+  cannot take the path as proof of who is listening. Every redial checks again, since a server
+  that bounces leaves its path free. `connect_expecting` also accepts one named UID, for a door
+  another account runs (below); the `ikigai` host reads it from `ipc.server_user` in its config,
+  a user name or a UID. A server in another user namespace is reported as whatever UID the
+  client's namespace maps it to, or the overflow UID, so across containers that UID is the one
+  to name. Root is not accepted unless named.
 
 Because the peer is the owner, a `cap`-attenuated `--connect` session carries its
 capability over `Call::IssueAs`; the server resolves under it (already ≤ root), so
@@ -76,6 +86,10 @@ sudo mkdir /var/run/ikigai && sudo chown brian:ikigai /var/run/ikigai && sudo ch
 ```
 
 Every directory above it must let the group's members search it as well.
+
+A client under another account dials that door by naming the door's account, or it refuses the
+door as it would refuse anyone else's: `connect_expecting(path, timeout, mode, Some(uid))`, or
+`ipc.server_user = "brian"` in the `ikigai` host's `config.toml`.
 
 ### The trust model, plainly
 
