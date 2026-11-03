@@ -1925,7 +1925,7 @@ ikigai-throttle = "0.3.1" # 0.3.1 = overlays pass `forwards()` through, so a vie
 # Timeout governor + Failover (the --prefer mount degrades through it)
 # LLM inference (urn:llm:ask + urn:llm:<provider>:ask + urn:llm:config): a facade grammar
 # over pluggable backends. OpenAI-compatible REST backend (Ollama/vLLM/llama.cpp/mlx_lm).
-ikigai-llm = "0.18.0" # 0.18.0 = on ikigai-http 0.5.0: the shared `HttpTransport`, so it moves with http and meeting. Beneath it: 0.17.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.17.1"` is `<0.18.0`. Beneath it: 0.16.0 = on ikigai-http 0.3.0 (ledger #1546): `space(transport, registry)` takes the 0.3
+ikigai-llm = "0.19.0" # 0.19.0 = host-held SecretReader and urn:cap:llm:use:<provider> for named keys (ledger #2714). Beneath it: 0.18.0 = on ikigai-http 0.5.0: the shared `HttpTransport`, so it moves with http and meeting. Beneath it: 0.17.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.17.1"` is `<0.18.0`. Beneath it: 0.16.0 = on ikigai-http 0.3.0 (ledger #1546): `space(transport, registry)` takes the 0.3
 # `HttpTransport`, and a backend's status is read through `ikigai_http::status` (its own copy deleted), so an
 # inference origin's 401/403 is `Refused`, 429 `RetryAfter`, 500 `Endpoint`; each action declares `.fails`.
 # ⚠ `^0.16.0` is also a ceiling below 0.17.0.
