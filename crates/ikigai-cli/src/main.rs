@@ -527,9 +527,6 @@ enum Mode {
         /// `--root`: serve UNRESTRICTED, by explicit request. Without it and without a grant,
         /// a scope or a principal, `ikigai mcp` refuses to start.
         root: bool,
-        /// `--grants <file>`: read grants (and the principals table) from this file instead
-        /// of the config home's `grants.json`.
-        grants_file: Option<std::path::PathBuf>,
         /// `--show <pattern>` (repeatable): project only the tools matching one of these,
         /// unioned with the named grants' `show` lists (ledger #1284). An IRI prefix
         /// (`urn:layer:`) selects by where a tool is bound. Relevance, never authority.
@@ -1180,6 +1177,11 @@ fn take_dir_flag(
     cwd: Option<&std::path::Path>,
     home: Option<&std::path::Path>,
 ) -> Result<Option<std::path::PathBuf>, String> {
+    let argument = if flag == "--grants" {
+        "<file>"
+    } else {
+        "<dir>"
+    };
     let assigned = format!("{flag}=");
     let mut found: Option<std::path::PathBuf> = None;
     let mut at = 0;
@@ -1187,7 +1189,7 @@ fn take_dir_flag(
         let value = if args[at] == flag {
             args.remove(at);
             if at >= args.len() {
-                return Err(format!("{flag} needs <dir>"));
+                return Err(format!("{flag} needs {argument}"));
             }
             args.remove(at)
         } else if let Some(value) = args[at].strip_prefix(assigned.as_str()) {
@@ -1199,7 +1201,7 @@ fn take_dir_flag(
             continue;
         };
         if value.is_empty() || value.starts_with('-') {
-            return Err(format!("{flag} needs <dir>, and was given `{value}`"));
+            return Err(format!("{flag} needs {argument}, and was given `{value}`"));
         }
         // The workspace's one `~` rule, shared with every config-home key that names a path.
         let typed = ikigai_resolve::expand_home(&value, home).map_err(|e| format!("{flag} {e}"))?;
@@ -1680,7 +1682,6 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
         let mut scopes = Vec::new();
         let mut principal = None;
         let mut root = false;
-        let mut grants_file = None;
         let mut shows = Vec::new();
         let mut certs = Certs::default();
         let mut mounts = Mounts::default();
@@ -1737,12 +1738,6 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                     })?)
                 }
                 "--root" => root = true,
-                "--grants" => {
-                    grants_file = Some(std::path::PathBuf::from(
-                        argv.next()
-                            .ok_or_else(|| "--grants needs a file".to_string())?,
-                    ))
-                }
                 "--show" => shows.push(argv.next().ok_or_else(|| {
                     "--show needs a pattern (a tool name, `repo-*`, or an IRI prefix such as \
                      `urn:layer:`)"
@@ -1765,7 +1760,6 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
             scopes,
             principal,
             root,
-            grants_file,
             shows,
             mounts,
         }));
@@ -2033,7 +2027,6 @@ fn main() {
             scopes,
             principal,
             root,
-            grants_file,
             shows,
             mounts,
         } => {
@@ -2045,7 +2038,6 @@ fn main() {
                     scopes,
                     principal,
                     root,
-                    grants_file,
                 },
                 shows,
                 mounts,
@@ -2320,7 +2312,6 @@ struct McpAuthority {
     scopes: Vec<String>,
     principal: Option<String>,
     root: bool,
-    grants_file: Option<std::path::PathBuf>,
 }
 
 /// The refusal for an `ikigai mcp` that names no authority (ledger #1830). It used to serve
@@ -2428,7 +2419,7 @@ fn mcp_capability(grants: &[String], scopes: &[String]) -> Result<ikigai_core::C
 fn mcp_capability_in(
     grants: &[String],
     scopes: &[String],
-    scopes_of: impl Fn(&str) -> Vec<String>,
+    scopes_of: impl Fn(&str) -> Result<Vec<String>, String>,
 ) -> Result<ikigai_core::Capability, String> {
     if grants.is_empty() && scopes.is_empty() {
         return Err(MCP_NO_AUTHORITY.to_string());
@@ -2436,7 +2427,7 @@ fn mcp_capability_in(
     let mut union: Vec<String> = scopes.to_vec();
     let mut undecided = Vec::new();
     for name in grants {
-        let granted = scopes_of(name);
+        let granted = scopes_of(name)?;
         if granted.is_empty() {
             undecided.push(format!("`{name}`"));
         }
@@ -2461,17 +2452,17 @@ fn mcp_capability_in(
 /// list bothers to show. Empty ⇒ allow-all. `--scope` unions carry authority only, no
 /// visibility; `--show` carries visibility only, no authority.
 #[cfg(feature = "embedded")]
-fn mcp_filter(grants: &[String], shows: &[String]) -> ikigai_mcp::ToolFilter {
+fn mcp_filter(grants: &[String], shows: &[String]) -> Result<ikigai_mcp::ToolFilter, String> {
     let mut filter = ikigai_mcp::ToolFilter {
         show: shows.to_vec(),
         hide: Vec::new(),
     };
     for name in grants {
-        let (show, hide) = ikigai_embedded::grant_visibility(name);
+        let (show, hide) = ikigai_embedded::grant_visibility(name)?;
         filter.show.extend(show);
         filter.hide.extend(hide);
     }
-    filter
+    Ok(filter)
 }
 
 /// MCP stdio mode: project the composed manifold as MCP tools, scoped to the
@@ -2491,9 +2482,6 @@ fn mcp(authority: McpAuthority, shows: Vec<String>, mounts: Mounts) {
     use std::io::Write;
     use std::sync::{Arc, Mutex, RwLock};
 
-    if let Some(path) = &authority.grants_file {
-        ikigai_embedded::set_grants_path(path.clone());
-    }
     // An unnamed authority, a grant that names nothing, or an agent outside its person's
     // grant refuses to start: running would be root (the old fail-open) or a session with an
     // authority the operator did not ask for.
@@ -2507,7 +2495,13 @@ fn mcp(authority: McpAuthority, shows: Vec<String>, mounts: Mounts) {
     let baseline = session.capability.clone();
     let grants = session.grants.clone();
     let capability = Arc::new(RwLock::new(session.capability));
-    let filter = Arc::new(RwLock::new(mcp_filter(&grants, &shows)));
+    let filter = match mcp_filter(&grants, &shows) {
+        Ok(filter) => Arc::new(RwLock::new(filter)),
+        Err(e) => {
+            eprintln!("ikigai mcp: refusing to start: {e}");
+            std::process::exit(2);
+        }
+    };
     match (
         &session.agent,
         capability.read().expect("cap lock").scopes(),
@@ -2660,7 +2654,10 @@ fn mcp(authority: McpAuthority, shows: Vec<String>, mounts: Mounts) {
                             ikigai_core::Capability::scoped(Vec::<String>::new())
                         }
                     };
-                    let fresh_filter = mcp_filter(&grants, &shows);
+                    let fresh_filter = mcp_filter(&grants, &shows).unwrap_or_else(|e| {
+                        eprintln!("ikigai mcp: {e} — keeping the previous visibility filter");
+                        filter.read().expect("filter lock").clone()
+                    });
                     let cap_changed =
                         fresh_cap.scopes() != capability.read().expect("cap lock").scopes();
                     let filter_changed = fresh_filter != *filter.read().expect("filter lock");
@@ -4074,16 +4071,10 @@ fn serve_quic(
         // failure this whole posture exists to avoid. (Relative fs scopes are the other
         // half, and are given a reachable meaning at mint time below.)
         let file_root = ikigai_embedded::file_root();
-        let declared: Vec<String> = caps
-            .iter()
-            .cloned()
-            .chain(
-                enrolment
-                    .iter()
-                    .flat_map(|e| e.grant_names())
-                    .flat_map(|name| ikigai_embedded::grant_scopes(&name)),
-            )
-            .collect();
+        let mut declared = caps.clone();
+        for name in enrolment.iter().flat_map(|e| e.grant_names()) {
+            declared.extend(ikigai_embedded::grant_scopes(&name)?);
+        }
         let unaddressable = ikigai_embedded::tenant::unaddressable_fs_scopes(&declared, &file_root);
         if !unaddressable.is_empty() {
             return Err(format!(
@@ -4308,7 +4299,7 @@ fn serve_quic(
         let surface_caps: Vec<String> = {
             let mut union = caps.clone();
             for grant in enrolment.iter().flat_map(|e| e.grant_names()) {
-                let scopes = ikigai_embedded::grant_scopes(&grant);
+                let scopes = ikigai_embedded::grant_scopes(&grant)?;
                 // Exactly what the minter clamps a connection under this grant to.
                 match &ceiling {
                     Some(ceiling) => union.extend(
@@ -7519,7 +7510,7 @@ mod mcp_authority_tests {
 
     #[test]
     fn naming_no_grant_and_no_scope_is_refused_never_root() {
-        let refused = mcp_capability_in(&[], &[], |_| Vec::new()).unwrap_err();
+        let refused = mcp_capability_in(&[], &[], |_| Ok(Vec::new())).unwrap_err();
         assert!(refused.contains("--root"), "{refused}");
         let Err(refused) = mcp_session(&McpAuthority::default()) else {
             panic!("no authority named must not serve");

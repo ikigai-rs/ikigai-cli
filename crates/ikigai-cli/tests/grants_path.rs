@@ -41,3 +41,17 @@ fn the_socket_host_reads_the_global_grants_flag() {
     assert!(!error.contains("unknown argument"), "{error}");
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn the_global_grants_parser_names_a_file_in_its_refusal() {
+    for args in [vec!["mcp", "--grants"], vec!["--grants=", "mcp"]] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_ikigai"))
+            .args(args)
+            .env_remove("IKIGAI_GRANTS")
+            .output()
+            .unwrap();
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{error}");
+        assert!(error.contains("--grants needs <file>"), "{error}");
+    }
+}

@@ -4,7 +4,8 @@ members = ["crates/*"]
 
 [workspace.package]
 # 0.3.0 removes IKIGAI_GRANTS: use the global --grants <file> flag instead.
-# grants_path now returns Result so every socket host can report a refused configuration.
+# grants_path, grant_scopes and grant_visibility return Result so library hosts can report
+# a refused configuration through client authorization as well as startup.
 # Shared socket admission is available through ikigai-embedded's optional ipc feature.
 # 0.1.32 is WEB PUSH (ledger #618): `EdgeConfig.push` (off by default) serves a server-sent-events
 # stream at `/_ikigai/push` — one core cut listener (core 0.1.82's `Kernel::listen`) per stream, under
@@ -1150,7 +1151,7 @@ members = ["crates/*"]
 # Additive; no public signature or wire format changes. Prepared here, not published.
 # 0.2.9 (a patch, opened after 0.2.8 was published, so it also carries what merged since):
 # the REPL's names layer reloads its file on a watcher RESCAN (events dropped), where it used to
-# keep the old bindings until the file changed again (ledger #2870). Prepared here, not published.
+# keep the old bindings until the file changed again (ledger #2870). Published.
 version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
