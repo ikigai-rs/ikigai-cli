@@ -5288,8 +5288,14 @@ fn compose_mounts(mut spaces: Vec<Arc<dyn Space>>, mounts: Vec<MountSpec>) -> Ar
         ));
     }
     for mount in first_segment {
+        // The peer answers in its own namespace; its `Unresolved` for the stripped name is
+        // reported under the name the caller asked for (ledger #3168).
+        let resolver: Arc<dyn ikigai_resolve::Resolver> = Arc::new(AliasUnresolved {
+            inner: mount.resolver,
+            prefix: mount.prefix.clone(),
+        });
         spaces.push(Arc::new(
-            ikigai_resolve::MountedRemote::new(mount.resolver, mount.prefix, mount.origin)
+            ikigai_resolve::MountedRemote::new(resolver, mount.prefix, mount.origin)
                 .sharing(&peers)
                 .with_clock(Arc::clone(&clock)),
         ));
@@ -5350,6 +5356,213 @@ pub fn alias_forwards_unchanged(prefix: &str) -> bool {
     prefix
         .strip_prefix("urn:")
         .is_some_and(|rest| rest.trim_end_matches(':').contains(':'))
+}
+
+/// The resolver under a first-segment ALIAS mount: the peer's own, except that its
+/// `Unresolved` for the name the mount forwarded is reported under the name the CALLER asked
+/// for (ledger #3168).
+///
+/// `MountedRemote` strips the alias (`urn:clj:greet` → `urn:greet`) and forwards; a peer that
+/// binds nothing there answers `Unresolved(urn:greet)`, and that came back to the caller as
+/// "no endpoint resolved for urn:greet", a name it never sent. Here the forwarded name gets
+/// its prefix back, so the caller reads the same words an unbound local name gets. Only the
+/// FORWARDED name is rewritten: an `Unresolved` for another name, one the peer's endpoint
+/// asked for in turn, names something in the peer's namespace and passes through unchanged.
+/// (A `Meta` already reported the caller's name, since the mount answers it with a local
+/// bottom, so this only changes what an invoke reports.)
+struct AliasUnresolved {
+    inner: Arc<dyn ikigai_resolve::Resolver>,
+    /// The alias prefix, `urn:clj:`, that the mount stripped to `urn:`.
+    prefix: String,
+}
+
+impl AliasUnresolved {
+    fn local<T>(
+        &self,
+        forwarded: &Iri,
+        result: std::result::Result<T, ikigai_core::Error>,
+    ) -> std::result::Result<T, ikigai_core::Error> {
+        match result {
+            Err(ikigai_core::Error::Unresolved(iri)) if iri == *forwarded => {
+                let local = iri
+                    .as_str()
+                    .strip_prefix("urn:")
+                    .and_then(|rest| Iri::parse(format!("{}{rest}", self.prefix)).ok());
+                Err(ikigai_core::Error::Unresolved(local.unwrap_or(iri)))
+            }
+            other => other,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ikigai_resolve::Resolver for AliasUnresolved {
+    fn issue(
+        &self,
+        request: Request,
+    ) -> std::result::Result<(Representation, ikigai_resolve::CacheStatus), ikigai_core::Error>
+    {
+        let target = request.target.clone();
+        self.local(&target, self.inner.issue(request))
+    }
+
+    fn issue_as(
+        &self,
+        request: Request,
+        capability: &ikigai_core::Capability,
+    ) -> std::result::Result<(Representation, ikigai_resolve::CacheStatus), ikigai_core::Error>
+    {
+        let target = request.target.clone();
+        self.local(&target, self.inner.issue_as(request, capability))
+    }
+
+    async fn issue_as_async(
+        &self,
+        request: Request,
+        capability: &ikigai_core::Capability,
+    ) -> std::result::Result<(Representation, ikigai_resolve::CacheStatus), ikigai_core::Error>
+    {
+        let target = request.target.clone();
+        let result = self.inner.issue_as_async(request, capability).await;
+        self.local(&target, result)
+    }
+
+    fn issue_as_in_run(
+        &self,
+        request: Request,
+        capability: &ikigai_core::Capability,
+        run: &ikigai_resolve::RunContext,
+    ) -> std::result::Result<(Representation, ikigai_resolve::CacheStatus), ikigai_core::Error>
+    {
+        let target = request.target.clone();
+        self.local(
+            &target,
+            self.inner.issue_as_in_run(request, capability, run),
+        )
+    }
+
+    async fn issue_body_as_in_run(
+        &self,
+        request: Request,
+        capability: &ikigai_core::Capability,
+        run: &ikigai_resolve::RunContext,
+    ) -> std::result::Result<
+        (
+            Representation<ikigai_core::Body>,
+            ikigai_resolve::CacheStatus,
+        ),
+        ikigai_core::Error,
+    > {
+        let target = request.target.clone();
+        let result = self
+            .inner
+            .issue_body_as_in_run(request, capability, run)
+            .await;
+        self.local(&target, result)
+    }
+
+    async fn issue_as_async_with_incoming(
+        &self,
+        request: Request,
+        capability: &ikigai_core::Capability,
+        incoming: ikigai_core::Provenance,
+    ) -> std::result::Result<(Representation, ikigai_resolve::CacheStatus), ikigai_core::Error>
+    {
+        let target = request.target.clone();
+        let result = self
+            .inner
+            .issue_as_async_with_incoming(request, capability, incoming)
+            .await;
+        self.local(&target, result)
+    }
+
+    async fn issue_as_async_in(
+        &self,
+        request: Request,
+        capability: &ikigai_core::Capability,
+        incoming: Option<ikigai_core::Provenance>,
+        scope: Scope,
+    ) -> std::result::Result<(Representation, ikigai_resolve::CacheStatus), ikigai_core::Error>
+    {
+        let target = request.target.clone();
+        let result = self
+            .inner
+            .issue_as_async_in(request, capability, incoming, scope)
+            .await;
+        self.local(&target, result)
+    }
+
+    async fn issue_attached_in(
+        &self,
+        request: Request,
+        capability: &ikigai_core::Capability,
+        incoming: Option<ikigai_core::Provenance>,
+        scope: Scope,
+        attach: Option<(String, ikigai_core::Body)>,
+    ) -> std::result::Result<(Representation, ikigai_resolve::CacheStatus), ikigai_core::Error>
+    {
+        let target = request.target.clone();
+        let result = self
+            .inner
+            .issue_attached_in(request, capability, incoming, scope, attach)
+            .await;
+        self.local(&target, result)
+    }
+
+    async fn issue_body_attached_in(
+        &self,
+        request: Request,
+        capability: &ikigai_core::Capability,
+        incoming: Option<ikigai_core::Provenance>,
+        scope: Scope,
+        attach: Option<(String, ikigai_core::Body)>,
+    ) -> std::result::Result<
+        (
+            Representation<ikigai_core::Body>,
+            ikigai_resolve::CacheStatus,
+        ),
+        ikigai_core::Error,
+    > {
+        let target = request.target.clone();
+        let result = self
+            .inner
+            .issue_body_attached_in(request, capability, incoming, scope, attach)
+            .await;
+        self.local(&target, result)
+    }
+
+    fn is_cached_in(
+        &self,
+        request: &Request,
+        capability: &ikigai_core::Capability,
+        scope: &Scope,
+    ) -> bool {
+        self.inner.is_cached_in(request, capability, scope)
+    }
+
+    fn set_tracer(&self, tracer: Arc<dyn ikigai_core::Tracer>) {
+        self.inner.set_tracer(tracer)
+    }
+
+    fn clear_tracer(&self) {
+        self.inner.clear_tracer()
+    }
+
+    fn is_cached(&self, request: &Request, capability: &ikigai_core::Capability) -> bool {
+        self.inner.is_cached(request, capability)
+    }
+
+    fn entries(&self) -> Option<Vec<SpaceEntry>> {
+        self.inner.entries()
+    }
+
+    fn try_entries(&self) -> std::result::Result<Option<Vec<SpaceEntry>>, ikigai_core::Error> {
+        self.inner.try_entries()
+    }
+
+    fn transport(&self) -> String {
+        self.inner.transport()
+    }
 }
 
 /// One remote mount: where it binds, a label for the catalog, the connected
@@ -9002,6 +9215,61 @@ mod tests {
         assert_eq!(
             probe(&space, "urn:quakes:regions").expect("the mount answers"),
             "quakes urn:regions"
+        );
+    }
+
+    /// A peer that binds nothing: every request comes back as the peer's own `Unresolved`,
+    /// naming the IRI it RECEIVED (or, for `urn:sub`, a name its endpoint asked for in turn).
+    struct UnbindingPeer;
+
+    #[async_trait::async_trait]
+    impl ikigai_resolve::Resolver for UnbindingPeer {
+        fn issue(
+            &self,
+            request: Request,
+        ) -> std::result::Result<(Representation, ikigai_resolve::CacheStatus), ikigai_core::Error>
+        {
+            if request.target.as_str() == "urn:sub" {
+                return Err(ikigai_core::Error::Unresolved(
+                    Iri::parse("urn:inner").unwrap(),
+                ));
+            }
+            Err(ikigai_core::Error::Unresolved(request.target))
+        }
+
+        fn is_cached(&self, _request: &Request, _capability: &Capability) -> bool {
+            false
+        }
+
+        fn entries(&self) -> Option<Vec<SpaceEntry>> {
+            None
+        }
+    }
+
+    /// ★ Ledger #3168: through a first-segment alias mount, the peer's `Unresolved` named the
+    /// STRIPPED name (`urn:greet`), so a caller who asked for `urn:clj:greet` was told nothing
+    /// resolved for a name it never sent. The caller is told about the name it asked for, in
+    /// the same words an unbound local name gets.
+    #[test]
+    fn an_alias_mounts_unresolved_names_the_name_the_caller_asked_for() {
+        let space = root_space_with_mounts(vec![MountSpec {
+            prefix: "urn:clj:".to_string(),
+            origin: "test://clj".to_string(),
+            resolver: Arc::new(UnbindingPeer),
+            kind: MountKind::Alias,
+        }]);
+        let err = probe(&space, "urn:clj:greet").expect_err("the peer binds nothing");
+        assert!(
+            matches!(&err, ikigai_core::Error::Unresolved(iri) if iri.as_str() == "urn:clj:greet"),
+            "{err:?}"
+        );
+        assert_eq!(err.to_string(), "no endpoint resolved for urn:clj:greet");
+        // An `Unresolved` for some OTHER name — one the peer's endpoint asked for — is the
+        // peer's to report, and is not re-prefixed into a name in this kernel.
+        let err = probe(&space, "urn:clj:sub").expect_err("the peer's sub-request fails");
+        assert!(
+            matches!(&err, ikigai_core::Error::Unresolved(iri) if iri.as_str() == "urn:inner"),
+            "{err:?}"
         );
     }
 
