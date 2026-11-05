@@ -87,6 +87,16 @@ its own (`CallHead::body`), the caller sends its chunks and END or ABORT after t
 class) and whole exchanges, including the collected answer a v9 and a v8 peer get. A test
 fails if the file differs from what the codec writes; the faces pin it verbatim.
 
+## Shared vectors
+
+`tests/vectors/wire_vectors.json` holds the postcard bytes of every type that crosses the
+wire (the primitives, `Verb`, `Request`, `Capability`, `Representation`, each `WireError`,
+`Call` and `Reply` variant, and the rest), the hello payloads, and whole IPC exchanges: each
+side's hello, then the framed call and reply for each verb, the other calls, and the
+downgrades a v8 and a v7 peer receive. `tests/wire_vectors.rs` computes it from the codec and
+fails if the committed file differs (regenerate with `IKIGAI_BLESS=1`). A face copies it, with
+`stream_frames.json`, verbatim instead of copying byte literals out of another face's tests.
+
 ## Framing
 
 | function | for transports that… |

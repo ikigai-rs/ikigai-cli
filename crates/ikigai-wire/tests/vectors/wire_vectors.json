@@ -1,0 +1,1075 @@
+{
+  "about": "The ikigai wire's shared vectors (ikigai-wire, ledger #3165), computed by crates/ikigai-wire/tests/wire_vectors.rs, which fails if this file differs from what the codec writes. Faces copy this file verbatim. Hex is lowercase. `postcard` holds the postcard bytes of each type that crosses the wire, named by `type`; `value` describes the value in JSON (a u64 past 2^53 is a decimal string; bytes are {\"hex\": …} or {\"utf8\": …}; an enum is its variant name, or an object naming it; a Capability is \"root\" or {\"scoped\": [...]}). `hello` holds the hello payloads, which are NOT postcard: \"IKWH\", a u32 big-endian version, a u8 mode (0 Verbatim, 1 Alias), trailing bytes ignored. `exchanges` holds whole IPC exchanges: each side's framed hello, then one framed call and one framed reply; every frame is a u32 big-endian length, then the payload. The streamed frames of wire v10 are stream_frames.json.",
+  "protocol_version": 10,
+  "min_protocol_version": 7,
+  "hello_magic": "494b5748",
+  "max_frame": 67108864,
+  "postcard": [
+    {
+      "name": "u32/0",
+      "type": "u32",
+      "value": 0,
+      "hex": "00"
+    },
+    {
+      "name": "u32/1",
+      "type": "u32",
+      "value": 1,
+      "hex": "01"
+    },
+    {
+      "name": "u32/127",
+      "type": "u32",
+      "value": 127,
+      "hex": "7f"
+    },
+    {
+      "name": "u32/128",
+      "type": "u32",
+      "value": 128,
+      "hex": "8001"
+    },
+    {
+      "name": "u32/300",
+      "type": "u32",
+      "value": 300,
+      "hex": "ac02"
+    },
+    {
+      "name": "u32/16384",
+      "type": "u32",
+      "value": 16384,
+      "hex": "808001"
+    },
+    {
+      "name": "u32/4294967295",
+      "type": "u32",
+      "value": 4294967295,
+      "hex": "ffffffff0f"
+    },
+    {
+      "name": "u64/2^53",
+      "type": "u64",
+      "value": 9007199254740992,
+      "hex": "8080808080808010"
+    },
+    {
+      "name": "u64/max",
+      "type": "u64",
+      "value": "18446744073709551615",
+      "hex": "ffffffffffffffffff01"
+    },
+    {
+      "name": "u8/255",
+      "type": "u8",
+      "value": 255,
+      "hex": "ff"
+    },
+    {
+      "name": "bool/false",
+      "type": "bool",
+      "value": false,
+      "hex": "00"
+    },
+    {
+      "name": "bool/true",
+      "type": "bool",
+      "value": true,
+      "hex": "01"
+    },
+    {
+      "name": "string/empty",
+      "type": "string",
+      "value": "",
+      "hex": "00"
+    },
+    {
+      "name": "string/ascii",
+      "type": "string",
+      "value": "hi",
+      "hex": "026869"
+    },
+    {
+      "name": "string/utf8",
+      "type": "string",
+      "value": "café ☕",
+      "hex": "09636166c3a920e29895"
+    },
+    {
+      "name": "bytes",
+      "type": "bytes",
+      "value": {
+        "hex": "00ff"
+      },
+      "hex": "0200ff"
+    },
+    {
+      "name": "option/none",
+      "type": "option<u32>",
+      "value": null,
+      "hex": "00"
+    },
+    {
+      "name": "option/some",
+      "type": "option<u32>",
+      "value": 300,
+      "hex": "01ac02"
+    },
+    {
+      "name": "Verb/Source",
+      "type": "Verb",
+      "value": "Source",
+      "hex": "00"
+    },
+    {
+      "name": "Verb/Sink",
+      "type": "Verb",
+      "value": "Sink",
+      "hex": "01"
+    },
+    {
+      "name": "Verb/Exists",
+      "type": "Verb",
+      "value": "Exists",
+      "hex": "02"
+    },
+    {
+      "name": "Verb/Delete",
+      "type": "Verb",
+      "value": "Delete",
+      "hex": "03"
+    },
+    {
+      "name": "Verb/Meta",
+      "type": "Verb",
+      "value": "Meta",
+      "hex": "04"
+    },
+    {
+      "name": "Iri",
+      "type": "Iri",
+      "value": "urn:test:upper",
+      "hex": "0e75726e3a746573743a7570706572"
+    },
+    {
+      "name": "ArgRef/Reference",
+      "type": "ArgRef",
+      "value": {
+        "Reference": "urn:example:doc"
+      },
+      "hex": "000f75726e3a6578616d706c653a646f63"
+    },
+    {
+      "name": "ArgRef/Inline",
+      "type": "ArgRef",
+      "value": {
+        "Inline": {
+          "hex": "6869"
+        }
+      },
+      "hex": "01026869"
+    },
+    {
+      "name": "ArgRef/Content",
+      "type": "ArgRef",
+      "value": {
+        "Content": "b3:85052e9aab1b67b6622d94a08441b09fd5b7aca61ee360416d70de5da67d86ca"
+      },
+      "hex": "024362333a38353035326539616162316236376236363232643934613038343431623039666435623761636136316565333630343136643730646535646136376438366361"
+    },
+    {
+      "name": "Request/no-args",
+      "type": "Request",
+      "value": {
+        "verb": "Source",
+        "target": "urn:example:note",
+        "args": {}
+      },
+      "hex": "001075726e3a6578616d706c653a6e6f746500"
+    },
+    {
+      "name": "Request/inline-arg",
+      "type": "Request",
+      "value": {
+        "verb": "Source",
+        "target": "urn:test:upper",
+        "args": {
+          "in": {
+            "Inline": {
+              "hex": "6869"
+            }
+          }
+        }
+      },
+      "hex": "000e75726e3a746573743a75707065720102696e01026869"
+    },
+    {
+      "name": "Request/args-in-key-order",
+      "type": "Request",
+      "value": {
+        "verb": "Sink",
+        "target": "urn:example:note",
+        "args": {
+          "a": {
+            "Reference": "urn:example:doc"
+          },
+          "b": {
+            "Inline": {
+              "hex": "00ff"
+            }
+          }
+        }
+      },
+      "hex": "011075726e3a6578616d706c653a6e6f7465020161000f75726e3a6578616d706c653a646f630162010200ff"
+    },
+    {
+      "name": "Capability/root",
+      "type": "Capability",
+      "value": "root",
+      "hex": "00"
+    },
+    {
+      "name": "Capability/scoped",
+      "type": "Capability",
+      "value": {
+        "scoped": [
+          "urn:cap:a",
+          "urn:cap:b"
+        ]
+      },
+      "hex": "01020975726e3a6361703a610975726e3a6361703a62"
+    },
+    {
+      "name": "ReprType/no-params",
+      "type": "ReprType",
+      "value": {
+        "media_type": "text/plain",
+        "params": {}
+      },
+      "hex": "0a746578742f706c61696e00"
+    },
+    {
+      "name": "ReprType/params",
+      "type": "ReprType",
+      "value": {
+        "media_type": "text/plain",
+        "params": {
+          "charset": "utf-8"
+        }
+      },
+      "hex": "0a746578742f706c61696e010763686172736574057574662d38"
+    },
+    {
+      "name": "Expiry/Always",
+      "type": "Expiry",
+      "value": "Always",
+      "hex": "00"
+    },
+    {
+      "name": "Expiry/At",
+      "type": "Expiry",
+      "value": {
+        "At": 1700000000000
+      },
+      "hex": "0180d095ffbc31"
+    },
+    {
+      "name": "Expiry/Never",
+      "type": "Expiry",
+      "value": "Never",
+      "hex": "02"
+    },
+    {
+      "name": "Representation/uncacheable",
+      "type": "Representation",
+      "value": {
+        "repr_type": {
+          "media_type": "text/plain",
+          "params": {}
+        },
+        "bytes": {
+          "utf8": "HI"
+        },
+        "expiry": "Always"
+      },
+      "hex": "0a746578742f706c61696e0002484900"
+    },
+    {
+      "name": "Representation/cacheable",
+      "type": "Representation",
+      "value": {
+        "repr_type": {
+          "media_type": "application/json",
+          "params": {}
+        },
+        "bytes": {
+          "utf8": "{}"
+        },
+        "expiry": "Never"
+      },
+      "hex": "106170706c69636174696f6e2f6a736f6e00027b7d02"
+    },
+    {
+      "name": "CacheStatus/Hit",
+      "type": "CacheStatus",
+      "value": "Hit",
+      "hex": "00"
+    },
+    {
+      "name": "CacheStatus/Miss",
+      "type": "CacheStatus",
+      "value": "Miss",
+      "hex": "01"
+    },
+    {
+      "name": "CacheStatus/Uncacheable",
+      "type": "CacheStatus",
+      "value": "Uncacheable",
+      "hex": "02"
+    },
+    {
+      "name": "SpaceEntry/local",
+      "type": "SpaceEntry",
+      "value": {
+        "pattern": "urn:test:upper",
+        "endpoint": "upper",
+        "origin": null
+      },
+      "hex": "0e75726e3a746573743a757070657205757070657200"
+    },
+    {
+      "name": "SpaceEntry/mounted",
+      "type": "SpaceEntry",
+      "value": {
+        "pattern": "urn:example:note/{id}",
+        "endpoint": "note",
+        "origin": "beefybox"
+      },
+      "hex": "1575726e3a6578616d706c653a6e6f74652f7b69647d046e6f746501086265656679626f78"
+    },
+    {
+      "name": "TraceEvent",
+      "type": "TraceEvent",
+      "value": {
+        "target": "urn:test:upper",
+        "thread": "ikigai-sched-0",
+        "started": 1000,
+        "ended": 1250,
+        "cache_hit": false,
+        "span": 1,
+        "parent": null,
+        "capability": [
+          "urn:cap:demo"
+        ],
+        "notes": [
+          [
+            "model",
+            "llama3.2:3b"
+          ]
+        ]
+      },
+      "hex": "0e75726e3a746573743a75707065720e696b696761692d73636865642d3001e80701e20900010001010c75726e3a6361703a64656d6f01056d6f64656c0b6c6c616d61332e323a3362"
+    },
+    {
+      "name": "TraceContext/root",
+      "type": "TraceContext",
+      "value": {
+        "trace_id": 7,
+        "parent_span": null
+      },
+      "hex": "0700"
+    },
+    {
+      "name": "TraceContext/parented",
+      "type": "TraceContext",
+      "value": {
+        "trace_id": 7,
+        "parent_span": 3
+      },
+      "hex": "070103"
+    },
+    {
+      "name": "IssueWith/empty",
+      "type": "IssueWith",
+      "value": {
+        "trace": null,
+        "retries": null,
+        "time_left_ms": null
+      },
+      "hex": "000000"
+    },
+    {
+      "name": "IssueWith/full",
+      "type": "IssueWith",
+      "value": {
+        "trace": {
+          "trace_id": 7,
+          "parent_span": null
+        },
+        "retries": 2,
+        "time_left_ms": 1500
+      },
+      "hex": "010700010201dc0b"
+    },
+    {
+      "name": "WireError/Unresolved",
+      "type": "WireError",
+      "value": {
+        "Unresolved": "urn:x"
+      },
+      "hex": "000575726e3a78"
+    },
+    {
+      "name": "WireError/MissingArgument",
+      "type": "WireError",
+      "value": {
+        "MissingArgument": "in"
+      },
+      "hex": "0102696e"
+    },
+    {
+      "name": "WireError/InvalidArgument",
+      "type": "WireError",
+      "value": {
+        "InvalidArgument": {
+          "name": "in",
+          "detail": "not a number"
+        }
+      },
+      "hex": "0202696e0c6e6f742061206e756d626572"
+    },
+    {
+      "name": "WireError/Endpoint",
+      "type": "WireError",
+      "value": {
+        "Endpoint": "boom"
+      },
+      "hex": "0304626f6f6d"
+    },
+    {
+      "name": "WireError/Denied",
+      "type": "WireError",
+      "value": {
+        "Denied": "x"
+      },
+      "hex": "040178"
+    },
+    {
+      "name": "WireError/NotFound",
+      "type": "WireError",
+      "value": {
+        "NotFound": "no such note"
+      },
+      "hex": "050c6e6f2073756368206e6f7465"
+    },
+    {
+      "name": "WireError/Timeout",
+      "type": "WireError",
+      "value": {
+        "Timeout": "slow"
+      },
+      "hex": "0604736c6f77"
+    },
+    {
+      "name": "WireError/Unavailable",
+      "type": "WireError",
+      "value": {
+        "Unavailable": "the origin went away"
+      },
+      "hex": "0714746865206f726967696e2077656e742061776179"
+    },
+    {
+      "name": "WireError/Conflict",
+      "type": "WireError",
+      "value": {
+        "Conflict": "x"
+      },
+      "hex": "080178"
+    },
+    {
+      "name": "WireError/DepthExceeded",
+      "type": "WireError",
+      "value": {
+        "DepthExceeded": {
+          "depth": 64,
+          "target": "urn:x"
+        }
+      },
+      "hex": "09400575726e3a78"
+    },
+    {
+      "name": "WireError/RetryAfter",
+      "type": "WireError",
+      "value": {
+        "RetryAfter": {
+          "delay_ms": 2000,
+          "detail": "rate-limited"
+        }
+      },
+      "hex": "0a01d00f0c726174652d6c696d69746564"
+    },
+    {
+      "name": "WireError/RetryAfter/no-delay",
+      "type": "WireError",
+      "value": {
+        "RetryAfter": {
+          "delay_ms": null,
+          "detail": "rate-limited"
+        }
+      },
+      "hex": "0a000c726174652d6c696d69746564"
+    },
+    {
+      "name": "WireError/OverBudget",
+      "type": "WireError",
+      "value": {
+        "OverBudget": "too big"
+      },
+      "hex": "0b07746f6f20626967"
+    },
+    {
+      "name": "WireError/Refused",
+      "type": "WireError",
+      "value": {
+        "Refused": "api.example.com answered 401"
+      },
+      "hex": "0c1c6170692e6578616d706c652e636f6d20616e73776572656420343031"
+    },
+    {
+      "name": "WireError/Unsupported",
+      "type": "WireError",
+      "value": {
+        "Unsupported": {
+          "verb": "Delete",
+          "detail": "read-only"
+        }
+      },
+      "hex": "0d010309726561642d6f6e6c79"
+    },
+    {
+      "name": "WireError/Unsupported/no-verb",
+      "type": "WireError",
+      "value": {
+        "Unsupported": {
+          "verb": null,
+          "detail": "no clock"
+        }
+      },
+      "hex": "0d00086e6f20636c6f636b"
+    },
+    {
+      "name": "Call/Issue",
+      "type": "Call",
+      "value": {
+        "Issue": {
+          "verb": "Source",
+          "target": "urn:test:upper",
+          "args": {
+            "in": {
+              "Inline": {
+                "hex": "6869"
+              }
+            }
+          }
+        }
+      },
+      "hex": "00000e75726e3a746573743a75707065720102696e01026869"
+    },
+    {
+      "name": "Call/IsCached",
+      "type": "Call",
+      "value": {
+        "IsCached": {
+          "verb": "Source",
+          "target": "urn:test:upper",
+          "args": {
+            "in": {
+              "Inline": {
+                "hex": "6869"
+              }
+            }
+          }
+        }
+      },
+      "hex": "01000e75726e3a746573743a75707065720102696e01026869"
+    },
+    {
+      "name": "Call/Entries",
+      "type": "Call",
+      "value": "Entries",
+      "hex": "02"
+    },
+    {
+      "name": "Call/IssueAs",
+      "type": "Call",
+      "value": {
+        "IssueAs": [
+          {
+            "verb": "Source",
+            "target": "urn:test:upper",
+            "args": {
+              "in": {
+                "Inline": {
+                  "hex": "6869"
+                }
+              }
+            }
+          },
+          "root"
+        ]
+      },
+      "hex": "03000e75726e3a746573743a75707065720102696e0102686900"
+    },
+    {
+      "name": "Call/IssueTraced",
+      "type": "Call",
+      "value": {
+        "IssueTraced": [
+          {
+            "verb": "Source",
+            "target": "urn:test:upper",
+            "args": {
+              "in": {
+                "Inline": {
+                  "hex": "6869"
+                }
+              }
+            }
+          },
+          "root",
+          {
+            "trace_id": 7,
+            "parent_span": null
+          }
+        ]
+      },
+      "hex": "04000e75726e3a746573743a75707065720102696e01026869000700"
+    },
+    {
+      "name": "Call/IssueWith",
+      "type": "Call",
+      "value": {
+        "IssueWith": [
+          {
+            "verb": "Source",
+            "target": "urn:test:upper",
+            "args": {
+              "in": {
+                "Inline": {
+                  "hex": "6869"
+                }
+              }
+            }
+          },
+          "root",
+          {
+            "trace": null,
+            "retries": 1,
+            "time_left_ms": 1500
+          }
+        ]
+      },
+      "hex": "05000e75726e3a746573743a75707065720102696e010268690000010101dc0b"
+    },
+    {
+      "name": "Reply/Resolved",
+      "type": "Reply",
+      "value": {
+        "Resolved": [
+          {
+            "repr_type": {
+              "media_type": "text/plain",
+              "params": {}
+            },
+            "bytes": {
+              "utf8": "HI"
+            },
+            "expiry": "Always"
+          },
+          "Miss"
+        ]
+      },
+      "hex": "000a746578742f706c61696e000248490001"
+    },
+    {
+      "name": "Reply/Cached/true",
+      "type": "Reply",
+      "value": {
+        "Cached": true
+      },
+      "hex": "0101"
+    },
+    {
+      "name": "Reply/Entries/none",
+      "type": "Reply",
+      "value": {
+        "Entries": null
+      },
+      "hex": "0200"
+    },
+    {
+      "name": "Reply/Entries/some",
+      "type": "Reply",
+      "value": {
+        "Entries": [
+          {
+            "pattern": "urn:test:upper",
+            "endpoint": "upper",
+            "origin": null
+          }
+        ]
+      },
+      "hex": "0201010e75726e3a746573743a757070657205757070657200"
+    },
+    {
+      "name": "Reply/Error",
+      "type": "Reply",
+      "value": {
+        "Error": "boom"
+      },
+      "hex": "0304626f6f6d"
+    },
+    {
+      "name": "Reply/ResolvedTraced",
+      "type": "Reply",
+      "value": {
+        "ResolvedTraced": [
+          {
+            "repr_type": {
+              "media_type": "text/plain",
+              "params": {}
+            },
+            "bytes": {
+              "utf8": "HI"
+            },
+            "expiry": "Always"
+          },
+          "Miss",
+          [
+            {
+              "target": "urn:test:upper",
+              "thread": "ikigai-sched-0",
+              "started": 1000,
+              "ended": 1250,
+              "cache_hit": false,
+              "span": 1,
+              "parent": null,
+              "capability": [
+                "urn:cap:demo"
+              ],
+              "notes": [
+                [
+                  "model",
+                  "llama3.2:3b"
+                ]
+              ]
+            }
+          ]
+        ]
+      },
+      "hex": "040a746578742f706c61696e000248490001010e75726e3a746573743a75707065720e696b696761692d73636865642d3001e80701e20900010001010c75726e3a6361703a64656d6f01056d6f64656c0b6c6c616d61332e323a3362"
+    },
+    {
+      "name": "Reply/ErrorTyped",
+      "type": "Reply",
+      "value": {
+        "ErrorTyped": {
+          "Denied": "x"
+        }
+      },
+      "hex": "05040178"
+    }
+  ],
+  "hello": [
+    {
+      "name": "client/verbatim",
+      "about": "a plain client's hello",
+      "version": 10,
+      "mode": "Verbatim",
+      "payload": "494b57480000000a00",
+      "framed": "00000009494b57480000000a00"
+    },
+    {
+      "name": "client/alias",
+      "about": "an alias mount's hello",
+      "version": 10,
+      "mode": "Alias",
+      "payload": "494b57480000000a01",
+      "framed": "00000009494b57480000000a01"
+    },
+    {
+      "name": "client/oldest",
+      "about": "the oldest version a current peer speaks",
+      "version": 7,
+      "mode": "Verbatim",
+      "payload": "494b57480000000700",
+      "framed": "00000009494b57480000000700"
+    },
+    {
+      "name": "server/answer",
+      "about": "a server's answer omits the mode byte; a reader defaults it to Verbatim",
+      "version": 10,
+      "mode": "Verbatim",
+      "payload": "494b57480000000a",
+      "framed": "00000008494b57480000000a"
+    }
+  ],
+  "exchanges": [
+    {
+      "name": "v10/Source",
+      "transport": "ipc",
+      "peer_version": 10,
+      "about": "a call under the root capability (Call::IssueAs) and a representative answer",
+      "call": {
+        "IssueAs": [
+          {
+            "verb": "Source",
+            "target": "urn:example:note",
+            "args": {}
+          },
+          "root"
+        ]
+      },
+      "call_payload": "03001075726e3a6578616d706c653a6e6f74650000",
+      "reply_payload": "000a746578742f706c61696e000568656c6c6f0201",
+      "client_writes": "00000009494b57480000000a000000001503001075726e3a6578616d706c653a6e6f74650000",
+      "server_writes": "00000008494b57480000000a00000015000a746578742f706c61696e000568656c6c6f0201"
+    },
+    {
+      "name": "v10/Sink",
+      "transport": "ipc",
+      "peer_version": 10,
+      "about": "a call under the root capability (Call::IssueAs) and a representative answer",
+      "call": {
+        "IssueAs": [
+          {
+            "verb": "Sink",
+            "target": "urn:example:note",
+            "args": {}
+          },
+          "root"
+        ]
+      },
+      "call_payload": "03011075726e3a6578616d706c653a6e6f74650000",
+      "reply_payload": "000a746578742f706c61696e000673746f7265640002",
+      "client_writes": "00000009494b57480000000a000000001503011075726e3a6578616d706c653a6e6f74650000",
+      "server_writes": "00000008494b57480000000a00000016000a746578742f706c61696e000673746f7265640002"
+    },
+    {
+      "name": "v10/Exists",
+      "transport": "ipc",
+      "peer_version": 10,
+      "about": "a call under the root capability (Call::IssueAs) and a representative answer",
+      "call": {
+        "IssueAs": [
+          {
+            "verb": "Exists",
+            "target": "urn:example:note",
+            "args": {}
+          },
+          "root"
+        ]
+      },
+      "call_payload": "03021075726e3a6578616d706c653a6e6f74650000",
+      "reply_payload": "000a746578742f706c61696e00000200",
+      "client_writes": "00000009494b57480000000a000000001503021075726e3a6578616d706c653a6e6f74650000",
+      "server_writes": "00000008494b57480000000a00000010000a746578742f706c61696e00000200"
+    },
+    {
+      "name": "v10/Delete",
+      "transport": "ipc",
+      "peer_version": 10,
+      "about": "a call under the root capability (Call::IssueAs) and a representative answer",
+      "call": {
+        "IssueAs": [
+          {
+            "verb": "Delete",
+            "target": "urn:example:note",
+            "args": {}
+          },
+          "root"
+        ]
+      },
+      "call_payload": "03031075726e3a6578616d706c653a6e6f74650000",
+      "reply_payload": "000a746578742f706c61696e00000002",
+      "client_writes": "00000009494b57480000000a000000001503031075726e3a6578616d706c653a6e6f74650000",
+      "server_writes": "00000008494b57480000000a00000010000a746578742f706c61696e00000002"
+    },
+    {
+      "name": "v10/Meta",
+      "transport": "ipc",
+      "peer_version": 10,
+      "about": "a call under the root capability (Call::IssueAs) and a representative answer",
+      "call": {
+        "IssueAs": [
+          {
+            "verb": "Meta",
+            "target": "urn:example:note",
+            "args": {}
+          },
+          "root"
+        ]
+      },
+      "call_payload": "03041075726e3a6578616d706c653a6e6f74650000",
+      "reply_payload": "00106170706c69636174696f6e2f6a736f6e00027b7d0002",
+      "client_writes": "00000009494b57480000000a000000001503041075726e3a6578616d706c653a6e6f74650000",
+      "server_writes": "00000008494b57480000000a0000001800106170706c69636174696f6e2f6a736f6e00027b7d0002"
+    },
+    {
+      "name": "v10/Source/not-found",
+      "transport": "ipc",
+      "peer_version": 10,
+      "about": "a failure crosses as Reply::ErrorTyped with its taxonomy",
+      "call": {
+        "IssueAs": [
+          {
+            "verb": "Source",
+            "target": "urn:example:note",
+            "args": {}
+          },
+          "root"
+        ]
+      },
+      "call_payload": "03001075726e3a6578616d706c653a6e6f74650000",
+      "reply_payload": "05050c6e6f2073756368206e6f7465",
+      "client_writes": "00000009494b57480000000a000000001503001075726e3a6578616d706c653a6e6f74650000",
+      "server_writes": "00000008494b57480000000a0000000f05050c6e6f2073756368206e6f7465"
+    },
+    {
+      "name": "v10/IsCached",
+      "transport": "ipc",
+      "peer_version": 10,
+      "about": "whether the server's cache holds an answer",
+      "call": {
+        "IsCached": {
+          "verb": "Source",
+          "target": "urn:example:note",
+          "args": {}
+        }
+      },
+      "call_payload": "01001075726e3a6578616d706c653a6e6f746500",
+      "reply_payload": "0100",
+      "client_writes": "00000009494b57480000000a000000001401001075726e3a6578616d706c653a6e6f746500",
+      "server_writes": "00000008494b57480000000a000000020100"
+    },
+    {
+      "name": "v10/Entries",
+      "transport": "ipc",
+      "peer_version": 10,
+      "about": "the server's bindings",
+      "call": "Entries",
+      "call_payload": "02",
+      "reply_payload": "0201011075726e3a6578616d706c653a6e6f7465046e6f746500",
+      "client_writes": "00000009494b57480000000a000000000102",
+      "server_writes": "00000008494b57480000000a0000001a0201011075726e3a6578616d706c653a6e6f7465046e6f746500"
+    },
+    {
+      "name": "v10/IssueTraced",
+      "transport": "ipc",
+      "peer_version": 10,
+      "about": "a recorded call, answered with the server's spans",
+      "call": {
+        "IssueTraced": [
+          {
+            "verb": "Source",
+            "target": "urn:test:upper",
+            "args": {
+              "in": {
+                "Inline": {
+                  "hex": "6869"
+                }
+              }
+            }
+          },
+          "root",
+          {
+            "trace_id": 7,
+            "parent_span": null
+          }
+        ]
+      },
+      "call_payload": "04000e75726e3a746573743a75707065720102696e01026869000700",
+      "reply_payload": "040a746578742f706c61696e000248490001010e75726e3a746573743a75707065720e696b696761692d73636865642d3001e80701e20900010001010c75726e3a6361703a64656d6f01056d6f64656c0b6c6c616d61332e323a3362",
+      "client_writes": "00000009494b57480000000a000000001c04000e75726e3a746573743a75707065720102696e01026869000700",
+      "server_writes": "00000008494b57480000000a0000005c040a746578742f706c61696e000248490001010e75726e3a746573743a75707065720e696b696761692d73636865642d3001e80701e20900010001010c75726e3a6361703a64656d6f01056d6f64656c0b6c6c616d61332e323a3362"
+    },
+    {
+      "name": "v10/IssueWith",
+      "transport": "ipc",
+      "peer_version": 10,
+      "about": "a call carrying its run's context, answered with a typed RetryAfter",
+      "call": {
+        "IssueWith": [
+          {
+            "verb": "Source",
+            "target": "urn:example:note",
+            "args": {}
+          },
+          {
+            "scoped": [
+              "urn:cap:a"
+            ]
+          },
+          {
+            "trace": null,
+            "retries": 1,
+            "time_left_ms": 1500
+          }
+        ]
+      },
+      "call_payload": "05001075726e3a6578616d706c653a6e6f74650001010975726e3a6361703a6100010101dc0b",
+      "reply_payload": "050a01d00f0c726174652d6c696d69746564",
+      "client_writes": "00000009494b57480000000a000000002605001075726e3a6578616d706c653a6e6f74650001010975726e3a6361703a6100010101dc0b",
+      "server_writes": "00000008494b57480000000a00000012050a01d00f0c726174652d6c696d69746564"
+    },
+    {
+      "name": "v8/IssueWith",
+      "transport": "ipc",
+      "peer_version": 8,
+      "about": "to a v8 peer the run context is dropped (Call::for_peer) and a v9 error crosses as Endpoint(display) (Reply::for_peer)",
+      "call": {
+        "IssueWith": [
+          {
+            "verb": "Source",
+            "target": "urn:example:note",
+            "args": {}
+          },
+          {
+            "scoped": [
+              "urn:cap:a"
+            ]
+          },
+          {
+            "trace": null,
+            "retries": 1,
+            "time_left_ms": 1500
+          }
+        ]
+      },
+      "call_payload": "03001075726e3a6578616d706c653a6e6f74650001010975726e3a6361703a61",
+      "reply_payload": "05032172657472792061667465722032303030206d733a20726174652d6c696d69746564",
+      "client_writes": "00000009494b574800000008000000002003001075726e3a6578616d706c653a6e6f74650001010975726e3a6361703a61",
+      "server_writes": "00000008494b5748000000080000002405032172657472792061667465722032303030206d733a20726174652d6c696d69746564"
+    },
+    {
+      "name": "v7/Conflict",
+      "transport": "ipc",
+      "peer_version": 7,
+      "about": "to a v7 peer a Conflict crosses as Endpoint(\"conflict: …\")",
+      "call": {
+        "IssueAs": [
+          {
+            "verb": "Sink",
+            "target": "urn:example:note",
+            "args": {}
+          },
+          "root"
+        ]
+      },
+      "call_payload": "03011075726e3a6578616d706c653a6e6f74650000",
+      "reply_payload": "05030b636f6e666c6963743a2078",
+      "client_writes": "00000009494b574800000007000000001503011075726e3a6578616d706c653a6e6f74650000",
+      "server_writes": "00000008494b5748000000070000000e05030b636f6e666c6963743a2078"
+    }
+  ]
+}
