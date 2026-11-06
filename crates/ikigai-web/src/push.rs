@@ -718,6 +718,15 @@ mod tests {
         }
     }
 
+    /// The whole data of the `resync` event `event` starts with, so a test pins every field.
+    fn resync_data(event: &str) -> serde_json::Value {
+        let data = event
+            .lines()
+            .find_map(|l| l.strip_prefix("data: "))
+            .unwrap();
+        serde_json::from_str(data).unwrap()
+    }
+
     /// Read and write a cell directly on the kernel, under `cap`, with no await in between —
     /// so on this single-threaded test runtime the stream's task cannot drain in between.
     fn read_now(kernel: &Kernel, iri: &str, cap: &Capability) {
@@ -833,7 +842,13 @@ mod tests {
         http(addr, "GET", "/test/cell/a", "", "").await;
         write_now(&kernel, "urn:test:cell:a", &Capability::root());
 
-        admin.until("urn:test:secret").await;
+        // Then a cell only the admin reads is written. Cuts arrive in sequence order, so once the
+        // admin stream has sent that cut, any cut of the anonymous page's cell it heard has been
+        // sent before it, and read.
+        http(addr, "GET", "/test/cell/s", "session=admin", "").await;
+        write_now(&kernel, "urn:test:cell:s", &Capability::root());
+
+        admin.until("urn:test:cell:s").await;
         anon.until("event: cut\n").await;
         let cuts = anon.cuts();
         // Cuts arrive in sequence order, so had the secret's cut been heard it would be first.
@@ -841,7 +856,13 @@ mod tests {
         assert_eq!(cuts[0]["thread"], "urn:test:cell:a");
         assert!(!anon.seen.contains("secret"), "{}", anon.seen);
         // And the admin stream hears the cell only if the admin read it — it did not.
-        assert_eq!(admin.cuts().len(), 1, "{}", admin.seen);
+        let threads = admin.cuts().iter().map(|c| c["thread"].clone()).collect();
+        assert_eq!(
+            serde_json::Value::Array(threads),
+            serde_json::json!(["urn:test:secret", "urn:test:cell:s"]),
+            "{}",
+            admin.seen
+        );
     }
 
     #[tokio::test]
@@ -858,8 +879,11 @@ mod tests {
             write_now(&kernel, "urn:test:cell:a", &anonymous());
         }
         let resync = stream.until("event: resync\n").await.to_string();
-        assert!(resync.contains(r#""dropped":8"#), "{resync}");
-        assert!(resync.contains(r#""reason":"dropped""#), "{resync}");
+        assert_eq!(
+            resync_data(&resync),
+            serde_json::json!({"reason": "dropped", "dropped": 8}),
+            "{resync}"
+        );
         assert_eq!(stream.cuts().len(), 2, "{}", stream.seen);
     }
 
@@ -871,7 +895,11 @@ mod tests {
         assert!(fresh.seen.contains("id: 0\n"), "{}", fresh.seen);
         let mut again = Stream::open(addr, "", "Last-Event-ID: 0\r\n").await;
         let resync = again.until("event: resync\n").await;
-        assert!(resync.contains(r#""reason":"reconnect""#), "{resync}");
+        assert_eq!(
+            resync_data(resync),
+            serde_json::json!({"reason": "reconnect"}),
+            "{resync}"
+        );
     }
 
     #[tokio::test]
