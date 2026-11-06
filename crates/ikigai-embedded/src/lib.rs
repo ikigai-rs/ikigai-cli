@@ -11684,16 +11684,22 @@ mod arrangement_tests {
             let ambiguous = harvest.ambiguous.contains_key(&door.endpoint);
             assert!(registered ^ ambiguous, "{door:?}");
         }
-        // On every machine: two jails under `file`, and two clones each under `meeting` and
-        // `org-agenda`. (`llm-*` join them wherever llm.json declares a second provider.)
-        for name in ["file", "meeting", "org-agenda"] {
-            assert!(
-                harvest.ambiguous.contains_key(name),
-                "{name}: {:?}",
-                harvest.ambiguous
-            );
-        }
-        for name in ["calendar", "availability"] {
+        // On every machine: two jails under `file`. (`llm-*` join it wherever llm.json declares
+        // a second provider.) `meeting` and `org-agenda` each named two doors until ikigai-meeting
+        // 0.7 and ikigai-org 0.3 gave every door its own id, so each of those is one endpoint.
+        assert!(
+            harvest.ambiguous.contains_key("file"),
+            "file: {:?}",
+            harvest.ambiguous
+        );
+        for name in [
+            "calendar",
+            "availability",
+            "meeting-schedule",
+            "meeting-zoom-schedule",
+            "org-agenda",
+            "org-agenda-period",
+        ] {
             assert!(
                 harvest.registry.get(name).is_some(),
                 "{name} is one endpoint"
