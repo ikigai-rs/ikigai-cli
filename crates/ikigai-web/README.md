@@ -151,10 +151,13 @@ let config = EdgeConfig {
 Rules match the raw encoded path, case-sensitively, in declaration order; the
 first match wins. Exact destinations must be same-origin absolute paths without
 queries or fragments. A trailing-slash prefix must end in `/`: the example
-redirects `/face/name` and every descendant lacking a final slash, including
-`/face/name/alice` to `/face/name/alice/`, while leaving `/face/names/alice` and
-already-slashed paths alone. Use an exact rule to limit canonicalization to one
-path. Rules explicitly declare redirect paths even on a routes-only door.
+redirects the bare prefix `/face/name` to `/face/name/` and exactly one non-empty
+segment below it, such as `/face/name/board` to `/face/name/board/`. Deeper paths
+such as `/face/name/board/app.js` and `/face/name/board/js/x.js` are unchanged, as
+are `/face/names/alice`, empty segments and already-slashed paths. Segments are
+separated by literal `/` bytes; an encoded slash (`%2f`) stays within a segment.
+Use an exact rule to limit canonicalization to one path. Rules explicitly declare
+redirect paths even on a routes-only door.
 
 The request's query is copied byte for byte, including escape case, `+`, repeated
 keys, order, and an empty `?`; `/old?x=%2f+%20` becomes

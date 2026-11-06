@@ -236,3 +236,39 @@ async fn first_matching_rule_wins_and_malformed_targets_still_fail_intake() {
         assert_eq!(header(&resp, "Location"), None);
     }
 }
+
+#[tokio::test]
+async fn trailing_slash_matches_only_the_bare_prefix_and_one_segment() {
+    for method in ["GET", "HEAD"] {
+        for (path, expected) in [
+            ("/face/name", "/face/name/"),
+            (
+                "/face/name/board?x=%2f+%20&bare",
+                "/face/name/board/?x=%2f+%20&bare",
+            ),
+        ] {
+            let resp = request(config(), method, path, "").await;
+            assert_eq!(
+                split(&resp).0[0],
+                "HTTP/1.1 308 Permanent Redirect",
+                "{resp}"
+            );
+            assert_eq!(header(&resp, "Location"), Some(expected));
+        }
+        for path in [
+            "/face/name/board/app.js",
+            "/face/name/board/js/x.js",
+            "/face/name/board/app.js?x=%2f",
+            "/face/name/",
+            "/face/name//board",
+        ] {
+            let resp = request(config(), method, path, "").await;
+            assert_eq!(
+                split(&resp).0[0],
+                "HTTP/1.1 404 Not Found",
+                "{method} {path}: {resp}"
+            );
+            assert_eq!(header(&resp, "Location"), None);
+        }
+    }
+}

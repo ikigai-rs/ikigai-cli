@@ -30,10 +30,11 @@ impl ReadRedirect {
         })
     }
 
-    /// Append `/` to paths at or beneath `prefix` that lack a trailing slash.
-    /// `prefix` must end in `/`; `/face/name/` matches `/face/name` and its
-    /// descendants, but not `/face/names`. Already-slashed paths are unchanged.
-    /// Use an exact rule when only one path should gain a slash.
+    /// Append `/` to the bare prefix or exactly one non-empty segment below it.
+    /// `prefix` must end in `/`; `/face/name/` matches `/face/name` and
+    /// `/face/name/board`, but not `/face/name/board/app.js` or `/face/names`.
+    /// Already-slashed paths are unchanged. Segments use the raw encoded path,
+    /// so an encoded slash (`%2f`) is part of a segment, not a separator.
     pub fn trailing_slash(prefix: &str) -> Result<Self, HeaderRefusal> {
         check_path(prefix)?;
         if !prefix.ends_with('/') {
@@ -81,7 +82,10 @@ pub(super) fn response(rules: &[ReadRedirect], req: &HttpRequest) -> Option<Resp
             } if path == source && path != destination => destination.clone(),
             Rule::TrailingSlash { prefix }
                 if !path.ends_with('/')
-                    && (path == prefix.trim_end_matches('/') || path.starts_with(prefix)) =>
+                    && (path == &prefix[..prefix.len() - 1]
+                        || path.strip_prefix(prefix).is_some_and(|segment| {
+                            !segment.is_empty() && !segment.contains('/')
+                        })) =>
             {
                 format!("{path}/")
             }
