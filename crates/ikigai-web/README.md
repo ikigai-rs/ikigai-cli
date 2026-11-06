@@ -130,6 +130,42 @@ personal data out of them.
 Adding `Route::redirect` requires Rust callers constructing a `Route` to supply
 `redirect: None` to keep the previous behavior.
 
+Hosts can also declare **read redirects** in `EdgeConfig::read_redirects` (empty by
+default). These answer GET and HEAD with `308 Permanent Redirect` after bounded
+intake and admission, before push or endpoint dispatch. POST and other methods
+keep their ordinary behavior. The answer carries the existing security headers,
+route CORS/CSP overrides, and HEAD handling; no page body is generated.
+
+```rust
+use ikigai_web::{EdgeConfig, ReadRedirect};
+
+let config = EdgeConfig {
+    read_redirects: vec![
+        ReadRedirect::exact("/old", "/canonical/").unwrap(),
+        ReadRedirect::trailing_slash("/face/name/").unwrap(),
+    ],
+    ..EdgeConfig::default()
+};
+```
+
+Rules match the raw encoded path, case-sensitively, in declaration order; the
+first match wins. Exact destinations must be same-origin absolute paths without
+queries or fragments. A trailing-slash prefix must end in `/`: the example
+redirects the bare prefix `/face/name` to `/face/name/` and exactly one non-empty
+segment below it, such as `/face/name/board` to `/face/name/board/`. Deeper paths
+such as `/face/name/board/app.js` and `/face/name/board/js/x.js` are unchanged, as
+are `/face/names/alice`, empty segments and already-slashed paths. Segments are
+separated by literal `/` bytes; an encoded slash (`%2f`) stays within a segment.
+Use an exact rule to limit canonicalization to one path. Rules explicitly declare
+redirect paths even on a routes-only door.
+
+The request's query is copied byte for byte, including escape case, `+`, repeated
+keys, order, and an empty `?`; `/old?x=%2f+%20` becomes
+`/canonical/?x=%2f+%20`. Malformed targets still fail intake. Constructors reject
+unsafe destinations, and generated Locations must fit the existing header bound.
+Rust callers constructing `HttpRequest` now supply `raw_target`, the original
+encoded path and optional query; both HTTP readers populate it automatically.
+
 ### Errors as pages, and HEAD
 
 Every refusal is a sentence. A client that names `text/html` in `Accept` and prefers it to

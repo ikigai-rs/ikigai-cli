@@ -519,6 +519,7 @@ mod tests {
         HttpRequest {
             method: method.to_string(),
             path: path.to_string(),
+            raw_target: path.to_string(),
             query: query
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
