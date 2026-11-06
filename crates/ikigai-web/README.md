@@ -259,6 +259,13 @@ host's capability function what the same request would get without its
 an upgrade or a mount breaks without cutting anything, and `no-cache` against the
 strong `ETag` costs a bodyless `304` while nothing changed.
 
+Set `EdgeConfig::private_no_store = true` to send reads whose credentials shaped their
+capability (including a named principal) as `Cache-Control: private, no-store`. The door
+applies this after any endpoint caching header, on GET, HEAD and 304, including streamed
+reads. It changes only HTTP storage policy: the kernel may still cache the answer, track
+its threads and notify push listeners, and `ETag` / `If-None-Match` still work. Reads that
+any caller would receive keep their usual cache policy. The default is `false`.
+
 `Vary` names what selected the answer: `Accept` (unless `?as=` named the face or
 the resource has only one), `Authorization` and `Cookie` (unless a route pins the
 capability), and `Origin` whenever CORS allows any origin.
@@ -349,13 +356,17 @@ data: {"thread":"urn:…","sequence":17,"invalidated":["urn:…"],"more":0,"path
 - **Authority**: the capability must hold `urn:cap:kernel:listen` (else `403`), and a non-root
   one hears only threads its OWN cached reads rest on, so an anonymous stream hears exactly what
   anonymous reads would. The edge never adds the scope for you: that would be another cache
-  partition, and it would hear nothing. Only cached reads are heard; a `no-store` fragment
-  must still be polled.
+  partition, and it would hear nothing. Only kernel-cached reads are heard; an `Expiry::Always` fragment
+  must still be polled. A kernel-cacheable fragment sent as `no-store` by
+  `private_no_store` can be heard.
 - **Losing history is said out loud**: an overflowing listener queue, or a reconnect carrying
   `Last-Event-ID`, sends `event: resync`, and the page refreshes everything it shows.
 - **Expiry is not a cut**: a deadline passing sends nothing. Revalidating on a deadline is the
   page's job, from the `max-age` its fragment was served with.
-- **Bounds**: a stream holds a slot under `max_connections`; a write that stalls past
+- **Bounds**: `PushConfig::max_streams` caps concurrent streams per server (default 128,
+  half of the default connection cap); the next gets `503` with `Retry-After: 1`. Set
+  it below `max_connections` to leave room for ordinary requests; zero refuses all streams.
+  Each stream also holds a connection slot; a write that stalls past
   `write_timeout` drops it; a heartbeat comment every 15 s; closed after 10 minutes with no
   event (`EventSource` reconnects and resyncs). Over HTTP/1.1 the stream is framed chunked.
 

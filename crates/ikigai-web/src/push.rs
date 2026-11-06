@@ -26,7 +26,8 @@
 //!   such a route are not heard.
 //! - ⚠ Only CACHED reads are heard. The kernel learns that a result depends on a thread when it
 //!   stores the result, so a fragment answered `no-store` (`Expiry::Always`) hangs from nothing
-//!   and must be polled.
+//!   and must be polled. [`EdgeConfig::private_no_store`] changes only the wire policy:
+//!   a kernel-cacheable answer sent as `no-store` by that override still hangs from its threads.
 //!
 //! # Subscribing
 //!
@@ -90,7 +91,9 @@
 //!
 //! - A stream is one connection and holds its slot under
 //!   [`EdgeConfig::max_connections`](crate::EdgeConfig::max_connections) for as long as it is
-//!   open.
+//!   open. [`PushConfig::max_streams`] separately caps open streams (default 128); the
+//!   next stream gets `503` with `Retry-After: 1`. Set it below the connection cap to leave
+//!   room for ordinary requests.
 //! - Its length is not known when its head is sent, so HTTP/1.1 frames it chunked (since the
 //!   door moved onto hyper, ledger #2236; it was close-delimited before). `EventSource` reads
 //!   either. When the stream ends at its idle limit, the connection closes unless the client
@@ -249,6 +252,10 @@ pub struct PushConfig {
     /// The most subscriptions one stream may carry; more is a `400`. Default
     /// [`DEFAULT_MAX_SUBSCRIPTIONS`].
     pub max_subscriptions: usize,
+    /// Concurrent event streams per server; the next gets `503` with `Retry-After`.
+    /// Default 128, half of the default connection cap. Set below
+    /// [`EdgeConfig::max_connections`] to reserve room for ordinary requests. Zero refuses all.
+    pub max_streams: usize,
 }
 
 impl Default for PushConfig {
@@ -260,6 +267,7 @@ impl Default for PushConfig {
             retry: DEFAULT_RETRY,
             queue: LISTEN_CAPACITY,
             max_subscriptions: DEFAULT_MAX_SUBSCRIPTIONS,
+            max_streams: crate::DEFAULT_MAX_CONNECTIONS / 2,
         }
     }
 }
@@ -460,6 +468,16 @@ pub(crate) fn open(
         }
     };
 
+    let permit = match std::sync::Arc::clone(&shared.push_permits).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            let mut resp = Resp::text(503, "Service Unavailable", "too many event streams");
+            resp.headers
+                .push(("Retry-After".to_string(), "1".to_string()));
+            return refuse(resp);
+        }
+    };
+
     let mut head = Resp {
         content_type: "text/event-stream".to_string(),
         cache_control: Some("no-store".to_string()),
@@ -487,6 +505,7 @@ pub(crate) fn open(
     let (events, receiver) = tokio::sync::mpsc::channel::<Bytes>(1);
     let (heartbeat_every, idle_after) = (push.heartbeat, push.idle_timeout);
     tokio::spawn(async move {
+        let _permit = permit;
         if events.send(Bytes::from(opening)).await.is_err() {
             return;
         }
@@ -907,17 +926,76 @@ mod tests {
         let (addr, _kernel) = serve(pushing(PushConfig {
             heartbeat: short(50),
             idle_timeout: short(400),
+            max_streams: 1,
             ..PushConfig::default()
         }))
         .await;
         let mut stream = Stream::open(addr, "", "").await;
         stream.until(": keepalive\n").await;
         stream.closed().await;
+        let next = Stream::open(addr, "", "").await;
+        assert!(next.seen.starts_with("HTTP/1.1 200 "), "{}", next.seen);
         assert!(
             stream.seen.matches(": keepalive\n").count() >= 2,
             "{}",
             stream.seen
         );
+    }
+
+    #[tokio::test]
+    async fn a_zero_stream_cap_refuses_with_the_doors_accessible_error_page() {
+        let (addr, _) = serve(pushing(PushConfig {
+            max_streams: 0,
+            ..PushConfig::default()
+        }))
+        .await;
+        let out = http(addr, "GET", "/_ikigai/push", "", "").await;
+        assert!(out.starts_with("HTTP/1.1 503 "), "{out}");
+        assert!(out.ends_with("\r\n\r\ntoo many event streams"), "{out}");
+        let page = roundtrip(
+            addr,
+            "GET /_ikigai/push HTTP/1.1\r\nHost: x\r\nAccept: text/html\r\n\r\n",
+        )
+        .await;
+        assert!(page.starts_with("HTTP/1.1 503 "), "{page}");
+        assert!(page.contains("Retry-After: 1\r\n"), "{page}");
+        assert!(page.contains("<html lang=\"en\">"), "{page}");
+        assert!(
+            page.contains("<main><h1>503 Service Unavailable</h1>"),
+            "{page}"
+        );
+        assert!(page.contains("too many event streams"), "{page}");
+        let ordinary = http(addr, "GET", "/test/cell/a", "", "").await;
+        assert!(ordinary.starts_with("HTTP/1.1 200 "), "{ordinary}");
+    }
+
+    #[tokio::test]
+    async fn a_push_stream_cap_leaves_room_for_ordinary_gets() {
+        let (addr, _kernel) = serve(EdgeConfig {
+            max_connections: 4,
+            ..pushing(PushConfig {
+                max_streams: 2,
+                ..PushConfig::default()
+            })
+        })
+        .await;
+        let first = Stream::open(addr, "", "").await;
+        let second = Stream::open(addr, "", "").await;
+        let refused = Stream::open(addr, "", "").await.seen;
+        assert!(refused.starts_with("HTTP/1.1 503 "), "{refused}");
+        assert!(refused.contains("Retry-After: 1\r\n"), "{refused}");
+        let ordinary = http(addr, "GET", "/test/cell/a", "", "").await;
+        assert!(ordinary.starts_with("HTTP/1.1 200 "), "{ordinary}");
+        drop(first);
+        for _ in 0..250 {
+            let next = Stream::open(addr, "", "").await;
+            if next.seen.starts_with("HTTP/1.1 200 ") {
+                drop(second);
+                return;
+            }
+            tokio::time::sleep(short(20)).await;
+        }
+        panic!("the stream permit never came back");
     }
 
     #[tokio::test]
@@ -948,6 +1026,7 @@ mod tests {
             write_timeout: short(300),
             ..pushing(PushConfig {
                 queue: 8,
+                max_streams: 1,
                 ..PushConfig::default()
             })
         })
@@ -964,6 +1043,8 @@ mod tests {
                 tokio::time::timeout(short(5), http(addr, "GET", "/test/cell/a", "", "")).await
             {
                 if answer.starts_with("HTTP/1.1 200 ") {
+                    let next = Stream::open(addr, "", "").await;
+                    assert!(next.seen.starts_with("HTTP/1.1 200 "), "{}", next.seen);
                     drop(stalled);
                     return;
                 }
