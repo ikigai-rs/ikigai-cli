@@ -355,6 +355,7 @@ mod tests {
         HttpRequest {
             method: "GET".to_string(),
             path: "/x".to_string(),
+            raw_target: "/x".to_string(),
             query: Vec::new(),
             headers: headers
                 .iter()

@@ -65,6 +65,9 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
   successful plain form POST answers `303 See Other` to that page on the same origin, so
   restoring or reloading the resulting page uses GET. `HX-Request: true` keeps its in-place
   answer. The route supplies no HTML; the destination page owns its markup.
+- A host can declare read redirects in `EdgeConfig::read_redirects`: GET and HEAD answer
+  `308 Permanent Redirect` to a same-origin path, keeping the raw query. The answer carries
+  no page body and uses the existing HEAD and security/CORS policy after intake and admission.
 - A message a script writes after the page loads goes into a status line that is a polite live
   region (`role=status aria-live=polite`), present and empty in the served markup before the
   script runs: the passkey pages' `#status` and `#pkstatus`. Its gray (`#666`) is 5.7:1 on white.
@@ -143,6 +146,10 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
   and checks the htmx answer, failed writes, page aliases, encoded captures, and refusals
   before writing when a destination cannot be addressed. These are socket tests, not
   browser or assistive technology tests.
+- `crates/ikigai-web/tests/read_redirects.rs` sends raw HTTP GET and HEAD requests and
+  checks the `308`, unchanged query bytes, empty body, security and route CORS/CSP headers,
+  and refusals before redirecting. POST still invokes its endpoint. These are socket tests;
+  no browser or assistive technology evaluation was performed.
 - `crates/ikigai-cli/tests/names_served.rs` serves a named page over ikigai-ui's shell and
   checks its landmarks, skip link, escaped title and same-origin assets, that the page holds
   exactly one live status region (one `role="status"`, one `aria-live`), and that its header
