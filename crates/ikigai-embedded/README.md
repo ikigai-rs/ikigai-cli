@@ -38,6 +38,30 @@ file's `urn:file:<rel>` thread, so the kernel's cached reads — and any composi
 them — recompute, exactly as a kernel-mediated `Sink` already does. Because the
 watcher and the engine share one `Arc<Kernel>`, they share one cache.
 
+### Cache residency after a file write
+
+A successful `Sink` cuts the file's thread before returning. The filesystem watcher
+also sees that write, and its notification can arrive **after** a subsequent
+`Source` has cached the new bytes. That notification cuts the thread again, so a
+later read can recompute even though no second write occurred. Composites that
+depend on the file can also recompute. This is conservative invalidation, not
+stale content (ledger #3170).
+
+The watcher does not suppress the host's own writes: a notification names paths,
+not the kernel operation that caused it, and notifications can be coalesced with
+an external edit. Ignoring the next event for a path, or ignoring events for a
+fixed interval after a `Sink`, could leave that external edit cached as old data.
+
+There is **no guaranteed settle time**. Delivery depends on the platform and load;
+`Sink` completion does not drain the watch, and the host exposes no watcher-drain
+barrier. A fixed sleep or a pair of consecutive cache hits cannot prove that no
+notification is pending. After a write, test the returned bytes for correctness
+rather than requiring a cache hit. To test the kernel's cache behavior in
+isolation, construct a kernel over `ikigai_fs::cacheable_space` without starting
+`WorkspaceWatch`; test out-of-band invalidation separately. A watcher-enabled
+benchmark should report its warm-up procedure and allow delayed invalidations
+rather than treating an immediate post-write miss as a correctness failure.
+
 Native only: it does not build for wasm32, because it pulls `socket2` through `mdns-sd`
 (peer discovery) and `lettre` (SMTP), and `socket2` has no wasm32 target. The wasm face
 is [ikigai-engine](https://crates.io/crates/ikigai-engine) on its own; ikigai-web-demo
