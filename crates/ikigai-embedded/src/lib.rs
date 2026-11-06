@@ -6864,6 +6864,12 @@ fn watch_root(kernel: Arc<Kernel>, root: PathBuf) {
 /// that file, and every composite over it, recomputes on the next request. A `Sink` through
 /// the kernel already does that for writes it can see; this is the half it cannot.
 ///
+/// A kernel-mediated write also produces filesystem events. A delayed event can cut a read
+/// cached after the `Sink` returned, causing another recompute with unchanged bytes. Events
+/// are not attributed to a particular writer, so they are not suppressed: one may also
+/// describe an external edit. There is no guaranteed settle interval or watch-drain barrier;
+/// callers should assert fresh content after a write, not immediate cache residency.
+///
 /// **Dropping it stops the watch.** It holds the platform watcher (FSEvents / inotify), whose
 /// own thread delivers each change and applies the cut, and it holds the kernel only weakly,
 /// so it neither keeps a kernel alive nor keeps a process (or a test) running. A served
@@ -10105,6 +10111,58 @@ mod tests {
             b"v2"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Ledger #3170: a Sink cuts immediately, but its filesystem notification can arrive
+    /// after a caller has cached the new bytes. Deliver that ordering directly rather than
+    /// relying on platform notification latency. This pins the conservative behavior
+    /// documented in the README: cache residency is not a post-write guarantee.
+    #[test]
+    fn a_delayed_file_notification_cuts_the_read_cached_after_a_sink() {
+        use notify::event::{Event, EventKind, ModifyKind};
+        let root = std::env::temp_dir().join(format!("ikigai-double-cut-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), b"v1").unwrap();
+        let kernel = Kernel::new(Arc::new(ikigai_fs::cacheable_space(&root)));
+        let cap = Capability::root();
+        let target = Iri::parse("urn:file:notes.txt").unwrap();
+        let source = Request::new(Verb::Source, target.clone());
+        assert_eq!(
+            block_on(kernel.issue(source.clone(), &cap)).unwrap().bytes,
+            b"v1"
+        );
+        assert!(kernel.is_cached(&source, &cap));
+
+        block_on(kernel.issue(
+            Request::new(Verb::Sink, target).with_arg("content", ArgRef::Inline(b"v2".to_vec())),
+            &cap,
+        ))
+        .unwrap();
+        assert!(!kernel.is_cached(&source, &cap), "the Sink cuts first");
+        assert_eq!(
+            block_on(kernel.issue(source.clone(), &cap)).unwrap().bytes,
+            b"v2"
+        );
+        assert!(kernel.is_cached(&source, &cap));
+
+        // No second write: this is the notification of the Sink above.
+        react_to_file_event(
+            &kernel,
+            &root,
+            &Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.join("notes.txt")),
+        );
+        assert!(
+            !kernel.is_cached(&source, &cap),
+            "the delayed notification cuts the freshly cached answer a second time"
+        );
+        assert_eq!(
+            block_on(kernel.issue(source.clone(), &cap)).unwrap().bytes,
+            b"v2"
+        );
+        assert!(kernel.is_cached(&source, &cap));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// Ledger #1534: a RESCAN event (an FSEvents or inotify queue overflow) names no file that
