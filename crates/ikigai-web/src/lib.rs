@@ -78,7 +78,9 @@ mod error_page;
 mod h1;
 mod origin;
 pub mod push;
+mod read_redirect;
 mod redirect;
+pub use read_redirect::ReadRedirect;
 mod source_limit;
 mod stream;
 mod upload;
@@ -109,6 +111,8 @@ pub struct HttpRequest {
     /// `path` on `/` always yields the request's own segments. Every other escape is
     /// decoded, and `+` is a literal `+` — form encoding applies to the query only.
     pub path: String,
+    /// The original path and query, without decoding or normalization.
+    pub raw_target: String,
     /// Query pairs (filters over a partition; the partition itself is in the path), decoded
     /// as `application/x-www-form-urlencoded`: percent-escapes, and `+` as a space.
     pub query: Vec<(String, String)>,
@@ -496,6 +500,9 @@ pub struct EdgeConfig {
     /// The route table: path patterns → IRI templates, with optional per-route cap/CORS/CSP.
     /// Default empty → every path uses the mechanical `/noun/partition/key` → `urn:` default.
     pub routes: RouteTable,
+    /// Opt-in GET/HEAD redirects, checked in order after bounded intake and admission.
+    /// The first match answers 308, keeping the raw query. Default: none.
+    pub read_redirects: Vec<ReadRedirect>,
     /// A live, swappable route handle for hot-reload. When set, it supersedes `routes` and
     /// the host may swap it (e.g. when a watched route file changes) without a restart; each
     /// request reads whatever the handle currently holds. `None` → the static `routes`.
@@ -684,6 +691,7 @@ impl Default for EdgeConfig {
             security: Some(SecurityHeaders::default()),
             cors: CorsPolicy::default(),
             routes: RouteTable::default(),
+            read_redirects: Vec::new(),
             live_routes: None,
             routes_only: false,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
@@ -1778,6 +1786,12 @@ pub(crate) async fn answer_admitted(
     // Resolve the route once; it drives the target IRI + per-route cap (in respond) and the
     // per-route CORS/CSP (in the policy layer). No match → the mechanical default throughout.
     let table = route_table(shared);
+    let matched = table.match_path(&req.path);
+    if let Some(resp) = read_redirect::response(&shared.config.read_redirects, &req) {
+        let mut resp = finish(resp, &req, &shared.config);
+        apply_edge_policy(&mut resp, &shared.config, &req, matched.as_ref());
+        return Reply::Whole(resp);
+    }
     // The event stream is not a resource read: it holds the answer open and sends cut
     // notices as they arrive, so it leaves the request/response path here, before routing.
     if let Some(push) = shared.config.push.as_ref() {
@@ -1785,7 +1799,6 @@ pub(crate) async fn answer_admitted(
             return push::open(&req, shared, &table, push);
         }
     }
-    let matched = table.match_path(&req.path);
     let mut resp = finish(
         respond(shared, &req, matched.as_ref(), &table, content).await,
         &req,
@@ -2910,6 +2923,7 @@ fn shaped_by_credentials(
     let anonymous = HttpRequest {
         method: req.method.clone(),
         path: req.path.clone(),
+        raw_target: req.raw_target.clone(),
         query: req.query.clone(),
         headers: req
             .headers
@@ -4011,6 +4025,9 @@ fn parse_head(head: &[u8]) -> Result<HttpRequest, String> {
         .collect();
     Ok(HttpRequest {
         method,
+        raw_target: std::str::from_utf8(target)
+            .map_err(|_| MALFORMED)?
+            .to_string(),
         path,
         query,
         headers,

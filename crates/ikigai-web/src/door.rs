@@ -184,6 +184,7 @@ fn head_of(parts: &http::request::Parts, peer: Option<IpAddr>) -> Result<HttpReq
     Ok(HttpRequest {
         method: parts.method.as_str().to_string(),
         path,
+        raw_target: target.to_string(),
         query,
         headers,
         body: Vec::new(),
