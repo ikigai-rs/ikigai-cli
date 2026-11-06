@@ -19,6 +19,14 @@
 //!   naming the grant. A caller holding NO grant in that family does not spill at all: its
 //!   request is taken into memory under [`EdgeConfig::max_body_bytes`](crate::EdgeConfig)
 //!   like any other, so a door's behavior is unchanged for every caller it grants nothing.
+//! - **Who delivered it** (ledger #2974): the spill is held for the caller, under the
+//!   capability its Sink is issued with ([`MemoryContentStore::put_replay_for`]), so the Sink
+//!   reads it and no other principal naming its id does (core's scoped content store, ledger
+//!   #2965). A store reads a hold that names nobody to root alone, so a caller whose capability
+//!   names no principal (a door with no
+//!   [`EdgeConfig::principal_fn`](crate::EdgeConfig::principal_fn)) and is not root does not
+//!   spill either: its Sink could not read what the door held. Its request is taken into
+//!   memory, as a caller with no grant's is.
 //! - **A minimum rate** ([`Uploads::min_rate`]): the body must keep arriving at
 //!   `bytes_per_second`, after a `grace` at the start. The deadline is `grace` plus one second
 //!   for every `bytes_per_second` received so far, so a client may pause as long as it is
@@ -83,6 +91,13 @@ pub const DEFAULT_UPLOAD_GRACE: Duration = DEFAULT_BODY_TIMEOUT;
 /// Admission runs before any of it. An upload route takes its body by `Content-Length`:
 /// `Transfer-Encoding` on one is `501`. A caller holding no grant in the family does not spill:
 /// its body is read into memory under `EdgeConfig::max_body_bytes`, as on any route.
+///
+/// Each spill is held for the caller that delivered it
+/// ([`put_replay_for`](MemoryContentStore::put_replay_for) under the capability the Sink is
+/// issued with), so only that principal, or root, reads it by its id (ledger #2974). A caller
+/// whose capability names no principal and is not root does not spill, since its Sink could not
+/// read a hold that names nobody: its body is read into memory too. A door that spills for its
+/// callers names them with [`EdgeConfig::principal_fn`](crate::EdgeConfig::principal_fn).
 ///
 /// `store` must be the store the kernel resolves content ids through
 /// ([`Kernel::with_content_store`](ikigai_core::Kernel::with_content_store)): the door puts each
@@ -189,16 +204,19 @@ impl Uploads {
     }
 }
 
-/// An upload the door will spill: the route's bound, the caller's grant, and the facility.
+/// An upload the door will spill: the route's bound, the caller's grant, the facility, and
+/// the capability the spill is held for (the one its Sink is issued with).
 pub(crate) struct Plan {
     max: u64,
     granted: u64,
     spill: Arc<dyn Spill>,
     matched: Option<Matched>,
+    capability: Capability,
 }
 
 /// The plan for `head`, when it is an upload to spill: a `POST` or `PUT` to an upload route,
-/// with a body, from a caller holding a disk grant. `None` takes the request the ordinary way.
+/// with a body, from a caller holding a disk grant whose Sink can read what is held for it (a
+/// principal, or root). `None` takes the request the ordinary way.
 pub(crate) fn plan(shared: &Shared, head: &HttpRequest) -> Option<Plan> {
     let uploads = shared.uploads.as_ref()?;
     if !matches!(head.method.as_str(), "POST" | "PUT") {
@@ -219,12 +237,18 @@ pub(crate) fn plan(shared: &Shared, head: &HttpRequest) -> Option<Plan> {
     if !cap.satisfies(CAP_STREAM_SPILL) {
         return None;
     }
+    // A hold that names nobody is root's alone (ledger #2965): spilled for a caller with no
+    // principal, the upload would be held where its own Sink answers it `NotFound`.
+    if !cap.is_root() && cap.principal().is_none() {
+        return None;
+    }
     let (spill, granted) = Issuer::spill(&*shared.kernel, &cap).ok()?;
     Some(Plan {
         max,
         granted,
         spill,
         matched,
+        capability: cap,
     })
 }
 
@@ -307,7 +331,9 @@ where
             });
         }
     };
-    let held = match uploads.store.put_replay(Held(replay)) {
+    // Held for whoever delivered it (ledger #2974): the Sink, issued under this same
+    // capability, reads it, and another principal naming its id is answered `NotFound`.
+    let held = match uploads.store.put_replay_for(&plan.capability, Held(replay)) {
         Ok(held) => held,
         Err(_) => {
             let mut busy = Resp::text(
