@@ -255,6 +255,31 @@ async fn an_answer_the_credentials_shaped_is_private_whatever_the_endpoint_says(
 }
 
 #[tokio::test]
+async fn private_no_store_overrides_endpoint_caching_on_get_head_and_304() {
+    let addr = start(
+        kernel(),
+        EdgeConfig {
+            private_no_store: true,
+            principal_fn: Some(Arc::new(|_| Some("urn:test:alice".into()))),
+            ..EdgeConfig::default()
+        },
+        public_cap(),
+    )
+    .await;
+    let first = send(addr, &get("/t/asset", "")).await;
+    let tag = header(&first, "etag").unwrap();
+    let again = send(addr, &get("/t/asset", &format!("If-None-Match: {tag}\r\n"))).await;
+    assert!(again.starts_with("HTTP/1.1 304 "), "{again}");
+    let head = send(addr, b"HEAD /t/asset HTTP/1.1\r\nHost: x\r\n\r\n").await;
+    for answer in [&first, &again, &head] {
+        assert_eq!(headers(answer, "cache-control"), vec!["private, no-store"]);
+        assert_eq!(header(answer, "etag"), Some(tag));
+    }
+    assert!(split(&again).1.is_empty());
+    assert!(split(&head).1.is_empty());
+}
+
+#[tokio::test]
 async fn a_304_repeats_caching_and_vary_but_no_content_metadata() {
     let addr = start(kernel(), EdgeConfig::default(), public_cap()).await;
     let first = send(addr, &get("/t/asset", "")).await;

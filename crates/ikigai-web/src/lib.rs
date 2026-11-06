@@ -530,6 +530,10 @@ pub struct EdgeConfig {
     /// thread its reads rest on is cut. `None` (the default) serves no stream, and the path is
     /// routed like any other. See [`push`].
     pub push: Option<PushConfig>,
+    /// Send credential-shaped reads as `private, no-store`, preserving kernel caching,
+    /// ETags and conditional requests. This overrides endpoint Cache-Control headers too.
+    /// Default `false` keeps the usual expiry projection.
+    pub private_no_store: bool,
     /// The body a typed kernel error is answered with. [`ErrorBody::Text`] (the default) is
     /// the error's message as `text/plain`, exactly as before the option existed;
     /// [`ErrorBody::Json`] is the typed object [`error_json`] renders, as `application/json`.
@@ -690,6 +694,7 @@ impl Default for EdgeConfig {
             write_timeout: DEFAULT_WRITE_TIMEOUT,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             push: None,
+            private_no_store: false,
             error_body: ErrorBody::Text,
             error_page: None,
             endpoint_headers: EndpointHeader::DEFAULTS.to_vec(),
@@ -1085,6 +1090,8 @@ struct Shared {
     /// The upload routes and the content store their spills are held in
     /// ([`serve_with_uploads`]); `None` takes every body into memory, as before.
     uploads: Option<Uploads>,
+    /// Permits held by open push streams, separate from the connection cap.
+    push_permits: Arc<tokio::sync::Semaphore>,
 }
 
 /// A DELETE tombstone's key: the target IRI and the query arguments, ordered by name.
@@ -1166,7 +1173,15 @@ fn shared(
         .live_routes
         .clone()
         .unwrap_or_else(|| live_routes(config.routes.clone()));
+    let push_permits = Arc::new(tokio::sync::Semaphore::new(
+        config
+            .push
+            .as_ref()
+            .map_or(0, |push| push.max_streams)
+            .min(tokio::sync::Semaphore::MAX_PERMITS),
+    ));
     Arc::new(Shared {
+        push_permits,
         kernel,
         cap_fn,
         config,
@@ -2012,7 +2027,11 @@ async fn respond(
                 shared: !shaped_by_credentials(shared, req, matched, &cap),
             };
             let vary = read_vary(explicit, &faces, matched, &cap);
-            return stream::read(req, repr, freshness, vary);
+            return private_read_policy(
+                stream::read(req, repr, freshness, vary),
+                config,
+                freshness,
+            );
         }
         Ok(stream::Settled::Streamed(repr)) => {
             if verb == Verb::Delete {
@@ -2047,11 +2066,15 @@ async fn respond(
                 self_contained: self_contained(repr, &iri, declared),
                 shared: served.shared,
             };
-            read_resp(
-                req,
-                served,
+            private_read_policy(
+                read_resp(
+                    req,
+                    served,
+                    freshness,
+                    read_vary(explicit, &faces, matched, &cap),
+                ),
+                config,
                 freshness,
-                read_vary(explicit, &faces, matched, &cap),
             )
         }
         Ok(Ok(served)) if verb == Verb::Delete => {
@@ -2553,6 +2576,15 @@ fn read_resp(req: &HttpRequest, served: Served, freshness: Freshness, vary: Vec<
         ..Resp::status(200, "OK")
     };
     served.answer(&mut resp);
+    resp
+}
+
+/// Apply the door's storage policy after endpoint headers, without changing the
+/// representation's expiry or its validator. Both whole and streamed reads use this.
+fn private_read_policy(mut resp: Resp, config: &EdgeConfig, freshness: Freshness) -> Resp {
+    if config.private_no_store && !freshness.shared {
+        resp.cache_control = Some("private, no-store".to_string());
+    }
     resp
 }
 
@@ -8003,6 +8035,11 @@ mod tests {
         /// appends to, and a read that hangs from the log's thread), and a resource whose
         /// answer depends on the capability.
         fn kernel() -> Arc<Kernel> {
+            counted_kernel().0
+        }
+
+        fn counted_kernel() -> (Arc<Kernel>, Arc<std::sync::atomic::AtomicUsize>) {
+            let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec!["one".to_string()]));
             // `Never`, and nothing but its own target's thread (which the kernel adds).
             let pure =
@@ -8015,7 +8052,9 @@ mod tests {
             // hanging from that resource's thread, so a write there cuts it.
             let items = {
                 let log = Arc::clone(&log);
+                let reads = Arc::clone(&reads);
                 FnEndpoint::new("items", move |_inv: &Invocation<'_>| {
+                    reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let body = log.lock().unwrap().join("\n");
                     Ok(text(body.as_bytes())
                         .cacheable()
@@ -8114,7 +8153,7 @@ mod tests {
                 .bind(Exact::new("urn:test:c:whoami"), whoami)
                 .bind(Exact::new("urn:test:c:faces"), faces)
                 .bind(Exact::new("urn:test:c:one-face"), one_face);
-            Arc::new(Kernel::new(Arc::new(space)))
+            (Arc::new(Kernel::new(Arc::new(space))), reads)
         }
 
         /// A door that grants `urn:cap:member` to a request carrying the good session cookie
@@ -8300,6 +8339,54 @@ mod tests {
             let resp = get(addr, "/test/c/whoami", "").await;
             assert_eq!(body(&resp), "anonymous");
             assert_eq!(cache_control(&resp), "public, no-cache", "{resp}");
+        }
+
+        #[tokio::test]
+        async fn a_private_no_store_read_keeps_its_validator_and_thread() {
+            let (kernel, reads) = counted_kernel();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                serve_with_listener(
+                    kernel,
+                    door(),
+                    listener,
+                    EdgeConfig {
+                        private_no_store: true,
+                        ..EdgeConfig::default()
+                    },
+                )
+                .await
+                .unwrap();
+            });
+            let first = get(addr, "/test/c/items", "Cookie: session=good\r\n").await;
+            assert_eq!(cache_control(&first), "private, no-store", "{first}");
+            let tag = etag(&first);
+            let again = get(
+                addr,
+                "/test/c/items",
+                &format!("Cookie: session=good\r\nIf-None-Match: {tag}\r\n"),
+            )
+            .await;
+            assert!(again.starts_with("HTTP/1.1 304 "), "{again}");
+            assert_eq!(etag(&again), tag);
+            assert_eq!(cache_control(&again), "private, no-store");
+            assert!(body(&again).is_empty());
+            assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let public = get(addr, "/test/c/items", "").await;
+            assert_eq!(cache_control(&public), "public, no-cache");
+            let write = roundtrip(addr, "PUT /test/c/append HTTP/1.1\r\nHost: x\r\nCookie: session=good\r\nContent-Length: 3\r\n\r\ntwo").await;
+            assert!(write.starts_with("HTTP/1.1 204 "), "{write}");
+            let changed = get(
+                addr,
+                "/test/c/items",
+                &format!("Cookie: session=good\r\nIf-None-Match: {tag}\r\n"),
+            )
+            .await;
+            assert!(changed.starts_with("HTTP/1.1 200 "), "{changed}");
+            assert_eq!(body(&changed), "one\ntwo");
+            assert_ne!(etag(&changed), tag);
+            assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 3);
         }
 
         /// ledger #1077: a door that names a principal makes the answer that party's — the

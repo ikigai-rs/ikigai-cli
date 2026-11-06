@@ -98,6 +98,36 @@ fn get(path: &str, extra: &str) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn a_private_stream_keeps_its_validator_under_no_store() {
+    let addr = common::start(
+        reading_kernel(),
+        EdgeConfig {
+            private_no_store: true,
+            principal_fn: Some(Arc::new(|_| Some("urn:test:alice".into()))),
+            ..EdgeConfig::default()
+        },
+        public_cap(),
+    )
+    .await;
+    let first = send(addr, &get("/t/seekable", "")).await;
+    assert_eq!(header(&first, "cache-control"), Some("private, no-store"));
+    let tag = header(&first, "etag").expect("a strong validator");
+    let again = send(
+        addr,
+        &get("/t/seekable", &format!("If-None-Match: {tag}\r\n")),
+    )
+    .await;
+    assert!(again.starts_with("HTTP/1.1 304 "), "{again}");
+    assert_eq!(header(&again, "cache-control"), Some("private, no-store"));
+    assert_eq!(header(&again, "etag"), Some(tag));
+    assert_eq!(split(&again).1, "");
+    let part = send(addr, &get("/t/seekable", "Range: bytes=3-11\r\n")).await;
+    assert!(part.starts_with("HTTP/1.1 206 "), "{part}");
+    assert_eq!(header(&part, "cache-control"), Some("private, no-store"));
+    assert_eq!(split(&part).1, "3456789ab");
+}
+
+#[tokio::test]
 async fn a_body_of_known_length_is_sent_with_content_length() {
     let addr = reading_door().await;
     let out = send(addr, &get("/t/seekable", "")).await;

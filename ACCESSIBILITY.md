@@ -87,6 +87,12 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
 
 ## How it is tested
 
+- `crates/ikigai-web/src/push.rs`'s
+  `a_zero_stream_cap_refuses_with_the_doors_accessible_error_page` pins the stream-cap
+  refusal: `503` with `Retry-After: 1`, the plain sentence "too many event streams",
+  and the same sentence on the browser's error page with `lang`, `main` and the status
+  heading. This is a socket test, with no browser or assistive technology evaluation.
+
 - `crates/ikigai-cli/tests/broken_pipe.rs` runs the binary with closed stdout and a
   consumer that closes after reading a response: help, version, batches, and the line REPL
   exit quietly on a broken pipe. On Linux it also checks that another stdout failure
@@ -176,6 +182,7 @@ Found by reading the source on 2026-10-15, not by testing:
 
 | Date | Change |
 |---|---|
+| 2026-11-06 | The HTTP door refuses a push stream beyond `PushConfig::max_streams` with `503`, `Retry-After: 1` and "too many event streams", using the existing negotiated error page. A socket regression pins the sentence and page landmarks; no assistive technology testing was performed. |
 | 2026-10-15 | First version ([PR 521](https://github.com/ikigai-rs/ikigai-cli/pull/521)). |
 | 2026-10-15 | The embedded host's pages and the intake's redirect page gain `<html lang="en">` and a `<main>`; the passkey status lines become live regions; the full-screen REPL honors `NO_COLOR`. Three known limitations removed ([PR 522](https://github.com/ikigai-rs/ikigai-cli/pull/522)). |
 | 2026-10-15 | Reports use the `accessibility` issue label instead of a word in the title; `AGENTS.md` (with `CLAUDE.md` a link to it) asks for this file to be read before any change to rendered output. |
