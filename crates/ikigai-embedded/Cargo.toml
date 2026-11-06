@@ -58,7 +58,7 @@ ikigai-throttle = { workspace = true }
 # mDNS announce/browse. The one sibling this host names by path rather than through
 # `[workspace.dependencies]`; the version is the LOCKSTEP version, not a floor (see the root
 # manifest for why, and `crates/ikigai-cli/tests/lockstep_pins.rs` for the check).
-ikigai-discovery = { path = "../ikigai-discovery", version = "0.3.0" }
+ikigai-discovery = { path = "../ikigai-discovery", version = "0.4.0" }
 # The plan resources — `urn:plan:eval`, `urn:plan:validate`, `urn:plan:requires` — live beside
 # the runner they share with the REPL's `run` (ledger #956). `plan-reader` is the feature that
 # can read a plan graph back; this native host has no wasm constraint keeping it off, and the
@@ -161,7 +161,7 @@ async-trait = "0.1"
 futures = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-ikigai-ipc = { path = "../ikigai-ipc", version = "0.3.0", optional = true }
+ikigai-ipc = { path = "../ikigai-ipc", version = "0.4.0", optional = true }
 
 [dev-dependencies]
 # `tests/layer_door.rs` and `layers.rs`'s own tests mint a throwaway age identity, the key a layer
@@ -193,7 +193,7 @@ age = { workspace = true }
 # 0.12.0 (ledger #2605, of the #2559 wave): BODIES and BODY-INPUTS run by default; both kernels are handed to the suite
 # with the root they were built from (`kernel_with_root`, `kernel_for_with_root`, for
 # `Suite::body_space`); no argument is declared `reads_body`. ⚠ `^0.12.0` is also a ceiling below 0.13.0.
-ikigai-conformance = "0.13.0"
+ikigai-conformance = "0.14.0" # 0.14.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.14.0"` is `<0.15.0`. Beneath it: 0.13.0.
 # The conformance fixture SEEDS the two edge verifying keys and one signing key, so the
 # decision faces are walked over real state instead of reporting "did not resolve". Same
 # version and features as the library dependency above: the fixture must write exactly the
