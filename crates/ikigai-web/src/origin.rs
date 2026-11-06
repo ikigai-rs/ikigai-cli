@@ -147,6 +147,7 @@ impl std::error::Error for InvalidOrigin {}
 /// let post = |headers: &[(&str, &str)]| HttpRequest {
 ///     method: "POST".into(),
 ///     path: "/note/x".into(),
+///     raw_target: "/note/x".into(),
 ///     query: vec![],
 ///     headers: headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
 ///     body: vec![],
