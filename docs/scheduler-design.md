@@ -388,6 +388,11 @@ the uniform interface.
 
 ## 13. `trace` with thread attachments (the demo)
 
+An embedded CLI trace records only the named request's resolution chain, including
+its descendants on other threads and through mounts. The trace header states this
+scope. Independent host jobs, such as the one-second `urn:time:now` clock, and
+other sessions resolving on the same kernel do not contribute rows.
+
 The native pool's payoff is a *visible* one — `trace` annotates each node with the
 thread it attached to, when it was queued vs attached, and whether it parked:
 

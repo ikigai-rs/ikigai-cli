@@ -19,6 +19,8 @@ mod clipboard;
 mod front;
 #[cfg(feature = "embedded")]
 mod layer;
+#[cfg(feature = "embedded")]
+mod local_resolver;
 mod output;
 #[cfg(feature = "quic")]
 mod quic;
@@ -2824,9 +2826,10 @@ fn build_engine(
             let names = ikigai_embedded::names::active().map(|_| {
                 ikigai_core::Iri::parse(ikigai_embedded::names::RESOURCE).expect("a constant IRI")
             });
+            let resolver = local_resolver::LocalResolver::new(kernel);
             let engine = match names {
-                Some(atom) => Engine::new(kernel).with_names_atom(atom),
-                None => Engine::new(kernel),
+                Some(atom) => Engine::new(resolver).with_names_atom(atom),
+                None => Engine::new(resolver),
             };
             Ok((
                 with_profiles(
@@ -7164,7 +7167,8 @@ mod adapter_gate_tests {
         let trace = Arc::new(Recorder::default());
         kernel.set_tracer(trace.clone() as Arc<dyn Tracer>);
         let engine = with_profiles(
-            Engine::new(Arc::clone(&kernel)).with_as_of_doors(ikigai_embedded::time_doors()),
+            Engine::new(local_resolver::LocalResolver::new(Arc::clone(&kernel)))
+                .with_as_of_doors(ikigai_embedded::time_doors()),
         );
         Session {
             _lock: lock,
@@ -7387,6 +7391,17 @@ mod adapter_gate_tests {
             run(&s.engine, "source urn:time:now as-of=2026-09-25T18:00Z"),
             Ok(six),
             "same instant, same corridor, same answer"
+        );
+        let traced = run(
+            &s.engine,
+            "trace urn:tz:now zone=UTC as-of=2026-09-25T18:00Z",
+        )
+        .unwrap();
+        assert!(traced.contains("2026-09-25T18:00:00+00:00"), "{traced}");
+        assert!(traced.contains("scope-clock="), "{traced}");
+        assert!(
+            traced.contains("trace includes only this request's chain"),
+            "{traced}"
         );
         // The chain is per line: without `as-of=` the zoned clock is live again.
         let live = run(&s.engine, "source urn:tz:now zone=UTC").unwrap();
