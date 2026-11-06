@@ -6,10 +6,16 @@ mod common;
 
 use common::{send, split};
 use ikigai_core::{
-    cap_stream_spill, ArgRef, AsyncFnEndpoint, ContentHasher, ContentId, Description,
-    EndpointSpace, Exact, Kernel, MemoryContentStore, ReprType, Representation, Verb,
+    cap_stream_spill, ArgRef, AsyncFnEndpoint, Capability, ContentHasher, ContentId, ContentStore,
+    Description, EndpointSpace, Exact, Kernel, MemoryContentStore, ReprType, Representation, Verb,
 };
 use ikigai_web::{fixed_cap, public_cap, CapFn, EdgeConfig, Uploads};
+
+/// The caller the upload doors name, through `EdgeConfig::principal_fn`: a spill is held for
+/// whoever delivered it (ledger #2974), so a door spills only for a caller it names.
+const ALICE: &str = "urn:example:person:alice";
+/// Another principal, who must not read what was held for `ALICE`.
+const BOB: &str = "urn:example:person:bob";
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -82,16 +88,62 @@ struct UploadDoor {
     spill: SpillDir,
 }
 
+/// A Sink that reports who may read its `content` while it runs: the caller's own capability,
+/// and `BOB` holding the same scopes. Read straight from the store, by the id it was handed.
+fn who_reads_sink(store: Arc<MemoryContentStore>) -> AsyncFnEndpoint {
+    AsyncFnEndpoint::new("who", move |inv| {
+        let store = store.clone();
+        Box::pin(async move {
+            let Some(ArgRef::Content(id)) = inv.request.args.get("content") else {
+                return Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    b"inline".to_vec(),
+                ));
+            };
+            let caller = inv.capability.clone();
+            let bob = Capability::scoped(caller.scopes().into_iter().flatten().cloned())
+                .with_principal(BOB)
+                .unwrap();
+            let line = format!(
+                "caller {} bob {} root {}",
+                store.get_for(id, &caller).is_some(),
+                store.get_for(id, &bob).is_some(),
+                store.get_for(id, &Capability::root()).is_some(),
+            );
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                line.into_bytes(),
+            ))
+        })
+    })
+    .with_description(Description::new("who").verb(Verb::Sink))
+}
+
 /// A door with one upload route, `/t/upload` (at most 4096 bytes), over a kernel spilling to
-/// a fresh directory, its callers granted `grant` bytes of spill.
+/// a fresh directory, its callers granted `grant` bytes of spill and named `ALICE`.
 async fn upload_door(name: &str, grant: Option<u64>, rate: Option<(u64, Duration)>) -> UploadDoor {
+    upload_door_as(name, grant, rate, Some(ALICE)).await
+}
+
+/// [`upload_door`], its callers named `principal` (`None`: a door that names nobody). It also
+/// binds `/t/who` (at most 4096 bytes), which reports who reads the upload ([`who_reads_sink`]).
+async fn upload_door_as(
+    name: &str,
+    grant: Option<u64>,
+    rate: Option<(u64, Duration)>,
+    principal: Option<&'static str>,
+) -> UploadDoor {
     let spill = SpillDir::new(name);
     let store = Arc::new(MemoryContentStore::new(1 << 30));
-    let space = EndpointSpace::new().bind(Exact::new("urn:t:upload"), measuring_sink());
+    let space = EndpointSpace::new()
+        .bind(Exact::new("urn:t:upload"), measuring_sink())
+        .bind(Exact::new("urn:t:who"), who_reads_sink(store.clone()));
     let kernel = Kernel::new(Arc::new(space))
         .with_spill(Arc::new(ikigai_fs::FileSpill::new(&spill.0).unwrap()))
         .with_content_store(store.clone());
-    let mut uploads = Uploads::new(store).route("/t/upload", 4096);
+    let mut uploads = Uploads::new(store)
+        .route("/t/upload", 4096)
+        .route("/t/who", 4096);
     if let Some((rate, grace)) = rate {
         uploads = uploads.min_rate(rate, grace);
     }
@@ -104,6 +156,10 @@ async fn upload_door(name: &str, grant: Option<u64>, rate: Option<(u64, Duration
     let kernel = Arc::new(kernel);
     let config = EdgeConfig {
         max_body_bytes: 64,
+        principal_fn: principal.map(|p| {
+            let named: ikigai_web::PrincipalFn = Arc::new(move |_req| Some(p.to_string()));
+            named
+        }),
         ..EdgeConfig::default()
     };
     tokio::spawn(async move {
@@ -134,6 +190,32 @@ async fn an_upload_spills_and_the_sink_reads_it_by_content_id() {
     let id = ContentId::of(&body);
     assert_eq!(split(&out).1, format!("content-id {id} 3000 {id}"), "{out}");
     // Answered, the spill is released and its file removed.
+    assert!(door.spill.files().is_empty(), "{:?}", door.spill.files());
+}
+
+/// The spill is held for the caller that delivered it (ledger #2974, on core's scoped content
+/// store, ledger #2965): its Sink, issued under the same capability, reads it; another
+/// principal holding the same scopes naming the same id does not; root does.
+#[tokio::test]
+async fn an_upload_is_held_for_its_deliverer_and_no_other_principal() {
+    let door = upload_door("deliverer", Some(1 << 20), None).await;
+    let out = send(door.addr, &put("/t/who", &[9u8; 3000])).await;
+    assert!(out.starts_with("HTTP/1.1 200 "), "{out}");
+    assert_eq!(split(&out).1, "caller true bob false root true", "{out}");
+    assert!(door.spill.files().is_empty(), "{:?}", door.spill.files());
+}
+
+/// A door that names nobody does not spill, though it grants the spill: a hold that names no
+/// principal is root's alone, so the Sink would be answered `NotFound` for its own upload. The
+/// body is taken into memory under the door's bound instead, as for a caller with no grant.
+#[tokio::test]
+async fn a_door_that_names_no_caller_takes_an_upload_into_memory() {
+    let door = upload_door_as("unnamed", Some(1 << 20), None, None).await;
+    let small = send(door.addr, &put("/t/upload", b"hello")).await;
+    assert!(small.starts_with("HTTP/1.1 200 "), "{small}");
+    assert!(split(&small).1.starts_with("inline 5 "), "{small}");
+    let large = send(door.addr, &put("/t/upload", &[1u8; 3000])).await;
+    assert!(large.starts_with("HTTP/1.1 413 "), "{large}");
     assert!(door.spill.files().is_empty(), "{:?}", door.spill.files());
 }
 
