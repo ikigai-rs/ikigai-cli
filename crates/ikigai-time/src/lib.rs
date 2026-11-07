@@ -557,8 +557,8 @@ impl JobRegistry {
         capability: Capability,
         timeout: Duration,
     ) -> std::result::Result<u64, String> {
-        if schedule.interval().is_zero() || timeout.is_zero() {
-            return Err("job interval and timeout must be greater than zero".into());
+        if timeout.is_zero() {
+            return Err("job timeout must be greater than zero".into());
         }
         // Stamp before locking, as `fire` does: the clock is host-injected code.
         let scheduled_at = self.clock.now();
