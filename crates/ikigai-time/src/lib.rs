@@ -1498,6 +1498,52 @@ mod tests {
         }
     }
 
+    /// A blocked peer must produce a failed attempt without waiting for that peer.
+    #[test]
+    fn hung_job_records_timeout_before_resolver_returns() {
+        struct BlockedResolver {
+            entered: std::sync::mpsc::Sender<()>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl Resolver for BlockedResolver {
+            fn issue(&self, _: Request) -> Result<(Representation, CacheStatus), Error> {
+                self.entered.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+                Ok((text("late success".into()), CacheStatus::Uncacheable))
+            }
+            fn is_cached(&self, _: &Request, _: &Capability) -> bool { false }
+            fn entries(&self) -> Option<Vec<SpaceEntry>> { None }
+        }
+        let millis = Arc::new(AtomicU64::new(1_000));
+        let reg = JobRegistry::new(Arc::new(ManualBackend::default()),
+            Arc::new(FixedClock(millis.clone())));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        reg.set_resolver(Arc::new(BlockedResolver {
+            entered: entered_tx, release: Mutex::new(release_rx),
+        }));
+        let id = reg.schedule("urn:test:blocked".into(), Verb::Source,
+            Schedule::Every(Duration::from_secs(1)), true, Capability::root()).unwrap();
+        let worker_reg = reg.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            worker_reg.fire(id);
+            done_tx.send(()).unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        millis.store(121_000, Ordering::SeqCst);
+        let returned = done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        let health = reg.health();
+        // Always release and join, even on the unfixed implementation.
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(returned, "hung fire did not return after 120 seconds of awake time");
+        assert_eq!(health[0].runs, 1);
+        assert_eq!(health[0].failures_in_a_row, 1);
+        assert!(health[0].last_output.contains("timeout"));
+        assert_eq!(health[0].since_last_success, None);
+    }
+
     #[test]
     fn since_last_is_measured_on_the_injected_clock() {
         let millis = Arc::new(AtomicU64::new(1_000_000));
