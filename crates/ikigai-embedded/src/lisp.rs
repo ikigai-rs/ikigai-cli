@@ -159,6 +159,8 @@ fn settings() -> &'static Result<Settings, String> {
 /// else (an evaluation ran first, with the defaults).
 pub fn configure() -> Result<(), String> {
     let settings = settings().as_ref().map_err(Clone::clone)?;
+    #[cfg(unix)]
+    prepare_steel_home_parent();
     match ikigai_lisp::set_limits(settings.limits.clone()) {
         Ok(()) => Ok(()),
         Err(fixed) if fixed == settings.limits => Ok(()),
@@ -167,6 +169,29 @@ pub fn configure() -> Result<(), String> {
              `lisp.*` keys cannot take effect; configure them before the first evaluation"
         )),
     }
+}
+
+/// Steel 0.8.3 creates its default home with `create_dir`, so a sparse account
+/// otherwise gets a diagnostic on every evaluation. Prepare only the parent;
+/// Steel still owns its directory and any diagnostic if creation is refused.
+#[cfg(unix)]
+fn prepare_steel_home_parent() {
+    static PREPARED: Once = Once::new();
+    PREPARED.call_once(|| {
+        // These are Steel's earlier choices, neither of which uses the XDG home.
+        if std::env::var("STEEL_HOME").is_ok()
+            || std::env::var("HOME")
+                .ok()
+                .filter(|home| !home.is_empty())
+                .is_some_and(|home| std::path::Path::new(&home).join(".steel").exists())
+        {
+            return;
+        }
+        if let Some(parent) = xdg::BaseDirectories::new().data_home {
+            // Best effort: a read-only home must not prevent pure evaluation.
+            let _ = std::fs::create_dir_all(parent);
+        }
+    });
 }
 
 /// `lisp.timeout`, when it is set and valid.
