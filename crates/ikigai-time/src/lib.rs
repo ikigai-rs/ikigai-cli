@@ -138,6 +138,14 @@ impl Schedule {
 /// sleep evidence use their monotonic clock; a browser uses elapsed wall time.
 pub const DEFAULT_JOB_TIMEOUT: Duration = Duration::from_secs(60);
 
+// This function cannot be compiled into the browser face. Native monotonic time
+// bounds waits when the host cannot supply paired sleep readings, and test cleanup.
+#[cfg(not(target_family = "wasm"))]
+#[allow(clippy::disallowed_methods)]
+fn native_monotonic_now() -> std::time::Instant {
+    std::time::Instant::now()
+}
+
 /// Parse a schedule string. Today a bare duration — `500ms`, `1s`, `10s`, `1m`, `2h`
 /// (a unitless number is seconds). Future: a cron expression dispatches to a
 /// `Schedule::Cron` variant here.
@@ -811,7 +819,7 @@ impl JobRegistry {
         // Capture both clocks before dispatch, so time spent inside issue_as counts.
         let started = self.clock.now();
         let asleep = self.sleep.as_ref().and_then(|s| s.asleep());
-        let monotonic_start = std::time::Instant::now();
+        let monotonic_start = native_monotonic_now();
         let elapsed = || {
             if asleep.is_some() && self.sleep.as_ref().and_then(|s| s.asleep()).is_some() {
                 self.awake_since(started, asleep)
@@ -1807,9 +1815,9 @@ mod tests {
         assert!(health[0].last_output.contains("timeout"));
         assert_eq!(health[0].since_last_success, None);
         let resolving = reg.inner.lock().unwrap().jobs[&id].resolving.clone();
-        let until = std::time::Instant::now() + Duration::from_secs(5);
+        let until = native_monotonic_now() + Duration::from_secs(5);
         while resolving.load(Ordering::SeqCst) {
-            assert!(std::time::Instant::now() < until, "resolver did not finish");
+            assert!(native_monotonic_now() < until, "resolver did not finish");
             std::thread::yield_now();
         }
         assert_eq!(
