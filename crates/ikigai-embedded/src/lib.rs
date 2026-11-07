@@ -11741,7 +11741,13 @@ mod arrangement_tests {
             .collect();
         expected.sort();
         expected.dedup();
-        assert!(!expected.is_empty());
+        // The file jails are now declarable and must participate in the full
+        // name-by-name comparison rather than being among the dropped doors.
+        for pattern in ["urn:file:{path}", "urn:orgfile:{path}"] {
+            let iri = concrete(pattern).unwrap();
+            assert!(names.contains(&iri), "{iri} is compared");
+            assert!(!expected.contains(&iri), "{iri} remains bound");
+        }
         assert_eq!(differing(&root, &built, &names), expected);
         for name in &expected {
             assert_eq!(
