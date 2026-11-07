@@ -150,24 +150,52 @@ fn both(out: &Output) -> String {
 /// otherwise successful evaluations, including a second invocation on that account.
 #[test]
 fn evaluation_is_quiet_with_a_sparse_home() {
-    let home = scratch("sparse-home", "");
-    assert!(!home.join(".local/share").exists());
-    for _ in 0..2 {
-        let out = command(&home, &["--quiet", "-e", "(+ 1 2)"])
-            .env_remove("STEEL_HOME")
-            .env_remove("XDG_DATA_HOME")
-            .output()
-            .expect("evaluation runs");
-        assert!(out.status.success(), "{}", both(&out));
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3");
-        assert_eq!(
-            String::from_utf8_lossy(&out.stderr).trim(),
-            "[uncacheable]",
-            "{}",
-            both(&out)
-        );
+    for case in ["default", "xdg", "relative-xdg", "legacy", "explicit"] {
+        let home = scratch(&format!("sparse-home-{case}"), "");
+        assert!(!home.join(".local/share").exists());
+        if case == "legacy" {
+            std::fs::create_dir(home.join(".steel")).expect("existing Steel home");
+        }
+        for _ in 0..2 {
+            let mut cmd = command(&home, &["--quiet", "-e", "(+ 1 2)"]);
+            cmd.env_remove("STEEL_HOME").env_remove("XDG_DATA_HOME");
+            match case {
+                "xdg" => {
+                    cmd.env("XDG_DATA_HOME", home.join("data/nested"));
+                }
+                "relative-xdg" => {
+                    cmd.env("XDG_DATA_HOME", "relative-data");
+                }
+                "explicit" => {
+                    cmd.env("STEEL_HOME", home.join("explicit-steel"));
+                }
+                _ => {}
+            }
+            let out = cmd.output().expect("evaluation runs");
+            assert!(out.status.success(), "{case}: {}", both(&out));
+            assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stderr).trim(),
+                "[uncacheable]",
+                "{case}: {}",
+                both(&out)
+            );
+        }
+        match case {
+            "default" | "relative-xdg" => assert!(home.join(".local/share/steel").is_dir()),
+            "xdg" => assert!(home.join("data/nested/steel").is_dir()),
+            _ => {}
+        }
+        if matches!(case, "xdg" | "legacy" | "explicit") {
+            assert!(
+                !home.join(".local").exists(),
+                "{case}: no default data home"
+            );
+        }
+        assert!(!home.join("relative-data").exists());
+        assert!(!home.join("explicit-steel").exists());
+        std::fs::remove_dir_all(home).expect("remove scratch home");
     }
-    std::fs::remove_dir_all(home).expect("remove scratch home");
 }
 
 /// A misspelled bound, a bad value, or one given twice stops the host before any mode runs,
