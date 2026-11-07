@@ -263,6 +263,8 @@ fn event_loop(
     }
     // Preload persisted command history when persistence is on — the flag is seeded
     // from the sticky on-disk marker, so ↑↓ recall spans prior sessions.
+    // History persistence is the embedded host's; a build without it keeps this session's.
+    #[cfg(feature = "embedded")]
     if ikigai_embedded::history_flag().load(std::sync::atomic::Ordering::Relaxed) {
         state.history = ikigai_embedded::load_history();
     }
@@ -273,7 +275,11 @@ fn event_loop(
         // The demo can be toggled at runtime (`demo on|off`, or over the wire via
         // `urn:host:demo`), so reconcile the tab bar with the flag each frame: load
         // the demos the first time it's on, drop them (and any open tab) when it's off.
+        // The demo flag is the embedded host's; a build without it has no demos to show.
+        #[cfg(feature = "embedded")]
         let demo_on = ikigai_embedded::demo_flag().load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(feature = "embedded"))]
+        let demo_on = false;
         if demo_on && state.demos.is_empty() {
             load_demos(&mut state, engine);
         } else if !demo_on && !state.demos.is_empty() {
@@ -1199,6 +1205,7 @@ fn submit(state: &mut State, engine: &Session) -> bool {
     if !line.trim().is_empty() {
         state.history.push(line.clone());
         // Persist across sessions when history is on (a no-op otherwise).
+        #[cfg(feature = "embedded")]
         ikigai_embedded::append_history(&line);
     }
     if let Some(invocation) = crate::script::command(&line) {
