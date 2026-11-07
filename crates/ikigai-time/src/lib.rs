@@ -15,7 +15,8 @@
 //!
 //! The job registry surfaces through three resources the host mounts:
 //! - `source urn:time:schedule target=<iri> every=<dur>` (or `after=<dur>` for a
-//!   one-shot, `method=<verb>` to pick the verb) — registers a job, returns its id;
+//!   one-shot, `method=<verb>` to pick the verb, `timeout=<dur>` to override the
+//!   one-minute awake-time deadline) — registers a job, returns its id;
 //! - `source urn:time:cancel id=<n>` — stops a job (or `id=all` for every
 //!   non-persistent job, or `target=<iri>` for every job firing that resource);
 //! - `source urn:time:jobs` — the live job list (id, target, interval, runs, last
@@ -132,6 +133,10 @@ impl Schedule {
         }
     }
 }
+
+/// Default per-attempt deadline: one minute of awake time. Native hosts without
+/// sleep evidence use their monotonic clock; a browser uses elapsed wall time.
+pub const DEFAULT_JOB_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Parse a schedule string. Today a bare duration — `500ms`, `1s`, `10s`, `1m`, `2h`
 /// (a unitless number is seconds). Future: a cron expression dispatches to a
@@ -271,6 +276,7 @@ struct JobRecord {
     target: String,
     verb: Verb,
     schedule: Schedule,
+    timeout: Duration,
     recurring: bool,
     /// A persistent job is skipped by [`cancel_all`](JobRegistry::cancel_all) — a
     /// blanket "cancel all" leaves it running. For host-registered background timers
@@ -305,6 +311,10 @@ struct JobRecord {
     /// Consecutive completed fires that failed; any success resets it.
     failures_in_a_row: u64,
     handle: TimerHandle,
+    /// A timed-out synchronous call cannot be killed safely. Keep at most one
+    /// outstanding call per job; subsequent attempts fail until it returns.
+    #[cfg(not(target_family = "wasm"))]
+    resolving: Arc<AtomicBool>,
 }
 
 /// Cumulative time this machine has spent **asleep** (suspended), measured from a fixed
@@ -462,7 +472,8 @@ impl JobRegistry {
     }
 
     /// Register a job that fires under `capability` (clamped to the registry's ceiling) and
-    /// start its timer. Returns the new job id, or an error if no resolver is installed yet.
+    /// start its timer. Uses [`DEFAULT_JOB_TIMEOUT`]; see [`Self::schedule_with_timeout`]
+    /// for deadline behavior. Returns an error if no resolver is installed yet.
     ///
     /// `capability` is a **required** argument rather than a defaulted one on purpose, for the
     /// reason [`new`](Self::new) requires a `Clock`: every default moves the hazard rather
@@ -481,7 +492,34 @@ impl JobRegistry {
         recurring: bool,
         capability: Capability,
     ) -> std::result::Result<u64, String> {
-        self.schedule_inner(target, verb, schedule, recurring, false, capability)
+        self.schedule_with_timeout(
+            target,
+            verb,
+            schedule,
+            recurring,
+            capability,
+            DEFAULT_JOB_TIMEOUT,
+        )
+    }
+
+    /// Register a job with an explicit positive per-attempt awake-time limit.
+    ///
+    /// Native hosts stop waiting even if the synchronous resolver blocks. The
+    /// outstanding call cannot be killed safely: its result is discarded, and later
+    /// attempts fail without starting more calls until it returns. Browser hosts
+    /// cannot preempt synchronous JavaScript and check the deadline on return only.
+    pub fn schedule_with_timeout(
+        &self,
+        target: String,
+        verb: Verb,
+        schedule: Schedule,
+        recurring: bool,
+        capability: Capability,
+        timeout: Duration,
+    ) -> std::result::Result<u64, String> {
+        self.schedule_inner(
+            target, verb, schedule, recurring, false, capability, timeout,
+        )
     }
 
     /// Like [`schedule`](Self::schedule), but the job is **persistent** —
@@ -497,9 +535,18 @@ impl JobRegistry {
         recurring: bool,
         capability: Capability,
     ) -> std::result::Result<u64, String> {
-        self.schedule_inner(target, verb, schedule, recurring, true, capability)
+        self.schedule_inner(
+            target,
+            verb,
+            schedule,
+            recurring,
+            true,
+            capability,
+            DEFAULT_JOB_TIMEOUT,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)] // Public scheduling variants share one registration path.
     fn schedule_inner(
         &self,
         target: String,
@@ -508,7 +555,11 @@ impl JobRegistry {
         recurring: bool,
         persistent: bool,
         capability: Capability,
+        timeout: Duration,
     ) -> std::result::Result<u64, String> {
+        if schedule.interval().is_zero() || timeout.is_zero() {
+            return Err("job interval and timeout must be greater than zero".into());
+        }
         // Stamp before locking, as `fire` does: the clock is host-injected code.
         let scheduled_at = self.clock.now();
         // Reserve an id and grab the backend handle under a *short* lock, then release
@@ -545,6 +596,7 @@ impl JobRegistry {
                 target,
                 verb,
                 schedule,
+                timeout,
                 recurring,
                 persistent,
                 capability,
@@ -556,6 +608,8 @@ impl JobRegistry {
                 last_success: None,
                 failures_in_a_row: 0,
                 handle,
+                #[cfg(not(target_family = "wasm"))]
+                resolving: Arc::new(AtomicBool::new(false)),
             },
         );
         Ok(id)
@@ -689,7 +743,7 @@ impl JobRegistry {
     /// authority and does not fire at all.
     fn fire(&self, id: u64) {
         // Copy what the tick needs out under a short lock; resolve without holding it.
-        let (resolver, target, verb, capability) = {
+        let (resolver, target, verb, capability, timeout) = {
             let inner = self.inner.lock().expect("time registry lock");
             let (Some(resolver), Some(job)) = (&inner.resolver, inner.jobs.get(&id)) else {
                 return;
@@ -699,13 +753,16 @@ impl JobRegistry {
                 job.target.clone(),
                 job.verb,
                 fire_capability(&inner.ceiling, &job.capability),
+                job.timeout,
             )
         };
         let (outcome, succeeded) = match Iri::parse(&target) {
-            Ok(iri) => match resolver.issue_as(Request::new(verb, iri), &capability) {
-                Ok((rep, _status)) => (one_line(&String::from_utf8_lossy(&rep.bytes)), true),
-                Err(e) => (format!("error: {}", one_line(&e.to_string())), false),
-            },
+            Ok(iri) => {
+                match self.issue_job(id, resolver, Request::new(verb, iri), capability, timeout) {
+                    Ok((rep, _status)) => (one_line(&String::from_utf8_lossy(&rep.bytes)), true),
+                    Err(e) => (format!("error: {}", one_line(&e.to_string())), false),
+                }
+            }
             Err(e) => (format!("error: bad target: {e}"), false),
         };
         // Stamp BEFORE locking. The clocks are host-injected code; reading one inside the
@@ -725,6 +782,133 @@ impl JobRegistry {
                 job.failures_in_a_row += 1;
             }
         }
+    }
+
+    /// A synchronous resolver is not cancellable. Isolate it on one worker per job,
+    /// stop waiting at the deadline, and discard any late result. Never start another
+    /// worker while that call is still outstanding (including after a timeout).
+    #[cfg(not(target_family = "wasm"))]
+    fn issue_job(
+        &self,
+        id: u64,
+        resolver: Arc<dyn Resolver>,
+        request: Request,
+        capability: Capability,
+        timeout: Duration,
+    ) -> Result<(Representation, ikigai_resolve::CacheStatus), Error> {
+        let resolving = {
+            let inner = self.inner.lock().expect("time registry lock");
+            let Some(job) = inner.jobs.get(&id) else {
+                return Err(Error::Endpoint("job cancelled".into()));
+            };
+            Arc::clone(&job.resolving)
+        };
+        if resolving.swap(true, Ordering::SeqCst) {
+            return Err(Error::Timeout(
+                "previous job attempt is still running".into(),
+            ));
+        }
+        // Capture both clocks before dispatch, so time spent inside issue_as counts.
+        let started = self.clock.now();
+        let asleep = self.sleep.as_ref().and_then(|s| s.asleep());
+        let monotonic_start = std::time::Instant::now();
+        let elapsed = || {
+            if asleep.is_some() && self.sleep.as_ref().and_then(|s| s.asleep()).is_some() {
+                self.awake_since(started, asleep)
+            } else {
+                // Native monotonic clocks exclude suspend on Darwin and Linux. In
+                // particular, lack of sleep evidence must not turn this into a wall
+                // deadline that expires as soon as the machine wakes.
+                monotonic_start.elapsed()
+            }
+        };
+        let (send, recv) = std::sync::mpsc::sync_channel(1);
+        let busy = Arc::clone(&resolving);
+        let spawned = std::thread::Builder::new()
+            .name(format!("time-job-{id}"))
+            .spawn(move || {
+                // Release the slot even if injected resolver code panics.
+                struct Release(Arc<AtomicBool>);
+                impl Drop for Release {
+                    fn drop(&mut self) {
+                        self.0.store(false, Ordering::SeqCst);
+                    }
+                }
+                let release = Release(busy);
+                let result = resolver.issue_as(request, &capability);
+                drop(release);
+                let _ = send.send(result);
+            });
+        if let Err(error) = spawned {
+            resolving.store(false, Ordering::SeqCst);
+            return Err(Error::Endpoint(format!("could not start job: {error}")));
+        }
+        loop {
+            let used = elapsed();
+            if used >= timeout {
+                return Err(Error::Timeout(format!(
+                    "job exceeded {} of awake time",
+                    fmt_duration(timeout)
+                )));
+            }
+            // Poll the injected clocks: a single wall-time recv_timeout would expire
+            // immediately after suspend. Short waits also honor small overrides.
+            match recv.recv_timeout((timeout - used).min(Duration::from_millis(50))) {
+                Ok(result) => {
+                    if elapsed() >= timeout {
+                        return Err(Error::Timeout(format!(
+                            "job exceeded {} of awake time",
+                            fmt_duration(timeout)
+                        )));
+                    }
+                    return result;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(Error::Endpoint(
+                        "job resolver exited without a result".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    // A browser cannot preempt synchronous JavaScript or start native threads. Retain
+    // its synchronous dispatch, but reject a result that used up the awake deadline.
+    #[cfg(target_family = "wasm")]
+    fn issue_job(
+        &self,
+        _id: u64,
+        resolver: Arc<dyn Resolver>,
+        request: Request,
+        capability: Capability,
+        timeout: Duration,
+    ) -> Result<(Representation, ikigai_resolve::CacheStatus), Error> {
+        let started = self.clock.now();
+        let asleep = self.sleep.as_ref().and_then(|s| s.asleep());
+        let result = resolver.issue_as(request, &capability);
+        if self.awake_since(started, asleep) >= timeout {
+            Err(Error::Timeout(format!(
+                "job exceeded {} of awake time",
+                fmt_duration(timeout)
+            )))
+        } else {
+            result
+        }
+    }
+
+    fn awake_since(&self, started: Time, asleep: Option<Duration>) -> Duration {
+        let elapsed = Duration::from_millis(
+            self.clock
+                .now()
+                .as_millis()
+                .saturating_sub(started.as_millis()),
+        );
+        let discount = match (asleep, self.sleep.as_ref().and_then(|s| s.asleep())) {
+            (Some(then), Some(now)) => now.saturating_sub(then),
+            _ => Duration::ZERO,
+        };
+        elapsed.saturating_sub(discount)
     }
 
     /// A machine-readable snapshot of every job's liveness, for a health report.
@@ -1033,6 +1217,10 @@ pub fn space(registry: JobRegistry) -> EndpointSpace {
                     ));
                 };
                 let schedule = parse_schedule(dur_str).map_err(Error::Endpoint)?;
+                let timeout = match inv.inline_str("timeout") {
+                    Ok(value) => parse_duration(value).map_err(Error::Endpoint)?,
+                    Err(_) => DEFAULT_JOB_TIMEOUT,
+                };
                 let verb = inv
                     .inline_str("method")
                     .map(parse_verb)
@@ -1045,12 +1233,13 @@ pub fn space(registry: JobRegistry) -> EndpointSpace {
                 // The job fires under THIS invocation's capability — the caller's own, as the
                 // kernel handed it here — clamped to the registry's ceiling at every tick.
                 let id = schedule_reg
-                    .schedule(
+                    .schedule_with_timeout(
                         target.to_string(),
                         verb,
                         schedule,
                         recurring,
                         inv.capability.clone(),
+                        timeout,
                     )
                     .map_err(Error::Endpoint)?;
                 let when = if recurring { "every" } else { "after" };
@@ -1066,7 +1255,8 @@ pub fn space(registry: JobRegistry) -> EndpointSpace {
                     .summary(
                         "Register a job that fires a resource-request on a timer, under the \
                          caller's own capability. every=<dur> recurs; after=<dur> is one-shot; \
-                         method=<verb> picks the verb.",
+                         method=<verb> picks the verb. timeout=<dur> bounds each attempt \
+                         in awake time (default 1m on native hosts).",
                     )
                     .verb(Verb::Source)
                     .requires(CAP_SCHEDULE)
@@ -1082,6 +1272,12 @@ pub fn space(registry: JobRegistry) -> EndpointSpace {
                     .input(
                         ArgSpec::new("after")
                             .summary("one-shot delay, e.g. 5s")
+                            .class(XSD_STRING)
+                            .optional(),
+                    )
+                    .input(
+                        ArgSpec::new("timeout")
+                            .summary("per-attempt awake-time limit, e.g. 30s; default 1m; native hosts can time out blocked calls")
                             .class(XSD_STRING)
                             .optional(),
                     )
@@ -1498,32 +1694,59 @@ mod tests {
         }
     }
 
+    struct BlockedResolver {
+        entered: std::sync::mpsc::Sender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl Resolver for BlockedResolver {
+        fn issue(&self, _: Request) -> Result<(Representation, CacheStatus), Error> {
+            self.entered.send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+            Ok((text("late success".into()), CacheStatus::Uncacheable))
+        }
+        fn is_cached(&self, _: &Request, _: &Capability) -> bool {
+            false
+        }
+        fn entries(&self) -> Option<Vec<SpaceEntry>> {
+            None
+        }
+    }
+
     /// A blocked peer must produce a failed attempt without waiting for that peer.
     #[test]
     fn hung_job_records_timeout_before_resolver_returns() {
-        struct BlockedResolver {
-            entered: std::sync::mpsc::Sender<()>,
-            release: Mutex<std::sync::mpsc::Receiver<()>>,
-        }
-        impl Resolver for BlockedResolver {
-            fn issue(&self, _: Request) -> Result<(Representation, CacheStatus), Error> {
-                self.entered.send(()).unwrap();
-                self.release.lock().unwrap().recv().unwrap();
-                Ok((text("late success".into()), CacheStatus::Uncacheable))
-            }
-            fn is_cached(&self, _: &Request, _: &Capability) -> bool { false }
-            fn entries(&self) -> Option<Vec<SpaceEntry>> { None }
-        }
+        check_blocked_job(None, false);
+    }
+
+    #[test]
+    fn job_deadline_discounts_sleep_and_honors_override() {
+        check_blocked_job(Some(Duration::from_secs(2)), true);
+    }
+
+    fn check_blocked_job(timeout: Option<Duration>, nap: bool) {
         let millis = Arc::new(AtomicU64::new(1_000));
-        let reg = JobRegistry::new(Arc::new(ManualBackend::default()),
-            Arc::new(FixedClock(millis.clone())));
+        let slept = Arc::new(AtomicU64::new(0));
+        let reg = JobRegistry::new(
+            Arc::new(ManualBackend::default()),
+            Arc::new(FixedClock(millis.clone())),
+        )
+        .with_sleep_clock(Arc::new(ManualSleep(slept.clone())));
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         reg.set_resolver(Arc::new(BlockedResolver {
-            entered: entered_tx, release: Mutex::new(release_rx),
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
         }));
-        let id = reg.schedule("urn:test:blocked".into(), Verb::Source,
-            Schedule::Every(Duration::from_secs(1)), true, Capability::root()).unwrap();
+        let id = reg
+            .schedule_with_timeout(
+                "urn:test:blocked".into(),
+                Verb::Source,
+                Schedule::Every(Duration::from_secs(1)),
+                true,
+                Capability::root(),
+                timeout.unwrap_or(DEFAULT_JOB_TIMEOUT),
+            )
+            .unwrap();
         let worker_reg = reg.clone();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
@@ -1531,17 +1754,74 @@ mod tests {
             done_tx.send(()).unwrap();
         });
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        millis.store(121_000, Ordering::SeqCst);
+        if nap {
+            // Publish the sleep evidence first to avoid an inconsistent test reading.
+            slept.store(3_600, Ordering::SeqCst);
+            millis.store(3_601_000, Ordering::SeqCst);
+            assert!(
+                done_rx.recv_timeout(Duration::from_millis(150)).is_err(),
+                "an hour asleep must not consume the awake deadline"
+            );
+            assert_eq!(reg.health()[0].runs, 0);
+        }
+        let elapsed = timeout.unwrap_or(DEFAULT_JOB_TIMEOUT).as_millis() as u64;
+        millis.store(
+            1_000 + if nap { 3_600_000 } else { 0 } + elapsed,
+            Ordering::SeqCst,
+        );
         let returned = done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
         let health = reg.health();
+        if returned {
+            reg.fire(id);
+            reg.fire(id);
+            assert_eq!(reg.health()[0].failures_in_a_row, 3);
+            assert!(
+                entered_rx.try_recv().is_err(),
+                "no duplicate outstanding calls"
+            );
+            // An unrelated job still completes while this one is blocked.
+            reg.set_resolver(Arc::new(StubResolver {
+                issued: Arc::new(AtomicU64::new(0)),
+            }));
+            let sibling = reg
+                .schedule(
+                    "urn:test:sibling".into(),
+                    Verb::Source,
+                    Schedule::Every(Duration::from_secs(1)),
+                    true,
+                    Capability::root(),
+                )
+                .unwrap();
+            reg.fire(sibling);
+            assert_eq!(reg.health()[1].runs, 1);
+        }
         // Always release and join, even on the unfixed implementation.
         release_tx.send(()).unwrap();
         worker.join().unwrap();
-        assert!(returned, "hung fire did not return after 120 seconds of awake time");
+        assert!(
+            returned,
+            "hung fire did not return after 120 seconds of awake time"
+        );
         assert_eq!(health[0].runs, 1);
         assert_eq!(health[0].failures_in_a_row, 1);
         assert!(health[0].last_output.contains("timeout"));
         assert_eq!(health[0].since_last_success, None);
+        let resolving = reg.inner.lock().unwrap().jobs[&id].resolving.clone();
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while resolving.load(Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < until, "resolver did not finish");
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            reg.health()[0].failures_in_a_row,
+            3,
+            "late success is discarded"
+        );
+        reg.fire(id);
+        let recovered = reg.health();
+        assert_eq!(recovered[0].runs, 4);
+        assert_eq!(recovered[0].failures_in_a_row, 0);
+        assert_eq!(recovered[0].since_last_success, Some(Duration::ZERO));
     }
 
     #[test]
@@ -1768,6 +2048,54 @@ mod tests {
         }
         Resolver::issue_as(kernel, request, capability)
             .map(|(rep, _)| String::from_utf8_lossy(&rep.bytes).into_owned())
+    }
+
+    #[test]
+    fn schedule_control_accepts_only_positive_timeout_overrides() {
+        let reg = JobRegistry::new(Arc::new(ManualBackend::default()), Arc::new(SystemClock));
+        let kernel = kernel_with_time(&reg, Arc::new(AtomicU64::new(0)));
+        for invalid in ["0s", "no", "18446744073709551615h"] {
+            assert!(call(
+                &kernel,
+                "urn:time:schedule",
+                &[("target", "urn:x"), ("every", "1s"), ("timeout", invalid)],
+                &Capability::root()
+            )
+            .is_err());
+        }
+        assert!(reg.health().is_empty());
+        call(
+            &kernel,
+            "urn:time:schedule",
+            &[("target", "urn:x"), ("every", "1s"), ("timeout", "250ms")],
+            &Capability::root(),
+        )
+        .unwrap();
+        assert_eq!(
+            reg.inner.lock().unwrap().jobs[&1].timeout,
+            Duration::from_millis(250)
+        );
+        call(
+            &kernel,
+            "urn:time:schedule",
+            &[("target", "urn:x"), ("after", "1s")],
+            &Capability::root(),
+        )
+        .unwrap();
+        assert_eq!(
+            reg.inner.lock().unwrap().jobs[&2].timeout,
+            DEFAULT_JOB_TIMEOUT
+        );
+        assert!(reg
+            .schedule_with_timeout(
+                "urn:x".into(),
+                Verb::Source,
+                Schedule::Every(Duration::from_secs(1)),
+                true,
+                Capability::root(),
+                Duration::ZERO
+            )
+            .is_err());
     }
 
     /// A caller that may schedule and read jobs but holds NO authority over `urn:x`.
