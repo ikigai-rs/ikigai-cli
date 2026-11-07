@@ -38,7 +38,7 @@ fn a_refused_cap_stops_the_c_batch_before_a_write_or_reset() {
     let out = ikigai(&home)
         .args([
             "-c",
-            "cap read-only lisp",
+            "cap read-only nosuchscope",
             "-c",
             "sink urn:file:blocked.txt unsafe",
             "-c",
@@ -64,7 +64,7 @@ fn a_replayed_file_refuses_until_an_explicit_recovery() {
     let home = scratch("replay");
     std::fs::write(home.join("files/readable.txt"), "read recovered").unwrap();
     let replay = home.join("replay.txt");
-    std::fs::write(&replay, "cap read-only lisp\nsink urn:file:blocked.txt unsafe\ncap\nsink urn:file:still-blocked.txt unsafe\ncap read-only\nsource urn:file:readable.txt\nsink urn:file:read-only.txt unsafe\ncap reset\nsink urn:file:after.txt safe\n").unwrap();
+    std::fs::write(&replay, "cap read-only nosuchscope\nsink urn:file:blocked.txt unsafe\ncap\nsink urn:file:still-blocked.txt unsafe\ncap read-only\nsource urn:file:readable.txt\nsink urn:file:read-only.txt unsafe\ncap reset\nsink urn:file:after.txt safe\n").unwrap();
     let out = ikigai(&home)
         .stdin(std::fs::File::open(replay).unwrap())
         .output()
@@ -91,7 +91,7 @@ fn a_script_file_stops_at_the_refused_cap() {
     let home = scratch("script");
     std::fs::write(
         home.join("refused.iki"),
-        "cap read-only lisp\nsink urn:file:blocked.txt unsafe\n",
+        "cap read-only nosuchscope\nsink urn:file:blocked.txt unsafe\n",
     )
     .unwrap();
     let out = ikigai(&home).arg("refused.iki").output().unwrap();
@@ -109,7 +109,7 @@ fn a_refused_cap_stops_before_a_lisp_write() {
     let out = ikigai(&home)
         .args([
             "-c",
-            "cap read-only lisp",
+            "cap read-only nosuchscope",
             "-e",
             "(sink \"urn:file:blocked.txt\" \"unsafe\")",
         ])
@@ -125,7 +125,7 @@ fn a_refused_cap_in_a_stored_script_stops_the_outer_batch() {
     let home = scratch("stored");
     std::fs::write(
         home.join("files/refused.iki"),
-        "cap read-only lisp\nsink urn:file:blocked.txt unsafe\n",
+        "cap read-only nosuchscope\nsink urn:file:blocked.txt unsafe\n",
     )
     .unwrap();
     let out = ikigai(&home)
@@ -176,4 +176,25 @@ fn only_an_explicit_valid_cap_recovers_a_replayed_session() {
             "{out:?}"
         );
     }
+}
+
+/// `lisp` is a registered profile (`urn:cap:lisp`) and profiles combine per word, so
+/// `cap read-only lisp` narrows rather than refusing; the narrowed capability still
+/// denies a write.
+#[test]
+fn a_combined_profile_narrowing_still_denies_a_write() {
+    let home = scratch("combined");
+    let out = ikigai(&home)
+        .args([
+            "-c",
+            "cap read-only lisp",
+            "-c",
+            "sink urn:file:blocked.txt unsafe",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("not a capability scope"), "{out:?}");
+    assert!(stderr.contains("denied"), "{out:?}");
+    assert!(!home.join("files/blocked.txt").exists(), "{out:?}");
 }

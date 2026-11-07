@@ -21,6 +21,12 @@
 //! A caller spills only when its capability holds `urn:cap:stream:spill:<bytes>` (with `--cap`,
 //! grant it there); without one, an upload route takes the body into memory under `--max-body`
 //! like any other route. A line that does not parse stops the door at start-up, naming it.
+//!
+//! ⚠ On ikigai-core 0.3 a spill is held for the caller that delivered it (ledger #2965, #2974),
+//! and this door names no caller (it sets no `principal_fn`), so a hold for one would be read by
+//! root alone and the Sink would be answered `NotFound` for its own upload. ikigai-web therefore
+//! does not spill for a caller its door does not name: until this door names its callers, an
+//! upload route here takes the body into memory under `--max-body`, as for a caller with no grant.
 use std::time::Duration;
 
 /// The route key; it repeats, one line per route.

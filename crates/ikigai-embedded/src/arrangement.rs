@@ -30,9 +30,10 @@
 //! Where it is bound to DIFFERENT endpoints, no registry can say which one a door means, so the
 //! name is left out and a declaration that uses it is refused naming every door it is bound at
 //! (`Harvest::ambiguous`). Nothing is renamed: a name is on the wire. The built-in root has
-//! three such names on every machine — `file` (the org-file jail and the workspace jail, two
-//! different roots), `meeting` and `org-agenda` (each module binds two clones of one endpoint)
-//! — and every `llm-*` backend name once `llm.json` declares a second provider.
+//! one such name on every machine — `file` (the org-file jail and the workspace jail, two
+//! different roots) — and every `llm-*` backend name once `llm.json` declares a second
+//! provider. (`meeting` and `org-agenda` were two more until ikigai-meeting 0.7 and ikigai-org
+//! 0.3 gave each of their doors its own id.)
 //!
 //! ## What stays around the arrangement
 //!

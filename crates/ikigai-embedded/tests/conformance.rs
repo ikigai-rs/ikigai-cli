@@ -166,6 +166,8 @@ const INHERITED: &[(&str, &str)] = &[
     ("ui-tokens-css", "ikigai-ui"),
     ("ui-palette", "ikigai-ui"),
     ("ui-theme-chooser", "ikigai-ui"),
+    // ikigai-ui 0.5: a page family's header chooser, a Source of HTML like the rest above.
+    ("ui-chooser", "ikigai-ui"),
     ("bookmarks", "ikigai-cms"),
     ("compose", "ikigai-fn"),
     ("diagram-arrangement", "ikigai-diagram"),
@@ -219,6 +221,8 @@ const INHERITED: &[(&str, &str)] = &[
     ("llm-ollama-up", "ikigai-llm"),
     ("llm-select", "ikigai-llm"),
     ("org-agenda", "ikigai-org"),
+    // ikigai-org 0.3: the explicit-period door moved from `org-agenda` to its own id.
+    ("org-agenda-period", "ikigai-org"),
     ("rdf-diff", "ikigai-rdf"),
     ("rdf-from-sexpr", "ikigai-sexpr"),
     ("rdf-transrept", "ikigai-rdf"),
@@ -226,6 +230,9 @@ const INHERITED: &[(&str, &str)] = &[
     ("repo-branch", "ikigai-repo"),
     ("repo-list", "ikigai-repo"),
     ("repo-log", "ikigai-repo"),
+    // ikigai-repo 0.5: `urn:repo:{repo}:object:sha:{sha}` and `urn:repo:show`.
+    ("repo-object", "ikigai-repo"),
+    ("repo-show", "ikigai-repo"),
     ("repo-pr-checks", "ikigai-repo"),
     ("repo-pr-diff", "ikigai-repo"),
     ("repo-pr-files", "ikigai-repo"),
@@ -254,7 +261,9 @@ const INHERITED: &[(&str, &str)] = &[
     ("sparql-describe", "ikigai-sparql"),
     ("sparql-from-sexpr", "ikigai-sexpr"),
     ("sparql-select", "ikigai-sparql"),
-    ("meeting", "ikigai-meeting"),
+    // ikigai-meeting 0.7 replaced the shared id `meeting` with one id per door.
+    ("meeting-schedule", "ikigai-meeting"),
+    ("meeting-zoom-schedule", "ikigai-meeting"),
     ("secret", "ikigai-secret"),
     ("secret-generate", "ikigai-secret"),
     ("secret-unlock", "ikigai-secret"),
@@ -289,7 +298,9 @@ const OWNER_ONLY: &[&str] = &[
     "secret-generate",
     "secret-unlock",
     "send",
-    "meeting",
+    // `meeting` until ikigai-meeting 0.7 gave each of its two doors its own id.
+    "meeting-schedule",
+    "meeting-zoom-schedule",
     "client-issue",
     "peer-list",
     // The picture of THIS host's arrangement: local root only (ikigai-diagram), like

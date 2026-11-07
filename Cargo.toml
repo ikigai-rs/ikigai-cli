@@ -1154,7 +1154,12 @@ members = ["crates/*"]
 # 0.2.9 (a patch, opened after 0.2.8 was published, so it also carries what merged since):
 # the REPL's names layer reloads its file on a watcher RESCAN (events dropped), where it used to
 # keep the old bindings until the file changed again (ledger #2870). Published.
-version = "0.3.0"
+# 0.4.0 is the core 0.3.0 cascade (ledger #2975, wave 5): every member re-pinned to ikigai-core 0.3.0
+# (the scoped content store, ledger #2965) and every external ikigai dependency to its core 0.3
+# release. Core's types are in every member's public API, so the move is a minor. ikigai-web holds
+# an upload with `put_for`/`put_replay_for` under the deliverer's capability (ledger #2974).
+# Prepared here, not published.
+version = "0.4.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -1164,7 +1169,7 @@ homepage = "https://github.com/ikigai-rs/ikigai-cli"
 [workspace.dependencies]
 # The released kernel, consumed from crates.io. For local cross-repo development
 # against a sibling checkout, use .cargo/config.toml (see .cargo/config.toml.example).
-ikigai-core = "0.2.7" # 0.2.7 = an answer with validators and no lifetime is KEPT for revalidation (ledger #2553), which ikigai-http 0.5.0 asks for as its own floor; the 304 on an ETag-only feed needs it. Beneath it: 0.2.5 = the kernel settles `key=<iri>` references by contract (ledger #2511), which the REPL now sends; a behavior floor. Beneath it: 0.2.0 is the STREAMS release (ledger #2261), taken in the core 0.2.0 sweep (ledger
+ikigai-core = "0.3.0" # 0.3.0 = the SCOPED CONTENT STORE (ledger #2965): held content is scoped to whoever delivered it, a principal-less hold is root's, and `ContentStore::put`/`put_replay` are root-only, so the door holds an upload with `put_for`/`put_replay_for` under the deliverer's capability (ledger #2974). Taken in the core 0.3.0 cascade (ledger #2975, wave 5). `"0.3.0"` is `<0.4.0`. Beneath it: 0.2.7 = an answer with validators and no lifetime is KEPT for revalidation (ledger #2553), which ikigai-http 0.5.0 asks for as its own floor; the 304 on an ETag-only feed needs it. Beneath it: 0.2.5 = the kernel settles `key=<iri>` references by contract (ledger #2511), which the REPL now sends; a behavior floor. Beneath it: 0.2.0 is the STREAMS release (ledger #2261), taken in the core 0.2.0 sweep (ledger
 # #2356): the old `"0.1.108"` meant `<0.2.0` under 0.x rules, so it could never reach it. `"0.2.0"` is a caret
 # FLOOR and `<0.3.0`; the lock resolves the newest 0.2.x, since several modules above ask for `^0.2.1`.
 # No source here calls an API new in 0.2.x. Beneath it: 0.1.108 = the failure classes (ledger #1546): `FailureClass` and `Error::class()`, the
@@ -1313,7 +1318,7 @@ ikigai-core = "0.2.7" # 0.2.7 = an answer with validators and no lifetime is KEP
 # holds beneath it: below that a MOUNTED template row whose local name-guess collides with a
 # shorter sibling is dropped from the manifold, so `ikigai mcp` silently stops projecting
 # browse-pr-explain and browse-pr-review.
-ikigai-vocab = "0.2.5" # 0.2.5 = core 0.2.5's lockstep release (`ik:fixed`). Beneath it: 0.2.0 = core 0.2.0's lockstep release (ledger #2261, #2356); the old `"0.1.108"`
+ikigai-vocab = "0.3.0" # 0.3.0 = core 0.3.0's lockstep release (the scoped content store, ledger #2965; cascade ledger #2975). Beneath it: 0.2.5 = core 0.2.5's lockstep release (`ik:fixed`). Beneath it: 0.2.0 = core 0.2.0's lockstep release (ledger #2261, #2356); the old `"0.1.108"`
 # meant `<0.2.0`. Not an API floor; raised with core. Beneath it: 0.1.108 = core 0.1.108's lockstep release (`ik:mayFail`, `ik:FailureClass` and its seven
 # individuals, `tests/vectors/failure_class_vectors.json`). Not an API floor; raised with core.
 # Beneath it: 0.1.107 = core 0.1.107's lockstep release. Not an API floor; raised with core.
@@ -1405,7 +1410,7 @@ ikigai-vocab = "0.2.5" # 0.2.5 = core 0.2.5's lockstep release (`ik:fixed`). Ben
 # CEILING. The lock alone was holding `ikigai-fn` at 0.2.0 and shipping a manifold that
 # contradicted itself. Refresh the lock when you touch these, and diff the lock FILE.
 # The reusable function library, linked in as a published module crate.
-ikigai-fn = "0.9.0" # 0.9.0 = `ikigai_fn::html::percent_decode` and `percent_decode_bytes` (ledger #2833), the one strict percent-decoder that replaced intake's, the embedded host's and ikigai-web's private copies (ledger #1878); a minor, so `"0.8.0"` was a ceiling below it. Beneath it: 0.8.0 = an unquoted `k=<iri>` in a compose marker is issued as a REFERENCE the kernel settles (ledger #2506); a minor, so `"0.7.x"` was a ceiling below it, and no marker this host ships writes a literal `=<…>`. Beneath it: 0.7.2 = `urn:iki:fn:html-to-text` (ledger #2528). Beneath it: 0.7.1 = `compose` takes template arguments by name (ledger #2498), a behavior floor the REPL grammar chapter teaches. 0.7.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.7.0"` is `<0.8.0`. Beneath it: 0.5.0 = `ikigai_fn::html` (`html_text`, `attr`, `url_segment`, `safe_href`), the one
+ikigai-fn = "0.10.0" # 0.10.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.10.0"` is `<0.11.0`. Beneath it: 0.9.0 = `ikigai_fn::html::percent_decode` and `percent_decode_bytes` (ledger #2833), the one strict percent-decoder that replaced intake's, the embedded host's and ikigai-web's private copies (ledger #1878); a minor, so `"0.8.0"` was a ceiling below it. Beneath it: 0.8.0 = an unquoted `k=<iri>` in a compose marker is issued as a REFERENCE the kernel settles (ledger #2506); a minor, so `"0.7.x"` was a ceiling below it, and no marker this host ships writes a literal `=<…>`. Beneath it: 0.7.2 = `urn:iki:fn:html-to-text` (ledger #2528). Beneath it: 0.7.1 = `compose` takes template arguments by name (ledger #2498), a behavior floor the REPL grammar chapter teaches. 0.7.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.7.0"` is `<0.8.0`. Beneath it: 0.5.0 = `ikigai_fn::html` (`html_text`, `attr`, `url_segment`, `safe_href`), the one
 # escaper and link check every page this host builds from data calls (ledger #1868, replacing intake's
 # `html_escape`, ikigai-web's error-page escape and two `urlencode` copies). A floor by API. Behavior change
 # with it: compose's `$h{…}` (and `html_text`) maps a C0 control other than tab, LF and CR to U+FFFD.
@@ -1446,9 +1451,9 @@ ikigai-fn = "0.9.0" # 0.9.0 = `ikigai_fn::html::percent_decode` and `percent_dec
 # at compile time. `urn:demo:*`, `urn:data:page` and `urn:host:info` deliberately did NOT move:
 # they are bound in several repos and a shared prefix cannot migrate one binder at a time.
 # Personal contexts (urn:personal:*), macOS-backed, linked as a published module.
-ikigai-personal = "0.8.1" # 0.8.1 = on ikigai-http 0.5.0, so the binary links ONE ikigai-http instead of 0.4.3 beside 0.5.0. Beneath it: 0.8.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.8.0"` is `<0.9.0`. Beneath it: 0.7.1 = multi-day events block every spanned day (free/busy + booking); notes/URL/attendees on the graph face + description= Sink (detail preservation)
+ikigai-personal = "0.9.0" # 0.9.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.9.0"` is `<0.10.0`. Beneath it: 0.8.1 = on ikigai-http 0.5.0, so the binary links ONE ikigai-http instead of 0.4.3 beside 0.5.0. Beneath it: 0.8.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.8.0"` is `<0.9.0`. Beneath it: 0.7.1 = multi-day events block every spanned day (free/busy + booking); notes/URL/attendees on the graph face + description= Sink (detail preservation)
 # Capability-gated file/store module, linked as a published module crate.
-ikigai-fs = "0.3.0" # 0.3.0 = a directory also answers `as=text/uri-list` (full `urn:file:` IRIs, so a map can run every saved search), and a path takes exactly one canonical percent-encoding (a minor for that). Beneath it: 0.2.4 = vetted media types (`.geojson` is `application/geo+json`, ledger #2532) and directory listings (ledger #2524), both taught in the book. Beneath it: 0.2.2 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.2.2"` is `<0.3.0`. Beneath it: 0.1.8 is a SECURITY floor (audit round 3, ledger #856): the jail authorizes the
+ikigai-fs = "0.4.1" # 0.4.1 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.4.1"` is `<0.5.0`. Beneath it: 0.3.0 = a directory also answers `as=text/uri-list` (full `urn:file:` IRIs, so a map can run every saved search), and a path takes exactly one canonical percent-encoding (a minor for that). Beneath it: 0.2.4 = vetted media types (`.geojson` is `application/geo+json`, ledger #2532) and directory listings (ledger #2524), both taught in the book. Beneath it: 0.2.2 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.2.2"` is `<0.3.0`. Beneath it: 0.1.8 is a SECURITY floor (audit round 3, ledger #856): the jail authorizes the
 # file it actually opens (no symlinks, canonical spellings, fails closed on a missing root).
 # 0.1.7 types `*.arrangement` files as `text/x-ikigai-arrangement`, which is
 # how `--arrangement game.arrangement` reaches `ikigai-sexpr`'s lossless transreptor in the
@@ -1463,7 +1468,7 @@ ikigai-fs = "0.3.0" # 0.3.0 = a directory also answers `as=text/uri-list` (full 
 # live mount is unchanged, so nothing else here moves.
 # 0.1.5 = path declared as Binding input (urn:file/orgfile rows in urn:kernel:actions)
 # Outbound HTTP-client module (urn:http:get…), linked as a published module crate.
-ikigai-http = "0.5.0" # 0.5.0 = conditional revalidation (ledger #2535): a stale GET/HEAD sends If-None-Match / If-Modified-Since and a 304 serves the stored body. `HttpTransport` is shared with ikigai-llm 0.18 and ikigai-meeting 0.6, so the three move together. Beneath it: 0.4.3 = `Expires` and a heuristic lifetime set freshness (ledger #2533); 0.4.2 strips credentials on a cross-origin redirect (ledger #2459). Beneath it: 0.4.1 adds `space_with(transport, max_response_bytes)` so the host can
+ikigai-http = "0.6.0" # 0.6.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.6.0"` is `<0.7.0`. Beneath it: 0.5.0 = conditional revalidation (ledger #2535): a stale GET/HEAD sends If-None-Match / If-Modified-Since and a 304 serves the stored body. `HttpTransport` is shared with ikigai-llm 0.18 and ikigai-meeting 0.6, so the three move together. Beneath it: 0.4.3 = `Expires` and a heuristic lifetime set freshness (ledger #2533); 0.4.2 strips credentials on a cross-origin redirect (ledger #2459). Beneath it: 0.4.1 adds `space_with(transport, max_response_bytes)` so the host can
 # apply http.max_response_bytes at both the transport and endpoint (ledger #2479).
 # 0.4.0 = core 0.2.0 sweep (ledger #2356), on ikigai-core 0.2.x. Beneath it: 0.3.0 = the one status table on core 0.1.108's failure classes (ledger #1546,
 # `ikigai_http::status`): an origin's 401/403 is `Refused` (was `Denied`), 429 and a 503 with `Retry-After`
@@ -1488,7 +1493,7 @@ ikigai-http = "0.5.0" # 0.5.0 = conditional revalidation (ledger #2535): a stale
 # Interactive runbook module (urn:runbook:*) — Linked Data demo tab since 0.1.3;
 # 0.1.5 adds the JSON-LD demo tab (expand/flatten/compact), which works here because
 # the CLI links its own pipe-fixed ikigai-engine.
-ikigai-runbook = "0.3.2" # 0.3.2 = the OWL 2 RL pages (ledger #2641): Selection through the reasoner, then Two vocabularies, Domain & range, Topics, The thread and Reasoner bounds, all over `urn:reason:*`, which this host binds (`ikigai-reason` above); `tests/reason_space.rs` runs every step of those pages through the binary. `"0.3.2"` is `<0.4.0`. Beneath it: 0.3.0 = core 0.2.0 sweep (ledger #2356). Beneath that: 0.2.1 = the 0.2 line names its `space()` `urn:iki:space:runbook` (ledger #987), so
+ikigai-runbook = "0.4.1" # 0.4.1 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.4.1"` is `<0.5.0`. Beneath it: 0.3.2 = the OWL 2 RL pages (ledger #2641): Selection through the reasoner, then Two vocabularies, Domain & range, Topics, The thread and Reasoner bounds, all over `urn:reason:*`, which this host binds (`ikigai-reason` above); `tests/reason_space.rs` runs every step of those pages through the binary. `"0.3.2"` is `<0.4.0`. Beneath it: 0.3.0 = core 0.2.0 sweep (ledger #2356). Beneath that: 0.2.1 = the 0.2 line names its `space()` `urn:iki:space:runbook` (ledger #987), so
 # `answered_by`, `urn:kernel:topology` and `urn:diagram:*` show that name where this host mounts
 # it plain, and the cache partitions under it. Under 0.x the old caret was a CEILING below the
 # named release. 0.2.1 REFUSES an `as` outside `PAGE_FACES` as `InvalidArgument` naming `as` (it
@@ -1502,7 +1507,7 @@ ikigai-runbook = "0.3.2" # 0.3.2 = the OWL 2 RL pages (ledger #2641): Selection 
 # 0.1.13 added `hide_tab`/`tab_ids`, which this workspace does not call yet.
 # 0.1.12 Lisp page: + generated aliases (named verbs, cap-scoped, transcluded)
 # Linked Data toolkit (separate ikigai-linkeddata repo): RDF transreption + SPARQL.
-ikigai-rdf = "0.3.2" # 0.3.2 = lockstep with ikigai-sparql below. Beneath it: 0.3.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.1"` is `<0.4.0`. Beneath it: 0.2.6 = the linkeddata lockstep line that names the HTTP GET `urn:http:get`
+ikigai-rdf = "0.5.0" # 0.5.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.5.0"` is `<0.6.0`. Beneath it: 0.3.2 = lockstep with ikigai-sparql below. Beneath it: 0.3.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.1"` is `<0.4.0`. Beneath it: 0.2.6 = the linkeddata lockstep line that names the HTTP GET `urn:http:get`
 # (ledger #11) and makes every cacheable RDF face byte-stable across recomputation (ledger #1566).
 # Beneath it, still true: 0.2.1 = the linkeddata lockstep line (`ikigai-sparql` 0.2.1 depends on it): `urn:iki:space:rdf`
 # (ledger #987), and Turtle / JSON / RDF-XML nesting refused past 64 before a recursive parser
@@ -1512,7 +1517,7 @@ ikigai-rdf = "0.3.2" # 0.3.2 = lockstep with ikigai-sparql below. Beneath it: 0.
 # one_of/default. 0.1.9 is a dev-dependency bump for this crate only, so 0.1.8 is the true
 # minimum rather than the newest. 0.1.3 = + urn:rdf:union / urn:rdf:diff (graph set ops,
 # with= carries ?k=v args)
-ikigai-sparql = "0.3.2" # 0.3.2 = a typed `bindings=` on the query endpoints (ledger #2517). Beneath it: 0.3.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.1"` is `<0.4.0`. Beneath it: 0.2.6 = the linkeddata lockstep line (ledger #11): a `graph=` source fetched over HTTP
+ikigai-sparql = "0.5.0" # 0.5.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.5.0"` is `<0.6.0`. Beneath it: 0.3.2 = a typed `bindings=` on the query endpoints (ledger #2517). Beneath it: 0.3.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.1"` is `<0.4.0`. Beneath it: 0.2.6 = the linkeddata lockstep line (ledger #11): a `graph=` source fetched over HTTP
 # goes through `urn:http:get`; between 0.2.1 and 0.2.6 the shared store's triple terms are bounded (ledger #1326),
 # GRAPH patterns count toward the join bound (ledger #1426, #1429), and a non-RDF `graph=` source is transrepted
 # to RDF (ledger #1442).
@@ -1545,13 +1550,13 @@ ikigai-sparql = "0.3.2" # 0.3.2 = a typed `bindings=` on the query endpoints (le
 # `space_with_store` — which the browse composition uses — behind `urn:cap:sparql:update`.
 # 0.1.6 = space_with_store (shared-store seam for browse/annotations)
 # Content sniffing + sniff-and-dispatch (urn:sniff, urn:transrept:auto).
-ikigai-sniff = "0.3.1" # 0.3.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.1"` is `<0.4.0`. Beneath it: 0.2.6 = the linkeddata lockstep line (ledger #11).
+ikigai-sniff = "0.5.0" # 0.5.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.5.0"` is `<0.6.0`. Beneath it: 0.3.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.1"` is `<0.4.0`. Beneath it: 0.2.6 = the linkeddata lockstep line (ledger #11).
 # `rdf-12` is REQUIRED here, not optional: ikigai-shacl turns on `oxigraph/rdf-12` and so `oxrdf/rdf-12`
 # for the whole workspace (feature unification), and `reasonable` 0.4.4 does not compile against that
 # oxrdf unless it is built with its own `rdf-12` (E0004, `TermRef::Triple` not covered; measured
 # 2026-10-30). ikigai-reason's `rdf-12` feature forwards to it.
-ikigai-reason = { version = "0.3.3", features = ["rdf-12"] } # 0.3.3 = its first published release: `urn:reason:closure` and `urn:reason:inferred`, OWL 2 RL forward chaining, pure and cacheable, bounded (1,000 input triples, 100,000 closure triples, refused as OverBudget, never truncated). The runbook's OWL 2 RL pages run on it (ledger #2641).
-ikigai-compress = "0.3.0" # 0.3.0 = core 0.2.x, the newest release. `"0.3.0"` is `<0.4.0`. gzip and zlib as endpoints and transreptors; the runbook's Bytes tab runs on it.
+ikigai-reason = { version = "0.5.0", features = ["rdf-12"] } # 0.5.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.5.0"` is `<0.6.0`. Beneath it: 0.3.3 = its first published release: `urn:reason:closure` and `urn:reason:inferred`, OWL 2 RL forward chaining, pure and cacheable, bounded (1,000 input triples, 100,000 closure triples, refused as OverBudget, never truncated). The runbook's OWL 2 RL pages run on it (ledger #2641).
+ikigai-compress = "0.5.0" # 0.5.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.5.0"` is `<0.6.0`. Beneath it: 0.3.0 = core 0.2.x, the newest release. `"0.3.0"` is `<0.4.0`. gzip and zlib as endpoints and transreptors; the runbook's Bytes tab runs on it.
 # Beneath it, still true: 0.2.1 = the linkeddata lockstep line: `urn:iki:space:sniff` (ledger #987).
 # Beneath it, still true: 0.1.9 sniffs a leading `<urn:…>` subject as text/turtle. Below it
 # `angle_token_is_iri` tested for `://` — an AUTHORITY, not a scheme — so every Turtle
@@ -1561,7 +1566,7 @@ ikigai-compress = "0.3.0" # 0.3.0 = core 0.2.x, the newest release. `"0.3.0"` is
 # `source <urn: graph> | urn:rdf:transrept` and `urn:transrept:auto` — both bound here.
 # 0.1.9 also declares `urn:transrept:auto`'s own text/turtle face and refuses an unknown `as=`.
 # Neutral s-expr foundation: Sexpr datum + urn:sparql:from-sexpr transreptor (text/x-sexpr → SPARQL).
-ikigai-sexpr = "0.3.1" # 0.3.1 = the `(name …)` arrangement form for a named request (ledger #2514). Beneath it: 0.3.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.0"` is `<0.4.0`. Beneath it: 0.2.0 = names its `space()` `urn:iki:space:sexpr` (ledger #987), so `answered_by`,
+ikigai-sexpr = "0.4.0" # 0.4.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.4.0"` is `<0.5.0`. Beneath it: 0.3.1 = the `(name …)` arrangement form for a named request (ledger #2514). Beneath it: 0.3.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.0"` is `<0.4.0`. Beneath it: 0.2.0 = names its `space()` `urn:iki:space:sexpr` (ledger #987), so `answered_by`,
 # `urn:kernel:topology` and `urn:diagram:*` show that name where this host mounts it plain, and
 # the cache partitions under it. Under 0.x the old caret was a CEILING below the named release.
 # `arrangement_space()` (unused here) is `urn:iki:space:sexpr:arrangement`; `ArrangementError`
@@ -1593,13 +1598,13 @@ ikigai-sexpr = "0.3.1" # 0.3.1 = the `(name …)` arrangement form for a named r
 # and carry no role), the `--line`/`--rule` border tokens, a theme chooser in every page's
 # header (`urn:iki:ui:theme-chooser:{theme}`), and ikigai-fn 0.9, so the host links one
 # ikigai-fn (ledger #2854). A minor, so `"0.3.0"` was a ceiling below it.
-ikigai-ui = "0.4.0"
-ikigai-diagram = "0.3.0" # 0.3.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.0"` is `<0.4.0`. Beneath it: 0.2.0 = names its `space()` `urn:iki:space:diagram` (ledger #987), so `answered_by`,
+ikigai-ui = "0.5.0" # 0.5.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.5.0"` is `<0.6.0`. Beneath it: 0.4.0.
+ikigai-diagram = "0.4.0" # 0.4.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.4.0"` is `<0.5.0`. Beneath it: 0.3.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.0"` is `<0.4.0`. Beneath it: 0.2.0 = names its `space()` `urn:iki:space:diagram` (ledger #987), so `answered_by`,
 # `urn:kernel:topology` and `urn:diagram:*` show that name where this host mounts it plain, and
 # the cache partitions under it. Under 0.x the old caret was a CEILING below the named release.
 # The SVG `<desc>` now lists the names of the named spaces it draws.
 # Signing + verification: urn:sign:sign (cap-gated) / urn:sign:verify (open), Ed25519.
-ikigai-sign = "0.4.1" # 0.4.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.4.1"` is `<0.5.0`. Beneath it: 0.3.0 = naming only: names its `space()` `urn:iki:space:sign` (ledger #987), so `answered_by`,
+ikigai-sign = "0.5.0" # 0.5.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.5.0"` is `<0.6.0`. Beneath it: 0.4.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.4.1"` is `<0.5.0`. Beneath it: 0.3.0 = naming only: names its `space()` `urn:iki:space:sign` (ledger #987), so `answered_by`,
 # `urn:kernel:topology` and `urn:diagram:*` show that name where this host mounts it plain, and
 # the cache partitions under it. Under 0.x the old caret was a CEILING below the named release.
 # This host mounts `ikigai_sign::space()` at TWO sites (the root and the served composition); same
@@ -1617,7 +1622,7 @@ ikigai-sign = "0.4.1" # 0.4.1 = core 0.2.0 sweep (ledger #2356): the newest rele
 # does not match after this bump.
 # Public-key encryption (urn:encrypt:encrypt/decrypt, age/X25519) — the dual of sign.
 # Keys resolved through the kernel (urn:secret:<id>.enc). Embedded-only (off the wire).
-ikigai-encrypt = "0.3.1" # 0.3.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.1"` is `<0.4.0`. Beneath it: 0.2.0 = naming only: names its `space()` `urn:iki:space:encrypt` (ledger #987), so
+ikigai-encrypt = "0.4.0" # 0.4.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.4.0"` is `<0.5.0`. Beneath it: 0.3.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.1"` is `<0.4.0`. Beneath it: 0.2.0 = naming only: names its `space()` `urn:iki:space:encrypt` (ledger #987), so
 # `answered_by`, `urn:kernel:topology` and `urn:diagram:*` show that name where this host mounts
 # it plain, and the cache partitions under it. Under 0.x the old caret was a CEILING below the
 # named release.
@@ -1628,7 +1633,7 @@ ikigai-encrypt = "0.3.1" # 0.3.1 = core 0.2.0 sweep (ledger #2356): the newest r
 # cacheable as its key, which is the correct claim. This host served the cached one.
 # Secrets custody: urn:secret:{name} (cap-gated read) + urn:secret:generate/unlock
 # (Ed25519 keygen + Touch ID), macOS Keychain backend. Owner-only, not served.
-ikigai-secret = "0.3.0" # 0.3.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.0"` is `<0.4.0`. Beneath it: 0.2.0 = the naming wave (ledger #11): the `urn:secret:{name}` endpoint's id is `secret`
+ikigai-secret = "0.4.0" # 0.4.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.4.0"` is `<0.5.0`. Beneath it: 0.3.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.0"` is `<0.4.0`. Beneath it: 0.2.0 = the naming wave (ledger #11): the `urn:secret:{name}` endpoint's id is `secret`
 # (was `urn:secret`), so its MCP tools are `secret__*`. IRIs unchanged. 0.2.0 also injects the presence gate
 # (`space_with_gate`; `space` keeps the platform gate) and adds Exists and Delete under a new
 # `urn:cap:secret:delete:<name>` (ledger #201, #202, #1525).
@@ -1647,7 +1652,7 @@ ikigai-secret = "0.3.0" # 0.3.0 = core 0.2.0 sweep (ledger #2356): the newest re
 # 0.1.5 = the urn:secret Sink write face (owns the item's ACL → silent reads)
 # XSLT transform module (urn:xslt:transform) — linked natively (no download cost in a
 # native binary; the dynamic/lazy form is a browser/WASI concern).
-ikigai-xslt = "0.4.1" # 0.4.1 = request arguments reach declared `xsl:param` values (ledger #2521). Beneath it: 0.4.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.4.0"` is `<0.5.0`. Beneath it: 0.3.0 REFUSES (typed `InvalidArgument` naming `stylesheet`) the constructs xrust 2.2.0 answers
+ikigai-xslt = "0.7.0" # 0.7.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.7.0"` is `<0.8.0`. Beneath it: 0.4.1 = request arguments reach declared `xsl:param` values (ledger #2521). Beneath it: 0.4.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.4.0"` is `<0.5.0`. Beneath it: 0.3.0 REFUSES (typed `InvalidArgument` naming `stylesheet`) the constructs xrust 2.2.0 answers
 # WRONGLY without an error (a predicate in a match pattern, a numeric predicate, position()/last()
 # away from the root, a leading // away from the root, a prefixed name in a literal result
 # element's attribute value template), and serializes `method="html"` as HTML (an empty non-void
@@ -1668,7 +1673,7 @@ ikigai-xslt = "0.4.1" # 0.4.1 = request arguments reach declared `xsl:param` val
 # claimed text/html, and accepts a stylesheet inline as well as by IRI.
 # JSON-LD operators (urn:jsonld:expand/compact/flatten) — linked natively (the heavy
 # json-ld tree is a browser-wasm concern, lazy-loaded there; native links it directly).
-ikigai-jsonld = "0.3.0" # 0.3.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.0"` is `<0.4.0`. Beneath it: 0.2.1 is a SECURITY floor: JSON-LD nesting past 64 is refused naming `content` or `context`, and
+ikigai-jsonld = "0.4.0" # 0.4.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.4.0"` is `<0.5.0`. Beneath it: 0.3.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.0"` is `<0.4.0`. Beneath it: 0.2.1 is a SECURITY floor: JSON-LD nesting past 64 is refused naming `content` or `context`, and
 # json-ld runs on a sized thread. 0.2.0 names its `space()` `urn:iki:space:jsonld` (ledger #987),
 # so `answered_by`, `urn:kernel:topology` and `urn:diagram:*` show that name where this host
 # mounts it plain, and the cache partitions under it. Under 0.x the old caret was a CEILING below
@@ -1678,14 +1683,14 @@ ikigai-jsonld = "0.3.0" # 0.3.0 = core 0.2.0 sweep (ledger #2356): the newest re
 # narrows on `ik:class`, and this host is the thing that serves that manifold — so the three
 # operators could not be narrowed to before matching fell through to the LLM residual.
 # jq and CSV as resources (urn:json:query/from-csv/to-csv, ledger #2481): bound in the local root only.
-ikigai-json = "0.3.1" # 0.3.1 = the newest release, on ikigai-core 0.2.x. `"0.3.1"` is `<0.4.0`. The floor is
+ikigai-json = "0.4.0" # 0.4.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.4.0"` is `<0.5.0`. Beneath it: 0.3.1 = the newest release, on ikigai-core 0.2.x. `"0.3.1"` is `<0.4.0`. The floor is
 # the newest release, by choice: this host calls only `space()`, which 0.3.0 has too. 0.3.1 changes one
 # thing beneath it: the jq sandbox reads its deadline from the invocation's clock on every target
 # (ledger #2196). 0.3.0 streams jq results as NDJSON and CSV incrementally, and needs core 0.2.1.
 # SHACL validation (urn:shacl:validate) — rudof's validator is linked natively here.
 # The browser uses ikigai-shacl's lazy-loaded wasm module by default; shacl-engine (JS)
 # is available behind `?shacl=js`.
-ikigai-shacl = "0.5.0" # 0.5.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.5.0"` is `<0.6.0`. Beneath it: 0.3.6: `futures` is optional (on only under `module`), and the rudof-free subset
+ikigai-shacl = "0.6.0" # 0.6.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.6.0"` is `<0.7.0`. Beneath it: 0.5.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.5.0"` is `<0.6.0`. Beneath it: 0.3.6: `futures` is optional (on only under `module`), and the rudof-free subset
 # gains `sh:closed` and `sh:ignoredProperties`. Taken because `ikigai-layers` 0.2.9 asks for it; nothing in
 # this workspace calls the subset. DEFAULT FEATURES STAY ON, BY CHOICE: `urn:shacl:validate` on a cli host
 # is rudof, and since the layers crate takes this crate with default features off, cargo's feature
@@ -1725,7 +1730,7 @@ ikigai-shacl = "0.5.0" # 0.5.0 = core 0.2.0 sweep (ledger #2356): the newest rel
 # The org-mode agenda (urn:org:agenda:{period}) — reads org files through the
 # kernel (urn:orgfile:*) and speaks the same skolemized event graph as the
 # calendar, so the two union/diff as graphs.
-ikigai-org = "0.2.0" # 0.2.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.2.0"` is `<0.3.0`. Beneath it: 0.1.7 makes the text/turtle face a DECLARED output with `as` listing
+ikigai-org = "0.5.0" # 0.5.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.5.0"` is `<0.6.0`. Beneath it: 0.2.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.2.0"` is `<0.3.0`. Beneath it: 0.1.7 makes the text/turtle face a DECLARED output with `as` listing
 # its faces, and declares the agenda cacheable. The caching claim is only safe on a host that
 # actually cuts the org files' threads, which this one does — `tests::the_watcher_cuts_a_
 # thread_on_an_out_of_band_change` is that guarantee — so an absolute period now caches under
@@ -1733,7 +1738,7 @@ ikigai-org = "0.2.0" # 0.2.0 = core 0.2.0 sweep (ledger #2356): the newest relea
 # 0.1.6 = drawer properties are read wherever the drawer sits (:ID:/:URL: below SCHEDULED:) + :ZOOM_PASSCODE:
 # Unix-like text endpoints (urn:text:wc/head/tail/grep/sort/uniq/nl/rev) — the
 # first satellite-built module; pure text, wasm-clean, ArgSpec showcase.
-ikigai-text = "0.4.0" # 0.4.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.4.0"` is `<0.5.0`. Beneath it: 0.2.0 = naming only: names its `space()` `urn:iki:space:text` (ledger #987), so `answered_by`,
+ikigai-text = "0.5.0" # 0.5.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.5.0"` is `<0.6.0`. Beneath it: 0.4.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.4.0"` is `<0.5.0`. Beneath it: 0.2.0 = naming only: names its `space()` `urn:iki:space:text` (ledger #987), so `answered_by`,
 # `urn:kernel:topology` and `urn:diagram:*` show that name where this host mounts it plain, and
 # the cache partitions under it. Under 0.x the old caret was a CEILING below the named release.
 # Beneath it, still true: 0.1.1 types `in`/`count`/`pattern` and declares all eight endpoints
@@ -1742,7 +1747,7 @@ ikigai-text = "0.4.0" # 0.4.0 = core 0.2.0 sweep (ledger #2356): the newest rele
 # can see", which for a host is the literal truth: it is in our catalog.
 # Semantic-CMS transreptors (urn:cms:*): personal content (org bookmarks/notes,
 # library metadata) as one RDF graph on the dc:subject tag axis.
-ikigai-cms = "0.3.0" # 0.3.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.0"` is `<0.4.0`. Beneath it: 0.2.0 = names its `space()` `urn:iki:space:cms` (ledger #987), so `answered_by`,
+ikigai-cms = "0.4.0" # 0.4.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.4.0"` is `<0.5.0`. Beneath it: 0.3.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.0"` is `<0.4.0`. Beneath it: 0.2.0 = names its `space()` `urn:iki:space:cms` (ledger #987), so `answered_by`,
 # `urn:kernel:topology` and `urn:diagram:*` show that name where this host mounts it plain, and
 # the cache partitions under it. Under 0.x the old caret was a CEILING below the named release.
 # 0.1.4 also fixed the org bookmarks parser (every heading is a record boundary; TODO/priority,
@@ -1758,7 +1763,7 @@ ikigai-cms = "0.3.0" # 0.3.0 = core 0.2.0 sweep (ledger #2356): the newest relea
 # 0.1.1 = stitch wrapped bookmark titles (no dropped entries)
 # Dev-tooling seam: git/gh as resources (urn:repo:*). Since 0.3 it serves no low-level
 # `urn:system:exec`, only the fixed facades.
-ikigai-repo = "0.3.1" # 0.3.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.1"` is `<0.4.0`. Beneath it: 0.2.0 = naming only: names its `space()` `urn:iki:space:repo` (ledger #987), so `answered_by`,
+ikigai-repo = "0.5.0" # 0.5.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.5.0"` is `<0.6.0`. Beneath it: 0.3.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.1"` is `<0.4.0`. Beneath it: 0.2.0 = naming only: names its `space()` `urn:iki:space:repo` (ledger #987), so `answered_by`,
 # `urn:kernel:topology` and `urn:diagram:*` show that name where this host mounts it plain, and
 # the cache partitions under it. Under 0.x the old caret was a CEILING below the named release.
 # Beneath it, still true: A floor a test in this repo actually holds, rather than an argument:
@@ -1773,7 +1778,7 @@ ikigai-repo = "0.3.1" # 0.3.1 = core 0.2.0 sweep (ledger #2356): the newest rele
 # Repository browsing (urn:repo:{root}:tree/file/state/hash/explain +
 # urn:iki:annotation:*) over configured roots — opt-in via `browse.root` config lines
 # (embedded host).
-ikigai-browse = "0.20.0" # 0.20.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.20.0"` is `<0.21.0`. Beneath it: 0.19.0 = the review pass and the judge loop stop at the first `Refused` or `RetryAfter`,
+ikigai-browse = "0.21.0" # 0.21.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.21.0"` is `<0.22.0`. Beneath it: 0.20.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.20.0"` is `<0.21.0`. Beneath it: 0.19.0 = the review pass and the judge loop stop at the first `Refused` or `RetryAfter`,
 # as they already stopped at a `Denied`, and return that error with its class kept (ledger #1932). This host mounts
 # browse's review family over its `browse.root`s, so a model call refused (an llm 0.16 backend 401) or rate-limited
 # (a 429, or the throttle's budget) now answers ONE typed error carrying its delay, instead of being collapsed region
@@ -1870,7 +1875,7 @@ ikigai-browse = "0.20.0" # 0.20.0 = core 0.2.0 sweep (ledger #2356): the newest 
 # is only a fix in a host that drops it, so the root governs every Lisp door with a `Timeout`
 # (ledger #920, #87). `IKIGAI_LISP_WORKERS` is gone; `lisp.workers` replaces it.
 # The floors below are still true and subsumed:
-ikigai-lisp = "0.4.1" # 0.4.1 = `sort` and `string-split` in the sandbox (ledger #2489). Beneath it: 0.4.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.4.0"` is `<0.5.0`. Beneath it: 0.3.1 = the 0.3 line names its `space()` `urn:iki:space:lisp` (ledger #987), so `answered_by`,
+ikigai-lisp = "0.5.0" # 0.5.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.5.0"` is `<0.6.0`. Beneath it: 0.4.1 = `sort` and `string-split` in the sandbox (ledger #2489). Beneath it: 0.4.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.4.0"` is `<0.5.0`. Beneath it: 0.3.1 = the 0.3 line names its `space()` `urn:iki:space:lisp` (ledger #987), so `answered_by`,
 # `urn:kernel:topology` and `urn:diagram:*` show that name where this host mounts it plain, and
 # the cache partitions under it. Under 0.x the old caret was a CEILING below the named release. ⚠
 # 0.3.1's stored-program doors DECLARE `in` (and `run_signed` `data`) rather than `content`, which
@@ -1889,7 +1894,7 @@ ikigai-lisp = "0.4.1" # 0.4.1 = `sort` and `string-split` in the sandbox (ledger
 # client reads `Endpoint` as RETRYABLE — so a permanent authority refusal came back over IPC
 # and QUIC as something worth trying again, and the HTTP face mapped it to 500 rather than
 # 403. 0.1.12 = scope_sync migration (core-owned bridge; channels deleted)
-ikigai-throttle = "0.3.1" # 0.3.1 = overlays pass `forwards()` through, so a view behind one is described by its target (ledger #2537). Beneath it: 0.3.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.0"` is `<0.4.0`. Beneath it: 0.2.0 = the overlays decide from core 0.1.108's `Error::class()` and spend the run's shared
+ikigai-throttle = "0.4.0" # 0.4.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.4.0"` is `<0.5.0`. Beneath it: 0.3.1 = overlays pass `forwards()` through, so a view behind one is described by its target (ledger #2537). Beneath it: 0.3.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.0"` is `<0.4.0`. Beneath it: 0.2.0 = the overlays decide from core 0.1.108's `Error::class()` and spend the run's shared
 # retry pool (ledger #1546): `RateLimit` answers `RetryAfter` with the delay (was `Endpoint("rate-limited …")`),
 # Retry re-issues only a transient failure of an idempotent verb, Failover advances on transient and
 # retry-after, CircuitBreaker's open state is `RetryAfter` with the cooldown left. `Timeout` (`lisp::govern`)
@@ -1927,7 +1932,7 @@ ikigai-throttle = "0.3.1" # 0.3.1 = overlays pass `forwards()` through, so a vie
 # Timeout governor + Failover (the --prefer mount degrades through it)
 # LLM inference (urn:llm:ask + urn:llm:<provider>:ask + urn:llm:config): a facade grammar
 # over pluggable backends. OpenAI-compatible REST backend (Ollama/vLLM/llama.cpp/mlx_lm).
-ikigai-llm = "0.19.0" # 0.19.0 = host-held SecretReader and urn:cap:llm:use:<provider> for named keys (ledger #2714). Beneath it: 0.18.0 = on ikigai-http 0.5.0: the shared `HttpTransport`, so it moves with http and meeting. Beneath it: 0.17.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.17.1"` is `<0.18.0`. Beneath it: 0.16.0 = on ikigai-http 0.3.0 (ledger #1546): `space(transport, registry)` takes the 0.3
+ikigai-llm = "0.20.0" # 0.20.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.20.0"` is `<0.21.0`. Beneath it: 0.19.0 = host-held SecretReader and urn:cap:llm:use:<provider> for named keys (ledger #2714). Beneath it: 0.18.0 = on ikigai-http 0.5.0: the shared `HttpTransport`, so it moves with http and meeting. Beneath it: 0.17.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.17.1"` is `<0.18.0`. Beneath it: 0.16.0 = on ikigai-http 0.3.0 (ledger #1546): `space(transport, registry)` takes the 0.3
 # `HttpTransport`, and a backend's status is read through `ikigai_http::status` (its own copy deleted), so an
 # inference origin's 401/403 is `Refused`, 429 `RetryAfter`, 500 `Endpoint`; each action declares `.fails`.
 # ⚠ `^0.16.0` is also a ceiling below 0.17.0.
@@ -1955,7 +1960,7 @@ ikigai-llm = "0.19.0" # 0.19.0 = host-held SecretReader and urn:cap:llm:use:<pro
 # urn:llm:{provider}:model, which browse's explain archive keys its version tags on.
 # Video-conference scheduling (urn:meeting:schedule + urn:meeting:<provider>:schedule): a facade
 # over provider backends, Zoom first. Now on crates.io — the git-rev bridge retired at first publish.
-ikigai-meeting = "0.6.0" # 0.6.0 = on ikigai-http 0.5.0: `space(transport…)` takes the shared `HttpTransport`, so it moves with http and llm. Beneath it: 0.5.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.5.0"` is `<0.6.0`. Beneath it: 0.4.0 = on ikigai-http 0.3.0 and core 0.1.108 (ledger #1917): its `space()` takes the
+ikigai-meeting = "0.8.0" # 0.8.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.8.0"` is `<0.9.0`. Beneath it: 0.6.0 = on ikigai-http 0.5.0: `space(transport…)` takes the shared `HttpTransport`, so it moves with http and llm. Beneath it: 0.5.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.5.0"` is `<0.6.0`. Beneath it: 0.4.0 = on ikigai-http 0.3.0 and core 0.1.108 (ledger #1917): its `space()` takes the
 # 0.3 `HttpTransport`, the one this host hands ikigai-http and ikigai-llm 0.16, so the three move together again;
 # Zoom 401/403 are `Refused` (was `Endpoint`), 429 `RetryAfter`, 413/414/431 `OverBudget`. ⚠ `"0.4.0"` is a
 # RANGE, `>=0.4.0, <0.5.0`: a 0.5 release of meeting needs this pin raised by hand.
@@ -2053,7 +2058,7 @@ ikigai-meeting = "0.6.0" # 0.6.0 = on ikigai-http 0.5.0: `space(transport…)` t
 # expansion (#1428). ⚠ Behavior: a real FILTER closing a group now counts that group into the enclosing
 # join (two groups of 20 are refused as one join of 40). No signature changed.
 # 0.3.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.1"` is `<0.4.0`. Beneath it: 0.2.21.
-ikigai-store = { version = "0.3.1", features = ["persistent"] }
+ikigai-store = { version = "0.4.0", features = ["persistent"] } # 0.4.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.4.0"` is `<0.5.0`. Beneath it: 0.3.1.
 # The work ledger (`urn:iki:ledger:*`): items, comments, labels, links, claims and
 # `next`, as RDF in the store above. It owns no bytes — every read is a scoped SPARQL
 # query at `urn:iki:store:graph-select` and every write a scoped UPDATE at
@@ -2106,7 +2111,7 @@ ikigai-store = { version = "0.3.1", features = ["persistent"] }
 # `ClaimKind` `#[non_exhaustive]`. Nothing here names `ClaimKind`, matches on it, or names a ledger `count`, and
 # `store::grants_for` issues the same lists (write:{ledger} still covers about), so this host compiles and
 # behaves unchanged; `tests/ledger.rs` runs against it.
-ikigai-ledger = "0.14.2" # 0.14.2 = the concurrency fixes (ledger #2764, #2765, #2766, #2779, #2780): one close and one reopen per item, and a delete or purge that leaves nothing behind; a BEHAVIOR floor for the binary. Beneath it: 0.14.0 = close timestamps, daily counts and the explicit backfill Sink (ledger PR 50, 51). Beneath it: 0.13.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.13.1"` is `<0.14.0`. Beneath it: 0.11.0.
+ikigai-ledger = "0.19.0" # 0.19.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.19.0"` is `<0.20.0`. Beneath it: 0.14.2 = the concurrency fixes (ledger #2764, #2765, #2766, #2779, #2780): one close and one reopen per item, and a delete or purge that leaves nothing behind; a BEHAVIOR floor for the binary. Beneath it: 0.14.0 = close timestamps, daily counts and the explicit backfill Sink (ledger PR 50, 51). Beneath it: 0.13.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.13.1"` is `<0.14.0`. Beneath it: 0.11.0.
 # The layer host (`urn:layer:{layer}`, `urn:layers:*`, `urn:collab:{name}`), linked by `serve
 # quic://` when the config home has a `layers/` directory (ledger #1188). 0.2.2 is a true FLOOR,
 # not a lock preference (ledger #1295): since 0.2.1 the host validates every write itself, and
@@ -2154,7 +2159,7 @@ ikigai-ledger = "0.14.2" # 0.14.2 = the concurrency fixes (ledger #2764, #2765, 
 # ⚠ …and 0.5.0 seals tuples through ikigai-intray's TupleCodec (ledger #2017, ikigai-rs/ikigai-layers
 # PR 44): a `match=` over an undecodable tuple refuses with a Conflict, and open discards claims a crashed
 # take left behind. `"0.5.0"` is `<0.6.0`.
-ikigai-layers = "0.6.0" # 0.6.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.6.0"` is `<0.7.0`. Beneath it: 0.5.0.
+ikigai-layers = "0.7.0" # 0.7.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.7.0"` is `<0.8.0`. Beneath it: 0.6.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.6.0"` is `<0.7.0`. Beneath it: 0.5.0.
 # TEST-ONLY (a dev-dependency of ikigai-cli and ikigai-embedded): the layer tests mint a throwaway
 # age identity for `--layers-key`, as `age-keygen -o` would. Already in the graph through
 # ikigai-layers and ikigai-encrypt, so it adds no package. `"0.11.1"` is what ikigai-layers 0.3.0
@@ -2165,7 +2170,7 @@ age = { version = "0.11.1", default-features = false }
 # this host calls (`Bayes::open`, `ModelConfig::new`, `space`, `model_iri`). It brings no new
 # third-party crate: its dependencies are ikigai-core, serde and serde_json, already here.
 # ⚠ `"0.1.0"` is `<0.2.0`: raise it when the module reaches 0.2.
-ikigai-bayes = "0.2.0" # 0.2.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.2.0"` is `<0.3.0`. Beneath it: 0.1.0.
+ikigai-bayes = "0.4.0" # 0.4.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.4.0"` is `<0.5.0`. Beneath it: 0.2.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.2.0"` is `<0.3.0`. Beneath it: 0.1.0.
 # The resolver seam, the engine and the intray, from github.com/ikigai-rs/ikigai-engine (ledger
 # #2316, #2317). They were members here through 0.1.69 and left at 0.1.70, whose sources are
 # the ones this workspace carried, so they are registry crates now and no longer move with
@@ -2179,8 +2184,8 @@ ikigai-bayes = "0.2.0" # 0.2.0 = core 0.2.0 sweep (ledger #2356): the newest rel
 # - ikigai-engine: `plan-reader` is the `execute <spec>` half of the plan face. It is off by
 #   default so the engine still compiles to wasm32, and both hosts here (ikigai-cli and
 #   ikigai-embedded) are native and want it.
-ikigai-resolve = "0.2.12" # 0.2.12 = lockstep with the engine floor below, released with it. Beneath it: 0.2.11 = lockstep with the engine floor below, released with it. Beneath it: 0.2.8 = lockstep with the engine floor below, released with it. Beneath it: 0.2.6 = lockstep with the engine floor below, which asks for `^0.2.6`. Beneath it: 0.2.5 = lockstep with the engine floor below. Beneath it: 0.2.3 = released in lockstep with the engine floor below. 0.2.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.2.1"` is `<0.3.0`. Beneath it: 0.1.70.
-ikigai-intray = "0.2.12" # 0.2.12 = the intray race fixes (ledger #2786, #2812, #2813): a dead letter per failed pass, a retry that keeps a newer note, a stalled take that never delivers twice; a BEHAVIOR floor for the binary. Beneath it: 0.2.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.2.1"` is `<0.3.0`. Beneath it: 0.1.70.
+ikigai-resolve = "0.3.0" # 0.3.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.3.0"` is `<0.4.0`. Beneath it: 0.2.12 = lockstep with the engine floor below, released with it. Beneath it: 0.2.11 = lockstep with the engine floor below, released with it. Beneath it: 0.2.8 = lockstep with the engine floor below, released with it. Beneath it: 0.2.6 = lockstep with the engine floor below, which asks for `^0.2.6`. Beneath it: 0.2.5 = lockstep with the engine floor below. Beneath it: 0.2.3 = released in lockstep with the engine floor below. 0.2.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.2.1"` is `<0.3.0`. Beneath it: 0.1.70.
+ikigai-intray = "0.3.0" # 0.3.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.3.0"` is `<0.4.0`. Beneath it: 0.2.12 = the intray race fixes (ledger #2786, #2812, #2813): a dead letter per failed pass, a retry that keeps a newer note, a stalled take that never delivers twice; a BEHAVIOR floor for the binary. Beneath it: 0.2.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.2.1"` is `<0.3.0`. Beneath it: 0.1.70.
 # 0.2.12 = the fixed vocabulary shapes for a fork's join bindings (engine PR 24), which `bind urn:river:all`
 # (ledger #2659, #2824) needs, a BEHAVIOR floor; also captures inside fixed references (engine PR 26). Beneath it,
 # 0.2.11 = the mapped fork, the fork as a branch and a fork that binds a name (ledger #2654), and an
@@ -2196,7 +2201,7 @@ ikigai-intray = "0.2.12" # 0.2.12 = the intray race fixes (ledger #2786, #2812, 
 # arguments, instead of being sent as positional text (ledger #2502); a BEHAVIOR floor, so the binary
 # this book-taught front door ships cannot regress to the silent fallback. 0.2.1 = core 0.2.0 sweep
 # (ledger #2356); 0.1.70.
-ikigai-engine = { version = "0.2.12", features = ["plan-reader"] }
+ikigai-engine = { version = "0.3.0", features = ["plan-reader"] } # 0.3.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.3.0"` is `<0.4.0`. Beneath it: 0.2.12.
 # ── Intra-workspace siblings: LOCKSTEP pins, not floors ───────────────────────
 # The fifteen members that take `version.workspace = true` are released TOGETHER, at one
 # version, always. So every sibling pin below states the CURRENT workspace version rather
@@ -2230,14 +2235,14 @@ ikigai-engine = { version = "0.2.12", features = ["plan-reader"] }
 # that reconciles personal/org/rdf THROUGH the kernel. Published since 0.1.14 (#296):
 # ikigai-embedded depends on it, and a path-only dependency makes every crate above it
 # in this workspace unpublishable, the `ikigai` binary included.
-ikigai-view = { path = "crates/ikigai-view", version = "0.3.0" }
+ikigai-view = { path = "crates/ikigai-view", version = "0.4.0" }
 # Timezone conversion (urn:tz:convert, IANA/DST-correct) + a zoned clock (urn:tz:now).
 # Published since 0.1.14 (#296); keeps the tzdata dependency out of the lean modules.
-ikigai-tz = { path = "crates/ikigai-tz", version = "0.3.0" }
+ikigai-tz = { path = "crates/ikigai-tz", version = "0.4.0" }
 # Outbound email (urn:email:send): a cap-gated Sink submitting over SMTP to a local MTA
 # that relays onward. Published since 0.1.14 (#296); the contact service and the
 # scheduling confirm-link both need it.
-ikigai-email = { path = "crates/ikigai-email", version = "0.3.0" }
+ikigai-email = { path = "crates/ikigai-email", version = "0.4.0" }
 # Public form intake (urn:*:submit): parse an untrusted urlencoded/JSON body, validate
 # declared fields, drop an escaped s-expr tuple into a space. Contact + booking share it.
 # API history — 0.1.17 = `IntakeField::max_len` and `IntakeField::legacy` (#300, the bounded
@@ -2249,9 +2254,9 @@ ikigai-email = { path = "crates/ikigai-email", version = "0.3.0" }
 # the caret resolves against the registry — `^0.1.14` picked the live 0.1.16, which
 # predates both methods, and ikigai-embedded failed to verify with four E0599s. Nothing
 # else catches this: the gates pass, CI passes, and the break waits for release day.
-ikigai-intake = { path = "crates/ikigai-intake", version = "0.3.0" }
+ikigai-intake = { path = "crates/ikigai-intake", version = "0.4.0" }
 # WebAuthn (ES256) assertion verifier: the second factor gating the edge decision links.
-ikigai-passkey = { path = "crates/ikigai-passkey", version = "0.3.0" }
+ikigai-passkey = { path = "crates/ikigai-passkey", version = "0.4.0" }
 # Sibling workspace crates pinned to the current release: a published crate requires
 # its siblings at this version too, so ANY subset of the workspace can publish in
 # dependency order (wire → ipc → … → cli) and a crate never builds against an
@@ -2259,14 +2264,14 @@ ikigai-passkey = { path = "crates/ikigai-passkey", version = "0.3.0" }
 # — `crates/ikigai-cli/tests/lockstep_pins.rs` enforces it here — and says nothing
 # about the REGISTRY, which only matches the tree after a full wave. The two parted for
 # weeks without anything saying so (ledger #494); `registry-drift` is what says so now.
-ikigai-wire = { path = "crates/ikigai-wire", version = "0.3.0" } # v6 hello + ErrorTyped/WireError
+ikigai-wire = { path = "crates/ikigai-wire", version = "0.4.0" } # v6 hello + ErrorTyped/WireError
 # API history — 0.1.16 = `Spawner::width()`: the scheduler answers how many tasks make progress AT ONCE
 # (1 for `single`), which is what the engine's fan-out routing sizes itself by. Core
 # defaults that method to `None` = unknown, and a caller reading unknown as "wide" is the
 # ~1.8x-slower case — so below this floor the routing is silently inert, not merely older.
 # API history — 0.1.15 = SchedulerSpec: a spec parsed WITHOUT building, so `--scheduler pool:xyz` is
 # rejected while argv is read instead of by spawning a threadpool to find out.
-ikigai-scheduler = { path = "crates/ikigai-scheduler", version = "0.3.0" }
+ikigai-scheduler = { path = "crates/ikigai-scheduler", version = "0.4.0" }
 # ⚠⚠ EXEMPT from the lockstep above — deliberately, and this pin must NOT be raised to the
 # workspace version. ikigai-time is the sixteenth member and the only one that does not take
 # `version.workspace = true`: it declares its own `version` in its own manifest and is
@@ -2295,10 +2300,10 @@ ikigai-scheduler = { path = "crates/ikigai-scheduler", version = "0.3.0" }
 # preference: 0.1.x stamps `last_run` with `std::time::Instant::now()`, which panics on
 # wasm32-unknown-unknown under the registry lock and bricks the registry for the life of
 # the process. (0.1.12 gave the older need: JobHealth::last_run for staleness.)
-ikigai-time = { path = "crates/ikigai-time", version = "0.5.0" }
+ikigai-time = { path = "crates/ikigai-time", version = "0.6.0" }
 # Inbound HTTP transport (method↔verb, path↔iri, cap-per-request). A published
 # transport like ipc/quic/mcp; only the `web`-featured CLI pulls it (and Tokio).
-ikigai-web = { path = "crates/ikigai-web", version = "0.3.0" }
+ikigai-web = { path = "crates/ikigai-web", version = "0.4.0" }
 futures = "0.3"
 # Turtle parsing for the engine's plan face — reading a stored `ik:Process` graph back.
 # Default features only: no tokio, so `ikigai-engine` still compiles to wasm. oxttl pins
