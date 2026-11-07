@@ -5547,7 +5547,9 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
 /// missing, with `config`'s per-request ceiling, and the content store an upload is held in
 /// while its Sink runs. A directory of this door's own, because a `FileSpill` removes the spill
 /// files it finds in its directory when it opens it: two processes must never share one, and two
-/// doors cannot both hold one port. Only under a config home that exists; never `TMPDIR`.
+/// doors cannot both hold one port. Startup removes abandoned `http-0-<pid>` spills only
+/// when the PID no longer exists; directories of live processes are never opened. Only under
+/// a config home that exists; never `TMPDIR`.
 ///
 /// A door with no upload routes serves without a spill when the directory cannot be made (and
 /// says why); one with upload routes refuses to start.
@@ -5575,13 +5577,17 @@ fn install_spill(
         0 => format!("http-0-{}", std::process::id()),
         port => format!("http-{port}"),
     };
-    let dir = home.join("spill").join(name);
+    let parent = home.join("spill");
+    let dir = parent.join(name);
     let spill = std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(&dir)
         .map_err(|e| e.to_string())
-        .and_then(|()| ikigai_fs::FileSpill::new(&dir).map_err(|e| e.to_string()));
+        .and_then(|()| {
+            remove_abandoned_http_spills(&parent);
+            ikigai_fs::FileSpill::new(&dir).map_err(|e| e.to_string())
+        });
     match spill {
         Ok(spill) => {
             let store = std::sync::Arc::new(ikigai_core::MemoryContentStore::new(config.total));
@@ -5601,6 +5607,40 @@ fn install_spill(
                 dir.display()
             );
             std::process::exit(2);
+        }
+    }
+}
+
+/// Best-effort cleanup of ephemeral HTTP spills left by exited processes. Preserve every
+/// live (including an inaccessible or reused PID) directory, symlink, and unrelated file.
+/// `FileSpill::new` removes only its own orphan files; `remove_dir` succeeds only if empty.
+#[cfg(all(feature = "embedded", feature = "web", unix))]
+fn remove_abandoned_http_spills(parent: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("http-0-"))
+            .filter(|pid| !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+            .filter(|pid| *pid > 0)
+        else {
+            continue;
+        };
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        // SAFETY: signal 0 sends nothing; it only checks whether this PID exists.
+        let answer = unsafe { libc::kill(pid, 0) };
+        if answer != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+            continue;
+        }
+        let dir = entry.path();
+        if ikigai_fs::FileSpill::new(&dir).is_ok() {
+            let _ = std::fs::remove_dir(dir);
         }
     }
 }
