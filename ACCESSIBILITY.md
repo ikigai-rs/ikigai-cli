@@ -84,6 +84,7 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
   runs it. `1`–`9` and `0` remain shortcuts for steps 1–10. The selected step has a `>`
   marker as well as reverse emphasis. Running a step reveals its answer, and the demo tab
   strip moves to keep the selected tab visible.
+- The full-screen REPL clock uses a steady colon; it does not blink.
 - `--plain` is a line-oriented REPL with no full-screen redraw, so a screen reader or braille
   display reads it as ordinary terminal output; `--quiet` prints only the answers. (Not yet tested
   with either; see below.)
@@ -128,7 +129,9 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
   `the_register_page_has_a_labeled_code_field_the_script_sends` pins that the enrollment code
   field has a `<label>` tied to it by `for`, and comes before the button.
 - The full-screen REPL is rendered against ratatui's test backend in `tui.rs`'s tests, mostly for
-  layout and editing. `no_color_takes_every_color_escape_out_of_the_frame` writes a frame through
+  layout and editing. `clock_colon_stays_visible_across_redraws` checks that the clock keeps
+  its colon across frames sampled over a second, covering the former blink phase.
+  `no_color_takes_every_color_escape_out_of_the_frame` writes a frame through
   the crossterm backend and finds no color escape in the bytes under `NO_COLOR`, and finds some
   without it. The runbook note tests render a step through the test backend and check every
   note cell for normal intensity, with and without `NO_COLOR`.
@@ -192,6 +195,7 @@ Found by reading the source on 2026-10-15, not by testing:
 
 | Date | Change |
 |---|---|
+| 2026-11-07 | The full-screen REPL clock (ledger #2696) keeps a steady colon instead of blinking indefinitely. A ratatui test-backend regression reproduces the missing colon before the fix and checks it stays visible across redraws after it. No assistive technology testing was performed. |
 | 2026-11-06 | The HTTP door refuses a push stream beyond `PushConfig::max_streams` with `503`, `Retry-After: 1` and "too many event streams", using the existing negotiated error page. A socket regression pins the sentence and page landmarks; no assistive technology testing was performed. |
 | 2026-10-15 | First version ([PR 521](https://github.com/ikigai-rs/ikigai-cli/pull/521)). |
 | 2026-10-15 | The embedded host's pages and the intake's redirect page gain `<html lang="en">` and a `<main>`; the passkey status lines become live regions; the full-screen REPL honors `NO_COLOR`. Three known limitations removed ([PR 522](https://github.com/ikigai-rs/ikigai-cli/pull/522)). |
