@@ -146,6 +146,30 @@ fn both(out: &Output) -> String {
     )
 }
 
+/// A fresh account has no XDG data directory. Steel must not add a diagnostic to
+/// otherwise successful evaluations, including a second invocation on that account.
+#[test]
+fn evaluation_is_quiet_with_a_sparse_home() {
+    let home = scratch("sparse-home", "");
+    assert!(!home.join(".local/share").exists());
+    for _ in 0..2 {
+        let out = command(&home, &["--quiet", "-e", "(+ 1 2)"])
+            .env_remove("STEEL_HOME")
+            .env_remove("XDG_DATA_HOME")
+            .output()
+            .expect("evaluation runs");
+        assert!(out.status.success(), "{}", both(&out));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr).trim(),
+            "[uncacheable]",
+            "{}",
+            both(&out)
+        );
+    }
+    std::fs::remove_dir_all(home).expect("remove scratch home");
+}
+
 /// A misspelled bound, a bad value, or one given twice stops the host before any mode runs,
 /// naming the key: a bound that silently reads as its default is the failure a bound exists to
 /// prevent.
