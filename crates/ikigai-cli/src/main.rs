@@ -13,6 +13,23 @@
 //! with `--plain` it falls back to the line-oriented [`repl`]. All drive the same
 //! renderer-agnostic [`engine`](ikigai_engine) over the chosen [`Resolver`](ikigai_resolve::Resolver).
 
+// Without `embedded` the binary is the stub `main` at the bottom of this file: it answers
+// `--version` and otherwise says it was built without a transport. Everything else here
+// (the parser's targets, the REPLs, the serve paths) still has to COMPILE in that build,
+// which is what CI's `no default features` job checks (ledger #1543), but nothing calls it,
+// so the dead-code family of lints is quieted for that build alone, with the doc links that
+// point at embedded-only items. Every other build keeps them at full strength.
+#![cfg_attr(
+    not(feature = "embedded"),
+    allow(
+        dead_code,
+        unused_imports,
+        unused_variables,
+        unused_mut,
+        rustdoc::broken_intra_doc_links
+    )
+)]
+
 #[cfg(not(target_family = "wasm"))]
 mod clipboard;
 #[cfg(all(feature = "embedded", feature = "quic", feature = "web"))]
@@ -615,6 +632,20 @@ struct ScriptFile {
     params: std::collections::BTreeMap<String, String>,
 }
 
+/// How a mount composes a peer's namespace. The embedded host's own type when it is built;
+/// without `embedded` there is no kernel to compose a mount into, but the command line and
+/// the config home's `mount` lines are still parsed (and refused or ignored by the caller),
+/// so the grammar keeps a stand-in with the same three kinds.
+#[cfg(feature = "embedded")]
+use ikigai_embedded::MountKind;
+#[cfg(not(feature = "embedded"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MountKind {
+    Alias,
+    Override,
+    Prefer,
+}
+
 /// One `--mount`: where it binds, what it connects to, and the certificates for
 /// THAT connection. Cert flags following a `--mount` attach to it; cert flags
 /// before any mount form the default set (used by `--connect`, and by a mount
@@ -629,7 +660,7 @@ struct Mount {
     prefix: String,
     target: String,
     certs: Certs,
-    kind: ikigai_embedded::MountKind,
+    kind: MountKind,
 }
 
 /// The prefixes one mount flag (or `mount =` line) names. `urn:layer:,urn:layers:,urn:collab:`
@@ -736,11 +767,11 @@ impl Mounts {
 
 /// The mode word a `mount` line in the config home would use for this kind, so what the
 /// banner prints is greppable in the file that produced it.
-fn mount_mode(kind: ikigai_embedded::MountKind) -> &'static str {
+fn mount_mode(kind: MountKind) -> &'static str {
     match kind {
-        ikigai_embedded::MountKind::Alias => "alias",
-        ikigai_embedded::MountKind::Override => "override",
-        ikigai_embedded::MountKind::Prefer => "prefer",
+        MountKind::Alias => "alias",
+        MountKind::Override => "override",
+        MountKind::Prefer => "prefer",
     }
 }
 
@@ -752,6 +783,7 @@ fn mount_mode(kind: ikigai_embedded::MountKind) -> &'static str {
 /// ([`ikigai_embedded::posture::mount_lines`]). Two renderers over the same facts is how a
 /// diagnostic and a resource end up as two spellings of one thing, which is the defect
 /// class #418/#426 were about; this makes that impossible rather than merely discouraged.
+#[cfg(feature = "embedded")]
 fn mount_posture(mounts: &[Mount], declined: bool) -> ikigai_embedded::posture::MountPosture {
     if declined {
         return ikigai_embedded::posture::MountPosture::Declined;
@@ -775,12 +807,14 @@ fn mount_posture(mounts: &[Mount], declined: bool) -> ikigai_embedded::posture::
 ///
 /// Printed BEFORE the mounts are resolved, so a door that hangs dialing a peer has already
 /// named the peer it is hanging on. That was #410's actual failure mode.
+#[cfg(feature = "embedded")]
 fn mount_lines(mounts: &[Mount], declined: bool) -> Vec<String> {
     ikigai_embedded::posture::mount_lines(&mount_posture(mounts, declined))
 }
 
 /// Say what this door composed, on stderr, one line per mount. `who` prefixes every line
 /// (`ikigai`, `ikigai mcp`) so a door's output stays attributable.
+#[cfg(feature = "embedded")]
 fn announce_mounts(who: &str, mounts: &[Mount], declined: bool) {
     for line in mount_lines(mounts, declined) {
         eprintln!("{who}: {line}");
@@ -1500,9 +1534,9 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 continue;
             }
             if let Some(kind) = match arg.as_str() {
-                "--mount" => Some(ikigai_embedded::MountKind::Alias),
-                "--override" => Some(ikigai_embedded::MountKind::Override),
-                "--prefer" => Some(ikigai_embedded::MountKind::Prefer),
+                "--mount" => Some(MountKind::Alias),
+                "--override" => Some(MountKind::Override),
+                "--prefer" => Some(MountKind::Prefer),
                 _ => None,
             } {
                 let spec = argv
@@ -1698,9 +1732,9 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 continue;
             }
             if let Some(kind) = match arg.as_str() {
-                "--mount" => Some(ikigai_embedded::MountKind::Alias),
-                "--override" => Some(ikigai_embedded::MountKind::Override),
-                "--prefer" => Some(ikigai_embedded::MountKind::Prefer),
+                "--mount" => Some(MountKind::Alias),
+                "--override" => Some(MountKind::Override),
+                "--prefer" => Some(MountKind::Prefer),
                 _ => None,
             } {
                 let spec = argv
@@ -1797,7 +1831,10 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 let name = argv
                     .next()
                     .ok_or_else(|| "--name needs a value".to_string())?;
+                #[cfg(feature = "embedded")]
                 ikigai_embedded::set_instance_name(name);
+                #[cfg(not(feature = "embedded"))]
+                let _ = name;
             }
             "--connect" => {
                 // Optional target: take the next token unless it looks like a flag.
@@ -1819,7 +1856,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                     prefix: prefix.to_string(),
                     target: socket.to_string(),
                     certs: repl.certs.clone(),
-                    kind: ikigai_embedded::MountKind::Alias,
+                    kind: MountKind::Alias,
                 });
             }
             "--override" => {
@@ -1837,7 +1874,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                     prefix: prefix.to_string(),
                     target: target.to_string(),
                     certs: repl.certs.clone(),
-                    kind: ikigai_embedded::MountKind::Override,
+                    kind: MountKind::Override,
                 });
             }
             "--no-config-mounts" => {
@@ -1876,7 +1913,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                     prefix: prefix.to_string(),
                     target: target.to_string(),
                     certs: repl.certs.clone(),
-                    kind: ikigai_embedded::MountKind::Prefer,
+                    kind: MountKind::Prefer,
                 });
             }
             "-c" | "--command" => {
@@ -2590,10 +2627,7 @@ fn mcp(authority: McpAuthority, shows: Vec<String>, mounts: Mounts) {
         // appear. One bounded probe (a UDS refusal is instant, QUIC has its dial
         // budget); the connection is cached by the dial regardless of the probe's
         // outcome, and an absent peer stays gracefully absent.
-        for spec in resolved
-            .iter()
-            .filter(|s| s.kind == ikigai_embedded::MountKind::Prefer)
-        {
+        for spec in resolved.iter().filter(|s| s.kind == MountKind::Prefer) {
             let _ = spec.resolver.issue(ikigai_core::Request::new(
                 ikigai_core::Verb::Meta,
                 ikigai_core::Iri::parse("urn:kernel:catalog").expect("static IRI"),
@@ -2966,9 +3000,9 @@ fn mounts_from_config_lines(
                 .next()
                 .ok_or_else(|| format!("mount `{line}`: expected <mode> <prefix>=<target>"))?;
             let kind = match mode {
-                "alias" | "mount" => ikigai_embedded::MountKind::Alias,
-                "override" => ikigai_embedded::MountKind::Override,
-                "prefer" => ikigai_embedded::MountKind::Prefer,
+                "alias" | "mount" => MountKind::Alias,
+                "override" => MountKind::Override,
+                "prefer" => MountKind::Prefer,
                 other => {
                     return Err(format!(
                         "mount `{line}`: unknown mode `{other}` (alias | override | prefer)"
@@ -3025,6 +3059,7 @@ fn home_dir() -> std::path::PathBuf {
 ///
 /// One spec PER PREFIX, every one holding the SAME resolver: a mount that names several
 /// prefixes ([`mount_prefixes`]) is one connection serving all of them, not one per prefix.
+#[cfg(feature = "embedded")]
 fn resolve_mount(mount: Mount) -> Result<Vec<ikigai_embedded::MountSpec>, String> {
     let Mount {
         prefix,
@@ -3033,17 +3068,16 @@ fn resolve_mount(mount: Mount) -> Result<Vec<ikigai_embedded::MountSpec>, String
         kind,
     } = mount;
     let prefixes = mount_prefixes(&prefix)?;
-    let resolver: std::sync::Arc<dyn ikigai_resolve::Resolver> =
-        if kind == ikigai_embedded::MountKind::Prefer {
-            std::sync::Arc::new(LazyResolver {
-                target: target.clone(),
-                certs,
-                inner: std::sync::Mutex::new(None),
-                entries_failed: std::sync::Mutex::new(None),
-            })
-        } else {
-            connect_mount(&target, &certs, kind, alias_hello(kind, &prefixes))?
-        };
+    let resolver: std::sync::Arc<dyn ikigai_resolve::Resolver> = if kind == MountKind::Prefer {
+        std::sync::Arc::new(LazyResolver {
+            target: target.clone(),
+            certs,
+            inner: std::sync::Mutex::new(None),
+            entries_failed: std::sync::Mutex::new(None),
+        })
+    } else {
+        connect_mount(&target, &certs, kind, alias_hello(kind, &prefixes))?
+    };
     Ok(prefixes
         .into_iter()
         .map(|prefix| ikigai_embedded::MountSpec {
@@ -3061,15 +3095,16 @@ fn resolve_mount(mount: Mount) -> Result<Vec<ikigai_embedded::MountSpec>, String
 /// [`ikigai_embedded::alias_forwards_unchanged`]), so a connection serving only deeper
 /// prefixes speaks verbatim, and a prefix-canonical peer lists the full names the mount
 /// claims. One connection carries one hello, so a list that mixes the two speaks alias.
-fn alias_hello(kind: ikigai_embedded::MountKind, prefixes: &[&str]) -> bool {
-    kind == ikigai_embedded::MountKind::Alias
+#[cfg(feature = "embedded")]
+fn alias_hello(kind: MountKind, prefixes: &[&str]) -> bool {
+    kind == MountKind::Alias
         && !prefixes
             .iter()
             .all(|prefix| ikigai_embedded::alias_forwards_unchanged(prefix))
 }
 
 /// [`resolve_mount`] for a mount that names ONE prefix, the tests' common case.
-#[cfg(test)]
+#[cfg(all(test, feature = "embedded"))]
 fn resolve_one_mount(mount: Mount) -> Result<ikigai_embedded::MountSpec, String> {
     let mut specs = resolve_mount(mount)?;
     assert_eq!(specs.len(), 1, "one prefix, one spec");
@@ -3098,6 +3133,7 @@ fn resolve_one_mount(mount: Mount) -> Result<ikigai_embedded::MountSpec, String>
 /// was the context where blocking is not allowed. `ikigai-quic` now detects that and hands
 /// the flush to a thread of its own, so a drop here would be SAFE; it is simply not needed,
 /// because the transport heals its own connection a layer down.
+#[cfg(feature = "embedded")]
 struct LazyResolver {
     target: String,
     certs: Certs,
@@ -3110,8 +3146,10 @@ struct LazyResolver {
 }
 
 /// How long `entries()` believes a failed dial before trying again.
+#[cfg(feature = "embedded")]
 const ENTRIES_REDIAL_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
 
+#[cfg(feature = "embedded")]
 impl LazyResolver {
     /// The live resolver, dialing the peer if this is the first call (or the first
     /// since a failure).
@@ -3120,18 +3158,14 @@ impl LazyResolver {
             return Ok(resolver);
         }
         // A prefer mount forwards IRIs unchanged, so it speaks verbatim.
-        let resolver = connect_mount(
-            &self.target,
-            &self.certs,
-            ikigai_embedded::MountKind::Prefer,
-            false,
-        )
-        .map_err(|e| ikigai_core::Error::Unavailable(format!("{}: {e}", self.target)))?;
+        let resolver = connect_mount(&self.target, &self.certs, MountKind::Prefer, false)
+            .map_err(|e| ikigai_core::Error::Unavailable(format!("{}: {e}", self.target)))?;
         *self.inner.lock().unwrap() = Some(std::sync::Arc::clone(&resolver));
         Ok(resolver)
     }
 }
 
+#[cfg(feature = "embedded")]
 #[async_trait::async_trait]
 impl ikigai_resolve::Resolver for LazyResolver {
     fn issue(
@@ -3245,10 +3279,11 @@ impl ikigai_resolve::Resolver for LazyResolver {
     }
 }
 
+#[cfg(feature = "embedded")]
 fn connect_mount(
     target: &str,
     certs: &Certs,
-    kind: ikigai_embedded::MountKind,
+    kind: MountKind,
     alias_hello: bool,
 ) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
     // The connect error names the flag the operator actually wrote: a down
@@ -3271,11 +3306,11 @@ fn connect_mount(
 
 /// The flag spelling of a mount kind (a `mount =` config line uses the same
 /// word without the dashes).
-fn mount_flag(kind: ikigai_embedded::MountKind) -> &'static str {
+fn mount_flag(kind: MountKind) -> &'static str {
     match kind {
-        ikigai_embedded::MountKind::Alias => "--mount",
-        ikigai_embedded::MountKind::Override => "--override",
-        ikigai_embedded::MountKind::Prefer => "--prefer",
+        MountKind::Alias => "--mount",
+        MountKind::Override => "--override",
+        MountKind::Prefer => "--prefer",
     }
 }
 
@@ -5711,7 +5746,7 @@ mod peer_name_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "embedded"))]
 mod mount_posture_tests {
     use super::*;
 
@@ -5724,7 +5759,7 @@ mod mount_posture_tests {
     /// unchanged and its peer must list the full names.
     #[test]
     fn only_a_first_segment_alias_mount_says_alias_in_its_hello() {
-        use ikigai_embedded::MountKind::{Alias, Override, Prefer};
+        use MountKind::{Alias, Override, Prefer};
         assert!(alias_hello(Alias, &["urn:quakes:"]));
         assert!(!alias_hello(Alias, &["urn:quakes:near:"]));
         assert!(!alias_hello(
@@ -5739,7 +5774,7 @@ mod mount_posture_tests {
         assert!(!alias_hello(Prefer, &["urn:quakes:"]));
     }
 
-    fn mount(kind: ikigai_embedded::MountKind) -> Mount {
+    fn mount(kind: MountKind) -> Mount {
         Mount {
             prefix: "urn:x:".to_string(),
             target: "/tmp/x.sock".to_string(),
@@ -5783,7 +5818,7 @@ mod mount_posture_tests {
     #[test]
     fn no_flags_still_compose_the_machines_topology() {
         let resolved = resolve_mounts(Mounts::default(), std::path::Path::new("/home/b"), || {
-            Ok(vec![mount(ikigai_embedded::MountKind::Prefer)])
+            Ok(vec![mount(MountKind::Prefer)])
         })
         .expect("a parsing config home is not an error");
         assert_eq!(resolved.len(), 1, "the config home is the default posture");
@@ -5794,7 +5829,7 @@ mod mount_posture_tests {
     #[test]
     fn mount_flags_win_wholesale_over_the_config_home() {
         let flagged = Mounts {
-            flags: vec![mount(ikigai_embedded::MountKind::Prefer)],
+            flags: vec![mount(MountKind::Prefer)],
             declined: false,
         };
         let resolved = resolve_mounts(flagged, std::path::Path::new("/home/b"), || {
@@ -5985,7 +6020,7 @@ mod mount_posture_tests {
             prefix: prefix.to_string(),
             target: target.to_string(),
             certs: Certs::default(),
-            kind: ikigai_embedded::MountKind::Prefer,
+            kind: MountKind::Prefer,
         }
     }
 
@@ -6127,9 +6162,9 @@ mod mount_posture_tests {
     #[test]
     fn the_mode_word_matches_the_config_lines_grammar() {
         for (kind, word) in [
-            (ikigai_embedded::MountKind::Alias, "alias"),
-            (ikigai_embedded::MountKind::Override, "override"),
-            (ikigai_embedded::MountKind::Prefer, "prefer"),
+            (MountKind::Alias, "alias"),
+            (MountKind::Override, "override"),
+            (MountKind::Prefer, "prefer"),
         ] {
             assert_eq!(mount_mode(kind), word);
             // …and the grammar really parses it back.
@@ -6156,9 +6191,9 @@ mod mount_posture_tests {
         )
         .expect("both lines parse");
         assert_eq!(mounts.len(), 2);
-        assert_eq!(mounts[0].kind, ikigai_embedded::MountKind::Prefer);
+        assert_eq!(mounts[0].kind, MountKind::Prefer);
         assert_eq!(mounts[0].prefix, "urn:iki:store:");
-        assert_eq!(mounts[1].kind, ikigai_embedded::MountKind::Alias);
+        assert_eq!(mounts[1].kind, MountKind::Alias);
         let expanded = std::path::Path::new("/Users/x").join(".config/ikigai/quic-bug");
         assert_eq!(
             mounts[1].certs.cert_dir.as_deref(),
@@ -6168,7 +6203,7 @@ mod mount_posture_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "embedded"))]
 mod mount_cert_tests {
     use super::*;
 
@@ -6248,9 +6283,9 @@ mod mount_cert_tests {
             "--cert-dir",
             "/certs/plasma",
         ]);
-        assert_eq!(mounts[0].kind, ikigai_embedded::MountKind::Alias);
-        assert_eq!(mounts[1].kind, ikigai_embedded::MountKind::Override);
-        assert_eq!(mounts[2].kind, ikigai_embedded::MountKind::Prefer);
+        assert_eq!(mounts[0].kind, MountKind::Alias);
+        assert_eq!(mounts[1].kind, MountKind::Override);
+        assert_eq!(mounts[2].kind, MountKind::Prefer);
         assert_eq!(mounts[2].prefix, "urn:llm:");
         assert_eq!(mounts[2].target, "quic://plasma.local:4433");
         assert_eq!(mounts[2].certs.cert_dir.as_deref(), Some("/certs/plasma"));
@@ -6280,7 +6315,7 @@ mod mount_cert_tests {
                 spec.prefix
             );
             assert_eq!(spec.origin, "quic://127.0.0.1:1");
-            assert_eq!(spec.kind, ikigai_embedded::MountKind::Prefer);
+            assert_eq!(spec.kind, MountKind::Prefer);
         }
     }
 
@@ -6498,7 +6533,7 @@ mod mount_cert_tests {
             prefix: "urn:test:".to_string(),
             target: path.display().to_string(),
             certs: Certs::default(),
-            kind: ikigai_embedded::MountKind::Prefer,
+            kind: MountKind::Prefer,
         };
         let spec = resolve_one_mount(mount).expect("prefer resolves lazily");
         let entries = spec
@@ -6538,13 +6573,13 @@ mod mount_cert_tests {
         assert_eq!(grants, vec!["cal".to_string()]);
         let mounts = mounts.flags;
         assert_eq!(mounts.len(), 2);
-        assert_eq!(mounts[0].kind, ikigai_embedded::MountKind::Prefer);
+        assert_eq!(mounts[0].kind, MountKind::Prefer);
         assert_eq!(mounts[0].target, "peer:plasma");
         assert!(
             mounts[0].certs.cert_dir.is_none(),
             "a cert flag after the SECOND mount must not leak onto the first"
         );
-        assert_eq!(mounts[1].kind, ikigai_embedded::MountKind::Alias);
+        assert_eq!(mounts[1].kind, MountKind::Alias);
         assert_eq!(mounts[1].certs.cert_dir.as_deref(), Some("/certs/bug"));
     }
 
@@ -6562,7 +6597,7 @@ mod mount_cert_tests {
             // Nothing is listening here, and nothing should try.
             target: "quic://127.0.0.1:1".to_string(),
             certs: Certs::default(),
-            kind: ikigai_embedded::MountKind::Prefer,
+            kind: MountKind::Prefer,
         };
         let spec = resolve_one_mount(mount).expect("a prefer mount must not fail at startup");
         assert!(
@@ -6712,7 +6747,7 @@ mod mount_flag_tests {
             prefix: "urn:repo:".to_string(),
             target: absent.to_string(),
             certs: Certs::default(),
-            kind: ikigai_embedded::MountKind::Prefer,
+            kind: MountKind::Prefer,
         })
         .expect("a prefer mount resolves lazily");
         // First use dials — and the failure names --prefer.
@@ -6727,12 +6762,7 @@ mod mount_flag_tests {
         assert!(err.contains("--prefer: connect"), "{err}");
         assert!(!err.contains("--mount:"), "{err}");
         // The eager kinds keep their own spellings.
-        let Err(err) = connect_mount(
-            absent,
-            &Certs::default(),
-            ikigai_embedded::MountKind::Alias,
-            true,
-        ) else {
+        let Err(err) = connect_mount(absent, &Certs::default(), MountKind::Alias, true) else {
             panic!("nothing listens at the absent socket");
         };
         assert!(err.contains("--mount: connect"), "{err}");
@@ -7542,7 +7572,7 @@ mod prefer_mount_capability_tests {
             prefix: "urn:peer:".to_string(),
             target: path.display().to_string(),
             certs: Certs::default(),
-            kind: ikigai_embedded::MountKind::Prefer,
+            kind: MountKind::Prefer,
         })
         .expect("a prefer mount never dials at startup");
         let local = Kernel::new(Arc::new(ikigai_resolve::MountedRemote::overriding(

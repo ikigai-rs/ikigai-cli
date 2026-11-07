@@ -4,7 +4,8 @@
 //! `ikigai-ipc`. A test cannot serve as another account without root, so what is pinned here is
 //! the host's half: both ways of dialing read the setting, a bad one stops the dial, and a
 //! client that names another account still reaches its own user's server.
-#![cfg(unix)]
+// It dials through `ikigai-ipc` and a served kernel, so it needs the `ipc` and `embedded` builds.
+#![cfg(all(unix, feature = "ipc", feature = "embedded"))]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
