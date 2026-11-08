@@ -42,7 +42,7 @@ pub fn run_commands(engine: Engine, commands: &[String]) -> i32 {
                 match &entry.result {
                     Ok(output) => println!("{output}"),
                     Err(err) => {
-                        eprintln!("error: {}", crate::restate_build_line(err));
+                        eprintln!("error: {err}");
                         code = 1;
                         if engine.is_refusing() {
                             break;
@@ -131,7 +131,7 @@ pub fn run(engine: Engine, topology: &[String], quiet: bool) -> i32 {
                 match &entry.result {
                     Ok(out) => println!("{out}"),
                     Err(err) => {
-                        eprintln!("error: {}", crate::restate_build_line(err));
+                        eprintln!("error: {err}");
                         code = 1;
                     }
                 }
@@ -214,7 +214,7 @@ fn show(engine: &Session, action: Action, quiet: bool) {
 }
 
 fn report_script_error(error: &ScriptError) {
-    eprintln!("error: {}", crate::restate_build_line(&error.to_string()));
+    eprintln!("error: {error}");
 }
 
 /// Report what a fan-out actually did — `[fan-out 10 → 1 wide]` — beside the cache
