@@ -2159,7 +2159,7 @@ ikigai-ledger = "0.19.0" # 0.19.0 = core 0.3.0 cascade (ledger #2975): the newes
 # ⚠ …and 0.5.0 seals tuples through ikigai-intray's TupleCodec (ledger #2017, ikigai-rs/ikigai-layers
 # PR 44): a `match=` over an undecodable tuple refuses with a Conflict, and open discards claims a crashed
 # take left behind. `"0.5.0"` is `<0.6.0`.
-ikigai-layers = "0.7.0" # 0.7.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.7.0"` is `<0.8.0`. Beneath it: 0.6.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.6.0"` is `<0.7.0`. Beneath it: 0.5.0.
+ikigai-layers = "0.7.1" # 0.7.1 = intray 0.4.0, keeping one intray/resolve with engine 0.4.0 (ledger #3261). Beneath it: 0.7.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.7.0"` is `<0.8.0`. Beneath it: 0.6.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.6.0"` is `<0.7.0`. Beneath it: 0.5.0.
 # TEST-ONLY (a dev-dependency of ikigai-cli and ikigai-embedded): the layer tests mint a throwaway
 # age identity for `--layers-key`, as `age-keygen -o` would. Already in the graph through
 # ikigai-layers and ikigai-encrypt, so it adds no package. `"0.11.1"` is what ikigai-layers 0.3.0

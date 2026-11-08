@@ -136,14 +136,14 @@ fn an_unresolved_name_names_the_running_build() {
         "{stderr}"
     );
     assert!(
-        stderr.contains(&format!(
-            "\n       a newer release may bind it; if `cargo search ikigai-cli` names one past \
-             {version}: cargo install --locked ikigai-cli"
-        )),
+        stderr.contains(
+            "\n       a newer release may bind it; if a release newer than this build is \
+             available: cargo install --locked ikigai-cli"
+        ),
         "{stderr}"
     );
     assert!(
-        !stderr.contains("newer than this build"),
+        !stderr.contains("a name newer than this build needs an upgrade"),
         "the build cannot know the name is newer: {stderr}"
     );
 }
