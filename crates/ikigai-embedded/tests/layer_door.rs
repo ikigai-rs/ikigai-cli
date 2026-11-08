@@ -200,3 +200,50 @@ fn a_layer_door_binds_the_layer_spaces_and_nothing_else() {
     drop(host);
     let _ = std::fs::remove_dir_all(&scratch);
 }
+
+#[test]
+fn a_feed_layer_opens_and_serves_its_two_concept_scheme() {
+    let scratch = std::env::temp_dir().join(format!("iki-feed-door-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    let config = scratch.join("config");
+    configure(&config);
+    write(
+        config.join("layers/talk.toml"),
+        "model = \"channel\"\nshapes = \"shapes.ttl\"\ncontext = \"context.jsonld\"\nfeed = true\npublishers = [\"alice\"]\nscheme = \"scheme.ttl\"\n",
+    );
+    let scheme = r#"@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+<urn:example:scheme> a skos:ConceptScheme .
+<urn:example:release> a skos:Concept ; skos:prefLabel "Release" ; skos:notation "1" .
+<urn:example:patch> a skos:Concept ; skos:prefLabel "Patch" ; skos:notation "1.1" ;
+  skos:broader <urn:example:release> .
+"#;
+    write(config.join("layers/scheme.ttl"), scheme);
+    write(
+        scratch.join("state.key"),
+        age::secrecy::ExposeSecret::expose_secret(&age::x25519::Identity::generate().to_string()),
+    );
+    let key = ikigai_layers::StateKey::load(scratch.join("state.key")).unwrap();
+    let host = ikigai_layers::Host::open(&config, scratch.join("state"), &key)
+        .expect("a config home with a feed channel opens");
+    let door = served_kernel_hosting(
+        "Test (QUIC)",
+        ServedSurface::default(),
+        Vec::new(),
+        Some(&host),
+    );
+    let response = block_on(door.issue(
+        Request::new(Verb::Source, Iri::parse("urn:layer:talk:scheme").unwrap()),
+        &Capability::root(),
+    ))
+    .expect("the layer door serves the feed scheme");
+    let parse = |bytes: &[u8]| {
+        oxigraph::io::RdfParser::from_format(oxigraph::io::RdfFormat::Turtle)
+            .for_reader(bytes)
+            .collect::<Result<std::collections::HashSet<_>, _>>()
+            .expect("a Turtle scheme")
+    };
+    assert_eq!(parse(&response.bytes), parse(scheme.as_bytes()));
+    drop(door);
+    drop(host);
+    std::fs::remove_dir_all(scratch).unwrap();
+}
