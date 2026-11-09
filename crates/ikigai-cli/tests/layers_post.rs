@@ -251,6 +251,58 @@ fn posted(out: Output, what: &str) -> String {
     iri
 }
 
+/// Talk entries may refer to one feed entry, with the door enforcing the subject's kind
+/// and namespace as well as its cardinality.
+#[test]
+fn messages_and_questions_admit_one_feed_entry_subject() {
+    let home = scratch("feed-subject");
+    let certs = configure(&home);
+    let (_door, target) = serve(&home, &certs);
+    for kind in ["Message", "Question"] {
+        let post = |subject: &str| {
+            let turtle = format!(
+                "@prefix ik: <{IK}> .\n\
+                 @prefix dcterms: <http://purl.org/dc/terms/> .\n\
+                 <urn:layer:new> a ik:{kind} ; ik:body \"About this entry\" ; \
+                 dcterms:subject {subject} .\n"
+            );
+            as_alice(
+                &home,
+                &certs,
+                &target,
+                &home,
+                &["-c", "sink urn:layer:work:say"],
+                Some(&turtle),
+            )
+        };
+        let subject = "urn:layer:feed-project-42:entry:announcement";
+        let entry = posted(post(&format!("<{subject}>")), "post a feed subject");
+        let saved = ok(
+            as_alice(
+                &home,
+                &certs,
+                &target,
+                &home,
+                &["-c", &format!("source {entry}")],
+                None,
+            ),
+            "read the talk entry",
+        );
+        assert!(saved.contains(subject), "the subject survives: {saved}");
+        for invalid in [
+            "\"urn:layer:feed-project:entry:announcement\"",
+            "<urn:layer:work:entry:announcement>",
+            "<urn:layer:feed-Project:entry:announcement>",
+            "<urn:layer:feed-:entry:announcement>",
+            "<urn:layer:feed-project:entry:one>, <urn:layer:feed-project:entry:two>",
+        ] {
+            let out = post(invalid);
+            assert!(!out.status.success(), "{kind} admitted {invalid}");
+        }
+    }
+    std::fs::remove_dir_all(home).unwrap();
+}
+
 /// A brief (its title from its first heading, its repository from `owner/name`), an issue
 /// (its body on stdin) and two files (text with quotes and newlines, and every byte value)
 /// each pass the door's closed shapes; the door holds what was composed; reading ONE kind
