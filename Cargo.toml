@@ -1163,7 +1163,11 @@ members = ["crates/*"]
 # including 0.7.2's refusal of entitlements naming another certificate's participant, and the
 # public layers and open join of ikigai-layers 0.9.0 (ledger #3290, #3295).
 # A deploy change: rebuild --locked. Prepared here, not published.
-version = "0.4.1"
+# 0.4.2 carries the join privacy changes through ikigai-layers 0.9.4 (ledger #3317):
+# no stored source address, day-granularity last read, an operator-only aggregate join count,
+# and IPv6 source counting by /64 (ledger #3307, #3308, #3309, #3296).
+# A deploy change: rebuild --locked. Prepared here, not published.
+version = "0.4.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -2163,7 +2167,7 @@ ikigai-ledger = "0.19.0" # 0.19.0 = core 0.3.0 cascade (ledger #2975): the newes
 # ⚠ …and 0.5.0 seals tuples through ikigai-intray's TupleCodec (ledger #2017, ikigai-rs/ikigai-layers
 # PR 44): a `match=` over an undecodable tuple refuses with a Conflict, and open discards claims a crashed
 # take left behind. `"0.5.0"` is `<0.6.0`.
-ikigai-layers = "0.9.0" # 0.9.0 = public layers and the open join (ledger #3290); `"0.9.0"` is `<0.10.0`. Beneath it: 0.8.0 = feed layers (ledger #3284); `"0.8.0"` is `<0.9.0`. Beneath it: 0.7.1 = intray 0.4.0, keeping one intray/resolve with engine 0.4.0 (ledger #3261). Beneath it: 0.7.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.7.0"` is `<0.8.0`. Beneath it: 0.6.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.6.0"` is `<0.7.0`. Beneath it: 0.5.0.
+ikigai-layers = "0.9.4" # 0.9.4 = the join keeps no address, last read is kept to the day, an operator-only aggregate join count, and IPv6 sources counted by /64 (ledger #3307, #3308, #3309, #3296); `"0.9.4"` is `<0.10.0`. Beneath it: 0.9.0 = public layers and the open join (ledger #3290); `"0.9.0"` is `<0.10.0`. Beneath it: 0.8.0 = feed layers (ledger #3284); `"0.8.0"` is `<0.9.0`. Beneath it: 0.7.1 = intray 0.4.0, keeping one intray/resolve with engine 0.4.0 (ledger #3261). Beneath it: 0.7.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.7.0"` is `<0.8.0`. Beneath it: 0.6.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.6.0"` is `<0.7.0`. Beneath it: 0.5.0.
 # TEST-ONLY (a dev-dependency of ikigai-cli and ikigai-embedded): the layer tests mint a throwaway
 # age identity for `--layers-key`, as `age-keygen -o` would. Already in the graph through
 # ikigai-layers and ikigai-encrypt, so it adds no package. `"0.11.1"` is what ikigai-layers 0.3.0
@@ -2239,14 +2243,14 @@ ikigai-engine = { version = "0.4.0", features = ["plan-reader"] } # 0.4.0 = addi
 # that reconciles personal/org/rdf THROUGH the kernel. Published since 0.1.14 (#296):
 # ikigai-embedded depends on it, and a path-only dependency makes every crate above it
 # in this workspace unpublishable, the `ikigai` binary included.
-ikigai-view = { path = "crates/ikigai-view", version = "0.4.1" }
+ikigai-view = { path = "crates/ikigai-view", version = "0.4.2" }
 # Timezone conversion (urn:tz:convert, IANA/DST-correct) + a zoned clock (urn:tz:now).
 # Published since 0.1.14 (#296); keeps the tzdata dependency out of the lean modules.
-ikigai-tz = { path = "crates/ikigai-tz", version = "0.4.1" }
+ikigai-tz = { path = "crates/ikigai-tz", version = "0.4.2" }
 # Outbound email (urn:email:send): a cap-gated Sink submitting over SMTP to a local MTA
 # that relays onward. Published since 0.1.14 (#296); the contact service and the
 # scheduling confirm-link both need it.
-ikigai-email = { path = "crates/ikigai-email", version = "0.4.1" }
+ikigai-email = { path = "crates/ikigai-email", version = "0.4.2" }
 # Public form intake (urn:*:submit): parse an untrusted urlencoded/JSON body, validate
 # declared fields, drop an escaped s-expr tuple into a space. Contact + booking share it.
 # API history — 0.1.17 = `IntakeField::max_len` and `IntakeField::legacy` (#300, the bounded
@@ -2258,9 +2262,9 @@ ikigai-email = { path = "crates/ikigai-email", version = "0.4.1" }
 # the caret resolves against the registry — `^0.1.14` picked the live 0.1.16, which
 # predates both methods, and ikigai-embedded failed to verify with four E0599s. Nothing
 # else catches this: the gates pass, CI passes, and the break waits for release day.
-ikigai-intake = { path = "crates/ikigai-intake", version = "0.4.1" }
+ikigai-intake = { path = "crates/ikigai-intake", version = "0.4.2" }
 # WebAuthn (ES256) assertion verifier: the second factor gating the edge decision links.
-ikigai-passkey = { path = "crates/ikigai-passkey", version = "0.4.1" }
+ikigai-passkey = { path = "crates/ikigai-passkey", version = "0.4.2" }
 # Sibling workspace crates pinned to the current release: a published crate requires
 # its siblings at this version too, so ANY subset of the workspace can publish in
 # dependency order (wire → ipc → … → cli) and a crate never builds against an
@@ -2268,14 +2272,14 @@ ikigai-passkey = { path = "crates/ikigai-passkey", version = "0.4.1" }
 # — `crates/ikigai-cli/tests/lockstep_pins.rs` enforces it here — and says nothing
 # about the REGISTRY, which only matches the tree after a full wave. The two parted for
 # weeks without anything saying so (ledger #494); `registry-drift` is what says so now.
-ikigai-wire = { path = "crates/ikigai-wire", version = "0.4.1" } # v6 hello + ErrorTyped/WireError
+ikigai-wire = { path = "crates/ikigai-wire", version = "0.4.2" } # v6 hello + ErrorTyped/WireError
 # API history — 0.1.16 = `Spawner::width()`: the scheduler answers how many tasks make progress AT ONCE
 # (1 for `single`), which is what the engine's fan-out routing sizes itself by. Core
 # defaults that method to `None` = unknown, and a caller reading unknown as "wide" is the
 # ~1.8x-slower case — so below this floor the routing is silently inert, not merely older.
 # API history — 0.1.15 = SchedulerSpec: a spec parsed WITHOUT building, so `--scheduler pool:xyz` is
 # rejected while argv is read instead of by spawning a threadpool to find out.
-ikigai-scheduler = { path = "crates/ikigai-scheduler", version = "0.4.1" }
+ikigai-scheduler = { path = "crates/ikigai-scheduler", version = "0.4.2" }
 # ⚠⚠ EXEMPT from the lockstep above — deliberately, and this pin must NOT be raised to the
 # workspace version. ikigai-time is the sixteenth member and the only one that does not take
 # `version.workspace = true`: it declares its own `version` in its own manifest and is
@@ -2311,7 +2315,7 @@ ikigai-scheduler = { path = "crates/ikigai-scheduler", version = "0.4.1" }
 ikigai-time = { path = "crates/ikigai-time", version = "0.7.0" }
 # Inbound HTTP transport (method↔verb, path↔iri, cap-per-request). A published
 # transport like ipc/quic/mcp; only the `web`-featured CLI pulls it (and Tokio).
-ikigai-web = { path = "crates/ikigai-web", version = "0.4.1" }
+ikigai-web = { path = "crates/ikigai-web", version = "0.4.2" }
 futures = "0.3"
 # Turtle parsing for the engine's plan face — reading a stored `ik:Process` graph back.
 # Default features only: no tokio, so `ikigai-engine` still compiles to wasm. oxttl pins

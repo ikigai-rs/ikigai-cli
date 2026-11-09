@@ -3099,7 +3099,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-cli"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "age",
  "async-trait",
@@ -3208,7 +3208,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-discovery"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "if-addrs",
  "mdns-sd",
@@ -3216,7 +3216,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-email"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "futures",
@@ -3226,7 +3226,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-embedded"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "age",
  "async-trait",
@@ -3375,7 +3375,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-intake"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "chrono-tz",
@@ -3405,7 +3405,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-ipc"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "futures",
@@ -3447,15 +3447,17 @@ dependencies = [
 
 [[package]]
 name = "ikigai-layers"
-version = "0.9.0"
+version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "845c77fdc20f02730b534c2e0383947b3af60c608a146910cdee6e86c3256af1"
+checksum = "fec08ea8fdaccce5d55e71224b040a3888d69926853a659bddb35b3499b93ddc"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
  "der",
  "futures",
  "futures-timer",
+ "getrandom 0.2.17",
+ "hmac 0.12.1",
  "ikigai-core",
  "ikigai-encrypt",
  "ikigai-intray",
@@ -3524,7 +3526,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-mcp"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "futures",
  "ikigai-core",
@@ -3561,7 +3563,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-p2p"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "futures",
  "ikigai-core",
@@ -3576,7 +3578,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-passkey"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "p256",
  "serde_json",
@@ -3602,7 +3604,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-quic"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "futures",
@@ -3690,7 +3692,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-scheduler"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "futures",
  "ikigai-core",
@@ -3849,7 +3851,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-tz"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -3873,7 +3875,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-view"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3895,7 +3897,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-web"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3919,7 +3921,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-wire"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "futures",
  "ikigai-core",
