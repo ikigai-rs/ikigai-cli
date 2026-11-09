@@ -83,6 +83,7 @@ fn door(mut command: Command, home: &Path, banner: &str) -> Door {
         .spawn()
         .expect("the binary runs");
     let read = || std::fs::read_to_string(&log).unwrap_or_default();
+    #[allow(clippy::disallowed_methods)] // a native test's own deadline; never built for wasm
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait().unwrap() {
