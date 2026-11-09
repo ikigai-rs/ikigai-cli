@@ -3177,9 +3177,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-core"
-version = "0.3.0"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76e62039fb8dd80f5176d2c990f1a34aeafbcda5495936daf84edb0019e19944"
+checksum = "d7c210be2e02eaf5363c7461291ddea938e3a631de4e8c9a38caf665d9549471"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3192,6 +3192,7 @@ dependencies = [
  "oxrdf",
  "oxttl",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
