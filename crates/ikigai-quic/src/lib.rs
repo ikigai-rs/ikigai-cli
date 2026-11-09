@@ -213,16 +213,27 @@ pub struct PeerIdentity {
     pub segment_id: String,
     /// Lowercase hex SHA-256 of the leaf certificate DER — see [`fingerprint`].
     pub fingerprint: String,
+    /// The address the connection came from, where there is one (a door keyed by a bearer
+    /// token has none). The IP alone: a client takes a new port for each connection, so a
+    /// limit counted over the port would never be reached.
+    pub source_address: Option<std::net::IpAddr>,
 }
 
 impl PeerIdentity {
-    /// Derive both ids from a post-handshake connection.
+    /// Derive the ids and the address from a post-handshake connection.
     fn of(connection: &quinn::Connection) -> Self {
         PeerIdentity {
             segment_id: peer_cert_id(connection),
             fingerprint: cert_fingerprint(connection),
+            source_address: Some(source_address_of(connection.remote_address())),
         }
     }
+}
+
+/// The IP a remote socket address counts as: its port dropped, and an IPv4 address a dual-stack
+/// socket reports as IPv6 (`::ffff:192.0.2.1`) folded back, so one client has one spelling.
+fn source_address_of(remote: std::net::SocketAddr) -> std::net::IpAddr {
+    remote.ip().to_canonical()
 }
 
 /// Mints the authority for one connection from the identity that authenticated it,
@@ -2240,6 +2251,15 @@ mod tests {
         builtins, ArgRef, EndpointSpace, Error, Exact, FnEndpoint, Invocation, Iri, ReprType,
         Representation, UriTemplate, Verb,
     };
+
+    #[test]
+    fn a_source_address_is_the_ip_alone_with_one_spelling() {
+        let source = |remote: &str| source_address_of(remote.parse().unwrap()).to_string();
+        assert_eq!(source("192.0.2.1:50000"), "192.0.2.1");
+        assert_eq!(source("192.0.2.1:50001"), "192.0.2.1");
+        assert_eq!(source("[::ffff:192.0.2.1]:50002"), "192.0.2.1");
+        assert_eq!(source("[2001:db8::1]:50003"), "2001:db8::1");
+    }
 
     fn kernel() -> Kernel {
         Kernel::new(Arc::new(

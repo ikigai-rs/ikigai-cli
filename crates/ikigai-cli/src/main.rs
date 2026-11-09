@@ -4211,8 +4211,10 @@ fn serve_quic(
         };
         // ★ A LOBBY (ledger #2009, #2104): when the layer host defines a `lobby = true` channel,
         // the door also admits a certificate its trust list does NOT name, and this minter, not
-        // the one above, decides it. It mints exactly `Host::lobby_capability`: `say` on every
-        // lobby and nothing else, under `urn:iki:host:{name}:client:<fp>`. Never through
+        // the one above, decides it. It mints exactly `Host::door_capability`, given the
+        // connection's address for the join's per-address limit (ledger #3295): `say` on every
+        // lobby and nothing else, under `urn:iki:host:{name}:client:<fp>`, or `read` and `feed`
+        // on its public layers for a certificate that joined. Never through
         // `root_fs_scopes` and never combined with `--cap`: the lobby capability is the whole
         // authority, so neither can widen or reshape it. The host holds every lobby to its size
         // and rate bounds itself. Decided ONCE at startup, like the surface: a door with no
@@ -4223,7 +4225,14 @@ fn serve_quic(
             .map(|hosted| -> ikigai_quic::Minter {
                 let layer_host = std::sync::Arc::clone(&hosted.host);
                 std::sync::Arc::new(move |peer: &ikigai_quic::PeerIdentity| {
-                    match layer_host.lobby_capability(host, &peer.fingerprint) {
+                    let source = peer.source_address.map(|ip| ip.to_string());
+                    let now = ikigai_core::Clock::now(&ikigai_core::SystemClock);
+                    match layer_host.door_capability(
+                        host,
+                        &peer.fingerprint,
+                        source.as_deref(),
+                        now,
+                    ) {
                         Ok(Some(capability)) => {
                             let principal = capability.principal().map(str::to_string);
                             Some(ikigai_quic::Session {
@@ -4234,8 +4243,9 @@ fn serve_quic(
                         }
                         Ok(None) => {
                             diagnose(format_args!(
-                                "ikigai: REFUSED an unlisted client certificate: this door's \
-                                 layer host has no lobby\n  fingerprint: {}",
+                                "ikigai: REFUSED an unlisted client certificate: the layer \
+                                 host's deny.txt names it, or the host has no lobby now\n  \
+                                 fingerprint: {}",
                                 peer.fingerprint
                             ));
                             None

@@ -5,7 +5,7 @@
 //! The wiring under test: `serve quic://` asks the layer host for its lobbies at startup; with
 //! one, it serves through `ikigai_quic::serve_lobby_on`, whose TLS admits any client certificate
 //! inside its validity window, and hands one its trust list does not name to a separate minter
-//! that mints exactly `Host::lobby_capability`. Without one it serves through
+//! that mints exactly `Host::door_capability` with the connection's address. Without one it serves through
 //! `serve_trusting_on`, as it always did, and an untrusted certificate is refused at TLS.
 //!
 //! ★ HERMETIC BY THE CHILD'S ENVIRONMENT, as `removal_beats_default.rs` is: `HOME`,
@@ -200,10 +200,6 @@ fn configure(home: &Path, certs: &Path, lobby: bool) {
         config.join("participants.ttl"),
         &format!("@prefix foaf: <http://xmlns.com/foaf/0.1/> .\n<{ALICE}> a foaf:Person .\n"),
     );
-    write(
-        config.join("enrollment.toml"),
-        &format!("alice = \"{}\"\n", fingerprint(&pair(certs, "alice").0)),
-    );
     // The host's key (ikigai-layers 0.3.0, ledger #2011): a throwaway age identity, named
     // through the config home's `layers.key`.
     let key = home.join("state.key");
@@ -215,6 +211,16 @@ fn configure(home: &Path, certs: &Path, lobby: bool) {
         config.join("config.toml"),
         &format!("layers.key = \"{}\"\n", key.display()),
     );
+    enroll(home, certs);
+}
+
+/// Generate the enrollment with the layer host's own generator: alice only.
+fn enroll(home: &Path, certs: &Path) {
+    let config = config_home(home);
+    write(
+        config.join("enrollment.toml"),
+        &format!("alice = \"{}\"\n", fingerprint(&pair(certs, "alice").0)),
+    );
     let loaded = ikigai_layers::Config::load(&config).expect("the configuration checks");
     let fingerprints: BTreeMap<String, BTreeSet<String>> =
         ikigai_layers::grants::load_fingerprints(&config, &loaded).expect("enrollment.toml");
@@ -222,6 +228,101 @@ fn configure(home: &Path, certs: &Path, lobby: bool) {
         .expect("an enrollment")
         .write(&config)
         .expect("grants.json and clients.json");
+}
+
+/// A public feed's closed shape: one announcement with the host's three stamps.
+const FEED_SHAPES: &str = r#"@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix ik: <https://ikigai-rs.dev/ns#> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
+@prefix dcterms: <http://purl.org/dc/terms/> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+<urn:example:shape:announcement> a sh:NodeShape ;
+  sh:targetClass ik:Message ;
+  sh:closed true ;
+  sh:ignoredProperties ( rdf:type ) ;
+  sh:property [ sh:path dcterms:title ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ] ,
+              [ sh:path prov:wasAttributedTo ; sh:minCount 1 ; sh:maxCount 1 ; sh:nodeKind sh:IRI ] ,
+              [ sh:path dcterms:created ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:dateTime ] ,
+              [ sh:path ik:seq ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:integer ] .
+"#;
+
+const FEED_CONTEXT: &str =
+    r#"{ "@context": { "dcterms": "http://purl.org/dc/terms/", "title": "dcterms:title" } }"#;
+
+const FEED_SCHEME: &str = r#"@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+<urn:example:scheme:releases> a skos:ConceptScheme .
+<urn:example:concept:release> a skos:Concept ; skos:prefLabel "Release" ; skos:notation "1" .
+"#;
+
+/// The join lobby's closed shape, as ikigai-layers' `onboard/layers/join.shapes.ttl` writes it: one
+/// `onb:JoinRequest` an entry, with the host's three stamps.
+const JOIN_SHAPES: &str = r#"@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix ik: <https://ikigai-rs.dev/ns#> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
+@prefix dcterms: <http://purl.org/dc/terms/> .
+@prefix onb: <https://ikigai-rs.dev/ns/onboard#> .
+
+<urn:iki:onboard:shape:join> a sh:NodeShape ;
+  sh:targetClass onb:JoinRequest ;
+  sh:closed true ;
+  sh:ignoredProperties ( rdf:type ) ;
+  sh:property
+    [ sh:path onb:certificate ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ;
+      sh:maxLength 8192 ] ,
+    [ sh:path onb:fingerprint ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ;
+      sh:pattern "^[0-9a-f]{64}$" ] ,
+    [ sh:path onb:layer ; sh:minCount 1 ; sh:nodeKind sh:IRI ;
+      sh:pattern "^urn:layer:[a-z0-9-]+$" ] ,
+    [ sh:path prov:wasAttributedTo ; sh:minCount 1 ; sh:maxCount 1 ; sh:nodeKind sh:IRI ] ,
+    [ sh:path dcterms:created ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:dateTime ] ,
+    [ sh:path ik:seq ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:integer ] .
+"#;
+
+const JOIN_CONTEXT: &str = r#"{ "@context": {
+  "onb": "https://ikigai-rs.dev/ns/onboard#",
+  "JoinRequest": "onb:JoinRequest"
+} }
+"#;
+
+/// What [`configure`] writes with no lobby, plus a public `releases` feed alice publishes and a
+/// `join` lobby answered by policy, taking `per_address` requests an hour from one source address
+/// and enough from one certificate and from everyone that only the address can refuse.
+fn configure_join(home: &Path, certs: &Path, per_address: usize) {
+    configure(home, certs, false);
+    let config = config_home(home);
+    write(config.join("layers/feed.shapes.ttl"), FEED_SHAPES);
+    write(config.join("layers/feed.context.jsonld"), FEED_CONTEXT);
+    write(config.join("layers/feed.scheme.ttl"), FEED_SCHEME);
+    write(
+        config.join("layers/releases.toml"),
+        "model = \"channel\"\nshapes = \"feed.shapes.ttl\"\ncontext = \"feed.context.jsonld\"\n\
+         feed = true\npublishers = [\"alice\"]\nscheme = \"feed.scheme.ttl\"\npublic = true\n",
+    );
+    write(config.join("layers/join.shapes.ttl"), JOIN_SHAPES);
+    write(config.join("layers/join.context.jsonld"), JOIN_CONTEXT);
+    write(
+        config.join("layers/join.toml"),
+        "model = \"channel\"\nshapes = \"join.shapes.ttl\"\n\
+         context = \"join.context.jsonld\"\nlobby = true\njoin = \"public\"\n",
+    );
+    let key = ed25519_dalek::pkcs8::EncodePrivateKey::to_pkcs8_pem(
+        &ed25519_dalek::SigningKey::from_bytes(&[0x33; 32]),
+        ed25519_dalek::pkcs8::spki::der::pem::LineEnding::LF,
+    )
+    .expect("a PKCS8 PEM");
+    write(config.join("join.pem"), &key);
+    write(
+        config.join("layers.toml"),
+        &format!(
+            "[join]\nhost_key = \"join.pem\"\nper_certificate = 100\n\
+             per_address = {per_address}\nper_hour = 100\n"
+        ),
+    );
+    enroll(home, certs);
 }
 
 /// Start `serve quic://127.0.0.1:0 --name lobby --cert-dir <certs>` and wait for its banner;
@@ -333,6 +434,19 @@ fn request(cert: &Path) -> String {
          onb:fingerprint \"{fp}\" ;\n  \
          onb:proof \"{}\" .\n",
         "0".repeat(64)
+    )
+}
+
+/// A join request for the public `releases` feed, carrying the certificate it was made with.
+fn join_request(cert: &Path) -> String {
+    let pem = std::fs::read_to_string(cert).unwrap();
+    let fp = fingerprint(cert);
+    format!(
+        "@prefix onb: <https://ikigai-rs.dev/ns/onboard#> .\n\
+         <urn:iki:onboard:join:{fp}> a onb:JoinRequest ;\n  \
+         onb:certificate \"\"\"{pem}\"\"\" ;\n  \
+         onb:fingerprint \"{fp}\" ;\n  \
+         onb:layer <urn:layer:releases> .\n"
     )
 }
 
@@ -454,6 +568,82 @@ fn an_unenrolled_certificate_can_say_on_the_lobby_and_nothing_else() {
         "alice's urn:layers:me",
     );
     assert!(me.contains(ALICE), "alice is still alice: {me}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A door whose config home has a public feed and a join lobby opens, and a stranger who joins
+/// reads the feed on its next connection and may do nothing else.
+///
+/// ★ THE SOURCE ADDRESS (ledger #3295): a second certificate from the same address is refused by
+/// the join's per-address limit. Each client is its own process on its own ephemeral port, so
+/// this also holds the door to counting the address and not the address and port.
+#[test]
+fn two_certificates_from_one_address_hit_the_joins_per_address_limit() {
+    let home = scratch("join");
+    let certs = certs(&home, "certs", &["alice"]);
+    let spare = self::certs(&home, "spare", &["first", "second"]);
+    configure_join(&home, &certs, 1);
+    let (_door, target, banner) = serve(&home, &certs);
+    assert!(
+        banner.contains("lobby open on join"),
+        "the door opens with its join lobby:\n{banner}"
+    );
+    let first = pair(&spare, "first");
+    let second = pair(&spare, "second");
+
+    ok(
+        ask(
+            &home,
+            &certs,
+            &first,
+            &target,
+            "sink urn:layer:join:say",
+            Some(&join_request(&first.0)),
+        ),
+        "the first join",
+    );
+    ok(
+        ask(
+            &home,
+            &certs,
+            &first,
+            &target,
+            "source urn:layer:releases:entries",
+            None,
+        ),
+        "the joined certificate reads the public feed",
+    );
+    let out = ask(
+        &home,
+        &certs,
+        &first,
+        &target,
+        "source urn:layer:talk:entries",
+        None,
+    );
+    assert!(
+        !out.status.success()
+            && String::from_utf8_lossy(&out.stderr)
+                .to_lowercase()
+                .contains("denied"),
+        "a joined certificate reads public feeds and nothing else: {}",
+        describe(&out)
+    );
+
+    let out = ask(
+        &home,
+        &certs,
+        &second,
+        &target,
+        "sink urn:layer:join:say",
+        Some(&join_request(&second.0)),
+    );
+    assert!(
+        !out.status.success()
+            && String::from_utf8_lossy(&out.stderr).contains("one source address"),
+        "the second certificate from one address must hit the per-address limit: {}",
+        describe(&out)
+    );
     let _ = std::fs::remove_dir_all(&home);
 }
 
