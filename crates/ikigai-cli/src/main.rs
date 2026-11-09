@@ -3497,6 +3497,9 @@ fn connect_mount_quic(
     if let Some(bound) = call_timeout() {
         resolver = resolver.with_call_timeout(bound);
     }
+    resolver
+        .check_admission()
+        .map_err(|e| format!("{flag}: {e}"))?;
     Ok(std::sync::Arc::new(resolver))
 }
 
@@ -4839,6 +4842,7 @@ fn connect_quic(target: &str, certs: &Certs) -> Result<Engine, String> {
     if let Some(bound) = call_timeout() {
         resolver = resolver.with_call_timeout(bound);
     }
+    resolver.check_admission().map_err(|e| e.to_string())?;
     Ok(with_profiles(Engine::new(resolver)))
 }
 

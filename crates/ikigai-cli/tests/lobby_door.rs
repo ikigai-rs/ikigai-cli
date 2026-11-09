@@ -688,3 +688,129 @@ fn a_layer_door_without_a_lobby_refuses_an_unlisted_certificate() {
     assert!(me.contains(ALICE), "alice is served: {me}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A real layer host refuses a fingerprint in deny.txt after TLS. The client must report
+/// admission, rather than diagnosing the first failed Meta request as a missing renderer.
+#[test]
+fn a_denied_certificate_is_reported_as_a_connection_refusal() {
+    use ikigai_core::{
+        Clock, EndpointSpace, Exact, FnEndpoint, Invocation, Kernel, ReprType, Representation,
+        SystemClock,
+    };
+    use std::sync::Arc;
+
+    let home = scratch("denied-certificate");
+    let certs = certs(&home, "certs", &["alice", "stranger"]);
+    configure(&home, &certs, true);
+    let stranger = pair(&certs, "stranger");
+    let denied = fingerprint(&stranger.0);
+    write(config_home(&home).join("deny.txt"), &format!("{denied}\n"));
+    let key = ikigai_layers::at_rest::StateKey::load(home.join("state.key")).unwrap();
+    let host = ikigai_layers::Host::open(config_home(&home), home.join("state"), &key).unwrap();
+    let server = ikigai_quic::Identity {
+        cert_pem: std::fs::read_to_string(certs.join("server.crt")).unwrap(),
+        key_pem: std::fs::read_to_string(certs.join("server.key")).unwrap(),
+    };
+    let socket = ikigai_quic::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let target = format!("quic://{}", socket.local_addr().unwrap());
+    let minter: ikigai_quic::Minter = Arc::new(move |peer| {
+        host.door_capability("test", &peer.fingerprint, None, SystemClock.now())
+            .unwrap()
+            .map(|_| ikigai_quic::Session {
+                // Only admission is under test; the fixture endpoint needs no layer grant.
+                capability: ikigai_core::Capability::root(),
+                file_segment: String::new(),
+                principal: None,
+            })
+    });
+    std::thread::spawn(move || {
+        // Deliberately no Meta renderer: an admitted connection must still get the
+        // existing missing-contract diagnostic, distinct from a refused connection.
+        let kernel = Kernel::new(Arc::new(EndpointSpace::new().bind(
+            Exact::new("urn:test:ok"),
+            FnEndpoint::new("ok", |_: &Invocation<'_>| {
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    b"ok".to_vec(),
+                ))
+            }),
+        )));
+        ikigai_quic::serve_lobby_on(
+            Arc::new(kernel),
+            socket,
+            &server,
+            Arc::new(|| Ok(Vec::new())),
+            Arc::clone(&minter),
+            minter,
+            Duration::from_secs(30),
+            None,
+        )
+        .unwrap();
+    });
+    let route = format!("urn:test:={target}");
+    for (flag, address) in [
+        ("--override", route.as_str()),
+        ("--connect", target.as_str()),
+    ] {
+        let out = run(
+            &home,
+            &[
+                "--cert-dir",
+                certs.to_str().unwrap(),
+                "--client-cert",
+                stranger.0.to_str().unwrap(),
+                "--client-key",
+                stranger.1.to_str().unwrap(),
+                flag,
+                address,
+                "-c",
+                "source urn:test:ok",
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{}", describe(&out));
+        assert!(stderr.contains(&format!("the door at {target} refused the connection: the client certificate is not admitted")), "{}", describe(&out));
+        assert!(
+            !stderr.contains("Meta renderer") && !stderr.contains("did not answer with a contract"),
+            "{}",
+            describe(&out)
+        );
+        assert!(
+            !stderr.contains('\u{1b}'),
+            "plain refusal: {}",
+            describe(&out)
+        );
+    }
+
+    // The same certificate is admitted on its next connection once deny.txt is cleared.
+    // With no Meta renderer, the admitted peer still earns the existing contract warning.
+    write(config_home(&home).join("deny.txt"), "");
+    let out = run(
+        &home,
+        &[
+            "--cert-dir",
+            certs.to_str().unwrap(),
+            "--client-cert",
+            stranger.0.to_str().unwrap(),
+            "--client-key",
+            stranger.1.to_str().unwrap(),
+            "--override",
+            &route,
+            "-c",
+            "source urn:test:ok",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{}", describe(&out));
+    assert!(
+        stderr.contains("did not answer with a contract") && stderr.contains("Meta renderer"),
+        "{}",
+        describe(&out)
+    );
+    assert!(
+        !stderr.contains("certificate is not admitted"),
+        "{}",
+        describe(&out)
+    );
+    std::fs::remove_dir_all(home).unwrap();
+}

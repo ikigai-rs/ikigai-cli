@@ -173,6 +173,13 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
   boundary, file jail and golden-thread invalidation after an editor change.
 - `crates/ikigai-ipc/src/lib.rs`'s `who_is_refused` pins, word for word, the sentence that
   refuses a socket server under another UID, which reaches the terminal as an `ikigai:` line.
+- `crates/ikigai-cli/tests/lobby_door.rs`'s
+  `a_denied_certificate_is_reported_as_a_connection_refusal` runs the client against an
+  in-process QUIC door using a real layer host's `deny.txt` decision. It pins the sentence
+  naming the door and saying the client certificate is not admitted, for both `--override`
+  and `--connect`, with no color escapes or Meta-renderer advice. Clearing the deny list
+  admits the same certificate, and a peer without a Meta renderer keeps its contract warning.
+  This is a socket test, with no assistive technology evaluation.
 - The other output above has had no automated accessibility checker or browser evaluation.
   No assistive technology has been used on any of this output.
 
@@ -195,6 +202,7 @@ Found by reading the source on 2026-10-15, not by testing:
 
 | Date | Change |
 |---|---|
+| 2026-11-08 | A QUIC door's refusal after TLS (ledger #3304) says that the door refused the connection and the client certificate is not admitted, before a mount or direct connection asks for contracts. A socket regression pins the sentence and distinguishes an admitted peer without a Meta renderer. Plain `ikigai:` line, no color; no assistive technology testing was performed. |
 | 2026-11-07 | The full-screen REPL clock (ledger #2696) keeps a steady colon instead of blinking indefinitely. A ratatui test-backend regression reproduces the missing colon before the fix and checks it stays visible across redraws after it. No assistive technology testing was performed. |
 | 2026-11-06 | The HTTP door refuses a push stream beyond `PushConfig::max_streams` with `503`, `Retry-After: 1` and "too many event streams", using the existing negotiated error page. A socket regression pins the sentence and page landmarks; no assistive technology testing was performed. |
 | 2026-10-15 | First version ([PR 521](https://github.com/ikigai-rs/ikigai-cli/pull/521)). |
