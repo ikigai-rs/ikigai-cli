@@ -1324,7 +1324,10 @@ impl Wire {
         let connection = { self.connection().clone() };
         // The peer runs a call only once it reads the stream to its end, so until
         // `finish` succeeds nothing can have run: a failure here is `Unsent`.
-        let (send, recv) = connection.open_bi().await.map_err(Attempt::unsent)?;
+        let (send, recv) = connection
+            .open_bi()
+            .await
+            .map_err(|e| Attempt::Unsent(connection_error(self.addr, &connection, e)))?;
         let mut stream = InFlight {
             send,
             recv,
@@ -1335,14 +1338,17 @@ impl Wire {
             .send
             .write_all(request)
             .await
-            .map_err(Attempt::unsent)?;
-        stream.send.finish().map_err(Attempt::unsent)?;
+            .map_err(|e| Attempt::Unsent(connection_error(self.addr, &connection, e)))?;
+        stream
+            .send
+            .finish()
+            .map_err(|e| Attempt::Unsent(connection_error(self.addr, &connection, e)))?;
         stream.sent = true;
         let bytes = stream
             .recv
             .read_to_end(MAX_MESSAGE)
             .await
-            .map_err(|e| Attempt::Sent(other(e)))?;
+            .map_err(|e| Attempt::Sent(connection_error(self.addr, &connection, e)))?;
         stream.answered = true;
         decode(&bytes).map_err(Attempt::Sent)
     }
@@ -1382,10 +1388,6 @@ enum Attempt {
 }
 
 impl Attempt {
-    fn unsent<E: std::fmt::Display>(error: E) -> Self {
-        Attempt::Unsent(other(error))
-    }
-
     fn into_error(self) -> io::Error {
         match self {
             Attempt::Unsent(error) | Attempt::Sent(error) => error,
@@ -1460,6 +1462,35 @@ fn is_describe(call: &Call) -> bool {
 }
 
 impl QuicResolver {
+    /// Check that the door admits this connection before presenting its endpoints.
+    ///
+    /// TLS can succeed before the door's minter refuses the certificate. A cache-status
+    /// query for an uncacheable verb waits for that admission decision without invoking an
+    /// endpoint, enumerating a catalog, or requiring a Meta renderer. It runs under the
+    /// describe deadline, including any reconnect.
+    ///
+    /// # Errors
+    ///
+    /// A refused certificate is [`Error::Denied`], naming the door. Other transport and
+    /// protocol failures are reported as for [`Resolver::issue`].
+    pub fn check_admission(&self) -> Result<(), Error> {
+        let probe = Request::new(
+            ikigai_core::Verb::Sink,
+            Iri::parse("urn:kernel:actions").expect("a valid IRI"),
+        );
+        match self
+            .round_trip_within(Call::IsCached(probe), self.describe_timeout)
+            .map_err(quic_error)?
+        {
+            Reply::Cached(_) => Ok(()),
+            Reply::ErrorTyped(error) => Err(error.into()),
+            Reply::Error(message) => Err(Error::Endpoint(message)),
+            other => Err(Error::Endpoint(format!(
+                "unexpected reply to admission check: {other:?}"
+            ))),
+        }
+    }
+
     /// Set the deadline a SELF-DESCRIPTION call runs under (builder) — see
     /// [`DEFAULT_DESCRIBE_TIMEOUT`], which is what [`connect`] installs. `None` takes the
     /// bound off.
@@ -1685,6 +1716,9 @@ fn quic_error(e: io::Error) -> Error {
     // accepted the stream, it just did not answer in time. A mount reads the difference —
     // `Unavailable` means "nothing is listening", `Timeout` means "it is listening and
     // silent", and only the second says a degraded catalog is hiding real resources.
+    if e.kind() == io::ErrorKind::PermissionDenied {
+        return Error::Denied(e.to_string());
+    }
     if e.kind() == io::ErrorKind::TimedOut {
         return Error::Timeout(format!("quic transport: {e}"));
     }
@@ -1942,6 +1976,11 @@ async fn dial(endpoint: &quinn::Endpoint, addr: SocketAddr) -> io::Result<quinn:
                     ikigai_wire::PROTOCOL_VERSION
                 ),
             ))
+        }
+        Ok(Err(quinn::ConnectionError::ApplicationClosed(close)))
+            if close.error_code == UNAUTHORIZED.into() =>
+        {
+            Err(not_admitted(addr))
         }
         Ok(Err(e)) => Err(other(e)),
         Err(_) => Err(io::Error::new(
@@ -2235,6 +2274,33 @@ fn load_cert(pem: &str) -> io::Result<CertificateDer<'static>> {
 fn load_key(pem: &str) -> io::Result<PrivateKeyDer<'static>> {
     rustls_pemfile::private_key(&mut pem.as_bytes())?
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no private key in PEM"))
+}
+
+/// A stream's generic error may omit the application's close code. Inspect the exact
+/// connection that failed, rather than a newer connection another call may have installed.
+fn connection_error(
+    addr: SocketAddr,
+    connection: &quinn::Connection,
+    error: impl std::fmt::Display,
+) -> io::Error {
+    match connection.close_reason() {
+        Some(quinn::ConnectionError::ApplicationClosed(close))
+            if close.error_code == UNAUTHORIZED.into() =>
+        {
+            not_admitted(addr)
+        }
+        _ => other(error),
+    }
+}
+
+fn not_admitted(addr: SocketAddr) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "the door at quic://{addr} refused the connection: \
+             the client certificate is not admitted"
+        ),
+    )
 }
 
 fn other<E: std::fmt::Display>(error: E) -> io::Error {
@@ -3255,6 +3321,51 @@ mod tests {
 
         drop(client); // closes the connection → the handler loop ends
         server.join().unwrap();
+    }
+
+    /// Only the door's authorization close code means the certificate was not admitted.
+    /// A routine close must remain a transport failure, even if its text says otherwise.
+    #[test]
+    fn admission_distinguishes_refusal_from_other_connection_closures() {
+        for code in [UNAUTHORIZED, 0] {
+            let server_id = generate();
+            let client_id = generate();
+            let config = server_config(
+                &server_id,
+                std::slice::from_ref(&client_id.cert_pem),
+                DEFAULT_IDLE_TIMEOUT,
+            )
+            .unwrap();
+            let runtime = Runtime::new().unwrap();
+            let endpoint = runtime
+                .block_on(async { quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()) })
+                .unwrap();
+            let addr = endpoint.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                runtime.block_on(async move {
+                    // Reads reconnect once after a lost connection.
+                    for _ in 0..2 {
+                        let connection = endpoint.accept().await.unwrap().await.unwrap();
+                        connection.close(code.into(), b"unauthorized");
+                    }
+                    endpoint.wait_idle().await;
+                });
+            });
+            let client = connect(addr, &client_id, &server_id.cert_pem).unwrap();
+            let error = client.check_admission().unwrap_err();
+            if code == UNAUTHORIZED {
+                assert!(
+                    matches!(&error, Error::Denied(message) if message == &format!(
+                        "the door at quic://{addr} refused the connection: the client certificate is not admitted"
+                    )),
+                    "{error}"
+                );
+            } else {
+                assert!(matches!(error, Error::Unavailable(_)), "{error}");
+            }
+            drop(client);
+            server.join().unwrap();
+        }
     }
 
     // ---- wire v8 over QUIC: the ALPN is the version (ledger #583) ----
