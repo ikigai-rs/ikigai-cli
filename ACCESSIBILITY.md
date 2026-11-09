@@ -19,6 +19,9 @@ how to report a barrier. It is not a conformance claim. Adapted from the
   same sentence as text. A door that sets `EdgeConfig::error_page` writes that page itself for a
   browser's request; that page, its markup and its accessibility, is the door's (gonk's, say), and
   this repository guarantees only the status and headers it is served with.
+- **Redirect pages** from the HTTP door (`crates/ikigai-web/src/redirect_answer.rs`): the body of
+  a read that an endpoint answers with core's typed redirect, for a client that does not follow it
+  and names `text/html` over `text/plain`; every other client gets the same target as a sentence.
 - **Pages from the embedded host's HTTP face**: the emailed decision, contact-block and label
   links and the passkey enrollment page (`crates/ikigai-embedded`: `decide.rs`, `contactblock.rs`,
   `passkey.rs`, all through `decide::page`), and the contact intake's redirect page
@@ -41,6 +44,11 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
 - An error page has `<html lang="en">`, a `<title>` and one `<h1>` naming the status, a `<main>`,
   and the message as escaped text; no style, no script. Its status code is the same as the text
   answer's, and both carry `Vary: Accept`.
+- A redirect page has the error page's shape: `<html lang="en">`, a `<title>` and one `<h1>` naming
+  the status, a `<main>`, no style and no script, and one sentence with the target as a link whose
+  text is the location, escaped. A location that is not `http` or `https` (`javascript:`, a `urn:`)
+  is shown as text and is never a link. Its status and `Location` are the same as the text answer's,
+  and both carry `Vary: Accept`.
 - A request whose percent-encoding is malformed or does not decode to UTF-8 is a `400` whose
   sentence names the byte offset in what the client sent, in words. From the door: "malformed
   percent-escape at byte N of the request target: a % must be followed by two hex digits" (the
@@ -111,6 +119,12 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
   `413 Payload Too Large`: declared and chunked bodies negotiate the built-in page, with
   global security headers, without admission, identity, capability or custom page hooks;
   plain clients keep the sentence, and `HEAD` carries the matching length without content.
+- `crates/ikigai-web/tests/redirect_answers.rs` sends raw HTTP to a read answering core's typed
+  redirect and pins each status and its exact `Location`, an off-site target, the percent-encoding
+  of what a URI cannot carry, `HEAD` with no body, and the page's `lang`, title, `main`, `h1`,
+  escaped link and absence of style or script; that a location not `http` or `https` is never a
+  link; that other clients get `text/plain`; and that `Error::Gone` is a `410` page. These are
+  socket tests, with no browser or assistive technology evaluation.
 - `crates/ikigai-web/tests/error_pages.rs` and the unit tests in `error_page.rs` pin the
   page's shape (`lang`, title, `main`, `h1`), escaping, which clients get a page, `Vary: Accept`,
   and that a JSON door and a success are left alone. `crates/ikigai-web/tests/door_error_page.rs`
@@ -202,6 +216,7 @@ Found by reading the source on 2026-10-15, not by testing:
 
 | Date | Change |
 |---|---|
+| 2026-11-09 | The HTTP door answers core's new outcomes (ledger #3151). `Error::Gone` is a `410 Gone`, on the existing negotiated error page. A read answering core's typed redirect is sent as its status with `Location`, and a client asking for HTML gets a new short page with the target as a link (shown as text when it is not `http` or `https`); any other client gets a `text/plain` sentence. Socket tests pin both; no browser or assistive technology testing was performed. |
 | 2026-11-08 | A QUIC door's refusal after TLS (ledger #3304) says that the door refused the connection and the client certificate is not admitted, before a mount or direct connection asks for contracts. A socket regression pins the sentence and distinguishes an admitted peer without a Meta renderer. Plain `ikigai:` line, no color; no assistive technology testing was performed. |
 | 2026-11-07 | The full-screen REPL clock (ledger #2696) keeps a steady colon instead of blinking indefinitely. A ratatui test-backend regression reproduces the missing colon before the fix and checks it stays visible across redraws after it. No assistive technology testing was performed. |
 | 2026-11-06 | The HTTP door refuses a push stream beyond `PushConfig::max_streams` with `503`, `Retry-After: 1` and "too many event streams", using the existing negotiated error page. A socket regression pins the sentence and page landmarks; no assistive technology testing was performed. |

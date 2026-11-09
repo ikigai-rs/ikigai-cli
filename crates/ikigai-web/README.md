@@ -225,10 +225,18 @@ with the head alone, as the routed adapter does.
   capability, or a fixed `--cap` ceiling that narrows the edge; a per-user capability
   (magic-link / passkey) fills the same seam.
 - **Typed error → status:** `Denied` → 403, `NotFound` and `Unresolved` (no endpoint
-  bound to the path) → 404, invalid/missing arg → 400, `Conflict` (the resource's
+  bound to the path) → 404, `Gone` (retired for good) → 410, invalid/missing arg → 400, `Conflict` (the resource's
   current state refuses the request) → 409, transient → 503, else 500. A failed
   `If-Match` / `If-None-Match` stays 412: that is a precondition the caller stated, and
   it is checked before the write reaches the endpoint.
+- **A read's redirect:** a Source answering core's typed redirect
+  (`Representation::redirect`, `application/vnd.ikigai.redirect+json`) is sent as its
+  status (301, 302, 303, 307 or 308) with `Location` set to the absolute location,
+  percent-encoded where a URI needs it. Off-site is allowed: the answer is typed and
+  explicit, unlike a write's envelope `Location`, which stays same-origin. A browser gets a
+  short page with the target as a link and any other client a `text/plain` sentence;
+  caching follows the representation's expiry as for any answer, and `HEAD` sends no body.
+  A write answering this type is served as it came.
 - **Error bodies:** the error's message as `text/plain` by default. A door that sets
   `EdgeConfig::error_body` to `ErrorBody::Json` answers the same status with a typed
   `application/json` object instead: `kind` (core's `Error::kind()`, one stable word),
