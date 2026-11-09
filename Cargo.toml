@@ -1160,7 +1160,8 @@ members = ["crates/*"]
 # an upload with `put_for`/`put_replay_for` under the deliverer's capability (ledger #2974).
 # Prepared here, not published.
 # 0.4.1 carries feed layers through ikigai-layers 0.8.0 (ledger #3284, #3294),
-# including 0.7.2's refusal of entitlements naming another certificate's participant.
+# including 0.7.2's refusal of entitlements naming another certificate's participant, and the
+# public layers and open join of ikigai-layers 0.9.0 (ledger #3290, #3295).
 # A deploy change: rebuild --locked. Prepared here, not published.
 version = "0.4.1"
 edition = "2021"
@@ -2162,7 +2163,7 @@ ikigai-ledger = "0.19.0" # 0.19.0 = core 0.3.0 cascade (ledger #2975): the newes
 # ⚠ …and 0.5.0 seals tuples through ikigai-intray's TupleCodec (ledger #2017, ikigai-rs/ikigai-layers
 # PR 44): a `match=` over an undecodable tuple refuses with a Conflict, and open discards claims a crashed
 # take left behind. `"0.5.0"` is `<0.6.0`.
-ikigai-layers = "0.8.0" # 0.8.0 = feed layers (ledger #3284); `"0.8.0"` is `<0.9.0`. Beneath it: 0.7.1 = intray 0.4.0, keeping one intray/resolve with engine 0.4.0 (ledger #3261). Beneath it: 0.7.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.7.0"` is `<0.8.0`. Beneath it: 0.6.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.6.0"` is `<0.7.0`. Beneath it: 0.5.0.
+ikigai-layers = "0.9.0" # 0.9.0 = public layers and the open join (ledger #3290); `"0.9.0"` is `<0.10.0`. Beneath it: 0.8.0 = feed layers (ledger #3284); `"0.8.0"` is `<0.9.0`. Beneath it: 0.7.1 = intray 0.4.0, keeping one intray/resolve with engine 0.4.0 (ledger #3261). Beneath it: 0.7.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.7.0"` is `<0.8.0`. Beneath it: 0.6.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.6.0"` is `<0.7.0`. Beneath it: 0.5.0.
 # TEST-ONLY (a dev-dependency of ikigai-cli and ikigai-embedded): the layer tests mint a throwaway
 # age identity for `--layers-key`, as `age-keygen -o` would. Already in the graph through
 # ikigai-layers and ikigai-encrypt, so it adds no package. `"0.11.1"` is what ikigai-layers 0.3.0

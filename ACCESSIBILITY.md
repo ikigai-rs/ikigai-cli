@@ -223,6 +223,7 @@ Found by reading the source on 2026-10-15, not by testing:
 | 2026-11-02 | `--grants <file>` becomes a global host flag. A set `IKIGAI_GRANTS` stops startup with a plain `ikigai:` diagnostic naming the variable and replacement flag. Binary regression tests cover the refusal and the socket host's flag; no assistive technology testing was performed. |
 | 2026-11-02 | The global `--grants` parser names `<file>` in missing-value refusals (ledger #2952). Library grant lookups preserve the `IKIGAI_GRANTS` refusal instead of reporting an unknown grant. Library and binary regression tests pin these diagnostics; no color is added and no assistive technology testing was performed. |
 | 2026-11-03 | The `names`-file recipe in `docs/shared-ui.md` declares a `theme` input instead of fixing `theme`, so a no-script Apply is answered with the page in the chosen theme, and it names the override for turning the chooser off (ledger #2955). Docs only, so no output changed. One `GET /quakes?theme=dark` was sent through the door with `curl` and ikigai-ui 0.4.1. No test covers it, and no browser, axe or assistive technology testing was performed. |
+| 2026-11-08 | A layer door's refusal of an unlisted certificate with no lobby capability (ledger #3295) says on stderr that the host's `deny.txt` names it or the host has no lobby now, where it said only that the host has no lobby. Plain `ikigai:` line, no color. No test pins this wording, and no assistive technology testing was performed. |
 
 ## Contributing
 
