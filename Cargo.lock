@@ -3122,7 +3122,7 @@ dependencies = [
  "ikigai-layers",
  "ikigai-mcp",
  "ikigai-quic",
- "ikigai-resolve",
+ "ikigai-resolve 0.4.0",
  "ikigai-sparql",
  "ikigai-ui",
  "ikigai-web",
@@ -3250,7 +3250,7 @@ dependencies = [
  "ikigai-fs",
  "ikigai-http",
  "ikigai-intake",
- "ikigai-intray",
+ "ikigai-intray 0.4.0",
  "ikigai-ipc",
  "ikigai-json",
  "ikigai-jsonld",
@@ -3265,7 +3265,7 @@ dependencies = [
  "ikigai-rdf",
  "ikigai-reason",
  "ikigai-repo",
- "ikigai-resolve",
+ "ikigai-resolve 0.4.0",
  "ikigai-runbook",
  "ikigai-scheduler",
  "ikigai-secret",
@@ -3319,7 +3319,7 @@ dependencies = [
  "chrono",
  "futures",
  "ikigai-core",
- "ikigai-resolve",
+ "ikigai-resolve 0.4.0",
  "ikigai-store",
  "ikigai-vocab",
  "oxigraph",
@@ -3395,7 +3395,25 @@ dependencies = [
  "blake3",
  "ikigai-core",
  "ikigai-rdf",
- "ikigai-resolve",
+ "ikigai-resolve 0.3.0",
+ "ikigai-store",
+ "notify",
+ "oxigraph",
+ "rustix",
+ "spargebra",
+]
+
+[[package]]
+name = "ikigai-intray"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b26fdadf01e91a9c137c28286a1a07119ba3ff809fa6d658b458f3551fa3c380"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "ikigai-core",
+ "ikigai-rdf",
+ "ikigai-resolve 0.4.0",
  "ikigai-store",
  "notify",
  "oxigraph",
@@ -3410,7 +3428,7 @@ dependencies = [
  "async-trait",
  "futures",
  "ikigai-core",
- "ikigai-resolve",
+ "ikigai-resolve 0.4.0",
  "ikigai-wire",
  "libc",
  "nix 0.30.1",
@@ -3460,7 +3478,7 @@ dependencies = [
  "hmac 0.12.1",
  "ikigai-core",
  "ikigai-encrypt",
- "ikigai-intray",
+ "ikigai-intray 0.3.0",
  "ikigai-jsonld",
  "ikigai-rdf",
  "ikigai-shacl",
@@ -3531,7 +3549,7 @@ dependencies = [
  "futures",
  "ikigai-core",
  "ikigai-http",
- "ikigai-resolve",
+ "ikigai-resolve 0.4.0",
  "serde",
  "serde_json",
 ]
@@ -3569,7 +3587,7 @@ dependencies = [
  "ikigai-core",
  "ikigai-embedded",
  "ikigai-quic",
- "ikigai-resolve",
+ "ikigai-resolve 0.4.0",
  "ikigai-secret",
  "ikigai-wire",
  "libp2p",
@@ -3609,7 +3627,7 @@ dependencies = [
  "async-trait",
  "futures",
  "ikigai-core",
- "ikigai-resolve",
+ "ikigai-resolve 0.4.0",
  "ikigai-wire",
  "quinn",
  "quinn-proto",
@@ -3663,6 +3681,19 @@ dependencies = [
  "async-trait",
  "futures",
  "ikigai-core",
+]
+
+[[package]]
+name = "ikigai-resolve"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53a19d49188f0b07c6c417ec9d2eb4136dc4aa73c90669fbfa40d8eca7c377a1"
+dependencies = [
+ "async-trait",
+ "futures",
+ "ikigai-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3846,7 +3877,7 @@ name = "ikigai-time"
 version = "0.7.0"
 dependencies = [
  "ikigai-core",
- "ikigai-resolve",
+ "ikigai-resolve 0.4.0",
 ]
 
 [[package]]
@@ -3925,7 +3956,7 @@ version = "0.4.2"
 dependencies = [
  "futures",
  "ikigai-core",
- "ikigai-resolve",
+ "ikigai-resolve 0.4.0",
  "postcard",
  "serde",
  "serde_json",
