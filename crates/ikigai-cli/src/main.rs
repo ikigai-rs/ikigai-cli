@@ -124,6 +124,13 @@ usage:
                                deadline reaches the peer as time left; its retry count stops
                                here (serve sets no retry budget, so the peer uses its own), and
                                a spent deadline is answered, not refused
+  ikigai serve <s> --mount <p>=<t> --pending
+                               start before the peer is up: the mount flag --pending FOLLOWS
+                               (--mount or --override) dials on first use, each read is
+                               Unavailable until the peer answers, and no restart is needed.
+                               Without it, a peer that does not answer stops the start.
+                               A served host's mount flags go after the word `serve`, before
+                               or after its target; `ikigai --mount … serve <s>` is refused
   ikigai serve … --code-signer <k>  accept SIGNED programs (urn:lisp:run) vouched for by key
                                resource <k> (repeatable; --code-signers-dir sets where
                                urn:codekey:{file} reads from). Without it the door is unbound.
@@ -617,6 +624,24 @@ struct Mount {
     target: String,
     certs: Certs,
     kind: MountKind,
+    /// `--pending` on a served `--mount`/`--override` (ledger #3169): dial on first use, as
+    /// `--prefer` always does, so the host may start before its peer. Off, the mount dials
+    /// while the process starts and a peer that does not answer stops the start.
+    pending: bool,
+}
+
+/// `--pending`, which belongs to the mount it FOLLOWS, as a cert flag does.
+fn mark_pending(flags: &mut [Mount]) -> Result<(), String> {
+    match flags.last_mut() {
+        None => Err("--pending must follow the --mount or --override it applies to".to_string()),
+        Some(mount) if mount.kind == MountKind::Prefer => Err(
+            "--pending does not apply to --prefer, which already dials on first use".to_string(),
+        ),
+        Some(mount) => {
+            mount.pending = true;
+            Ok(())
+        }
+    }
 }
 
 /// The prefixes one mount flag (or `mount =` line) names. `urn:layer:,urn:layers:,urn:collab:`
@@ -752,6 +777,7 @@ fn mount_posture(mounts: &[Mount], declined: bool) -> ikigai_embedded::posture::
                 prefix: mount.prefix.clone(),
                 target: mount.target.clone(),
                 cert_dir: mount.certs.cert_dir.clone(),
+                pending: mount.pending,
             })
             .collect(),
     )
@@ -1489,6 +1515,10 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 mounts.declined = true;
                 continue;
             }
+            if arg == "--pending" {
+                mark_pending(&mut mounts.flags)?;
+                continue;
+            }
             if let Some(kind) = match arg.as_str() {
                 "--mount" => Some(MountKind::Alias),
                 "--override" => Some(MountKind::Override),
@@ -1506,6 +1536,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                     target: target.to_string(),
                     certs: certs.clone(),
                     kind,
+                    pending: false,
                 });
                 continue;
             }
@@ -1702,6 +1733,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                     target: target.to_string(),
                     certs: certs.clone(),
                     kind,
+                    pending: false,
                 });
                 continue;
             }
@@ -1813,6 +1845,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                     target: socket.to_string(),
                     certs: repl.certs.clone(),
                     kind: MountKind::Alias,
+                    pending: false,
                 });
             }
             "--override" => {
@@ -1831,6 +1864,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                     target: target.to_string(),
                     certs: repl.certs.clone(),
                     kind: MountKind::Override,
+                    pending: false,
                 });
             }
             "--no-config-mounts" => {
@@ -1870,6 +1904,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                     target: target.to_string(),
                     certs: repl.certs.clone(),
                     kind: MountKind::Prefer,
+                    pending: false,
                 });
             }
             "-c" | "--command" => {
@@ -2986,6 +3021,7 @@ fn mounts_from_config_lines(
                 target,
                 certs,
                 kind,
+                pending: false,
             })
         })
         .collect()
@@ -3011,7 +3047,9 @@ fn home_dir() -> std::path::PathBuf {
 /// `--mount` and `--override` connect NOW: you named that peer because you want
 /// its namespace, and a silent no-op is the failure mode worth being loud about.
 /// `--prefer` connects on demand — its whole contract is that the peer may be
-/// absent, so an absent peer at startup is normal operation, not an error.
+/// absent, so an absent peer at startup is normal operation, not an error. A served
+/// `--mount` or `--override` that says `--pending` connects on demand too: the operator
+/// asked for that by name, and the banner says so.
 ///
 /// One spec PER PREFIX, every one holding the SAME resolver: a mount that names several
 /// prefixes ([`mount_prefixes`]) is one connection serving all of them, not one per prefix.
@@ -3022,12 +3060,16 @@ fn resolve_mount(mount: Mount) -> Result<Vec<ikigai_embedded::MountSpec>, String
         target,
         certs,
         kind,
+        pending,
     } = mount;
     let prefixes = mount_prefixes(&prefix)?;
-    let resolver: std::sync::Arc<dyn ikigai_resolve::Resolver> = if kind == MountKind::Prefer {
+    let lazy = pending || kind == MountKind::Prefer;
+    let resolver: std::sync::Arc<dyn ikigai_resolve::Resolver> = if lazy {
         std::sync::Arc::new(LazyResolver {
             target: target.clone(),
             certs,
+            kind,
+            alias_hello: alias_hello(kind, &prefixes),
             inner: std::sync::Mutex::new(None),
             entries_failed: std::sync::Mutex::new(None),
         })
@@ -3093,6 +3135,10 @@ fn resolve_one_mount(mount: Mount) -> Result<ikigai_embedded::MountSpec, String>
 struct LazyResolver {
     target: String,
     certs: Certs,
+    /// What the dial says it is for: a `--prefer`, or a `--pending` mount's own kind.
+    kind: MountKind,
+    /// The hello this mount's connection says, [`alias_hello`]'s answer for its prefixes.
+    alias_hello: bool,
     inner: std::sync::Mutex<Option<std::sync::Arc<dyn ikigai_resolve::Resolver>>>,
     /// When the last `entries()` dial FAILED — the negative cache that keeps an
     /// enumeration-happy session from paying the connect bound on every `list`
@@ -3113,8 +3159,7 @@ impl LazyResolver {
         if let Some(resolver) = self.inner.lock().unwrap().clone() {
             return Ok(resolver);
         }
-        // A prefer mount forwards IRIs unchanged, so it speaks verbatim.
-        let resolver = connect_mount(&self.target, &self.certs, MountKind::Prefer, false)
+        let resolver = connect_mount(&self.target, &self.certs, self.kind, self.alias_hello)
             .map_err(|e| ikigai_core::Error::Unavailable(format!("{}: {e}", self.target)))?;
         *self.inner.lock().unwrap() = Some(std::sync::Arc::clone(&resolver));
         Ok(resolver)
@@ -3182,7 +3227,7 @@ impl ikigai_resolve::Resolver for LazyResolver {
 
     /// The enumeration, keeping the failure — with ONE failure deliberately swallowed.
     ///
-    /// ★ A `--prefer` mount's whole contract is that the peer may be absent, so a peer
+    /// ★ A lazy mount's whole contract is that the peer may be absent, so a peer
     /// that will not DIAL is normal operation, not a degraded catalog: reporting it as an
     /// error would put a "mount unavailable" row in the manifold of every laptop whose
     /// workstation is asleep. A peer that is CONNECTED and then goes silent is the
@@ -5750,6 +5795,7 @@ mod mount_posture_tests {
             target: "/tmp/x.sock".to_string(),
             certs: Certs::default(),
             kind,
+            pending: false,
         }
     }
 
@@ -5991,6 +6037,7 @@ mod mount_posture_tests {
             target: target.to_string(),
             certs: Certs::default(),
             kind: MountKind::Prefer,
+            pending: false,
         }
     }
 
@@ -6504,6 +6551,7 @@ mod mount_cert_tests {
             target: path.display().to_string(),
             certs: Certs::default(),
             kind: MountKind::Prefer,
+            pending: false,
         };
         let spec = resolve_one_mount(mount).expect("prefer resolves lazily");
         let entries = spec
@@ -6568,6 +6616,7 @@ mod mount_cert_tests {
             target: "quic://127.0.0.1:1".to_string(),
             certs: Certs::default(),
             kind: MountKind::Prefer,
+            pending: false,
         };
         let spec = resolve_one_mount(mount).expect("a prefer mount must not fail at startup");
         assert!(
@@ -6587,6 +6636,51 @@ mod mount_cert_tests {
             spec.resolver.entries().is_none() && start.elapsed() < ENTRIES_REDIAL_AFTER,
             "the second probe rides the negative cache"
         );
+    }
+
+    /// `--pending` attaches to the mount it follows, and defers that mount's dial.
+    #[test]
+    fn pending_defers_the_dial_of_the_mount_it_follows() {
+        let parsed = parse_argv(
+            argv(&[
+                "serve",
+                "/tmp/s.sock",
+                "--mount",
+                "urn:a:=quic://127.0.0.1:1",
+                "--pending",
+                "--override",
+                "urn:b:=quic://127.0.0.1:2",
+            ])
+            .into_iter(),
+        );
+        let Ok(Some(Mode::Serve { mounts, .. })) = parsed else {
+            panic!("serve parses as serve");
+        };
+        let [first, second] = mounts.flags.as_slice() else {
+            panic!("two mounts");
+        };
+        assert!(first.pending && !second.pending);
+        let spec = resolve_one_mount(first.clone()).expect("a pending mount does not dial");
+        assert!(spec.resolver.transport().contains("not connected"));
+    }
+
+    /// A `--pending` with no mount to apply to, or after a `--prefer`, is a typo, said by name.
+    #[test]
+    fn pending_is_refused_where_it_means_nothing() {
+        let refusal = |args: &[&str]| match parse_argv(argv(args).into_iter()) {
+            Ok(_) => panic!("{args:?} must be refused"),
+            Err(e) => e,
+        };
+        let e = refusal(&["serve", "/tmp/s.sock", "--pending"]);
+        assert!(e.contains("must follow the --mount or --override"), "{e}");
+        let e = refusal(&[
+            "serve",
+            "/tmp/s.sock",
+            "--prefer",
+            "urn:a:=/tmp/a.sock",
+            "--pending",
+        ]);
+        assert!(e.contains("already dials on first use"), "{e}");
     }
 
     /// Per-file overrides ride along with the mount too, not just --cert-dir.
@@ -6718,6 +6812,7 @@ mod mount_flag_tests {
             target: absent.to_string(),
             certs: Certs::default(),
             kind: MountKind::Prefer,
+            pending: false,
         })
         .expect("a prefer mount resolves lazily");
         // First use dials — and the failure names --prefer.
@@ -7543,6 +7638,7 @@ mod prefer_mount_capability_tests {
             target: path.display().to_string(),
             certs: Certs::default(),
             kind: MountKind::Prefer,
+            pending: false,
         })
         .expect("a prefer mount never dials at startup");
         let local = Kernel::new(Arc::new(ikigai_resolve::MountedRemote::overriding(

@@ -506,6 +506,14 @@ they FOLLOW, so two peers never share a certificate set. The config home's `moun
 (`mount = "override urn:x:=quic://host:4433 ~/certs/x"`) say the same thing for the whole
 machine.
 
+`--mount` and `--override` dial while the process starts, and a peer that does not answer
+stops the start. On `ikigai serve`, `--pending` after one of them (`ikigai serve <s> --mount
+urn:x:=/tmp/x.sock --pending`) defers that mount's dial to first use instead: the host starts
+without the peer, a read answers `Unavailable` until the peer does, and no restart is needed.
+The startup banner's line for such a mount says `[pending: …]`. A `list` that found the peer
+absent does not look again for 30 seconds. A served host's mount flags go after the word
+`serve`; `ikigai --mount … serve <s>` is refused as an unknown argument.
+
 An alias mount at a whole first segment (`--mount urn:quakes:=…`) strips it: the peer
 receives `urn:quakes:regions` as `urn:regions`. An alias mount DEEPER than one segment
 (`--mount urn:quakes:near:=…`, ledger #2735) forwards the name UNCHANGED: the peer receives
