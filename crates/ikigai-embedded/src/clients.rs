@@ -8,7 +8,7 @@
 //! authority is a function of WHICH certificate authenticated.
 //!
 //! The mapping lives in `clients.json`, beside `grants.json` in the ikigai config home
-//! (env override `IKIGAI_CLIENTS`), and reuses the grants machinery rather than
+//! (or the file `--clients <file>` names), and reuses the grants machinery rather than
 //! inventing a parallel vocabulary of scopes — a *client* maps to a **grant name**, and
 //! [`grant_scopes`](crate::grant_scopes) says what that name means:
 //!
@@ -110,15 +110,42 @@ struct Entry {
     principal: Option<String>,
 }
 
-/// Where the per-identity client map is read from: `$IKIGAI_CLIENTS` else
+/// Where the per-identity client map is read from: `--clients` else
 /// `clients.json` in the [config home](crate::config::config_home) — beside `grants.json`,
 /// which it references by name. "Beside" is the whole point, so both resolve the config
 /// home the same way; this file once spelled it `$HOME/.config/ikigai` directly, which put
 /// it in a different directory than `config.toml` wherever `XDG_CONFIG_HOME` was set.
-pub fn clients_path() -> Option<PathBuf> {
-    std::env::var_os("IKIGAI_CLIENTS")
-        .map(PathBuf::from)
-        .or_else(|| crate::config::config_home().map(|dir| dir.join("clients.json")))
+///
+/// # Errors
+///
+/// A set `IKIGAI_CLIENTS` is refused, including an empty value. Unset it and pass
+/// `--clients <file>` instead.
+pub fn clients_path() -> Result<Option<PathBuf>, String> {
+    if std::env::var_os("IKIGAI_CLIENTS").is_some() {
+        return Err(
+            "IKIGAI_CLIENTS is no longer supported; move its path to --clients <file>.".into(),
+        );
+    }
+    if let Some(path) = explicit_path() {
+        return Ok(Some(path));
+    }
+    Ok(crate::config::config_home().map(|dir| dir.join("clients.json")))
+}
+
+static CLIENTS_PATH_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Point [`clients_path`] at `path`, ahead of the config home: the `--clients <file>` flag.
+/// Process-global, like [`set_grants_path`](crate::set_grants_path). A file named this way
+/// must exist: [`enrolment`] refuses one that does not.
+pub fn set_clients_path(path: PathBuf) {
+    *CLIENTS_PATH_OVERRIDE.lock().expect("clients path lock") = Some(path);
+}
+
+fn explicit_path() -> Option<PathBuf> {
+    CLIENTS_PATH_OVERRIDE
+        .lock()
+        .expect("clients path lock")
+        .clone()
 }
 
 /// The parsed enrolment: fingerprint → grant name, plus the operator's *explicit*
@@ -213,16 +240,25 @@ impl Enrolment {
 
 /// Read the enrolment from `clients_path()`.
 ///
-/// `Ok(None)` means there is no such file — the server keeps its historical postures.
-/// `Err` means the file EXISTS and is unusable: a broken authority config must stop the
-/// server, not degrade it into serving everyone under the old shared ceiling.
+/// `Ok(None)` means the config home has no such file — the server keeps its historical
+/// postures. `Err` means the file EXISTS and is unusable, or a file named by `--clients` is not
+/// there, or `IKIGAI_CLIENTS` is set: a broken authority config must stop the server, not
+/// degrade it into serving everyone under the old shared ceiling.
 pub fn enrolment() -> Result<Option<Enrolment>, String> {
-    let Some(path) = clients_path() else {
+    let Some(path) = clients_path()? else {
         return Ok(None);
     };
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if explicit_path().is_some() {
+                return Err(format!(
+                    "--clients names a file that does not exist: {}",
+                    path.display()
+                ));
+            }
+            return Ok(None);
+        }
         Err(e) => return Err(format!("read {}: {e}", path.display())),
     };
     parse(&text)
@@ -356,7 +392,10 @@ pub fn authorize(fingerprint: &str, ceiling: &Capability) -> Result<Authority, S
         None => {
             return Err(format!(
                 "no client enrolment file ({})",
-                clients_path().map_or_else(|| "unset".into(), |p| p.display().to_string())
+                clients_path()
+                    .ok()
+                    .flatten()
+                    .map_or_else(|| "unset".into(), |p| p.display().to_string())
             ))
         }
     };

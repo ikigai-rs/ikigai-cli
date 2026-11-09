@@ -14,7 +14,7 @@ fn an_enrolled_client_receives_the_legacy_grants_refusal() {
     )
     .unwrap();
     std::fs::write(&grants, r#"{"reader":["urn:cap:personal:contacts:read"]}"#).unwrap();
-    std::env::set_var("IKIGAI_CLIENTS", &clients);
+    ikigai_embedded::clients::set_clients_path(clients);
     std::env::remove_var("IKIGAI_GRANTS");
     ikigai_embedded::set_grants_path(grants);
     assert!(ikigai_embedded::clients::authorize(fingerprint, &Capability::root()).is_ok());
