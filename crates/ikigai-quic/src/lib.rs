@@ -15,11 +15,19 @@
 //!
 //! quinn is async; the sync [`Resolver`] hides a `tokio` runtime, just as the
 //! embedded kernel hides its executor.
+//!
+//! A door a host means to stop or restart serves through [`serve_draining_on`] with a
+//! [`Drain`]: triggering it lets the calls in progress finish and their replies land, turns new
+//! ones away so the client sends them again, and holds new handshakes for the next process.
 
+use std::future::pending;
 use std::io;
 use std::net::SocketAddr;
+use std::pin::pin;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
+use futures::future::{select, Either};
 use ikigai_core::{
     Capability, Clock, Error, Iri, Kernel, Representation, Request, SpaceEntry, SystemClock, Tracer,
 };
@@ -266,14 +274,22 @@ pub type TrustList = Arc<dyn Fn() -> io::Result<Vec<String>> + Send + Sync>;
 const UNAUTHORIZED: u32 = 1;
 
 /// The QUIC application close code for a connection closed because it reached the door's
-/// connection-age bound ([`serve_bounded`]). Not an error: the client's next call redials,
-/// and the new connection is minted afresh, which is the point.
+/// connection-age bound ([`serve_bounded`]) or by a [`Drain`]. Not an error: the client's next
+/// call redials, and the new connection is minted afresh, which is the point.
+///
+/// As a STREAM reset it means something narrower, which the client relies on: the door turned
+/// this call away without reading it, so it cannot have run. `serve_connection_aged` is its
+/// only sender, on a stream the door never read.
 const AGED: u32 = 3;
 
 /// How long a connection that reached its age bound mid-call waits for the peer to
 /// acknowledge that call's reply before the door closes it. A reply the door has finished
 /// writing is not yet DELIVERED, and closing at once would throw it away.
 const REPLY_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How much of a [`Drain`]'s cap is kept for the close: a connection still working when the cap
+/// is this close closes, so its peer is told and the door still returns inside the cap.
+const CLOSE_FLUSH: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// How long a CALL may be silent: the default per-call deadline ([`connect_with`] starts
 /// [`QuicResolver::with_call_timeout`] at the `idle` it is given), and a SERVER's idle timeout.
@@ -362,6 +378,129 @@ pub const CANCELED: u32 = 0x1335;
 /// call deadline.
 pub const MAX_CALLS_PER_CONNECTION: usize = 16;
 
+/// Stops a door without losing the calls it is answering: pass it to [`serve_draining_on`] and
+/// call [`trigger`](Self::trigger) once when the door should stop. Cloned freely, and usable
+/// from any thread, inside or outside a runtime.
+///
+/// ★ **Why a door drains.** A process that stops ends every call in flight, so a write in
+/// progress fails with a transport error and its client cannot tell whether it applied. A drain
+/// sends every live connection down the path a connection past its age bound takes
+/// ([`serve_bounded`]):
+///
+/// - a call in progress finishes and its reply is delivered (each waited for up to five
+///   seconds), then the connection closes;
+/// - a call opened after the trigger is turned away unread, its stream reset under code 3, so
+///   [`QuicResolver`] sends it again on a new connection, a Sink or Delete included: it did
+///   not run;
+/// - a handshake that arrives is IGNORED, never refused. A refused client fails at once, while
+///   an ignored one retransmits and connects to the next process on the port.
+///
+/// The door stops accepting work the moment the drain is triggered, and the serve function
+/// returns [`Served::Drained`] once its connections have closed or `cap` has passed. A call
+/// still running at the cap has its connection closed under it, and its thread is left to the
+/// process's exit: a host drains in order to exit.
+///
+/// ⚠ Two limits. A reply fully written just before the trigger is not waited for, as with
+/// [`serve_bounded`]: if its packets are lost and the connection closes before they are
+/// retransmitted, that call fails as a lost reply. And the client's redial is bounded by its
+/// connect timeout (five seconds), so a next process slower than that surfaces as a transient
+/// error; a Sink or Delete turned away by then has not run.
+#[derive(Clone, Debug, Default)]
+pub struct Drain {
+    /// When the door closes what is left and when it returns; `None` until triggered.
+    trigger: Arc<tokio::sync::watch::Sender<Option<Trigger>>>,
+    /// The connections closed at the cap with calls still running.
+    cut_off: Arc<AtomicUsize>,
+}
+
+/// The two instants a triggered [`Drain`] set.
+#[derive(Clone, Copy, Debug)]
+struct Trigger {
+    close_at: tokio::time::Instant,
+    return_at: tokio::time::Instant,
+}
+
+impl Drain {
+    /// A drain that has not been triggered: a door serving under it behaves as a door without
+    /// one.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Start the drain, giving the door at most `cap` to finish. Only the first trigger counts,
+    /// so a second signal cannot move the deadline.
+    pub fn trigger(&self, cap: std::time::Duration) {
+        // tokio's clock, as in `serve_connection_aged`.
+        let now = tokio::time::Instant::now();
+        let trigger = Trigger {
+            close_at: now + cap.saturating_sub(CLOSE_FLUSH),
+            return_at: now + cap,
+        };
+        self.trigger.send_if_modified(|current| {
+            let first = current.is_none();
+            if first {
+                *current = Some(trigger);
+            }
+            first
+        });
+    }
+
+    fn is_triggered(&self) -> bool {
+        self.trigger.borrow().is_some()
+    }
+
+    /// Wait for the trigger.
+    async fn triggered(&self) -> Trigger {
+        let mut trigger = self.trigger.subscribe();
+        // A statement of its own: the `Ref` it yields must not be held across an await.
+        let fired = trigger
+            .wait_for(Option::is_some)
+            .await
+            .ok()
+            .and_then(|t| *t);
+        match fired {
+            Some(fired) => fired,
+            // `self` holds the sender, and the value is only ever set.
+            None => pending().await,
+        }
+    }
+
+    fn cut_off(&self) -> usize {
+        self.cut_off.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// [`Drain::triggered`], never ready for a door with no drain.
+async fn triggered(drain: Option<&Drain>) -> Trigger {
+    match drain {
+        Some(drain) => drain.triggered().await,
+        None => pending().await,
+    }
+}
+
+/// Why a door's serve function returned without an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Served {
+    /// The endpoint stopped on its own; nobody asked for it. What the functions that return
+    /// `io::Result<()>` report as `Ok(())`.
+    Stopped,
+    /// A [`Drain`] was triggered and the door has finished. `cut_off` counts the connections
+    /// closed at the cap with calls still running: 0 is a clean drain.
+    Drained { cut_off: usize },
+}
+
+/// Which client certificates a door admits, for [`serve_draining_on`]: the three the serve
+/// functions take.
+pub enum Admission<'a> {
+    /// Exactly these certificates, for the door's whole life, as [`serve_shared_on`] pins them.
+    Pinned(&'a [String]),
+    /// The certificates a [`TrustList`] names at each handshake, as [`serve_trusting_on`].
+    Live(TrustList),
+    /// A [`TrustList`] plus a lobby for any other certificate, as [`serve_lobby_on`].
+    Lobby { trust: TrustList, lobby: Minter },
+}
+
 pub fn serve(
     kernel: Kernel,
     addr: SocketAddr,
@@ -413,8 +552,8 @@ pub fn serve_with(
 /// finish and their replies are delivered (each waited for up to five seconds) before the
 /// door closes with code 3; a connection that is idle when it passes is closed then. A call
 /// the client opens while those finish is turned away at once (its stream reset under code
-/// 3), so the resolver redials rather than wait behind them; a read is replayed on the new
-/// connection, a Sink or Delete is not (it did not run). The resolver from
+/// 3, unread), so the resolver redials rather than wait behind them, and sends it again on
+/// the new connection, a Sink or Delete included: it did not run. The resolver from
 /// [`connect_with`] heals onto a new connection at its next call, minted afresh — refused,
 /// if the client was revoked. ⚠ One race remains: a call the client opens in the instant
 /// the door closes fails as a lost reply, and a Sink or Delete is then NOT replayed (the
@@ -508,8 +647,11 @@ pub fn serve_shared_on(
     idle: std::time::Duration,
     max_age: Option<std::time::Duration>,
 ) -> io::Result<()> {
-    let config = server_config(identity, trusted_client_cert_pems, idle)?;
-    serve_config_on(kernel, socket, identity, config, minter, max_age)
+    let admission = Admission::Pinned(trusted_client_cert_pems);
+    serve_admitting(
+        kernel, socket, identity, admission, minter, idle, max_age, None,
+    )
+    .map(drop)
 }
 
 /// [`serve_shared_on`] with a [`TrustList`] read at every handshake instead of a fixed set
@@ -526,11 +668,11 @@ pub fn serve_trusting_on(
     idle: std::time::Duration,
     max_age: Option<std::time::Duration>,
 ) -> io::Result<()> {
-    for pem in trust()? {
-        load_cert(&pem)?;
-    }
-    let config = server_config_pinning(identity, Pins::Live(trust), idle, alpn_protocols())?;
-    serve_config_on(kernel, socket, identity, config, minter, max_age)
+    let admission = Admission::Live(trust);
+    serve_admitting(
+        kernel, socket, identity, admission, minter, idle, max_age, None,
+    )
+    .map(drop)
 }
 
 /// [`serve_trusting_on`] for a door with a LOBBY (ledger #2009): it also admits a client
@@ -566,18 +708,75 @@ pub fn serve_lobby_on(
     idle: std::time::Duration,
     max_age: Option<std::time::Duration>,
 ) -> io::Result<()> {
-    for pem in trust()? {
-        load_cert(&pem)?;
-    }
-    let config = server_config_pinning(identity, Pins::AnyInWindow, idle, alpn_protocols())?;
-    serve_config_on(
+    let admission = Admission::Lobby { trust, lobby };
+    serve_admitting(
+        kernel, socket, identity, admission, minter, idle, max_age, None,
+    )
+    .map(drop)
+}
+
+/// A door a host can stop without losing its calls: [`serve_shared_on`],
+/// [`serve_trusting_on`] or [`serve_lobby_on`] (whichever `admission` names), until `drain`
+/// is triggered. See [`Drain`] for what triggering it does.
+///
+/// Returns once the door has drained, as [`Served::Drained`], which is how the caller tells a
+/// drain from a door that failed (`Err`) or stopped on its own ([`Served::Stopped`]). Until
+/// then it behaves as the function `admission` names.
+#[allow(clippy::too_many_arguments)] // one door's whole configuration, in the order its siblings take it
+pub fn serve_draining_on(
+    kernel: Arc<Kernel>,
+    socket: std::net::UdpSocket,
+    identity: &Identity,
+    admission: Admission<'_>,
+    minter: Minter,
+    idle: std::time::Duration,
+    max_age: Option<std::time::Duration>,
+    drain: &Drain,
+) -> io::Result<Served> {
+    serve_admitting(
         kernel,
         socket,
         identity,
-        config,
-        lobby_router(trust, minter, lobby),
+        admission,
+        minter,
+        idle,
         max_age,
+        Some(drain),
     )
+}
+
+/// Every door that names its [`Admission`]: build the config it needs, then serve.
+#[allow(clippy::too_many_arguments)] // as `serve_draining_on`, plus whether it can drain
+fn serve_admitting(
+    kernel: Arc<Kernel>,
+    socket: std::net::UdpSocket,
+    identity: &Identity,
+    admission: Admission<'_>,
+    minter: Minter,
+    idle: std::time::Duration,
+    max_age: Option<std::time::Duration>,
+    drain: Option<&Drain>,
+) -> io::Result<Served> {
+    let (config, minter) = match admission {
+        Admission::Pinned(pems) => (server_config(identity, pems, idle)?, minter),
+        Admission::Live(trust) => {
+            for pem in trust()? {
+                load_cert(&pem)?;
+            }
+            let pins = Pins::Live(trust);
+            let config = server_config_pinning(identity, pins, idle, alpn_protocols())?;
+            (config, minter)
+        }
+        Admission::Lobby { trust, lobby } => {
+            for pem in trust()? {
+                load_cert(&pem)?;
+            }
+            let pins = Pins::AnyInWindow;
+            let config = server_config_pinning(identity, pins, idle, alpn_protocols())?;
+            (config, lobby_router(trust, minter, lobby))
+        }
+    };
+    serve_config_on(kernel, socket, identity, config, minter, max_age, drain)
 }
 
 /// The [`Minter`] a lobby door runs: the trusted path for a listed certificate, the lobby for
@@ -607,14 +806,22 @@ fn serve_config_on(
     config: quinn::ServerConfig,
     minter: Minter,
     max_age: Option<std::time::Duration>,
-) -> io::Result<()> {
+    drain: Option<&Drain>,
+) -> io::Result<Served> {
     let endpoint_config = endpoint_config(identity);
     let runtime = Runtime::new()?;
-    runtime.block_on(async move {
+    let served: io::Result<Served> = runtime.block_on(async move {
         let endpoint = endpoint_on(config, socket, endpoint_config)?;
-        while let Some(incoming) = endpoint.accept().await {
+        // The trigger is polled first, so a stream of handshakes cannot hold a drain off.
+        let trigger = loop {
+            let incoming = match select(pin!(triggered(drain)), pin!(endpoint.accept())).await {
+                Either::Left((trigger, _)) => break trigger,
+                Either::Right((Some(incoming), _)) => incoming,
+                Either::Right((None, _)) => return Ok(Served::Stopped),
+            };
             let kernel = Arc::clone(&kernel);
             let minter = Arc::clone(&minter);
+            let drain = drain.cloned();
             tokio::spawn(async move {
                 if let Ok(connection) = incoming.await {
                     // mTLS verified the peer is one of the enrolled clients; mint that
@@ -624,7 +831,7 @@ fn serve_config_on(
                     // on its next connection rather than at the end of some TTL.
                     match minter(&PeerIdentity::of(&connection)) {
                         Some(session) => {
-                            serve_connection_aged(kernel, connection, session, max_age).await
+                            serve_connection_aged(kernel, connection, session, max_age, drain).await
                         }
                         // Authenticated but not authorized: close rather than serve. The
                         // alternative — falling back to a shared ceiling — is how a
@@ -636,9 +843,28 @@ fn serve_config_on(
                     }
                 }
             });
-        }
-        Ok(())
-    })
+        };
+        // Every connection is on its way to closing (`serve_connection_aged`), each by the
+        // cap. New handshakes wait for the next process: an `Incoming` dropped here would be
+        // refused, and so would `Endpoint::close`, which is why it is never called.
+        tokio::spawn({
+            let endpoint = endpoint.clone();
+            async move {
+                while let Some(incoming) = endpoint.accept().await {
+                    incoming.ignore();
+                }
+            }
+        });
+        let _ = tokio::time::timeout_at(trigger.return_at, endpoint.wait_idle()).await;
+        let cut_off = drain.map_or(0, Drain::cut_off);
+        Ok(Served::Drained { cut_off })
+    });
+    if matches!(served, Ok(Served::Drained { .. })) {
+        // ★ Dropping a runtime waits for every task, and a call that never finishes is one
+        // (`block_in_place`) the wait would never end for, so the cap would mean nothing.
+        runtime.shutdown_background();
+    }
+    served
 }
 
 /// The server endpoint over a bound socket, under `endpoint_config` (see
@@ -768,7 +994,7 @@ fn peer_cert_id(connection: &quinn::Connection) -> String {
 /// [`serve_connection_aged`].)
 #[cfg(test)]
 async fn serve_connection(kernel: &Arc<Kernel>, connection: quinn::Connection, session: Session) {
-    serve_connection_aged(Arc::clone(kernel), connection, session, None).await;
+    serve_connection_aged(Arc::clone(kernel), connection, session, None, None).await;
 }
 
 /// [`serve_connection`], closing the connection once it is `max_age` old — see
@@ -783,6 +1009,7 @@ async fn serve_connection_aged(
     connection: quinn::Connection,
     session: Session,
     max_age: Option<std::time::Duration>,
+    drain: Option<Drain>,
 ) {
     let Some(version) = negotiated_version(&connection) else {
         connection.close(
@@ -794,18 +1021,18 @@ async fn serve_connection_aged(
     let session = Arc::new(session);
     // tokio's clock, not `std::time::Instant` (banned workspace-wide for wasm's sake): this
     // crate is native-only, and the deadline is compared only with tokio's own timers.
-    let deadline = max_age.map(|age| tokio::time::Instant::now() + age);
+    let closing = Closing {
+        age: max_age.map(|age| tokio::time::Instant::now() + age),
+        drain,
+    };
     // One permit per call in progress. A call holds its permit until its reply is written
-    // (and, past the age bound, delivered), so taking EVERY permit is how the age bound
-    // waits for the calls in progress to finish.
+    // (and, past the age bound or into a drain, delivered), so taking EVERY permit is how the
+    // door waits for the calls in progress to finish.
     let in_flight = Arc::new(tokio::sync::Semaphore::new(MAX_CALLS_PER_CONNECTION));
     loop {
-        let next = match deadline {
-            Some(at) => match tokio::time::timeout_at(at, connection.accept_bi()).await {
-                Ok(next) => next,
-                Err(_elapsed) => break,
-            },
-            None => connection.accept_bi().await,
+        let next = match select(pin!(closing.reached()), pin!(connection.accept_bi())).await {
+            Either::Left(_) => break,
+            Either::Right((next, _)) => next,
         };
         let Ok((send, recv)) = next else {
             return;
@@ -814,8 +1041,9 @@ async fn serve_connection_aged(
             Ok(permit) => {
                 let kernel = Arc::clone(&kernel);
                 let session = Arc::clone(&session);
+                let closing = closing.clone();
                 tokio::spawn(async move {
-                    answer(&kernel, &session, send, recv, version, deadline).await;
+                    answer(&kernel, &session, send, recv, version, &closing).await;
                     drop(permit);
                 });
             }
@@ -824,11 +1052,11 @@ async fn serve_connection_aged(
             }
         }
     }
-    // The bound passed: run nothing more, let the calls in progress finish and their replies
-    // land (idle, this returns at once), then close. Meanwhile a call opened on this connection
-    // is turned away at once, both halves reset under code 3, rather than left unaccepted
-    // behind a long call (a long poll) past its own deadline: its client heals onto a new
-    // connection, where a read is replayed and a Sink or Delete fails as a transient (not run).
+    // The bound passed or a drain began: run nothing more, let the calls in progress finish and
+    // their replies land (idle, this returns at once), then close. Meanwhile a call opened on
+    // this connection is turned away at once and UNREAD, both halves reset under code 3, rather
+    // than left unaccepted behind a long call (a long poll) past its own deadline: nothing
+    // below can reach the kernel, which is what lets its client send it again.
     let turn_away = tokio::spawn({
         let connection = connection.clone();
         async move {
@@ -839,12 +1067,55 @@ async fn serve_connection_aged(
         }
     });
     let all = u32::try_from(MAX_CALLS_PER_CONNECTION).unwrap_or(u32::MAX);
-    let _ = in_flight.acquire_many(all).await;
-    connection.close(
-        AGED.into(),
-        b"this door bounds connection age; reconnect to continue",
-    );
+    let _ = select(pin!(in_flight.acquire_many(all)), pin!(closing.capped())).await;
+    connection.close(AGED.into(), closing.reason());
     turn_away.abort();
+}
+
+/// What ends a connection's taking of new calls: its age bound, a [`Drain`], or neither.
+#[derive(Clone)]
+struct Closing {
+    age: Option<tokio::time::Instant>,
+    drain: Option<Drain>,
+}
+
+impl Closing {
+    /// Ready once the bound has passed or the drain was triggered; never otherwise.
+    async fn reached(&self) {
+        let age = async {
+            match self.age {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => pending().await,
+            }
+        };
+        select(pin!(age), pin!(triggered(self.drain.as_ref()))).await;
+    }
+
+    fn passed(&self) -> bool {
+        let aged = self.age.is_some_and(|at| tokio::time::Instant::now() >= at);
+        aged || self.drain.as_ref().is_some_and(Drain::is_triggered)
+    }
+
+    /// Ready when a drain's cap leaves only the time to close, counting this connection as cut
+    /// off; never for a connection that is not draining.
+    async fn capped(&self) {
+        let Some(drain) = &self.drain else {
+            return pending().await;
+        };
+        tokio::time::sleep_until(drain.triggered().await.close_at).await;
+        drain
+            .cut_off
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The reason the connection's close carries, which can reach a person in a transient error.
+    fn reason(&self) -> &'static [u8] {
+        if self.drain.as_ref().is_some_and(Drain::is_triggered) {
+            b"this door is shutting down; reconnect to continue"
+        } else {
+            b"this door bounds connection age; reconnect to continue"
+        }
+    }
 }
 
 /// Answer ONE call: read it (at most [`MAX_MESSAGE`]), resolve it under the connection's
@@ -857,7 +1128,7 @@ async fn answer(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     version: u32,
-    deadline: Option<tokio::time::Instant>,
+    closing: &Closing,
 ) {
     let Some(bytes) = read_call(&mut recv, version).await else {
         return;
@@ -866,9 +1137,9 @@ async fn answer(
         Opened::Plain(bytes) => bytes,
         Opened::Frames => {
             let answered = stream::answer_streamed(kernel, session, send, recv, version).await;
-            // As below: past the age bound, let the answer land before the door closes.
+            // As below: past the bound, let the answer land before the door closes.
             if let Some(send) = answered {
-                if deadline.is_some_and(|at| tokio::time::Instant::now() >= at) {
+                if closing.passed() {
                     let _ = tokio::time::timeout(REPLY_GRACE, send.stopped()).await;
                 }
             }
@@ -887,9 +1158,9 @@ async fn answer(
         let _ = send.write_all(&out).await;
         let _ = send.finish();
     }
-    // The age bound passed while this call ran: the door closes once every call in progress
-    // is done, so let this reply land first.
-    if deadline.is_some_and(|at| tokio::time::Instant::now() >= at) {
+    // The bound passed or a drain began while this call ran: the door closes once every call in
+    // progress is done, so let this reply land first.
+    if closing.passed() {
         let _ = tokio::time::timeout(REPLY_GRACE, send.stopped()).await;
     }
 }
@@ -1299,7 +1570,9 @@ impl Wire {
     /// lost. Then only a `replayable` call (a read) is sent again; a Sink or Delete
     /// surfaces the transient for its CALLER to decide, because running it twice is not
     /// the transport's choice to make (ledger #733, finding Q2). The connection still
-    /// heals: the next call's stream fails to open on the dead one and reconnects.
+    /// heals: the next call's stream fails to open on the dead one and reconnects. A stream
+    /// the door reset under [`AGED`] is the one reply-side failure that proves the call did
+    /// not run, so it counts as never sent, and a Sink or Delete is sent again too.
     async fn round_trip(&self, request: Vec<u8>, replayable: bool) -> io::Result<Reply> {
         use std::sync::atomic::Ordering;
         if self.stale.swap(false, Ordering::SeqCst) {
@@ -1344,11 +1617,15 @@ impl Wire {
             .finish()
             .map_err(|e| Attempt::Unsent(connection_error(self.addr, &connection, e)))?;
         stream.sent = true;
-        let bytes = stream
-            .recv
-            .read_to_end(MAX_MESSAGE)
-            .await
-            .map_err(|e| Attempt::Sent(connection_error(self.addr, &connection, e)))?;
+        let bytes = stream.recv.read_to_end(MAX_MESSAGE).await.map_err(|e| {
+            let turned_away = turned_away(&e);
+            let error = connection_error(self.addr, &connection, e);
+            if turned_away {
+                Attempt::Unsent(error)
+            } else {
+                Attempt::Sent(error)
+            }
+        })?;
         stream.answered = true;
         decode(&bytes).map_err(Attempt::Sent)
     }
@@ -1379,9 +1656,21 @@ impl Wire {
     }
 }
 
+/// Whether a failed reply read means the door turned the call away unread: its stream was
+/// RESET under [`AGED`]. A connection closed under the same code proves nothing about a call
+/// on it, so it does not count, and neither does any other reset.
+fn turned_away(error: &quinn::ReadToEndError) -> bool {
+    matches!(
+        error,
+        quinn::ReadToEndError::Read(quinn::ReadError::Reset(code))
+            if *code == quinn::VarInt::from_u32(AGED)
+    )
+}
+
 /// How an [`attempt`](Wire::attempt) failed, as far as replaying it is concerned.
 enum Attempt {
-    /// The request never reached the peer whole, so it cannot have run.
+    /// The request never reached the kernel: it never reached the peer whole, or the door
+    /// turned it away unread. It cannot have run.
     Unsent(io::Error),
     /// The request was handed over; the peer may have run it and the reply been lost.
     Sent(io::Error),
@@ -4889,5 +5178,133 @@ mod resumption {
         assert_eq!(tls.send_tls13_tickets, 0);
         assert!(!tls.ticketer.enabled());
         assert!(!tls.session_storage.can_cache());
+    }
+}
+
+/// Which failed reply reads the client may send again, against a door scripted to fail each
+/// way (ledger #3325). A stream reset under [`AGED`] is a call the door never read; anything
+/// else may have run.
+#[cfg(test)]
+mod turned_away {
+    use super::*;
+    use ikigai_core::{ArgRef, ReprType, Verb};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// What the scripted door does with one call it has read to the end.
+    #[derive(Clone, Copy)]
+    enum Step {
+        Reset(u32),
+        CloseConnection(u32),
+        Answer,
+    }
+
+    /// A door that counts the calls it reads and plays `script`, one step per call (the last
+    /// step repeats), on a runtime the caller holds; and a client pinned to it.
+    fn scripted(script: Vec<Step>, reads: &Arc<AtomicUsize>) -> (Runtime, QuicResolver) {
+        let server_id = generate();
+        let client_id = generate();
+        let config = server_config(
+            &server_id,
+            std::slice::from_ref(&client_id.cert_pem),
+            DEFAULT_IDLE_TIMEOUT,
+        )
+        .unwrap();
+        let rt = Runtime::new().unwrap();
+        let socket = bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = socket.local_addr().unwrap();
+        let endpoint = rt
+            .block_on(async { endpoint_on(config, socket, endpoint_config(&server_id)) })
+            .unwrap();
+        let reads = Arc::clone(reads);
+        rt.spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                let script = script.clone();
+                let reads = Arc::clone(&reads);
+                tokio::spawn(async move {
+                    let Ok(connection) = incoming.await else {
+                        return;
+                    };
+                    let version = negotiated_version(&connection).unwrap();
+                    while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+                        recv.read_to_end(MAX_MESSAGE).await.unwrap();
+                        let turn = reads.fetch_add(1, Ordering::SeqCst);
+                        match script[turn.min(script.len() - 1)] {
+                            Step::Reset(code) => {
+                                send.reset(code.into()).unwrap();
+                                // Hold the connection so the reset, not a close, is what arrives.
+                                let _ = send.stopped().await;
+                            }
+                            Step::CloseConnection(code) => {
+                                connection.close(code.into(), b"scripted");
+                            }
+                            Step::Answer => {
+                                let reply = Reply::Resolved(
+                                    Representation::new(
+                                        ReprType::new("text/plain"),
+                                        b"appended".to_vec(),
+                                    ),
+                                    CacheStatus::Uncacheable,
+                                );
+                                let out = encode_reply_for_peer(reply, version).unwrap();
+                                send.write_all(&out).await.unwrap();
+                                send.finish().unwrap();
+                                let _ = send.stopped().await;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let client = connect_with(
+            addr,
+            &client_id,
+            &server_id.cert_pem,
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        (rt, client)
+    }
+
+    fn sink() -> Request {
+        Request::new(Verb::Sink, Iri::parse("urn:test:append").unwrap())
+            .with_arg("content", ArgRef::Inline(b"one line".to_vec()))
+    }
+
+    #[test]
+    fn a_sink_reset_under_aged_is_sent_again_on_a_new_connection() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (_door, client) = scripted(vec![Step::Reset(AGED), Step::Answer], &reads);
+        let (answer, _) = client
+            .issue(sink())
+            .expect("a turned-away Sink is sent again");
+        assert_eq!(answer.bytes, b"appended");
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_sink_reset_under_any_other_code_is_not_sent_again() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (_door, client) = scripted(vec![Step::Reset(AGED + 4)], &reads);
+        let lost = client.issue(sink());
+        assert!(lost.is_err(), "the reply was lost: {lost:?}");
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "it may have run: no resend"
+        );
+    }
+
+    /// The same number as a CONNECTION close says nothing about one call on it.
+    #[test]
+    fn a_sink_whose_connection_closes_under_aged_is_not_sent_again() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (_door, client) = scripted(vec![Step::CloseConnection(AGED)], &reads);
+        let lost = client.issue(sink());
+        assert!(lost.is_err(), "the reply was lost: {lost:?}");
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "it may have run: no resend"
+        );
     }
 }
