@@ -64,7 +64,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       # 2. The remote path a collaborator would use: a QUIC door (`ikigai serve quic://`) and a
       #    one-shot client that reaches it through an --override mount, in a scratch home. The
-      #    door binds port 0 and the client reads the bound port off its banner.
+      #    door binds port 0 and the client reads the bound port off its banner. The scratch home
+      #    enrolls no client, so the door is started with --allow-unenrolled (ledger #3330).
       - id: quic
         name: smoke - a QUIC door and an ikigai -c client through it
         if: steps.build.outcome == 'success'
@@ -77,7 +78,7 @@ jobs:
           mkdir -p "$scratch/config/ikigai"
           export HOME="$scratch" XDG_CONFIG_HOME="$scratch/config" IKIGAI_FILES="$scratch/files"
           "$ikigai" cert generate --dir "$scratch/certs" </dev/null
-          "$ikigai" serve quic://127.0.0.1:0 --name win --cert-dir "$scratch/certs" </dev/null 2>"$scratch/door.log" &
+          "$ikigai" serve quic://127.0.0.1:0 --name win --cert-dir "$scratch/certs" --allow-unenrolled </dev/null 2>"$scratch/door.log" &
           door=$!
           for _ in $(seq 1 240); do
             grep -q 'serving on' "$scratch/door.log" && break
