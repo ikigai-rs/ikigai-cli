@@ -4067,6 +4067,9 @@ fn serve_quic(
     let caps = caps.to_vec();
     let result = (|| -> Result<(), String> {
         let addr = quic::parse_addr(target)?;
+        // Before any authority file is read: refuse one another account could write, and a
+        // private key another account could read, naming the `chmod` that fixes it.
+        ikigai_embedded::authority::check(&quic::authority_paths(certs)?)?;
         let identity = quic::server_identity(certs)?;
         let trusted = quic::trusted_clients(certs)?;
         let max_age = quic_max_connection_age()?;

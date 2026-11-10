@@ -252,6 +252,49 @@ pub fn trusted_clients(certs: &Certs) -> Result<Vec<TrustedClient>, String> {
     Ok(trusted)
 }
 
+/// Every file and directory a serving door takes its authority from, with what it holds:
+/// the server's key and certificate, the base client certificate, the certificate directory,
+/// the `clients/` trust directory and each `*.crt` in it, `clients.json` and `grants.json`.
+/// Checked by [`ikigai_embedded::authority::check`] before the door opens.
+#[cfg(feature = "embedded")]
+pub fn authority_paths(
+    certs: &Certs,
+) -> Result<Vec<(PathBuf, ikigai_embedded::authority::Kind)>, String> {
+    use ikigai_embedded::authority::Kind;
+    let named = |explicit: &Option<String>, name: &str| match explicit {
+        Some(path) => Ok(PathBuf::from(path)),
+        None => default_path(name, certs),
+    };
+    let base = base_dir(certs)?;
+    let clients = base.join("clients");
+    let mut paths = vec![
+        (named(&certs.server_key, "server.key")?, Kind::PrivateKey),
+        (named(&certs.server_cert, "server.crt")?, Kind::Public),
+        (named(&certs.client_cert, "client.crt")?, Kind::Public),
+        (base, Kind::Public),
+        (clients.clone(), Kind::Public),
+    ];
+    if let Ok(entries) = std::fs::read_dir(&clients) {
+        let mut crts: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|e| e == "crt"))
+            .collect();
+        crts.sort();
+        paths.extend(crts.into_iter().map(|path| (path, Kind::Public)));
+    }
+    for path in [
+        ikigai_embedded::clients::clients_path()?,
+        ikigai_embedded::grants_path()?,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        paths.push((path, Kind::Public));
+    }
+    Ok(paths)
+}
+
 /// The server certificate the client pins.
 pub fn trusted_server_cert(certs: &Certs) -> Result<String, String> {
     read(certs.server_cert.clone(), "server.crt", certs)
