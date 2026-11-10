@@ -477,16 +477,18 @@ fn toggle_description(
 /// not write the home: `history_flag()` is seeded through this, so every caller of the flag,
 /// a test included, created `~/.ikigai` as a side effect and failed `just hermetic` (ledger
 /// #1264). The two writers create it: [`ikigai_home_for_writing`].
-fn ikigai_home() -> PathBuf {
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    home.join(".ikigai")
+///
+/// `None` with no usable home ([`config::user_home`]): nothing is kept then, rather than
+/// kept under the working directory.
+fn ikigai_home() -> Option<PathBuf> {
+    Some(config::user_home()?.join(".ikigai"))
 }
 
 /// [`ikigai_home`], created, for the paths that are about to write into it.
-fn ikigai_home_for_writing() -> PathBuf {
-    let dir = ikigai_home();
+fn ikigai_home_for_writing() -> Option<PathBuf> {
+    let dir = ikigai_home()?;
     let _ = std::fs::create_dir_all(&dir);
-    dir
+    Some(dir)
 }
 
 /// Process-global flag: persist command history across invocations? Mirrors
@@ -496,15 +498,19 @@ fn ikigai_home_for_writing() -> PathBuf {
 pub fn history_flag() -> Arc<AtomicBool> {
     static HISTORY: OnceLock<Arc<AtomicBool>> = OnceLock::new();
     HISTORY
-        .get_or_init(|| Arc::new(AtomicBool::new(history_marker().exists())))
+        .get_or_init(|| {
+            Arc::new(AtomicBool::new(
+                history_marker().is_some_and(|m| m.exists()),
+            ))
+        })
         .clone()
 }
 
 /// The marker whose presence means persistence is on, so the toggle survives across
 /// invocations (the flag is seeded from it). Kept separate from the history file, so
 /// turning persistence off never discards the lines already recorded.
-fn history_marker() -> PathBuf {
-    ikigai_home().join("history.on")
+fn history_marker() -> Option<PathBuf> {
+    Some(ikigai_home()?.join("history.on"))
 }
 
 /// The history file within a given config dir — one line per command. Split from
@@ -539,7 +545,7 @@ fn write_history(dir: &Path, line: &str) {
 /// The persisted command history, oldest first — what a fresh session preloads into
 /// its line recall. Empty if nothing has been saved (or the file can't be read).
 pub fn load_history() -> Vec<String> {
-    read_history(&ikigai_home())
+    ikigai_home().map_or_else(Vec::new, |home| read_history(&home))
 }
 
 /// Append one command to the persisted history — a no-op when persistence is off or
@@ -548,15 +554,21 @@ pub fn append_history(line: &str) {
     if !history_flag().load(Ordering::Relaxed) {
         return;
     }
-    write_history(&ikigai_home_for_writing(), line);
+    if let Some(home) = ikigai_home_for_writing() {
+        write_history(&home, line);
+    }
 }
 
 /// Turn history persistence on or off, updating both the live flag and the on-disk
 /// marker that makes the choice stick across invocations. Turning it off leaves the
 /// recorded lines in place.
 pub fn set_history(on: bool) {
+    // With no home there is nowhere to persist to, so the flag stays off and says so.
+    let Some(marker) = history_marker() else {
+        history_flag().store(false, Ordering::SeqCst);
+        return;
+    };
     history_flag().store(on, Ordering::SeqCst);
-    let marker = history_marker();
     if on {
         ikigai_home_for_writing();
         let _ = std::fs::File::create(&marker); // presence is the signal; empty is fine
@@ -906,21 +918,11 @@ pub fn file_root() -> PathBuf {
     let root = tests::thread_file_root();
     #[cfg(not(test))]
     let root = {
-        let instance = instance_name();
-        let configured =
-            config::get(&format!("{instance}.{FILES_KEY}")).or_else(|| config::get(FILES_KEY));
-        file_root_from(
-            configured.as_deref(),
-            std::env::var_os("IKIGAI_FILES").as_deref(),
-            config::config_home().as_deref(),
-            std::env::var_os("HOME")
-                .as_deref()
-                .map(std::path::Path::new),
-        )
-        // The config home's other refusals stop the process the same way (`browse.root`,
-        // `store`): a file root nobody meant is worse than no start, and the kernel build
-        // reaches this before any request does.
-        .unwrap_or_else(|e| panic!("ikigai: {e} — fix the config"))
+        configured_file_root()
+            // The config home's other refusals stop the process the same way (`browse.root`,
+            // `store`): a file root nobody meant is worse than no start, and the kernel build
+            // reaches this before any request does.
+            .unwrap_or_else(|e| panic!("ikigai: {e} — fix the config"))
     };
     create_workspace(&root);
     root
@@ -938,7 +940,8 @@ pub const FILES_KEY: &str = "files";
 ///    is, by the workspace's one rule ([`ikigai_resolve::expand_home`], ledger #1379): a `~`
 ///    it cannot expand (`~bob/ws`, or any `~` with no `home`) is an `Err` naming the key.
 /// 2. `env`: `$IKIGAI_FILES`, the fallback it always was.
-/// 3. `<home>/.ikigai/workspace` (`./.ikigai/workspace` with no `home`).
+/// 3. `<home>/.ikigai/workspace`, or an `Err` with no `home`: the root is never relative to
+///    the working directory by default.
 ///
 /// ⚠ The config home is SHARED by every process on the machine, so an unscoped `files` line
 /// moves the root of every one of them (the daemon, a served door, the REPL); scope it to
@@ -956,6 +959,7 @@ pub const FILES_KEY: &str = "files";
 /// assert!(file_root_from(Some("~/ws"), None, cfg, None).is_err());
 /// assert_eq!(file_root_from(None, Some("/env".as_ref()), cfg, home), Ok(PathBuf::from("/env")));
 /// assert_eq!(file_root_from(None, None, cfg, home), Ok(PathBuf::from("/h/.ikigai/workspace")));
+/// assert!(file_root_from(None, None, cfg, None).unwrap_err().contains("--files"));
 /// ```
 pub fn file_root_from(
     configured: Option<&str>,
@@ -974,10 +978,36 @@ pub fn file_root_from(
     if let Some(env) = env.filter(|v| !v.is_empty()) {
         return Ok(PathBuf::from(env));
     }
-    Ok(home
-        .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf)
-        .join(".ikigai")
-        .join("workspace"))
+    match home {
+        Some(home) => Ok(home.join(".ikigai").join("workspace")),
+        None => Err(NO_FILE_ROOT.to_string()),
+    }
+}
+
+/// Why [`file_root_from`] has no default root.
+const NO_FILE_ROOT: &str = "no file root: HOME and USERPROFILE are each unset, empty or not an \
+     absolute path, so there is no default workspace; set one to an absolute path, or name the \
+     root with --files <dir>";
+
+/// Stop before a kernel is built when it would have no file root and none was named.
+pub fn check_file_root() -> std::result::Result<(), String> {
+    if FILE_ROOT_OVERRIDE.lock().expect("file root lock").is_some() {
+        return Ok(());
+    }
+    configured_file_root().map(drop)
+}
+
+/// [`file_root_from`] over this process's config home and environment.
+fn configured_file_root() -> std::result::Result<PathBuf, String> {
+    let instance = instance_name();
+    let configured =
+        config::get(&format!("{instance}.{FILES_KEY}")).or_else(|| config::get(FILES_KEY));
+    file_root_from(
+        configured.as_deref(),
+        std::env::var_os("IKIGAI_FILES").as_deref(),
+        config::config_home().as_deref(),
+        config::user_home().as_deref(),
+    )
 }
 
 /// Create the workspace directory PRIVATE (`0700`) if it does not exist yet, whatever the
@@ -1067,7 +1097,7 @@ fn org_config() -> Option<(PathBuf, Vec<String>)> {
     let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     // The workspace's one `~` rule (ledger #1379). A `~` it cannot expand gives no org
     // config, the failure this function already had for an unset HOME.
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = config::user_home();
     let dir = ikigai_resolve::expand_home(v["org_dir"].as_str()?, home.as_deref()).ok()?;
     let files = v["org_files"]
         .as_array()?
@@ -2336,7 +2366,7 @@ fn http_timeout_setting() -> std::result::Result<std::time::Duration, String> {
     http_timeout(config::get("http.timeout").as_deref()).map_err(|e| {
         format!(
             "{e} (in {}; see `http.timeout` in ikigai-cli's README)",
-            config::config_path().display()
+            config::config_path_shown()
         )
     })
 }
@@ -3368,10 +3398,12 @@ const HEARTBEAT_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 /// answer. The writer daemon serves no socket — its jobs live inside it — so an external
 /// checker cannot ask it anything. It can, however, notice that a file stopped changing,
 /// which is the one signal a dead process still emits.
-fn heartbeat_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join(".ikigai/health")
-        .join(format!("{}.txt", instance_name()))
+fn heartbeat_path() -> Option<std::path::PathBuf> {
+    Some(
+        ikigai_home()?
+            .join("health")
+            .join(format!("{}.txt", instance_name())),
+    )
 }
 
 /// `urn:host:heartbeat` — write this host's health where a watcher can find it.
@@ -3396,7 +3428,9 @@ impl Endpoint for HostHeartbeat {
             .map(|browser| browser.peers())
             .unwrap_or_default();
         let report = health_text(&jobs, &peers, &HealthContext::now());
-        let path = heartbeat_path();
+        let path = heartbeat_path().ok_or_else(|| {
+            Error::Endpoint("heartbeat: HOME is not an absolute path".to_string())
+        })?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)
                 .map_err(|e| Error::Endpoint(format!("heartbeat dir: {e}")))?;
@@ -7147,7 +7181,7 @@ fn watch_store(kernel: Arc<Kernel>) {
     // EKEventStoreChangedNotification needs a serviced MAIN runloop this CLI
     // doesn't have — ikigai_personal::observe_calendar_changes remains for
     // hosts that do.)
-    let Some(home) = std::env::var("HOME").ok() else {
+    let Some(home) = config::user_home() else {
         return;
     };
     // Both store locations: the classic path and the modern group container.

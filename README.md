@@ -325,6 +325,12 @@ directory. **The flag wins**: when both it and `XDG_CONFIG_HOME` are set, the en
 not read for the config home. It moves the config home only; the data home (`~/.ikigai`)
 stays put.
 
+An empty or relative `XDG_CONFIG_HOME` or `XDG_RUNTIME_DIR` counts as unset, as the XDG
+spec says, and `HOME` and `TMPDIR` are held to the same rule. A host with no usable config
+home stops with a message naming the variables and `--config-home`, and one with no usable
+home for its default workspace stops with a message naming `--files`; neither path is ever
+taken from the working directory.
+
 ```toml
 keybindings = "emacs"   # "emacs" (default) · "vi" · "native"
 ```

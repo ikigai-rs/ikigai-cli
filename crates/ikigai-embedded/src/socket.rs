@@ -60,7 +60,7 @@ pub fn shared_socket_from(
                 "{} admits other accounts to the socket, so it needs a group to share the socket \
              with: set `ipc.group = \"<group>\"` in {}, a group those accounts are in",
                 path.display(),
-                crate::config::config_path().display()
+                crate::config::config_path_shown()
             )
         })?;
     let gid = match group.parse::<u32>() {
