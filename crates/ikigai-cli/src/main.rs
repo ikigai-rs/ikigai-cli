@@ -158,6 +158,9 @@ usage:
                                repl / daemon / serve by mode)
   ikigai --grants <file>       read grants and socket accounts from <file> (all local hosts);
                                otherwise <config home>/grants.json. IKIGAI_GRANTS is refused
+  ikigai --clients <file>      read client enrollment from <file> (serve quic://…, layers-token,
+                               cert add-client); otherwise <config home>/clients.json. A named
+                               file that is not there stops the start. IKIGAI_CLIENTS is refused
   ikigai --config-home <dir>   use <dir> as the config home (config.toml, grants.json, clients.json,
                                …) instead of $XDG_CONFIG_HOME/ikigai or ~/.config/ikigai. Any mode
                                (REPL, -c, serve, mcp, --daemon, --connect, cert). A relative <dir> is
@@ -1087,12 +1090,55 @@ fn parse_args() -> Result<Option<Mode>, String> {
             path.display()
         ));
     }
+    let clients = take_dir_flag(
+        &mut args,
+        "--clients",
+        "client enrollment file",
+        cwd.as_deref(),
+        home.as_deref(),
+    )?;
+    #[cfg(not(feature = "embedded"))]
+    if let Some(path) = &clients {
+        return Err(format!(
+            "--clients requires the embedded feature: {}",
+            path.display()
+        ));
+    }
     let (bayes_state, bayes_models) = take_bayes(&mut args, cwd.as_deref(), home.as_deref())?;
     #[cfg(feature = "embedded")]
     ikigai_embedded::bayes::set_flags(bayes_state, bayes_models);
     #[cfg(not(feature = "embedded"))]
     let _ = (bayes_state, bayes_models);
-    parse_argv(args.into_iter())
+    let mode = parse_argv(args.into_iter())?;
+    #[cfg(feature = "embedded")]
+    if let Some(path) = clients {
+        if !reads_enrollment(mode.as_ref()) {
+            return Err(
+                "--clients applies to `serve quic://…`, `layers-token` and `cert add-client`, \
+                 the modes that read the client enrollment file"
+                    .to_string(),
+            );
+        }
+        ikigai_embedded::clients::set_clients_path(path);
+    }
+    Ok(mode)
+}
+
+/// Whether `--clients` means anything to this mode. Enrollment is the QUIC door's, as
+/// `--require-enrollment` says; `layers-token` binds a token to an enrolled participant, and
+/// `cert add-client` prints where to enroll the certificate it wrote. `--version` and the usage
+/// text answer whatever else was typed.
+#[cfg(feature = "embedded")]
+fn reads_enrollment(mode: Option<&Mode>) -> bool {
+    match mode {
+        None | Some(Mode::Version { .. } | Mode::LayersToken(_) | Mode::CertAddClient { .. }) => {
+            true
+        }
+        Some(Mode::Serve { http, target, .. }) => {
+            http.is_none() && target.as_deref().is_some_and(is_quic)
+        }
+        Some(_) => false,
+    }
 }
 
 /// Take every `--bayes-state <dir>` and `--bayes-model <name>` (either also as `--flag=value`)
@@ -1195,7 +1241,7 @@ fn take_dir_flag(
     cwd: Option<&std::path::Path>,
     home: Option<&std::path::Path>,
 ) -> Result<Option<std::path::PathBuf>, String> {
-    let argument = if flag == "--grants" {
+    let argument = if matches!(flag, "--grants" | "--clients") {
         "<file>"
     } else {
         "<dir>"
@@ -2001,7 +2047,8 @@ fn main() {
     };
 
     if !matches!(mode, Mode::Version { .. }) {
-        if let Err(e) = ikigai_embedded::grants_path() {
+        if let Err(e) = ikigai_embedded::grants_path().and(ikigai_embedded::clients::clients_path())
+        {
             eprintln!("ikigai: {e}");
             std::process::exit(2);
         }
@@ -3841,6 +3888,8 @@ fn cert_add_client(name: &str, cert_dir: Option<String>, force: bool) -> ! {
                          to give it its own authority, add it to the `clients` map in \
                          {}: \"{fingerprint}\": {{\"grant\": \"<grant>\", \"label\": \"{name}\"}}",
                         ikigai_embedded::clients::clients_path()
+                            .ok()
+                            .flatten()
                             .map_or_else(|| "clients.json".into(), |p| p.display().to_string())
                     );
                 }
@@ -4081,7 +4130,7 @@ fn serve_quic(
         // for layers serving a filesystem instead. The edge guarded it with an `ExecStartPre`
         // file test; the door should not need one. A door WITHOUT `layers/` is unchanged.
         if let (Some(hosted), None) = (&layers, &enrolment) {
-            let clients = ikigai_embedded::clients::clients_path()
+            let clients = ikigai_embedded::clients::clients_path()?
                 .map_or_else(|| "clients.json".into(), |p| p.display().to_string());
             let grants = ikigai_embedded::grants_path()?
                 .map_or_else(|| "grants.json".into(), |p| p.display().to_string());
@@ -4101,7 +4150,7 @@ fn serve_quic(
         // never opens it. (While serving, a file that goes away refuses every client: the
         // minter reads it per connection.)
         if require_enrollment && enrolment.is_none() {
-            let clients = ikigai_embedded::clients::clients_path()
+            let clients = ikigai_embedded::clients::clients_path()?
                 .map_or_else(|| "clients.json".into(), |p| p.display().to_string());
             return Err(format!(
                 "--require-enrollment: there is no {clients}, so this door would serve every \
@@ -4175,6 +4224,8 @@ fn serve_quic(
                 ikigai_core::Capability::scoped(caps.clone())
             };
             let path = ikigai_embedded::clients::clients_path()
+                .ok()
+                .flatten()
                 .map_or_else(|| "clients.json".into(), |p| p.display().to_string());
             let root = file_root.clone();
             std::sync::Arc::new(move |peer: &ikigai_quic::PeerIdentity| {
@@ -4811,6 +4862,8 @@ fn layers_token(command: TokenCommand) -> ! {
                          enroll it first (`ikigai-layers grants <config home>` writes \
                          clients.json from enrollment.toml)",
                         ikigai_embedded::clients::clients_path()
+                            .ok()
+                            .flatten()
                             .map_or_else(|| "unset".into(), |p| p.display().to_string())
                     )
                 })?;

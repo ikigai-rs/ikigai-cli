@@ -370,8 +370,7 @@ mod tests {
     /// another.
     #[test]
     fn the_config_home_files_are_siblings() {
-        // An explicit override relocates its file BY DESIGN — the escape hatch for CI and
-        // containers is not a divergence.
+        // Both retired variables make these lookups refuse, so there is nothing to compare.
         if std::env::var_os("IKIGAI_GRANTS").is_some()
             || std::env::var_os("IKIGAI_CLIENTS").is_some()
         {
@@ -381,7 +380,7 @@ mod tests {
             return; // no HOME and no XDG_CONFIG_HOME: nothing to be a sibling of.
         };
         let grants = crate::grants_path().unwrap();
-        let clients = crate::clients::clients_path();
+        let clients = crate::clients::clients_path().unwrap();
         assert_eq!(config_path().parent(), Some(home.as_path()));
         assert_eq!(
             grants.as_deref().and_then(Path::parent),

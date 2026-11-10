@@ -1210,3 +1210,16 @@ introduced. The grants file's existing account protection checks still apply.
 Socket hosts can reuse the account-to-admission policy through
 `ikigai_embedded::socket` with the `ipc` feature enabled. `grants_path()` now
 returns `Result<Option<PathBuf>, String>` so hosts can report retired configuration.
+
+### Client enrollment configuration
+
+`IKIGAI_CLIENTS` is no longer supported. A set variable, including an empty one, stops
+host startup with a migration message; unset it and pass `--clients <file>` instead. The
+flag applies to `ikigai serve quic://…`, `ikigai layers-token` and `ikigai cert add-client`,
+and any other mode refuses it. Without it, the enrollment is read from
+`<config home>/clients.json`, which may be absent. A file named by `--clients` must exist:
+a missing one stops the door, and if it goes away while the door serves, every client is
+refused until it is back.
+
+`ikigai_embedded::clients::clients_path()` now returns
+`Result<Option<PathBuf>, String>`, and `clients::set_clients_path` sets the explicit path.
