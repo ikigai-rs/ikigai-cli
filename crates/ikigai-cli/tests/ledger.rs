@@ -107,7 +107,7 @@ fn ledger_upgrade_preserves_labels_and_exposes_claim_epochs() {
         "source urn:iki:ledger:upgrade:item:1 as=application/json",
     );
     let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
-    assert_eq!(detail["labels"], serde_json::json!(["cli"]));
+    assert_eq!(detail["item"]["labels"], serde_json::json!(["cli"]));
 
     line(&engine, "sink urn:iki:ledger:upgrade:claim item=1 cli-test");
     let detail = line(
@@ -115,7 +115,7 @@ fn ledger_upgrade_preserves_labels_and_exposes_claim_epochs() {
         "source urn:iki:ledger:upgrade:item:1 as=application/json",
     );
     let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
-    assert_eq!(detail["claim"]["epoch"], 1);
+    assert_eq!(detail["item"]["claim"]["epoch"], 1);
 }
 
 /// ★ **The arc's deliverable, as a test.** Append, list, comment, rank and close — the
