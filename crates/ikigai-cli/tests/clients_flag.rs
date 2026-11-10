@@ -181,8 +181,8 @@ fn a_set_clients_variable_stops_every_mode_but_version() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// An explicit file that is not there stops the door, where a missing `clients.json` in the
-/// config home does not.
+/// An explicit file that is not there stops the door. A missing `clients.json` in the config
+/// home stops it too, unless `--allow-unenrolled` asks for the shared posture.
 #[test]
 fn a_clients_flag_naming_a_missing_file_stops_the_door() {
     let home = scratch("missing");
@@ -202,8 +202,20 @@ fn a_clients_flag_naming_a_missing_file_stops_the_door() {
         &["--clients", missing],
     );
 
-    // The config home's own file is optional: this door starts.
+    // The config home's own file is required by default: this door stops.
     let args = ["serve", "quic://127.0.0.1:0", "--cert-dir", &certs];
+    assert_stopped(
+        door(command(&home, &args), &home, "serving on"),
+        &["clients.json", "--allow-unenrolled"],
+    );
+    // And starts when the shared posture is asked for by name.
+    let args = [
+        "serve",
+        "quic://127.0.0.1:0",
+        "--cert-dir",
+        &certs,
+        "--allow-unenrolled",
+    ];
     assert!(matches!(
         door(command(&home, &args), &home, "per-client workspaces"),
         Door::Serving(_)
