@@ -441,7 +441,9 @@ ikigai serve quic://0.0.0.0:4434 --name layers
 - **State location** (entries, tuples, receipts, feeds), first match wins:
   `--layers-state <dir>` on `serve`; `layers.state = "<dir>"` in `config.toml`
   (instance-scoped as `<name>.layers.state`; relative to the config home, a leading `~` to `$HOME`);
-  else `~/.ikigai/layers/<name>` under the data home. No environment variable names it. One
+  else `~/.ikigai/layers/<name>` under the data home, where `<name>` (`--name`) must be one
+  plain file name (no separator, `..` or drive prefix) or the door refuses to start. No
+  environment variable names it. One
   door per state directory: the host holds `<state>/host.lock` while it lives, and a second
   door over the same directory is refused with the holder's pid.
 - **Encryption at rest** (ikigai-cli 0.1.67+, ikigai-layers 0.3.0): every file the

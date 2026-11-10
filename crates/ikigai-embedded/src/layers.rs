@@ -14,7 +14,9 @@
 //! 2. `<instance>.layers.state` in the config home's `config.toml`, else `layers.state`
 //!    ([`StateSource::Config`]), relative to the config home;
 //! 3. `<data home>/layers/<instance>`, i.e. `~/.ikigai/layers/<instance>`
-//!    ([`StateSource::Default`]).
+//!    ([`StateSource::Default`]). The instance name (`--name`) must then be one plain file
+//!    name ([`ikigai_resolve::is_plain_file_name`]); any other is refused at start, naming the
+//!    flag and the key that set the directory instead.
 //!
 //! **The state is sealed at rest** (ikigai-layers 0.3.0, ledger #2011): every file the host
 //! writes is age ciphertext sealed to the host's key, an age identity FILE (`age-keygen -o`)
@@ -243,6 +245,17 @@ pub fn state_dir_from(
              (~/.ikigai/layers/{instance}) has somewhere to be"
         )
     })?;
+    // The default joins the instance name as one directory under `layers/`, so the name has
+    // to be one plain file name: a separator, `..`, a drive prefix or a device name would put
+    // the state somewhere other than its own directory there.
+    if !ikigai_resolve::is_plain_file_name(instance) {
+        return Err(format!(
+            "the instance name {instance:?} (--name) is not a plain file name, so it cannot \
+             name the default layer state directory (~/.ikigai/layers/<instance>): pass a \
+             name without separators, `..` or a drive prefix, or name the state directory \
+             with {STATE_FLAG} <dir> or `{STATE_KEY}` in the config home"
+        ));
+    }
     Ok((
         ikigai_core::config::data_home_in(home)
             .join("layers")
@@ -427,6 +440,45 @@ mod tests {
         );
         let err = state_dir_from(None, None, Some(config), None, "layers").unwrap_err();
         assert!(err.contains(STATE_FLAG) && err.contains(STATE_KEY), "{err}");
+    }
+
+    /// The default state directory joins the instance name onto `~/.ikigai/layers`, so a name
+    /// that is not one plain file name is refused, naming `--name`, rather than joined. A flag
+    /// or configured directory does not join the name and is unaffected.
+    #[test]
+    fn the_default_state_directory_takes_only_a_plain_instance_name() {
+        let home = Path::new("/home/b");
+        let config = Path::new("/home/b/.config/ikigai");
+        for name in [
+            "../../elsewhere",
+            "..",
+            ".",
+            "a/b",
+            "a\\b",
+            "C:x",
+            "",
+            "nul",
+            "x.",
+        ] {
+            let err = state_dir_from(None, None, Some(config), Some(home), name).unwrap_err();
+            assert!(
+                err.contains("--name") && err.contains(STATE_FLAG),
+                "{name:?}: {err}"
+            );
+        }
+        assert_eq!(
+            state_dir_from(None, None, Some(config), Some(home), "edge.2"),
+            Ok((home.join(".ikigai/layers/edge.2"), StateSource::Default))
+        );
+        let flag = Path::new("/srv/flagged");
+        assert_eq!(
+            state_dir_from(Some(flag), None, Some(config), Some(home), "a/b"),
+            Ok((flag.to_path_buf(), StateSource::Flag))
+        );
+        assert_eq!(
+            state_dir_from(None, Some("state"), Some(config), Some(home), "a/b"),
+            Ok((config.join("state"), StateSource::Config))
+        );
     }
 
     /// ledger #1379: the state key takes the workspace's one `~` rule. A bare `~` is the
