@@ -49,6 +49,7 @@ const XSD_BOOLEAN: &str = "http://www.w3.org/2001/XMLSchema#boolean";
 // kernel, and `urn:iki:host:arrangement`, the root's arrangement as a declaration.
 pub mod agents;
 pub mod arrangement;
+pub mod authority;
 #[cfg(all(feature = "ipc", unix))]
 pub mod socket;
 // The spam filter (`urn:bayes:*`, ledger #1512): bound in the local root when the binary arms it
