@@ -1146,6 +1146,76 @@ pub fn set_grants_path(path: PathBuf) {
     *GRANTS_PATH_OVERRIDE.lock().expect("grants path lock") = Some(path);
 }
 
+/// Refuse a `--grants` that names a file that is not there. Every host reads the flag, so a
+/// host started with one checks it before it serves: a missing explicit file is a mistyped path,
+/// not "no grants", and serving as though no file was named would hide it.
+///
+/// # Errors
+///
+/// The refusal from [`grants_path`], or a `--grants` naming a file that does not exist.
+pub fn check_grants_flag() -> std::result::Result<(), String> {
+    let path = grants_path()?;
+    if !grants_path_is_explicit() {
+        return Ok(());
+    }
+    match path.map(std::fs::metadata) {
+        Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(missing_grants_flag(&grants_path()?.unwrap_or_default()))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Whether [`grants_path`] is the file `--grants` named rather than the config home's.
+pub(crate) fn grants_path_is_explicit() -> bool {
+    GRANTS_PATH_OVERRIDE
+        .lock()
+        .expect("grants path lock")
+        .is_some()
+}
+
+/// The refusal for a `--grants` that names a file that is not there.
+pub(crate) fn missing_grants_flag(path: &std::path::Path) -> String {
+    format!(
+        "--grants names a file that does not exist: {}",
+        path.display()
+    )
+}
+
+/// The grants file, parsed: `Ok(None)` when the config home has none. A door that serves from
+/// it reads it whole once at start, so a file it could not use stops the door rather than
+/// leaving every grant it names quietly empty ([`grant_scopes`] reads an unusable file as no
+/// grants).
+///
+/// # Errors
+///
+/// The refusal from [`grants_path`]; a `--grants` naming a file that does not exist; a file
+/// that cannot be read, does not parse as JSON, or is not an object of grant name to scopes.
+pub fn grants_document() -> std::result::Result<Option<serde_json::Value>, String> {
+    let Some(path) = grants_path()? else {
+        return Ok(None);
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if grants_path_is_explicit() {
+                return Err(missing_grants_flag(&path));
+            }
+            return Ok(None);
+        }
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    let document = serde_json::from_str::<serde_json::Value>(&text)
+        .map_err(|e| format!("{} does not parse as JSON: {e}", path.display()))?;
+    if !document.is_object() {
+        return Err(format!(
+            "{} is not a grants file: it must be a JSON object of grant name → scopes",
+            path.display()
+        ));
+    }
+    Ok(Some(document))
+}
+
 /// The scopes of one grant entry of a parsed grants document (either shape); empty for
 /// anything else. The reader [`grant_scopes`] and [`agents`] share.
 pub(crate) fn grant_entry_scopes(entry: &serde_json::Value) -> Vec<String> {

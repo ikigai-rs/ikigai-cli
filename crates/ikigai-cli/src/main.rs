@@ -161,7 +161,8 @@ usage:
   ikigai --name <instance>     name this instance (scopes <name>.* config properties; defaults
                                repl / daemon / serve by mode)
   ikigai --grants <file>       read grants and socket accounts from <file> (all local hosts);
-                               otherwise <config home>/grants.json. IKIGAI_GRANTS is refused
+                               otherwise <config home>/grants.json. A named file that is not
+                               there stops the start. IKIGAI_GRANTS is refused
   ikigai --clients <file>      read client enrollment from <file> (serve quic://…, layers-token,
                                cert add-client); otherwise <config home>/clients.json. A named
                                file that is not there stops the start. IKIGAI_CLIENTS is refused
@@ -2103,7 +2104,8 @@ fn main() {
     };
 
     if !matches!(mode, Mode::Version { .. }) {
-        if let Err(e) = ikigai_embedded::grants_path().and(ikigai_embedded::clients::clients_path())
+        if let Err(e) = ikigai_embedded::check_grants_flag()
+            .and(ikigai_embedded::clients::clients_path().map(drop))
         {
             eprintln!("ikigai: {e}");
             std::process::exit(2);
@@ -4203,6 +4205,27 @@ fn serve_quic(
         // A `clients.json` that exists but does not parse stops the server here: a
         // broken authority config must not degrade into serving everyone under 2 or 3.
         let enrolment = ikigai_embedded::clients::enrolment()?;
+        // The grants file is authority config too: one that does not parse stops the door, and
+        // so does an enrolled grant it does not define or gives no scopes. The minter refuses
+        // every client under such a grant, so a door opened with it would report its clients
+        // enrolled and serve none of them.
+        ikigai_embedded::grants_document()?;
+        if let Some(enrolment) = &enrolment {
+            let grants = ikigai_embedded::grants_path()?
+                .map_or_else(|| "grants.json".into(), |p| p.display().to_string());
+            let clients = ikigai_embedded::clients::clients_path()?
+                .map_or_else(|| "clients.json".into(), |p| p.display().to_string());
+            for name in enrolment.grant_names() {
+                if ikigai_embedded::grant_scopes(&name)?.is_empty() {
+                    return Err(format!(
+                        "{clients} enrolls clients under the grant `{name}`, which {grants} \
+                         does not define or gives no scopes, so every client under it would be \
+                         refused. Define `{name}` in {grants} with the scopes it grants, or \
+                         enroll those clients under a grant it defines."
+                    ));
+                }
+            }
+        }
         // ★ A door that HOSTS LAYERS needs posture 1, and refuses to start without it (ledger
         // #1281). Layers are for participants: each certificate is named by its enrollment and
         // granted exactly its layer actions. Without a `clients.json` the door fell to posture
