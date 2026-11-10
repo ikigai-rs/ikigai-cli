@@ -207,6 +207,8 @@ fn configure(home: &Path, certs: &Path, lobby: bool) {
         key.clone(),
         age::secrecy::ExposeSecret::expose_secret(&age::x25519::Identity::generate().to_string()),
     );
+    #[cfg(unix)]
+    std::fs::set_permissions(&key, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
     write(
         config.join("config.toml"),
         &format!("layers.key = \"{}\"\n", key.display()),

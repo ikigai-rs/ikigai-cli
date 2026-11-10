@@ -112,6 +112,8 @@ fn mint_key(path: &Path) -> age::x25519::Identity {
         path.to_path_buf(),
         age::secrecy::ExposeSecret::expose_secret(&identity.to_string()),
     );
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
     identity
 }
 

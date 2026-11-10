@@ -161,6 +161,12 @@ fn a_layer_door_binds_the_layer_spaces_and_nothing_else() {
         age::secrecy::ExposeSecret::expose_secret(&age::x25519::Identity::generate().to_string()),
     )
     .unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        scratch.join("state.key"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
     let key = ikigai_layers::StateKey::load(scratch.join("state.key")).expect("an age identity");
     let host =
         ikigai_layers::Host::open(&config, scratch.join("state"), &key).expect("the host opens");
@@ -222,6 +228,12 @@ fn a_feed_layer_opens_and_serves_its_two_concept_scheme() {
         scratch.join("state.key"),
         age::secrecy::ExposeSecret::expose_secret(&age::x25519::Identity::generate().to_string()),
     );
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        scratch.join("state.key"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
     let key = ikigai_layers::StateKey::load(scratch.join("state.key")).unwrap();
     let host = ikigai_layers::Host::open(&config, scratch.join("state"), &key)
         .expect("a config home with a feed channel opens");
