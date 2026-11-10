@@ -2110,10 +2110,27 @@ fn main() {
         }
     }
 
+    // The default instance name follows the mode; an explicit --name (already
+    // set during parsing) wins because set_instance_name is first-write-wins.
+    // Before the config check: keys after this instance's name are the host's own to check.
+    #[cfg(feature = "embedded")]
+    ikigai_embedded::set_instance_name(match &mode {
+        Mode::Daemon { .. } => "daemon",
+        Mode::Serve { .. } => "serve",
+        Mode::Mcp { .. } => "mcp",
+        _ => "repl",
+    });
+
     // Representation cache bounds and ikigai-lisp's bounds, from the config home, fixed
     // once before constructing a kernel or evaluating Lisp. A bad line stops every mode
     // rather than reading as the default; `--version` alone answers whatever the config says.
     if !matches!(mode, Mode::Version { .. }) {
+        // `config.toml` itself first: a line it cannot read, or an unknown key in one of the
+        // host's own families, stops every mode here rather than being skipped by each reader.
+        if let Err(e) = ikigai_embedded::config::check() {
+            eprintln!("ikigai: {e}");
+            std::process::exit(2);
+        }
         if let Err(e) = ikigai_embedded::cache::configure() {
             eprintln!("ikigai: {e}");
             std::process::exit(2);
@@ -2129,16 +2146,6 @@ fn main() {
             std::process::exit(2);
         }
     }
-
-    // The default instance name follows the mode; an explicit --name (already
-    // set during parsing) wins because set_instance_name is first-write-wins.
-    #[cfg(feature = "embedded")]
-    ikigai_embedded::set_instance_name(match &mode {
-        Mode::Daemon { .. } => "daemon",
-        Mode::Serve { .. } => "serve",
-        Mode::Mcp { .. } => "mcp",
-        _ => "repl",
-    });
 
     // After the instance name: a file root may be named by an `<instance>.files` line.
     if let Err(e) = check_homes(&mode) {
