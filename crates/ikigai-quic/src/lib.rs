@@ -29,7 +29,8 @@ use std::sync::{Arc, Mutex};
 
 use futures::future::{select, Either};
 use ikigai_core::{
-    Capability, Clock, Error, Iri, Kernel, Representation, Request, SpaceEntry, SystemClock, Tracer,
+    Body, Capability, Clock, Error, Iri, Kernel, Representation, Request, SpaceEntry, SystemClock,
+    Tracer,
 };
 use ikigai_resolve::{scoped_entries, CacheStatus, Resolver, RunContext, SpanCollector};
 use ikigai_wire::{
@@ -1491,9 +1492,11 @@ pub fn connect_with(
 /// - **`tokio::task::block_in_place`** is multi-thread-only, so it would make correctness
 ///   depend on how the CALLER built its runtime — coupling that comes back.
 ///
-/// Blocking a caller's worker thread is a real cost and is unavoidable: the trait is sync.
-/// It cannot deadlock, because the work makes progress on a different runtime's threads
-/// than the one being blocked — including when the caller is a current-thread runtime.
+/// Blocking a caller's worker thread is a real cost, and unavoidable for a SYNC caller. An
+/// async caller does not pay it: the trait's async methods go through [`drive_async`], which
+/// parks the caller's task instead (ledger #303). The blocking wait cannot deadlock, because
+/// the work makes progress on a different runtime's threads than the one being blocked —
+/// including when the caller is a current-thread runtime.
 ///
 /// A panic inside the spawned task drops the sender, so it arrives here as a closed channel
 /// and becomes a typed [`Unavailable`](Error::Unavailable) naming the cause, rather than
@@ -1511,6 +1514,36 @@ fn drive<T: Send + 'static>(
         let _ = tx.send(future.await);
     });
     rx.recv()
+        .map_err(|_| io::Error::other("the resolver's task panicked before replying"))
+}
+
+/// [`drive`] for an **async** caller (ledger #303): `future` runs on the resolver's own
+/// `runtime` and the caller's task PARKS on its join handle, so the thread under it is free
+/// for other work for the whole round trip.
+///
+/// Why this shape and not awaiting the round trip in place: quinn's I/O is driven by the
+/// runtime that created the endpoint, and the caller may be on any executor (another tokio
+/// runtime, a current-thread one, `futures::executor::block_on`). The round trip stays on the
+/// runtime that owns the endpoint, as it does through [`drive`]; only the wait moves, and a
+/// tokio join handle is woken from whichever executor polls it.
+///
+/// Dropping the returned future (an HTTP client that hung up, a deadline above this one)
+/// ABORTS the task, so the call's stream is canceled on the wire as it is when the call
+/// deadline drops it; nothing is left running for an answer nobody is waiting for.
+async fn drive_async<T: Send + 'static>(
+    runtime: &Runtime,
+    future: impl std::future::Future<Output = T> + Send + 'static,
+) -> io::Result<T> {
+    /// Aborts the task when the waiter goes away.
+    struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+    impl<T> Drop for AbortOnDrop<T> {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let mut task = AbortOnDrop(runtime.spawn(future));
+    (&mut task.0)
+        .await
         .map_err(|_| io::Error::other("the resolver's task panicked before replying"))
 }
 
@@ -1861,6 +1894,26 @@ impl QuicResolver {
         call: Call,
         explicit: Option<std::time::Duration>,
     ) -> io::Result<Reply> {
+        drive(self.runtime(), self.exchange(call, explicit)?)?
+    }
+
+    /// [`round_trip_within`](Self::round_trip_within) for an async caller: the caller's task
+    /// parks for the round trip instead of blocking its thread ([`drive_async`]).
+    async fn round_trip_within_async(
+        &self,
+        call: Call,
+        explicit: Option<std::time::Duration>,
+    ) -> io::Result<Reply> {
+        drive_async(self.runtime(), self.exchange(call, explicit)?).await?
+    }
+
+    /// The round trip of `call`, under its deadline, as a `'static` future for the
+    /// resolver's runtime to run: what [`drive`] and [`drive_async`] both hand over.
+    fn exchange(
+        &self,
+        call: Call,
+        explicit: Option<std::time::Duration>,
+    ) -> io::Result<impl std::future::Future<Output = io::Result<Reply>> + Send + 'static> {
         let request = encode(&call)?;
         let wire = Arc::clone(&self.wire);
         // A self-description runs under the short describe deadline, a resolution under the
@@ -1876,7 +1929,7 @@ impl QuicResolver {
         // Named in a deadline's error: a host relaying it to its own caller must say WHICH
         // peer was silent, or the message reads as being about the host (ledger #1288).
         let addr = wire.addr;
-        drive(self.runtime(), async move {
+        Ok(async move {
             match deadline {
                 None => wire.round_trip(request, replayable).await,
                 // ★ This bounds the WHOLE exchange — the reconnect-and-retry inside
@@ -1911,7 +1964,7 @@ impl QuicResolver {
                     }
                 }
             }
-        })?
+        })
     }
 
     /// [`Resolver::issue_as`] under `explicit` if given, else the standing deadline.
@@ -1922,6 +1975,35 @@ impl QuicResolver {
         explicit: Option<std::time::Duration>,
         run: &RunContext,
     ) -> Result<(Representation, CacheStatus), Error> {
+        let (call, tracer) = self.issue_call(request, capability, run);
+        let reply = self.round_trip_within(call, explicit).map_err(quic_error)?;
+        settle_issue(reply, tracer.as_ref())
+    }
+
+    /// [`issue_as_under`](Self::issue_as_under) for an async caller (ledger #303): the same
+    /// call and the same answer, with the caller's task parked for the round trip.
+    async fn issue_as_under_async(
+        &self,
+        request: Request,
+        capability: &Capability,
+        explicit: Option<std::time::Duration>,
+        run: &RunContext,
+    ) -> Result<(Representation, CacheStatus), Error> {
+        let (call, tracer) = self.issue_call(request, capability, run);
+        let reply = self
+            .round_trip_within_async(call, explicit)
+            .await
+            .map_err(quic_error)?;
+        settle_issue(reply, tracer.as_ref())
+    }
+
+    /// The call a resolution sends, and the tracer (if any) its returned spans go to.
+    fn issue_call(
+        &self,
+        request: Request,
+        capability: &Capability,
+        run: &RunContext,
+    ) -> (Call, Option<Arc<dyn Tracer>>) {
         let tracer = self.tracer().clone();
         let trace = tracer.as_ref().map(|_| TraceContext {
             trace_id: 1,
@@ -1934,29 +2016,7 @@ impl QuicResolver {
         // next call reads the new version.)
         let call =
             Call::issue_in_run(request, capability, trace, run).for_peer(self.wire.version());
-        match self.round_trip_within(call, explicit).map_err(quic_error)? {
-            Reply::Resolved(representation, status) => Ok((representation, status)),
-            Reply::ResolvedTraced(representation, status, events) => {
-                if let Some(tracer) = &tracer {
-                    for event in events {
-                        tracer.record(event);
-                    }
-                }
-                Ok((representation, status))
-            }
-            // The server already rendered its error to a string; don't re-prefix an
-            // already-"endpoint error: …" message into a doubled one across the wire.
-            Reply::ErrorTyped(wire_error) => Err(wire_error.into()),
-            Reply::Error(message) => Err(Error::Endpoint(
-                message
-                    .strip_prefix("endpoint error: ")
-                    .map(str::to_string)
-                    .unwrap_or(message),
-            )),
-            other => Err(Error::Endpoint(format!(
-                "unexpected reply to IssueAs: {other:?}"
-            ))),
-        }
+        (call, tracer)
     }
 
     /// The tracer lock, taken through the poison — same reasoning as
@@ -1965,6 +2025,36 @@ impl QuicResolver {
         self.tracer
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// A resolution's reply as its answer, forwarding a traced reply's spans to `tracer`.
+fn settle_issue(
+    reply: Reply,
+    tracer: Option<&Arc<dyn Tracer>>,
+) -> Result<(Representation, CacheStatus), Error> {
+    match reply {
+        Reply::Resolved(representation, status) => Ok((representation, status)),
+        Reply::ResolvedTraced(representation, status, events) => {
+            if let Some(tracer) = tracer {
+                for event in events {
+                    tracer.record(event);
+                }
+            }
+            Ok((representation, status))
+        }
+        // The server already rendered its error to a string; don't re-prefix an
+        // already-"endpoint error: …" message into a doubled one across the wire.
+        Reply::ErrorTyped(wire_error) => Err(wire_error.into()),
+        Reply::Error(message) => Err(Error::Endpoint(
+            message
+                .strip_prefix("endpoint error: ")
+                .map(str::to_string)
+                .unwrap_or(message),
+        )),
+        other => Err(Error::Endpoint(format!(
+            "unexpected reply to IssueAs: {other:?}"
+        ))),
     }
 }
 
@@ -2014,6 +2104,7 @@ fn quic_error(e: io::Error) -> Error {
     Error::Unavailable(format!("quic transport: {e}"))
 }
 
+#[async_trait::async_trait]
 impl Resolver for QuicResolver {
     fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), Error> {
         match self.round_trip(Call::Issue(request)).map_err(quic_error)? {
@@ -2064,6 +2155,35 @@ impl Resolver for QuicResolver {
         run: &RunContext,
     ) -> Result<(Representation, CacheStatus), Error> {
         self.issue_as_under(request, capability, None, run)
+    }
+
+    /// [`issue_as`](Resolver::issue_as) for an async caller, with the caller's task PARKED
+    /// for the round trip (ledger #303). The trait's default runs the synchronous method,
+    /// which blocks the calling thread until the peer answers: on a door's tokio worker that
+    /// is one worker held for every in-flight call, for as long as the peer works.
+    async fn issue_as_async(
+        &self,
+        request: Request,
+        capability: &Capability,
+    ) -> Result<(Representation, CacheStatus), Error> {
+        self.issue_as_under_async(request, capability, None, &RunContext::default())
+            .await
+    }
+
+    /// What a mount forwards through (`ForwardingEndpoint::invoke_body`, which the kernel
+    /// calls for every resolution), so this is the override that frees an inbound door's
+    /// worker for a mounted call (ledger #303). The answer is collected, as the trait's
+    /// default collects it: [`issue_streamed`](QuicResolver::issue_streamed) is the streamed
+    /// exchange.
+    async fn issue_body_as_in_run(
+        &self,
+        request: Request,
+        capability: &Capability,
+        run: &RunContext,
+    ) -> Result<(Representation<Body>, CacheStatus), Error> {
+        self.issue_as_under_async(request, capability, None, run)
+            .await
+            .map(|(representation, status)| (representation.into_body(), status))
     }
 
     fn set_tracer(&self, tracer: Arc<dyn Tracer>) {
@@ -5306,5 +5426,140 @@ mod turned_away {
             1,
             "it may have run: no resend"
         );
+    }
+}
+
+#[cfg(test)]
+mod async_mount {
+    use super::*;
+    use ikigai_core::{
+        EndpointSpace, Exact, Fallback, FnEndpoint, Invocation, Iri, ReprType, Representation,
+        Space, Verb,
+    };
+    use ikigai_resolve::RemoteSpace;
+    use std::net::SocketAddr;
+    use std::sync::atomic::Ordering;
+    use std::thread;
+    use std::time::Duration;
+
+    /// How long the peer's endpoint works before it answers.
+    const WORK: Duration = Duration::from_millis(600);
+
+    /// Serve a kernel whose `urn:demo:slow` answers after [`WORK`], accepting connections
+    /// until the test ends. Returns the address, a pinned client identity and the server's
+    /// certificate.
+    fn serve_slow() -> (SocketAddr, Identity, String) {
+        let server_id = generate();
+        let client_id = generate();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server_cfg = server_config(
+            &server_id,
+            std::slice::from_ref(&client_id.cert_pem),
+            DEFAULT_IDLE_TIMEOUT,
+        )
+        .unwrap();
+        let rt = Runtime::new().unwrap();
+        let endpoint = rt
+            .block_on(async { quinn::Endpoint::server(server_cfg, addr) })
+            .unwrap();
+        let server_addr = endpoint.local_addr().unwrap();
+        let slow = FnEndpoint::new("slow", |_inv: &Invocation<'_>| {
+            // The peer's own work (a model generating, say): the wire carries nothing until
+            // it finishes.
+            std::thread::sleep(WORK);
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                b"done".to_vec(),
+            ))
+        });
+        let kernel = Arc::new(Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:demo:slow"), slow),
+        )));
+        thread::spawn(move || {
+            rt.block_on(async move {
+                while let Some(incoming) = endpoint.accept().await {
+                    let kernel = Arc::clone(&kernel);
+                    tokio::spawn(async move {
+                        let Ok(connection) = incoming.await else {
+                            return;
+                        };
+                        let session = Session {
+                            capability: Capability::root(),
+                            file_segment: String::new(),
+                            principal: None,
+                        };
+                        serve_connection(&kernel, connection, session).await;
+                    });
+                }
+            });
+        });
+        (server_addr, client_id, server_id.cert_pem)
+    }
+
+    /// ★ Ledger #303: a mounted resolution must PARK the caller's task for the peer's round
+    /// trip, not block the thread under it. An inbound HTTP door awaits `Kernel::issue_body`
+    /// on a tokio worker; the mount forwards through `Resolver::issue_body_as_in_run`, and
+    /// the trait's default for it runs the SYNCHRONOUS `issue_as_in_run`, which for this
+    /// resolver blocks the worker on a channel until the peer answers. Enough slow mounted
+    /// requests at once and every worker is held, so the door stops accepting.
+    ///
+    /// The caller here is a current-thread runtime, a door with one worker. A second task
+    /// ticks on it while the mounted call is in flight: if the call blocks the thread, the
+    /// ticker does not run until the call is over.
+    #[test]
+    fn a_mounted_resolution_parks_the_callers_task_instead_of_blocking_its_thread() {
+        let (server_addr, client_id, server_cert) = serve_slow();
+        let caller = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let answer = caller.block_on({
+            let ticks = Arc::clone(&ticks);
+            async move {
+                let client = connect(server_addr, &client_id, &server_cert).unwrap();
+                let local_kernel = Kernel::new(Arc::new(Fallback::new(vec![
+                    Arc::new(EndpointSpace::new()) as Arc<dyn Space>,
+                    Arc::new(RemoteSpace::new(Arc::new(client))) as Arc<dyn Space>,
+                ])));
+                let ticker = tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        ticks.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+                // Let the ticker start before the call goes out.
+                tokio::task::yield_now().await;
+                let slow = Request::new(Verb::Source, Iri::parse("urn:demo:slow").unwrap());
+                let answered = local_kernel
+                    .issue(slow, &Capability::root())
+                    .await
+                    .map(|representation| representation.bytes);
+                ticker.abort();
+                answered
+            }
+        });
+        assert_eq!(answer.expect("the mounted call resolves"), b"done");
+        let during = ticks.load(Ordering::SeqCst);
+        // 600ms of peer work at a 20ms tick is ~30 ticks; a blocked thread gives 0.
+        assert!(
+            during >= 10,
+            "the caller's runtime ran another task only {during} time(s) during a {WORK:?} \
+             mounted call: the round trip held its thread"
+        );
+    }
+
+    /// The async path needs no tokio context of the caller's own: quinn's I/O stays on the
+    /// resolver's runtime, which created the endpoint, and only the wait is the caller's. So
+    /// it resolves from an executor that is not tokio at all.
+    #[test]
+    fn the_async_issue_resolves_from_an_executor_that_is_not_tokio() {
+        let (server_addr, client_id, server_cert) = serve_slow();
+        let client = connect(server_addr, &client_id, &server_cert).unwrap();
+        let slow = Request::new(Verb::Source, Iri::parse("urn:demo:slow").unwrap());
+        let (representation, _) =
+            futures::executor::block_on(client.issue_as_async(slow, &Capability::root()))
+                .expect("the async issue resolves");
+        assert_eq!(representation.bytes, b"done");
     }
 }
