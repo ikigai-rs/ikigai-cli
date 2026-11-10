@@ -3283,7 +3283,7 @@ dependencies = [
  "ikigai-ui",
  "ikigai-view",
  "ikigai-vocab",
- "ikigai-xslt",
+ "ikigai-xslt 0.8.0",
  "libc",
  "notify",
  "oxigraph",
@@ -3468,7 +3468,7 @@ dependencies = [
  "ikigai-sign",
  "ikigai-sparql",
  "ikigai-store",
- "ikigai-xslt",
+ "ikigai-xslt 0.7.0",
  "oxrdf",
  "oxrdfio",
  "oxsdatatypes",
@@ -3934,6 +3934,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "ikigai-xrust"
+version = "2.3.0-ikigai.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62b9382fda443e8122bebba7938477c2bb202e2393f2253b4e8b6ccc5e37e9fe"
+dependencies = [
+ "chrono",
+ "english-numbers",
+ "formato",
+ "hexdump",
+ "italian_numbers",
+ "lexers",
+ "pkg-version",
+ "qualname",
+ "regex",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "stacksafe",
+ "unicode-segmentation",
+ "url",
+]
+
+[[package]]
 name = "ikigai-xslt"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3944,6 +3966,19 @@ dependencies = [
  "oxiri 0.2.11",
  "qualname",
  "xrust",
+]
+
+[[package]]
+name = "ikigai-xslt"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e18d13bea6a4117f00ab082258817a1a2fc0d8c75bca2452be5d0c14d5e91634"
+dependencies = [
+ "async-trait",
+ "ikigai-core",
+ "ikigai-xrust",
+ "oxiri 0.2.11",
+ "qualname",
 ]
 
 [[package]]
