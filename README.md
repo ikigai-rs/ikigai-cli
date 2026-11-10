@@ -64,9 +64,17 @@ Across a **network**, the same `serve` / `--connect` work over QUIC (built with
 
 ```bash
 ikigai cert generate                       # writes server/client certs to your config dir
-ikigai serve quic://0.0.0.0:4433           # run a QUIC kernel server
+ikigai serve quic://0.0.0.0:4433           # run a QUIC kernel server (needs clients.json)
 ikigai --connect quic://host:4433          # attach the REPL over QUIC
 ```
+
+**A QUIC door needs an enrollment.** It starts only when `<config home>/clients.json` (or the
+file `--clients` names) enrolls client certificates: each fingerprint maps to a grant in
+`grants.json`, and a certificate with no entry is refused. `ikigai cert add-client` prints the
+fingerprint to enroll. Without the file the door stops at start and names it. To serve every
+trusted certificate without one, start the door with `--allow-unenrolled`: each certificate is
+then served under the one `--cap` ceiling, or, with no `--cap`, in its own writable workspace,
+and the door prints a warning saying so. (Before this release that posture was the default.)
 
 A `quic://host:port` target selects QUIC; a plain path stays a Unix socket. Each
 side presents its own self-signed cert and pins the exact peer cert — no CA. On

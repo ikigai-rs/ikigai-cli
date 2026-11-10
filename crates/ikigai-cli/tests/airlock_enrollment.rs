@@ -300,3 +300,63 @@ fn each_drainer_gets_its_own_grant_under_the_ceiling() {
     );
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// Enrollment is required by default: a QUIC door with no `clients.json` and no flag stops at
+/// start, naming the file and the opt-out, with `--cap` or without it. It never opens to every
+/// trusted certificate because the file is missing.
+#[test]
+fn a_door_with_no_enrollment_will_not_start_by_default() {
+    let home = scratch("default");
+    let certs = certs(&home, &[]);
+    let c = certs.to_str().unwrap();
+    for extra in [&[][..], &CEILING[..]] {
+        let mut args = vec!["serve", "quic://127.0.0.1:0", "--cert-dir", c];
+        args.extend_from_slice(extra);
+        let out = run(&home, &args);
+        assert!(!out.status.success(), "{}", describe(&out));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("clients.json") && stderr.contains("--allow-unenrolled"),
+            "{stderr}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// `--allow-unenrolled` is the opt-out: the door starts in the shared posture and says so on
+/// its own line, distinct from the banner. It cannot be given with `--require-enrollment`, nor
+/// to a door that is not a QUIC door.
+#[test]
+fn a_door_that_allows_unenrolled_clients_says_so() {
+    let home = scratch("optout");
+    let certs = certs(&home, &[]);
+    let (_door, banner) = serve(&home, &certs, &["--allow-unenrolled"]);
+    assert!(banner.contains("per-client workspaces"), "{banner}");
+    assert!(
+        banner.contains("warning:") && banner.contains("--allow-unenrolled"),
+        "{banner}"
+    );
+    let (_door, banner) = serve(
+        &home,
+        &certs,
+        &["--allow-unenrolled", "--cap", "urn:cap:space:read"],
+    );
+    assert!(banner.contains("fixed ceiling"), "{banner}");
+    assert!(banner.contains("warning:"), "{banner}");
+
+    let c = certs.to_str().unwrap();
+    let both = [
+        "serve",
+        "quic://127.0.0.1:0",
+        "--cert-dir",
+        c,
+        "--allow-unenrolled",
+        "--require-enrollment",
+    ];
+    let out = run(&home, &both);
+    assert!(!out.status.success(), "{}", describe(&out));
+    let sock = format!("/tmp/iki-ae-u-{}.sock", std::process::id());
+    let out = run(&home, &["serve", &sock, "--allow-unenrolled"]);
+    assert!(!out.status.success(), "{}", describe(&out));
+    let _ = std::fs::remove_dir_all(&home);
+}

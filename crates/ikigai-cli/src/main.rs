@@ -92,9 +92,13 @@ usage:
                                is quic.max_connection_age seconds old (default 600), so the
                                next call reconnects under the enrolment as it is then.
   ikigai serve <q> --require-enrollment
-                               refuse to start without clients.json, so the door never falls
-                               back to one shared --cap ceiling for every trusted certificate
-                               (the booking airlock runs this way, its --cap the clamp)
+                               the default: refuse to start without clients.json, so the door
+                               never falls back to one shared --cap ceiling (or to per-client
+                               workspaces) for every trusted certificate
+  ikigai serve <q> --allow-unenrolled
+                               start without clients.json anyway: every trusted certificate is
+                               served under the one --cap ceiling, or with no --cap in its own
+                               writable workspace. Prints a warning at start
   ikigai serve <q> --announce  also advertise this kernel on the local network (mDNS), so clients
                                can mount it by name; `source urn:peer:list` shows who is out there
   ikigai serve <q>             hosts LAYERS (ikigai-layers: urn:layer:*, urn:layers:*, urn:collab:*)
@@ -492,8 +496,12 @@ enum Mode {
         layers_https: Option<String>,
         /// `--require-enrollment`: a QUIC door that refuses to start without a `clients.json`,
         /// so it can never fall back to a shared `--cap` ceiling or to per-client workspaces
-        /// because the file went missing (ledger #1826: the booking airlock).
+        /// because the file went missing (ledger #1826: the booking airlock). The default now;
+        /// the flag says it explicitly.
         require_enrollment: bool,
+        /// `--allow-unenrolled`: the opt-out. A QUIC door with no `clients.json` starts in the
+        /// shared posture (`--cap` for every trusted certificate, or per-client workspaces).
+        allow_unenrolled: bool,
         /// `--names <file>` (absolute once parsed): the named requests `serve --http` places
         /// LAST in its surface (ledger #2516), so a route target such as `urn:quakes:page`
         /// resolves in this one process. `None`: the door serves no names, whatever the config
@@ -1474,10 +1482,15 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
         let mut layers_reseal = false;
         let mut layers_https: Option<String> = None;
         let mut require_enrollment = false;
+        let mut allow_unenrolled = false;
         let mut names: Option<std::path::PathBuf> = None;
         while let Some(arg) = argv.next() {
             if arg == "--require-enrollment" {
                 require_enrollment = true;
+                continue;
+            }
+            if arg == "--allow-unenrolled" {
+                allow_unenrolled = true;
                 continue;
             }
             if arg == "--names" {
@@ -1761,6 +1774,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
             layers_reseal,
             layers_https,
             require_enrollment,
+            allow_unenrolled,
             names,
         }));
     }
@@ -2193,16 +2207,25 @@ fn main() {
             layers_reseal,
             layers_https,
             require_enrollment,
+            allow_unenrolled,
             names,
         } => match (http, target.as_deref()) {
             // Enrollment is the QUIC door's (it is the door that authenticates certificates), so
-            // the flag on any other door would require nothing.
+            // either flag on any other door would change nothing.
             (http, target)
-                if require_enrollment && (http.is_some() || !target.is_some_and(is_quic)) =>
+                if (require_enrollment || allow_unenrolled)
+                    && (http.is_some() || !target.is_some_and(is_quic)) =>
             {
                 eprintln!(
-                    "ikigai: --require-enrollment applies to `serve quic://…`, the door that \
-                     enrolls client certificates"
+                    "ikigai: --require-enrollment and --allow-unenrolled apply to \
+                     `serve quic://…`, the door that enrolls client certificates"
+                );
+                std::process::exit(2);
+            }
+            (_, _) if require_enrollment && allow_unenrolled => {
+                eprintln!(
+                    "ikigai: --require-enrollment and --allow-unenrolled say opposite things; \
+                     give one"
                 );
                 std::process::exit(2);
             }
@@ -2263,7 +2286,7 @@ fn main() {
                         layers_key,
                         layers_reseal,
                         layers_https,
-                        require_enrollment,
+                        require_enrollment: !allow_unenrolled,
                     },
                 )
             }
@@ -4044,7 +4067,7 @@ struct QuicDoorFlags {
     layers_reseal: bool,
     /// `--layers-https <addr>`.
     layers_https: Option<String>,
-    /// `--require-enrollment`.
+    /// Whether a missing `clients.json` stops the door: true unless `--allow-unenrolled`.
     require_enrollment: bool,
 }
 
@@ -4195,20 +4218,34 @@ fn serve_quic(
                 hosted.config.display(),
             ));
         }
-        // ★ `--require-enrollment` (ledger #1826): the booking airlock serves per-drainer grants
-        // under its `--cap` ceiling, and without a `clients.json` it would fall to posture 2,
-        // the one shared ceiling for every trusted certificate. A missing file stops the door,
-        // never opens it. (While serving, a file that goes away refuses every client: the
-        // minter reads it per connection.)
-        if require_enrollment && enrolment.is_none() {
+        // ★ Enrollment is required by default (ledger #1826 made it a flag): without a
+        // `clients.json` the door would fall to posture 2, the one shared ceiling for every
+        // trusted certificate, or to posture 3, a writable workspace for each. A missing file
+        // stops the door, never opens it, unless `--allow-unenrolled` asks for that posture by
+        // name. (While serving, a file that goes away refuses every client: the minter reads it
+        // per connection.)
+        if enrolment.is_none() {
             let clients = ikigai_embedded::clients::clients_path()?
                 .map_or_else(|| "clients.json".into(), |p| p.display().to_string());
-            return Err(format!(
-                "--require-enrollment: there is no {clients}, so this door would serve every \
-                 trusted certificate under one shared authority. Enroll each client there \
-                 (`\"<fingerprint>\": {{\"grant\": \"<grant in grants.json>\", \"label\": \"…\"}}`; \
-                 `ikigai cert add-client` prints the fingerprint), or drop the flag."
-            ));
+            if require_enrollment {
+                return Err(format!(
+                    "enrollment is required (--require-enrollment is the default): there is no \
+                     {clients}, so this door would serve every trusted certificate under one \
+                     shared authority. Enroll each client there \
+                     (`\"<fingerprint>\": {{\"grant\": \"<grant in grants.json>\", \"label\": \"…\"}}`; \
+                     `ikigai cert add-client` prints the fingerprint), or start with \
+                     --allow-unenrolled to serve that shared posture."
+                ));
+            }
+            let shared = if caps.is_empty() {
+                "its own writable workspace".to_string()
+            } else {
+                format!("the one ceiling {}", caps.join(", "))
+            };
+            eprintln!(
+                "ikigai: warning: --allow-unenrolled and there is no {clients}: every trusted \
+                 certificate is served with {shared}"
+            );
         }
         // A served connection addresses files only inside `file_root/<segment>` — the
         // file module's jail refuses absolute IRI paths and anything outside its root

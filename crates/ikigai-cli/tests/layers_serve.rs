@@ -908,9 +908,10 @@ fn a_layer_door_without_per_identity_grants_refuses_to_start() {
         assert!(!stderr.contains("serving on"), "{extra:?}: {stderr}");
     }
 
-    // The same config home without `layers/` is the door it always was.
+    // The same config home without `layers/` serves the shared posture when asked by name.
     std::fs::remove_dir_all(config_home(&home).join("layers")).unwrap();
-    let banner = start_or_refuse(&home, &certs, &[]).expect("a door without layers/ serves");
+    let banner = start_or_refuse(&home, &certs, &["--allow-unenrolled"])
+        .expect("a door without layers/ serves");
     assert!(banner.contains("per-client workspaces"), "{banner}");
     let _ = std::fs::remove_dir_all(&home);
 }
