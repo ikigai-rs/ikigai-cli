@@ -29,6 +29,7 @@
 
 mod accept;
 
+use std::ffi::OsString;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -2054,16 +2055,15 @@ fn dispatch(kernel: &Kernel, call: Call, admission: &Admission) -> Reply {
 
 /// The default per-user socket path: `<runtime-dir>/ikigai/kernel.sock`, with the
 /// `ikigai` directory created `0700` so only this user can reach the socket.
-/// `<runtime-dir>` is `$XDG_RUNTIME_DIR` when set, else `$TMPDIR`/`/tmp` plus the
-/// uid. `None` if the directory can't be created.
+/// `<runtime-dir>` is `$XDG_RUNTIME_DIR`, else `$TMPDIR` or `/tmp` plus the uid, each only
+/// when absolute, so it is never relative to the working directory. `None` if the directory
+/// can't be created.
 pub fn default_socket_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let tmp =
-                std::env::var_os("TMPDIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
-            tmp.join(format!("ikigai-{}", own_uid()))
-        });
+    let base = runtime_dir(
+        std::env::var_os("XDG_RUNTIME_DIR"),
+        std::env::var_os("TMPDIR"),
+        own_uid(),
+    );
     let dir = base.join("ikigai");
     // ambient: fs: creates only `<runtime-dir>/ikigai`, the per-user socket directory, for `ikigai serve`/`ikigai --connect` when no socket path is given
     #[allow(clippy::disallowed_methods)]
@@ -2074,6 +2074,22 @@ pub fn default_socket_path() -> Option<PathBuf> {
     let restricted = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     restricted.ok()?;
     Some(dir.join("kernel.sock"))
+}
+
+/// `$XDG_RUNTIME_DIR` when it is absolute, else `$TMPDIR` when it is absolute, else `/tmp`,
+/// the last two plus the uid. An empty or relative value counts as unset, as the XDG base
+/// directory spec says.
+fn runtime_dir(xdg_runtime: Option<OsString>, tmpdir: Option<OsString>, uid: u32) -> PathBuf {
+    let absolute = |value: Option<OsString>| {
+        value
+            .map(PathBuf::from)
+            .filter(|path: &PathBuf| path.is_absolute())
+    };
+    absolute(xdg_runtime).unwrap_or_else(|| {
+        absolute(tmpdir)
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join(format!("ikigai-{uid}"))
+    })
 }
 
 /// This process's real user id.
@@ -2159,6 +2175,24 @@ mod tests {
         Kernel::new(Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),
         ))
+    }
+
+    /// An empty or relative runtime directory counts as unset, so the default socket is
+    /// never under the working directory.
+    #[test]
+    fn the_runtime_dir_is_always_absolute() {
+        let dir = |xdg: Option<&str>, tmp: Option<&str>| {
+            runtime_dir(xdg.map(Into::into), tmp.map(Into::into), 7)
+        };
+        assert_eq!(dir(Some("/run/u"), Some("/t")), PathBuf::from("/run/u"));
+        assert_eq!(dir(None, Some("/t")), PathBuf::from("/t/ikigai-7"));
+        assert_eq!(dir(None, None), PathBuf::from("/tmp/ikigai-7"));
+        for empty_or_relative in ["", "run", "./run", "../run"] {
+            let unset = Some(empty_or_relative);
+            assert_eq!(dir(unset, Some("/t")), PathBuf::from("/t/ikigai-7"));
+            assert_eq!(dir(unset, unset), PathBuf::from("/tmp/ikigai-7"));
+            assert_eq!(dir(None, unset), PathBuf::from("/tmp/ikigai-7"));
+        }
     }
 
     fn socket_path(name: &str) -> PathBuf {

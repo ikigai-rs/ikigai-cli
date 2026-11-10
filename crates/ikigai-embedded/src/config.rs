@@ -66,7 +66,8 @@ pub fn config_home_flag() -> Option<&'static Path> {
 /// The ikigai config home: the `--config-home` flag's directory when one was given
 /// ([`set_config_home`]), else `$XDG_CONFIG_HOME/ikigai`, or `$HOME/.config/ikigai` when
 /// `XDG_CONFIG_HOME` is unset, or `%USERPROFILE%\.config\ikigai` when `HOME` is unset too
-/// (Windows). `None` when none of them is known.
+/// (Windows). A variable that is unset, empty or not an absolute path is passed over, so the
+/// answer is always absolute, and `None` when none of them is usable.
 ///
 /// THE spelling of the config home — every file the host reads from it resolves through
 /// here. It used to be written twice: this module honoured `XDG_CONFIG_HOME` while nine
@@ -97,39 +98,65 @@ pub fn config_home() -> Option<PathBuf> {
 /// without `set_var`: the environment is process-global, and mutating it races the test
 /// harness's own threads.
 ///
-/// A set-but-EMPTY `XDG_CONFIG_HOME` counts as unset, per the XDG base directory spec. The
-/// old spellings took it literally and resolved a relative `ikigai/…` against the working
-/// directory — a config home that moved with `cd`.
+/// An empty or relative `XDG_CONFIG_HOME` counts as unset, per the XDG base directory spec,
+/// and `HOME` and `USERPROFILE` are held to the same rule: the config home never moves with
+/// the working directory.
 ///
-/// `USERPROFILE` is read only when `HOME` is unset or empty: plain PowerShell and cmd on
-/// Windows set it instead of `HOME`. Where `HOME` is set, the result is unchanged.
+/// `USERPROFILE` is read only when `HOME` is not usable: plain PowerShell and cmd on Windows
+/// set it instead of `HOME`. Where `HOME` is usable, the result is unchanged.
 fn config_home_from(
     xdg: Option<OsString>,
     home: Option<OsString>,
     userprofile: Option<OsString>,
 ) -> Option<PathBuf> {
-    let non_empty = |value: Option<OsString>| value.filter(|value| !value.is_empty());
-    non_empty(xdg)
-        .map(PathBuf::from)
-        .or_else(|| {
-            non_empty(home.clone())
-                .or_else(|| non_empty(userprofile))
-                .or(home)
-                .map(|home| PathBuf::from(home).join(".config"))
-        })
+    absolute(xdg)
+        .or_else(|| user_home_from(home, userprofile).map(|home| home.join(".config")))
         .map(|base| base.join("ikigai"))
+}
+
+/// `value` as a path when it is set and absolute. The empty path is not absolute, so an
+/// empty variable is an unset one.
+fn absolute(value: Option<OsString>) -> Option<PathBuf> {
+    value.map(PathBuf::from).filter(|path| path.is_absolute())
+}
+
+/// The user's home: `$HOME`, else `%USERPROFILE%`, each only when absolute. `None` when
+/// neither is usable, so that no path is ever built from a home that is not one.
+pub fn user_home() -> Option<PathBuf> {
+    user_home_from(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
+}
+
+/// [`user_home`] with the environment passed in.
+fn user_home_from(home: Option<OsString>, userprofile: Option<OsString>) -> Option<PathBuf> {
+    absolute(home).or_else(|| absolute(userprofile))
+}
+
+/// The config home, or the sentence that stops a host which needs one and has none.
+pub fn require_config_home() -> Result<PathBuf, String> {
+    config_home().ok_or_else(|| {
+        "no config home: XDG_CONFIG_HOME, HOME and USERPROFILE are each unset, empty or not an \
+         absolute path; set one to an absolute path, or name the directory with \
+         --config-home <dir>"
+            .to_string()
+    })
 }
 
 /// `$XDG_CONFIG_HOME/ikigai/config.toml`, or `~/.config/ikigai/config.toml` when
 /// `XDG_CONFIG_HOME` is unset. Independent of `IKIGAI_FILES` (see the module note).
 ///
-/// Falls back to a RELATIVE `./.config/ikigai/config.toml` where [`config_home`] gives up:
-/// a process with no `HOME` still reads *a* file. The JSON siblings return `None` instead —
-/// each caller keeps the failure semantics it already had, only the directory is unified.
-pub fn config_path() -> PathBuf {
-    config_home()
-        .unwrap_or_else(|| Path::new(".").join(".config").join("ikigai"))
-        .join("config.toml")
+/// `None` where [`config_home`] gives up: with no config home there is no file to read.
+pub fn config_path() -> Option<PathBuf> {
+    Some(config_home()?.join("config.toml"))
+}
+
+/// [`config_path`] for a diagnostic that names the file: its bare name with no config home.
+pub fn config_path_shown() -> String {
+    config_path().map_or_else(|| "config.toml".to_string(), |p| p.display().to_string())
+}
+
+/// The text of `config.toml`, when there is a config home and the file reads.
+fn config_text() -> Option<String> {
+    std::fs::read_to_string(config_path()?).ok()
 }
 
 /// The per-peer certificate directory `<config home>/quic-<name>/` (plasma holds
@@ -179,7 +206,7 @@ fn is_single_segment(name: &str) -> bool {
 
 /// The value of `key` in the host config, or `None` if the file or the key is absent.
 pub fn get(key: &str) -> Option<String> {
-    value_for(&std::fs::read_to_string(config_path()).ok()?, key)
+    value_for(&config_text()?, key)
 }
 
 /// Every value for `key`, in file order — for settings that legitimately repeat.
@@ -188,7 +215,7 @@ pub fn get(key: &str) -> Option<String> {
 /// they belong in the config home rather than in a launchd plist, so `git pull` cannot
 /// overwrite one machine's identity with another's.
 pub fn all(key: &str) -> Vec<String> {
-    std::fs::read_to_string(config_path())
+    config_text()
         .map(|text| values_for(&text, key))
         .unwrap_or_default()
 }
@@ -197,7 +224,7 @@ pub fn all(key: &str) -> Vec<String> {
 /// `(key, value)` — for a family of settings that is validated as a whole, so a misspelled
 /// key is reported rather than silently ignored (the `lisp.*` bounds read it).
 pub fn entries_under(prefix: &str) -> Vec<(String, String)> {
-    std::fs::read_to_string(config_path())
+    config_text()
         .map(|text| entries_under_in(&text, prefix))
         .unwrap_or_default()
 }
@@ -229,7 +256,7 @@ pub(crate) fn entries_under_in(text: &str, prefix: &str) -> Vec<(String, String)
 /// plus an unscoped line that instance B still honours re-creates exactly the collision the
 /// scoping exists to prevent.
 pub fn scoping_instances(key: &str) -> Vec<String> {
-    std::fs::read_to_string(config_path())
+    config_text()
         .map(|text| scoping_instances_in(&text, key))
         .unwrap_or_default()
 }
@@ -292,19 +319,28 @@ mod tests {
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
 
+    /// `path` as an absolute path on this platform, for the rules that test `is_absolute`.
+    fn abs(path: &str) -> OsString {
+        if cfg!(windows) {
+            format!("C:{path}").into()
+        } else {
+            path.into()
+        }
+    }
+
     /// `XDG_CONFIG_HOME` decides the config home when it is set. The second spelling this
     /// replaced ignored it, and the two agreed everywhere except on the machines that set
     /// it — a divergence the default case cannot show.
     #[test]
     fn xdg_config_home_decides_the_config_home_when_set() {
         assert_eq!(
-            config_home_from(Some("/xdg".into()), Some("/home/b".into()), None),
-            Some(PathBuf::from("/xdg/ikigai"))
+            config_home_from(Some(abs("/xdg")), Some(abs("/home/b")), None),
+            Some(PathBuf::from(abs("/xdg/ikigai")))
         );
         // With no HOME to fall back to, XDG alone still resolves.
         assert_eq!(
-            config_home_from(Some("/xdg".into()), None, None),
-            Some(PathBuf::from("/xdg/ikigai"))
+            config_home_from(Some(abs("/xdg")), None, None),
+            Some(PathBuf::from(abs("/xdg/ikigai")))
         );
     }
 
@@ -314,12 +350,12 @@ mod tests {
     #[test]
     fn an_unset_or_empty_xdg_falls_back_to_home_config() {
         assert_eq!(
-            config_home_from(None, Some("/home/b".into()), None),
-            Some(PathBuf::from("/home/b/.config/ikigai"))
+            config_home_from(None, Some(abs("/home/b")), None),
+            Some(PathBuf::from(abs("/home/b/.config/ikigai")))
         );
         assert_eq!(
-            config_home_from(Some(OsString::new()), Some("/home/b".into()), None),
-            Some(PathBuf::from("/home/b/.config/ikigai"))
+            config_home_from(Some(OsString::new()), Some(abs("/home/b")), None),
+            Some(PathBuf::from(abs("/home/b/.config/ikigai")))
         );
     }
 
@@ -327,28 +363,44 @@ mod tests {
     /// PowerShell sets it and not `HOME`); `XDG_CONFIG_HOME` and `HOME` both beat it.
     #[test]
     fn userprofile_is_the_last_resort() {
-        let profile = || Some(OsString::from("C:/Users/b"));
+        let profile = || Some(abs("/Users/b"));
         assert_eq!(
             config_home_from(None, None, profile()),
-            Some(PathBuf::from("C:/Users/b/.config/ikigai"))
+            Some(PathBuf::from(abs("/Users/b/.config/ikigai")))
         );
         assert_eq!(
             config_home_from(None, Some(OsString::new()), profile()),
-            Some(PathBuf::from("C:/Users/b/.config/ikigai"))
+            Some(PathBuf::from(abs("/Users/b/.config/ikigai")))
         );
         assert_eq!(
-            config_home_from(None, Some("/home/b".into()), profile()),
-            Some(PathBuf::from("/home/b/.config/ikigai"))
+            config_home_from(None, Some(abs("/home/b")), profile()),
+            Some(PathBuf::from(abs("/home/b/.config/ikigai")))
         );
         assert_eq!(
-            config_home_from(Some("/xdg".into()), None, profile()),
-            Some(PathBuf::from("/xdg/ikigai"))
+            config_home_from(Some(abs("/xdg")), None, profile()),
+            Some(PathBuf::from(abs("/xdg/ikigai")))
         );
-        // An empty HOME with no USERPROFILE keeps the old (relative) answer on Unix.
-        assert_eq!(
-            config_home_from(None, Some(OsString::new()), None),
-            Some(PathBuf::from(".config/ikigai"))
-        );
+    }
+
+    /// An empty or relative value counts as unset, wherever it appears, so the answer is
+    /// absolute or `None` and never moves with the working directory.
+    #[test]
+    fn an_empty_or_relative_variable_counts_as_unset() {
+        for unusable in ["", "rel", "./rel", "../rel"] {
+            let bad = || Some(OsString::from(unusable));
+            assert_eq!(config_home_from(bad(), None, None), None);
+            assert_eq!(config_home_from(None, bad(), None), None);
+            assert_eq!(config_home_from(None, None, bad()), None);
+            assert_eq!(config_home_from(bad(), bad(), bad()), None);
+            assert_eq!(
+                config_home_from(bad(), Some(abs("/home/b")), None),
+                Some(PathBuf::from(abs("/home/b/.config/ikigai")))
+            );
+            assert_eq!(
+                config_home_from(None, bad(), Some(abs("/Users/b"))),
+                Some(PathBuf::from(abs("/Users/b/.config/ikigai")))
+            );
+        }
     }
 
     /// Neither base directory known: `None`, so each caller applies its OWN fallback
@@ -358,9 +410,7 @@ mod tests {
         assert_eq!(config_home_from(None, None, None), None);
         assert_eq!(
             config_path(),
-            config_home()
-                .unwrap_or_else(|| Path::new(".").join(".config").join("ikigai"))
-                .join("config.toml")
+            config_home().map(|home| home.join("config.toml"))
         );
     }
 
@@ -381,7 +431,10 @@ mod tests {
         };
         let grants = crate::grants_path().unwrap();
         let clients = crate::clients::clients_path().unwrap();
-        assert_eq!(config_path().parent(), Some(home.as_path()));
+        assert_eq!(
+            config_path().as_deref().and_then(Path::parent),
+            Some(home.as_path())
+        );
         assert_eq!(
             grants.as_deref().and_then(Path::parent),
             Some(home.as_path())

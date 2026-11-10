@@ -182,7 +182,7 @@ fn named() -> std::result::Result<Option<(PathBuf, ArrangementSource)>, String> 
     else {
         return Ok(None);
     };
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = crate::config::user_home();
     let path = config_relative(
         &value,
         home.as_deref(),

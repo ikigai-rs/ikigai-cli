@@ -1065,9 +1065,13 @@ fn parse_args() -> Result<Option<Mode>, String> {
     // Read only to resolve a relative `--config-home`: a process whose working directory is
     // gone must still start when it was not given one.
     let cwd = std::env::current_dir().ok();
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|home| home.is_absolute());
     if let Some(dir) = take_config_home(&mut args, cwd.as_deref(), home.as_deref())? {
         apply_config_home(dir)?;
+    } else {
+        share_config_home()?;
     }
     if let Some(dir) = take_files(&mut args, cwd.as_deref(), home.as_deref())? {
         #[cfg(feature = "embedded")]
@@ -1301,6 +1305,22 @@ fn apply_config_home(dir: std::path::PathBuf) -> Result<(), String> {
     ikigai_embedded::config::set_config_home(dir.clone())
         .map_err(|e| format!("--config-home: {e}"))?;
     ikigai_engine::config::set_config_home(dir).map_err(|e| format!("--config-home: {e}"))
+}
+
+/// Hold the engine's reading of the config home to this host's, which only ever answers an
+/// absolute path, so `config`, the TUI's keybindings and the certificate directory agree with
+/// everything else when the environment names no usable home.
+#[cfg(feature = "embedded")]
+fn share_config_home() -> Result<(), String> {
+    match ikigai_embedded::config::config_home() {
+        Some(dir) => ikigai_engine::config::set_config_home(dir),
+        None => Ok(()),
+    }
+}
+
+#[cfg(not(feature = "embedded"))]
+fn share_config_home() -> Result<(), String> {
+    Ok(())
 }
 
 /// The argument parser proper, over any argv — so it can be tested without a
@@ -2032,6 +2052,28 @@ fn script_file(path: String, rest: impl Iterator<Item = String>) -> Result<Scrip
     Ok(ScriptFile { path, params })
 }
 
+/// Stop a mode that would otherwise resolve its config home or file root against the
+/// working directory. `--version` needs neither, a `cert` command given its directory needs
+/// no config home, and a `--connect` client builds no kernel and so has no file root.
+#[cfg(feature = "embedded")]
+fn check_homes(mode: &Mode) -> Result<(), String> {
+    let (config_home, file_root) = match mode {
+        Mode::Version { .. } => (false, false),
+        Mode::CertGenerate { dir, .. } => (dir.is_none(), false),
+        Mode::CertAddClient { cert_dir, .. } => (cert_dir.is_none(), false),
+        Mode::LayersToken(_) => (true, false),
+        Mode::Repl(repl) => (true, repl.connect.is_none()),
+        Mode::Daemon { .. } | Mode::Serve { .. } | Mode::Mcp { .. } => (true, true),
+    };
+    if config_home {
+        ikigai_embedded::config::require_config_home()?;
+    }
+    if file_root {
+        ikigai_embedded::check_file_root()?;
+    }
+    Ok(())
+}
+
 #[cfg(feature = "embedded")]
 fn main() {
     let mode = match parse_args() {
@@ -2083,6 +2125,12 @@ fn main() {
         Mode::Mcp { .. } => "mcp",
         _ => "repl",
     });
+
+    // After the instance name: a file root may be named by an `<instance>.files` line.
+    if let Err(e) = check_homes(&mode) {
+        eprintln!("ikigai: {e}");
+        std::process::exit(2);
+    }
 
     // Before any mount is resolved: a door's mounts describe under the INNER deadline.
     if matches!(mode, Mode::Serve { .. }) {
@@ -3083,7 +3131,7 @@ fn mounts_from_config_lines(
 /// as it was before ledger #1379.
 #[cfg(feature = "embedded")]
 fn home_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+    ikigai_embedded::config::user_home().unwrap_or_default()
 }
 
 /// Turn a parsed [`Mount`] into a [`MountSpec`](ikigai_embedded::MountSpec), connecting eagerly or lazily
@@ -5400,7 +5448,7 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
         Err(e) => {
             eprintln!(
                 "ikigai: {e} (in {})",
-                ikigai_embedded::config::config_path().display()
+                ikigai_embedded::config::config_path_shown()
             );
             std::process::exit(2);
         }
@@ -5458,7 +5506,7 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
         Err(e) => {
             eprintln!(
                 "ikigai: {e} (in {})",
-                ikigai_embedded::config::config_path().display()
+                ikigai_embedded::config::config_path_shown()
             );
             std::process::exit(2);
         }

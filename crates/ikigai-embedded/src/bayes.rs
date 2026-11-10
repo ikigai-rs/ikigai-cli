@@ -159,7 +159,7 @@ pub fn arm() -> Result<Option<String>, String> {
         config_state.as_deref(),
         &config_models,
         crate::config::config_home().as_deref(),
-        std::env::var_os("HOME").as_deref().map(Path::new),
+        crate::config::user_home().as_deref(),
     )?;
     let opened = match setting {
         None => None,

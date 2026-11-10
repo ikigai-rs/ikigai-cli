@@ -27,8 +27,8 @@ let (representation, status) = resolver.issue(request)?;
 No CA, no TLS — the operating system already authenticates a local peer:
 
 - **`default_socket_path()`** places the socket in a `0700` per-user directory
-  (`$XDG_RUNTIME_DIR`, else `$TMPDIR`/`/tmp` plus the uid), and the socket itself is
-  `0600`, so no other user can reach it.
+  (`$XDG_RUNTIME_DIR`, else `$TMPDIR`/`/tmp` plus the uid; an empty or relative value
+  counts as unset), and the socket itself is `0600`, so no other user can reach it.
 - **`serve`** additionally checks each peer's **kernel-verified UID** (`SO_PEERCRED`
   on Linux, `getpeereid` on macOS/BSD, read through the `nix` crate) and refuses any
   connection that isn't the server's own user — defense in depth over the directory mode.
