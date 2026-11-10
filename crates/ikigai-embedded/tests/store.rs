@@ -10,7 +10,7 @@
 //! ⚠ **`tests/conformance.rs` does NOT walk these resources, and that is not an
 //! oversight.** Its fixture home carries no `store` line, so the composed kernel it walks
 //! binds no dataset and its catalog is unchanged by this feature — which is also why
-//! adding the feature needed no opt-out there. The seven store resources are walked by
+//! adding the feature needed no opt-out there. The store resources are walked by
 //! `ikigai-store`'s own conformance suite, over the same `space()` this host binds; what
 //! is left for THIS crate to state is the composition, and that is what this file is.
 #![cfg(feature = "store")]
@@ -147,7 +147,7 @@ fn reading_the_store_needs_the_stores_own_read_scope() {
     .expect("urn:cap:store:read reads");
 }
 
-/// The seven store resources are in the composed catalog, under the names the manifold
+/// The store resources are in the composed catalog, under the names the manifold
 /// advertises — so `urn:kernel:actions` offers them and the engine can route named
 /// arguments to them.
 #[test]
@@ -166,6 +166,7 @@ fn the_store_resources_join_the_composed_catalog() {
         "urn:iki:store:info",
         "urn:iki:store:update",
         "urn:iki:store:load",
+        "urn:iki:store:graph-written:{graph}",
     ] {
         assert!(
             patterns.iter().any(|p| p == iri),

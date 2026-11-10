@@ -90,6 +90,34 @@ fn refused(engine: &Engine, input: &str) -> String {
     }
 }
 
+#[test]
+fn ledger_upgrade_preserves_labels_and_exposes_claim_epochs() {
+    let engine = engine();
+    line(
+        &engine,
+        "sink urn:iki:ledger:upgrade:append labels=cli Upgrade the ledger",
+    );
+    let error = refused(
+        &engine,
+        "sink urn:iki:ledger:upgrade:label item=1 content=\"repo:x worker:y\"",
+    );
+    assert!(error.contains("label"), "{error}");
+    let detail = line(
+        &engine,
+        "source urn:iki:ledger:upgrade:item:1 as=application/json",
+    );
+    let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+    assert_eq!(detail["labels"], serde_json::json!(["cli"]));
+
+    line(&engine, "sink urn:iki:ledger:upgrade:claim item=1 cli-test");
+    let detail = line(
+        &engine,
+        "source urn:iki:ledger:upgrade:item:1 as=application/json",
+    );
+    let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+    assert_eq!(detail["claim"]["epoch"], 1);
+}
+
 /// ★ **The arc's deliverable, as a test.** Append, list, comment, rank and close — the
 /// five verbs, typed the way the docs tell an operator to type them.
 ///
