@@ -1,5 +1,6 @@
-//! `config.toml` is read strictly: a line the reader cannot read, or a key the host does not
-//! know, stops startup with the line named, and a trailing comment is not part of a value.
+//! `config.toml` is read strictly: a line the reader cannot read, or an unknown key in one of
+//! the host's own families, stops startup with the line named, and a trailing comment is not
+//! part of a value. Another program's keys in the shared config home are left alone.
 #![cfg(all(feature = "embedded", unix))]
 
 use std::process::{Command, Output, Stdio};
@@ -7,6 +8,11 @@ use std::process::{Command, Output, Stdio};
 /// Run `ikigai -c <command>` with `config` as the config home's `config.toml`. `config` may
 /// name `{root}`, which is replaced by a scratch file root holding `marker.txt`.
 fn run(case: &str, config: &str, command: &str) -> Output {
+    run_with(case, config, &[], command)
+}
+
+/// [`run`] with `args` (`--name <instance>`, say) before `-c`.
+fn run_with(case: &str, config: &str, args: &[&str], command: &str) -> Output {
     let home = std::env::temp_dir().join(format!("iki-config-toml-{}-{case}", std::process::id()));
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(home.join("config")).unwrap();
@@ -18,6 +24,7 @@ fn run(case: &str, config: &str, command: &str) -> Output {
     let output = Command::new(env!("CARGO_BIN_EXE_ikigai"))
         .arg("--config-home")
         .arg(home.join("config"))
+        .args(args)
         .args(["--quiet", "-c", command])
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", home.join("decoy"))
@@ -81,6 +88,7 @@ fn an_unknown_key_stops_startup() {
         ("mounts", "mounts = \"alias urn:x:=peer:p\"\n", "mounts"),
         ("scoped", "serve.filez = \"{root}\"\n", "serve.filez"),
         ("mail", "mail.form = \"a@b.example\"\n", "mail.form"),
+        ("http", "http.timeut = 5\n", "http.timeut"),
     ] {
         let out = run(case, config, "source urn:file:marker.txt");
         let text = stderr(&out);
@@ -129,4 +137,88 @@ fn the_flat_shape_still_reads() {
     let out = run("flat", config, "source urn:file:marker.txt");
     assert!(out.status.success(), "{out:?}");
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "marked");
+}
+
+/// The config home is shared: another program's keys (`gonk.*`, `web.*`) are that program's,
+/// so the host starts beside them, and still stops on its own misspellings.
+#[test]
+fn other_programs_keys_are_left_alone() {
+    let shared = "gonk.browse.github = \"ikigai-rs\"\n\
+                  gonk.review.arm = \"on\"\n\
+                  gonk.face = \"plain\"\n\
+                  gonk.quic.bind = \"127.0.0.1:4433\"\n\
+                  web.bind = \"127.0.0.1:8080\"\n\
+                  web.cap = \"urn:cap:x\"\n\
+                  files = \"{root}\"\n";
+    let out = run("shared", shared, "source urn:file:marker.txt");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "marked");
+
+    for (case, extra, key) in [
+        (
+            "shared-mounts",
+            "mounts = \"alias urn:x:=peer:p\"\n",
+            "mounts",
+        ),
+        ("shared-http", "http.timeut = 5\n", "http.timeut"),
+    ] {
+        let out = run(
+            case,
+            &format!("{shared}{extra}"),
+            "source urn:file:marker.txt",
+        );
+        assert_eq!(out.status.code(), Some(2), "{case}: {out:?}");
+        assert!(
+            stderr(&out).contains(&format!("`{key}`")),
+            "{case}: {out:?}"
+        );
+    }
+
+    // A line another program's key is on must still read.
+    let out = run(
+        "shared-unreadable",
+        &format!("{shared}web.mount = \"unclosed\n"),
+        "source urn:file:marker.txt",
+    );
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(stderr(&out).contains("line 8"), "{out:?}");
+}
+
+/// An instance name is the host's when the host runs under it (`--name`) or it is a mode
+/// default (`repl`, `serve`, `daemon`, `mcp`); any other first segment is another program's.
+#[test]
+fn an_instance_name_is_told_apart_from_another_programs_namespace() {
+    // `serve.files` reads for the instance named `serve`.
+    let out = run_with(
+        "serve-files",
+        "serve.files = \"{root}\"\n",
+        &["--name", "serve"],
+        "source urn:file:marker.txt",
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "marked");
+
+    // A misspelling after a minted name stops the instance running under that name...
+    let config = "files = \"{root}\"\nmy-box.filez = \"/elsewhere\"\n";
+    let out = run_with(
+        "minted",
+        config,
+        &["--name", "my-box"],
+        "source urn:file:marker.txt",
+    );
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(stderr(&out).contains("`my-box.filez`"), "{out:?}");
+    // ...and is another namespace to a host running under any other name.
+    let out = run("unminted", config, "source urn:file:marker.txt");
+    assert!(out.status.success(), "{out:?}");
+
+    // Run as `--name gonk`, gonk's keys read as this host's own, and an unknown one stops it.
+    let out = run_with(
+        "named-gonk",
+        "files = \"{root}\"\ngonk.browse.github = \"x\"\n",
+        &["--name", "gonk"],
+        "source urn:file:marker.txt",
+    );
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(stderr(&out).contains("`gonk.browse.github`"), "{out:?}");
 }

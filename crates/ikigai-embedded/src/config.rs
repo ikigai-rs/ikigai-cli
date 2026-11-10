@@ -254,6 +254,10 @@ const KNOWN_KEYS: &[&str] = &[
 /// (`lisp.*`, the upload, spill and rate-limit rules), so any key under them is let through.
 const KNOWN_PREFIXES: &[&str] = &["lisp.", "http.upload", "http.spill", "http.rate_limit"];
 
+/// The instance names the host gives itself when no `--name` is passed, one per mode. They
+/// are always the host's own, whichever mode is running.
+const DEFAULT_INSTANCES: &[&str] = &["repl", "serve", "daemon", "mcp"];
+
 /// Whether `key` is one the host reads: a [`KNOWN_KEYS`] entry, a member of a
 /// [`KNOWN_PREFIXES`] family, or either of those after an instance name.
 fn is_known_key(key: &str) -> bool {
@@ -266,9 +270,35 @@ fn is_known_key(key: &str) -> bool {
             .any(|(at, _)| at > 0 && known(&key[at + 1..]))
 }
 
+/// Whether `key` falls in a family the host owns, so that an unknown one is a mistake to
+/// stop on rather than another program's setting. That is a bare key (`mounts`), a key whose
+/// first segment is a host family (`http.timeut`, the families being the first segments of
+/// [`KNOWN_KEYS`] and [`KNOWN_PREFIXES`]), or any key after one of the host's own instance
+/// names: `instance` (this process's, from `--name`) or a [`DEFAULT_INSTANCES`] name.
+///
+/// Any other first segment (`gonk.`, `web.`) is another program's namespace in the shared
+/// config home, and its keys are that program's to read and check. An instance name is told
+/// apart from such a namespace by being the name this host runs under or a mode default.
+fn is_host_family(key: &str, instance: &str) -> bool {
+    let Some((first, _)) = key.split_once('.') else {
+        return true;
+    };
+    let family = |name: &str| {
+        KNOWN_KEYS
+            .iter()
+            .chain(KNOWN_PREFIXES)
+            .any(|known| known.split('.').next() == Some(name))
+    };
+    family(first) || first == instance || DEFAULT_INSTANCES.contains(&first)
+}
+
 /// Read `config.toml` through, before the host acts on any of it: `Ok` when there is no
 /// config home or no file, or when every line reads and names a key the host knows; else the
-/// sentence that stops the host, naming the file and the line.
+/// sentence that stops the host, naming the file and the line. An unknown key stops the host
+/// only in one of its own families: a bare key, a key under one of the host's first segments
+/// (`http.`, `browse.`, ...), or a key after one of its instance names (the one it runs under,
+/// or `repl`, `serve`, `daemon`, `mcp`). Any other first segment (`gonk.`, `web.`) is another
+/// program's in the shared config home and is left alone; the line it is on must still read.
 ///
 /// A line is blank, a `#` comment, or `key = value`. The key is bare: letters, digits, `_`,
 /// `-` and `.`, with no empty segment. The value is a `"basic"` string (with TOML's escapes),
@@ -284,16 +314,17 @@ pub fn check() -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
     };
-    check_text(&text).map_err(|e| format!("{} {e}", path.display()))
+    check_text(&text, crate::instance_name()).map_err(|e| format!("{} {e}", path.display()))
 }
 
-/// [`check`] over text already read; the error begins with the line it is about.
-pub(crate) fn check_text(text: &str) -> Result<(), String> {
+/// [`check`] over text already read, for the host running as `instance`; the error begins
+/// with the line it is about.
+pub(crate) fn check_text(text: &str, instance: &str) -> Result<(), String> {
     for (index, line) in text.lines().enumerate() {
         let at = || format!("line {}", index + 1);
         match parse_line(line) {
             Err(e) => return Err(format!("{}: {e}", at())),
-            Ok(Some((key, _))) if !is_known_key(&key) => {
+            Ok(Some((key, _))) if !is_known_key(&key) && is_host_family(&key, instance) => {
                 return Err(format!(
                     "{}: `{key}` is not a setting this host reads; check its spelling, or \
                      remove the line",
@@ -496,8 +527,8 @@ fn value_for(text: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_text, config_home, config_home_from, config_path, is_known_key, parse_line,
-        peer_cert_dir_in, scoping_instances_in, value_for, values_for,
+        check_text, config_home, config_home_from, config_path, is_host_family, is_known_key,
+        parse_line, peer_cert_dir_in, scoping_instances_in, value_for, values_for,
     };
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
@@ -736,14 +767,53 @@ mod tests {
         ] {
             assert!(!is_known_key(unknown), "{unknown}");
         }
-        let err = check_text("# ok\nfiles = \"/r\"\nmounts = \"x\"\n").unwrap_err();
+        let err = check_text("# ok\nfiles = \"/r\"\nmounts = \"x\"\n", "repl").unwrap_err();
         assert!(err.starts_with("line 3: `mounts`"), "{err}");
-        let err = check_text("files = \"/r\"\n[ipc\n").unwrap_err();
+        let err = check_text("files = \"/r\"\n[ipc\n", "repl").unwrap_err();
         assert!(err.starts_with("line 2: "), "{err}");
         assert_eq!(
-            check_text("# only comments\n\nmount = \"a\"\nmount = \"b\"\n"),
+            check_text("# only comments\n\nmount = \"a\"\nmount = \"b\"\n", "repl"),
             Ok(())
         );
+    }
+
+    /// The host checks its own families: bare keys, its first segments (`http`, `browse`,
+    /// ...), and anything after its own instance names. Another program's namespace in the
+    /// shared config home is left alone, and only an instance name the host runs under, or a
+    /// mode default, counts as the host's.
+    #[test]
+    fn other_programs_keys_are_theirs() {
+        for (key, instance) in [
+            ("mounts", "repl"),
+            ("http.timeut", "repl"),
+            ("browse.github", "repl"),
+            ("lisp.anything", "repl"),
+            ("serve.filez", "repl"),
+            ("daemon.mail.form", "serve"),
+            ("my-box.filez", "my-box"),
+            ("my-box.browse.github", "my-box"),
+            ("gonk.browse.github", "gonk"),
+        ] {
+            assert!(is_host_family(key, instance), "{key} as {instance}");
+        }
+        for (key, instance) in [
+            ("gonk.browse.github", "repl"),
+            ("gonk.review.arm", "repl"),
+            ("gonk.face", "serve"),
+            ("gonk.quic.bind", "daemon"),
+            ("web.bind", "repl"),
+            ("web.cap", "my-box"),
+            ("my-box.filez", "repl"),
+        ] {
+            assert!(!is_host_family(key, instance), "{key} as {instance}");
+        }
+        let shared = "gonk.browse.github = \"x\"\ngonk.review.arm = 1\ngonk.face = \"y\"\n\
+                      web.bind = \"127.0.0.1:8080\"\nweb.cap = \"z\"\nfiles = \"/r\"\n";
+        assert_eq!(check_text(shared, "repl"), Ok(()));
+        let err = check_text(shared, "gonk").unwrap_err();
+        assert!(err.starts_with("line 1: `gonk.browse.github`"), "{err}");
+        let err = check_text("web.bind = \"x\"\nweb.cap = 'y\n", "repl").unwrap_err();
+        assert!(err.starts_with("line 2: "), "{err}");
     }
 
     #[test]

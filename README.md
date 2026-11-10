@@ -328,9 +328,18 @@ same file the host reads `mail.*`, `mount` and `scheduler` from).
 `config.toml` holds flat `key = value` lines, one setting per line; `mount` and the other
 repeating keys take one line each. A value is a `"basic"` or `'literal'` TOML string, or a
 bare number or word, and a `#` after it starts a comment. A `[table]` header, a line with no
-`=`, an unclosed string, anything after a string's closing quote, or a key the host does not
-read (`mounts` for `mount`, say) stops startup with an `ikigai:` line naming the file and
-the line number.
+`=`, an unclosed string, or anything after a string's closing quote stops startup with an
+`ikigai:` line naming the file and the line number, whichever program's key the line holds.
+
+The config home is shared with other programs, so the host checks keys only in its own
+families: a bare key (`files`, `store`, `mount`, `scheduler`, `keybindings`, ...), a key under
+`browse`, `bayes`, `cache`, `call`, `describe`, `http`, `ipc`, `layers`, `lisp`, `mail`,
+`passkey`, `quic` or `show`, and anything after one of the host's own instance names. An
+unknown key there (`mounts` for `mount`, `http.timeut`) stops startup the same way. The host's
+instance names are the one it runs under (`--name`) and the mode defaults `repl`, `serve`,
+`daemon` and `mcp`; any other first segment (`gonk.`, `web.`) is another program's namespace,
+and its keys are that program's to read and check. An instance named after another program
+(`--name gonk`) reads that program's keys as its own, so pick a name of its own.
 
 `--config-home <dir>` names the config home outright, in every mode (REPL, `-c`, `serve`,
 `mcp`, `--daemon`, `--connect`, `cert`), so a scratch run needs no environment variable:
