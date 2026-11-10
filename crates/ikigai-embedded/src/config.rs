@@ -3,8 +3,13 @@
 //!
 //! The one place the daemon and the CLI both read — so they cannot diverge the way a shell
 //! env var and a launchd plist just did (the mail `from` that was set for one process and not
-//! the other). A minimal `key = "value"` scanner; dotted keys like `mail.from` are ordinary
-//! keys to it. It grows a real TOML parser if and when the config outgrows a flat map.
+//! the other). A strict reader of flat `key = value` lines; dotted keys like `mail.from` are
+//! ordinary keys to it. See [`check`] for the grammar.
+//!
+//! Not a TOML parser, on purpose: `mount` (and `browse.root`, `bayes.models`) repeat, one line
+//! per mount, which TOML forbids as a duplicate key, and `ikigai_engine::config` reads and
+//! rewrites the same file line by line. Each line is read the way TOML reads a `key = value`
+//! line, and anything outside that shape stops the host ([`check`]) rather than being skipped.
 //!
 //! Deliberately in the CONFIG dir, NOT `file_root()`: `IKIGAI_FILES` repoints the workspace
 //! *data* dir, but a *setting* like the mail sender shouldn't move with it. This is the shared
@@ -204,6 +209,211 @@ fn is_single_segment(name: &str) -> bool {
     !name.is_empty() && ikigai_resolve::is_plain_file_name(&format!("quic-{name}"))
 }
 
+/// Every key the host reads from `config.toml`. A key is also known with an instance name
+/// in front of it (`serve.files`, `daemon.browse.root`), the way the scoped readers look
+/// it up, so an instance minted by `--name` needs no entry here.
+const KNOWN_KEYS: &[&str] = &[
+    "files",
+    "store",
+    "mount",
+    "scheduler",
+    "width-routing",
+    "arrangement",
+    "keybindings",
+    "show.opener",
+    "describe.timeout",
+    "call.timeout",
+    "quic.timeout",
+    "quic.max_connection_age",
+    "ipc.timeout",
+    "ipc.group",
+    "ipc.server_user",
+    "layers.https",
+    "layers.state",
+    "layers.key",
+    "bayes.state",
+    "bayes.models",
+    "passkey.max_challenges",
+    "http.max_response_bytes",
+    "http.user_agent",
+    "http.timeout",
+    "mail.host",
+    "mail.port",
+    "mail.from",
+    "browse.root",
+    "browse.store",
+    "browse.file_model",
+    "browse.dir_model",
+    "browse.file_max_tokens",
+    "browse.dir_max_tokens",
+    "cache.max_entries",
+    "cache.max_bytes",
+];
+
+/// Key families whose own readers validate every member and name a misspelled one
+/// (`lisp.*`, the upload, spill and rate-limit rules), so any key under them is let through.
+const KNOWN_PREFIXES: &[&str] = &["lisp.", "http.upload", "http.spill", "http.rate_limit"];
+
+/// Whether `key` is one the host reads: a [`KNOWN_KEYS`] entry, a member of a
+/// [`KNOWN_PREFIXES`] family, or either of those after an instance name.
+fn is_known_key(key: &str) -> bool {
+    let known =
+        |key: &str| KNOWN_KEYS.contains(&key) || KNOWN_PREFIXES.iter().any(|p| key.starts_with(p));
+    known(key)
+        || key
+            .char_indices()
+            .filter(|&(_, c)| c == '.')
+            .any(|(at, _)| at > 0 && known(&key[at + 1..]))
+}
+
+/// Read `config.toml` through, before the host acts on any of it: `Ok` when there is no
+/// config home or no file, or when every line reads and names a key the host knows; else the
+/// sentence that stops the host, naming the file and the line.
+///
+/// A line is blank, a `#` comment, or `key = value`. The key is bare: letters, digits, `_`,
+/// `-` and `.`, with no empty segment. The value is a `"basic"` string (with TOML's escapes),
+/// a `'literal'` string, or a bare word or number running to the end of the line. A `#` after
+/// the value starts a comment. A `[table]` header, a line with no `=`, an unterminated string
+/// or anything after a string's closing quote is an unreadable line.
+pub fn check() -> Result<(), String> {
+    let Some(path) = config_path() else {
+        return Ok(());
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    check_text(&text).map_err(|e| format!("{} {e}", path.display()))
+}
+
+/// [`check`] over text already read; the error begins with the line it is about.
+pub(crate) fn check_text(text: &str) -> Result<(), String> {
+    for (index, line) in text.lines().enumerate() {
+        let at = || format!("line {}", index + 1);
+        match parse_line(line) {
+            Err(e) => return Err(format!("{}: {e}", at())),
+            Ok(Some((key, _))) if !is_known_key(&key) => {
+                return Err(format!(
+                    "{}: `{key}` is not a setting this host reads; check its spelling, or \
+                     remove the line",
+                    at()
+                ))
+            }
+            Ok(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// One line of `config.toml`: `None` for a blank or comment line, the key and its unquoted
+/// value for an assignment, or why the line cannot be read. See [`check`] for the grammar.
+fn parse_line(line: &str) -> Result<Option<(String, String)>, String> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return Ok(None);
+    }
+    if line.starts_with('[') {
+        return Err(format!(
+            "`{line}`: table headers are not read here; write each setting as one \
+             `dotted.key = value` line"
+        ));
+    }
+    let (key, value) = line
+        .split_once('=')
+        .ok_or_else(|| format!("`{line}`: expected `key = value`"))?;
+    let key = key.trim();
+    let bare_key = !key.is_empty()
+        && key.split('.').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        });
+    if !bare_key {
+        return Err(format!(
+            "`{line}`: expected a key of letters, digits, `_`, `-` and `.` before the `=`"
+        ));
+    }
+    let value = value.trim_start();
+    let (value, rest) = match value.chars().next() {
+        Some('"') => basic_string(&value[1..]).ok_or_else(|| {
+            format!("`{line}`: the string after `{key} =` is not closed, or has a bad escape")
+        })?,
+        Some('\'') => {
+            let body = &value[1..];
+            let end = body
+                .find('\'')
+                .ok_or_else(|| format!("`{line}`: the string after `{key} =` is not closed"))?;
+            (body[..end].to_string(), &body[end + 1..])
+        }
+        _ => {
+            let bare = value.split('#').next().unwrap_or_default().trim();
+            if bare.is_empty() {
+                return Err(format!("`{line}`: `{key}` has no value"));
+            }
+            if bare.contains(['"', '\'']) {
+                return Err(format!(
+                    "`{line}`: a quote inside a bare value; quote the whole value instead"
+                ));
+            }
+            (bare.to_string(), "")
+        }
+    };
+    let rest = rest.trim_start();
+    if !(rest.is_empty() || rest.starts_with('#')) {
+        return Err(format!(
+            "`{line}`: unexpected `{rest}` after the value; a comment starts with `#`"
+        ));
+    }
+    Ok(Some((key.to_string(), value)))
+}
+
+/// A TOML basic string's body, `text` being what follows the opening `"`: the unescaped
+/// value and what follows the closing quote, or `None` if it is unclosed or a bad escape.
+fn basic_string(text: &str) -> Option<(String, &str)> {
+    let mut value = String::new();
+    let mut chars = text.char_indices();
+    while let Some((at, c)) = chars.next() {
+        match c {
+            '"' => return Some((value, &text[at + 1..])),
+            '\\' => {
+                let (_, escaped) = chars.next()?;
+                match escaped {
+                    '"' => value.push('"'),
+                    '\\' => value.push('\\'),
+                    'n' => value.push('\n'),
+                    't' => value.push('\t'),
+                    'r' => value.push('\r'),
+                    'b' => value.push('\u{8}'),
+                    'f' => value.push('\u{c}'),
+                    'e' => value.push('\u{1b}'),
+                    'u' | 'U' => {
+                        let width = if escaped == 'u' { 4 } else { 8 };
+                        let digits: String = (0..width)
+                            .filter_map(|_| chars.next().map(|(_, c)| c))
+                            .collect();
+                        if digits.len() != width {
+                            return None;
+                        }
+                        value.push(char::from_u32(u32::from_str_radix(&digits, 16).ok()?)?);
+                    }
+                    _ => return None,
+                }
+            }
+            _ => value.push(c),
+        }
+    }
+    None
+}
+
+/// Every readable assignment in `text`, in file order. A line [`check`] would refuse is
+/// passed over here; the host has already stopped on it before any setting is read.
+fn entries(text: &str) -> impl Iterator<Item = (String, String)> + '_ {
+    text.lines()
+        .filter_map(|line| parse_line(line).ok().flatten())
+}
+
 /// The value of `key` in the host config, or `None` if the file or the key is absent.
 pub fn get(key: &str) -> Option<String> {
     value_for(&config_text()?, key)
@@ -232,17 +442,8 @@ pub fn entries_under(prefix: &str) -> Vec<(String, String)> {
 /// The `(key, value)` lines of `text` whose key begins with `prefix`. See [`value_for`] for
 /// the parsing rules.
 pub(crate) fn entries_under_in(text: &str, prefix: &str) -> Vec<(String, String)> {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .filter_map(|line| line.split_once('='))
-        .filter(|(name, _)| name.trim().starts_with(prefix))
-        .map(|(name, value)| {
-            (
-                name.trim().to_string(),
-                value.trim().trim_matches(['"', '\'']).trim().to_string(),
-            )
-        })
+    entries(text)
+        .filter(|(name, _)| name.starts_with(prefix))
         .collect()
 }
 
@@ -266,16 +467,10 @@ pub fn scoping_instances(key: &str) -> Vec<String> {
 fn scoping_instances_in(text: &str, key: &str) -> Vec<String> {
     let suffix = format!(".{key}");
     let mut instances: Vec<String> = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((name, _)) = line.split_once('=') {
-            if let Some(instance) = name.trim().strip_suffix(&suffix) {
-                if !instance.is_empty() && !instances.iter().any(|i| i == instance) {
-                    instances.push(instance.to_string());
-                }
+    for (name, _) in entries(text) {
+        if let Some(instance) = name.strip_suffix(&suffix) {
+            if !instance.is_empty() && !instances.iter().any(|i| i == instance) {
+                instances.push(instance.to_string());
             }
         }
     }
@@ -284,37 +479,25 @@ fn scoping_instances_in(text: &str, key: &str) -> Vec<String> {
 
 /// Every `key = value` line for `key`. See [`value_for`] for the parsing rules.
 fn values_for(text: &str, key: &str) -> Vec<String> {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .filter_map(|line| line.split_once('='))
-        .filter(|(name, _)| name.trim() == key)
-        .map(|(_, value)| value.trim().trim_matches(['"', '\'']).trim().to_string())
+    entries(text)
+        .filter(|(name, _)| name == key)
+        .map(|(_, value)| value)
         .collect()
 }
 
-/// The first `key = value` line for `key`, trimmed and unquoted. Blank lines and `#` comments
-/// are skipped. Not a full TOML parser — the flat `key = "value"` shape the config uses today.
+/// The value of the first `key = value` line for `key`, unquoted, with any trailing comment
+/// dropped. See [`check`] for the line grammar.
 fn value_for(text: &str, key: &str) -> Option<String> {
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((name, value)) = line.split_once('=') {
-            if name.trim() == key {
-                return Some(value.trim().trim_matches(['"', '\'']).trim().to_string());
-            }
-        }
-    }
-    None
+    entries(text)
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        config_home, config_home_from, config_path, peer_cert_dir_in, scoping_instances_in,
-        value_for, values_for,
+        check_text, config_home, config_home_from, config_path, is_known_key, parse_line,
+        peer_cert_dir_in, scoping_instances_in, value_for, values_for,
     };
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
@@ -478,6 +661,89 @@ mod tests {
             ]
         );
         assert!(values_for(text, "absent").is_empty());
+    }
+
+    /// A value reads the way TOML reads it: quotes removed, escapes applied in a basic string
+    /// and not in a literal one, and a `#` after the value is a comment, not part of it.
+    #[test]
+    fn a_line_reads_as_toml_reads_it() {
+        let read = |line: &str| parse_line(line).unwrap().unwrap().1;
+        assert_eq!(read(r#"files = "/r" # the root"#), "/r");
+        assert_eq!(read("files = '/r'# the root"), "/r");
+        assert_eq!(read(r#"mail.from = "a#b@c.example""#), "a#b@c.example");
+        assert_eq!(
+            read(r#"x.y = "say \"hi\" \\ \u00e9""#),
+            "say \"hi\" \\ \u{e9}"
+        );
+        assert_eq!(read(r"x.y = 'C:\Users\b'"), r"C:\Users\b");
+        assert_eq!(read("mail.port = 587 # submission"), "587");
+        assert_eq!(
+            read(r#"mount = "prefer urn:llm:=peer:plasma""#),
+            "prefer urn:llm:=peer:plasma"
+        );
+        assert_eq!(read(r#"x = """#), "");
+        for skipped in ["", "   ", "# a comment", "  # indented"] {
+            assert_eq!(parse_line(skipped), Ok(None), "{skipped:?}");
+        }
+        for unreadable in [
+            "[mail]",
+            "[ipc",
+            "just words",
+            "= \"x\"",
+            "two words = 1",
+            "a..b = 1",
+            "files =",
+            "files = # nothing",
+            r#"files = "/r"#,
+            r#"files = "/r" trailing"#,
+            r#"files = "/r" "/s""#,
+            "files = '/r",
+            r#"files = "bad \q escape""#,
+            r#"files = /r"x"#,
+        ] {
+            assert!(
+                parse_line(unreadable).is_err(),
+                "{unreadable:?} must not read"
+            );
+        }
+    }
+
+    /// A key is known as itself, as a member of a validated family, or after an instance
+    /// name; anything else is refused by name, on the line it is on.
+    #[test]
+    fn unknown_keys_are_refused_by_name() {
+        for known in [
+            "files",
+            "serve.files",
+            "mount",
+            "serve.browse.root",
+            "my-box.scheduler",
+            "lisp.timeout",
+            "lisp.anything",
+            "http.upload_grace",
+            "http.rate_limit_sources",
+            "cache.max_bytes",
+        ] {
+            assert!(is_known_key(known), "{known}");
+        }
+        for unknown in [
+            "mounts",
+            "serve.filez",
+            "mail.form",
+            "files.x",
+            ".files",
+            "http.timout",
+        ] {
+            assert!(!is_known_key(unknown), "{unknown}");
+        }
+        let err = check_text("# ok\nfiles = \"/r\"\nmounts = \"x\"\n").unwrap_err();
+        assert!(err.starts_with("line 3: `mounts`"), "{err}");
+        let err = check_text("files = \"/r\"\n[ipc\n").unwrap_err();
+        assert!(err.starts_with("line 2: "), "{err}");
+        assert_eq!(
+            check_text("# only comments\n\nmount = \"a\"\nmount = \"b\"\n"),
+            Ok(())
+        );
     }
 
     #[test]

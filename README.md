@@ -325,6 +325,13 @@ The scheme is configurable — set `keybindings` from inside the REPL with
 (falling back to `~/.config/ikigai/config.toml` — the one shared config home, the
 same file the host reads `mail.*`, `mount` and `scheduler` from).
 
+`config.toml` holds flat `key = value` lines, one setting per line; `mount` and the other
+repeating keys take one line each. A value is a `"basic"` or `'literal'` TOML string, or a
+bare number or word, and a `#` after it starts a comment. A `[table]` header, a line with no
+`=`, an unclosed string, anything after a string's closing quote, or a key the host does not
+read (`mounts` for `mount`, say) stops startup with an `ikigai:` line naming the file and
+the line number.
+
 `--config-home <dir>` names the config home outright, in every mode (REPL, `-c`, `serve`,
 `mcp`, `--daemon`, `--connect`, `cert`), so a scratch run needs no environment variable:
 `ikigai --config-home ./scratch -c config`. `<dir>` IS the config home (it holds

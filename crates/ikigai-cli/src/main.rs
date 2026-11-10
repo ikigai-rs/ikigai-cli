@@ -2114,6 +2114,12 @@ fn main() {
     // once before constructing a kernel or evaluating Lisp. A bad line stops every mode
     // rather than reading as the default; `--version` alone answers whatever the config says.
     if !matches!(mode, Mode::Version { .. }) {
+        // `config.toml` itself first: a line it cannot read, or a key no part of the host
+        // reads, stops every mode here rather than being skipped by each reader.
+        if let Err(e) = ikigai_embedded::config::check() {
+            eprintln!("ikigai: {e}");
+            std::process::exit(2);
+        }
         if let Err(e) = ikigai_embedded::cache::configure() {
             eprintln!("ikigai: {e}");
             std::process::exit(2);
