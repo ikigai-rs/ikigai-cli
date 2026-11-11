@@ -5052,14 +5052,57 @@ fn connect_quic(target: &str, certs: &Certs) -> Result<Engine, String> {
     let addr = quic::parse_addr(target)?;
     let identity = quic::client_identity(certs)?;
     let trusted = quic::trusted_server_cert(certs)?;
-    let mut resolver = ikigai_quic::connect_with(addr, &identity, &trusted, quic_idle_timeout())
-        .map_err(|e| format!("connect {target}: {e}"))?
-        .with_describe_timeout(describe_timeout(ikigai_quic::DEFAULT_DESCRIBE_TIMEOUT));
-    if let Some(bound) = call_timeout() {
-        resolver = resolver.with_call_timeout(bound);
+    let describe = describe_timeout(ikigai_quic::DEFAULT_DESCRIBE_TIMEOUT);
+    let bound = call_timeout();
+    let idle = quic_idle_timeout();
+    let origin = target.to_string();
+    // The dial and its admission check, as one attempt.
+    let dial = move || -> Result<ikigai_quic::QuicResolver, ikigai_core::Error> {
+        let mut resolver = ikigai_quic::connect_with(addr, &identity, &trusted, idle)
+            .map_err(|e| dial_error(&origin, e))?
+            .with_describe_timeout(describe);
+        if let Some(bound) = bound {
+            resolver = resolver.with_call_timeout(bound);
+        }
+        resolver.check_admission()?;
+        Ok(resolver)
+    };
+    // `connect.retry.*` (ledger #3383). With no key there is no policy: one dial, and a
+    // failure ends the client at once, as before. With a policy, the first dial and
+    // admission go through the policy's Retry and limit too (a hub down at startup is waited
+    // for; a refusal such as Denied still fails at once), and every later call goes through
+    // a cache-less issuer over the governed resolver, so reads stay as fresh as without it.
+    match ikigai_embedded::retry::RetryPolicy::from_config()? {
+        None => Ok(with_profiles(Engine::new(
+            dial().map_err(|e| e.to_string())?,
+        ))),
+        Some(policy) => {
+            let resolver =
+                ikigai_embedded::retry::first_dial(&policy, dial).map_err(|e| e.to_string())?;
+            Ok(with_profiles(Engine::new(
+                ikigai_embedded::retry::connect_issuer(
+                    &policy,
+                    std::sync::Arc::new(resolver),
+                    target,
+                ),
+            )))
+        }
     }
-    resolver.check_admission().map_err(|e| e.to_string())?;
-    Ok(with_profiles(Engine::new(resolver)))
+}
+
+/// A failed `--connect` dial as core's error, classed the way the QUIC transport classes
+/// its own: a refused admission is `Denied` and a wire-version mismatch an endpoint error
+/// (neither is tried again); an unreachable or silent hub is transient. The text is the one
+/// the client printed before the policy (`connect <target>: …`).
+#[cfg(all(feature = "embedded", feature = "quic"))]
+fn dial_error(target: &str, e: std::io::Error) -> ikigai_core::Error {
+    let text = format!("connect {target}: {e}");
+    match e.kind() {
+        std::io::ErrorKind::PermissionDenied => ikigai_core::Error::Denied(text),
+        std::io::ErrorKind::InvalidData => ikigai_core::Error::Endpoint(text),
+        std::io::ErrorKind::TimedOut => ikigai_core::Error::Timeout(text),
+        _ => ikigai_core::Error::Unavailable(text),
+    }
 }
 
 #[cfg(all(feature = "embedded", not(feature = "quic")))]

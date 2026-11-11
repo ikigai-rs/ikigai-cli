@@ -1253,3 +1253,29 @@ refused until it is back.
 
 `ikigai_embedded::clients::clients_path()` now returns
 `Result<Option<PathBuf>, String>`, and `clients::set_clients_path` sets the explicit path.
+
+## Several tools on one machine: a served host with mounts, under one retry policy
+
+The recommended shape for several tools on one machine is ONE local served host that mounts
+the hub (`ikigai serve <socket> --mount urn:hub:=quic://hub:4433`), with every tool connecting
+to that host. Its link to the hub then rides out an outage the same way for every tool, under
+one circuit breaker. Configure it in `config.toml` (every key optional; no key means no policy,
+today's behavior):
+
+```toml
+connect.retry.limit_minutes = 2            # overall time limit for one call (default 1)
+connect.retry.initial_backoff_ms = 100     # first backoff, doubling (default 100)
+connect.retry.max_backoff_ms = 10000       # largest backoff (default 10000)
+connect.retry.jitter = true                # full jitter (default true)
+connect.retry.breaker_threshold = 5        # consecutive failures that open a circuit (default: no breaker)
+connect.retry.breaker_cooloff_seconds = 30 # how long a circuit stays open (default 30)
+```
+
+The policy covers `--mount` and `--override` mounts (one shared breaker for all of them) and
+`--connect quic://…` (through a cache-less issuer, so reads stay as fresh as without it; the
+first dial and admission check ride the same policy, so a client started while its hub is down
+waits for it within the limit, while a refusal such as `Denied` still fails at once). A
+`--prefer` mount is left as it was: it already falls back to the local binding. Only what is
+safe is resent: reads, calls the transport proved never ran, and Sinks whose contract declares a
+resend safe (with the declared key present). A final failure is the typed `GaveUp`, which names
+the attempts and the elapsed time.
