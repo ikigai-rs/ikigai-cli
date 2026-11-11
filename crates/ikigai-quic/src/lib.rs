@@ -3917,8 +3917,8 @@ mod tests {
     }
 
     #[test]
-    fn gave_up_crosses_typed_at_v11_and_untyped_at_v10() {
-        for version in [10, PROTOCOL_VERSION] {
+    fn gave_up_crosses_typed_at_v11_and_untyped_for_every_older_peer() {
+        for version in ikigai_wire::MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION {
             let (server_id, client_id) = (generate(), generate());
             let space = EndpointSpace::new().bind(
                 Exact::new("urn:test:gaveup"),
@@ -3943,7 +3943,19 @@ mod tests {
                     Iri::parse("urn:test:gaveup").unwrap(),
                 ))
                 .unwrap_err();
-            if version == 10 {
+            let local = Kernel::new(Arc::new(ikigai_resolve::RemoteSpace::new(Arc::new(client))));
+            let mounted = Resolver::issue_as(
+                &local,
+                Request::new(Verb::Source, Iri::parse("urn:test:gaveup").unwrap()),
+                &Capability::root(),
+            )
+            .unwrap_err();
+            assert_eq!(
+                ikigai_wire::WireError::from(&mounted),
+                ikigai_wire::WireError::from(&error),
+                "forwarding through a mount preserves the negotiated error"
+            );
+            if version < 11 {
                 assert!(matches!(error, Error::Endpoint(_)), "{error:?}");
                 assert_eq!(error.class(), ikigai_core::FailureClass::Unknown);
             } else {
@@ -3954,7 +3966,7 @@ mod tests {
                     if elapsed == std::time::Duration::new(120, 123_456_789) && detail == "down")
                 );
             }
-            drop(client);
+            drop(local);
             assert_eq!(server.join().unwrap(), Some(version));
         }
     }
