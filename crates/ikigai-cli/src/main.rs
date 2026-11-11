@@ -2110,6 +2110,13 @@ fn main() {
             eprintln!("ikigai: {e}");
             std::process::exit(2);
         }
+        // A set IKIGAI_LLM_CONFIG names the LLM registry; one naming no file stops the start
+        // rather than letting llm.json or the built-in default stand in for it.
+        #[cfg(feature = "embedded")]
+        if let Err(e) = ikigai_embedded::check_llm_config() {
+            eprintln!("ikigai: {e}");
+            std::process::exit(2);
+        }
     }
 
     // The default instance name follows the mode; an explicit --name (already
