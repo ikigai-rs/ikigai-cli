@@ -215,6 +215,89 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The environment variable that tells [`in_a_user_namespace_child`] it is the child.
+    #[cfg(target_os = "linux")]
+    const NS_CHILD: &str = "IKIGAI_AUTHORITY_NS_CHILD";
+
+    /// The child half of [`a_sandboxed_door_takes_its_authority_in_a_real_user_namespace`]:
+    /// it runs inside `unshare --user --map-current-user`, where `/` and the temp directory
+    /// (root's, unmapped) read as the overflow uid, and does nothing when run on its own.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn in_a_user_namespace_child() {
+        let Some(dir) = std::env::var_os(NS_CHILD) else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let paths = [
+            (dir.join("server.key"), Kind::PrivateKey),
+            (dir.join("server.crt"), Kind::Public),
+            (dir.clone(), Kind::Public),
+        ];
+        // The directories above the door's own tree are root's, unmapped: accepted.
+        assert_eq!(check(&paths), Ok(()));
+        // The grants-file walk accepts them too: they are not this user's and it cannot
+        // write them.
+        let hosts = Path::new("/etc/hosts");
+        if hosts.exists() {
+            assert_eq!(crate::agents::check_protected(hosts), Ok(()));
+        }
+    }
+
+    /// The edge's sandboxed door (ledger #3397): a systemd user unit with `PrivateUsers=yes`
+    /// sees every unmapped owner, root included, as the overflow uid. Runs the check in a
+    /// child under a real user namespace over a scratch certificate directory.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_sandboxed_door_takes_its_authority_in_a_real_user_namespace() {
+        use std::process::Command;
+        let probe = Command::new("unshare")
+            .args(["--user", "--map-current-user", "true"])
+            .output();
+        match probe {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                eprintln!(
+                    "SKIPPED: this runner refuses an unprivileged user namespace \
+                     (`unshare --user --map-current-user true`: {}); on Ubuntu 24.04 that is \
+                     AppArmor's kernel.apparmor_restrict_unprivileged_userns",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!("SKIPPED: `unshare` cannot be run here ({e}), so no user namespace");
+                return;
+            }
+        }
+        let dir = scratch("userns");
+        let key = dir.join("server.key");
+        let crt = dir.join("server.crt");
+        std::fs::write(&key, "k").unwrap();
+        std::fs::write(&crt, "c").unwrap();
+        chmod(&key, 0o600);
+        chmod(&crt, 0o644);
+        let out = Command::new("unshare")
+            .args(["--user", "--map-current-user"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "authority::tests::in_a_user_namespace_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(NS_CHILD, &dir)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "the check refused inside a user namespace:\n{stdout}\n{stderr}"
+        );
+    }
+
     #[test]
     fn a_missing_file_is_left_to_its_reader() {
         let dir = scratch("missing");
