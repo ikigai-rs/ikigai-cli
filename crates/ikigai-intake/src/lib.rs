@@ -476,13 +476,25 @@ fn sexpr_string(value: &str) -> String {
     out
 }
 
+/// RFC 5322 `specials` other than `@` and `.`. A bare address (an addr-spec in dot-atom
+/// form, which is what an email box holds) never contains one; they only appear in display
+/// names (`Bob <a@x>`), groups (`g: a@x;`), comments, quoted local parts, domain literals
+/// and address lists.
+const ADDRESS_SPECIALS: &[char] = &['<', '>', '(', ')', '[', ']', ':', ';', ',', '"', '\\'];
+
 /// A minimal address shape check — one `@`, something either side, a dotted domain, no
-/// spaces. The MTA is the real authority; this turns obvious junk into a typed rejection.
+/// spaces, no control characters and none of the [`ADDRESS_SPECIALS`]. The MTA is the real
+/// authority; this turns obvious junk into a typed rejection, and keeps the value ONE bare
+/// address: `x<blocked@x.example>` names the same mailbox as `blocked@x.example`, but would
+/// not match it on the blocklist, and would carry a display name the submitter chose into the
+/// handler's Reply-To.
 fn address_like(value: &str) -> bool {
     let mut parts = value.split('@');
     matches!((parts.next(), parts.next(), parts.next()), (Some(local), Some(domain), None)
         if !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.'))
-        && !value.contains(char::is_whitespace)
+        && !value.contains(|c: char| {
+            c.is_whitespace() || c.is_control() || ADDRESS_SPECIALS.contains(&c)
+        })
 }
 
 #[async_trait]
@@ -888,6 +900,68 @@ mod tests {
             dropped.lock().unwrap().is_empty(),
             "a blocked sender's message must not drop"
         );
+    }
+
+    /// A blocked sender cannot step around the blocklist by wrapping the address in a
+    /// display name or angle brackets: `x<spammer@x.example>` names the same mailbox (it is
+    /// what lands in the handler's Reply-To), but is not the string the log was asked about.
+    /// Only a bare address is an address here, so the wrapped forms are refused at the door.
+    #[test]
+    fn a_blocked_sender_cannot_wrap_the_address_to_slip_the_blocklist() {
+        for wrapped in [
+            "x%3Cspammer%40x.example%3E",
+            "%3Cspammer%40x.example%3E",
+            "%22Your+Bank%22%3Cspammer%40x.example%3E",
+        ] {
+            let (k, dropped) = blocking_kernel("spammer@x.example");
+            let outcome = block_on(k.issue(
+                post(&format!("name=Spammer&email={wrapped}&message=the+price")),
+                &block_cap(),
+            ));
+            assert_eq!(
+                dropped.lock().unwrap().as_slice(),
+                &[] as &[String],
+                "`{wrapped}` slipped the blocklist and dropped a tuple"
+            );
+            assert!(
+                matches!(outcome, Err(Error::InvalidArgument { ref name, .. }) if name == "email"),
+                "`{wrapped}` must be refused as an email address, got: {outcome:?}"
+            );
+        }
+    }
+
+    /// An email field carries ONE bare address: RFC 5322 specials other than `@` and `.`
+    /// (`< > ( ) [ ] : ; , " \`) only appear in display names, groups, comments, quoted local
+    /// parts and address lists, none of which a contact form's email box should produce.
+    #[test]
+    fn an_email_field_is_one_bare_address() {
+        let (k, dropped) = kernel();
+        for bad in [
+            "Bob<a@x.example>",
+            "<a@x.example>",
+            "a,b@x.example",
+            "a@x.example,b",
+            "g:a@x.example;",
+            "a(c)@x.example",
+            "\"a\"@x.example",
+            "a\\b@x.example",
+            "a@[192.0.2.1]",
+        ] {
+            let body = serde_json::json!({"name": "A", "message": "hi", "email": bad}).to_string();
+            let outcome = block_on(k.issue(post(&body), &cap()));
+            assert!(
+                matches!(outcome, Err(Error::InvalidArgument { ref name, .. }) if name == "email"),
+                "`{bad}` must be refused, got: {outcome:?}"
+            );
+        }
+        assert!(dropped.lock().unwrap().is_empty());
+        // An ordinary address with the atext a real one uses still lands.
+        block_on(k.issue(
+            post("name=A&message=hi&email=o%27brien%2Btag%40mail.x.example"),
+            &cap(),
+        ))
+        .unwrap();
+        assert_eq!(dropped.lock().unwrap().len(), 1);
     }
 
     #[test]
