@@ -341,11 +341,13 @@ pub(crate) fn open(
 
 /// A `Location` an endpoint may set: a same-origin relative reference (RFC 3986 §4.2), an
 /// absolute path or a query alone. Refused: a scheme or an authority (`https://x`, `//x`), a
-/// backslash (which browsers read as `/`, so `/\x` is `//x`), and anything else (`done`, a
-/// relative path a browser would resolve against a directory the endpoint cannot see).
+/// backslash (which browsers read as `/`, so `/\x` is `//x`), a tab (which browsers remove
+/// from a URL before parsing it, WHATWG URL, so `/<TAB>/x` is `//x` too; a CR or LF is
+/// refused by [`check_value`]), and anything else (`done`, a relative path a browser would
+/// resolve against a directory the endpoint cannot see).
 pub(crate) fn check_same_origin(name: &str, value: &str) -> Result<(), HeaderRefusal> {
     let path_absolute = value.starts_with('/') && !value.starts_with("//");
-    if !(path_absolute || value.starts_with('?')) || value.contains('\\') {
+    if !(path_absolute || value.starts_with('?')) || value.contains(['\\', '\t']) {
         return Err(HeaderRefusal::new(
             name,
             "not a same-origin relative reference (an absolute path `/…` or a query `?…`)",
