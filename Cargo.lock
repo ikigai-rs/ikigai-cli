@@ -3099,7 +3099,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-cli"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "age",
  "async-trait",
@@ -3209,7 +3209,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-discovery"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "if-addrs",
  "mdns-sd",
@@ -3217,7 +3217,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-email"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -3227,7 +3227,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-embedded"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "age",
  "async-trait",
@@ -3283,7 +3283,7 @@ dependencies = [
  "ikigai-ui",
  "ikigai-view",
  "ikigai-vocab",
- "ikigai-xslt 0.8.0",
+ "ikigai-xslt 0.8.1",
  "libc",
  "notify",
  "oxigraph",
@@ -3376,7 +3376,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-intake"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "chrono-tz",
@@ -3406,7 +3406,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-ipc"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -3528,7 +3528,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-mcp"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "futures",
  "ikigai-core",
@@ -3565,7 +3565,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-p2p"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "futures",
  "ikigai-core",
@@ -3580,7 +3580,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-passkey"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "p256",
  "serde_json",
@@ -3606,7 +3606,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-quic"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -3694,7 +3694,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-scheduler"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "futures",
  "ikigai-core",
@@ -3853,7 +3853,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-tz"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -3877,7 +3877,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-view"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3899,7 +3899,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-web"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3923,7 +3923,7 @@ dependencies = [
 
 [[package]]
 name = "ikigai-wire"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "futures",
  "ikigai-core",
@@ -3970,9 +3970,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-xslt"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e18d13bea6a4117f00ab082258817a1a2fc0d8c75bca2452be5d0c14d5e91634"
+checksum = "9d0a6b9b9dd9f59ee7890a609c2a4ece008f1a03259b405cd8cc2c23f39f5462"
 dependencies = [
  "async-trait",
  "ikigai-core",
