@@ -5059,7 +5059,14 @@ fn connect_quic(target: &str, certs: &Certs) -> Result<Engine, String> {
         resolver = resolver.with_call_timeout(bound);
     }
     resolver.check_admission().map_err(|e| e.to_string())?;
-    Ok(with_profiles(Engine::new(resolver)))
+    // `connect.retry.*` (ledger #3383): the hub is reached through a cache-less issuer over
+    // the governed resolver, so reads stay as fresh as without the policy. No key, no policy.
+    match ikigai_embedded::retry::RetryPolicy::from_config()? {
+        None => Ok(with_profiles(Engine::new(resolver))),
+        Some(policy) => Ok(with_profiles(Engine::new(
+            ikigai_embedded::retry::connect_issuer(&policy, std::sync::Arc::new(resolver), target),
+        ))),
+    }
 }
 
 #[cfg(all(feature = "embedded", not(feature = "quic")))]

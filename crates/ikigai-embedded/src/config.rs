@@ -223,6 +223,12 @@ const KNOWN_KEYS: &[&str] = &[
     "show.opener",
     "describe.timeout",
     "call.timeout",
+    "connect.retry.limit_minutes",
+    "connect.retry.initial_backoff_ms",
+    "connect.retry.max_backoff_ms",
+    "connect.retry.jitter",
+    "connect.retry.breaker_threshold",
+    "connect.retry.breaker_cooloff_seconds",
     "quic.timeout",
     "quic.max_connection_age",
     "ipc.timeout",
@@ -306,6 +312,13 @@ fn is_host_family(key: &str, instance: &str) -> bool {
 /// the value starts a comment. A `[table]` header, a line with no `=`, an unterminated string
 /// or anything after a string's closing quote is an unreadable line.
 pub fn check() -> Result<(), String> {
+    check_keys()?;
+    // The retry policy's values are read here too, so an unusable one stops the host
+    // before it dials anything (ledger #3383).
+    crate::retry::RetryPolicy::from_config().map(|_| ())
+}
+
+fn check_keys() -> Result<(), String> {
     let Some(path) = config_path() else {
         return Ok(());
     };

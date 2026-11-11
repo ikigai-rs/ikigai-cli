@@ -79,6 +79,7 @@ mod ui;
 // `ikigai-cli` build its value and print from it: the banner and the resource are two faces
 // of one recorded fact, which is what keeps them from drifting into two spellings of it.
 pub mod posture;
+pub mod retry;
 pub mod scheduling;
 #[cfg(unix)]
 pub mod spill;
@@ -5385,8 +5386,35 @@ fn compose_mounts(mut spaces: Vec<Arc<dyn Space>>, mounts: Vec<MountSpec>) -> Ar
         }
     }
     deeper.sort_by_key(|mount| std::cmp::Reverse(mount.prefix.len()));
+    // Ordered by prefix LENGTH, so the most specific mount wins regardless of
+    // declaration order: `--override urn:llm:=peerA --override urn:llm:ask=peerB`
+    // sends `urn:llm:ask` to peerB and the rest of `urn:llm:*` to peerA. A whole
+    // IRI is simply the most specific prefix there is, which is what makes
+    // single-RESOURCE overrides work.
+    fronting.sort_by_key(|mount| std::cmp::Reverse(mount.prefix.len()));
+    // Every remote space, built before any is placed, so the `connect.retry.*` policy can
+    // govern them all with ONE breaker (ledger #3383).
+    let fronting: Vec<(String, MountKind, Arc<dyn Space>)> = fronting
+        .into_iter()
+        .map(
+            |MountSpec {
+                 prefix,
+                 origin,
+                 resolver,
+                 kind,
+             }| {
+                let remote = Arc::new(
+                    ikigai_resolve::MountedRemote::overriding(resolver, prefix.clone(), origin)
+                        .sharing(&peers)
+                        .with_clock(Arc::clone(&clock)),
+                ) as Arc<dyn Space>;
+                (prefix, kind, remote)
+            },
+        )
+        .collect();
+    let mut aliases: Vec<Arc<dyn Space>> = Vec::new();
     for mount in deeper {
-        spaces.push(Arc::new(
+        aliases.push(Arc::new(
             ikigai_resolve::MountedRemote::overriding(mount.resolver, mount.prefix, mount.origin)
                 .sharing(&peers)
                 .with_clock(Arc::clone(&clock)),
@@ -5399,35 +5427,50 @@ fn compose_mounts(mut spaces: Vec<Arc<dyn Space>>, mounts: Vec<MountSpec>) -> Ar
             inner: mount.resolver,
             prefix: mount.prefix.clone(),
         });
-        spaces.push(Arc::new(
+        aliases.push(Arc::new(
             ikigai_resolve::MountedRemote::new(resolver, mount.prefix, mount.origin)
                 .sharing(&peers)
                 .with_clock(Arc::clone(&clock)),
         ));
     }
+    // The retry policy (ledger #3383): override and alias mounts resolve through one shared
+    // Retry and CircuitBreaker, combined in the order this composition tries them, so the
+    // mount a request reaches is the one that answers it. A `--prefer` mount is left as it
+    // was: it already falls back to the local space on a transient failure, and retrying
+    // first would only delay that answer.
+    let (fronting, aliases) = match retry::RetryPolicy::from_config().ok().flatten() {
+        None => (fronting, aliases),
+        Some(policy) => {
+            let governed = policy.govern(
+                fronting
+                    .iter()
+                    .filter(|(_, kind, _)| *kind != MountKind::Prefer)
+                    .map(|(_, _, remote)| Arc::clone(remote))
+                    .chain(aliases.iter().cloned())
+                    .collect(),
+            );
+            (
+                fronting
+                    .into_iter()
+                    .map(|(prefix, kind, remote)| match kind {
+                        MountKind::Prefer => (prefix, kind, remote),
+                        _ => (prefix, kind, governed.slot(remote)),
+                    })
+                    .collect(),
+                aliases
+                    .into_iter()
+                    .map(|space| governed.slot(space))
+                    .collect(),
+            )
+        }
+    };
+    spaces.extend(aliases);
     if fronting.is_empty() {
         return Arc::new(Fallback::new(spaces));
     }
-    // Ordered by prefix LENGTH, so the most specific mount wins regardless of
-    // declaration order: `--override urn:llm:=peerA --override urn:llm:ask=peerB`
-    // sends `urn:llm:ask` to peerB and the rest of `urn:llm:*` to peerA. A whole
-    // IRI is simply the most specific prefix there is, which is what makes
-    // single-RESOURCE overrides work.
-    fronting.sort_by_key(|mount| std::cmp::Reverse(mount.prefix.len()));
     let local: Arc<dyn Space> = Arc::new(Fallback::new(spaces));
     let mut ordered: Vec<Arc<dyn Space>> = Vec::new();
-    for MountSpec {
-        prefix,
-        origin,
-        resolver,
-        kind,
-    } in fronting
-    {
-        let remote = Arc::new(
-            ikigai_resolve::MountedRemote::overriding(resolver, prefix.clone(), origin)
-                .sharing(&peers)
-                .with_clock(Arc::clone(&clock)),
-        ) as Arc<dyn Space>;
+    for (prefix, kind, remote) in fronting {
         ordered.push(match kind {
             // The failover pair must stay INSIDE the prefix. `Failover` resolves
             // every target, so an unguarded `[remote, local]` would also answer
