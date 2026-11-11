@@ -666,15 +666,27 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
     // value by name HERE, before anything reads it as missing: as a selector it was
     // misreported as "required", and as an optional binding it was dropped and the call
     // answered another resource. `null` stays what a JSON client means by it: not given.
-    let named = action
-        .inputs
+    //
+    // On an OPEN argument set every other name the caller gives is passed through as a request
+    // argument too, so it is held to the same rule: an object there reached the endpoint as an
+    // empty string.
+    let open = matches!(action.arguments, ikigai_core::Arguments::Open(_));
+    let inputs = &action.inputs;
+    let named = inputs
         .iter()
         .map(|i| i.name.as_str())
-        .chain(shape.synthesized.iter().map(|a| a.name.as_str()));
+        .chain(shape.synthesized.iter().map(|a| a.name.as_str()))
+        .chain(
+            args_map
+                .keys()
+                .map(String::as_str)
+                .filter(move |name| open && !inputs.iter().any(|i| i.name == *name)),
+        );
     //
     // A LIST argument (ledger #1547) is the one exception: it takes an ARRAY of scalars,
     // which is joined below with its separator's canonical character, exactly as the engine
-    // joins `graph=A graph=B`.
+    // joins `graph=A graph=B`. A `null` item is not one either: it is not an absent list, and
+    // read as a scalar it became an empty item.
     let is_list = |arg: &str| {
         action
             .inputs
@@ -686,7 +698,7 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
             Some(Value::Array(items)) if is_list(arg) => {
                 if items
                     .iter()
-                    .any(|item| matches!(item, Value::Array(_) | Value::Object(_)))
+                    .any(|item| matches!(item, Value::Null | Value::Array(_) | Value::Object(_)))
                 {
                     return tool_error(format!(
                         "`{arg}` is a list of values (strings, numbers or booleans), and an \
@@ -754,13 +766,15 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
     // turn the row's template into ANOTHER endpoint's IRI, so the target is checked below to
     // still reach this tool's endpoint (ledger #86). Delimiters themselves are legitimate,
     // since `urn:file:{path}` and `urn:repo:{repo}:file:{path}` take `/` and `:`; what is
-    // refused is a call answered by an endpoint the tool does not name.
+    // refused is a call answered by an endpoint the tool does not name. An EMPTY value
+    // changes the structure as surely as a delimiter does: `urn:demo:user:{name}` with
+    // `name=""` is `urn:demo:user:`, which another endpoint may be bound at.
     let mut structural: Vec<&str> = Vec::new();
     for (name, value) in joined.pairs() {
         let input = action.inputs.iter().find(|i| i.name == name);
         match input {
             Some(input) if input.source == ikigai_core::InputSource::Binding => {
-                if value.contains([':', '/', '?', '#', '[', ']', '@']) {
+                if value.is_empty() || value.contains([':', '/', '?', '#', '[', ']', '@']) {
                     structural.push(&input.name);
                 }
                 target = target.replace(&format!("{{{}}}", input.name), value);
@@ -1479,6 +1493,56 @@ mod tests {
         );
         let (error, text) = call_text(&k, "graphs__source", json!({"title": "Hi"}));
         assert!(error && text.contains("unknown argument `title`"), "{text}");
+    }
+
+    /// A `null` ITEM of a list is not a value: read as a scalar it became an empty item, and
+    /// `["urn:a", null]` reached the endpoint as `graph=urn:a,`. Refused by name instead.
+    #[test]
+    fn a_null_item_of_a_list_is_refused_not_sent_empty() {
+        let k = shape_kernel();
+        let (error, text) = call_text(&k, "graphs__source", json!({"graph": ["urn:a", null]}));
+        assert!(error && text.contains("an item of it is not one"), "{text}");
+        // A `null` list is still what a JSON client means by it: not given.
+        assert_eq!(
+            call_text(&k, "graphs__source", json!({"graph": null})),
+            (false, "graph=- query=-".to_string())
+        );
+    }
+
+    /// An OPEN action passes its undeclared names through as request arguments, so they take
+    /// one value like a declared one: an object there reached the endpoint as an EMPTY string
+    /// (`title=`) and the call answered as if the caller had sent it.
+    #[test]
+    fn an_open_actions_extra_name_takes_one_value_too() {
+        let k = shape_kernel();
+        let (error, text) = call_text(
+            &k,
+            "compose__source",
+            json!({"src": "urn:x", "title": {"text": "Hi"}}),
+        );
+        assert!(
+            error && text.contains("`title` takes one value") && text.contains("an object"),
+            "{text}"
+        );
+        let (error, text) = call_text(
+            &k,
+            "compose__source",
+            json!({"src": "urn:x", "title": [["Hi"]]}),
+        );
+        assert!(error && text.contains("`title` takes one value"), "{text}");
+        // `null` is not given; a scalar passes through as before.
+        assert_eq!(
+            call_text(
+                &k,
+                "compose__source",
+                json!({"src": "urn:x", "title": null})
+            ),
+            (false, "src=urn:x title=-".to_string())
+        );
+        assert_eq!(
+            call_text(&k, "compose__source", json!({"src": "urn:x", "title": 7})),
+            (false, "src=urn:x title=7".to_string())
+        );
     }
 
     /// ledger #1547 (#358): an ENVELOPE action's fields are serialized into its carrier, as
@@ -2382,6 +2446,34 @@ mod tests {
             "never answered by another endpoint: {text}"
         );
         // A plain value reaches the tool's own endpoint as before.
+        let resp = call_tool(&k, "user__sink", json!({ "name": "alice" }));
+        assert_eq!(resp["content"][0]["text"], "urn:demo:user:alice name=alice");
+    }
+
+    /// ledger #86 without a delimiter: an EMPTY binding value turns `urn:demo:user:{name}`
+    /// into `urn:demo:user:`, and the endpoint bound THERE answered a call to `user__sink`.
+    #[test]
+    fn an_empty_binding_value_that_reaches_another_endpoint_is_refused() {
+        let user = reporting("user", "name", ArgSpec::new("name").binding());
+        let index = reporting("index", "name", ArgSpec::new("unused").optional());
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:demo:user:"), index)
+            .bind(
+                ikigai_core::UriTemplate::parse("urn:demo:user:{name}").unwrap(),
+                user,
+            );
+        let k = Kernel::new(Arc::new(space));
+        let resp = call_tool(&k, "user__sink", json!({ "name": "" }));
+        assert_eq!(resp["isError"], true, "{resp}");
+        let text = resp["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("`name`") && text.contains("`index`"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("name=-"),
+            "never answered by another endpoint: {text}"
+        );
         let resp = call_tool(&k, "user__sink", json!({ "name": "alice" }));
         assert_eq!(resp["content"][0]["text"], "urn:demo:user:alice name=alice");
     }
