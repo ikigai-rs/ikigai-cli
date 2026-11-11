@@ -1272,7 +1272,9 @@ connect.retry.breaker_cooloff_seconds = 30 # how long a circuit stays open (defa
 ```
 
 The policy covers `--mount` and `--override` mounts (one shared breaker for all of them) and
-`--connect quic://…` (through a cache-less issuer, so reads stay as fresh as without it). A
+`--connect quic://…` (through a cache-less issuer, so reads stay as fresh as without it; the
+first dial and admission check ride the same policy, so a client started while its hub is down
+waits for it within the limit, while a refusal such as `Denied` still fails at once). A
 `--prefer` mount is left as it was: it already falls back to the local binding. Only what is
 safe is resent: reads, calls the transport proved never ran, and Sinks whose contract declares a
 resend safe (with the declared key present). A final failure is the typed `GaveUp`, which names

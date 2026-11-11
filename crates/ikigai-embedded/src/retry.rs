@@ -217,6 +217,40 @@ pub fn connect_issuer(
     Kernel::new(governed.slot(remote)).with_cache_policy(Arc::new(NoCache))
 }
 
+/// Run `attempt` (a `--connect` dial and its admission check) under the policy's
+/// [`Retry`], so a hub that is down when the client starts is waited for, within the same
+/// overall limit and backoff as every later call (ledger #3383). Only a transient failure
+/// (`Unavailable`, `Timeout`) is tried again; a refusal such as `Denied` comes back at once,
+/// unchanged. The retry is throttle's, not a loop of this crate's: the attempt is an endpoint
+/// read through a `Retry` over it, and its final failure is the typed
+/// [`Error::GaveUp`](ikigai_core::Error::GaveUp).
+pub fn first_dial<T: Send + 'static>(
+    policy: &RetryPolicy,
+    attempt: impl Fn() -> Result<T, ikigai_core::Error> + Send + Sync + 'static,
+) -> Result<T, ikigai_core::Error> {
+    use std::sync::Mutex;
+    const DIAL: &str = "urn:ikigai:connect:dial";
+    let made: Arc<Mutex<Option<T>>> = Arc::new(Mutex::new(None));
+    let slot = Arc::clone(&made);
+    let endpoint = ikigai_core::FnEndpoint::new("connect-dial", move |_| {
+        let value = attempt()?;
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(value);
+        Ok(ikigai_core::Representation::new(
+            ikigai_core::ReprType::new("text/plain"),
+            b"dialed".to_vec(),
+        ))
+    });
+    let space = ikigai_core::EndpointSpace::new().bind(ikigai_core::Exact::new(DIAL), endpoint);
+    let kernel = Kernel::new(Arc::new(policy.retry(space))).with_cache_policy(Arc::new(NoCache));
+    let read = Request::new(
+        ikigai_core::Verb::Source,
+        ikigai_core::Iri::parse(DIAL).expect("a valid IRI"),
+    );
+    futures::executor::block_on(kernel.issue(read, &ikigai_core::Capability::root()))?;
+    let value = made.lock().unwrap_or_else(|e| e.into_inner()).take();
+    value.ok_or_else(|| ikigai_core::Error::Endpoint("connect: the dial left no connection".into()))
+}
+
 /// A cache that stores nothing.
 struct NoCache;
 
