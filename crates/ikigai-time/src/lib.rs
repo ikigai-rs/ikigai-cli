@@ -516,6 +516,7 @@ impl JobRegistry {
     /// outstanding call cannot be killed safely: its result is discarded, and later
     /// attempts fail without starting more calls until it returns. Browser hosts
     /// cannot preempt synchronous JavaScript and check the deadline on return only.
+    /// For persistent jobs, use [`Self::schedule_persistent_with_timeout`].
     pub fn schedule_with_timeout(
         &self,
         target: String,
@@ -534,6 +535,8 @@ impl JobRegistry {
     /// [`cancel_all`](Self::cancel_all) skips it. For host-registered background timers
     /// (the nav clock) that a demo's "cancel all" button shouldn't stop. Cancel it
     /// explicitly with [`cancel`](Self::cancel) or [`cancel_target`](Self::cancel_target).
+    /// Uses [`DEFAULT_JOB_TIMEOUT`]; override it with
+    /// [`Self::schedule_persistent_with_timeout`].
     /// `capability` is required for the reason [`schedule`](Self::schedule) gives.
     pub fn schedule_persistent(
         &self,
@@ -543,15 +546,29 @@ impl JobRegistry {
         recurring: bool,
         capability: Capability,
     ) -> std::result::Result<u64, String> {
-        self.schedule_inner(
+        self.schedule_persistent_with_timeout(
             target,
             verb,
             schedule,
             recurring,
-            true,
             capability,
             DEFAULT_JOB_TIMEOUT,
         )
+    }
+
+    /// Like [`Self::schedule_with_timeout`], but persistent: [`Self::cancel_all`]
+    /// skips the job. The timeout must be positive and applies to each attempt,
+    /// with the same awake-time and native/browser behavior as that method.
+    pub fn schedule_persistent_with_timeout(
+        &self,
+        target: String,
+        verb: Verb,
+        schedule: Schedule,
+        recurring: bool,
+        capability: Capability,
+        timeout: Duration,
+    ) -> std::result::Result<u64, String> {
+        self.schedule_inner(target, verb, schedule, recurring, true, capability, timeout)
     }
 
     #[allow(clippy::too_many_arguments)] // Public scheduling variants share one registration path.
@@ -1731,6 +1748,62 @@ mod tests {
         check_blocked_job(Some(Duration::from_secs(2)), true);
     }
 
+    #[test]
+    fn persistent_job_honors_longer_timeout() {
+        let millis = Arc::new(AtomicU64::new(1_000));
+        let reg = JobRegistry::new(
+            Arc::new(ManualBackend::default()),
+            Arc::new(FixedClock(millis.clone())),
+        )
+        .with_sleep_clock(Arc::new(ManualSleep(Arc::new(AtomicU64::new(0)))));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        reg.set_resolver(Arc::new(BlockedResolver {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        }));
+        let id = reg
+            .schedule_persistent_with_timeout(
+                "urn:test:backup".into(),
+                Verb::Source,
+                Schedule::Every(Duration::from_secs(1)),
+                true,
+                Capability::root(),
+                Duration::from_secs(150),
+            )
+            .unwrap();
+        let worker_reg = reg.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            worker_reg.fire(id);
+            done_tx.send(()).unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        millis.store(
+            1_000 + DEFAULT_JOB_TIMEOUT.as_millis() as u64,
+            Ordering::SeqCst,
+        );
+        let survived_default = done_rx.recv_timeout(Duration::from_millis(150)).is_err();
+        let runs_at_default = reg.health()[0].runs;
+        millis.store(152_000, Ordering::SeqCst);
+        let timed_out = !survived_default || done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        let health = reg.health();
+        // Release the resolver even when the regression assertions will fail.
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(
+            survived_default,
+            "persistent job failed at the default timeout"
+        );
+        assert_eq!(runs_at_default, 0);
+        assert!(timed_out, "persistent job exceeded its own timeout");
+        assert_eq!(health[0].runs, 1);
+        assert_eq!(health[0].failures_in_a_row, 1);
+        assert!(health[0].last_output.contains("timeout"));
+        assert_eq!(reg.cancel_all(), 0);
+        assert!(reg.cancel(id));
+    }
+
     fn check_blocked_job(timeout: Option<Duration>, nap: bool) {
         let millis = Arc::new(AtomicU64::new(1_000));
         let slept = Arc::new(AtomicU64::new(0));
@@ -2104,6 +2177,40 @@ mod tests {
                 Duration::ZERO
             )
             .is_err());
+    }
+
+    #[test]
+    fn persistent_job_rejects_zero_timeout() {
+        let backend = Arc::new(ManualBackend::default());
+        let reg = JobRegistry::new(backend, Arc::new(SystemClock));
+        reg.set_resolver(Arc::new(StubResolver {
+            issued: Arc::new(AtomicU64::new(0)),
+        }));
+        assert_eq!(
+            reg.schedule_persistent_with_timeout(
+                "urn:x".into(),
+                Verb::Source,
+                Schedule::Every(Duration::from_secs(1)),
+                true,
+                Capability::root(),
+                Duration::ZERO,
+            ),
+            Err("job timeout must be greater than zero".into())
+        );
+        assert!(reg.health().is_empty());
+        let id = reg
+            .schedule_persistent(
+                "urn:x".into(),
+                Verb::Source,
+                Schedule::Every(Duration::from_secs(1)),
+                true,
+                Capability::root(),
+            )
+            .unwrap();
+        assert_eq!(
+            reg.inner.lock().unwrap().jobs[&id].timeout,
+            DEFAULT_JOB_TIMEOUT
+        );
     }
 
     /// A caller that may schedule and read jobs but holds NO authority over `urn:x`.
