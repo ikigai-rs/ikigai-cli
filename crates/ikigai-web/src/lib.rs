@@ -1964,8 +1964,9 @@ async fn respond(
     }
 
     // PROVENANCE on a write: who sent it, and when — read off the CONNECTION, never the
-    // payload. A public form endpoint records these alongside the submitted fields, so a
-    // stored submission carries an origin its submitter did not get to choose.
+    // payload, so an endpoint is told an origin its submitter did not get to choose. The
+    // public form intake stores `received` beside the submitted fields; it does NOT store
+    // `client`, because nothing tracks individuals (ledger #3490).
     //
     // Writes only, and not for want of tidiness: an argument is part of a request's content
     // address, which is the kernel's cache key. A per-request timestamp on a read would give
