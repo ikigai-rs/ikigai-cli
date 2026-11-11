@@ -49,10 +49,10 @@ pub use stream::{QuicStreamed, MAX_UPLOAD};
 // The caller's body for a streamed call ([`QuicResolver::issue_streamed`]).
 pub use ikigai_wire::Upload;
 
-/// The ALPN protocol ids, newest first — since v10, `ikigai/10` down to `ikigai/7`
+/// The ALPN protocol ids, newest first — since v11, `ikigai/11` down to `ikigai/7`
 /// ([`ikigai_wire::alpns`]). The TLS handshake IS the version gate on this transport,
 /// and there is no hello frame on it: the NEGOTIATED id is the connection's version.
-/// Both sides list 10 first, so a v10 pair speaks 10 and an older peer (which offers or
+/// Both sides list 11 first, so a v11 pair speaks 11 and an older peer (which offers or
 /// accepts only its own ids) still finds its own. A peer outside the range fails the
 /// handshake at connect (mDNS TXT advertises the version pre-connect, which is where
 /// the human-readable hint lives).
@@ -3916,6 +3916,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn gave_up_crosses_typed_at_v11_and_untyped_at_v10() {
+        for version in [10, PROTOCOL_VERSION] {
+            let (server_id, client_id) = (generate(), generate());
+            let space = EndpointSpace::new().bind(
+                Exact::new("urn:test:gaveup"),
+                FnEndpoint::new("gaveup", |_: &Invocation<'_>| {
+                    Err(Error::GaveUp {
+                        attempts: 9,
+                        elapsed: std::time::Duration::new(120, 123_456_789),
+                        detail: "down".into(),
+                    })
+                }),
+            );
+            let (addr, server) = serve_kernel_alpn(
+                &server_id,
+                &client_id,
+                vec![ikigai_wire::alpn_for(version)],
+                Kernel::new(Arc::new(space)),
+            );
+            let client = connect(addr, &client_id, &server_id.cert_pem).unwrap();
+            let error = client
+                .issue(Request::new(
+                    Verb::Source,
+                    Iri::parse("urn:test:gaveup").unwrap(),
+                ))
+                .unwrap_err();
+            if version == 10 {
+                assert!(matches!(error, Error::Endpoint(_)), "{error:?}");
+                assert_eq!(error.class(), ikigai_core::FailureClass::Unknown);
+            } else {
+                assert_eq!(error.class(), ikigai_core::FailureClass::Transient);
+                assert_eq!(error.attempts(), Some(9));
+                assert!(
+                    matches!(error, Error::GaveUp { attempts: 9, elapsed, detail }
+                    if elapsed == std::time::Duration::new(120, 123_456_789) && detail == "down")
+                );
+            }
+            drop(client);
+            assert_eq!(server.join().unwrap(), Some(version));
+        }
+    }
+
     /// A v8 server meeting a v7-ONLY client (offering just `ikigai/7`): the connection
     /// negotiates 7, and a Conflict arrives as the untyped Endpoint a v7 peer always got.
     #[test]
@@ -3983,10 +4026,10 @@ mod tests {
     /// with `no_application_protocol` before any connection exists. (Measured: the
     /// no-version branch in `dial` is therefore defensive; this is the gate that fires.)
     #[test]
-    fn a_server_outside_7_to_10_is_refused_at_the_handshake() {
+    fn a_server_outside_the_spoken_range_is_refused_at_the_handshake() {
         for alpns in [
             vec![b"ikigai/6".to_vec()],
-            vec![b"ikigai/11".to_vec()],
+            vec![ikigai_wire::alpn_for(PROTOCOL_VERSION + 1)],
             Vec::new(),
         ] {
             let (server_id, client_id) = (generate(), generate());

@@ -220,7 +220,7 @@ pub fn connect_issuer(
 /// Run `attempt` (a `--connect` dial and its admission check) under the policy's
 /// [`Retry`], so a hub that is down when the client starts is waited for, within the same
 /// overall limit and backoff as every later call (ledger #3383). Only a transient failure
-/// (`Unavailable`, `Timeout`) is tried again; a refusal such as `Denied` comes back at once,
+/// (`Unavailable`, `Timeout`, `GaveUp`) is tried again; a refusal such as `Denied` comes back at once,
 /// unchanged. The retry is throttle's, not a loop of this crate's: the attempt is an endpoint
 /// read through a `Retry` over it, and its final failure is the typed
 /// [`Error::GaveUp`](ikigai_core::Error::GaveUp).
