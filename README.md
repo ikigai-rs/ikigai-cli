@@ -783,7 +783,8 @@ so one segment cannot reach a deeper resource; `{+var}` opts into carrying them 
 `Accept` becomes the `as=` face, query parameters become named
 arguments, and every request resolves under the `--cap` ceiling. Besides the public
 intakes (`urn:contact:submit`, `urn:booking:submit` — validated forms that drop a
-tuple into a space), the emailed decision links and the passkey ceremony (whose two
+tuple into a space; the tuple stores the declared fields and the time received, never the
+submitter's IP address), the emailed decision links and the passkey ceremony (whose two
 endpoints declare `urn:cap:passkey:challenge` and `urn:cap:passkey:register` since the
 release after 0.1.63, so a ceiling that serves the ceremony lists both), it carries
 **`urn:iki:foaf`**: one FOAF document (`src=`), every face by negotiation — the RDF/XML as

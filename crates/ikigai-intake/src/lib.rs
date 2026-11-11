@@ -25,6 +25,11 @@
 //! - **A honeypot field must stay empty.** Bots fill every input; humans never see it.
 //!   The rejection is deliberately indistinguishable from success to the submitter.
 //!
+//! - **No submitter is tracked.** The stored tuple holds the declared fields, the link
+//!   token's resolved client id (and attested fields) when one came along, and the transport's
+//!   `received` time. It never holds the submitter's IP address: the web layer passes one as
+//!   `client`, and it is not copied (ledger #3490).
+//!
 //! What this does NOT do is authorise: the endpoint is capability-gated, and rate limiting
 //! belongs in an overlay above it. CORS is browser-side only and is not a defence here.
 #![forbid(unsafe_code)]
@@ -647,17 +652,20 @@ impl Endpoint for IntakeEndpoint {
             }
         }
 
-        // PROVENANCE comes from the TRANSPORT, never the body. The web layer sets these
-        // from the connection (`client` from the proxy's forwarded-for, `received` from
-        // its clock); a submitter cannot forge them, because only DECLARED body fields are
-        // carried above — a `client=` input in the form is simply dropped like any other
+        // PROVENANCE comes from the TRANSPORT, never the body. The web layer sets `received`
+        // from its clock; a submitter cannot forge it, because only DECLARED body fields are
+        // carried above — a `received=` input in the form is simply dropped like any other
         // undeclared key. Keeping the two sources separate is the whole point.
-        for name in ["received", "client"] {
-            if let Ok(value) = inv.inline_str(name) {
-                let value = value.trim();
-                if !value.is_empty() {
-                    carried.push((name.to_string(), value.to_string()));
-                }
+        //
+        // ★ The web layer also hands every write the submitter's address as `client`. It is
+        // deliberately NOT copied into the tuple (ledger #3490): nothing tracks individuals,
+        // so a stored submission carries no IP address. Abuse is handled at the door, whose
+        // per-source rate limit (`ikigai-web`'s `source_limit`) holds an address in memory
+        // only for its window and never writes it anywhere.
+        if let Ok(value) = inv.inline_str("received") {
+            let value = value.trim();
+            if !value.is_empty() {
+                carried.push(("received".to_string(), value.to_string()));
             }
         }
 
@@ -1506,24 +1514,40 @@ mod tests {
     #[test]
     fn provenance_comes_from_the_transport_and_cannot_be_forged_in_the_body() {
         let (k, dropped) = kernel();
-        // The body TRIES to claim a different client; the transport arg is the real one.
-        let request = post("name=X&email=x%40y.com&message=hi&client=1.2.3.4")
-            .with_arg("client", ArgRef::Inline(b"203.0.113.9".to_vec()))
+        // The body TRIES to claim a different arrival time; the transport arg is the real one.
+        let request = post("name=X&email=x%40y.com&message=hi&received=1999-01-01T00:00:00Z")
             .with_arg("received", ArgRef::Inline(b"2026-07-22T19:40:00Z".to_vec()));
         block_on(k.issue(request, &cap())).unwrap();
         let tuple = dropped.lock().unwrap()[0].clone();
         assert!(
-            tuple.contains(r#"(client "203.0.113.9")"#),
-            "the transport's client wins: {tuple}"
+            tuple.contains(r#"(received "2026-07-22T19:40:00Z")"#),
+            "the transport's clock wins: {tuple}"
         );
         assert!(
-            !tuple.contains("1.2.3.4"),
+            !tuple.contains("1999"),
             "a body field cannot forge provenance: {tuple}"
         );
-        assert!(
-            tuple.contains(r#"(received "2026-07-22T19:40:00Z")"#),
-            "{tuple}"
-        );
+    }
+
+    /// Ledger #3490: nothing tracks individuals, so a dropped tuple carries no address —
+    /// neither the one the transport attaches as `client` nor one a body tries to smuggle in.
+    #[test]
+    fn a_dropped_tuple_carries_no_ip_address() {
+        let (k, dropped) = kernel();
+        for transport in ["203.0.113.9", "2001:db8::7"] {
+            let request = post("name=X&email=x%40y.com&message=hi&client=198.51.100.4")
+                .with_arg("client", ArgRef::Inline(transport.as_bytes().to_vec()))
+                .with_arg("received", ArgRef::Inline(b"2026-07-22T19:40:00Z".to_vec()));
+            block_on(k.issue(request, &cap())).unwrap();
+            let tuple = dropped.lock().unwrap().last().unwrap().clone();
+            assert!(!tuple.contains("(client "), "no client field: {tuple}");
+            assert!(!tuple.contains(transport), "no transport address: {tuple}");
+            assert!(!tuple.contains("198.51.100.4"), "no body address: {tuple}");
+            assert!(
+                tuple.contains(r#"(received "2026-07-22T19:40:00Z")"#),
+                "the arrival time is still recorded: {tuple}"
+            );
+        }
     }
 
     #[test]
