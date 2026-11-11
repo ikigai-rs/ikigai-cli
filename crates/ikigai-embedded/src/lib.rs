@@ -4236,10 +4236,15 @@ impl ikigai_meeting::SecretReader for HostSecrets {
 }
 
 /// The LLM provider registry: a hand-editable JSON file pointed at by
-/// `IKIGAI_LLM_CONFIG` (see ikigai-llm's `Registry::from_json`), else a local
-/// Ollama default. Load-time — a config edit needs a restart; live-reload (the
-/// config as a golden-thread resource) is a follow-up. A bad path/JSON warns and
-/// falls back rather than failing the kernel build.
+/// `IKIGAI_LLM_CONFIG` (see ikigai-llm's `Registry::from_json`), else the config
+/// home's `llm.json`, else a local Ollama default. Load-time — a config edit needs a
+/// restart; live-reload (the config as a golden-thread resource) is a follow-up.
+///
+/// A set `IKIGAI_LLM_CONFIG` that names no readable file is an error: the `ikigai` binary
+/// refuses to start on it ([`check_llm_config`]) before any kernel is built. A host that
+/// skips that check gets the error on stderr here and the built-in default, never the
+/// config home's `llm.json`. JSON that does not parse warns and falls back rather than
+/// failing the kernel build.
 fn llm_registry() -> ikigai_llm::Registry {
     let mut registry = llm_declared_registry();
     // The annotation graph (IKIGAI_LLM_ANNOTATIONS, Turtle) completes or CORRECTS
@@ -4281,8 +4286,15 @@ fn llm_declared_registry() -> ikigai_llm::Registry {
     // urn:llm:big:ask`. `calendar.json` has always loaded from the config home; llm.json
     // was the odd one out.
     for (path, source) in llm_config_candidates() {
-        let Ok(json) = std::fs::read_to_string(&path) else {
-            continue;
+        let json = match std::fs::read_to_string(&path) {
+            Ok(json) => json,
+            // A set variable names the file to use; one that is not there is an error, never
+            // a cue to try the next place.
+            Err(e) if source == "IKIGAI_LLM_CONFIG" => {
+                eprintln!("ikigai: {}", llm_config_unreadable(&path, &e));
+                return ikigai_llm::Registry::single(ollama_default());
+            }
+            Err(_) => continue,
         };
         match ikigai_llm::Registry::from_json(&json) {
             Ok(registry) => return registry,
@@ -4292,6 +4304,11 @@ fn llm_declared_registry() -> ikigai_llm::Registry {
             Err(e) => eprintln!("ikigai: {source} ({path}) parse error: {e:?} — using the default"),
         }
     }
+    ikigai_llm::Registry::single(ollama_default())
+}
+
+/// The built-in provider when nothing declares one: a local Ollama.
+fn ollama_default() -> ikigai_llm::OpenAiConfig {
     let mut ollama = ikigai_llm::OpenAiConfig::ollama("llama3.2:3b");
     // The declared trait profile urn:llm:models reports (and selection reasons
     // over): a 3B text model with a 128k window. vendor "ollama" (set by the
@@ -4299,7 +4316,39 @@ fn llm_declared_registry() -> ikigai_llm::Registry {
     ollama.caps.context = Some(131_072);
     ollama.caps.modalities = vec!["text".to_string()];
     ollama.caps.params = Some("3B".to_string());
-    ikigai_llm::Registry::single(ollama)
+    ollama
+}
+
+/// Refuses a set `IKIGAI_LLM_CONFIG` that names no readable file, including an empty value.
+/// Unset, the config home's `llm.json` (or the built-in default) is used as before.
+///
+/// # Errors
+///
+/// The message names the variable, the path it holds and why it could not be read.
+pub fn check_llm_config() -> std::result::Result<(), String> {
+    let Some(path) = std::env::var_os("IKIGAI_LLM_CONFIG") else {
+        return Ok(());
+    };
+    let path = std::path::PathBuf::from(path);
+    match std::fs::File::open(&path).and_then(|f| f.metadata()) {
+        Ok(meta) if meta.is_file() => Ok(()),
+        Ok(_) => Err(format!(
+            "IKIGAI_LLM_CONFIG names something that is not a file: {}. Point it at an LLM \
+             registry JSON file, or unset it to use the config home's llm.json.",
+            path.display()
+        )),
+        Err(e) => Err(llm_config_unreadable(&path.display().to_string(), &e)),
+    }
+}
+
+/// The refusal for a set `IKIGAI_LLM_CONFIG` whose file cannot be read.
+fn llm_config_unreadable(path: &str, e: &std::io::Error) -> String {
+    let what = if path.is_empty() {
+        "IKIGAI_LLM_CONFIG is set but empty".to_string()
+    } else {
+        format!("IKIGAI_LLM_CONFIG names a file that cannot be read: {path} ({e})")
+    };
+    format!("{what}. Point it at an LLM registry JSON file, or unset it to use the config home's llm.json.")
 }
 
 /// Facts from the `IKIGAI_LLM_ANNOTATIONS` Turtle file, as `(subject, predicate,
