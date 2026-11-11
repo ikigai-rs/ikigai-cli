@@ -9157,6 +9157,52 @@ mod tests {
         assert_eq!(jobs[0].asleep_since_last, Some(std::time::Duration::ZERO));
     }
 
+    /// A stuck synchronous peer used to stay STALE forever with zero failures.
+    #[test]
+    fn timed_out_job_reaches_failing_while_peer_is_still_blocked() {
+        struct Blocked(std::sync::Mutex<std::sync::mpsc::Receiver<()>>);
+        impl ikigai_resolve::Resolver for Blocked {
+            fn issue(&self, _: Request) -> Result<(Representation, ikigai_resolve::CacheStatus)> {
+                let _ = self.0.lock().unwrap().recv();
+                Ok((
+                    Representation::new(ReprType::new("text/plain"), b"late".to_vec()),
+                    ikigai_resolve::CacheStatus::Uncacheable,
+                ))
+            }
+            fn is_cached(&self, _: &Request, _: &Capability) -> bool {
+                false
+            }
+            fn entries(&self) -> Option<Vec<ikigai_core::SpaceEntry>> {
+                None
+            }
+        }
+        let ticks = Arc::new(Ticks::default());
+        let registry = JobRegistry::new(ticks.clone(), Arc::new(SystemClock));
+        let (release, blocked) = std::sync::mpsc::channel();
+        registry.set_resolver(Arc::new(Blocked(std::sync::Mutex::new(blocked))));
+        registry
+            .schedule_with_timeout(
+                "urn:booking:drain".into(),
+                Verb::Source,
+                ikigai_time::Schedule::Every(std::time::Duration::from_secs(30)),
+                true,
+                Capability::root(),
+                std::time::Duration::from_millis(20),
+            )
+            .unwrap();
+        // The first attempt times out; subsequent ticks fail without duplicating work.
+        for _ in 0..STALE_CADENCES {
+            ticks.fire();
+        }
+        let jobs = registry.health();
+        let up = context(600, false);
+        assert_eq!(job_status(&jobs[0], up.uptime), "FAILING");
+        let report = health_text(&jobs, &[], &up);
+        assert!(report.starts_with("FAILING"), "{report}");
+        assert!(report.contains("3 failed in a row"), "{report}");
+        release.send(()).unwrap();
+    }
+
     /// The bound is unchanged where there is no evidence: without a sleep measurement the
     /// whole wall-clock age counts, and the report says the check could not be made.
     #[test]
