@@ -7,6 +7,11 @@ as resolved in `Cargo.lock`.
 
 ## Reproduced and fixed
 
+- **An explicit attached `as` was overwritten.** A Source request attaching
+  `as=text/html` succeeded through the inner resolver, but the adapter inserted
+  another `as=text/plain`. `an_explicit_attached_as_is_preserved_by_both_attachment_methods`
+  failed with `InvalidArgument { name: "as", detail: "given twice; ..." }`.
+  Both attachment methods now forward an explicit attached face without negotiation.
 - **A non-JSON Meta representation influenced terminal negotiation.** A Meta renderer
   returning a JSON description's bytes labeled `text/plain` made the adapter select
   text. `non_json_meta_answers_do_not_select_a_terminal_face` failed before the fix
@@ -60,7 +65,7 @@ cargo test -p ikigai-cli --bin ikigai terminal_resolver::tests::audit_ --locked 
 
 ## Other checks
 
-- Explicit `as` values (including empty and unsupported values), Meta, Sink, and
+- Explicit `as` values (including attached, empty, and unsupported values), Meta, Sink, and
   Delete are preserved. Contract requests are restricted to Source without `as`.
   Denied, absent, malformed, and non-description contracts leave the request alone.
 - The Meta request is the engine routing request: same target, `Verb::Meta`,

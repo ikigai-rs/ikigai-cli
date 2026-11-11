@@ -208,11 +208,15 @@ impl<R: Resolver> Resolver for TerminalResolver<R> {
         scope: Scope,
         attach: Option<(String, Body)>,
     ) -> Result<(Representation, CacheStatus), Error> {
-        let request = prepare_async(request, |meta| {
-            self.0
-                .issue_as_async_in(meta, capability, None, scope.clone())
-        })
-        .await;
+        let request = if attach.as_ref().is_some_and(|(name, _)| name == "as") {
+            request
+        } else {
+            prepare_async(request, |meta| {
+                self.0
+                    .issue_as_async_in(meta, capability, None, scope.clone())
+            })
+            .await
+        };
         self.0
             .issue_attached_in(request, capability, incoming, scope, attach)
             .await
@@ -226,11 +230,15 @@ impl<R: Resolver> Resolver for TerminalResolver<R> {
         scope: Scope,
         attach: Option<(String, Body)>,
     ) -> Result<(Representation<Body>, CacheStatus), Error> {
-        let request = prepare_async(request, |meta| {
-            self.0
-                .issue_as_async_in(meta, capability, None, scope.clone())
-        })
-        .await;
+        let request = if attach.as_ref().is_some_and(|(name, _)| name == "as") {
+            request
+        } else {
+            prepare_async(request, |meta| {
+                self.0
+                    .issue_as_async_in(meta, capability, None, scope.clone())
+            })
+            .await
+        };
         self.0
             .issue_body_attached_in(request, capability, incoming, scope, attach)
             .await
@@ -612,6 +620,57 @@ mod tests {
             );
             assert_eq!(kernel.issue(request.clone()).unwrap().0.bytes, b"text/html");
         }
+    }
+
+    #[test]
+    fn an_explicit_attached_as_is_preserved_by_both_attachment_methods() {
+        use futures::executor::block_on;
+        use ikigai_core::{ArgSpec, Description};
+
+        let resolver = TerminalResolver(page_kernel(
+            Description::new("page")
+                .verb(Verb::Source)
+                .input(
+                    ArgSpec::new("as")
+                        .optional()
+                        .one_of(["text/html", "text/plain"]),
+                )
+                .output("text/html")
+                .output("text/plain"),
+        ));
+        let request = Request::new(Verb::Source, Iri::parse("urn:test:page").unwrap());
+        let capability = Capability::root();
+        let attachment = || Some(("as".into(), Body::from(b"text/html".to_vec())));
+        let baseline = block_on(resolver.0.issue_attached_in(
+            request.clone(),
+            &capability,
+            None,
+            Scope::default(),
+            attachment(),
+        ))
+        .unwrap();
+        assert_eq!(baseline.0.bytes, b"text/html");
+        let bytes = block_on(resolver.issue_attached_in(
+            request.clone(),
+            &capability,
+            None,
+            Scope::default(),
+            attachment(),
+        ))
+        .unwrap();
+        assert_eq!(bytes.0.bytes, b"text/html");
+        let body = block_on(async {
+            resolver
+                .issue_body_attached_in(request, &capability, None, Scope::default(), attachment())
+                .await
+                .unwrap()
+                .0
+                .bytes
+                .collect(1024)
+                .await
+                .unwrap()
+        });
+        assert_eq!(body.as_ref(), b"text/html");
     }
 
     #[test]
