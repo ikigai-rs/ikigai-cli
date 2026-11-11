@@ -130,15 +130,22 @@ fn header_safe(name: &str, value: &str) -> Result<String> {
     Ok(value.to_string())
 }
 
-/// A minimal address shape check — one `@`, something either side, no spaces. Not RFC
-/// 5322 (that way lies madness); the transport is the real authority. This exists to turn
-/// obvious junk from a public form into a typed 400 instead of an SMTP round trip.
+/// RFC 5322 `specials` other than `@` and `.`. A bare address never contains one; they only
+/// appear in display names (`Bob <a@x>`), groups, comments, quoted local parts, domain
+/// literals and address lists.
+const ADDRESS_SPECIALS: &[char] = &['<', '>', '(', ')', '[', ']', ':', ';', ',', '"', '\\'];
+
+/// A minimal address shape check — one `@`, something either side, no spaces and none of
+/// the [`ADDRESS_SPECIALS`]. Not RFC 5322 (that way lies madness); the transport is the real
+/// authority. This exists to turn obvious junk from a public form into a typed 400 instead of
+/// an SMTP round trip, and to keep `to`/`reply_to` ONE bare address: `Your Bank<a@x.example>`
+/// would otherwise go out with a display name whoever filled the form chose.
 fn address_like(name: &str, value: &str) -> Result<String> {
     let value = header_safe(name, value)?;
     let mut parts = value.split('@');
     let ok = matches!((parts.next(), parts.next(), parts.next()), (Some(local), Some(domain), None)
         if !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.'))
-        && !value.contains(' ');
+        && !value.contains(|c: char| c.is_whitespace() || ADDRESS_SPECIALS.contains(&c));
     if !ok {
         return Err(Error::InvalidArgument {
             name: name.to_string(),
@@ -510,6 +517,52 @@ mod tests {
                 "`{bad}` should be rejected, got: {err:?}"
             );
         }
+    }
+
+    /// `to` and `reply_to` are ONE bare address. A display name, angle brackets, a group or a
+    /// list reached lettre before, which turned `Your Bank<a@x.example>` into
+    /// `Reply-To: Your Bank <a@x.example>`: text a form's submitter chose, in a header.
+    #[test]
+    fn an_envelope_address_is_one_bare_address() {
+        let mail = FakeMail::ok();
+        let k = kernel(mail.clone());
+        for bad in [
+            "Your Bank<a@x.example>",
+            "Bank<a@x.example>",
+            "<a@x.example>",
+            "a,b@x.example",
+            "g:a@x.example;",
+            "a(c)@x.example",
+            "\"a\"@x.example",
+            "a@[192.0.2.1]",
+        ] {
+            for field in ["to", "reply_to"] {
+                let mut args = vec![
+                    ("to", "owner@example.com"),
+                    ("subject", "Hi"),
+                    ("content", "b"),
+                ];
+                args.retain(|(n, _)| *n != field);
+                args.push((field, bad));
+                let err = block_on(k.issue(send_request(&args), &cap())).unwrap_err();
+                assert!(
+                    matches!(err, Error::InvalidArgument { ref name, .. } if name == field),
+                    "`{bad}` in `{field}` should be refused, got: {err:?}"
+                );
+            }
+        }
+        assert!(mail.sent.lock().unwrap().is_empty());
+        // Ordinary atext still passes.
+        block_on(k.issue(
+            send_request(&[
+                ("to", "o'brien+tag@mail.example.com"),
+                ("subject", "Hi"),
+                ("content", "b"),
+            ]),
+            &cap(),
+        ))
+        .unwrap();
+        assert_eq!(mail.sent.lock().unwrap().len(), 1);
     }
 
     #[test]
