@@ -96,8 +96,21 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
 - `--plain` is a line-oriented REPL with no full-screen redraw, so a screen reader or braille
   display reads it as ordinary terminal output; `--quiet` prints only the answers. (Not yet tested
   with either; see below.)
+- Terminal reads choose `text/plain` when no `as` is supplied and the target's Source
+  contract offers that face, including `-c` and the line REPL. Faces come from the `as`
+  input's `one_of` list, or the action's outputs when there is no such list. Explicit types
+  are preserved. Without a text face or a readable contract, the request keeps its default.
+  The shared kernel and HTTP door keep their defaults, including runbook HTML.
 
 ## How it is tested
+
+- `crates/ikigai-cli/tests/runbook_text.rs` runs the binary in `-c` and line REPL modes
+  and compares an untyped runbook read to its explicit text face. It also checks explicit
+  HTML and JSON, quoted names and a pipeline. Unit tests check that the shared kernel
+  retains its HTML default. Resolver tests cover a second HTML-default resource family,
+  explicit HTML, a resource without a text face, unreadable contracts, `one_of` declarations,
+  and cache identity across scopes and capabilities.
+  No assistive technology evaluation was performed.
 
 - `crates/ikigai-web/src/push.rs`'s
   `a_zero_stream_cap_refuses_with_the_doors_accessible_error_page` pins the stream-cap
@@ -218,6 +231,7 @@ Found by reading the source on 2026-10-15, not by testing:
 |---|---|
 | 2026-11-11 | A set `IKIGAI_LLM_CONFIG` that names no readable file, or is empty, stops startup with exit 2 and one plain `ikigai:` line on stderr naming the variable and the path, and saying to point it at an LLM registry JSON file or unset it to use the config home's `llm.json`. No color. `tests/llm_config.rs` pins the variable and the path in the line, not its full wording; no assistive technology testing was performed. |
 | 2026-11-10 | A layer door whose default state directory would join a `--name` that is not one plain file name stops startup with one plain `ikigai:` line on stderr quoting the name, naming `--name`, and naming `--layers-state` and `layers.state` as the other ways to set the directory. No color. A library test pins that the line names `--name` and `--layers-state`, not its full wording; no assistive technology testing was performed. |
+| 2026-11-11 | Terminal reads (ledger #2695) choose the text face when the caller names no type and the target's contract offers `text/plain`. The policy applies to every resource family. Binary regressions reproduced HTML in both `-c` and the line REPL before the fix and now compare the output to explicit `text/plain`; explicit HTML/JSON and the shared kernel's HTML default are preserved. No assistive technology testing was performed. |
 | 2026-11-10 | A socket server closing during the version hello is reported as unavailable, with a plain sentence saying it may be restarting or predate wire v6, and advising a retry or server update. Socket tests cover a legacy decoder closing, a partial hello, and a close during redial. No assistive technology testing was performed. |
 | 2026-11-10 | A `config.toml` line the host cannot read, or an unknown key in one of the host's own families (another program's keys are left alone), stops startup with one plain `ikigai:` line on stderr naming the file, the line number and the line or key in backquotes, and saying what to write instead. No color. `tests/config_toml.rs` pins the file, line number and key in the sentence, not its full wording; no assistive technology testing was performed. |
 | 2026-11-09 | A QUIC door being drained (ledger #3325) closes its connections with the reason `this door is shutting down; reconnect to continue`, a plain sentence that can reach a person inside a transient `unavailable` error on a call whose reply was lost, in the same place the age bound's reason already can. No new output otherwise and no color. The sentence is not pinned by a test; no assistive technology testing was performed. |
