@@ -353,6 +353,11 @@ pub fn replaceable_by(
 ///
 /// Running as root is refused outright: root can rewrite every file, so nothing protects one.
 ///
+/// In a user namespace ([`crate::authority::overflow_uid`]), a component whose real owner is
+/// not mapped reads as the overflow uid. That is never this user, and this user cannot write
+/// it unless its mode lets everyone, so the rule above already accepts it with no allowance
+/// of its own: unlike [`crate::authority::check`], nothing here asks for root's ownership.
+///
 /// # Errors
 ///
 /// The path and the reason, naming the first component that fails.
