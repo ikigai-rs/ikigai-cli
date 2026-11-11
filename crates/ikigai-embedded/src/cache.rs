@@ -13,7 +13,9 @@ pub fn configure() -> Result<(), String> {
 fn bound() -> &'static Result<CacheBound, String> {
     static BOUND: OnceLock<Result<CacheBound, String>> = OnceLock::new();
     BOUND.get_or_init(|| {
-        let path = crate::config::config_path();
+        let Some(path) = crate::config::config_path() else {
+            return Ok(CacheBound::default());
+        };
         let result = match std::fs::read_to_string(&path) {
             Ok(text) => bound_from(&text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(CacheBound::default()),

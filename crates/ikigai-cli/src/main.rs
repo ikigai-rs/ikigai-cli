@@ -13,6 +13,23 @@
 //! with `--plain` it falls back to the line-oriented [`repl`]. All drive the same
 //! renderer-agnostic [`engine`](ikigai_engine) over the chosen [`Resolver`](ikigai_resolve::Resolver).
 
+// Without `embedded` the binary is the stub `main` at the bottom of this file: it answers
+// `--version` and otherwise says it was built without a transport. Everything else here
+// (the parser's targets, the REPLs, the serve paths) still has to COMPILE in that build,
+// which is what CI's `no default features` job checks (ledger #1543), but nothing calls it,
+// so the dead-code family of lints is quieted for that build alone, with the doc links that
+// point at embedded-only items. Every other build keeps them at full strength.
+#![cfg_attr(
+    not(feature = "embedded"),
+    allow(
+        dead_code,
+        unused_imports,
+        unused_variables,
+        unused_mut,
+        rustdoc::broken_intra_doc_links
+    )
+)]
+
 #[cfg(not(target_family = "wasm"))]
 mod clipboard;
 #[cfg(all(feature = "embedded", feature = "quic", feature = "web"))]
@@ -33,12 +50,14 @@ mod script;
 mod session;
 #[cfg(all(feature = "embedded", not(target_family = "wasm")))]
 mod show;
+mod terminal_resolver;
 #[cfg(not(target_family = "wasm"))]
 mod tui;
 #[cfg(all(feature = "embedded", feature = "web"))]
 mod uploads;
 
 use output::{print, println};
+use terminal_resolver::TerminalResolver;
 
 const USAGE: &str = "\
 ikigai — resource-resolution REPL
@@ -75,9 +94,13 @@ usage:
                                is quic.max_connection_age seconds old (default 600), so the
                                next call reconnects under the enrolment as it is then.
   ikigai serve <q> --require-enrollment
-                               refuse to start without clients.json, so the door never falls
-                               back to one shared --cap ceiling for every trusted certificate
-                               (the booking airlock runs this way, its --cap the clamp)
+                               the default: refuse to start without clients.json, so the door
+                               never falls back to one shared --cap ceiling (or to per-client
+                               workspaces) for every trusted certificate
+  ikigai serve <q> --allow-unenrolled
+                               start without clients.json anyway: every trusted certificate is
+                               served under the one --cap ceiling, or with no --cap in its own
+                               writable workspace. Prints a warning at start
   ikigai serve <q> --announce  also advertise this kernel on the local network (mDNS), so clients
                                can mount it by name; `source urn:peer:list` shows who is out there
   ikigai serve <q>             hosts LAYERS (ikigai-layers: urn:layer:*, urn:layers:*, urn:collab:*)
@@ -107,6 +130,13 @@ usage:
                                deadline reaches the peer as time left; its retry count stops
                                here (serve sets no retry budget, so the peer uses its own), and
                                a spent deadline is answered, not refused
+  ikigai serve <s> --mount <p>=<t> --pending
+                               start before the peer is up: the mount flag --pending FOLLOWS
+                               (--mount or --override) dials on first use, each read is
+                               Unavailable until the peer answers, and no restart is needed.
+                               Without it, a peer that does not answer stops the start.
+                               A served host's mount flags go after the word `serve`, before
+                               or after its target; `ikigai --mount … serve <s>` is refused
   ikigai serve … --code-signer <k>  accept SIGNED programs (urn:lisp:run) vouched for by key
                                resource <k> (repeatable; --code-signers-dir sets where
                                urn:codekey:{file} reads from). Without it the door is unbound.
@@ -133,7 +163,11 @@ usage:
   ikigai --name <instance>     name this instance (scopes <name>.* config properties; defaults
                                repl / daemon / serve by mode)
   ikigai --grants <file>       read grants and socket accounts from <file> (all local hosts);
-                               otherwise <config home>/grants.json. IKIGAI_GRANTS is refused
+                               otherwise <config home>/grants.json. A named file that is not
+                               there stops the start. IKIGAI_GRANTS is refused
+  ikigai --clients <file>      read client enrollment from <file> (serve quic://…, layers-token,
+                               cert add-client); otherwise <config home>/clients.json. A named
+                               file that is not there stops the start. IKIGAI_CLIENTS is refused
   ikigai --config-home <dir>   use <dir> as the config home (config.toml, grants.json, clients.json,
                                …) instead of $XDG_CONFIG_HOME/ikigai or ~/.config/ikigai. Any mode
                                (REPL, -c, serve, mcp, --daemon, --connect, cert). A relative <dir> is
@@ -366,50 +400,6 @@ fn upgrade_command() -> String {
     command
 }
 
-/// The build line under an unresolved name, said as this binary can justify it (ledger
-/// #2481). ikigai-engine 0.2 words the line it hangs under an unresolved name (from
-/// [`upgrade_command`], ledger #288) as if the name were NEWER than this build: "a name newer
-/// than this build needs an upgrade". This build cannot know that. A name no release binds
-/// (until 0.2.3 that was `urn:json:query`) sent the reader to reinstall the binary they
-/// already had. So the faces replace the engine's sentence: this build binds no such name,
-/// and an upgrade helps only if a newer release exists, which `cargo search` shows.
-///
-/// ```text
-/// error: no endpoint resolved for urn:json:query
-///        this host is ikigai 0.2.2, and it binds no such name
-///        a newer release may bind it; if `cargo search ikigai-cli` names one past 0.2.2: cargo install --locked ikigai-cli
-/// ```
-///
-/// Only the exact sentence the engine builds from [`VERSION_LINE`] and [`upgrade_command`]
-/// is replaced, so a `--connect` engine (which names no build) and every other error pass
-/// through untouched.
-#[cfg(feature = "embedded")]
-fn restate_build_line(err: &str) -> std::borrow::Cow<'_, str> {
-    let upgrade = upgrade_command();
-    let engine = format!(
-        "this host is {VERSION_LINE}; a name newer than this build needs an upgrade: {upgrade}"
-    );
-    if !err.contains(&engine) {
-        return std::borrow::Cow::Borrowed(err);
-    }
-    // The engine's continuation indent (`SUGGESTION_INDENT`), which clears `error: `.
-    const INDENT: &str = "       ";
-    let version = env!("CARGO_PKG_VERSION");
-    std::borrow::Cow::Owned(err.replace(
-        &engine,
-        &format!(
-            "this host is {VERSION_LINE}, and it binds no such name\n{INDENT}a newer release \
-             may bind it; if `cargo search ikigai-cli` names one past {version}: {upgrade}"
-        ),
-    ))
-}
-
-/// Without `embedded` no engine names a build, so there is nothing to restate.
-#[cfg(not(feature = "embedded"))]
-fn restate_build_line(err: &str) -> std::borrow::Cow<'_, str> {
-    std::borrow::Cow::Borrowed(err)
-}
-
 use ikigai_engine::Engine;
 
 /// Per-role certificate-path overrides for QUIC, shared by `serve` and `--connect`.
@@ -509,8 +499,12 @@ enum Mode {
         layers_https: Option<String>,
         /// `--require-enrollment`: a QUIC door that refuses to start without a `clients.json`,
         /// so it can never fall back to a shared `--cap` ceiling or to per-client workspaces
-        /// because the file went missing (ledger #1826: the booking airlock).
+        /// because the file went missing (ledger #1826: the booking airlock). The default now;
+        /// the flag says it explicitly.
         require_enrollment: bool,
+        /// `--allow-unenrolled`: the opt-out. A QUIC door with no `clients.json` starts in the
+        /// shared posture (`--cap` for every trusted certificate, or per-client workspaces).
+        allow_unenrolled: bool,
         /// `--names <file>` (absolute once parsed): the named requests `serve --http` places
         /// LAST in its surface (ledger #2516), so a route target such as `urn:quakes:page`
         /// resolves in this one process. `None`: the door serves no names, whatever the config
@@ -615,6 +609,20 @@ struct ScriptFile {
     params: std::collections::BTreeMap<String, String>,
 }
 
+/// How a mount composes a peer's namespace. The embedded host's own type when it is built;
+/// without `embedded` there is no kernel to compose a mount into, but the command line and
+/// the config home's `mount` lines are still parsed (and refused or ignored by the caller),
+/// so the grammar keeps a stand-in with the same three kinds.
+#[cfg(feature = "embedded")]
+use ikigai_embedded::MountKind;
+#[cfg(not(feature = "embedded"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MountKind {
+    Alias,
+    Override,
+    Prefer,
+}
+
 /// One `--mount`: where it binds, what it connects to, and the certificates for
 /// THAT connection. Cert flags following a `--mount` attach to it; cert flags
 /// before any mount form the default set (used by `--connect`, and by a mount
@@ -629,7 +637,25 @@ struct Mount {
     prefix: String,
     target: String,
     certs: Certs,
-    kind: ikigai_embedded::MountKind,
+    kind: MountKind,
+    /// `--pending` on a served `--mount`/`--override` (ledger #3169): dial on first use, as
+    /// `--prefer` always does, so the host may start before its peer. Off, the mount dials
+    /// while the process starts and a peer that does not answer stops the start.
+    pending: bool,
+}
+
+/// `--pending`, which belongs to the mount it FOLLOWS, as a cert flag does.
+fn mark_pending(flags: &mut [Mount]) -> Result<(), String> {
+    match flags.last_mut() {
+        None => Err("--pending must follow the --mount or --override it applies to".to_string()),
+        Some(mount) if mount.kind == MountKind::Prefer => Err(
+            "--pending does not apply to --prefer, which already dials on first use".to_string(),
+        ),
+        Some(mount) => {
+            mount.pending = true;
+            Ok(())
+        }
+    }
 }
 
 /// The prefixes one mount flag (or `mount =` line) names. `urn:layer:,urn:layers:,urn:collab:`
@@ -736,11 +762,11 @@ impl Mounts {
 
 /// The mode word a `mount` line in the config home would use for this kind, so what the
 /// banner prints is greppable in the file that produced it.
-fn mount_mode(kind: ikigai_embedded::MountKind) -> &'static str {
+fn mount_mode(kind: MountKind) -> &'static str {
     match kind {
-        ikigai_embedded::MountKind::Alias => "alias",
-        ikigai_embedded::MountKind::Override => "override",
-        ikigai_embedded::MountKind::Prefer => "prefer",
+        MountKind::Alias => "alias",
+        MountKind::Override => "override",
+        MountKind::Prefer => "prefer",
     }
 }
 
@@ -752,6 +778,7 @@ fn mount_mode(kind: ikigai_embedded::MountKind) -> &'static str {
 /// ([`ikigai_embedded::posture::mount_lines`]). Two renderers over the same facts is how a
 /// diagnostic and a resource end up as two spellings of one thing, which is the defect
 /// class #418/#426 were about; this makes that impossible rather than merely discouraged.
+#[cfg(feature = "embedded")]
 fn mount_posture(mounts: &[Mount], declined: bool) -> ikigai_embedded::posture::MountPosture {
     if declined {
         return ikigai_embedded::posture::MountPosture::Declined;
@@ -764,6 +791,7 @@ fn mount_posture(mounts: &[Mount], declined: bool) -> ikigai_embedded::posture::
                 prefix: mount.prefix.clone(),
                 target: mount.target.clone(),
                 cert_dir: mount.certs.cert_dir.clone(),
+                pending: mount.pending,
             })
             .collect(),
     )
@@ -775,12 +803,14 @@ fn mount_posture(mounts: &[Mount], declined: bool) -> ikigai_embedded::posture::
 ///
 /// Printed BEFORE the mounts are resolved, so a door that hangs dialing a peer has already
 /// named the peer it is hanging on. That was #410's actual failure mode.
+#[cfg(feature = "embedded")]
 fn mount_lines(mounts: &[Mount], declined: bool) -> Vec<String> {
     ikigai_embedded::posture::mount_lines(&mount_posture(mounts, declined))
 }
 
 /// Say what this door composed, on stderr, one line per mount. `who` prefixes every line
 /// (`ikigai`, `ikigai mcp`) so a door's output stays attributable.
+#[cfg(feature = "embedded")]
 fn announce_mounts(who: &str, mounts: &[Mount], declined: bool) {
     for line in mount_lines(mounts, declined) {
         eprintln!("{who}: {line}");
@@ -1046,9 +1076,13 @@ fn parse_args() -> Result<Option<Mode>, String> {
     // Read only to resolve a relative `--config-home`: a process whose working directory is
     // gone must still start when it was not given one.
     let cwd = std::env::current_dir().ok();
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|home| home.is_absolute());
     if let Some(dir) = take_config_home(&mut args, cwd.as_deref(), home.as_deref())? {
         apply_config_home(dir)?;
+    } else {
+        share_config_home()?;
     }
     if let Some(dir) = take_files(&mut args, cwd.as_deref(), home.as_deref())? {
         #[cfg(feature = "embedded")]
@@ -1071,12 +1105,55 @@ fn parse_args() -> Result<Option<Mode>, String> {
             path.display()
         ));
     }
+    let clients = take_dir_flag(
+        &mut args,
+        "--clients",
+        "client enrollment file",
+        cwd.as_deref(),
+        home.as_deref(),
+    )?;
+    #[cfg(not(feature = "embedded"))]
+    if let Some(path) = &clients {
+        return Err(format!(
+            "--clients requires the embedded feature: {}",
+            path.display()
+        ));
+    }
     let (bayes_state, bayes_models) = take_bayes(&mut args, cwd.as_deref(), home.as_deref())?;
     #[cfg(feature = "embedded")]
     ikigai_embedded::bayes::set_flags(bayes_state, bayes_models);
     #[cfg(not(feature = "embedded"))]
     let _ = (bayes_state, bayes_models);
-    parse_argv(args.into_iter())
+    let mode = parse_argv(args.into_iter())?;
+    #[cfg(feature = "embedded")]
+    if let Some(path) = clients {
+        if !reads_enrollment(mode.as_ref()) {
+            return Err(
+                "--clients applies to `serve quic://…`, `layers-token` and `cert add-client`, \
+                 the modes that read the client enrollment file"
+                    .to_string(),
+            );
+        }
+        ikigai_embedded::clients::set_clients_path(path);
+    }
+    Ok(mode)
+}
+
+/// Whether `--clients` means anything to this mode. Enrollment is the QUIC door's, as
+/// `--require-enrollment` says; `layers-token` binds a token to an enrolled participant, and
+/// `cert add-client` prints where to enroll the certificate it wrote. `--version` and the usage
+/// text answer whatever else was typed.
+#[cfg(feature = "embedded")]
+fn reads_enrollment(mode: Option<&Mode>) -> bool {
+    match mode {
+        None | Some(Mode::Version { .. } | Mode::LayersToken(_) | Mode::CertAddClient { .. }) => {
+            true
+        }
+        Some(Mode::Serve { http, target, .. }) => {
+            http.is_none() && target.as_deref().is_some_and(is_quic)
+        }
+        Some(_) => false,
+    }
 }
 
 /// Take every `--bayes-state <dir>` and `--bayes-model <name>` (either also as `--flag=value`)
@@ -1179,7 +1256,7 @@ fn take_dir_flag(
     cwd: Option<&std::path::Path>,
     home: Option<&std::path::Path>,
 ) -> Result<Option<std::path::PathBuf>, String> {
-    let argument = if flag == "--grants" {
+    let argument = if matches!(flag, "--grants" | "--clients") {
         "<file>"
     } else {
         "<dir>"
@@ -1239,6 +1316,22 @@ fn apply_config_home(dir: std::path::PathBuf) -> Result<(), String> {
     ikigai_embedded::config::set_config_home(dir.clone())
         .map_err(|e| format!("--config-home: {e}"))?;
     ikigai_engine::config::set_config_home(dir).map_err(|e| format!("--config-home: {e}"))
+}
+
+/// Hold the engine's reading of the config home to this host's, which only ever answers an
+/// absolute path, so `config`, the TUI's keybindings and the certificate directory agree with
+/// everything else when the environment names no usable home.
+#[cfg(feature = "embedded")]
+fn share_config_home() -> Result<(), String> {
+    match ikigai_embedded::config::config_home() {
+        Some(dir) => ikigai_engine::config::set_config_home(dir),
+        None => Ok(()),
+    }
+}
+
+#[cfg(not(feature = "embedded"))]
+fn share_config_home() -> Result<(), String> {
+    Ok(())
 }
 
 /// The argument parser proper, over any argv — so it can be tested without a
@@ -1392,10 +1485,15 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
         let mut layers_reseal = false;
         let mut layers_https: Option<String> = None;
         let mut require_enrollment = false;
+        let mut allow_unenrolled = false;
         let mut names: Option<std::path::PathBuf> = None;
         while let Some(arg) = argv.next() {
             if arg == "--require-enrollment" {
                 require_enrollment = true;
+                continue;
+            }
+            if arg == "--allow-unenrolled" {
+                allow_unenrolled = true;
                 continue;
             }
             if arg == "--names" {
@@ -1499,10 +1597,14 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 mounts.declined = true;
                 continue;
             }
+            if arg == "--pending" {
+                mark_pending(&mut mounts.flags)?;
+                continue;
+            }
             if let Some(kind) = match arg.as_str() {
-                "--mount" => Some(ikigai_embedded::MountKind::Alias),
-                "--override" => Some(ikigai_embedded::MountKind::Override),
-                "--prefer" => Some(ikigai_embedded::MountKind::Prefer),
+                "--mount" => Some(MountKind::Alias),
+                "--override" => Some(MountKind::Override),
+                "--prefer" => Some(MountKind::Prefer),
                 _ => None,
             } {
                 let spec = argv
@@ -1516,6 +1618,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                     target: target.to_string(),
                     certs: certs.clone(),
                     kind,
+                    pending: false,
                 });
                 continue;
             }
@@ -1674,6 +1777,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
             layers_reseal,
             layers_https,
             require_enrollment,
+            allow_unenrolled,
             names,
         }));
     }
@@ -1698,9 +1802,9 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 continue;
             }
             if let Some(kind) = match arg.as_str() {
-                "--mount" => Some(ikigai_embedded::MountKind::Alias),
-                "--override" => Some(ikigai_embedded::MountKind::Override),
-                "--prefer" => Some(ikigai_embedded::MountKind::Prefer),
+                "--mount" => Some(MountKind::Alias),
+                "--override" => Some(MountKind::Override),
+                "--prefer" => Some(MountKind::Prefer),
                 _ => None,
             } {
                 let spec = argv
@@ -1712,6 +1816,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                     target: target.to_string(),
                     certs: certs.clone(),
                     kind,
+                    pending: false,
                 });
                 continue;
             }
@@ -1797,7 +1902,10 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 let name = argv
                     .next()
                     .ok_or_else(|| "--name needs a value".to_string())?;
+                #[cfg(feature = "embedded")]
                 ikigai_embedded::set_instance_name(name);
+                #[cfg(not(feature = "embedded"))]
+                let _ = name;
             }
             "--connect" => {
                 // Optional target: take the next token unless it looks like a flag.
@@ -1819,7 +1927,8 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                     prefix: prefix.to_string(),
                     target: socket.to_string(),
                     certs: repl.certs.clone(),
-                    kind: ikigai_embedded::MountKind::Alias,
+                    kind: MountKind::Alias,
+                    pending: false,
                 });
             }
             "--override" => {
@@ -1837,7 +1946,8 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                     prefix: prefix.to_string(),
                     target: target.to_string(),
                     certs: repl.certs.clone(),
-                    kind: ikigai_embedded::MountKind::Override,
+                    kind: MountKind::Override,
+                    pending: false,
                 });
             }
             "--no-config-mounts" => {
@@ -1876,7 +1986,8 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                     prefix: prefix.to_string(),
                     target: target.to_string(),
                     certs: repl.certs.clone(),
-                    kind: ikigai_embedded::MountKind::Prefer,
+                    kind: MountKind::Prefer,
+                    pending: false,
                 });
             }
             "-c" | "--command" => {
@@ -1958,6 +2069,28 @@ fn script_file(path: String, rest: impl Iterator<Item = String>) -> Result<Scrip
     Ok(ScriptFile { path, params })
 }
 
+/// Stop a mode that would otherwise resolve its config home or file root against the
+/// working directory. `--version` needs neither, a `cert` command given its directory needs
+/// no config home, and a `--connect` client builds no kernel and so has no file root.
+#[cfg(feature = "embedded")]
+fn check_homes(mode: &Mode) -> Result<(), String> {
+    let (config_home, file_root) = match mode {
+        Mode::Version { .. } => (false, false),
+        Mode::CertGenerate { dir, .. } => (dir.is_none(), false),
+        Mode::CertAddClient { cert_dir, .. } => (cert_dir.is_none(), false),
+        Mode::LayersToken(_) => (true, false),
+        Mode::Repl(repl) => (true, repl.connect.is_none()),
+        Mode::Daemon { .. } | Mode::Serve { .. } | Mode::Mcp { .. } => (true, true),
+    };
+    if config_home {
+        ikigai_embedded::config::require_config_home()?;
+    }
+    if file_root {
+        ikigai_embedded::check_file_root()?;
+    }
+    Ok(())
+}
+
 #[cfg(feature = "embedded")]
 fn main() {
     let mode = match parse_args() {
@@ -1973,16 +2106,42 @@ fn main() {
     };
 
     if !matches!(mode, Mode::Version { .. }) {
-        if let Err(e) = ikigai_embedded::grants_path() {
+        if let Err(e) = ikigai_embedded::check_grants_flag()
+            .and(ikigai_embedded::clients::clients_path().map(drop))
+        {
+            eprintln!("ikigai: {e}");
+            std::process::exit(2);
+        }
+        // A set IKIGAI_LLM_CONFIG names the LLM registry; one naming no file stops the start
+        // rather than letting llm.json or the built-in default stand in for it.
+        #[cfg(feature = "embedded")]
+        if let Err(e) = ikigai_embedded::check_llm_config() {
             eprintln!("ikigai: {e}");
             std::process::exit(2);
         }
     }
 
+    // The default instance name follows the mode; an explicit --name (already
+    // set during parsing) wins because set_instance_name is first-write-wins.
+    // Before the config check: keys after this instance's name are the host's own to check.
+    #[cfg(feature = "embedded")]
+    ikigai_embedded::set_instance_name(match &mode {
+        Mode::Daemon { .. } => "daemon",
+        Mode::Serve { .. } => "serve",
+        Mode::Mcp { .. } => "mcp",
+        _ => "repl",
+    });
+
     // Representation cache bounds and ikigai-lisp's bounds, from the config home, fixed
     // once before constructing a kernel or evaluating Lisp. A bad line stops every mode
     // rather than reading as the default; `--version` alone answers whatever the config says.
     if !matches!(mode, Mode::Version { .. }) {
+        // `config.toml` itself first: a line it cannot read, or an unknown key in one of the
+        // host's own families, stops every mode here rather than being skipped by each reader.
+        if let Err(e) = ikigai_embedded::config::check() {
+            eprintln!("ikigai: {e}");
+            std::process::exit(2);
+        }
         if let Err(e) = ikigai_embedded::cache::configure() {
             eprintln!("ikigai: {e}");
             std::process::exit(2);
@@ -1999,15 +2158,11 @@ fn main() {
         }
     }
 
-    // The default instance name follows the mode; an explicit --name (already
-    // set during parsing) wins because set_instance_name is first-write-wins.
-    #[cfg(feature = "embedded")]
-    ikigai_embedded::set_instance_name(match &mode {
-        Mode::Daemon { .. } => "daemon",
-        Mode::Serve { .. } => "serve",
-        Mode::Mcp { .. } => "mcp",
-        _ => "repl",
-    });
+    // After the instance name: a file root may be named by an `<instance>.files` line.
+    if let Err(e) = check_homes(&mode) {
+        eprintln!("ikigai: {e}");
+        std::process::exit(2);
+    }
 
     // Before any mount is resolved: a door's mounts describe under the INNER deadline.
     if matches!(mode, Mode::Serve { .. }) {
@@ -2070,16 +2225,25 @@ fn main() {
             layers_reseal,
             layers_https,
             require_enrollment,
+            allow_unenrolled,
             names,
         } => match (http, target.as_deref()) {
             // Enrollment is the QUIC door's (it is the door that authenticates certificates), so
-            // the flag on any other door would require nothing.
+            // either flag on any other door would change nothing.
             (http, target)
-                if require_enrollment && (http.is_some() || !target.is_some_and(is_quic)) =>
+                if (require_enrollment || allow_unenrolled)
+                    && (http.is_some() || !target.is_some_and(is_quic)) =>
             {
                 eprintln!(
-                    "ikigai: --require-enrollment applies to `serve quic://…`, the door that \
-                     enrolls client certificates"
+                    "ikigai: --require-enrollment and --allow-unenrolled apply to \
+                     `serve quic://…`, the door that enrolls client certificates"
+                );
+                std::process::exit(2);
+            }
+            (_, _) if require_enrollment && allow_unenrolled => {
+                eprintln!(
+                    "ikigai: --require-enrollment and --allow-unenrolled say opposite things; \
+                     give one"
                 );
                 std::process::exit(2);
             }
@@ -2140,7 +2304,7 @@ fn main() {
                         layers_key,
                         layers_reseal,
                         layers_https,
-                        require_enrollment,
+                        require_enrollment: !allow_unenrolled,
                     },
                 )
             }
@@ -2590,10 +2754,7 @@ fn mcp(authority: McpAuthority, shows: Vec<String>, mounts: Mounts) {
         // appear. One bounded probe (a UDS refusal is instant, QUIC has its dial
         // budget); the connection is cached by the dial regardless of the probe's
         // outcome, and an absent peer stays gracefully absent.
-        for spec in resolved
-            .iter()
-            .filter(|s| s.kind == ikigai_embedded::MountKind::Prefer)
-        {
+        for spec in resolved.iter().filter(|s| s.kind == MountKind::Prefer) {
             let _ = spec.resolver.issue(ikigai_core::Request::new(
                 ikigai_core::Verb::Meta,
                 ikigai_core::Iri::parse("urn:kernel:catalog").expect("static IRI"),
@@ -2826,7 +2987,7 @@ fn build_engine(
             let names = ikigai_embedded::names::active().map(|_| {
                 ikigai_core::Iri::parse(ikigai_embedded::names::RESOURCE).expect("a constant IRI")
             });
-            let resolver = local_resolver::LocalResolver::new(kernel);
+            let resolver = TerminalResolver(local_resolver::LocalResolver::new(kernel));
             let engine = match names {
                 Some(atom) => Engine::new(resolver).with_names_atom(atom),
                 None => Engine::new(resolver),
@@ -2966,9 +3127,9 @@ fn mounts_from_config_lines(
                 .next()
                 .ok_or_else(|| format!("mount `{line}`: expected <mode> <prefix>=<target>"))?;
             let kind = match mode {
-                "alias" | "mount" => ikigai_embedded::MountKind::Alias,
-                "override" => ikigai_embedded::MountKind::Override,
-                "prefer" => ikigai_embedded::MountKind::Prefer,
+                "alias" | "mount" => MountKind::Alias,
+                "override" => MountKind::Override,
+                "prefer" => MountKind::Prefer,
                 other => {
                     return Err(format!(
                         "mount `{line}`: unknown mode `{other}` (alias | override | prefer)"
@@ -2996,6 +3157,7 @@ fn mounts_from_config_lines(
                 target,
                 certs,
                 kind,
+                pending: false,
             })
         })
         .collect()
@@ -3010,7 +3172,7 @@ fn mounts_from_config_lines(
 /// as it was before ledger #1379.
 #[cfg(feature = "embedded")]
 fn home_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+    ikigai_embedded::config::user_home().unwrap_or_default()
 }
 
 /// Turn a parsed [`Mount`] into a [`MountSpec`](ikigai_embedded::MountSpec), connecting eagerly or lazily
@@ -3021,29 +3183,35 @@ fn home_dir() -> std::path::PathBuf {
 /// `--mount` and `--override` connect NOW: you named that peer because you want
 /// its namespace, and a silent no-op is the failure mode worth being loud about.
 /// `--prefer` connects on demand — its whole contract is that the peer may be
-/// absent, so an absent peer at startup is normal operation, not an error.
+/// absent, so an absent peer at startup is normal operation, not an error. A served
+/// `--mount` or `--override` that says `--pending` connects on demand too: the operator
+/// asked for that by name, and the banner says so.
 ///
 /// One spec PER PREFIX, every one holding the SAME resolver: a mount that names several
 /// prefixes ([`mount_prefixes`]) is one connection serving all of them, not one per prefix.
+#[cfg(feature = "embedded")]
 fn resolve_mount(mount: Mount) -> Result<Vec<ikigai_embedded::MountSpec>, String> {
     let Mount {
         prefix,
         target,
         certs,
         kind,
+        pending,
     } = mount;
     let prefixes = mount_prefixes(&prefix)?;
-    let resolver: std::sync::Arc<dyn ikigai_resolve::Resolver> =
-        if kind == ikigai_embedded::MountKind::Prefer {
-            std::sync::Arc::new(LazyResolver {
-                target: target.clone(),
-                certs,
-                inner: std::sync::Mutex::new(None),
-                entries_failed: std::sync::Mutex::new(None),
-            })
-        } else {
-            connect_mount(&target, &certs, kind, alias_hello(kind, &prefixes))?
-        };
+    let lazy = pending || kind == MountKind::Prefer;
+    let resolver: std::sync::Arc<dyn ikigai_resolve::Resolver> = if lazy {
+        std::sync::Arc::new(LazyResolver {
+            target: target.clone(),
+            certs,
+            kind,
+            alias_hello: alias_hello(kind, &prefixes),
+            inner: std::sync::Mutex::new(None),
+            entries_failed: std::sync::Mutex::new(None),
+        })
+    } else {
+        connect_mount(&target, &certs, kind, alias_hello(kind, &prefixes))?
+    };
     Ok(prefixes
         .into_iter()
         .map(|prefix| ikigai_embedded::MountSpec {
@@ -3061,15 +3229,16 @@ fn resolve_mount(mount: Mount) -> Result<Vec<ikigai_embedded::MountSpec>, String
 /// [`ikigai_embedded::alias_forwards_unchanged`]), so a connection serving only deeper
 /// prefixes speaks verbatim, and a prefix-canonical peer lists the full names the mount
 /// claims. One connection carries one hello, so a list that mixes the two speaks alias.
-fn alias_hello(kind: ikigai_embedded::MountKind, prefixes: &[&str]) -> bool {
-    kind == ikigai_embedded::MountKind::Alias
+#[cfg(feature = "embedded")]
+fn alias_hello(kind: MountKind, prefixes: &[&str]) -> bool {
+    kind == MountKind::Alias
         && !prefixes
             .iter()
             .all(|prefix| ikigai_embedded::alias_forwards_unchanged(prefix))
 }
 
 /// [`resolve_mount`] for a mount that names ONE prefix, the tests' common case.
-#[cfg(test)]
+#[cfg(all(test, feature = "embedded"))]
 fn resolve_one_mount(mount: Mount) -> Result<ikigai_embedded::MountSpec, String> {
     let mut specs = resolve_mount(mount)?;
     assert_eq!(specs.len(), 1, "one prefix, one spec");
@@ -3098,9 +3267,14 @@ fn resolve_one_mount(mount: Mount) -> Result<ikigai_embedded::MountSpec, String>
 /// was the context where blocking is not allowed. `ikigai-quic` now detects that and hands
 /// the flush to a thread of its own, so a drop here would be SAFE; it is simply not needed,
 /// because the transport heals its own connection a layer down.
+#[cfg(feature = "embedded")]
 struct LazyResolver {
     target: String,
     certs: Certs,
+    /// What the dial says it is for: a `--prefer`, or a `--pending` mount's own kind.
+    kind: MountKind,
+    /// The hello this mount's connection says, [`alias_hello`]'s answer for its prefixes.
+    alias_hello: bool,
     inner: std::sync::Mutex<Option<std::sync::Arc<dyn ikigai_resolve::Resolver>>>,
     /// When the last `entries()` dial FAILED — the negative cache that keeps an
     /// enumeration-happy session from paying the connect bound on every `list`
@@ -3110,8 +3284,10 @@ struct LazyResolver {
 }
 
 /// How long `entries()` believes a failed dial before trying again.
+#[cfg(feature = "embedded")]
 const ENTRIES_REDIAL_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
 
+#[cfg(feature = "embedded")]
 impl LazyResolver {
     /// The live resolver, dialing the peer if this is the first call (or the first
     /// since a failure).
@@ -3119,19 +3295,14 @@ impl LazyResolver {
         if let Some(resolver) = self.inner.lock().unwrap().clone() {
             return Ok(resolver);
         }
-        // A prefer mount forwards IRIs unchanged, so it speaks verbatim.
-        let resolver = connect_mount(
-            &self.target,
-            &self.certs,
-            ikigai_embedded::MountKind::Prefer,
-            false,
-        )
-        .map_err(|e| ikigai_core::Error::Unavailable(format!("{}: {e}", self.target)))?;
+        let resolver = connect_mount(&self.target, &self.certs, self.kind, self.alias_hello)
+            .map_err(|e| ikigai_core::Error::Unavailable(format!("{}: {e}", self.target)))?;
         *self.inner.lock().unwrap() = Some(std::sync::Arc::clone(&resolver));
         Ok(resolver)
     }
 }
 
+#[cfg(feature = "embedded")]
 #[async_trait::async_trait]
 impl ikigai_resolve::Resolver for LazyResolver {
     fn issue(
@@ -3192,7 +3363,7 @@ impl ikigai_resolve::Resolver for LazyResolver {
 
     /// The enumeration, keeping the failure — with ONE failure deliberately swallowed.
     ///
-    /// ★ A `--prefer` mount's whole contract is that the peer may be absent, so a peer
+    /// ★ A lazy mount's whole contract is that the peer may be absent, so a peer
     /// that will not DIAL is normal operation, not a degraded catalog: reporting it as an
     /// error would put a "mount unavailable" row in the manifold of every laptop whose
     /// workstation is asleep. A peer that is CONNECTED and then goes silent is the
@@ -3245,10 +3416,11 @@ impl ikigai_resolve::Resolver for LazyResolver {
     }
 }
 
+#[cfg(feature = "embedded")]
 fn connect_mount(
     target: &str,
     certs: &Certs,
-    kind: ikigai_embedded::MountKind,
+    kind: MountKind,
     alias_hello: bool,
 ) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
     // The connect error names the flag the operator actually wrote: a down
@@ -3271,11 +3443,11 @@ fn connect_mount(
 
 /// The flag spelling of a mount kind (a `mount =` config line uses the same
 /// word without the dashes).
-fn mount_flag(kind: ikigai_embedded::MountKind) -> &'static str {
+fn mount_flag(kind: MountKind) -> &'static str {
     match kind {
-        ikigai_embedded::MountKind::Alias => "--mount",
-        ikigai_embedded::MountKind::Override => "--override",
-        ikigai_embedded::MountKind::Prefer => "--prefer",
+        MountKind::Alias => "--mount",
+        MountKind::Override => "--override",
+        MountKind::Prefer => "--prefer",
     }
 }
 
@@ -3506,6 +3678,9 @@ fn connect_mount_quic(
     if let Some(bound) = call_timeout() {
         resolver = resolver.with_call_timeout(bound);
     }
+    resolver
+        .check_admission()
+        .map_err(|e| format!("{flag}: {e}"))?;
     Ok(std::sync::Arc::new(resolver))
 }
 
@@ -3802,6 +3977,8 @@ fn cert_add_client(name: &str, cert_dir: Option<String>, force: bool) -> ! {
                          to give it its own authority, add it to the `clients` map in \
                          {}: \"{fingerprint}\": {{\"grant\": \"<grant>\", \"label\": \"{name}\"}}",
                         ikigai_embedded::clients::clients_path()
+                            .ok()
+                            .flatten()
                             .map_or_else(|| "clients.json".into(), |p| p.display().to_string())
                     );
                 }
@@ -3908,7 +4085,7 @@ struct QuicDoorFlags {
     layers_reseal: bool,
     /// `--layers-https <addr>`.
     layers_https: Option<String>,
-    /// `--require-enrollment`.
+    /// Whether a missing `clients.json` stops the door: true unless `--allow-unenrolled`.
     require_enrollment: bool,
 }
 
@@ -3931,6 +4108,9 @@ fn serve_quic(
     let caps = caps.to_vec();
     let result = (|| -> Result<(), String> {
         let addr = quic::parse_addr(target)?;
+        // Before any authority file is read: refuse one another account could write, and a
+        // private key another account could read, naming the `chmod` that fixes it.
+        ikigai_embedded::authority::check(&quic::authority_paths(certs)?)?;
         let identity = quic::server_identity(certs)?;
         let trusted = quic::trusted_clients(certs)?;
         let max_age = quic_max_connection_age()?;
@@ -4034,6 +4214,27 @@ fn serve_quic(
         // A `clients.json` that exists but does not parse stops the server here: a
         // broken authority config must not degrade into serving everyone under 2 or 3.
         let enrolment = ikigai_embedded::clients::enrolment()?;
+        // The grants file is authority config too: one that does not parse stops the door, and
+        // so does an enrolled grant it does not define or gives no scopes. The minter refuses
+        // every client under such a grant, so a door opened with it would report its clients
+        // enrolled and serve none of them.
+        ikigai_embedded::grants_document()?;
+        if let Some(enrolment) = &enrolment {
+            let grants = ikigai_embedded::grants_path()?
+                .map_or_else(|| "grants.json".into(), |p| p.display().to_string());
+            let clients = ikigai_embedded::clients::clients_path()?
+                .map_or_else(|| "clients.json".into(), |p| p.display().to_string());
+            for name in enrolment.grant_names() {
+                if ikigai_embedded::grant_scopes(&name)?.is_empty() {
+                    return Err(format!(
+                        "{clients} enrolls clients under the grant `{name}`, which {grants} \
+                         does not define or gives no scopes, so every client under it would be \
+                         refused. Define `{name}` in {grants} with the scopes it grants, or \
+                         enroll those clients under a grant it defines."
+                    ));
+                }
+            }
+        }
         // ★ A door that HOSTS LAYERS needs posture 1, and refuses to start without it (ledger
         // #1281). Layers are for participants: each certificate is named by its enrollment and
         // granted exactly its layer actions. Without a `clients.json` the door fell to posture
@@ -4042,7 +4243,7 @@ fn serve_quic(
         // for layers serving a filesystem instead. The edge guarded it with an `ExecStartPre`
         // file test; the door should not need one. A door WITHOUT `layers/` is unchanged.
         if let (Some(hosted), None) = (&layers, &enrolment) {
-            let clients = ikigai_embedded::clients::clients_path()
+            let clients = ikigai_embedded::clients::clients_path()?
                 .map_or_else(|| "clients.json".into(), |p| p.display().to_string());
             let grants = ikigai_embedded::grants_path()?
                 .map_or_else(|| "grants.json".into(), |p| p.display().to_string());
@@ -4056,20 +4257,34 @@ fn serve_quic(
                 hosted.config.display(),
             ));
         }
-        // ★ `--require-enrollment` (ledger #1826): the booking airlock serves per-drainer grants
-        // under its `--cap` ceiling, and without a `clients.json` it would fall to posture 2,
-        // the one shared ceiling for every trusted certificate. A missing file stops the door,
-        // never opens it. (While serving, a file that goes away refuses every client: the
-        // minter reads it per connection.)
-        if require_enrollment && enrolment.is_none() {
-            let clients = ikigai_embedded::clients::clients_path()
+        // ★ Enrollment is required by default (ledger #1826 made it a flag): without a
+        // `clients.json` the door would fall to posture 2, the one shared ceiling for every
+        // trusted certificate, or to posture 3, a writable workspace for each. A missing file
+        // stops the door, never opens it, unless `--allow-unenrolled` asks for that posture by
+        // name. (While serving, a file that goes away refuses every client: the minter reads it
+        // per connection.)
+        if enrolment.is_none() {
+            let clients = ikigai_embedded::clients::clients_path()?
                 .map_or_else(|| "clients.json".into(), |p| p.display().to_string());
-            return Err(format!(
-                "--require-enrollment: there is no {clients}, so this door would serve every \
-                 trusted certificate under one shared authority. Enroll each client there \
-                 (`\"<fingerprint>\": {{\"grant\": \"<grant in grants.json>\", \"label\": \"…\"}}`; \
-                 `ikigai cert add-client` prints the fingerprint), or drop the flag."
-            ));
+            if require_enrollment {
+                return Err(format!(
+                    "enrollment is required (--require-enrollment is the default): there is no \
+                     {clients}, so this door would serve every trusted certificate under one \
+                     shared authority. Enroll each client there \
+                     (`\"<fingerprint>\": {{\"grant\": \"<grant in grants.json>\", \"label\": \"…\"}}`; \
+                     `ikigai cert add-client` prints the fingerprint), or start with \
+                     --allow-unenrolled to serve that shared posture."
+                ));
+            }
+            let shared = if caps.is_empty() {
+                "its own writable workspace".to_string()
+            } else {
+                format!("the one ceiling {}", caps.join(", "))
+            };
+            eprintln!(
+                "ikigai: warning: --allow-unenrolled and there is no {clients}: every trusted \
+                 certificate is served with {shared}"
+            );
         }
         // A served connection addresses files only inside `file_root/<segment>` — the
         // file module's jail refuses absolute IRI paths and anything outside its root
@@ -4136,6 +4351,8 @@ fn serve_quic(
                 ikigai_core::Capability::scoped(caps.clone())
             };
             let path = ikigai_embedded::clients::clients_path()
+                .ok()
+                .flatten()
                 .map_or_else(|| "clients.json".into(), |p| p.display().to_string());
             let root = file_root.clone();
             std::sync::Arc::new(move |peer: &ikigai_quic::PeerIdentity| {
@@ -4220,8 +4437,10 @@ fn serve_quic(
         };
         // ★ A LOBBY (ledger #2009, #2104): when the layer host defines a `lobby = true` channel,
         // the door also admits a certificate its trust list does NOT name, and this minter, not
-        // the one above, decides it. It mints exactly `Host::lobby_capability`: `say` on every
-        // lobby and nothing else, under `urn:iki:host:{name}:client:<fp>`. Never through
+        // the one above, decides it. It mints exactly `Host::door_capability`, given the
+        // connection's address for the join's per-address limit (ledger #3295): `say` on every
+        // lobby and nothing else, under `urn:iki:host:{name}:client:<fp>`, or `read` and `feed`
+        // on its public layers for a certificate that joined. Never through
         // `root_fs_scopes` and never combined with `--cap`: the lobby capability is the whole
         // authority, so neither can widen or reshape it. The host holds every lobby to its size
         // and rate bounds itself. Decided ONCE at startup, like the surface: a door with no
@@ -4232,7 +4451,14 @@ fn serve_quic(
             .map(|hosted| -> ikigai_quic::Minter {
                 let layer_host = std::sync::Arc::clone(&hosted.host);
                 std::sync::Arc::new(move |peer: &ikigai_quic::PeerIdentity| {
-                    match layer_host.lobby_capability(host, &peer.fingerprint) {
+                    let source = peer.source_address.map(|ip| ip.to_string());
+                    let now = ikigai_core::Clock::now(&ikigai_core::SystemClock);
+                    match layer_host.door_capability(
+                        host,
+                        &peer.fingerprint,
+                        source.as_deref(),
+                        now,
+                    ) {
                         Ok(Some(capability)) => {
                             let principal = capability.principal().map(str::to_string);
                             Some(ikigai_quic::Session {
@@ -4243,8 +4469,9 @@ fn serve_quic(
                         }
                         Ok(None) => {
                             diagnose(format_args!(
-                                "ikigai: REFUSED an unlisted client certificate: this door's \
-                                 layer host has no lobby\n  fingerprint: {}",
+                                "ikigai: REFUSED an unlisted client certificate: the layer \
+                                 host's deny.txt names it, or the host has no lobby now\n  \
+                                 fingerprint: {}",
                                 peer.fingerprint
                             ));
                             None
@@ -4762,6 +4989,8 @@ fn layers_token(command: TokenCommand) -> ! {
                          enroll it first (`ikigai-layers grants <config home>` writes \
                          clients.json from enrollment.toml)",
                         ikigai_embedded::clients::clients_path()
+                            .ok()
+                            .flatten()
                             .map_or_else(|| "unset".into(), |p| p.display().to_string())
                     )
                 })?;
@@ -4832,13 +5061,57 @@ fn connect_quic(target: &str, certs: &Certs) -> Result<Engine, String> {
     let addr = quic::parse_addr(target)?;
     let identity = quic::client_identity(certs)?;
     let trusted = quic::trusted_server_cert(certs)?;
-    let mut resolver = ikigai_quic::connect_with(addr, &identity, &trusted, quic_idle_timeout())
-        .map_err(|e| format!("connect {target}: {e}"))?
-        .with_describe_timeout(describe_timeout(ikigai_quic::DEFAULT_DESCRIBE_TIMEOUT));
-    if let Some(bound) = call_timeout() {
-        resolver = resolver.with_call_timeout(bound);
+    let describe = describe_timeout(ikigai_quic::DEFAULT_DESCRIBE_TIMEOUT);
+    let bound = call_timeout();
+    let idle = quic_idle_timeout();
+    let origin = target.to_string();
+    // The dial and its admission check, as one attempt.
+    let dial = move || -> Result<ikigai_quic::QuicResolver, ikigai_core::Error> {
+        let mut resolver = ikigai_quic::connect_with(addr, &identity, &trusted, idle)
+            .map_err(|e| dial_error(&origin, e))?
+            .with_describe_timeout(describe);
+        if let Some(bound) = bound {
+            resolver = resolver.with_call_timeout(bound);
+        }
+        resolver.check_admission()?;
+        Ok(resolver)
+    };
+    // `connect.retry.*` (ledger #3383). With no key there is no policy: one dial, and a
+    // failure ends the client at once, as before. With a policy, the first dial and
+    // admission go through the policy's Retry and limit too (a hub down at startup is waited
+    // for; a refusal such as Denied still fails at once), and every later call goes through
+    // a cache-less issuer over the governed resolver, so reads stay as fresh as without it.
+    match ikigai_embedded::retry::RetryPolicy::from_config()? {
+        None => Ok(with_profiles(Engine::new(TerminalResolver(
+            dial().map_err(|e| e.to_string())?,
+        )))),
+        Some(policy) => {
+            let resolver =
+                ikigai_embedded::retry::first_dial(&policy, dial).map_err(|e| e.to_string())?;
+            Ok(with_profiles(Engine::new(TerminalResolver(
+                ikigai_embedded::retry::connect_issuer(
+                    &policy,
+                    std::sync::Arc::new(resolver),
+                    target,
+                ),
+            ))))
+        }
     }
-    Ok(with_profiles(Engine::new(resolver)))
+}
+
+/// A failed `--connect` dial as core's error, classed the way the QUIC transport classes
+/// its own: a refused admission is `Denied` and a wire-version mismatch an endpoint error
+/// (neither is tried again); an unreachable or silent hub is transient. The text is the one
+/// the client printed before the policy (`connect <target>: …`).
+#[cfg(all(feature = "embedded", feature = "quic"))]
+fn dial_error(target: &str, e: std::io::Error) -> ikigai_core::Error {
+    let text = format!("connect {target}: {e}");
+    match e.kind() {
+        std::io::ErrorKind::PermissionDenied => ikigai_core::Error::Denied(text),
+        std::io::ErrorKind::InvalidData => ikigai_core::Error::Endpoint(text),
+        std::io::ErrorKind::TimedOut => ikigai_core::Error::Timeout(text),
+        _ => ikigai_core::Error::Unavailable(text),
+    }
 }
 
 #[cfg(all(feature = "embedded", not(feature = "quic")))]
@@ -5092,7 +5365,7 @@ fn connect_ipc(path: Option<String>) -> Result<Engine, String> {
     if let Some(bound) = call_timeout() {
         resolver = resolver.with_call_timeout(bound);
     }
-    Ok(with_profiles(Engine::new(resolver)))
+    Ok(with_profiles(Engine::new(TerminalResolver(resolver))))
 }
 
 /// True when a mount target dials this process's own QUIC bind address — the
@@ -5297,7 +5570,7 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
         Err(e) => {
             eprintln!(
                 "ikigai: {e} (in {})",
-                ikigai_embedded::config::config_path().display()
+                ikigai_embedded::config::config_path_shown()
             );
             std::process::exit(2);
         }
@@ -5355,7 +5628,7 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
         Err(e) => {
             eprintln!(
                 "ikigai: {e} (in {})",
-                ikigai_embedded::config::config_path().display()
+                ikigai_embedded::config::config_path_shown()
             );
             std::process::exit(2);
         }
@@ -5547,7 +5820,9 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
 /// missing, with `config`'s per-request ceiling, and the content store an upload is held in
 /// while its Sink runs. A directory of this door's own, because a `FileSpill` removes the spill
 /// files it finds in its directory when it opens it: two processes must never share one, and two
-/// doors cannot both hold one port. Only under a config home that exists; never `TMPDIR`.
+/// doors cannot both hold one port. Startup removes abandoned `http-0-<pid>` spills only
+/// when the PID no longer exists; directories of live processes are never opened. Only under
+/// a config home that exists; never `TMPDIR`.
 ///
 /// A door with no upload routes serves without a spill when the directory cannot be made (and
 /// says why); one with upload routes refuses to start.
@@ -5575,13 +5850,17 @@ fn install_spill(
         0 => format!("http-0-{}", std::process::id()),
         port => format!("http-{port}"),
     };
-    let dir = home.join("spill").join(name);
+    let parent = home.join("spill");
+    let dir = parent.join(name);
     let spill = std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(&dir)
         .map_err(|e| e.to_string())
-        .and_then(|()| ikigai_fs::FileSpill::new(&dir).map_err(|e| e.to_string()));
+        .and_then(|()| {
+            remove_abandoned_http_spills(&parent);
+            ikigai_fs::FileSpill::new(&dir).map_err(|e| e.to_string())
+        });
     match spill {
         Ok(spill) => {
             let store = std::sync::Arc::new(ikigai_core::MemoryContentStore::new(config.total));
@@ -5601,6 +5880,40 @@ fn install_spill(
                 dir.display()
             );
             std::process::exit(2);
+        }
+    }
+}
+
+/// Best-effort cleanup of ephemeral HTTP spills left by exited processes. Preserve every
+/// live (including an inaccessible or reused PID) directory, symlink, and unrelated file.
+/// `FileSpill::new` removes only its own orphan files; `remove_dir` succeeds only if empty.
+#[cfg(all(feature = "embedded", feature = "web", unix))]
+fn remove_abandoned_http_spills(parent: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("http-0-"))
+            .filter(|pid| !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+            .filter(|pid| *pid > 0)
+        else {
+            continue;
+        };
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        // SAFETY: signal 0 sends nothing; it only checks whether this PID exists.
+        let answer = unsafe { libc::kill(pid, 0) };
+        if answer != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+            continue;
+        }
+        let dir = entry.path();
+        if ikigai_fs::FileSpill::new(&dir).is_ok() {
+            let _ = std::fs::remove_dir(dir);
         }
     }
 }
@@ -5671,7 +5984,7 @@ mod peer_name_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "embedded"))]
 mod mount_posture_tests {
     use super::*;
 
@@ -5684,7 +5997,7 @@ mod mount_posture_tests {
     /// unchanged and its peer must list the full names.
     #[test]
     fn only_a_first_segment_alias_mount_says_alias_in_its_hello() {
-        use ikigai_embedded::MountKind::{Alias, Override, Prefer};
+        use MountKind::{Alias, Override, Prefer};
         assert!(alias_hello(Alias, &["urn:quakes:"]));
         assert!(!alias_hello(Alias, &["urn:quakes:near:"]));
         assert!(!alias_hello(
@@ -5699,12 +6012,13 @@ mod mount_posture_tests {
         assert!(!alias_hello(Prefer, &["urn:quakes:"]));
     }
 
-    fn mount(kind: ikigai_embedded::MountKind) -> Mount {
+    fn mount(kind: MountKind) -> Mount {
         Mount {
             prefix: "urn:x:".to_string(),
             target: "/tmp/x.sock".to_string(),
             certs: Certs::default(),
             kind,
+            pending: false,
         }
     }
 
@@ -5743,7 +6057,7 @@ mod mount_posture_tests {
     #[test]
     fn no_flags_still_compose_the_machines_topology() {
         let resolved = resolve_mounts(Mounts::default(), std::path::Path::new("/home/b"), || {
-            Ok(vec![mount(ikigai_embedded::MountKind::Prefer)])
+            Ok(vec![mount(MountKind::Prefer)])
         })
         .expect("a parsing config home is not an error");
         assert_eq!(resolved.len(), 1, "the config home is the default posture");
@@ -5754,7 +6068,7 @@ mod mount_posture_tests {
     #[test]
     fn mount_flags_win_wholesale_over_the_config_home() {
         let flagged = Mounts {
-            flags: vec![mount(ikigai_embedded::MountKind::Prefer)],
+            flags: vec![mount(MountKind::Prefer)],
             declined: false,
         };
         let resolved = resolve_mounts(flagged, std::path::Path::new("/home/b"), || {
@@ -5945,7 +6259,8 @@ mod mount_posture_tests {
             prefix: prefix.to_string(),
             target: target.to_string(),
             certs: Certs::default(),
-            kind: ikigai_embedded::MountKind::Prefer,
+            kind: MountKind::Prefer,
+            pending: false,
         }
     }
 
@@ -6087,9 +6402,9 @@ mod mount_posture_tests {
     #[test]
     fn the_mode_word_matches_the_config_lines_grammar() {
         for (kind, word) in [
-            (ikigai_embedded::MountKind::Alias, "alias"),
-            (ikigai_embedded::MountKind::Override, "override"),
-            (ikigai_embedded::MountKind::Prefer, "prefer"),
+            (MountKind::Alias, "alias"),
+            (MountKind::Override, "override"),
+            (MountKind::Prefer, "prefer"),
         ] {
             assert_eq!(mount_mode(kind), word);
             // …and the grammar really parses it back.
@@ -6116,9 +6431,9 @@ mod mount_posture_tests {
         )
         .expect("both lines parse");
         assert_eq!(mounts.len(), 2);
-        assert_eq!(mounts[0].kind, ikigai_embedded::MountKind::Prefer);
+        assert_eq!(mounts[0].kind, MountKind::Prefer);
         assert_eq!(mounts[0].prefix, "urn:iki:store:");
-        assert_eq!(mounts[1].kind, ikigai_embedded::MountKind::Alias);
+        assert_eq!(mounts[1].kind, MountKind::Alias);
         let expanded = std::path::Path::new("/Users/x").join(".config/ikigai/quic-bug");
         assert_eq!(
             mounts[1].certs.cert_dir.as_deref(),
@@ -6128,7 +6443,7 @@ mod mount_posture_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "embedded"))]
 mod mount_cert_tests {
     use super::*;
 
@@ -6208,9 +6523,9 @@ mod mount_cert_tests {
             "--cert-dir",
             "/certs/plasma",
         ]);
-        assert_eq!(mounts[0].kind, ikigai_embedded::MountKind::Alias);
-        assert_eq!(mounts[1].kind, ikigai_embedded::MountKind::Override);
-        assert_eq!(mounts[2].kind, ikigai_embedded::MountKind::Prefer);
+        assert_eq!(mounts[0].kind, MountKind::Alias);
+        assert_eq!(mounts[1].kind, MountKind::Override);
+        assert_eq!(mounts[2].kind, MountKind::Prefer);
         assert_eq!(mounts[2].prefix, "urn:llm:");
         assert_eq!(mounts[2].target, "quic://plasma.local:4433");
         assert_eq!(mounts[2].certs.cert_dir.as_deref(), Some("/certs/plasma"));
@@ -6240,7 +6555,7 @@ mod mount_cert_tests {
                 spec.prefix
             );
             assert_eq!(spec.origin, "quic://127.0.0.1:1");
-            assert_eq!(spec.kind, ikigai_embedded::MountKind::Prefer);
+            assert_eq!(spec.kind, MountKind::Prefer);
         }
     }
 
@@ -6458,7 +6773,8 @@ mod mount_cert_tests {
             prefix: "urn:test:".to_string(),
             target: path.display().to_string(),
             certs: Certs::default(),
-            kind: ikigai_embedded::MountKind::Prefer,
+            kind: MountKind::Prefer,
+            pending: false,
         };
         let spec = resolve_one_mount(mount).expect("prefer resolves lazily");
         let entries = spec
@@ -6498,13 +6814,13 @@ mod mount_cert_tests {
         assert_eq!(grants, vec!["cal".to_string()]);
         let mounts = mounts.flags;
         assert_eq!(mounts.len(), 2);
-        assert_eq!(mounts[0].kind, ikigai_embedded::MountKind::Prefer);
+        assert_eq!(mounts[0].kind, MountKind::Prefer);
         assert_eq!(mounts[0].target, "peer:plasma");
         assert!(
             mounts[0].certs.cert_dir.is_none(),
             "a cert flag after the SECOND mount must not leak onto the first"
         );
-        assert_eq!(mounts[1].kind, ikigai_embedded::MountKind::Alias);
+        assert_eq!(mounts[1].kind, MountKind::Alias);
         assert_eq!(mounts[1].certs.cert_dir.as_deref(), Some("/certs/bug"));
     }
 
@@ -6522,7 +6838,8 @@ mod mount_cert_tests {
             // Nothing is listening here, and nothing should try.
             target: "quic://127.0.0.1:1".to_string(),
             certs: Certs::default(),
-            kind: ikigai_embedded::MountKind::Prefer,
+            kind: MountKind::Prefer,
+            pending: false,
         };
         let spec = resolve_one_mount(mount).expect("a prefer mount must not fail at startup");
         assert!(
@@ -6542,6 +6859,51 @@ mod mount_cert_tests {
             spec.resolver.entries().is_none() && start.elapsed() < ENTRIES_REDIAL_AFTER,
             "the second probe rides the negative cache"
         );
+    }
+
+    /// `--pending` attaches to the mount it follows, and defers that mount's dial.
+    #[test]
+    fn pending_defers_the_dial_of_the_mount_it_follows() {
+        let parsed = parse_argv(
+            argv(&[
+                "serve",
+                "/tmp/s.sock",
+                "--mount",
+                "urn:a:=quic://127.0.0.1:1",
+                "--pending",
+                "--override",
+                "urn:b:=quic://127.0.0.1:2",
+            ])
+            .into_iter(),
+        );
+        let Ok(Some(Mode::Serve { mounts, .. })) = parsed else {
+            panic!("serve parses as serve");
+        };
+        let [first, second] = mounts.flags.as_slice() else {
+            panic!("two mounts");
+        };
+        assert!(first.pending && !second.pending);
+        let spec = resolve_one_mount(first.clone()).expect("a pending mount does not dial");
+        assert!(spec.resolver.transport().contains("not connected"));
+    }
+
+    /// A `--pending` with no mount to apply to, or after a `--prefer`, is a typo, said by name.
+    #[test]
+    fn pending_is_refused_where_it_means_nothing() {
+        let refusal = |args: &[&str]| match parse_argv(argv(args).into_iter()) {
+            Ok(_) => panic!("{args:?} must be refused"),
+            Err(e) => e,
+        };
+        let e = refusal(&["serve", "/tmp/s.sock", "--pending"]);
+        assert!(e.contains("must follow the --mount or --override"), "{e}");
+        let e = refusal(&[
+            "serve",
+            "/tmp/s.sock",
+            "--prefer",
+            "urn:a:=/tmp/a.sock",
+            "--pending",
+        ]);
+        assert!(e.contains("already dials on first use"), "{e}");
     }
 
     /// Per-file overrides ride along with the mount too, not just --cert-dir.
@@ -6672,7 +7034,8 @@ mod mount_flag_tests {
             prefix: "urn:repo:".to_string(),
             target: absent.to_string(),
             certs: Certs::default(),
-            kind: ikigai_embedded::MountKind::Prefer,
+            kind: MountKind::Prefer,
+            pending: false,
         })
         .expect("a prefer mount resolves lazily");
         // First use dials — and the failure names --prefer.
@@ -6687,12 +7050,7 @@ mod mount_flag_tests {
         assert!(err.contains("--prefer: connect"), "{err}");
         assert!(!err.contains("--mount:"), "{err}");
         // The eager kinds keep their own spellings.
-        let Err(err) = connect_mount(
-            absent,
-            &Certs::default(),
-            ikigai_embedded::MountKind::Alias,
-            true,
-        ) else {
+        let Err(err) = connect_mount(absent, &Certs::default(), MountKind::Alias, true) else {
             panic!("nothing listens at the absent socket");
         };
         assert!(err.contains("--mount: connect"), "{err}");
@@ -7189,6 +7547,24 @@ mod adapter_gate_tests {
         }
     }
 
+    /// Only terminal requests choose text; a shared kernel still serves HTML by default.
+    #[test]
+    fn terminal_runbook_policy_leaves_the_shared_kernels_html_default_alone() {
+        let s = session("terminal-runbook");
+        let terminal = Engine::new(TerminalResolver(local_resolver::LocalResolver::new(
+            Arc::clone(&s.kernel),
+        )));
+        let command = "source urn:runbook:basics";
+        let html = run(&s.engine, command).unwrap();
+        assert!(html.contains("hx-get="), "{html}");
+        let plain = run(&terminal, command).unwrap();
+        assert_eq!(
+            plain,
+            run(&s.engine, &format!("{command} as=text/plain")).unwrap()
+        );
+        assert_eq!(run(&s.engine, command).unwrap(), html);
+    }
+
     /// Reverse the runbook's attribute escaping (`esc` in ikigai-runbook).
     fn unescape(s: &str) -> String {
         s.replace("&quot;", "\"")
@@ -7502,7 +7878,8 @@ mod prefer_mount_capability_tests {
             prefix: "urn:peer:".to_string(),
             target: path.display().to_string(),
             certs: Certs::default(),
-            kind: ikigai_embedded::MountKind::Prefer,
+            kind: MountKind::Prefer,
+            pending: false,
         })
         .expect("a prefer mount never dials at startup");
         let local = Kernel::new(Arc::new(ikigai_resolve::MountedRemote::overriding(

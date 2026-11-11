@@ -25,6 +25,11 @@
 //! - **A honeypot field must stay empty.** Bots fill every input; humans never see it.
 //!   The rejection is deliberately indistinguishable from success to the submitter.
 //!
+//! - **No submitter is tracked.** The stored tuple holds the declared fields, the link
+//!   token's resolved client id (and attested fields) when one came along, and the transport's
+//!   `received` time. It never holds the submitter's IP address: the web layer passes one as
+//!   `client`, and it is not copied (ledger #3490).
+//!
 //! What this does NOT do is authorise: the endpoint is capability-gated, and rate limiting
 //! belongs in an overlay above it. CORS is browser-side only and is not a defence here.
 #![forbid(unsafe_code)]
@@ -476,13 +481,25 @@ fn sexpr_string(value: &str) -> String {
     out
 }
 
+/// RFC 5322 `specials` other than `@` and `.`. A bare address (an addr-spec in dot-atom
+/// form, which is what an email box holds) never contains one; they only appear in display
+/// names (`Bob <a@x>`), groups (`g: a@x;`), comments, quoted local parts, domain literals
+/// and address lists.
+const ADDRESS_SPECIALS: &[char] = &['<', '>', '(', ')', '[', ']', ':', ';', ',', '"', '\\'];
+
 /// A minimal address shape check — one `@`, something either side, a dotted domain, no
-/// spaces. The MTA is the real authority; this turns obvious junk into a typed rejection.
+/// spaces, no control characters and none of the [`ADDRESS_SPECIALS`]. The MTA is the real
+/// authority; this turns obvious junk into a typed rejection, and keeps the value ONE bare
+/// address: `x<blocked@x.example>` names the same mailbox as `blocked@x.example`, but would
+/// not match it on the blocklist, and would carry a display name the submitter chose into the
+/// handler's Reply-To.
 fn address_like(value: &str) -> bool {
     let mut parts = value.split('@');
     matches!((parts.next(), parts.next(), parts.next()), (Some(local), Some(domain), None)
         if !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.'))
-        && !value.contains(char::is_whitespace)
+        && !value.contains(|c: char| {
+            c.is_whitespace() || c.is_control() || ADDRESS_SPECIALS.contains(&c)
+        })
 }
 
 #[async_trait]
@@ -635,17 +652,20 @@ impl Endpoint for IntakeEndpoint {
             }
         }
 
-        // PROVENANCE comes from the TRANSPORT, never the body. The web layer sets these
-        // from the connection (`client` from the proxy's forwarded-for, `received` from
-        // its clock); a submitter cannot forge them, because only DECLARED body fields are
-        // carried above — a `client=` input in the form is simply dropped like any other
+        // PROVENANCE comes from the TRANSPORT, never the body. The web layer sets `received`
+        // from its clock; a submitter cannot forge it, because only DECLARED body fields are
+        // carried above — a `received=` input in the form is simply dropped like any other
         // undeclared key. Keeping the two sources separate is the whole point.
-        for name in ["received", "client"] {
-            if let Ok(value) = inv.inline_str(name) {
-                let value = value.trim();
-                if !value.is_empty() {
-                    carried.push((name.to_string(), value.to_string()));
-                }
+        //
+        // ★ The web layer also hands every write the submitter's address as `client`. It is
+        // deliberately NOT copied into the tuple (ledger #3490): nothing tracks individuals,
+        // so a stored submission carries no IP address. Abuse is handled at the door, whose
+        // per-source rate limit (`ikigai-web`'s `source_limit`) holds an address in memory
+        // only for its window and never writes it anywhere.
+        if let Ok(value) = inv.inline_str("received") {
+            let value = value.trim();
+            if !value.is_empty() {
+                carried.push(("received".to_string(), value.to_string()));
             }
         }
 
@@ -888,6 +908,68 @@ mod tests {
             dropped.lock().unwrap().is_empty(),
             "a blocked sender's message must not drop"
         );
+    }
+
+    /// A blocked sender cannot step around the blocklist by wrapping the address in a
+    /// display name or angle brackets: `x<spammer@x.example>` names the same mailbox (it is
+    /// what lands in the handler's Reply-To), but is not the string the log was asked about.
+    /// Only a bare address is an address here, so the wrapped forms are refused at the door.
+    #[test]
+    fn a_blocked_sender_cannot_wrap_the_address_to_slip_the_blocklist() {
+        for wrapped in [
+            "x%3Cspammer%40x.example%3E",
+            "%3Cspammer%40x.example%3E",
+            "%22Your+Bank%22%3Cspammer%40x.example%3E",
+        ] {
+            let (k, dropped) = blocking_kernel("spammer@x.example");
+            let outcome = block_on(k.issue(
+                post(&format!("name=Spammer&email={wrapped}&message=the+price")),
+                &block_cap(),
+            ));
+            assert_eq!(
+                dropped.lock().unwrap().as_slice(),
+                &[] as &[String],
+                "`{wrapped}` slipped the blocklist and dropped a tuple"
+            );
+            assert!(
+                matches!(outcome, Err(Error::InvalidArgument { ref name, .. }) if name == "email"),
+                "`{wrapped}` must be refused as an email address, got: {outcome:?}"
+            );
+        }
+    }
+
+    /// An email field carries ONE bare address: RFC 5322 specials other than `@` and `.`
+    /// (`< > ( ) [ ] : ; , " \`) only appear in display names, groups, comments, quoted local
+    /// parts and address lists, none of which a contact form's email box should produce.
+    #[test]
+    fn an_email_field_is_one_bare_address() {
+        let (k, dropped) = kernel();
+        for bad in [
+            "Bob<a@x.example>",
+            "<a@x.example>",
+            "a,b@x.example",
+            "a@x.example,b",
+            "g:a@x.example;",
+            "a(c)@x.example",
+            "\"a\"@x.example",
+            "a\\b@x.example",
+            "a@[192.0.2.1]",
+        ] {
+            let body = serde_json::json!({"name": "A", "message": "hi", "email": bad}).to_string();
+            let outcome = block_on(k.issue(post(&body), &cap()));
+            assert!(
+                matches!(outcome, Err(Error::InvalidArgument { ref name, .. }) if name == "email"),
+                "`{bad}` must be refused, got: {outcome:?}"
+            );
+        }
+        assert!(dropped.lock().unwrap().is_empty());
+        // An ordinary address with the atext a real one uses still lands.
+        block_on(k.issue(
+            post("name=A&message=hi&email=o%27brien%2Btag%40mail.x.example"),
+            &cap(),
+        ))
+        .unwrap();
+        assert_eq!(dropped.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -1432,24 +1514,40 @@ mod tests {
     #[test]
     fn provenance_comes_from_the_transport_and_cannot_be_forged_in_the_body() {
         let (k, dropped) = kernel();
-        // The body TRIES to claim a different client; the transport arg is the real one.
-        let request = post("name=X&email=x%40y.com&message=hi&client=1.2.3.4")
-            .with_arg("client", ArgRef::Inline(b"203.0.113.9".to_vec()))
+        // The body TRIES to claim a different arrival time; the transport arg is the real one.
+        let request = post("name=X&email=x%40y.com&message=hi&received=1999-01-01T00:00:00Z")
             .with_arg("received", ArgRef::Inline(b"2026-07-22T19:40:00Z".to_vec()));
         block_on(k.issue(request, &cap())).unwrap();
         let tuple = dropped.lock().unwrap()[0].clone();
         assert!(
-            tuple.contains(r#"(client "203.0.113.9")"#),
-            "the transport's client wins: {tuple}"
+            tuple.contains(r#"(received "2026-07-22T19:40:00Z")"#),
+            "the transport's clock wins: {tuple}"
         );
         assert!(
-            !tuple.contains("1.2.3.4"),
+            !tuple.contains("1999"),
             "a body field cannot forge provenance: {tuple}"
         );
-        assert!(
-            tuple.contains(r#"(received "2026-07-22T19:40:00Z")"#),
-            "{tuple}"
-        );
+    }
+
+    /// Ledger #3490: nothing tracks individuals, so a dropped tuple carries no address —
+    /// neither the one the transport attaches as `client` nor one a body tries to smuggle in.
+    #[test]
+    fn a_dropped_tuple_carries_no_ip_address() {
+        let (k, dropped) = kernel();
+        for transport in ["203.0.113.9", "2001:db8::7"] {
+            let request = post("name=X&email=x%40y.com&message=hi&client=198.51.100.4")
+                .with_arg("client", ArgRef::Inline(transport.as_bytes().to_vec()))
+                .with_arg("received", ArgRef::Inline(b"2026-07-22T19:40:00Z".to_vec()));
+            block_on(k.issue(request, &cap())).unwrap();
+            let tuple = dropped.lock().unwrap().last().unwrap().clone();
+            assert!(!tuple.contains("(client "), "no client field: {tuple}");
+            assert!(!tuple.contains(transport), "no transport address: {tuple}");
+            assert!(!tuple.contains("198.51.100.4"), "no body address: {tuple}");
+            assert!(
+                tuple.contains(r#"(received "2026-07-22T19:40:00Z")"#),
+                "the arrival time is still recorded: {tuple}"
+            );
+        }
     }
 
     #[test]

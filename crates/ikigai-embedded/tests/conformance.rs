@@ -193,6 +193,9 @@ const INHERITED: &[(&str, &str)] = &[
     ("contacts", "ikigai-personal"),
     ("eval", "ikigai-lisp"),
     ("file", "ikigai-fs"),
+    // The host gives the org jail a distinct id; its contract and both invocation
+    // paths are still delegated to the published file endpoint.
+    ("orgfile", "ikigai-fs"),
     ("http-delete", "ikigai-http"),
     ("http-get", "ikigai-http"),
     ("http-head", "ikigai-http"),
@@ -380,6 +383,7 @@ fn fixture_home() -> &'static Path {
                     prefix: "urn:iki:store:".to_string(),
                     target: "/tmp/conformance.sock".to_string(),
                     cert_dir: Some("/tmp/conformance/quic".to_string()),
+                    pending: false,
                 },
             ]),
             clients: vec![ikigai_embedded::posture::TrustedIdentity {

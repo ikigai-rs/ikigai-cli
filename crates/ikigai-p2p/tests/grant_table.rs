@@ -3,7 +3,7 @@
 //! server's minter calls with a certificate fingerprint — and an edit to that file revokes
 //! the peer on its NEXT CALL over a connection that stays up.
 //!
-//! Its own test binary on purpose: the `IKIGAI_CLIENTS` and grants-path overrides
+//! Its own test binary on purpose: the clients-path and grants-path overrides
 //! are process-global.
 #![cfg(feature = "p2p")]
 
@@ -80,7 +80,7 @@ async fn a_peer_id_is_authorized_by_the_same_clients_json_and_an_edit_revokes_it
         r#"{"freebusy": ["urn:cap:demo:freebusy"], "detail": ["urn:cap:demo:detail"]}"#,
     )
     .unwrap();
-    std::env::set_var("IKIGAI_CLIENTS", &clients);
+    ikigai_embedded::clients::set_clients_path(clients.clone());
     ikigai_embedded::set_grants_path(grants);
 
     let server_key = Keypair::generate_ed25519();

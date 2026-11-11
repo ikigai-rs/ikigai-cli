@@ -1,6 +1,6 @@
 {
   "about": "Wire v10 stream frames (ikigai-wire, ledger #2242), computed by crates/ikigai-wire/tests/stream_vectors.rs, which fails if this file differs from what the codec writes. Hex is lowercase. `payload` is a frame's bytes; `framed` adds the u32 big-endian length every frame carries on the IPC socket and on a QUIC stream of frames (which opens with `stream_magic`). Tags 6 to 9 are the same in both directions: head, chunk (a varint length, then the bytes, at most `max_chunk`), end, abort (a WireError). A body is whole only at END; a stream that stops without it is a failure, never a shorter body. Each abort is named by its error's failure class.",
-  "protocol_version": 10,
+  "protocol_version": 11,
   "max_chunk": 262144,
   "stream_magic": "494b5753",
   "frames": [
@@ -135,6 +135,19 @@
       "framed": "00000017090714746865206f726967696e2077656e742061776179"
     },
     {
+      "name": "call/abort/transient/gave-up",
+      "direction": "call",
+      "value": {
+        "kind": "abort",
+        "error": {
+          "class": "transient",
+          "display": "gave up after 9 attempts over 120123 ms: down"
+        }
+      },
+      "payload": "090e0978959aef3a04646f776e",
+      "framed": "0000000d090e0978959aef3a04646f776e"
+    },
+    {
       "name": "call/abort/retry-after",
       "direction": "call",
       "value": {
@@ -266,6 +279,19 @@
       },
       "payload": "090714746865206f726967696e2077656e742061776179",
       "framed": "00000017090714746865206f726967696e2077656e742061776179"
+    },
+    {
+      "name": "reply/abort/transient/gave-up",
+      "direction": "reply",
+      "value": {
+        "kind": "abort",
+        "error": {
+          "class": "transient",
+          "display": "gave up after 9 attempts over 120123 ms: down"
+        }
+      },
+      "payload": "090e0978959aef3a04646f776e",
+      "framed": "0000000d090e0978959aef3a04646f776e"
     },
     {
       "name": "reply/abort/retry-after",

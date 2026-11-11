@@ -193,7 +193,7 @@ struct State {
     control: String,
     /// The tab-bar clock `HH:MM`, refreshed each frame from the cacheable `urn:time:now`
     /// (a cache hit within the minute — recomputes only on the minute). Empty until the
-    /// first fetch. The colon blinks per second, computed at draw time.
+    /// first fetch. The colon stays visible across redraws.
     clock: String,
     /// The persistent multi-line Lisp scratch buffer (the "Scratch (Lisp)" tab). A
     /// single `String` with `\n`s — the same representation as `input`, so the shared
@@ -263,18 +263,23 @@ fn event_loop(
     }
     // Preload persisted command history when persistence is on — the flag is seeded
     // from the sticky on-disk marker, so ↑↓ recall spans prior sessions.
+    // History persistence is the embedded host's; a build without it keeps this session's.
+    #[cfg(feature = "embedded")]
     if ikigai_embedded::history_flag().load(std::sync::atomic::Ordering::Relaxed) {
         state.history = ikigai_embedded::load_history();
     }
     // The eval-driven readouts (clock + Control tab) refresh at ~1s, not every 250ms
-    // draw — the colon blink is computed at draw time, so drawing stays at the full
-    // frame rate while these (and their scheduler fan-out) tick just once a second.
+    // draw, so these (and their scheduler fan-out) tick just once a second.
     let mut last_refresh: Option<std::time::Instant> = None;
     loop {
         // The demo can be toggled at runtime (`demo on|off`, or over the wire via
         // `urn:host:demo`), so reconcile the tab bar with the flag each frame: load
         // the demos the first time it's on, drop them (and any open tab) when it's off.
+        // The demo flag is the embedded host's; a build without it has no demos to show.
+        #[cfg(feature = "embedded")]
         let demo_on = ikigai_embedded::demo_flag().load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(feature = "embedded"))]
+        let demo_on = false;
         if demo_on && state.demos.is_empty() {
             load_demos(&mut state, engine);
         } else if !demo_on && !state.demos.is_empty() {
@@ -293,7 +298,7 @@ fn event_loop(
         // — re-compose the Control tab so its scheduler/cache/time-jobs readouts (the
         // clock timer and any greeter timer) tick instead of freezing. Throttling this to
         // 1s (vs every frame) keeps the compose fan-out from spinning the scheduler ~4×/s
-        // just to display itself; the colon blink is unaffected (it's computed at draw).
+        // just to display itself.
         if last_refresh.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
             state.clock = clock_text(engine);
             if state.tab == TAB_CONTROL {
@@ -555,7 +560,7 @@ fn run_step(state: &mut State, engine: &Session, idx: usize) {
                     .unwrap_or_default();
                 format!("{text}{tag}")
             }
-            Err(e) => format!("error: {}", crate::restate_build_line(&e)),
+            Err(e) => format!("error: {e}"),
         },
         Action::Help => HELP.to_string(),
         Action::Clear => {
@@ -1200,6 +1205,7 @@ fn submit(state: &mut State, engine: &Session) -> bool {
     if !line.trim().is_empty() {
         state.history.push(line.clone());
         // Persist across sessions when history is on (a no-op otherwise).
+        #[cfg(feature = "embedded")]
         ikigai_embedded::append_history(&line);
     }
     if let Some(invocation) = crate::script::command(&line) {
@@ -1213,12 +1219,7 @@ fn submit(state: &mut State, engine: &Session) -> bool {
             result: Ok(HELP.to_string()),
             cache: CacheStats::default(),
         }),
-        Action::Output(mut entry) => {
-            if let Err(err) = &mut entry.result {
-                *err = crate::restate_build_line(err).into_owned();
-            }
-            state.transcript.push(entry)
-        }
+        Action::Output(entry) => state.transcript.push(entry),
         // Drop the scrollback transcript; `state.history` (line recall) is untouched,
         // and the `clear` line itself was already pushed to it above.
         Action::Clear => state.transcript.clear(),
@@ -1249,7 +1250,7 @@ fn run_script(
         });
     });
     if let Err(error) = ran {
-        let message = crate::restate_build_line(&error.to_string()).into_owned();
+        let message = error.to_string();
         match (error.line, entries.last_mut()) {
             (Some(_), Some(failed)) => failed.result = Err(message),
             _ => entries.push(Entry {
@@ -1291,25 +1292,15 @@ fn clock_text(engine: &Session) -> String {
     }
 }
 
-/// The clock as styled spans `HH : MM` with the colon blinked per second (shown in the
-/// first half of each second, dimmed in the second half — computed from the wall clock,
-/// so it's aligned to real seconds regardless of the 250ms redraw tick). Empty input
-/// (no fetch yet) renders nothing.
+/// The clock as styled spans `HH:MM` with a steady colon. Empty input (no fetch yet)
+/// renders nothing.
 fn clock_spans(clock: &str) -> Vec<Span<'static>> {
     let Some((h, m)) = clock.split_once(':') else {
         return vec![clock.to_string().into()];
     };
-    // Native-only: same terminal TUI. The blinking colon's phase has to come from
-    // the wall clock rather than the redraw tick, and this renderer takes no kernel.
-    #[allow(clippy::disallowed_methods)]
-    let colon_on = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_millis() < 500)
-        .unwrap_or(true);
-    let colon = if colon_on { ":" } else { " " };
     vec![
         h.to_string().cyan().bold(),
-        colon.cyan().bold(),
+        ":".cyan().bold(),
         m.to_string().cyan().bold(),
     ]
 }
@@ -1950,6 +1941,23 @@ mod tests {
         render(20, 6, &state); // narrow → intro wraps, output scrolls
     }
 
+    #[test]
+    fn clock_colon_stays_visible_across_redraws() {
+        let state = State {
+            clock: "12:34".into(),
+            ..State::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        // Cover both halves of a wall-clock second, including the former blink phase.
+        for _ in 0..12 {
+            terminal.draw(|f| draw(f, &state)).unwrap();
+            let buf = terminal.backend().buffer();
+            let row: String = (0..60).map(|x| buf[(x, 0)].symbol()).collect();
+            assert!(row.trim_end().ends_with("12:34"), "clock: {row:?}");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
     // The tab bar is two rows when demos are shown: core tabs + clock (far right) on
     // row 0, the demo tabs wrapped onto row 1.
     #[test]
@@ -1970,13 +1978,13 @@ mod tests {
         let buf = terminal.backend().buffer();
         let row = |y: u16| -> String { (0..60).map(|x| buf[(x, y)].symbol()).collect() };
         let (row0, row1) = (row(0), row(1));
-        // Core tabs + the clock digits on the top row (the colon may be blinked to a space).
+        // Core tabs + the steady clock on the top row.
         assert!(
             row0.contains("REPL") && row0.contains("Control"),
             "core tabs: {row0:?}"
         );
         assert!(
-            row0.contains("12") && row0.trim_end().ends_with("34"),
+            row0.trim_end().ends_with("12:34"),
             "clock far right: {row0:?}"
         );
         // Demo tabs wrapped onto the second row (not on row 0 with the core tabs).

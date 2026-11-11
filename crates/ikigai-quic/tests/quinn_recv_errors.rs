@@ -102,7 +102,21 @@ fn a_receive_error_on_the_production_socket_does_not_end_the_driver() {
         // (epoll reports EPOLLERR, which tokio keeps apart from READABLE). So follow the
         // error with a datagram from the dead port, now re-bound: the socket turns
         // readable on both, and Linux's recvmsg reports the pending error BEFORE the data.
-        let wake = UdpSocket::bind(dead_addr).expect("re-bind the dead port");
+        // Another process can claim the released port. Allow transient contention,
+        // but keep a deadline so a permanently occupied port fails with a clear cause.
+        let wake = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match UdpSocket::bind(dead_addr) {
+                    Ok(socket) => break socket,
+                    Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("re-bind the dead port: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("re-bind the dead port: still in use after 2 seconds");
         wake.send_to(b"wake", twin.local_addr().unwrap()).unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
 

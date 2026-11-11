@@ -16,7 +16,7 @@ cross as `Reply::ErrorTyped(WireError)`).
 
 ## Versions
 
-`PROTOCOL_VERSION` is **10** and `MIN_PROTOCOL_VERSION` is **7**: a v10 peer speaks 7 to 10,
+`PROTOCOL_VERSION` is **11** and `MIN_PROTOCOL_VERSION` is **7**: a v11 peer speaks 7 to 11,
 and each connection is served at the version it negotiated. A server answers an accepted
 hello with the PEER's version (`answer_to`); QUIC negotiates by ALPN (`alpns()`, newest
 first). Each revision since v7 is backward compatible, downgraded per peer:
@@ -32,6 +32,11 @@ first). Each revision since v7 is backward compatible, downgraded per peer:
   a frame (`encode_reply_for_peer`).
 
 The full hello design is `docs/wire-hello-design.md` in the ikigai-cli repository.
+
+- **v11** appends `WireError::GaveUp` (variant 14): attempts as u32, elapsed as
+  serde's Duration (u64 seconds, u32 nanoseconds), then detail as text. A v7–v10 peer
+  receives the previous `Endpoint(display)`, class Unknown; v11 preserves Transient
+  and all fields, including sub-millisecond elapsed time.
 
 ## Messages
 

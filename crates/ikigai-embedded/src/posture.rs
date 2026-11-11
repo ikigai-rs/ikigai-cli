@@ -170,6 +170,8 @@ pub struct ComposedMount {
     pub prefix: String,
     pub target: String,
     pub cert_dir: Option<String>,
+    /// A mount that said `--pending`: not dialed at startup, so its peer may not be up.
+    pub pending: bool,
 }
 
 /// One trusted client certificate, as the process holds it.
@@ -247,8 +249,13 @@ fn mount_line(mount: &ComposedMount) -> String {
         Some(dir) => format!("  [certs {dir}]"),
         None => String::new(),
     };
+    let pending = if mount.pending {
+        "  [pending: dials on first use, Unavailable until the peer answers]"
+    } else {
+        ""
+    };
     format!(
-        "mount   {} {} -> {}{unchanged}{certs}",
+        "mount   {} {} -> {}{unchanged}{pending}{certs}",
         mount.mode, mount.prefix, mount.target
     )
 }
@@ -556,6 +563,7 @@ mod tests {
             prefix: prefix.to_string(),
             target: target.to_string(),
             cert_dir: None,
+            pending: false,
         }
     }
 
@@ -629,6 +637,7 @@ mod tests {
             prefix: prefix.to_string(),
             target: "/tmp/quakes.sock".to_string(),
             cert_dir: None,
+            pending: false,
         };
         assert_eq!(
             mount_line(&mount("urn:quakes:near:")),

@@ -8,6 +8,9 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+# `Resolver` is an `async_trait`, so overriding its async methods (`issue_as_async`,
+# `issue_body_as_in_run`) needs the macro. Already in the graph through ikigai-resolve.
+async-trait = "0.1"
 ikigai-core = { workspace = true }
 ikigai-resolve = { workspace = true }
 ikigai-wire = { workspace = true }
@@ -43,7 +46,3 @@ ring = "0.17"
 # drops their packets without resetting (ledger #1092). `from_key` is the API used; the floor
 # is the version this lock has always built (quinn 0.11.11 requires it), not a guess older.
 quinn-proto = { version = "0.11.17", default-features = false }
-
-[dev-dependencies]
-# A test endpoint that answers with a streamed body (`Endpoint::invoke_body`).
-async-trait = "0.1"

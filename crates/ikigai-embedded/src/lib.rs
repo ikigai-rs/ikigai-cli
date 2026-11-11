@@ -49,6 +49,7 @@ const XSD_BOOLEAN: &str = "http://www.w3.org/2001/XMLSchema#boolean";
 // kernel, and `urn:iki:host:arrangement`, the root's arrangement as a declaration.
 pub mod agents;
 pub mod arrangement;
+pub mod authority;
 #[cfg(all(feature = "ipc", unix))]
 pub mod socket;
 // The spam filter (`urn:bayes:*`, ledger #1512): bound in the local root when the binary arms it
@@ -67,6 +68,7 @@ pub mod jsonl;
 pub mod layers;
 pub mod lisp;
 pub mod names;
+mod orgfile;
 pub mod passkey;
 pub mod people;
 mod prg;
@@ -78,6 +80,7 @@ mod ui;
 // `ikigai-cli` build its value and print from it: the banner and the resource are two faces
 // of one recorded fact, which is what keeps them from drifting into two spellings of it.
 pub mod posture;
+pub mod retry;
 pub mod scheduling;
 #[cfg(unix)]
 pub mod spill;
@@ -477,16 +480,18 @@ fn toggle_description(
 /// not write the home: `history_flag()` is seeded through this, so every caller of the flag,
 /// a test included, created `~/.ikigai` as a side effect and failed `just hermetic` (ledger
 /// #1264). The two writers create it: [`ikigai_home_for_writing`].
-fn ikigai_home() -> PathBuf {
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    home.join(".ikigai")
+///
+/// `None` with no usable home ([`config::user_home`]): nothing is kept then, rather than
+/// kept under the working directory.
+fn ikigai_home() -> Option<PathBuf> {
+    Some(config::user_home()?.join(".ikigai"))
 }
 
 /// [`ikigai_home`], created, for the paths that are about to write into it.
-fn ikigai_home_for_writing() -> PathBuf {
-    let dir = ikigai_home();
+fn ikigai_home_for_writing() -> Option<PathBuf> {
+    let dir = ikigai_home()?;
     let _ = std::fs::create_dir_all(&dir);
-    dir
+    Some(dir)
 }
 
 /// Process-global flag: persist command history across invocations? Mirrors
@@ -496,15 +501,19 @@ fn ikigai_home_for_writing() -> PathBuf {
 pub fn history_flag() -> Arc<AtomicBool> {
     static HISTORY: OnceLock<Arc<AtomicBool>> = OnceLock::new();
     HISTORY
-        .get_or_init(|| Arc::new(AtomicBool::new(history_marker().exists())))
+        .get_or_init(|| {
+            Arc::new(AtomicBool::new(
+                history_marker().is_some_and(|m| m.exists()),
+            ))
+        })
         .clone()
 }
 
 /// The marker whose presence means persistence is on, so the toggle survives across
 /// invocations (the flag is seeded from it). Kept separate from the history file, so
 /// turning persistence off never discards the lines already recorded.
-fn history_marker() -> PathBuf {
-    ikigai_home().join("history.on")
+fn history_marker() -> Option<PathBuf> {
+    Some(ikigai_home()?.join("history.on"))
 }
 
 /// The history file within a given config dir — one line per command. Split from
@@ -539,7 +548,7 @@ fn write_history(dir: &Path, line: &str) {
 /// The persisted command history, oldest first — what a fresh session preloads into
 /// its line recall. Empty if nothing has been saved (or the file can't be read).
 pub fn load_history() -> Vec<String> {
-    read_history(&ikigai_home())
+    ikigai_home().map_or_else(Vec::new, |home| read_history(&home))
 }
 
 /// Append one command to the persisted history — a no-op when persistence is off or
@@ -548,15 +557,21 @@ pub fn append_history(line: &str) {
     if !history_flag().load(Ordering::Relaxed) {
         return;
     }
-    write_history(&ikigai_home_for_writing(), line);
+    if let Some(home) = ikigai_home_for_writing() {
+        write_history(&home, line);
+    }
 }
 
 /// Turn history persistence on or off, updating both the live flag and the on-disk
 /// marker that makes the choice stick across invocations. Turning it off leaves the
 /// recorded lines in place.
 pub fn set_history(on: bool) {
+    // With no home there is nowhere to persist to, so the flag stays off and says so.
+    let Some(marker) = history_marker() else {
+        history_flag().store(false, Ordering::SeqCst);
+        return;
+    };
     history_flag().store(on, Ordering::SeqCst);
-    let marker = history_marker();
     if on {
         ikigai_home_for_writing();
         let _ = std::fs::File::create(&marker); // presence is the signal; empty is fine
@@ -906,21 +921,11 @@ pub fn file_root() -> PathBuf {
     let root = tests::thread_file_root();
     #[cfg(not(test))]
     let root = {
-        let instance = instance_name();
-        let configured =
-            config::get(&format!("{instance}.{FILES_KEY}")).or_else(|| config::get(FILES_KEY));
-        file_root_from(
-            configured.as_deref(),
-            std::env::var_os("IKIGAI_FILES").as_deref(),
-            config::config_home().as_deref(),
-            std::env::var_os("HOME")
-                .as_deref()
-                .map(std::path::Path::new),
-        )
-        // The config home's other refusals stop the process the same way (`browse.root`,
-        // `store`): a file root nobody meant is worse than no start, and the kernel build
-        // reaches this before any request does.
-        .unwrap_or_else(|e| panic!("ikigai: {e} — fix the config"))
+        configured_file_root()
+            // The config home's other refusals stop the process the same way (`browse.root`,
+            // `store`): a file root nobody meant is worse than no start, and the kernel build
+            // reaches this before any request does.
+            .unwrap_or_else(|e| panic!("ikigai: {e} — fix the config"))
     };
     create_workspace(&root);
     root
@@ -938,7 +943,8 @@ pub const FILES_KEY: &str = "files";
 ///    is, by the workspace's one rule ([`ikigai_resolve::expand_home`], ledger #1379): a `~`
 ///    it cannot expand (`~bob/ws`, or any `~` with no `home`) is an `Err` naming the key.
 /// 2. `env`: `$IKIGAI_FILES`, the fallback it always was.
-/// 3. `<home>/.ikigai/workspace` (`./.ikigai/workspace` with no `home`).
+/// 3. `<home>/.ikigai/workspace`, or an `Err` with no `home`: the root is never relative to
+///    the working directory by default.
 ///
 /// ⚠ The config home is SHARED by every process on the machine, so an unscoped `files` line
 /// moves the root of every one of them (the daemon, a served door, the REPL); scope it to
@@ -956,6 +962,7 @@ pub const FILES_KEY: &str = "files";
 /// assert!(file_root_from(Some("~/ws"), None, cfg, None).is_err());
 /// assert_eq!(file_root_from(None, Some("/env".as_ref()), cfg, home), Ok(PathBuf::from("/env")));
 /// assert_eq!(file_root_from(None, None, cfg, home), Ok(PathBuf::from("/h/.ikigai/workspace")));
+/// assert!(file_root_from(None, None, cfg, None).unwrap_err().contains("--files"));
 /// ```
 pub fn file_root_from(
     configured: Option<&str>,
@@ -974,10 +981,36 @@ pub fn file_root_from(
     if let Some(env) = env.filter(|v| !v.is_empty()) {
         return Ok(PathBuf::from(env));
     }
-    Ok(home
-        .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf)
-        .join(".ikigai")
-        .join("workspace"))
+    match home {
+        Some(home) => Ok(home.join(".ikigai").join("workspace")),
+        None => Err(NO_FILE_ROOT.to_string()),
+    }
+}
+
+/// Why [`file_root_from`] has no default root.
+const NO_FILE_ROOT: &str = "no file root: HOME and USERPROFILE are each unset, empty or not an \
+     absolute path, so there is no default workspace; set one to an absolute path, or name the \
+     root with --files <dir>";
+
+/// Stop before a kernel is built when it would have no file root and none was named.
+pub fn check_file_root() -> std::result::Result<(), String> {
+    if FILE_ROOT_OVERRIDE.lock().expect("file root lock").is_some() {
+        return Ok(());
+    }
+    configured_file_root().map(drop)
+}
+
+/// [`file_root_from`] over this process's config home and environment.
+fn configured_file_root() -> std::result::Result<PathBuf, String> {
+    let instance = instance_name();
+    let configured =
+        config::get(&format!("{instance}.{FILES_KEY}")).or_else(|| config::get(FILES_KEY));
+    file_root_from(
+        configured.as_deref(),
+        std::env::var_os("IKIGAI_FILES").as_deref(),
+        config::config_home().as_deref(),
+        config::user_home().as_deref(),
+    )
 }
 
 /// Create the workspace directory PRIVATE (`0700`) if it does not exist yet, whatever the
@@ -1067,7 +1100,7 @@ fn org_config() -> Option<(PathBuf, Vec<String>)> {
     let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     // The workspace's one `~` rule (ledger #1379). A `~` it cannot expand gives no org
     // config, the failure this function already had for an unset HOME.
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = config::user_home();
     let dir = ikigai_resolve::expand_home(v["org_dir"].as_str()?, home.as_deref()).ok()?;
     let files = v["org_files"]
         .as_array()?
@@ -1113,6 +1146,76 @@ static GRANTS_PATH_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mute
 /// config home is that user's. Process-global, like [`set_file_root`].
 pub fn set_grants_path(path: PathBuf) {
     *GRANTS_PATH_OVERRIDE.lock().expect("grants path lock") = Some(path);
+}
+
+/// Refuse a `--grants` that names a file that is not there. Every host reads the flag, so a
+/// host started with one checks it before it serves: a missing explicit file is a mistyped path,
+/// not "no grants", and serving as though no file was named would hide it.
+///
+/// # Errors
+///
+/// The refusal from [`grants_path`], or a `--grants` naming a file that does not exist.
+pub fn check_grants_flag() -> std::result::Result<(), String> {
+    let path = grants_path()?;
+    if !grants_path_is_explicit() {
+        return Ok(());
+    }
+    match path.map(std::fs::metadata) {
+        Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(missing_grants_flag(&grants_path()?.unwrap_or_default()))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Whether [`grants_path`] is the file `--grants` named rather than the config home's.
+pub(crate) fn grants_path_is_explicit() -> bool {
+    GRANTS_PATH_OVERRIDE
+        .lock()
+        .expect("grants path lock")
+        .is_some()
+}
+
+/// The refusal for a `--grants` that names a file that is not there.
+pub(crate) fn missing_grants_flag(path: &std::path::Path) -> String {
+    format!(
+        "--grants names a file that does not exist: {}",
+        path.display()
+    )
+}
+
+/// The grants file, parsed: `Ok(None)` when the config home has none. A door that serves from
+/// it reads it whole once at start, so a file it could not use stops the door rather than
+/// leaving every grant it names quietly empty ([`grant_scopes`] reads an unusable file as no
+/// grants).
+///
+/// # Errors
+///
+/// The refusal from [`grants_path`]; a `--grants` naming a file that does not exist; a file
+/// that cannot be read, does not parse as JSON, or is not an object of grant name to scopes.
+pub fn grants_document() -> std::result::Result<Option<serde_json::Value>, String> {
+    let Some(path) = grants_path()? else {
+        return Ok(None);
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if grants_path_is_explicit() {
+                return Err(missing_grants_flag(&path));
+            }
+            return Ok(None);
+        }
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    let document = serde_json::from_str::<serde_json::Value>(&text)
+        .map_err(|e| format!("{} does not parse as JSON: {e}", path.display()))?;
+    if !document.is_object() {
+        return Err(format!(
+            "{} is not a grants file: it must be a JSON object of grant name → scopes",
+            path.display()
+        ));
+    }
+    Ok(Some(document))
 }
 
 /// The scopes of one grant entry of a parsed grants document (either shape); empty for
@@ -1658,7 +1761,7 @@ fn local_space(nature: &'static str) -> EndpointSpace {
             // The org files, jailed to the configured org_dir and read THROUGH
             // the kernel by urn:org:agenda (capability-gated; golden-thread-ready).
             UriTemplate::parse("urn:orgfile:{path}").expect("valid template"),
-            ikigai_fs::FileEndpoint::new(org_config().map(|(dir, _)| dir).unwrap_or_default()),
+            orgfile::OrgFileEndpoint::new(org_config().map(|(dir, _)| dir).unwrap_or_default()),
         )
         .bind(
             UriTemplate::parse(ikigai_fs::FILE_TEMPLATE).expect("FILE_TEMPLATE is valid"),
@@ -2336,7 +2439,7 @@ fn http_timeout_setting() -> std::result::Result<std::time::Duration, String> {
     http_timeout(config::get("http.timeout").as_deref()).map_err(|e| {
         format!(
             "{e} (in {}; see `http.timeout` in ikigai-cli's README)",
-            config::config_path().display()
+            config::config_path_shown()
         )
     })
 }
@@ -3368,10 +3471,12 @@ const HEARTBEAT_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 /// answer. The writer daemon serves no socket — its jobs live inside it — so an external
 /// checker cannot ask it anything. It can, however, notice that a file stopped changing,
 /// which is the one signal a dead process still emits.
-fn heartbeat_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join(".ikigai/health")
-        .join(format!("{}.txt", instance_name()))
+fn heartbeat_path() -> Option<std::path::PathBuf> {
+    Some(
+        ikigai_home()?
+            .join("health")
+            .join(format!("{}.txt", instance_name())),
+    )
 }
 
 /// `urn:host:heartbeat` — write this host's health where a watcher can find it.
@@ -3396,7 +3501,9 @@ impl Endpoint for HostHeartbeat {
             .map(|browser| browser.peers())
             .unwrap_or_default();
         let report = health_text(&jobs, &peers, &HealthContext::now());
-        let path = heartbeat_path();
+        let path = heartbeat_path().ok_or_else(|| {
+            Error::Endpoint("heartbeat: HOME is not an absolute path".to_string())
+        })?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)
                 .map_err(|e| Error::Endpoint(format!("heartbeat dir: {e}")))?;
@@ -4129,10 +4236,15 @@ impl ikigai_meeting::SecretReader for HostSecrets {
 }
 
 /// The LLM provider registry: a hand-editable JSON file pointed at by
-/// `IKIGAI_LLM_CONFIG` (see ikigai-llm's `Registry::from_json`), else a local
-/// Ollama default. Load-time — a config edit needs a restart; live-reload (the
-/// config as a golden-thread resource) is a follow-up. A bad path/JSON warns and
-/// falls back rather than failing the kernel build.
+/// `IKIGAI_LLM_CONFIG` (see ikigai-llm's `Registry::from_json`), else the config
+/// home's `llm.json`, else a local Ollama default. Load-time — a config edit needs a
+/// restart; live-reload (the config as a golden-thread resource) is a follow-up.
+///
+/// A set `IKIGAI_LLM_CONFIG` that names no readable file is an error: the `ikigai` binary
+/// refuses to start on it ([`check_llm_config`]) before any kernel is built. A host that
+/// skips that check gets the error on stderr here and the built-in default, never the
+/// config home's `llm.json`. JSON that does not parse warns and falls back rather than
+/// failing the kernel build.
 fn llm_registry() -> ikigai_llm::Registry {
     let mut registry = llm_declared_registry();
     // The annotation graph (IKIGAI_LLM_ANNOTATIONS, Turtle) completes or CORRECTS
@@ -4174,8 +4286,15 @@ fn llm_declared_registry() -> ikigai_llm::Registry {
     // urn:llm:big:ask`. `calendar.json` has always loaded from the config home; llm.json
     // was the odd one out.
     for (path, source) in llm_config_candidates() {
-        let Ok(json) = std::fs::read_to_string(&path) else {
-            continue;
+        let json = match std::fs::read_to_string(&path) {
+            Ok(json) => json,
+            // A set variable names the file to use; one that is not there is an error, never
+            // a cue to try the next place.
+            Err(e) if source == "IKIGAI_LLM_CONFIG" => {
+                eprintln!("ikigai: {}", llm_config_unreadable(&path, &e));
+                return ikigai_llm::Registry::single(ollama_default());
+            }
+            Err(_) => continue,
         };
         match ikigai_llm::Registry::from_json(&json) {
             Ok(registry) => return registry,
@@ -4185,6 +4304,11 @@ fn llm_declared_registry() -> ikigai_llm::Registry {
             Err(e) => eprintln!("ikigai: {source} ({path}) parse error: {e:?} — using the default"),
         }
     }
+    ikigai_llm::Registry::single(ollama_default())
+}
+
+/// The built-in provider when nothing declares one: a local Ollama.
+fn ollama_default() -> ikigai_llm::OpenAiConfig {
     let mut ollama = ikigai_llm::OpenAiConfig::ollama("llama3.2:3b");
     // The declared trait profile urn:llm:models reports (and selection reasons
     // over): a 3B text model with a 128k window. vendor "ollama" (set by the
@@ -4192,7 +4316,39 @@ fn llm_declared_registry() -> ikigai_llm::Registry {
     ollama.caps.context = Some(131_072);
     ollama.caps.modalities = vec!["text".to_string()];
     ollama.caps.params = Some("3B".to_string());
-    ikigai_llm::Registry::single(ollama)
+    ollama
+}
+
+/// Refuses a set `IKIGAI_LLM_CONFIG` that names no readable file, including an empty value.
+/// Unset, the config home's `llm.json` (or the built-in default) is used as before.
+///
+/// # Errors
+///
+/// The message names the variable, the path it holds and why it could not be read.
+pub fn check_llm_config() -> std::result::Result<(), String> {
+    let Some(path) = std::env::var_os("IKIGAI_LLM_CONFIG") else {
+        return Ok(());
+    };
+    let path = std::path::PathBuf::from(path);
+    match std::fs::File::open(&path).and_then(|f| f.metadata()) {
+        Ok(meta) if meta.is_file() => Ok(()),
+        Ok(_) => Err(format!(
+            "IKIGAI_LLM_CONFIG names something that is not a file: {}. Point it at an LLM \
+             registry JSON file, or unset it to use the config home's llm.json.",
+            path.display()
+        )),
+        Err(e) => Err(llm_config_unreadable(&path.display().to_string(), &e)),
+    }
+}
+
+/// The refusal for a set `IKIGAI_LLM_CONFIG` whose file cannot be read.
+fn llm_config_unreadable(path: &str, e: &std::io::Error) -> String {
+    let what = if path.is_empty() {
+        "IKIGAI_LLM_CONFIG is set but empty".to_string()
+    } else {
+        format!("IKIGAI_LLM_CONFIG names a file that cannot be read: {path} ({e})")
+    };
+    format!("{what}. Point it at an LLM registry JSON file, or unset it to use the config home's llm.json.")
 }
 
 /// Facts from the `IKIGAI_LLM_ANNOTATIONS` Turtle file, as `(subject, predicate,
@@ -5280,8 +5436,35 @@ fn compose_mounts(mut spaces: Vec<Arc<dyn Space>>, mounts: Vec<MountSpec>) -> Ar
         }
     }
     deeper.sort_by_key(|mount| std::cmp::Reverse(mount.prefix.len()));
+    // Ordered by prefix LENGTH, so the most specific mount wins regardless of
+    // declaration order: `--override urn:llm:=peerA --override urn:llm:ask=peerB`
+    // sends `urn:llm:ask` to peerB and the rest of `urn:llm:*` to peerA. A whole
+    // IRI is simply the most specific prefix there is, which is what makes
+    // single-RESOURCE overrides work.
+    fronting.sort_by_key(|mount| std::cmp::Reverse(mount.prefix.len()));
+    // Every remote space, built before any is placed, so the `connect.retry.*` policy can
+    // govern them all with ONE breaker (ledger #3383).
+    let fronting: Vec<(String, MountKind, Arc<dyn Space>)> = fronting
+        .into_iter()
+        .map(
+            |MountSpec {
+                 prefix,
+                 origin,
+                 resolver,
+                 kind,
+             }| {
+                let remote = Arc::new(
+                    ikigai_resolve::MountedRemote::overriding(resolver, prefix.clone(), origin)
+                        .sharing(&peers)
+                        .with_clock(Arc::clone(&clock)),
+                ) as Arc<dyn Space>;
+                (prefix, kind, remote)
+            },
+        )
+        .collect();
+    let mut aliases: Vec<Arc<dyn Space>> = Vec::new();
     for mount in deeper {
-        spaces.push(Arc::new(
+        aliases.push(Arc::new(
             ikigai_resolve::MountedRemote::overriding(mount.resolver, mount.prefix, mount.origin)
                 .sharing(&peers)
                 .with_clock(Arc::clone(&clock)),
@@ -5294,35 +5477,50 @@ fn compose_mounts(mut spaces: Vec<Arc<dyn Space>>, mounts: Vec<MountSpec>) -> Ar
             inner: mount.resolver,
             prefix: mount.prefix.clone(),
         });
-        spaces.push(Arc::new(
+        aliases.push(Arc::new(
             ikigai_resolve::MountedRemote::new(resolver, mount.prefix, mount.origin)
                 .sharing(&peers)
                 .with_clock(Arc::clone(&clock)),
         ));
     }
+    // The retry policy (ledger #3383): override and alias mounts resolve through one shared
+    // Retry and CircuitBreaker, combined in the order this composition tries them, so the
+    // mount a request reaches is the one that answers it. A `--prefer` mount is left as it
+    // was: it already falls back to the local space on a transient failure, and retrying
+    // first would only delay that answer.
+    let (fronting, aliases) = match retry::RetryPolicy::from_config().ok().flatten() {
+        None => (fronting, aliases),
+        Some(policy) => {
+            let governed = policy.govern(
+                fronting
+                    .iter()
+                    .filter(|(_, kind, _)| *kind != MountKind::Prefer)
+                    .map(|(_, _, remote)| Arc::clone(remote))
+                    .chain(aliases.iter().cloned())
+                    .collect(),
+            );
+            (
+                fronting
+                    .into_iter()
+                    .map(|(prefix, kind, remote)| match kind {
+                        MountKind::Prefer => (prefix, kind, remote),
+                        _ => (prefix, kind, governed.slot(remote)),
+                    })
+                    .collect(),
+                aliases
+                    .into_iter()
+                    .map(|space| governed.slot(space))
+                    .collect(),
+            )
+        }
+    };
+    spaces.extend(aliases);
     if fronting.is_empty() {
         return Arc::new(Fallback::new(spaces));
     }
-    // Ordered by prefix LENGTH, so the most specific mount wins regardless of
-    // declaration order: `--override urn:llm:=peerA --override urn:llm:ask=peerB`
-    // sends `urn:llm:ask` to peerB and the rest of `urn:llm:*` to peerA. A whole
-    // IRI is simply the most specific prefix there is, which is what makes
-    // single-RESOURCE overrides work.
-    fronting.sort_by_key(|mount| std::cmp::Reverse(mount.prefix.len()));
     let local: Arc<dyn Space> = Arc::new(Fallback::new(spaces));
     let mut ordered: Vec<Arc<dyn Space>> = Vec::new();
-    for MountSpec {
-        prefix,
-        origin,
-        resolver,
-        kind,
-    } in fronting
-    {
-        let remote = Arc::new(
-            ikigai_resolve::MountedRemote::overriding(resolver, prefix.clone(), origin)
-                .sharing(&peers)
-                .with_clock(Arc::clone(&clock)),
-        ) as Arc<dyn Space>;
+    for (prefix, kind, remote) in fronting {
         ordered.push(match kind {
             // The failover pair must stay INSIDE the prefix. `Failover` resolves
             // every target, so an unguarded `[remote, local]` would also answer
@@ -7147,7 +7345,7 @@ fn watch_store(kernel: Arc<Kernel>) {
     // EKEventStoreChangedNotification needs a serviced MAIN runloop this CLI
     // doesn't have — ikigai_personal::observe_calendar_changes remains for
     // hosts that do.)
-    let Some(home) = std::env::var("HOME").ok() else {
+    let Some(home) = config::user_home() else {
         return;
     };
     // Both store locations: the classic path and the modern group container.
@@ -11730,15 +11928,13 @@ mod arrangement_tests {
             let ambiguous = harvest.ambiguous.contains_key(&door.endpoint);
             assert!(registered ^ ambiguous, "{door:?}");
         }
-        // On every machine: two jails under `file`. (`llm-*` join it wherever llm.json declares
-        // a second provider.) `meeting` and `org-agenda` each named two doors until ikigai-meeting
-        // 0.7 and ikigai-org 0.3 gave every door its own id, so each of those is one endpoint.
-        assert!(
-            harvest.ambiguous.contains_key("file"),
-            "file: {:?}",
-            harvest.ambiguous
-        );
+        // Each file jail has its own endpoint identity. Configured LLM backends can
+        // still share names, which the generic ambiguity checks above must preserve.
+        assert!(!harvest.ambiguous.contains_key("file"));
+        assert!(!harvest.ambiguous.contains_key("orgfile"));
         for name in [
+            "file",
+            "orgfile",
             "calendar",
             "availability",
             "meeting-schedule",
@@ -11753,17 +11949,20 @@ mod arrangement_tests {
         }
     }
 
-    /// The dump as it stands names `file`, and the refusal says why in the host's words.
+    /// Both file jails survive a dump and rebuild with their distinct identities.
     #[test]
-    fn the_whole_dump_is_refused_on_a_name_that_cannot_say_which() {
+    fn the_dumped_file_doors_bind_distinct_endpoints() {
         let (root, harvest) = default_root();
-        let Err(refused) = arrangement::arrange(&harvest, &dumped(&root)) else {
-            panic!("`file` names two endpoints; the dump must not build")
-        };
-        assert!(
-            refused.contains("different endpoints in this host"),
-            "{refused}"
-        );
+        let (declaration, _) = declarable(&root, &harvest);
+        let built = arrangement::arrange(&harvest, &declaration).expect("file doors build");
+        for (pattern, name) in [
+            ("urn:file:{path}", "file"),
+            ("urn:orgfile:{path}", "orgfile"),
+        ] {
+            assert_eq!(door(&declaration, pattern).unwrap().endpoint, name);
+            let iri = concrete(pattern).unwrap();
+            assert_eq!(answer(root.as_ref(), &iri), answer(built.as_ref(), &iri));
+        }
     }
 
     /// ★ THE ROUND TRIP. The declarable part of the dumped arrangement, built over the harvested
@@ -11785,7 +11984,13 @@ mod arrangement_tests {
             .collect();
         expected.sort();
         expected.dedup();
-        assert!(!expected.is_empty());
+        // The file jails are now declarable and must participate in the full
+        // name-by-name comparison rather than being among the dropped doors.
+        for pattern in ["urn:file:{path}", "urn:orgfile:{path}"] {
+            let iri = concrete(pattern).unwrap();
+            assert!(names.contains(&iri), "{iri} is compared");
+            assert!(!expected.contains(&iri), "{iri} remains bound");
+        }
         assert_eq!(differing(&root, &built, &names), expected);
         for name in &expected {
             assert_eq!(

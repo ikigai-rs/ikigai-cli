@@ -897,6 +897,38 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[test]
+    fn a_trailing_gave_up_is_downgraded_only_for_v10() {
+        let original = Error::GaveUp {
+            attempts: u32::MAX,
+            elapsed: std::time::Duration::MAX,
+            detail: "\"quoted\"\n雪".into(),
+        };
+        for version in [10, 11] {
+            let body = Body::once(futures::stream::iter([
+                Ok(Bytes::from_static(b"partial")),
+                Err(original.clone()),
+            ]));
+            let mut out = Vec::new();
+            pump(body, &mut out, version).unwrap();
+            let mut frames = &out[..];
+            assert_eq!(
+                ikigai_wire::decode_body_frame(&read_frame(&mut frames).unwrap()).unwrap(),
+                BodyFrame::Chunk(Bytes::from_static(b"partial"))
+            );
+            let expected = if version == 10 {
+                WireError::Endpoint(original.to_string())
+            } else {
+                WireError::from(&original)
+            };
+            assert_eq!(
+                ikigai_wire::decode_body_frame(&read_frame(&mut frames).unwrap()).unwrap(),
+                BodyFrame::Abort(expected)
+            );
+            assert!(frames.is_empty());
+        }
+    }
+
     /// The caller's body crosses as chunks and becomes the Sink's `content`, larger than one
     /// chunk; past the door's upload bound it is refused, the connection kept aligned for
     /// the next call.

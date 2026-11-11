@@ -27,7 +27,7 @@
 //!   capability derived from its identity. A public default (or a fixed `--cap` ceiling that
 //!   narrows the edge); a per-user capability (magic-link / passkey) fills the same seam later.
 //! - **typed error → status** (ledger #1546's table, see [`error_status`]): `Denied`→403,
-//!   `NotFound`/`Unresolved`→404, invalid/missing arg→400, `Conflict`→409, `Timeout`→504,
+//!   `NotFound`/`Unresolved`→404, `Gone`→410, invalid/missing arg→400, `Conflict`→409, `Timeout`→504,
 //!   `Unavailable`→503, `RetryAfter`→429 with `Retry-After`, `OverBudget`→422, `Refused`→502,
 //!   `Unsupported`→405 with `Allow` (a verb) or 501 (a facility), else 500. The body is the message as
 //!   `text/plain`, or a typed JSON object (see [`error_json`]) when [`EdgeConfig::error_body`]
@@ -40,6 +40,10 @@
 //!   allowlist ([`EndpointHeader`]) and its own [`EdgeConfig::endpoint_headers`], and refuses
 //!   anything else with `500` naming it. A `Location` on a write's answer makes it
 //!   `303 See Other` to a same-origin page (Post/Redirect/Get).
+//! - **a read's redirect**: a Source answering core's typed redirect
+//!   ([`ikigai_core::Representation::redirect`]) is sent as its status (301, 302, 303, 307 or
+//!   308) with `Location` set to the absolute location, off-site allowed, and a short page or
+//!   sentence for a client that does not follow it.
 //! - **HEAD**: the head GET would carry and no content, on every path, refusals included.
 //! - **a write's answer**: a Sink or Delete whose endpoint answers with a representation is
 //!   `200` with it (a take returns what it took); an empty answer is `204`.
@@ -80,6 +84,7 @@ mod origin;
 pub mod push;
 mod read_redirect;
 mod redirect;
+mod redirect_answer;
 pub use read_redirect::ReadRedirect;
 mod source_limit;
 mod stream;
@@ -1959,8 +1964,9 @@ async fn respond(
     }
 
     // PROVENANCE on a write: who sent it, and when — read off the CONNECTION, never the
-    // payload. A public form endpoint records these alongside the submitted fields, so a
-    // stored submission carries an origin its submitter did not get to choose.
+    // payload, so an endpoint is told an origin its submitter did not get to choose. The
+    // public form intake stores `received` beside the submitted fields; it does NOT store
+    // `client`, because nothing tracks individuals (ledger #3490).
     //
     // Writes only, and not for want of tidiness: an argument is part of a request's content
     // address, which is the kernel's cache key. A per-request timestamp on a read would give
@@ -2079,16 +2085,16 @@ async fn respond(
                 self_contained: self_contained(repr, &iri, declared),
                 shared: served.shared,
             };
-            private_read_policy(
-                read_resp(
-                    req,
-                    served,
-                    freshness,
-                    read_vary(explicit, &faces, matched, &cap),
-                ),
-                config,
-                freshness,
-            )
+            let vary = read_vary(explicit, &faces, matched, &cap);
+            let resp = match served.repr.as_redirect() {
+                Some(redirect) => redirect_answer::read(req, &redirect, served, freshness, vary)
+                    .unwrap_or_else(|refused| {
+                        eprintln!("ikigai-web: {} ({})", refused, iri.as_str());
+                        header_refused(&refused)
+                    }),
+                None => read_resp(req, served, freshness, vary),
+            };
+            private_read_policy(resp, config, freshness)
         }
         Ok(Ok(served)) if verb == Verb::Delete => {
             record_tombstone(shared, tombstone_key(&iri_str, req));
@@ -3064,7 +3070,7 @@ pub fn retry_after_seconds(e: &ikigai_core::Error) -> Option<u64> {
 /// The HTTP status a typed kernel error is answered with, in every door this crate serves,
 /// the DECIDED table of ledger #1546 (core's shared `failure_class_vectors.json`, which the
 /// Python and Deno faces pin to the same numbers): `Denied` 403, `NotFound`/`Unresolved`
-/// 404, a missing or invalid argument 400, `Conflict` 409, `Timeout` 504 (was 503 before
+/// 404, `Gone` 410, a missing or invalid argument 400, `Conflict` 409, `Timeout` 504 (was 503 before
 /// 0.1.66: the edge waited on something that did not answer, which is a gateway's timeout),
 /// `Unavailable` 503, `RetryAfter` 429 (with `Retry-After`, see [`retry_after_seconds`]),
 /// `OverBudget` 422, `Refused` 502 (a remote authority refused the credential this side
@@ -3079,6 +3085,7 @@ pub fn retry_after_seconds(e: &ikigai_core::Error) -> Option<u64> {
 ///
 /// assert_eq!(error_status(&Error::Denied("no".into())), 403);
 /// assert_eq!(error_status(&Error::Conflict("taken by bob".into())), 409);
+/// assert_eq!(error_status(&Error::Gone("retired in 2024".into())), 410);
 /// assert_eq!(error_status(&Error::MissingArgument("tuple".into())), 400);
 /// assert_eq!(error_status(&Error::Timeout("slow".into())), 504);
 /// assert_eq!(error_status(&Error::Unavailable("down".into())), 503);
@@ -3095,10 +3102,11 @@ pub fn error_status(e: &ikigai_core::Error) -> u16 {
     match e {
         Error::Denied(_) => 403,
         Error::NotFound(_) | Error::Unresolved(_) => 404,
+        Error::Gone(_) => 410,
         Error::MissingArgument(_) | Error::InvalidArgument { .. } => 400,
         Error::Conflict(_) => 409,
         Error::Timeout(_) => 504,
-        Error::Unavailable(_) => 503,
+        Error::Unavailable(_) | Error::GaveUp { .. } => 503,
         Error::RetryAfter { .. } => 429,
         Error::OverBudget { .. } => 422,
         Error::Refused(_) => 502,
@@ -3114,8 +3122,12 @@ fn reason_phrase(status: u16) -> &'static str {
         200 => "OK",
         201 => "Created",
         204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
         303 => "See Other",
         304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
@@ -3124,6 +3136,7 @@ fn reason_phrase(status: u16) -> &'static str {
         406 => "Not Acceptable",
         408 => "Request Timeout",
         409 => "Conflict",
+        410 => "Gone",
         412 => "Precondition Failed",
         413 => "Payload Too Large",
         415 => "Unsupported Media Type",
@@ -4340,6 +4353,14 @@ mod tests {
             Err(Error::Refused("api.example.com answered 401".into()))
         })
         .with_description(Description::new("refused").verb(Verb::Source));
+        let gave_up = FnEndpoint::new("gaveup", |_inv: &Invocation<'_>| {
+            Err(Error::GaveUp {
+                attempts: 9,
+                elapsed: std::time::Duration::from_secs(120),
+                detail: "down".into(),
+            })
+        })
+        .with_description(Description::new("gaveup").verb(Verb::Source));
         let slow = FnEndpoint::new("slow", |_inv: &Invocation<'_>| {
             Err(Error::Timeout("the origin did not answer in 30 s".into()))
         })
@@ -4763,6 +4784,7 @@ mod tests {
             .bind(Exact::new("urn:test:limited"), limited)
             .bind(Exact::new("urn:test:budget"), budget)
             .bind(Exact::new("urn:test:refused"), refused)
+            .bind(Exact::new("urn:test:gaveup"), gave_up)
             .bind(Exact::new("urn:test:slow"), slow)
             .bind(Exact::new("urn:test:readonly"), readonly)
             .bind(Exact::new("urn:test:noclock"), noclock)
@@ -5680,10 +5702,28 @@ mod tests {
     /// decide them: RetryAfter 429 with `Retry-After` in seconds rounded up, OverBudget 422,
     /// Refused 502, Timeout 504 (was 503), Unsupported 405 with `Allow` when it names a verb
     /// and 501 when it names a facility.
+    #[test]
+    fn gave_up_is_service_unavailable_without_a_retry_delay() {
+        let error = Error::GaveUp {
+            attempts: 9,
+            elapsed: std::time::Duration::from_secs(120),
+            detail: "down".into(),
+        };
+        assert_eq!(error_status(&error), 503);
+        assert_eq!(retry_after_seconds(&error), None);
+    }
+
     #[tokio::test]
     async fn the_failure_classes_answer_the_decided_statuses() {
         let addr = start().await;
         let get = |path: &str| format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n");
+        let gave_up = roundtrip(addr, &get("/test/gaveup")).await;
+        assert!(
+            gave_up.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+            "{gave_up}"
+        );
+        assert!(!gave_up.contains("Retry-After"), "{gave_up}");
+        assert!(gave_up.ends_with("down"), "{gave_up}");
         let limited = roundtrip(addr, &get("/test/limited")).await;
         assert!(
             limited.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),

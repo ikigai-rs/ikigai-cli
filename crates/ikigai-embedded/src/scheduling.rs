@@ -277,7 +277,7 @@ fn decide(flag: Option<&str>, config: Option<&str>, env: Option<&str>) -> Decisi
                     warnings.push(format!(
                         "{ENV_VAR} is deprecated; write `{CONFIG_KEY} = \"{spec}\"` in \
                          {} or pass `--scheduler {spec}`",
-                        crate::config::config_path().display()
+                        crate::config::config_path_shown()
                     ));
                 }
                 return Decision {

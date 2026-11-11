@@ -19,6 +19,9 @@ how to report a barrier. It is not a conformance claim. Adapted from the
   same sentence as text. A door that sets `EdgeConfig::error_page` writes that page itself for a
   browser's request; that page, its markup and its accessibility, is the door's (gonk's, say), and
   this repository guarantees only the status and headers it is served with.
+- **Redirect pages** from the HTTP door (`crates/ikigai-web/src/redirect_answer.rs`): the body of
+  a read that an endpoint answers with core's typed redirect, for a client that does not follow it
+  and names `text/html` over `text/plain`; every other client gets the same target as a sentence.
 - **Pages from the embedded host's HTTP face**: the emailed decision, contact-block and label
   links and the passkey enrollment page (`crates/ikigai-embedded`: `decide.rs`, `contactblock.rs`,
   `passkey.rs`, all through `decide::page`), and the contact intake's redirect page
@@ -41,6 +44,11 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
 - An error page has `<html lang="en">`, a `<title>` and one `<h1>` naming the status, a `<main>`,
   and the message as escaped text; no style, no script. Its status code is the same as the text
   answer's, and both carry `Vary: Accept`.
+- A redirect page has the error page's shape: `<html lang="en">`, a `<title>` and one `<h1>` naming
+  the status, a `<main>`, no style and no script, and one sentence with the target as a link whose
+  text is the location, escaped. A location that is not `http` or `https` (`javascript:`, a `urn:`)
+  is shown as text and is never a link. Its status and `Location` are the same as the text answer's,
+  and both carry `Vary: Accept`.
 - A request whose percent-encoding is malformed or does not decode to UTF-8 is a `400` whose
   sentence names the byte offset in what the client sent, in words. From the door: "malformed
   percent-escape at byte N of the request target: a % must be followed by two hex digits" (the
@@ -84,11 +92,30 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
   runs it. `1`–`9` and `0` remain shortcuts for steps 1–10. The selected step has a `>`
   marker as well as reverse emphasis. Running a step reveals its answer, and the demo tab
   strip moves to keep the selected tab visible.
+- The full-screen REPL clock uses a steady colon; it does not blink.
 - `--plain` is a line-oriented REPL with no full-screen redraw, so a screen reader or braille
   display reads it as ordinary terminal output; `--quiet` prints only the answers. (Not yet tested
   with either; see below.)
+- Terminal reads choose `text/plain` when no `as` is supplied and the target's Source
+  contract offers that face, including `-c` and the line REPL. Faces come from the `as`
+  input's `one_of` list, or the action's outputs when there is no such list. Explicit types
+  are preserved. Without a text face or a readable contract, the request keeps its default.
+  An explicit face supplied as an attached body is also preserved.
+  The selected face keeps its declared media-type parameters. Only a Meta answer
+  labeled `application/json` is used for this negotiation. The shared kernel and
+  HTTP door keep their defaults, including runbook HTML. The audit's reproduced
+  pipeline and duplicate-contract-read limitations are documented in
+  [the terminal resolver audit](docs/audits/terminal-resolver-3417.md).
 
 ## How it is tested
+
+- `crates/ikigai-cli/tests/runbook_text.rs` runs the binary in `-c` and line REPL modes
+  and compares an untyped runbook read to its explicit text face. It also checks explicit
+  HTML and JSON, quoted names and a pipeline. Unit tests check that the shared kernel
+  retains its HTML default. Resolver tests cover a second HTML-default resource family,
+  explicit HTML, a resource without a text face, unreadable contracts, `one_of` declarations,
+  and cache identity across scopes and capabilities.
+  No assistive technology evaluation was performed.
 
 - `crates/ikigai-web/src/push.rs`'s
   `a_zero_stream_cap_refuses_with_the_doors_accessible_error_page` pins the stream-cap
@@ -110,6 +137,12 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
   `413 Payload Too Large`: declared and chunked bodies negotiate the built-in page, with
   global security headers, without admission, identity, capability or custom page hooks;
   plain clients keep the sentence, and `HEAD` carries the matching length without content.
+- `crates/ikigai-web/tests/redirect_answers.rs` sends raw HTTP to a read answering core's typed
+  redirect and pins each status and its exact `Location`, an off-site target, the percent-encoding
+  of what a URI cannot carry, `HEAD` with no body, and the page's `lang`, title, `main`, `h1`,
+  escaped link and absence of style or script; that a location not `http` or `https` is never a
+  link; that other clients get `text/plain`; and that `Error::Gone` is a `410` page. These are
+  socket tests, with no browser or assistive technology evaluation.
 - `crates/ikigai-web/tests/error_pages.rs` and the unit tests in `error_page.rs` pin the
   page's shape (`lang`, title, `main`, `h1`), escaping, which clients get a page, `Vary: Accept`,
   and that a JSON door and a success are left alone. `crates/ikigai-web/tests/door_error_page.rs`
@@ -128,7 +161,9 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
   `the_register_page_has_a_labeled_code_field_the_script_sends` pins that the enrollment code
   field has a `<label>` tied to it by `for`, and comes before the button.
 - The full-screen REPL is rendered against ratatui's test backend in `tui.rs`'s tests, mostly for
-  layout and editing. `no_color_takes_every_color_escape_out_of_the_frame` writes a frame through
+  layout and editing. `clock_colon_stays_visible_across_redraws` checks that the clock keeps
+  its colon across frames sampled over a second, covering the former blink phase.
+  `no_color_takes_every_color_escape_out_of_the_frame` writes a frame through
   the crossterm backend and finds no color escape in the bytes under `NO_COLOR`, and finds some
   without it. The runbook note tests render a step through the test backend and check every
   note cell for normal intensity, with and without `NO_COLOR`.
@@ -170,6 +205,13 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
   boundary, file jail and golden-thread invalidation after an editor change.
 - `crates/ikigai-ipc/src/lib.rs`'s `who_is_refused` pins, word for word, the sentence that
   refuses a socket server under another UID, which reaches the terminal as an `ikigai:` line.
+- `crates/ikigai-cli/tests/lobby_door.rs`'s
+  `a_denied_certificate_is_reported_as_a_connection_refusal` runs the client against an
+  in-process QUIC door using a real layer host's `deny.txt` decision. It pins the sentence
+  naming the door and saying the client certificate is not admitted, for both `--override`
+  and `--connect`, with no color escapes or Meta-renderer advice. Clearing the deny list
+  admits the same certificate, and a peer without a Meta renderer keeps its contract warning.
+  This is a socket test, with no assistive technology evaluation.
 - The other output above has had no automated accessibility checker or browser evaluation.
   No assistive technology has been used on any of this output.
 
@@ -192,6 +234,16 @@ Found by reading the source on 2026-10-15, not by testing:
 
 | Date | Change |
 |---|---|
+| 2026-11-11 | The batch summary labels cache counts as “request outcomes” (ledger #2699), so pipeline and fan-out requests are distinguished from commands. A binary regression checks two commands with six request outcomes. No color is added; no assistive technology testing was performed. |
+| 2026-11-11 | A set `IKIGAI_LLM_CONFIG` that names no readable file, or is empty, stops startup with exit 2 and one plain `ikigai:` line on stderr naming the variable and the path, and saying to point it at an LLM registry JSON file or unset it to use the config home's `llm.json`. No color. `tests/llm_config.rs` pins the variable and the path in the line, not its full wording; no assistive technology testing was performed. |
+| 2026-11-10 | A layer door whose default state directory would join a `--name` that is not one plain file name stops startup with one plain `ikigai:` line on stderr quoting the name, naming `--name`, and naming `--layers-state` and `layers.state` as the other ways to set the directory. No color. A library test pins that the line names `--name` and `--layers-state`, not its full wording; no assistive technology testing was performed. |
+| 2026-11-11 | Terminal reads (ledger #2695) choose the text face when the caller names no type and the target's contract offers `text/plain`. The policy applies to every resource family. Binary regressions reproduced HTML in both `-c` and the line REPL before the fix and now compare the output to explicit `text/plain`; explicit HTML/JSON and the shared kernel's HTML default are preserved. No assistive technology testing was performed. |
+| 2026-11-10 | A socket server closing during the version hello is reported as unavailable, with a plain sentence saying it may be restarting or predate wire v6, and advising a retry or server update. Socket tests cover a legacy decoder closing, a partial hello, and a close during redial. No assistive technology testing was performed. |
+| 2026-11-10 | A `config.toml` line the host cannot read, or an unknown key in one of the host's own families (another program's keys are left alone), stops startup with one plain `ikigai:` line on stderr naming the file, the line number and the line or key in backquotes, and saying what to write instead. No color. `tests/config_toml.rs` pins the file, line number and key in the sentence, not its full wording; no assistive technology testing was performed. |
+| 2026-11-09 | A QUIC door being drained (ledger #3325) closes its connections with the reason `this door is shutting down; reconnect to continue`, a plain sentence that can reach a person inside a transient `unavailable` error on a call whose reply was lost, in the same place the age bound's reason already can. No new output otherwise and no color. The sentence is not pinned by a test; no assistive technology testing was performed. |
+| 2026-11-09 | The HTTP door answers core's new outcomes (ledger #3151). `Error::Gone` is a `410 Gone`, on the existing negotiated error page. A read answering core's typed redirect is sent as its status with `Location`, and a client asking for HTML gets a new short page with the target as a link (shown as text when it is not `http` or `https`); any other client gets a `text/plain` sentence. Socket tests pin both; no browser or assistive technology testing was performed. |
+| 2026-11-08 | A QUIC door's refusal after TLS (ledger #3304) says that the door refused the connection and the client certificate is not admitted, before a mount or direct connection asks for contracts. A socket regression pins the sentence and distinguishes an admitted peer without a Meta renderer. Plain `ikigai:` line, no color; no assistive technology testing was performed. |
+| 2026-11-07 | The full-screen REPL clock (ledger #2696) keeps a steady colon instead of blinking indefinitely. A ratatui test-backend regression reproduces the missing colon before the fix and checks it stays visible across redraws after it. No assistive technology testing was performed. |
 | 2026-11-06 | The HTTP door refuses a push stream beyond `PushConfig::max_streams` with `503`, `Retry-After: 1` and "too many event streams", using the existing negotiated error page. A socket regression pins the sentence and page landmarks; no assistive technology testing was performed. |
 | 2026-10-15 | First version ([PR 521](https://github.com/ikigai-rs/ikigai-cli/pull/521)). |
 | 2026-10-15 | The embedded host's pages and the intake's redirect page gain `<html lang="en">` and a `<main>`; the passkey status lines become live regions; the full-screen REPL honors `NO_COLOR`. Three known limitations removed ([PR 522](https://github.com/ikigai-rs/ikigai-cli/pull/522)). |
@@ -219,6 +271,11 @@ Found by reading the source on 2026-10-15, not by testing:
 | 2026-11-02 | `--grants <file>` becomes a global host flag. A set `IKIGAI_GRANTS` stops startup with a plain `ikigai:` diagnostic naming the variable and replacement flag. Binary regression tests cover the refusal and the socket host's flag; no assistive technology testing was performed. |
 | 2026-11-02 | The global `--grants` parser names `<file>` in missing-value refusals (ledger #2952). Library grant lookups preserve the `IKIGAI_GRANTS` refusal instead of reporting an unknown grant. Library and binary regression tests pin these diagnostics; no color is added and no assistive technology testing was performed. |
 | 2026-11-03 | The `names`-file recipe in `docs/shared-ui.md` declares a `theme` input instead of fixing `theme`, so a no-script Apply is answered with the page in the chosen theme, and it names the override for turning the chooser off (ledger #2955). Docs only, so no output changed. One `GET /quakes?theme=dark` was sent through the door with `curl` and ikigai-ui 0.4.1. No test covers it, and no browser, axe or assistive technology testing was performed. |
+| 2026-11-09 | `--clients <file>` names the client enrollment file. A set `IKIGAI_CLIENTS`, a `--clients` file that is not there, and `--clients` on a mode that reads no enrollment each stop startup with a plain `ikigai:` line on stderr; the usage text gains three plain lines. Binary and library regression tests pin the diagnostics; no color is added and no assistive technology testing was performed. |
+| 2026-11-08 | A layer door's refusal of an unlisted certificate with no lobby capability (ledger #3295) says on stderr that the host's `deny.txt` names it or the host has no lobby now, where it said only that the host has no lobby. Plain `ikigai:` line, no color. No test pins this wording, and no assistive technology testing was performed. |
+| 2026-11-09 | `ikigai serve … --mount <p>=<t> --pending` (ledger #3169) adds terminal text under the same rules: six plain usage lines (which also say a served host's mount flags go after the word `serve`), the startup banner's and `urn:host:posture`'s `mount` line for such a mount carries `[pending: dials on first use, Unavailable until the peer answers]`, and a misplaced `--pending` stops the start with a plain `ikigai:` line naming the rule. A binary regression pins the banner, unit tests pin the refusals; no color is added and no assistive technology testing was performed. |
+| 2026-11-09 | A host with no usable config home, or no usable home for its default workspace, stops at startup with exit 2 and one plain `ikigai:` line on stderr naming `XDG_CONFIG_HOME`, `HOME`, `USERPROFILE` and `--config-home`, or `HOME`, `USERPROFILE` and `--files`. The default socket's banner names an absolute path. Binary tests pin the lines; no color is added and no assistive technology testing was performed. |
+| 2026-11-07 | The org-directory file jail identifies itself as `orgfile` in descriptions and arrangement dumps (ledger #2751), so a declared arrangement can distinguish it from the workspace's `file` endpoint. The resource IRIs stay the same. Binary arrangement tests cover both named jails and loading the default dump; no browser or assistive technology testing was performed. |
 
 ## Contributing
 

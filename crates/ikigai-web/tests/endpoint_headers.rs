@@ -361,3 +361,44 @@ async fn header_injection_and_door_owned_headers_are_refused_by_name() {
         "{fine}"
     );
 }
+
+/// A tab inside an endpoint's `Location` is refused, wherever it sits (ledger #3432). A browser
+/// removes every ASCII tab and newline from a URL before it parses it (WHATWG URL, the basic
+/// URL parser's first step), so `/<TAB>/evil.example` is followed as `//evil.example`: another
+/// site, through the one check meant to keep a write's redirect on this door. The value is
+/// visible ASCII and a tab, so the header-value check alone passed it.
+#[tokio::test]
+async fn a_tab_cannot_turn_a_write_redirect_off_site() {
+    let redirect = FnEndpoint::new("redirect", |inv: &Invocation<'_>| {
+        let kind = inv.request.target.as_str().rsplit(':').next().unwrap_or("");
+        let location = match kind {
+            "tab-authority" => "/\t/evil.example/",
+            "tabs-authority" => "/\t\t/evil.example/",
+            "tab-inside" => "/do\tne",
+            _ => "/done",
+        };
+        Ok(raw_envelope(
+            &format!("Content-Type: text/plain\r\nLocation: {location}"),
+            "payload",
+        ))
+    })
+    .with_description(Description::new("redirect").verb(Verb::Sink));
+    let space = EndpointSpace::new().bind(
+        UriTemplate::parse("urn:t:redirect:{kind}").unwrap(),
+        redirect,
+    );
+    let kernel = Arc::new(Kernel::new(Arc::new(space)));
+    let addr = start(kernel, EdgeConfig::default(), public_cap()).await;
+    for kind in ["tab-authority", "tabs-authority", "tab-inside"] {
+        let resp = send(addr, &post(&format!("/t/redirect/{kind}"))).await;
+        assert!(resp.starts_with("HTTP/1.1 500"), "{kind}: {resp}");
+        assert_eq!(header(&resp, "location"), None, "{kind}: {resp}");
+        assert!(!resp.contains("payload"), "{kind}: {resp}");
+    }
+    // The same answer with a plain path redirects, so each refusal is the tab's.
+    let fine = send(addr, &post("/t/redirect/fine")).await;
+    assert_eq!(header(&fine, "location"), Some("/done"), "{fine}");
+    // `with_headers` refuses to build one too.
+    let plain = Representation::new(ReprType::new("text/plain"), b"x".to_vec());
+    assert!(with_headers(plain, &[("Location", "/\t/evil.example/")]).is_err());
+}
