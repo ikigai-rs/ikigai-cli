@@ -5,7 +5,9 @@
 //! The rule is the one [`crate::agents::check_protected`] and the passkey store apply, from
 //! the door's side: every file and every directory above it must be owned by this process's
 //! user or by root, and no group or other account may write it (a sticky directory such as
-//! `/tmp` is fine: only an entry's owner can replace it). A private key must also not be
+//! `/tmp` is fine: only an entry's owner can replace it). Every symbolic link on the way must be
+//! owned by this user or root too, since its owner can repoint it after the check, sticky
+//! directory or not ([`link_exposure`]). A private key must also not be
 //! readable by any other account. A read-only group or world read of a certificate, of
 //! `clients.json` or of a directory is fine. Each refusal names the path and the command that
 //! fixes it.
@@ -215,9 +217,41 @@ fn remedy(
     }
 }
 
+/// Why a symbolic link owned by `owner` is not safe for the process running as `me` to follow
+/// to an authority path, if it is not: the link rule [`check`] applies, pure so it is testable
+/// without another account. Whoever owns a link can repoint it at any time, even inside a
+/// sticky directory such as `/tmp` (the sticky bit stops other accounts, never the owner), so
+/// the door would read a file the check never judged. A link's owner must therefore be this
+/// user or root, as for any directory above an authority path (the overflow uid of a user
+/// namespace counts as root, [`counts_as_root`]). A link's own mode means nothing.
+///
+/// ```
+/// use ikigai_embedded::authority::link_exposure;
+///
+/// assert_eq!(link_exposure(501, 501, None), None);
+/// assert_eq!(link_exposure(0, 501, None), None);
+/// assert!(link_exposure(502, 501, None).is_some());
+/// // An unmapped root's link (a system CA bundle) inside a sandboxed user unit: fine.
+/// assert_eq!(link_exposure(65534, 501, Some(65534)), None);
+/// ```
+pub fn link_exposure(owner: u32, me: u32, overflow: Option<u32>) -> Option<String> {
+    if owner == me || counts_as_root(owner, true, overflow) {
+        return None;
+    }
+    Some(format!(
+        "is a symbolic link owned by uid {owner}, not by this process's uid {me} or root, and \
+         its owner can repoint it after this check"
+    ))
+}
+
+/// How many symbolic links [`check`] follows for one path before it refuses it, as the
+/// kernel's own `ELOOP` limit does.
+const MAX_LINKS: usize = 40;
+
 /// Check every path in `paths`, each file or directory and every directory above it (both as
-/// written and with symbolic links resolved), by [`exposure`]. A path that does not exist is
-/// skipped: whoever reads it reports that.
+/// written and with symbolic links resolved), by [`exposure`]; and every symbolic link on the
+/// way, by its own owner ([`link_exposure`]), following each to its target as written. A path
+/// that does not exist is skipped: whoever reads it reports that.
 ///
 /// # Errors
 ///
@@ -228,7 +262,26 @@ pub fn check(paths: &[(PathBuf, Kind)]) -> Result<(), String> {
 
     // SAFETY: `geteuid` takes no arguments, has no preconditions, and cannot fail.
     let me = unsafe { libc::geteuid() };
-    let overflow = overflow_uid();
+    let link_owner = |p: &Path| {
+        std::fs::symlink_metadata(p)
+            .ok()
+            .filter(|meta| meta.file_type().is_symlink())
+            .map(|meta| meta.uid())
+    };
+    walk(paths, me, overflow_uid(), &link_owner)
+}
+
+/// [`check`]'s walk, with the owner of each symbolic link (`link_owner` is `Some` only for a
+/// link) injected so a test can stand for a link another account owns.
+#[cfg(unix)]
+fn walk(
+    paths: &[(PathBuf, Kind)],
+    me: u32,
+    overflow: Option<u32>,
+    link_owner: &dyn Fn(&Path) -> Option<u32>,
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
     for (path, kind) in paths {
         let absolute = if path.is_absolute() {
             path.clone()
@@ -240,8 +293,13 @@ pub fn check(paths: &[(PathBuf, Kind)]) -> Result<(), String> {
         let Ok(real) = std::fs::canonicalize(&absolute) else {
             continue;
         };
-        for chain in [&absolute, &real] {
-            let mut here: Option<&Path> = Some(chain);
+        // The as-written chain first, then the target as written of every link met on the
+        // way (joined with the rest of the path below it), then the canonical chain: a stack,
+        // popped from the end.
+        let mut chains = vec![real.clone(), absolute.clone()];
+        let mut followed = 0;
+        while let Some(chain) = chains.pop() {
+            let mut here: Option<&Path> = Some(&chain);
             let mut first = true;
             while let Some(p) = here {
                 // The path itself is judged as its kind; the directories above it hold it.
@@ -249,6 +307,45 @@ pub fn check(paths: &[(PathBuf, Kind)]) -> Result<(), String> {
                 let kind = if first { *kind } else { Kind::Public };
                 first = false;
                 here = p.parent();
+                let shown = if p == path.as_path() || p == absolute || p == real {
+                    String::new()
+                } else {
+                    format!(", which holds {}", path.display())
+                };
+                if let Some(owner) = link_owner(p) {
+                    if let Some(why) = link_exposure(owner, me, overflow) {
+                        let target = std::fs::read_link(p)
+                            .map(|t| format!("{} ", t.display()))
+                            .unwrap_or_default();
+                        return Err(format!(
+                            "{}{shown} {why}, so this door will not take its authority through \
+                             it; check that it is yours, then name its target {target}directly \
+                             instead, or replace {} with a link of your own",
+                            p.display(),
+                            p.display()
+                        ));
+                    }
+                    followed += 1;
+                    if followed > MAX_LINKS {
+                        return Err(format!(
+                            "{} passes through more than {MAX_LINKS} symbolic links, so this \
+                             door will not take its authority from it; name its target \
+                             directly instead",
+                            path.display()
+                        ));
+                    }
+                    if let (Ok(target), Ok(rest)) = (std::fs::read_link(p), chain.strip_prefix(p)) {
+                        let target = match p.parent() {
+                            Some(parent) => parent.join(target),
+                            None => target,
+                        };
+                        chains.push(if rest.as_os_str().is_empty() {
+                            target
+                        } else {
+                            target.join(rest)
+                        });
+                    }
+                }
                 let Ok(meta) = std::fs::metadata(p) else {
                     continue;
                 };
@@ -256,11 +353,6 @@ pub fn check(paths: &[(PathBuf, Kind)]) -> Result<(), String> {
                 let (owner, mode) = (meta.uid(), meta.mode());
                 if let Some(why) = exposure(owner, mode, me, is_dir, kind, above, overflow) {
                     let fix = remedy(p, owner, me, is_dir, kind, above, overflow);
-                    let shown = if p == path.as_path() || p == absolute || p == real {
-                        String::new()
-                    } else {
-                        format!(", which holds {}", path.display())
-                    };
                     return Err(format!(
                         "{}{shown} {why}, so this door will not take its authority from it; \
                          check that it is yours, then fix it with {fix}",
@@ -589,6 +681,105 @@ mod tests {
             out.status.success() && stdout.contains("1 passed"),
             "the check refused inside a user namespace:\n{stdout}\n{stderr}"
         );
+    }
+
+    /// The door's tree, reached through `/tmp/door -> ~/door`-style links in a sticky
+    /// directory: a scratch `sticky/` (mode 1777) beside the real `door/`, all this user's.
+    fn sticky_links(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = scratch(name);
+        let door = dir.join("door");
+        let sticky = dir.join("sticky");
+        std::fs::create_dir(&door).unwrap();
+        std::fs::create_dir(&sticky).unwrap();
+        chmod(&door, 0o700);
+        chmod(&sticky, 0o1777);
+        let key = door.join("server.key");
+        std::fs::write(&key, "k").unwrap();
+        chmod(&key, 0o600);
+        std::os::unix::fs::symlink(&door, sticky.join("door")).unwrap();
+        (dir, sticky, key)
+    }
+
+    // SAFETY: `geteuid` takes no arguments, has no preconditions, and cannot fail.
+    fn me() -> u32 {
+        unsafe { libc::geteuid() }
+    }
+
+    /// Ledger #3423: a link another account owns in a sticky directory can be repointed after
+    /// the check, so the check must judge the link's own owner, not only its target's.
+    #[test]
+    fn a_link_another_account_owns_in_a_sticky_directory_is_refused() {
+        let (dir, sticky, _key) = sticky_links("foreign-link");
+        let link = sticky.join("door");
+        let through = link.join("server.key");
+        let other = me() + 1;
+        let foreign = |p: &Path| {
+            std::fs::symlink_metadata(p)
+                .ok()
+                .filter(|m| m.file_type().is_symlink())
+                .map(|_| if p == link { other } else { me() })
+        };
+        // The link is this user's: the door's tree passes through it.
+        assert_eq!(check(&[(through.clone(), Kind::PrivateKey)]), Ok(()));
+        // The same link owned by another account: refused, naming the link, with no `chown`.
+        let err = walk(&[(through.clone(), Kind::PrivateKey)], me(), None, &foreign).unwrap_err();
+        assert!(err.starts_with(&link.display().to_string()), "{err}");
+        assert!(err.contains(&format!("owned by uid {other}")), "{err}");
+        assert!(err.contains("repoint"), "{err}");
+        assert!(!err.contains("chown"), "{err}");
+        // The link as the authority path itself is judged the same way.
+        let direct = sticky.join("server.key");
+        std::os::unix::fs::symlink(dir.join("door/server.key"), &direct).unwrap();
+        let foreign_key = |p: &Path| {
+            std::fs::symlink_metadata(p)
+                .ok()
+                .filter(|m| m.file_type().is_symlink())
+                .map(|_| if p == direct { other } else { me() })
+        };
+        assert_eq!(check(&[(direct.clone(), Kind::PrivateKey)]), Ok(()));
+        let err = walk(
+            &[(direct.clone(), Kind::PrivateKey)],
+            me(),
+            None,
+            &foreign_key,
+        )
+        .unwrap_err();
+        assert!(err.starts_with(&direct.display().to_string()), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A link that points at another link: the second is on neither the as-written nor the
+    /// canonical chain, and its owner can repoint it too.
+    #[test]
+    fn a_link_reached_through_another_link_is_judged_too() {
+        let (dir, sticky, _key) = sticky_links("link-chain");
+        let hop = sticky.join("hop");
+        std::os::unix::fs::symlink(sticky.join("door"), &hop).unwrap();
+        let second = sticky.join("door");
+        let through = hop.join("server.key");
+        let other = me() + 1;
+        let foreign = |p: &Path| {
+            std::fs::symlink_metadata(p)
+                .ok()
+                .filter(|m| m.file_type().is_symlink())
+                .map(|_| if p == second { other } else { me() })
+        };
+        assert_eq!(check(&[(through.clone(), Kind::PrivateKey)]), Ok(()));
+        let err = walk(&[(through, Kind::PrivateKey)], me(), None, &foreign).unwrap_err();
+        assert!(err.starts_with(&second.display().to_string()), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_link_loop_is_refused_not_followed_forever() {
+        let dir = scratch("link-loop");
+        let a = dir.join("a");
+        let b = dir.join("b");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        // `canonicalize` fails on a loop: left to its reader, as a missing file is.
+        assert_eq!(check(&[(a.join("server.key"), Kind::PrivateKey)]), Ok(()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
