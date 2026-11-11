@@ -68,6 +68,7 @@ pub mod jsonl;
 pub mod layers;
 pub mod lisp;
 pub mod names;
+mod orgfile;
 pub mod passkey;
 pub mod people;
 mod prg;
@@ -79,6 +80,7 @@ mod ui;
 // `ikigai-cli` build its value and print from it: the banner and the resource are two faces
 // of one recorded fact, which is what keeps them from drifting into two spellings of it.
 pub mod posture;
+pub mod retry;
 pub mod scheduling;
 #[cfg(unix)]
 pub mod spill;
@@ -1759,7 +1761,7 @@ fn local_space(nature: &'static str) -> EndpointSpace {
             // The org files, jailed to the configured org_dir and read THROUGH
             // the kernel by urn:org:agenda (capability-gated; golden-thread-ready).
             UriTemplate::parse("urn:orgfile:{path}").expect("valid template"),
-            ikigai_fs::FileEndpoint::new(org_config().map(|(dir, _)| dir).unwrap_or_default()),
+            orgfile::OrgFileEndpoint::new(org_config().map(|(dir, _)| dir).unwrap_or_default()),
         )
         .bind(
             UriTemplate::parse(ikigai_fs::FILE_TEMPLATE).expect("FILE_TEMPLATE is valid"),
@@ -5385,8 +5387,35 @@ fn compose_mounts(mut spaces: Vec<Arc<dyn Space>>, mounts: Vec<MountSpec>) -> Ar
         }
     }
     deeper.sort_by_key(|mount| std::cmp::Reverse(mount.prefix.len()));
+    // Ordered by prefix LENGTH, so the most specific mount wins regardless of
+    // declaration order: `--override urn:llm:=peerA --override urn:llm:ask=peerB`
+    // sends `urn:llm:ask` to peerB and the rest of `urn:llm:*` to peerA. A whole
+    // IRI is simply the most specific prefix there is, which is what makes
+    // single-RESOURCE overrides work.
+    fronting.sort_by_key(|mount| std::cmp::Reverse(mount.prefix.len()));
+    // Every remote space, built before any is placed, so the `connect.retry.*` policy can
+    // govern them all with ONE breaker (ledger #3383).
+    let fronting: Vec<(String, MountKind, Arc<dyn Space>)> = fronting
+        .into_iter()
+        .map(
+            |MountSpec {
+                 prefix,
+                 origin,
+                 resolver,
+                 kind,
+             }| {
+                let remote = Arc::new(
+                    ikigai_resolve::MountedRemote::overriding(resolver, prefix.clone(), origin)
+                        .sharing(&peers)
+                        .with_clock(Arc::clone(&clock)),
+                ) as Arc<dyn Space>;
+                (prefix, kind, remote)
+            },
+        )
+        .collect();
+    let mut aliases: Vec<Arc<dyn Space>> = Vec::new();
     for mount in deeper {
-        spaces.push(Arc::new(
+        aliases.push(Arc::new(
             ikigai_resolve::MountedRemote::overriding(mount.resolver, mount.prefix, mount.origin)
                 .sharing(&peers)
                 .with_clock(Arc::clone(&clock)),
@@ -5399,35 +5428,50 @@ fn compose_mounts(mut spaces: Vec<Arc<dyn Space>>, mounts: Vec<MountSpec>) -> Ar
             inner: mount.resolver,
             prefix: mount.prefix.clone(),
         });
-        spaces.push(Arc::new(
+        aliases.push(Arc::new(
             ikigai_resolve::MountedRemote::new(resolver, mount.prefix, mount.origin)
                 .sharing(&peers)
                 .with_clock(Arc::clone(&clock)),
         ));
     }
+    // The retry policy (ledger #3383): override and alias mounts resolve through one shared
+    // Retry and CircuitBreaker, combined in the order this composition tries them, so the
+    // mount a request reaches is the one that answers it. A `--prefer` mount is left as it
+    // was: it already falls back to the local space on a transient failure, and retrying
+    // first would only delay that answer.
+    let (fronting, aliases) = match retry::RetryPolicy::from_config().ok().flatten() {
+        None => (fronting, aliases),
+        Some(policy) => {
+            let governed = policy.govern(
+                fronting
+                    .iter()
+                    .filter(|(_, kind, _)| *kind != MountKind::Prefer)
+                    .map(|(_, _, remote)| Arc::clone(remote))
+                    .chain(aliases.iter().cloned())
+                    .collect(),
+            );
+            (
+                fronting
+                    .into_iter()
+                    .map(|(prefix, kind, remote)| match kind {
+                        MountKind::Prefer => (prefix, kind, remote),
+                        _ => (prefix, kind, governed.slot(remote)),
+                    })
+                    .collect(),
+                aliases
+                    .into_iter()
+                    .map(|space| governed.slot(space))
+                    .collect(),
+            )
+        }
+    };
+    spaces.extend(aliases);
     if fronting.is_empty() {
         return Arc::new(Fallback::new(spaces));
     }
-    // Ordered by prefix LENGTH, so the most specific mount wins regardless of
-    // declaration order: `--override urn:llm:=peerA --override urn:llm:ask=peerB`
-    // sends `urn:llm:ask` to peerB and the rest of `urn:llm:*` to peerA. A whole
-    // IRI is simply the most specific prefix there is, which is what makes
-    // single-RESOURCE overrides work.
-    fronting.sort_by_key(|mount| std::cmp::Reverse(mount.prefix.len()));
     let local: Arc<dyn Space> = Arc::new(Fallback::new(spaces));
     let mut ordered: Vec<Arc<dyn Space>> = Vec::new();
-    for MountSpec {
-        prefix,
-        origin,
-        resolver,
-        kind,
-    } in fronting
-    {
-        let remote = Arc::new(
-            ikigai_resolve::MountedRemote::overriding(resolver, prefix.clone(), origin)
-                .sharing(&peers)
-                .with_clock(Arc::clone(&clock)),
-        ) as Arc<dyn Space>;
+    for (prefix, kind, remote) in fronting {
         ordered.push(match kind {
             // The failover pair must stay INSIDE the prefix. `Failover` resolves
             // every target, so an unguarded `[remote, local]` would also answer
@@ -11789,15 +11833,13 @@ mod arrangement_tests {
             let ambiguous = harvest.ambiguous.contains_key(&door.endpoint);
             assert!(registered ^ ambiguous, "{door:?}");
         }
-        // On every machine: two jails under `file`. (`llm-*` join it wherever llm.json declares
-        // a second provider.) `meeting` and `org-agenda` each named two doors until ikigai-meeting
-        // 0.7 and ikigai-org 0.3 gave every door its own id, so each of those is one endpoint.
-        assert!(
-            harvest.ambiguous.contains_key("file"),
-            "file: {:?}",
-            harvest.ambiguous
-        );
+        // Each file jail has its own endpoint identity. Configured LLM backends can
+        // still share names, which the generic ambiguity checks above must preserve.
+        assert!(!harvest.ambiguous.contains_key("file"));
+        assert!(!harvest.ambiguous.contains_key("orgfile"));
         for name in [
+            "file",
+            "orgfile",
             "calendar",
             "availability",
             "meeting-schedule",
@@ -11812,17 +11854,20 @@ mod arrangement_tests {
         }
     }
 
-    /// The dump as it stands names `file`, and the refusal says why in the host's words.
+    /// Both file jails survive a dump and rebuild with their distinct identities.
     #[test]
-    fn the_whole_dump_is_refused_on_a_name_that_cannot_say_which() {
+    fn the_dumped_file_doors_bind_distinct_endpoints() {
         let (root, harvest) = default_root();
-        let Err(refused) = arrangement::arrange(&harvest, &dumped(&root)) else {
-            panic!("`file` names two endpoints; the dump must not build")
-        };
-        assert!(
-            refused.contains("different endpoints in this host"),
-            "{refused}"
-        );
+        let (declaration, _) = declarable(&root, &harvest);
+        let built = arrangement::arrange(&harvest, &declaration).expect("file doors build");
+        for (pattern, name) in [
+            ("urn:file:{path}", "file"),
+            ("urn:orgfile:{path}", "orgfile"),
+        ] {
+            assert_eq!(door(&declaration, pattern).unwrap().endpoint, name);
+            let iri = concrete(pattern).unwrap();
+            assert_eq!(answer(root.as_ref(), &iri), answer(built.as_ref(), &iri));
+        }
     }
 
     /// ★ THE ROUND TRIP. The declarable part of the dumped arrangement, built over the harvested
@@ -11844,7 +11889,13 @@ mod arrangement_tests {
             .collect();
         expected.sort();
         expected.dedup();
-        assert!(!expected.is_empty());
+        // The file jails are now declarable and must participate in the full
+        // name-by-name comparison rather than being among the dropped doors.
+        for pattern in ["urn:file:{path}", "urn:orgfile:{path}"] {
+            let iri = concrete(pattern).unwrap();
+            assert!(names.contains(&iri), "{iri} is compared");
+            assert!(!expected.contains(&iri), "{iri} remains bound");
+        }
         assert_eq!(differing(&root, &built, &names), expected);
         for name in &expected {
             assert_eq!(
