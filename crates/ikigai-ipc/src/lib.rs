@@ -785,26 +785,36 @@ impl Drop for Slot {
 
 /// Turn away a connection that arrived with the door full: answer its hello, then answer its
 /// first call with a typed [`Unavailable`](Error::Unavailable), then close. Each step waits at
-/// most [`REFUSAL_TIMEOUT`], since this runs on the accept loop. A client that sends no call in
-/// that time finds the socket closed when it does, and a healing [`IpcResolver`] redials and
-/// replays straight into this refusal, so it still reads the typed answer.
+/// most [`REFUSAL_TIMEOUT`] IN ALL, since this runs on the accept loop. A client that sends no
+/// call in that time finds the socket closed when it does, and a healing [`IpcResolver`]
+/// redials and replays straight into this refusal, so it still reads the typed answer.
+///
+/// ★ Each step is a [`Deadline`], not a socket timeout (ledger #3476). `SO_RCVTIMEO` bounds
+/// ONE read, so a peer that trickled its hello a byte at a time, each inside the timeout, held
+/// the accept loop (and with it every other client of the door) for as long as it liked.
 fn refuse_over_capacity(stream: UnixStream, cap: usize) {
-    let _ = stream.set_read_timeout(Some(REFUSAL_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(REFUSAL_TIMEOUT));
-    let mut stream = &stream;
-    let Some(version) = answer_hello(&mut stream) else {
+    let step = || Deadline::new(REFUSAL_TIMEOUT, false);
+    let bounded = |deadline| Bounded {
+        stream: &stream,
+        standing: Some(REFUSAL_TIMEOUT),
+        deadline: Some(deadline),
+    };
+    let hello = step();
+    let Some(version) = answer_hello(&mut bounded(&hello)) else {
         return;
     };
     // Any first frame, a plain call or a streamed call's head: the refusal answers it either
     // way (a streamed caller still writing its body meets the close, and reads this answer).
-    if read_frame(&mut stream).is_err() {
+    let call = step();
+    if read_frame(&mut bounded(&call)).is_err() {
         return;
     }
     let refusal = Error::Unavailable(format!(
         "the kernel server is at its limit of {cap} connections; try again shortly"
     ));
+    let answer = step();
     let _ = stream::write_reply(
-        &mut stream,
+        &mut bounded(&answer),
         Reply::ErrorTyped(WireError::from(&refusal)),
         version,
     );
@@ -1833,7 +1843,7 @@ fn serve_connection(kernel: &Kernel, stream: UnixStream, limits: &Limits, admiss
 /// variant. A hello outside the range gets our own version (so the CLIENT can
 /// name both in its error) and a close. A frame WITHOUT the magic is a ≤v5
 /// client and is refused.
-fn answer_hello(stream: &mut &UnixStream) -> Option<u32> {
+fn answer_hello(stream: &mut (impl io::Read + io::Write)) -> Option<u32> {
     let first = read_frame(stream).ok()?;
     match decode_hello(&first) {
         Some(hello) => {
@@ -2421,6 +2431,62 @@ mod tests {
             "the freed place is served"
         );
         drop(turned_away);
+        remove_socket(&path);
+    }
+
+    /// ledger #3476: turning away a connection past the cap runs ON THE ACCEPT LOOP, and each
+    /// step was bounded only by `SO_RCVTIMEO`, which bounds ONE read. A peer past the cap that
+    /// trickled its hello a byte at a time, each inside [`REFUSAL_TIMEOUT`], held the accept
+    /// loop for as long as it liked: once the place came back, no other client was accepted.
+    #[test]
+    fn a_trickling_peer_past_the_cap_does_not_hold_the_accept_loop() {
+        use std::io::Write;
+        let path = socket_path("trickle");
+        serve_limited(&path, Limits::default().with_max_connections(1));
+
+        let holder = connect(&path).unwrap();
+        assert_eq!(holder.issue(upper("one")).unwrap().0.bytes, b"ONE");
+
+        // Past the cap: a hello frame that announces 1 KiB and sends it a byte every 300ms
+        // (each read returns well inside the one-second step), for up to 12 seconds.
+        let mut trickler = UnixStream::connect(&path).unwrap();
+        trickler.write_all(&1024u32.to_be_bytes()).unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let trickling = thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || {
+                for _ in 0..40 {
+                    if stop.load(Ordering::SeqCst) || trickler.write_all(&[0]).is_err() {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(300));
+                }
+            }
+        });
+        thread::sleep(Duration::from_millis(200)); // the accept loop is in the refusal now
+        drop(holder); // the place comes back
+
+        // A new client must be accepted and served within the refusal's own bound (a second
+        // per step) plus slack, not after the trickler gives up.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dial = path.clone();
+        thread::spawn(move || {
+            let answer = connect(&dial).and_then(|client| {
+                client
+                    .issue(upper("next"))
+                    .map(|(representation, _)| representation.bytes)
+                    .map_err(io::Error::other)
+            });
+            let _ = tx.send(answer);
+        });
+        let served = rx.recv_timeout(Duration::from_secs(5));
+        stop.store(true, Ordering::SeqCst);
+        let _ = trickling.join();
+        match served {
+            Ok(Ok(bytes)) => assert_eq!(bytes, b"NEXT"),
+            Ok(Err(e)) => panic!("the next client failed: {e}"),
+            Err(_) => panic!("a trickling peer past the cap held the accept loop for over 5s"),
+        }
         remove_socket(&path);
     }
 
