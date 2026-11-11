@@ -10,11 +10,14 @@
 //! `clients.json` or of a directory is fine. Each refusal names the path and the command that
 //! fixes it.
 //!
-//! In a user namespace (a sandboxed service: systemd's `PrivateUsers=yes`, which a user unit's
-//! `ProtectSystem=` or `PrivateTmp=` imply), every owner not mapped into it, root included,
-//! reads as the overflow uid. A DIRECTORY ABOVE an authority path owned by the overflow uid
-//! counts as root's there ([`counts_as_root`]); the authority paths themselves get no such
-//! allowance, and a refusal for an overflow-uid owner never suggests a `chown` (ledger #3397).
+//! In a user namespace that leaves root unmapped (a sandboxed user service: systemd's
+//! `PrivateUsers=yes`, which a user unit's `ProtectSystem=` or `PrivateTmp=` imply), every
+//! owner not mapped into it, root included, reads as the overflow uid. A DIRECTORY ABOVE an
+//! authority path owned by the overflow uid counts as root's there ([`counts_as_root`]); the
+//! authority paths themselves get no such allowance, and a refusal for an overflow-uid owner
+//! never suggests a `chown` (ledger #3397). A namespace that maps root (a system unit's
+//! `PrivateUsers=yes`) or the overflow uid itself gets no allowance at all: there the overflow
+//! uid is never root ([`namespace_overflow`]).
 
 use std::path::{Path, PathBuf};
 
@@ -28,12 +31,18 @@ pub enum Kind {
     Public,
 }
 
-/// The overflow uid when this process runs in a user namespace, from the namespace's
-/// `/proc/self/uid_map` and `/proc/sys/kernel/overflowuid`: [`overflow_uid`]'s rule, pure so
-/// it is testable without a namespace. The initial namespace's map is the full identity map,
-/// `0 0 4294967295`; any other map is a user namespace (a sandbox such as systemd's
-/// `PrivateUsers=yes`), where every owner not mapped into it, root included, reads as the
-/// overflow uid. The overflow uid is 65534 when `overflowuid` cannot be read.
+/// The overflow uid when this process runs in a user namespace that leaves root unmapped,
+/// from the namespace's `/proc/self/uid_map` and `/proc/sys/kernel/overflowuid`:
+/// [`overflow_uid`]'s rule, pure so it is testable without a namespace. In such a namespace (a
+/// sandboxed user unit's `PrivateUsers=yes`, or `unshare -r`) every owner not mapped into it,
+/// root included, reads as the overflow uid, which is 65534 when `overflowuid` cannot be read.
+///
+/// `None` when an owner reading as the overflow uid cannot be root: when the map gives outside
+/// uid 0 a place (the initial namespace's full identity map `0 0 4294967295`, a system unit's
+/// `PrivateUsers=yes`, which maps root to itself, or `PrivateUsers=identity`), root reads as
+/// itself and the overflow uid is only ever another account; and when the map gives the
+/// overflow uid itself to a real account. A map this rule cannot read is `None` too, so no
+/// allowance is made on a guess.
 ///
 /// ```
 /// use ikigai_embedded::authority::namespace_overflow;
@@ -42,21 +51,34 @@ pub enum Kind {
 /// assert_eq!(namespace_overflow("      1000       1000          1\n", Some("65534\n")), Some(65534));
 /// assert_eq!(namespace_overflow("0 1000 1\n", None), Some(65534));
 /// assert_eq!(namespace_overflow("0 1000 1\n", Some("4242\n")), Some(4242));
+/// // A system unit's `PrivateUsers=yes`: root maps to itself, so the overflow uid is not root.
+/// assert_eq!(namespace_overflow("0 0 1\n1000 1000 1\n", Some("65534\n")), None);
 /// ```
 pub fn namespace_overflow(uid_map: &str, overflowuid: Option<&str>) -> Option<u32> {
-    let lines: Vec<Vec<&str>> = uid_map
-        .lines()
-        .map(|line| line.split_whitespace().collect::<Vec<_>>())
-        .filter(|fields| !fields.is_empty())
-        .collect();
-    if lines == [vec!["0", "0", "4294967295"]] {
-        return None;
+    let overflow: u32 = overflowuid
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(65534);
+    for line in uid_map.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.is_empty() {
+            continue;
+        }
+        let [inside, outside, count] = fields[..] else {
+            return None;
+        };
+        let (Ok(inside), Ok(outside), Ok(count)) = (
+            inside.parse::<u64>(),
+            outside.parse::<u64>(),
+            count.parse::<u64>(),
+        ) else {
+            return None;
+        };
+        let holds = |start: u64, id: u64| start <= id && id < start.saturating_add(count);
+        if holds(outside, 0) || holds(inside, u64::from(overflow)) {
+            return None;
+        }
     }
-    Some(
-        overflowuid
-            .and_then(|text| text.trim().parse().ok())
-            .unwrap_or(65534),
-    )
+    Some(overflow)
 }
 
 /// The overflow uid if this process runs in a user namespace, `None` if it does not
@@ -443,10 +465,47 @@ mod tests {
         assert_eq!(namespace_overflow("0 0 4294967295", Some("65534")), None);
         assert_eq!(namespace_overflow("", Some("65534")), Some(65534));
         assert_eq!(
-            namespace_overflow("0 0 4294967295\n1 1 1\n", Some("65534")),
-            Some(65534)
+            namespace_overflow("\t0\t0\t4294967295\t\n", Some("65534")),
+            None
         );
         assert_eq!(namespace_overflow("1000 1000 1", Some("junk")), Some(65534));
+    }
+
+    /// A system unit's `PrivateUsers=yes` maps root and the unit's own user to themselves
+    /// (systemd.exec(5)), so root reads as 0 there and an owner reading as the overflow uid is
+    /// some OTHER account: a directory it owns must not count as root's. The same holds for
+    /// `PrivateUsers=identity` (0 to 65535 mapped, overflow uid included) and for any map that
+    /// gives the overflow uid to a real account.
+    #[test]
+    fn an_overflow_uid_is_not_root_when_root_or_the_overflow_uid_is_mapped() {
+        for map in [
+            "         0          0          1\n      1000       1000          1\n",
+            "0 0 65536\n",
+            "0 0 100\n100 100 4294967195\n",
+            "1000 1000 1\n65534 65534 1\n",
+        ] {
+            let overflow = namespace_overflow(map, Some("65534\n"));
+            assert_eq!(overflow, None, "{map:?}");
+            // So a directory above an authority path that another account owns is refused.
+            assert!(
+                exposure(OVERFLOW, 0o40755, ME, true, Kind::Public, true, overflow).is_some(),
+                "{map:?}"
+            );
+        }
+        // Root unmapped, the overflow uid unmapped: the sandboxed user unit and `unshare -r`.
+        for map in [
+            "      1000       1000          1\n",
+            "0 1000 1\n",
+            "0\t1000\t1\n",
+        ] {
+            assert_eq!(
+                namespace_overflow(map, Some("65534\n")),
+                Some(65534),
+                "{map:?}"
+            );
+        }
+        // A map this rule cannot read grants no allowance.
+        assert_eq!(namespace_overflow("0 x 1\n", Some("65534\n")), None);
     }
 
     /// The environment variable that tells [`in_a_user_namespace_child`] it is the child.
