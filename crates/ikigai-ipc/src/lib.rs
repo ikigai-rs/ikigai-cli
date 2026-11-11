@@ -2996,7 +2996,7 @@ mod tests {
         let path = socket_path("mismatch");
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
-        // A future v11 server: answers the hello with its own version, closes.
+        // A future server: answers the hello with its own version, closes.
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut s = &stream;
@@ -3004,7 +3004,7 @@ mod tests {
             write_hello(
                 &mut s,
                 &Hello {
-                    version: 11,
+                    version: PROTOCOL_VERSION + 1,
                     mode: HelloMode::Verbatim,
                 },
             )
@@ -3015,7 +3015,10 @@ mod tests {
             Err(err) => err.to_string(),
             Ok(_) => panic!("a version mismatch must refuse the connection"),
         };
-        assert!(message.contains("v11"), "{message}");
+        assert!(
+            message.contains(&format!("v{}", PROTOCOL_VERSION + 1)),
+            "{message}"
+        );
         assert!(
             message.contains(&format!("v{PROTOCOL_VERSION}")),
             "{message}"
@@ -3084,11 +3087,11 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A hello outside the spoken range (6 below, 11 above) gets OUR version, so the
+    /// A hello outside the spoken range (6 below, the next version above) gets OUR version, so the
     /// client can name both, and the connection closes without serving.
     #[test]
-    fn a_hello_outside_7_to_10_is_answered_10_and_refused() {
-        for (n, offered) in [6u32, 11].into_iter().enumerate() {
+    fn a_hello_outside_the_spoken_range_is_answered_and_refused() {
+        for (n, offered) in [6u32, PROTOCOL_VERSION + 1].into_iter().enumerate() {
             let path = socket_path(&format!("v-out-{n}"));
             let server = serve_one(&path, kernel());
             let (stream, answer) = raw_hello(&path, offered);

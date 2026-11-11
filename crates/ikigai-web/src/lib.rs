@@ -3105,7 +3105,7 @@ pub fn error_status(e: &ikigai_core::Error) -> u16 {
         Error::MissingArgument(_) | Error::InvalidArgument { .. } => 400,
         Error::Conflict(_) => 409,
         Error::Timeout(_) => 504,
-        Error::Unavailable(_) => 503,
+        Error::Unavailable(_) | Error::GaveUp { .. } => 503,
         Error::RetryAfter { .. } => 429,
         Error::OverBudget { .. } => 422,
         Error::Refused(_) => 502,
@@ -4352,6 +4352,14 @@ mod tests {
             Err(Error::Refused("api.example.com answered 401".into()))
         })
         .with_description(Description::new("refused").verb(Verb::Source));
+        let gave_up = FnEndpoint::new("gaveup", |_inv: &Invocation<'_>| {
+            Err(Error::GaveUp {
+                attempts: 9,
+                elapsed: std::time::Duration::from_secs(120),
+                detail: "down".into(),
+            })
+        })
+        .with_description(Description::new("gaveup").verb(Verb::Source));
         let slow = FnEndpoint::new("slow", |_inv: &Invocation<'_>| {
             Err(Error::Timeout("the origin did not answer in 30 s".into()))
         })
@@ -4775,6 +4783,7 @@ mod tests {
             .bind(Exact::new("urn:test:limited"), limited)
             .bind(Exact::new("urn:test:budget"), budget)
             .bind(Exact::new("urn:test:refused"), refused)
+            .bind(Exact::new("urn:test:gaveup"), gave_up)
             .bind(Exact::new("urn:test:slow"), slow)
             .bind(Exact::new("urn:test:readonly"), readonly)
             .bind(Exact::new("urn:test:noclock"), noclock)
@@ -5692,10 +5701,28 @@ mod tests {
     /// decide them: RetryAfter 429 with `Retry-After` in seconds rounded up, OverBudget 422,
     /// Refused 502, Timeout 504 (was 503), Unsupported 405 with `Allow` when it names a verb
     /// and 501 when it names a facility.
+    #[test]
+    fn gave_up_is_service_unavailable_without_a_retry_delay() {
+        let error = Error::GaveUp {
+            attempts: 9,
+            elapsed: std::time::Duration::from_secs(120),
+            detail: "down".into(),
+        };
+        assert_eq!(error_status(&error), 503);
+        assert_eq!(retry_after_seconds(&error), None);
+    }
+
     #[tokio::test]
     async fn the_failure_classes_answer_the_decided_statuses() {
         let addr = start().await;
         let get = |path: &str| format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n");
+        let gave_up = roundtrip(addr, &get("/test/gaveup")).await;
+        assert!(
+            gave_up.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+            "{gave_up}"
+        );
+        assert!(!gave_up.contains("Retry-After"), "{gave_up}");
+        assert!(gave_up.ends_with("down"), "{gave_up}");
         let limited = roundtrip(addr, &get("/test/limited")).await;
         assert!(
             limited.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),

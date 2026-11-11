@@ -59,7 +59,9 @@ pub use stream::{
 /// see the [`stream`] module. A v7 to v9 peer never sends a head, so it never
 /// meets a frame, and gets the collected answer or `OverBudget`
 /// ([`encode_reply_for_peer`]).
-pub const PROTOCOL_VERSION: u32 = 10;
+/// **v11 carries retry exhaustion** as [`WireError::GaveUp`] (variant 14), preserving
+/// attempts, elapsed time and detail. A v7 to v10 peer gets `Endpoint(display)`.
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// The oldest wire version this build still speaks. A hello (or ALPN id) in
 /// `MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION` is accepted and served AT THAT
@@ -79,7 +81,7 @@ const FAILURE_CLASSES_SINCE: u32 = 9;
 /// ```
 /// use ikigai_wire::{speaks, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
 /// assert!(speaks(7) && speaks(8) && speaks(9) && speaks(10));
-/// assert!(!speaks(6) && !speaks(11));
+/// assert!(!speaks(6) && !speaks(12));
 /// assert!(speaks(MIN_PROTOCOL_VERSION) && speaks(PROTOCOL_VERSION));
 /// ```
 pub fn speaks(version: u32) -> bool {
@@ -98,8 +100,8 @@ pub fn speaks(version: u32) -> bool {
 /// assert_eq!(answer_to(8), 8);
 /// assert_eq!(answer_to(9), 9);
 /// assert_eq!(answer_to(10), 10);
-/// assert_eq!(answer_to(6), 10);
-/// assert_eq!(answer_to(11), 10);
+/// assert_eq!(answer_to(6), 11);
+/// assert_eq!(answer_to(12), 11);
 /// ```
 pub fn answer_to(offered: u32) -> u32 {
     if speaks(offered) {
@@ -120,13 +122,14 @@ pub fn alpn() -> Vec<u8> {
 }
 
 /// Every ALPN id this build offers and accepts, NEWEST FIRST: the TLS handshake
-/// is the version gate on QUIC, and the preference order is what makes a v10
-/// pair choose 10 while a v9, v8 or v7 peer still finds its own.
+/// is the version gate on QUIC, and the preference order is what makes a v11
+/// pair choose 11 while a v10, v9, v8 or v7 peer still finds its own.
 ///
 /// ```
 /// assert_eq!(
 ///     ikigai_wire::alpns(),
 ///     vec![
+///         b"ikigai/11".to_vec(),
 ///         b"ikigai/10".to_vec(),
 ///         b"ikigai/9".to_vec(),
 ///         b"ikigai/8".to_vec(),
@@ -543,6 +546,14 @@ pub enum WireError {
         verb: Option<ikigai_core::Verb>,
         detail: String,
     },
+    /// Transient: retry exhaustion. Since v11 — variant **14**: attempts, elapsed
+    /// seconds and nanoseconds (serde's Duration layout), then detail. Older peers
+    /// receive `Endpoint(display)`, retaining their previous untyped behavior.
+    GaveUp {
+        attempts: u32,
+        elapsed: std::time::Duration,
+        detail: String,
+    },
 }
 
 impl WireError {
@@ -553,6 +564,7 @@ impl WireError {
     /// back to it. A peer older than v9 cannot decode the five failure-class variants,
     /// so each goes as `Endpoint(display)`, byte-identical to what a v8 server sends for
     /// the same core error (its `From<&Error>` fell back to `Endpoint(other.to_string())`).
+    /// A peer older than v11 receives retry exhaustion as `Endpoint(display)` too.
     /// Everything else passes through unchanged.
     ///
     /// ```
@@ -572,6 +584,10 @@ impl WireError {
     /// ```
     pub fn for_peer(self, peer_version: u32) -> WireError {
         match self {
+            WireError::GaveUp { .. } if peer_version < 11 => {
+                let core: ikigai_core::Error = self.into();
+                WireError::Endpoint(core.to_string())
+            }
             WireError::Conflict(message) if peer_version < CONFLICT_SINCE => {
                 WireError::Endpoint(format!("conflict: {message}"))
             }
@@ -600,6 +616,15 @@ impl From<&ikigai_core::Error> for WireError {
             E::MissingArgument(name) => WireError::MissingArgument(name.clone()),
             E::InvalidArgument { name, detail } => WireError::InvalidArgument {
                 name: name.clone(),
+                detail: detail.clone(),
+            },
+            E::GaveUp {
+                attempts,
+                elapsed,
+                detail,
+            } => WireError::GaveUp {
+                attempts: *attempts,
+                elapsed: *elapsed,
                 detail: detail.clone(),
             },
             E::Endpoint(message) => WireError::Endpoint(message.clone()),
@@ -643,6 +668,15 @@ impl From<WireError> for ikigai_core::Error {
             },
             WireError::MissingArgument(name) => E::MissingArgument(name),
             WireError::InvalidArgument { name, detail } => E::InvalidArgument { name, detail },
+            WireError::GaveUp {
+                attempts,
+                elapsed,
+                detail,
+            } => E::GaveUp {
+                attempts,
+                elapsed,
+                detail,
+            },
             WireError::Endpoint(message) => E::Endpoint(message),
             WireError::Denied(message) => E::Denied(message),
             WireError::NotFound(message) => E::NotFound(message),
@@ -717,6 +751,49 @@ fn codec_error(error: postcard::Error) -> io::Error {
 mod tests {
     use super::*;
     use ikigai_core::{ArgRef, Iri, ReprType, Verb};
+
+    #[test]
+    fn gave_up_round_trip_preserves_transient_class_and_fields() {
+        let elapsed = std::time::Duration::new(120, 123_456_789);
+        let original = ikigai_core::Error::GaveUp {
+            attempts: 9,
+            elapsed,
+            detail: "down".into(),
+        };
+        let reply = Reply::ErrorTyped(WireError::from(&original));
+        let decoded: Reply = decode(&encode(&reply).unwrap()).unwrap();
+        let Reply::ErrorTyped(wire) = decoded else {
+            panic!("expected typed error")
+        };
+        let rebuilt: ikigai_core::Error = wire.into();
+        assert_eq!(rebuilt.class(), ikigai_core::FailureClass::Transient);
+        assert_eq!(rebuilt.attempts(), Some(9));
+        assert!(matches!(rebuilt, ikigai_core::Error::GaveUp {
+            attempts: 9, elapsed: got, detail
+        } if got == elapsed && detail == "down"));
+    }
+
+    #[test]
+    fn gave_up_downgrades_for_every_older_peer() {
+        let original = ikigai_core::Error::GaveUp {
+            attempts: 9,
+            elapsed: std::time::Duration::from_secs(120),
+            detail: "down".into(),
+        };
+        for version in MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION {
+            let reply = Reply::ErrorTyped(WireError::from(&original));
+            let decoded: Reply =
+                decode(&encode_reply_for_peer(reply.clone(), version).unwrap()).unwrap();
+            if version < 11 {
+                assert_eq!(
+                    decoded,
+                    Reply::ErrorTyped(WireError::Endpoint(original.to_string()))
+                );
+            } else {
+                assert_eq!(decoded, reply);
+            }
+        }
+    }
 
     fn request() -> Request {
         Request::new(Verb::Source, Iri::parse("urn:test:upper").unwrap())
@@ -866,7 +943,7 @@ mod tests {
         assert_eq!(alpns().first(), Some(&alpn()), "newest first");
         assert_eq!(version_of_alpn(b"ikigai/6"), None);
         assert_eq!(version_of_alpn(b"ikigai/10"), Some(10));
-        assert_eq!(version_of_alpn(b"ikigai/11"), None);
+        assert_eq!(version_of_alpn(b"ikigai/12"), None);
         assert_eq!(version_of_alpn(b"ikigai/0"), None);
         assert_eq!(version_of_alpn(b"ikigai/+8"), None);
         assert_eq!(version_of_alpn(b"h3"), None);

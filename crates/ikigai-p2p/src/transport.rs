@@ -21,7 +21,7 @@ pub use libp2p::{Multiaddr, PeerId};
 /// transport SPEAKS — a mismatched peer fails protocol negotiation, just as a mismatched ALPN
 /// fails the QUIC handshake. (A `&'static str` because `StreamProtocol::new` wants one; a test
 /// pins it.) ⚠ It stays at 9, below the wire's [`PROTOCOL_VERSION`](ikigai_wire::PROTOCOL_VERSION)
-/// of 10: v10 is the stream frames, which this transport does not carry yet (it reads each
+/// of 11: v10 added the stream frames, which this transport does not carry yet (it reads each
 /// message whole; ledger #2452), and a peer must never be told a version whose frames it
 /// would then be refused.
 pub const WIRE_PROTOCOL: &str = "/ikigai/wire/9";
