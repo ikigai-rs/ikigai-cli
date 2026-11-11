@@ -325,6 +325,7 @@ impl Front {
         let peer = ikigai_quic::PeerIdentity {
             segment_id: format!("token-{}", binding.id),
             fingerprint: binding.client.clone(),
+            source_address: None,
         };
         (self.minter)(&peer).ok_or_else(|| {
             crate::diagnose(format_args!(

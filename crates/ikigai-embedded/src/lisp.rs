@@ -145,7 +145,7 @@ fn settings() -> &'static Result<Settings, String> {
         settings_from(&crate::config::entries_under("lisp.")).map_err(|e| {
             format!(
                 "{e} (in {}; see the `lisp.*` keys in ikigai-cli's README)",
-                crate::config::config_path().display()
+                crate::config::config_path_shown()
             )
         })
     })
@@ -187,7 +187,10 @@ fn prepare_steel_home_parent() {
         {
             return;
         }
-        if let Some(parent) = xdg::BaseDirectories::new().data_home {
+        if let Some(parent) = xdg::BaseDirectories::new()
+            .data_home
+            .filter(|parent| parent.is_absolute())
+        {
             // Best effort: a read-only home must not prevent pure evaluation.
             let _ = std::fs::create_dir_all(parent);
         }

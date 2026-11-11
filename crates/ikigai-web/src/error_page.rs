@@ -88,7 +88,7 @@ fn from_a_browser(req: &HttpRequest) -> bool {
 /// Whether `Accept` asks for HTML over plain text: `text/html` NAMED (a wildcard tolerates
 /// HTML without asking for it, and is what curl sends), at a quality above zero and above
 /// `text/plain`'s. A tie stays plain, the answer this door gave before pages existed.
-fn wants_html(accept: Option<&str>) -> bool {
+pub(crate) fn wants_html(accept: Option<&str>) -> bool {
     let Some(accept) = accept else {
         return false;
     };
@@ -111,17 +111,24 @@ fn wants_html(accept: Option<&str>) -> bool {
 /// </html>
 /// ```
 pub(crate) fn page(status: u16, reason: &str, message: &str) -> String {
-    let title = html_text(format!("{status} {reason}").trim());
+    let title = format!("{status} {reason}");
     let message = message.trim();
     let paragraph = if message.is_empty() {
         String::new()
     } else {
         format!("<p>{}</p>", html_text(message))
     };
+    shell(title.trim(), &paragraph)
+}
+
+/// The page's shape, shared with the redirect answer's page: `title` becomes the title and
+/// the one heading (escaped here), and `content` is already markup.
+pub(crate) fn shell(title: &str, content: &str) -> String {
+    let title = html_text(title);
     format!(
         "<!DOCTYPE html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-         <title>{title}</title></head>\n<body><main><h1>{title}</h1>{paragraph}</main></body>\n</html>\n"
+         <title>{title}</title></head>\n<body><main><h1>{title}</h1>{content}</main></body>\n</html>\n"
     )
 }
 

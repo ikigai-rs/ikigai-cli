@@ -315,7 +315,7 @@ pub fn max_challenges_from(value: Option<&str>) -> std::result::Result<usize, St
 pub fn check_config() -> std::result::Result<(), String> {
     max_challenges_from(crate::config::get(MAX_CHALLENGES_KEY).as_deref())
         .map(|_| ())
-        .map_err(|e| format!("{e} (in {})", crate::config::config_path().display()))
+        .map_err(|e| format!("{e} (in {})", crate::config::config_path_shown()))
 }
 
 /// The bound in force: the config home's `passkey.max_challenges`, read once. An invalid value

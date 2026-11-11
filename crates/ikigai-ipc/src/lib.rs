@@ -29,6 +29,7 @@
 
 mod accept;
 
+use std::ffi::OsString;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -538,10 +539,9 @@ pub fn serve_shared_on(kernel: Arc<Kernel>, listener: UnixListener) -> io::Resul
 ///   One past it is answered, not dropped: the door reads its hello and its first call, each
 ///   within a second, and answers that call with a typed
 ///   [`Unavailable`](Error::Unavailable) naming the cap, a transient a Retry overlay acts on.
-///   (A connection closed without a word reads to the client as a server that predates wire
-///   v6, which would misreport a busy door.) That exchange runs on the accept loop, so while
-///   the door is full it takes at most about two seconds per refused connection, and it spawns
-///   no thread.
+///   This distinguishes a busy door from a lost connection. That exchange runs on the accept
+///   loop, so while the door is full it takes at most about two seconds per refused connection,
+///   and it spawns no thread.
 /// - **A hello timeout.** A connection that has not sent its hello within
 ///   `limits.hello_timeout()` is closed.
 /// - **An idle timeout.** A connection silent between calls for `limits.idle_timeout()` is
@@ -869,8 +869,8 @@ pub fn connect_with_timeout(path: &Path, timeout: Option<Duration>) -> io::Resul
 /// The full connect: dial, then exchange the version [`Hello`] — REQUIRED
 /// since v7 (the v6 legacy-reconnect tolerance is gone). A v7 server is met by
 /// redialing at 7 (see the private `handshake`). A peer outside the spoken
-/// range errors naming BOTH versions; a peer that hangs up on the hello
-/// predates v6 entirely and is refused with that diagnosis.
+/// range errors naming BOTH versions; a peer that hangs up on the hello is
+/// unavailable (it may be restarting or predate v6). No legacy reconnect is attempted.
 ///
 /// The server must run as this user; [`connect_expecting`] names another account as well. Every
 /// dial checks that before it sends anything, so a call's arguments never reach a server under
@@ -1037,8 +1037,8 @@ fn hello_at(
                 "the kernel server answered the version hello with something else entirely",
             )),
         },
-        // Silence is a HANG (the server may be overloaded — do not misdiagnose
-        // it as ancient); a hang-up (EOF/reset) is the pre-v6 signature.
+        // Silence is a timeout; a hang-up is unavailable. A pre-v6 server also
+        // closes on a hello it cannot decode, so EOF alone cannot prove its version.
         Err(e)
             if matches!(
                 e.kind(),
@@ -1050,14 +1050,15 @@ fn hello_at(
                 "no answer to the version hello within the deadline (server hung or overloaded)",
             ))
         }
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
+        Err(e) if is_dead_connection(&e) => Err(io::Error::new(
+            e.kind(),
             format!(
-                "the kernel server at {} hung up on the version hello — it predates wire v6 \
-                 and cannot speak v{PROTOCOL_VERSION}; update the server",
+                "the kernel server at {} closed during the version hello (it may be restarting \
+                 or predate wire v6); retry or update the server",
                 path.display()
             ),
         )),
+        Err(e) => Err(e),
     }
 }
 
@@ -2054,16 +2055,15 @@ fn dispatch(kernel: &Kernel, call: Call, admission: &Admission) -> Reply {
 
 /// The default per-user socket path: `<runtime-dir>/ikigai/kernel.sock`, with the
 /// `ikigai` directory created `0700` so only this user can reach the socket.
-/// `<runtime-dir>` is `$XDG_RUNTIME_DIR` when set, else `$TMPDIR`/`/tmp` plus the
-/// uid. `None` if the directory can't be created.
+/// `<runtime-dir>` is `$XDG_RUNTIME_DIR`, else `$TMPDIR` or `/tmp` plus the uid, each only
+/// when absolute, so it is never relative to the working directory. `None` if the directory
+/// can't be created.
 pub fn default_socket_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let tmp =
-                std::env::var_os("TMPDIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
-            tmp.join(format!("ikigai-{}", own_uid()))
-        });
+    let base = runtime_dir(
+        std::env::var_os("XDG_RUNTIME_DIR"),
+        std::env::var_os("TMPDIR"),
+        own_uid(),
+    );
     let dir = base.join("ikigai");
     // ambient: fs: creates only `<runtime-dir>/ikigai`, the per-user socket directory, for `ikigai serve`/`ikigai --connect` when no socket path is given
     #[allow(clippy::disallowed_methods)]
@@ -2074,6 +2074,22 @@ pub fn default_socket_path() -> Option<PathBuf> {
     let restricted = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     restricted.ok()?;
     Some(dir.join("kernel.sock"))
+}
+
+/// `$XDG_RUNTIME_DIR` when it is absolute, else `$TMPDIR` when it is absolute, else `/tmp`,
+/// the last two plus the uid. An empty or relative value counts as unset, as the XDG base
+/// directory spec says.
+fn runtime_dir(xdg_runtime: Option<OsString>, tmpdir: Option<OsString>, uid: u32) -> PathBuf {
+    let absolute = |value: Option<OsString>| {
+        value
+            .map(PathBuf::from)
+            .filter(|path: &PathBuf| path.is_absolute())
+    };
+    absolute(xdg_runtime).unwrap_or_else(|| {
+        absolute(tmpdir)
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join(format!("ikigai-{uid}"))
+    })
 }
 
 /// This process's real user id.
@@ -2159,6 +2175,24 @@ mod tests {
         Kernel::new(Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),
         ))
+    }
+
+    /// An empty or relative runtime directory counts as unset, so the default socket is
+    /// never under the working directory.
+    #[test]
+    fn the_runtime_dir_is_always_absolute() {
+        let dir = |xdg: Option<&str>, tmp: Option<&str>| {
+            runtime_dir(xdg.map(Into::into), tmp.map(Into::into), 7)
+        };
+        assert_eq!(dir(Some("/run/u"), Some("/t")), PathBuf::from("/run/u"));
+        assert_eq!(dir(None, Some("/t")), PathBuf::from("/t/ikigai-7"));
+        assert_eq!(dir(None, None), PathBuf::from("/tmp/ikigai-7"));
+        for empty_or_relative in ["", "run", "./run", "../run"] {
+            let unset = Some(empty_or_relative);
+            assert_eq!(dir(unset, Some("/t")), PathBuf::from("/t/ikigai-7"));
+            assert_eq!(dir(unset, unset), PathBuf::from("/tmp/ikigai-7"));
+            assert_eq!(dir(None, unset), PathBuf::from("/tmp/ikigai-7"));
+        }
     }
 
     fn socket_path(name: &str) -> PathBuf {
@@ -2727,6 +2761,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
         // A "server" that accepts the connection but never replies.
+        let (done, hold) = std::sync::mpsc::channel();
         let server = thread::spawn(move || {
             if let Ok((stream, _)) = listener.accept() {
                 let mut s = &stream;
@@ -2738,7 +2773,8 @@ mod tests {
                         mode: HelloMode::Verbatim,
                     },
                 );
-                std::thread::sleep(Duration::from_millis(400)); // hold it, write nothing
+                // Keep the stream and listener alive through the client's timeout.
+                let _ = hold.recv();
                 drop(stream);
             }
         });
@@ -2758,6 +2794,7 @@ mod tests {
         assert!(err.is_transient());
 
         drop(client);
+        done.send(()).unwrap();
         server.join().unwrap();
         let _ = std::fs::remove_file(&path);
     }
@@ -2770,6 +2807,7 @@ mod tests {
         let path = socket_path("mount-hang");
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
+        let (done, hold) = std::sync::mpsc::channel();
         let server = thread::spawn(move || {
             if let Ok((stream, _)) = listener.accept() {
                 let mut s = &stream;
@@ -2781,7 +2819,9 @@ mod tests {
                         mode: HelloMode::Verbatim,
                     },
                 );
-                std::thread::sleep(Duration::from_millis(400));
+                // Mount construction probes the peer and can redial after a timeout.
+                // Keep the listener too: queued hellos must time out, not see EOF.
+                let _ = hold.recv();
                 drop(stream);
             }
         });
@@ -2798,12 +2838,14 @@ mod tests {
         // error — so a Retry/Failover overlay above this kernel would act on it, the
         // whole point of the structured Resolver boundary.
         let err = Resolver::issue_as(&kernel, upper("hi"), &Capability::root()).unwrap_err();
+        assert!(matches!(err, Error::Timeout(_)), "{err:?}");
         assert!(
             err.is_transient(),
             "the mount forwards the hang as transient: {err:?}"
         );
 
         drop(kernel);
+        done.send(()).unwrap();
         server.join().unwrap();
         let _ = std::fs::remove_file(&path);
     }
@@ -2863,30 +2905,88 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// v7: a client dialing a pre-hello server gets a CLEAR refusal naming the
-    /// diagnosis — no silent legacy reconnect.
+    /// A pre-v6 server decodes a hello as a Call, fails, and closes without a reply.
+    /// That is indistinguishable from a restarting server, so it is retryable,
+    /// with an old server mentioned as a possibility. No legacy reconnect.
     #[test]
-    fn a_pre_hello_server_is_diagnosed_not_tolerated() {
+    fn a_pre_hello_server_is_refused_without_claiming_its_version() {
         let path = socket_path("legacy-server");
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
-        // A ≤v5 server: cannot decode the hello, hangs up silently.
+        // The pre-v6 read loop (479af94^): read_message::<_, Call>, return on Err.
+        // The Call variants are append-only, so the current decoder also rejects
+        // the hello's IKWH magic as an unknown variant, just as the v5 decoder did.
         let server = thread::spawn(move || {
             let Ok((stream, _)) = listener.accept() else {
                 return;
             };
             let mut s = &stream;
-            let _ = read_frame(&mut s);
+            let err = read_message::<_, Call>(&mut s).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         });
 
-        let message = match connect(&path) {
-            Err(err) => err.to_string(),
-            Ok(_) => panic!("a pre-hello server must be refused"),
-        };
-        assert!(message.contains("predates wire v6"), "{message}");
+        let err = connect(&path)
+            .err()
+            .expect("a pre-hello server must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("may be restarting or predate wire v6"),
+            "{message}"
+        );
+        assert!(matches!(wire_error(err), Error::Unavailable(_)));
 
         server.join().unwrap();
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A current server can close mid-hello too: EOF does not prove its version.
+    #[test]
+    fn a_server_closing_mid_hello_is_transient() {
+        let path = socket_path("hello-close");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let hello = decode_hello(&read_frame(&mut stream).unwrap()).unwrap();
+            assert_eq!(hello.version, PROTOCOL_VERSION);
+            // A modern server starts its answer, then shuts down before completing it.
+            use std::io::Write;
+            stream.write_all(&9_u32.to_be_bytes()).unwrap();
+            stream.write_all(b"IKWH").unwrap();
+        });
+
+        let err = connect(&path).err().expect("an incomplete hello must fail");
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            matches!(wire_error(err), Error::Unavailable(_)),
+            "a server closing during its hello must be retryable"
+        );
+    }
+
+    #[test]
+    fn a_server_closing_during_the_redial_hello_is_unavailable() {
+        let path = socket_path("redial-hello-close");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let hello = decode_hello(&read_frame(&mut stream).unwrap()).unwrap();
+            write_hello(&mut stream, &hello).unwrap();
+            // Close after receiving a read-only call: the client will redial and replay.
+            let _ = read_message::<_, Call>(&mut stream).unwrap();
+            drop(stream);
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(decode_hello(&read_frame(&mut stream).unwrap()).is_some());
+            // Restart before answering the redial's hello.
+        });
+
+        let client = connect(&path).unwrap();
+        let err = client.issue(upper("hi")).unwrap_err();
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(err, Error::Unavailable(_)), "{err:?}");
+        assert!(err.is_transient());
     }
 
     /// A version MISMATCH against a hello-speaking server errors immediately,

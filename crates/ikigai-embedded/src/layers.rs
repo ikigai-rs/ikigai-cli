@@ -208,7 +208,7 @@ pub fn state_dir(flag: Option<&Path>) -> Result<(PathBuf, StateSource), String> 
         flag,
         configured.as_deref(),
         crate::config::config_home().as_deref(),
-        std::env::var_os("HOME").as_deref().map(Path::new),
+        crate::config::user_home().as_deref(),
         instance,
     )
 }
@@ -261,7 +261,7 @@ pub fn key_path(flag: Option<&Path>) -> Result<(PathBuf, KeySource), String> {
         flag,
         configured.as_deref(),
         crate::config::config_home().as_deref(),
-        std::env::var_os("HOME").as_deref().map(Path::new),
+        crate::config::user_home().as_deref(),
     )
 }
 

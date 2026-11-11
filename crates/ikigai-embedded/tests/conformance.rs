@@ -383,6 +383,7 @@ fn fixture_home() -> &'static Path {
                     prefix: "urn:iki:store:".to_string(),
                     target: "/tmp/conformance.sock".to_string(),
                     cert_dir: Some("/tmp/conformance/quic".to_string()),
+                    pending: false,
                 },
             ]),
             clients: vec![ikigai_embedded::posture::TrustedIdentity {

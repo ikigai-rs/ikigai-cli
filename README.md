@@ -64,9 +64,17 @@ Across a **network**, the same `serve` / `--connect` work over QUIC (built with
 
 ```bash
 ikigai cert generate                       # writes server/client certs to your config dir
-ikigai serve quic://0.0.0.0:4433           # run a QUIC kernel server
+ikigai serve quic://0.0.0.0:4433           # run a QUIC kernel server (needs clients.json)
 ikigai --connect quic://host:4433          # attach the REPL over QUIC
 ```
+
+**A QUIC door needs an enrollment.** It starts only when `<config home>/clients.json` (or the
+file `--clients` names) enrolls client certificates: each fingerprint maps to a grant in
+`grants.json`, and a certificate with no entry is refused. `ikigai cert add-client` prints the
+fingerprint to enroll. Without the file the door stops at start and names it. To serve every
+trusted certificate without one, start the door with `--allow-unenrolled`: each certificate is
+then served under the one `--cap` ceiling, or, with no `--cap`, in its own writable workspace,
+and the door prints a warning saying so. (Before this release that posture was the default.)
 
 A `quic://host:port` target selects QUIC; a plain path stays a Unix socket. Each
 side presents its own self-signed cert and pins the exact peer cert — no CA. On
@@ -317,6 +325,22 @@ The scheme is configurable — set `keybindings` from inside the REPL with
 (falling back to `~/.config/ikigai/config.toml` — the one shared config home, the
 same file the host reads `mail.*`, `mount` and `scheduler` from).
 
+`config.toml` holds flat `key = value` lines, one setting per line; `mount` and the other
+repeating keys take one line each. A value is a `"basic"` or `'literal'` TOML string, or a
+bare number or word, and a `#` after it starts a comment. A `[table]` header, a line with no
+`=`, an unclosed string, or anything after a string's closing quote stops startup with an
+`ikigai:` line naming the file and the line number, whichever program's key the line holds.
+
+The config home is shared with other programs, so the host checks keys only in its own
+families: a bare key (`files`, `store`, `mount`, `scheduler`, `keybindings`, ...), a key under
+`browse`, `bayes`, `cache`, `call`, `describe`, `http`, `ipc`, `layers`, `lisp`, `mail`,
+`passkey`, `quic` or `show`, and anything after one of the host's own instance names. An
+unknown key there (`mounts` for `mount`, `http.timeut`) stops startup the same way. The host's
+instance names are the one it runs under (`--name`) and the mode defaults `repl`, `serve`,
+`daemon` and `mcp`; any other first segment (`gonk.`, `web.`) is another program's namespace,
+and its keys are that program's to read and check. An instance named after another program
+(`--name gonk`) reads that program's keys as its own, so pick a name of its own.
+
 `--config-home <dir>` names the config home outright, in every mode (REPL, `-c`, `serve`,
 `mcp`, `--daemon`, `--connect`, `cert`), so a scratch run needs no environment variable:
 `ikigai --config-home ./scratch -c config`. `<dir>` IS the config home (it holds
@@ -324,6 +348,12 @@ same file the host reads `mail.*`, `mount` and `scheduler` from).
 directory. **The flag wins**: when both it and `XDG_CONFIG_HOME` are set, the environment is
 not read for the config home. It moves the config home only; the data home (`~/.ikigai`)
 stays put.
+
+An empty or relative `XDG_CONFIG_HOME` or `XDG_RUNTIME_DIR` counts as unset, as the XDG
+spec says, and `HOME` and `TMPDIR` are held to the same rule. A host with no usable config
+home stops with a message naming the variables and `--config-home`, and one with no usable
+home for its default workspace stops with a message naming `--files`; neither path is ever
+taken from the working directory.
 
 ```toml
 keybindings = "emacs"   # "emacs" (default) · "vi" · "native"
@@ -505,6 +535,14 @@ the one this process builds; `<target>` is a Unix socket path, `quic://host:port
 they FOLLOW, so two peers never share a certificate set. The config home's `mount` lines
 (`mount = "override urn:x:=quic://host:4433 ~/certs/x"`) say the same thing for the whole
 machine.
+
+`--mount` and `--override` dial while the process starts, and a peer that does not answer
+stops the start. On `ikigai serve`, `--pending` after one of them (`ikigai serve <s> --mount
+urn:x:=/tmp/x.sock --pending`) defers that mount's dial to first use instead: the host starts
+without the peer, a read answers `Unavailable` until the peer does, and no restart is needed.
+The startup banner's line for such a mount says `[pending: …]`. A `list` that found the peer
+absent does not look again for 30 seconds. A served host's mount flags go after the word
+`serve`; `ikigai --mount … serve <s>` is refused as an unknown argument.
 
 An alias mount at a whole first segment (`--mount urn:quakes:=…`) strips it: the peer
 receives `urn:quakes:regions` as `urn:regions`. An alias mount DEEPER than one segment
@@ -1202,3 +1240,42 @@ introduced. The grants file's existing account protection checks still apply.
 Socket hosts can reuse the account-to-admission policy through
 `ikigai_embedded::socket` with the `ipc` feature enabled. `grants_path()` now
 returns `Result<Option<PathBuf>, String>` so hosts can report retired configuration.
+
+### Client enrollment configuration
+
+`IKIGAI_CLIENTS` is no longer supported. A set variable, including an empty one, stops
+host startup with a migration message; unset it and pass `--clients <file>` instead. The
+flag applies to `ikigai serve quic://…`, `ikigai layers-token` and `ikigai cert add-client`,
+and any other mode refuses it. Without it, the enrollment is read from
+`<config home>/clients.json`, which may be absent. A file named by `--clients` must exist:
+a missing one stops the door, and if it goes away while the door serves, every client is
+refused until it is back.
+
+`ikigai_embedded::clients::clients_path()` now returns
+`Result<Option<PathBuf>, String>`, and `clients::set_clients_path` sets the explicit path.
+
+## Several tools on one machine: a served host with mounts, under one retry policy
+
+The recommended shape for several tools on one machine is ONE local served host that mounts
+the hub (`ikigai serve <socket> --mount urn:hub:=quic://hub:4433`), with every tool connecting
+to that host. Its link to the hub then rides out an outage the same way for every tool, under
+one circuit breaker. Configure it in `config.toml` (every key optional; no key means no policy,
+today's behavior):
+
+```toml
+connect.retry.limit_minutes = 2            # overall time limit for one call (default 1)
+connect.retry.initial_backoff_ms = 100     # first backoff, doubling (default 100)
+connect.retry.max_backoff_ms = 10000       # largest backoff (default 10000)
+connect.retry.jitter = true                # full jitter (default true)
+connect.retry.breaker_threshold = 5        # consecutive failures that open a circuit (default: no breaker)
+connect.retry.breaker_cooloff_seconds = 30 # how long a circuit stays open (default 30)
+```
+
+The policy covers `--mount` and `--override` mounts (one shared breaker for all of them) and
+`--connect quic://…` (through a cache-less issuer, so reads stay as fresh as without it; the
+first dial and admission check ride the same policy, so a client started while its hub is down
+waits for it within the limit, while a refusal such as `Denied` still fails at once). A
+`--prefer` mount is left as it was: it already falls back to the local binding. Only what is
+safe is resent: reads, calls the transport proved never ran, and Sinks whose contract declares a
+resend safe (with the declared key present). A final failure is the typed `GaveUp`, which names
+the attempts and the elapsed time.
