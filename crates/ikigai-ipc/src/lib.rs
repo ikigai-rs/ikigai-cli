@@ -543,7 +543,8 @@ pub fn serve_shared_on(kernel: Arc<Kernel>, listener: UnixListener) -> io::Resul
 ///   loop, so while the door is full it takes at most about two seconds per refused connection,
 ///   and it spawns no thread.
 /// - **A hello timeout.** A connection that has not sent its hello within
-///   `limits.hello_timeout()` is closed.
+///   `limits.hello_timeout()` is closed. The bound is on the whole hello, not on each read,
+///   so a peer that trickles its hello cannot hold its place past it.
 /// - **An idle timeout.** A connection silent between calls for `limits.idle_timeout()` is
 ///   closed, and so is one whose reply cannot be written for that long.
 ///
@@ -1796,16 +1797,31 @@ fn handle_connection(kernel: &Kernel, stream: UnixStream) {
 
 /// Serve one connection: the version hello first, then calls until the peer
 /// hangs up, falls silent past `limits` (see [`serve_shared_on_with`]), or sends a wire error.
+///
+/// ★ The hello (reading it and answering it) is bounded by `limits.hello_timeout()` IN ALL,
+/// a [`Deadline`], not a socket timeout (ledger #3478). `SO_RCVTIMEO` bounds ONE read, so
+/// peers that trickled their hellos a byte at a time, each inside the timeout, held their
+/// places for as long as they liked, and enough of them filled the cap: every later client,
+/// the owner included, was refused as over capacity.
+///
+/// The calls after the hello keep the idle timeout per read. An admitted peer may hold its
+/// place indefinitely by making real calls inside the idle timeout, so bounding a call's
+/// frame in total would take nothing from a trickler and would cut off a slow honest one.
 fn serve_connection(kernel: &Kernel, stream: UnixStream, limits: &Limits, admission: &Admission) {
-    // Ignored on failure: a socket the peer already closed refuses `setsockopt` on macOS, and
-    // the read below reports that death properly.
-    let _ = stream.set_read_timeout(Some(limits.hello_timeout));
-    let _ = stream.set_write_timeout(Some(limits.idle_timeout));
-    let mut stream = &stream;
-    let Some(peer_version) = answer_hello(&mut stream) else {
+    let hello = Deadline::new(limits.hello_timeout, false);
+    let peer_version = answer_hello(&mut Bounded {
+        stream: &stream,
+        standing: Some(limits.hello_timeout),
+        deadline: Some(&hello),
+    });
+    let Some(peer_version) = peer_version else {
         return;
     };
+    // Ignored on failure: a socket the peer already closed refuses `setsockopt` on macOS, and
+    // the read below reports that death properly.
     let _ = stream.set_read_timeout(Some(limits.idle_timeout));
+    let _ = stream.set_write_timeout(Some(limits.idle_timeout));
+    let mut stream = &stream;
     loop {
         // EOF, a malformed frame, or silence past the idle timeout ends the session.
         let Ok(payload) = read_frame(&mut stream) else {
@@ -2509,6 +2525,61 @@ mod tests {
             matches!(read, Ok(0)),
             "the door hangs up on a connection that says nothing: {read:?}"
         );
+        remove_socket(&path);
+    }
+
+    /// ledger #3478: an ADMITTED connection's hello was bounded only by `SO_RCVTIMEO`, which
+    /// bounds ONE read. Peers that trickled their hellos a byte at a time, each inside the hello
+    /// timeout, held their places for as long as they liked, and with the cap full every later
+    /// client, the owner included, was refused as over capacity. The hello is now bounded in all.
+    #[test]
+    fn tricklers_inside_the_cap_do_not_hold_their_places_past_the_hello_timeout() {
+        use std::io::Write;
+        let path = socket_path("hello-trickle");
+        let hello_timeout = Duration::from_millis(500);
+        serve_limited(
+            &path,
+            Limits::default()
+                .with_max_connections(2)
+                .with_hello_timeout(hello_timeout),
+        );
+
+        // Fill the cap: each trickler announces a 1 KiB hello frame and sends it a byte every
+        // 100ms (each read returns well inside the hello timeout), for up to 12 seconds.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tricklers: Vec<_> = (0..2)
+            .map(|_| {
+                let mut trickler = UnixStream::connect(&path).unwrap();
+                trickler.write_all(&1024u32.to_be_bytes()).unwrap();
+                let stop = Arc::clone(&stop);
+                thread::spawn(move || {
+                    for _ in 0..120 {
+                        if stop.load(Ordering::SeqCst) || trickler.write_all(&[0]).is_err() {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                })
+            })
+            .collect();
+
+        // Well past the hello bound, both places must be free again: a client is served, not
+        // refused as over capacity.
+        thread::sleep(hello_timeout * 3);
+        let served = connect(&path)
+            .map_err(wire_error)
+            .and_then(|client| client.issue(upper("owner")));
+        stop.store(true, Ordering::SeqCst);
+        for trickling in tricklers {
+            let _ = trickling.join();
+        }
+        match served {
+            Ok((representation, _)) => assert_eq!(representation.bytes, b"OWNER"),
+            Err(e) => panic!(
+                "tricklers held the cap for over {:?} (hello timeout {hello_timeout:?}): {e:?}",
+                hello_timeout * 3
+            ),
+        }
         remove_socket(&path);
     }
 
