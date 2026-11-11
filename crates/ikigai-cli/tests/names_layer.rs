@@ -305,7 +305,13 @@ fn edits_to_the_query_file_and_the_names_file_recompute() {
         "urn:quakes:count = source urn:json:query src=<urn:file:quakes.json> q=\".type\"\n",
     )
     .expect("edit the names");
-    until("source urn:quakes:count", "\"FeatureCollection\"");
+    // The rebound query offers a text face, selected by the terminal's default.
+    until("source urn:quakes:count", "FeatureCollection");
+    // An explicit JSON read still keeps the JSON string's quotes after rebinding.
+    until(
+        "source urn:quakes:count as=application/json",
+        "\"FeatureCollection\"",
+    );
 
     drop(stdin);
     let _ = child.wait();
