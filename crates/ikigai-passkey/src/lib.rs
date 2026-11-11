@@ -25,9 +25,14 @@
 //! 1. the assertion names the credential we registered;
 //! 2. `clientDataJSON` is a `webauthn.get` for our exact `origin` and the exact `challenge` we
 //!    issued (the caller stores challenges single-use and short-lived — replay defense lives
-//!    there, since a verifier is stateless);
-//! 3. `authenticatorData`'s RP-ID hash is `SHA256("ikigai-rs.dev")`;
-//! 4. the **user-present** flag is set (and **user-verified**, if the policy demands the biometric);
+//!    there, since a verifier is stateless), made in a top-level page of that origin: an
+//!    assertion with `crossOrigin: true` or a `topOrigin` came from a frame another site embedded,
+//!    and is refused;
+//! 3. `authenticatorData` is exactly the shape its flags declare — the 37-byte header, with no
+//!    attested credential data, and trailing bytes only under the extensions (ED) flag — and its
+//!    RP-ID hash is `SHA256("ikigai-rs.dev")`;
+//! 4. the **user-present** flag is set (and **user-verified**, if the policy demands the
+//!    biometric), and backup-state is not set without backup-eligibility;
 //! 5. the signature counter has not regressed — a clone that reused a stolen key would show a
 //!    counter at or below the last one we saw;
 //! 6. the ECDSA-P256 signature verifies over `authenticatorData ‖ SHA256(clientDataJSON)`.
@@ -127,6 +132,15 @@ pub enum PasskeyError {
     BadSignature,
     /// The stored/registered public key could not be parsed.
     BadKey(String),
+    /// `clientDataJSON` says the ceremony ran in a cross-origin iframe (`crossOrigin: true`) or
+    /// names a `topOrigin`: another site framed our page. This relying party is never framed.
+    CrossOrigin,
+    /// The flags are an impossible state: backup-state (BS) set without backup-eligible (BE).
+    BadFlags,
+    /// `authenticatorData` is not the shape its flags declare: bytes after the header with no
+    /// extensions flag, attested credential data in an assertion, or an extensions flag with
+    /// nothing after the header.
+    BadAuthData,
 }
 
 impl std::fmt::Display for PasskeyError {
@@ -139,6 +153,17 @@ impl std::fmt::Display for PasskeyError {
 }
 
 impl std::error::Error for PasskeyError {}
+
+/// `rpIdHash(32) ‖ flags(1) ‖ signCount(4)`: the whole of an assertion's `authenticatorData`
+/// unless the extensions flag is set.
+const AUTH_DATA_HEADER: usize = 37;
+/// The `authenticatorData` flag bits (WebAuthn §6.1).
+const FLAG_UP: u8 = 0x01;
+const FLAG_UV: u8 = 0x04;
+const FLAG_BE: u8 = 0x08;
+const FLAG_BS: u8 = 0x10;
+const FLAG_AT: u8 = 0x40;
+const FLAG_ED: u8 = 0x80;
 
 /// One string field out of `clientDataJSON`, without pulling in a derive.
 fn client_field(json: &serde_json::Value, key: &str) -> Result<String, PasskeyError> {
@@ -175,21 +200,52 @@ pub fn verify(
     if client_field(&client, "challenge")? != policy.challenge_b64url {
         return Err(PasskeyError::WrongChallenge);
     }
+    // WebAuthn L3 §7.2: `crossOrigin: true` means the ceremony ran in an iframe that is not
+    // same-origin with its ancestors, and `topOrigin` names the page that embedded it. The
+    // `origin` is still ours then, and the signature genuine, so without this check a page on any
+    // site that frames ours (and is delegated `publickey-credentials-get`) could get a person to
+    // approve a decision there. This relying party is never framed, so both are refused. L2
+    // browsers may omit `crossOrigin`; absent is the same-origin case.
+    match client.get("crossOrigin") {
+        None | Some(serde_json::Value::Bool(false)) => {}
+        Some(serde_json::Value::Bool(true)) => return Err(PasskeyError::CrossOrigin),
+        Some(_) => return Err(PasskeyError::BadClientData),
+    }
+    if client.get("topOrigin").is_some() {
+        return Err(PasskeyError::CrossOrigin);
+    }
 
     // 3. authenticatorData: the RP-ID hash, the flags, and the counter.
     let auth = assertion.authenticator_data;
-    if auth.len() < 37 {
+    if auth.len() < AUTH_DATA_HEADER {
         return Err(PasskeyError::ShortAuthData);
+    }
+    let flags = auth[32];
+    // §6.1: attested credential data (AT) follows the header only in a registration, and
+    // extensions only when ED is set. With ED clear the data is exactly the header; with ED set
+    // there must be something after it. The extension map itself is not parsed: none is
+    // requested, nothing here reads one, and the signature covers its bytes, so there is no
+    // offset past the header for a malformed one to misalign.
+    let extensions = flags & FLAG_ED != 0;
+    if flags & FLAG_AT != 0
+        || (!extensions && auth.len() != AUTH_DATA_HEADER)
+        || (extensions && auth.len() == AUTH_DATA_HEADER)
+    {
+        return Err(PasskeyError::BadAuthData);
     }
     if auth[0..32] != Sha256::digest(policy.rp_id.as_bytes())[..] {
         return Err(PasskeyError::WrongRpId);
     }
-    let flags = auth[32];
-    if flags & 0x01 == 0 {
+    if flags & FLAG_UP == 0 {
         return Err(PasskeyError::UserNotPresent);
     }
-    if policy.require_user_verified && flags & 0x04 == 0 {
+    if policy.require_user_verified && flags & FLAG_UV == 0 {
         return Err(PasskeyError::UserNotVerified);
+    }
+    // L3 §7.2: "If the BE bit of the flags in authData is not set, verify that the BS bit is not
+    // set." A credential that cannot be backed up cannot be backed up.
+    if flags & FLAG_BE == 0 && flags & FLAG_BS != 0 {
+        return Err(PasskeyError::BadFlags);
     }
     let count = u32::from_be_bytes([auth[33], auth[34], auth[35], auth[36]]);
 
@@ -510,6 +566,265 @@ mod tests {
             ),
             Err(PasskeyError::BadSignature)
         );
+    }
+
+    /// Sign `client` with a well-formed UP|UV authData and verify it under the standard policy.
+    fn verify_client(client: &[u8]) -> Result<u32, PasskeyError> {
+        let a = Authenticator::new();
+        let auth = a.auth_data(RP_ID, 0x05, 7);
+        let sig = a.sign(&auth, client);
+        verify(&a.credential(6), &assertion(&auth, client, &sig), &policy())
+    }
+
+    #[test]
+    fn an_assertion_made_in_a_cross_origin_frame_is_refused() {
+        // WebAuthn L3 §7.2: `crossOrigin: true` means the ceremony ran in an iframe that is not
+        // same-origin with its ancestors, and `topOrigin` names the page that framed it. This
+        // relying party is never framed (the origin is exactly ours, nothing else), so a page on
+        // another site that frames ours and gets the person to tap must not yield a usable
+        // assertion, even though `origin` and the signature are genuine.
+        let framed = format!(
+            r#"{{"type":"webauthn.get","challenge":"{CHALLENGE}","origin":"{ORIGIN}","crossOrigin":true,"topOrigin":"https://evil.example"}}"#
+        );
+        assert_eq!(
+            verify_client(framed.as_bytes()),
+            Err(PasskeyError::CrossOrigin)
+        );
+        // `crossOrigin: true` alone (older browsers send no topOrigin) is refused too.
+        let framed = format!(
+            r#"{{"type":"webauthn.get","challenge":"{CHALLENGE}","origin":"{ORIGIN}","crossOrigin":true}}"#
+        );
+        assert_eq!(
+            verify_client(framed.as_bytes()),
+            Err(PasskeyError::CrossOrigin)
+        );
+        // A `topOrigin` with `crossOrigin` absent or false is not one we expect either.
+        let framed = format!(
+            r#"{{"type":"webauthn.get","challenge":"{CHALLENGE}","origin":"{ORIGIN}","topOrigin":"https://evil.example"}}"#
+        );
+        assert_eq!(
+            verify_client(framed.as_bytes()),
+            Err(PasskeyError::CrossOrigin)
+        );
+        // A `crossOrigin` that is not a boolean is malformed client data.
+        let odd = format!(
+            r#"{{"type":"webauthn.get","challenge":"{CHALLENGE}","origin":"{ORIGIN}","crossOrigin":"false"}}"#
+        );
+        assert_eq!(
+            verify_client(odd.as_bytes()),
+            Err(PasskeyError::BadClientData)
+        );
+        // Absent (L2 browsers may omit it) and explicit `false` are both a same-origin ceremony.
+        let plain =
+            format!(r#"{{"type":"webauthn.get","challenge":"{CHALLENGE}","origin":"{ORIGIN}"}}"#);
+        assert_eq!(verify_client(plain.as_bytes()), Ok(7));
+        let a = Authenticator::new();
+        assert_eq!(
+            verify_client(&a.client_data("webauthn.get", ORIGIN, CHALLENGE)),
+            Ok(7)
+        );
+    }
+
+    #[test]
+    fn origins_and_types_are_compared_exactly_not_by_prefix_or_case() {
+        for origin in [
+            "https://ikigai-rs.dev:443",
+            "https://ikigai-rs.dev:8443",
+            "http://ikigai-rs.dev",
+            "https://IKIGAI-RS.dev",
+            "https://ikigai-rs.dev/",
+            "https://ikigai-rs.dev.evil.example",
+            "https://sub.ikigai-rs.dev",
+        ] {
+            let a = Authenticator::new();
+            assert_eq!(
+                verify_client(&a.client_data("webauthn.get", origin, CHALLENGE)),
+                Err(PasskeyError::WrongOrigin),
+                "{origin}"
+            );
+        }
+        for ty in [
+            "webauthn.get ",
+            "WEBAUTHN.GET",
+            "webauthn.getx",
+            "payment.get",
+        ] {
+            let a = Authenticator::new();
+            assert_eq!(
+                verify_client(&a.client_data(ty, ORIGIN, CHALLENGE)),
+                Err(PasskeyError::WrongType),
+                "{ty}"
+            );
+        }
+        // The fields must be JSON strings; a substring of the raw bytes is never enough.
+        let smuggled = format!(
+            r#"{{"type":"webauthn.create","x":"\"type\":\"webauthn.get\"","challenge":"{CHALLENGE}","origin":"{ORIGIN}"}}"#
+        );
+        assert_eq!(
+            verify_client(smuggled.as_bytes()),
+            Err(PasskeyError::WrongType)
+        );
+    }
+
+    #[test]
+    fn backup_state_without_backup_eligibility_is_refused() {
+        // WebAuthn L3 §7.2: "If the BE bit of the flags in authData is not set, verify that the
+        // BS bit is not set." BS (0x10) without BE (0x08) is an impossible authenticator state.
+        let a = Authenticator::new();
+        let client = a.client_data("webauthn.get", ORIGIN, CHALLENGE);
+        let bad = a.auth_data(RP_ID, 0x05 | 0x10, 7);
+        let sig = a.sign(&bad, &client);
+        assert_eq!(
+            verify(&a.credential(6), &assertion(&bad, &client, &sig), &policy()),
+            Err(PasskeyError::BadFlags)
+        );
+        // BE alone (a syncable credential not yet backed up) and BE|BS (a synced passkey, the
+        // shape iCloud Keychain and Google Password Manager produce) both verify.
+        for flags in [0x05 | 0x08, 0x05 | 0x08 | 0x10] {
+            let auth = a.auth_data(RP_ID, flags, 7);
+            let sig = a.sign(&auth, &client);
+            assert_eq!(
+                verify(
+                    &a.credential(6),
+                    &assertion(&auth, &client, &sig),
+                    &policy()
+                ),
+                Ok(7),
+                "flags {flags:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn authenticator_data_must_be_exactly_the_shape_its_flags_declare() {
+        // §6.1: with neither AT (0x40) nor ED (0x80) set, authenticatorData is exactly
+        // rpIdHash ‖ flags ‖ signCount, 37 bytes. Trailing bytes the flags do not declare are
+        // malformed, even under a valid signature; an assertion never carries attested credential
+        // data (AT), which belongs to registration.
+        let a = Authenticator::new();
+        let client = a.client_data("webauthn.get", ORIGIN, CHALLENGE);
+        let mut overlong = a.auth_data(RP_ID, 0x05, 7);
+        overlong.extend_from_slice(b"\xa0junk");
+        let sig = a.sign(&overlong, &client);
+        assert_eq!(
+            verify(
+                &a.credential(6),
+                &assertion(&overlong, &client, &sig),
+                &policy()
+            ),
+            Err(PasskeyError::BadAuthData)
+        );
+        let mut attested = a.auth_data(RP_ID, 0x05 | 0x40, 7);
+        attested.extend_from_slice(&[0u8; 18]);
+        let sig = a.sign(&attested, &client);
+        assert_eq!(
+            verify(
+                &a.credential(6),
+                &assertion(&attested, &client, &sig),
+                &policy()
+            ),
+            Err(PasskeyError::BadAuthData)
+        );
+        // ED set with nothing after the header declares extensions that are not there.
+        let empty_ext = a.auth_data(RP_ID, 0x05 | 0x80, 7);
+        let sig = a.sign(&empty_ext, &client);
+        assert_eq!(
+            verify(
+                &a.credential(6),
+                &assertion(&empty_ext, &client, &sig),
+                &policy()
+            ),
+            Err(PasskeyError::BadAuthData)
+        );
+        // One byte short of the header is still the short-header refusal.
+        let short = &a.auth_data(RP_ID, 0x05, 7)[..36];
+        assert_eq!(
+            verify(
+                &a.credential(6),
+                &assertion(short, &client, &sig),
+                &policy()
+            ),
+            Err(PasskeyError::ShortAuthData)
+        );
+    }
+
+    #[test]
+    fn the_signature_covers_the_client_data_hash_and_its_exact_bytes() {
+        let (a, client, auth, sig) = good();
+        // Re-serialising the same JSON (whitespace) changes the hash the signature is over.
+        let mut spaced = client.clone();
+        spaced.insert(1, b' ');
+        assert_eq!(
+            verify(
+                &a.credential(6),
+                &assertion(&auth, &spaced, &sig),
+                &policy()
+            ),
+            Err(PasskeyError::BadSignature)
+        );
+        // A signature over authData alone (no clientData hash) is refused.
+        let bare: Signature = a.key.sign(&auth);
+        let bare = bare.to_der().as_bytes().to_vec();
+        assert_eq!(
+            verify(
+                &a.credential(6),
+                &assertion(&auth, &client, &bare),
+                &policy()
+            ),
+            Err(PasskeyError::BadSignature)
+        );
+        // A raw r‖s (IEEE P1363) signature is not the DER wire form and is refused.
+        let raw: Signature = a.key.sign(&{
+            let mut m = auth.clone();
+            m.extend_from_slice(&Sha256::digest(&client));
+            m
+        });
+        assert_eq!(
+            verify(
+                &a.credential(6),
+                &assertion(&auth, &client, &raw.to_bytes()),
+                &policy()
+            ),
+            Err(PasskeyError::BadSignature)
+        );
+        // The genuine one still verifies.
+        assert_eq!(
+            verify(
+                &a.credential(6),
+                &assertion(&auth, &client, &sig),
+                &policy()
+            ),
+            Ok(7)
+        );
+    }
+
+    #[test]
+    fn a_key_on_another_curve_is_refused_at_registration() {
+        // An SPKI naming id-ecPublicKey on secp384r1 with a 97-byte uncompressed point: a well-
+        // formed key, but not ES256's curve.
+        let mut spki = vec![0x30, 0x76, 0x30, 0x10, 0x06, 0x07];
+        spki.extend_from_slice(&[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]); // id-ecPublicKey
+        spki.extend_from_slice(&[0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x22]); // secp384r1
+        spki.extend_from_slice(&[0x03, 0x62, 0x00, 0x04]);
+        spki.extend_from_slice(&[0x11; 96]);
+        assert_eq!(spki.len(), 0x76 + 2);
+        assert!(matches!(
+            RegisteredCredential::from_spki_der(b"c".to_vec(), &spki, 0),
+            Err(PasskeyError::BadKey(_))
+        ));
+        // A P-256 SPKI whose point is not on the curve is refused too.
+        let a = Authenticator::new();
+        let mut der = VerifyingKey::from(&a.key)
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let last = der.len() - 1;
+        der[last] ^= 0x01;
+        assert!(matches!(
+            RegisteredCredential::from_spki_der(b"c".to_vec(), &der, 0),
+            Err(PasskeyError::BadKey(_))
+        ));
     }
 
     #[test]
