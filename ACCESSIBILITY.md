@@ -96,8 +96,17 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
 - `--plain` is a line-oriented REPL with no full-screen redraw, so a screen reader or braille
   display reads it as ordinary terminal output; `--quiet` prints only the answers. (Not yet tested
   with either; see below.)
+- Terminal runbook reads (`source urn:runbook:<page>`) choose `text/plain` when no `as`
+  is supplied, including `-c` and the line REPL. Explicit types are preserved. The served
+  kernel and HTTP door keep the runbook's HTML default.
 
 ## How it is tested
+
+- `crates/ikigai-cli/tests/runbook_text.rs` runs the binary in `-c` and line REPL modes
+  and compares an untyped runbook read to its explicit text face. It also checks explicit
+  HTML and JSON, quoted names and a pipeline. Unit tests check that the shared kernel
+  retains its HTML default and that terminal cache probes use the text request's identity.
+  No assistive technology evaluation was performed.
 
 - `crates/ikigai-web/src/push.rs`'s
   `a_zero_stream_cap_refuses_with_the_doors_accessible_error_page` pins the stream-cap
@@ -216,6 +225,7 @@ Found by reading the source on 2026-10-15, not by testing:
 
 | Date | Change |
 |---|---|
+| 2026-11-10 | Terminal runbook reads (ledger #2695) choose the text face when the caller names no type. Binary regressions reproduced HTML in both `-c` and the line REPL before the fix and now compare the output to explicit `text/plain`; explicit HTML/JSON and the shared kernel's HTML default are preserved. No assistive technology testing was performed. |
 | 2026-11-10 | A socket server closing during the version hello is reported as unavailable, with a plain sentence saying it may be restarting or predate wire v6, and advising a retry or server update. Socket tests cover a legacy decoder closing, a partial hello, and a close during redial. No assistive technology testing was performed. |
 | 2026-11-10 | A `config.toml` line the host cannot read, or an unknown key in one of the host's own families (another program's keys are left alone), stops startup with one plain `ikigai:` line on stderr naming the file, the line number and the line or key in backquotes, and saying what to write instead. No color. `tests/config_toml.rs` pins the file, line number and key in the sentence, not its full wording; no assistive technology testing was performed. |
 | 2026-11-09 | A QUIC door being drained (ledger #3325) closes its connections with the reason `this door is shutting down; reconnect to continue`, a plain sentence that can reach a person inside a transient `unavailable` error on a call whose reply was lost, in the same place the age bound's reason already can. No new output otherwise and no color. The sentence is not pinned by a test; no assistive technology testing was performed. |
