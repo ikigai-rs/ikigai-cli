@@ -100,7 +100,11 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
   contract offers that face, including `-c` and the line REPL. Faces come from the `as`
   input's `one_of` list, or the action's outputs when there is no such list. Explicit types
   are preserved. Without a text face or a readable contract, the request keeps its default.
-  The shared kernel and HTTP door keep their defaults, including runbook HTML.
+  The selected face keeps its declared media-type parameters. Only a Meta answer
+  labeled `application/json` is used for this negotiation. The shared kernel and
+  HTTP door keep their defaults, including runbook HTML. The audit's reproduced
+  pipeline and duplicate-contract-read limitations are documented in
+  [the terminal resolver audit](docs/audits/terminal-resolver-3417.md).
 
 ## How it is tested
 
