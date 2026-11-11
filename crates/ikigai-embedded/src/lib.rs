@@ -68,6 +68,7 @@ pub mod jsonl;
 pub mod layers;
 pub mod lisp;
 pub mod names;
+mod orgfile;
 pub mod passkey;
 pub mod people;
 mod prg;
@@ -1760,7 +1761,7 @@ fn local_space(nature: &'static str) -> EndpointSpace {
             // The org files, jailed to the configured org_dir and read THROUGH
             // the kernel by urn:org:agenda (capability-gated; golden-thread-ready).
             UriTemplate::parse("urn:orgfile:{path}").expect("valid template"),
-            ikigai_fs::FileEndpoint::new(org_config().map(|(dir, _)| dir).unwrap_or_default()),
+            orgfile::OrgFileEndpoint::new(org_config().map(|(dir, _)| dir).unwrap_or_default()),
         )
         .bind(
             UriTemplate::parse(ikigai_fs::FILE_TEMPLATE).expect("FILE_TEMPLATE is valid"),
@@ -11832,15 +11833,13 @@ mod arrangement_tests {
             let ambiguous = harvest.ambiguous.contains_key(&door.endpoint);
             assert!(registered ^ ambiguous, "{door:?}");
         }
-        // On every machine: two jails under `file`. (`llm-*` join it wherever llm.json declares
-        // a second provider.) `meeting` and `org-agenda` each named two doors until ikigai-meeting
-        // 0.7 and ikigai-org 0.3 gave every door its own id, so each of those is one endpoint.
-        assert!(
-            harvest.ambiguous.contains_key("file"),
-            "file: {:?}",
-            harvest.ambiguous
-        );
+        // Each file jail has its own endpoint identity. Configured LLM backends can
+        // still share names, which the generic ambiguity checks above must preserve.
+        assert!(!harvest.ambiguous.contains_key("file"));
+        assert!(!harvest.ambiguous.contains_key("orgfile"));
         for name in [
+            "file",
+            "orgfile",
             "calendar",
             "availability",
             "meeting-schedule",
@@ -11855,17 +11854,20 @@ mod arrangement_tests {
         }
     }
 
-    /// The dump as it stands names `file`, and the refusal says why in the host's words.
+    /// Both file jails survive a dump and rebuild with their distinct identities.
     #[test]
-    fn the_whole_dump_is_refused_on_a_name_that_cannot_say_which() {
+    fn the_dumped_file_doors_bind_distinct_endpoints() {
         let (root, harvest) = default_root();
-        let Err(refused) = arrangement::arrange(&harvest, &dumped(&root)) else {
-            panic!("`file` names two endpoints; the dump must not build")
-        };
-        assert!(
-            refused.contains("different endpoints in this host"),
-            "{refused}"
-        );
+        let (declaration, _) = declarable(&root, &harvest);
+        let built = arrangement::arrange(&harvest, &declaration).expect("file doors build");
+        for (pattern, name) in [
+            ("urn:file:{path}", "file"),
+            ("urn:orgfile:{path}", "orgfile"),
+        ] {
+            assert_eq!(door(&declaration, pattern).unwrap().endpoint, name);
+            let iri = concrete(pattern).unwrap();
+            assert_eq!(answer(root.as_ref(), &iri), answer(built.as_ref(), &iri));
+        }
     }
 
     /// ★ THE ROUND TRIP. The declarable part of the dumped arrangement, built over the harvested
@@ -11887,7 +11889,13 @@ mod arrangement_tests {
             .collect();
         expected.sort();
         expected.dedup();
-        assert!(!expected.is_empty());
+        // The file jails are now declarable and must participate in the full
+        // name-by-name comparison rather than being among the dropped doors.
+        for pattern in ["urn:file:{path}", "urn:orgfile:{path}"] {
+            let iri = concrete(pattern).unwrap();
+            assert!(names.contains(&iri), "{iri} is compared");
+            assert!(!expected.contains(&iri), "{iri} remains bound");
+        }
         assert_eq!(differing(&root, &built, &names), expected);
         for name in &expected {
             assert_eq!(

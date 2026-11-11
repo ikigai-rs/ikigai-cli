@@ -102,19 +102,23 @@ the default would have no way to know.
 **A name that means two endpoints.** A door binds an endpoint by its name, and names are not unique.
 Where the host binds one name to two *different* endpoints, a declaration cannot say which one it
 means, and the host refuses it, naming every door the name is bound at. The dump marks those names in
-its header (`# ⚠ Not declarable as it stands: …`). On every machine today that is:
+its header (`# ⚠ Not declarable as it stands: …`). This can happen with `llm-*` backend names
+(`llm-openai`, `llm-up`, `llm-installed`, `llm-model`) when `llm.json` declares multiple providers.
+Remove the marked doors (or their layers) before starting from such a dump.
 
-| name | bound at | why they differ |
-|---|---|---|
-| `file` | `urn:orgfile:{path}`, `urn:file:{path}` | two jails: the org directory and the workspace |
-| `meeting` | `urn:meeting:zoom:schedule`, `urn:meeting:schedule` | `ikigai-meeting` binds two clones of one backend |
-| `org-agenda` | `urn:org:agenda`, `urn:org:agenda:{period}` | `ikigai-org` binds two instances with the same files |
+The file jails have distinct endpoint names: `file` for the workspace (`urn:file:{path}`) and
+`orgfile` for the configured org directory (`urn:orgfile:{path}`). Both can be declared together:
 
-and every `llm-*` backend name (`llm-openai`, `llm-up`, `llm-installed`, `llm-model`) once `llm.json`
-declares a second provider. So the dump of the built-in root does not start as it stands: remove those
-doors (or the layers holding them) and the rest runs exactly as the built-in root does, which the
-tests prove name by name. The fix belongs to the modules (a distinct name per endpoint) or to core (a
-door identity other than the name), not to a rename here: a name is on the wire.
+```lisp
+(endpoints
+  (door "urn:file:{path}" file)
+  (door "urn:orgfile:{path}" orgfile))
+```
+
+Each keeps its own root and the file endpoint's capability checks. The org-directory endpoint's
+self-description now identifies it as `orgfile`; consumers that used its former `file` id should
+use `orgfile`. The resource IRIs stay the same. Meeting and org-agenda doors also have distinct
+endpoint names in the current dependencies.
 
 **A space that does not describe itself.** An `ik:OpaqueSpace` (a remote peer, a hand-written
 resolver), a closure `Rewrite`, and a door whose grammar core does not know (`matchKind "custom"`)
