@@ -19,7 +19,8 @@ use crate::session::Session;
 /// immediately. A `quit` ends the batch.
 ///
 /// Across a multi-command batch, the cache outcomes are tallied and a one-line
-/// summary is printed at the end (to stderr) — so `ikigai -c … -c …`, especially
+/// summary names the command count and request outcomes (including pipeline and
+/// fan-out stages) at the end on stderr — so `ikigai -c … -c …`, especially
 /// `--connect`'d to a server with a warm cache, shows how much of the batch was
 /// served from cache rather than recomputed.
 pub fn run_commands(engine: Engine, commands: &[String]) -> i32 {
@@ -68,7 +69,7 @@ pub fn run_commands(engine: Engine, commands: &[String]) -> i32 {
     // Batch caching summary — only when a batch resolved more than one command.
     if ran > 1 {
         if let Some(label) = total.label() {
-            eprintln!("— batch: {ran} commands · {label}");
+            eprintln!("— batch: {ran} commands · request outcomes: {label}");
         }
     }
     code
