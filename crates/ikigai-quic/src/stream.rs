@@ -1086,6 +1086,36 @@ mod tests {
         pass: bool,
     }
 
+    struct Exhausted;
+
+    fn exhaustion() -> Error {
+        Error::GaveUp {
+            attempts: u32::MAX,
+            elapsed: std::time::Duration::MAX,
+            detail: "\"quoted\"\n雪".into(),
+        }
+    }
+
+    #[async_trait]
+    impl Endpoint for Exhausted {
+        async fn invoke(&self, _: &Invocation<'_>) -> ikigai_core::Result<Representation> {
+            Err(exhaustion())
+        }
+
+        async fn invoke_body(
+            &self,
+            _: &Invocation<'_>,
+        ) -> ikigai_core::Result<Representation<Body>> {
+            Ok(Representation::from_body(
+                ReprType::new("application/octet-stream"),
+                Body::once(futures::stream::iter([
+                    Ok(Bytes::from_static(b"partial")),
+                    Err(exhaustion()),
+                ])),
+            ))
+        }
+    }
+
     #[async_trait]
     impl Endpoint for BodyReading {
         async fn invoke(&self, inv: &Invocation<'_>) -> ikigai_core::Result<Representation> {
@@ -1149,6 +1179,7 @@ mod tests {
                 .bind(Exact::new("urn:test:endless"), generate(None, None))
                 .bind(Exact::new("urn:test:echo"), echo)
                 .bind(Exact::new("urn:test:huge"), huge)
+                .bind(Exact::new("urn:test:exhausted"), Exhausted)
                 .bind(
                     Exact::new("urn:test:stream_count"),
                     BodyReading { pass: false },
@@ -1261,6 +1292,40 @@ mod tests {
         );
         drop(client);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn a_trailing_gave_up_crosses_quic_at_the_negotiated_version() {
+        for version in [10, 11] {
+            let (server_id, client_id) = pair();
+            let (addr, server) = serve(
+                &server_id,
+                &client_id,
+                vec![ikigai_wire::alpn_for(version)],
+                Arc::new(AtomicBool::new(false)),
+            );
+            let client = connect(addr, &client_id, &server_id.cert_pem).unwrap();
+            let mut answer = client
+                .issue_streamed(
+                    read("urn:test:exhausted"),
+                    &Capability::root(),
+                    &RunContext::default(),
+                    None,
+                )
+                .unwrap();
+            let mut partial = [0; 7];
+            answer.read_exact(&mut partial).unwrap();
+            assert_eq!(&partial, b"partial");
+            let error = answer.collect(usize::MAX).unwrap_err();
+            let expected = if version == 10 {
+                WireError::Endpoint(exhaustion().to_string())
+            } else {
+                WireError::from(&exhaustion())
+            };
+            assert_eq!(WireError::from(&error), expected);
+            drop(client);
+            assert_eq!(server.join().unwrap(), Some(version));
+        }
     }
 
     /// The caller's body crosses as chunks and is the Sink's `content`; a Sink that reads it

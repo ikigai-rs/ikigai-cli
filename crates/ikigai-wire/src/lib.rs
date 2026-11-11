@@ -795,6 +795,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn gave_up_boundary_fields_survive_replies_and_body_aborts() {
+        use std::time::Duration;
+
+        for attempts in [0, 127, 128, u32::MAX] {
+            for elapsed in [Duration::ZERO, Duration::new(1, 999_999_999), Duration::MAX] {
+                for detail in [
+                    String::new(),
+                    "\"quoted\"\n雪\0".into(),
+                    "long\n".repeat(200_000),
+                ] {
+                    let error = WireError::GaveUp {
+                        attempts,
+                        elapsed,
+                        detail,
+                    };
+                    let reply = Reply::ErrorTyped(error.clone());
+                    assert_eq!(decode::<Reply>(&encode(&reply).unwrap()).unwrap(), reply);
+                    let abort = BodyFrame::Abort(error.clone());
+                    assert_eq!(
+                        decode_body_frame(&encode_body_frame(&abort)).unwrap(),
+                        abort
+                    );
+                    let rebuilt: ikigai_core::Error = error.clone().into();
+                    assert_eq!(WireError::from(&rebuilt), error);
+                }
+            }
+        }
+    }
+
     fn request() -> Request {
         Request::new(Verb::Source, Iri::parse("urn:test:upper").unwrap())
             .with_arg("in", ArgRef::Inline(b"hi".to_vec()))
