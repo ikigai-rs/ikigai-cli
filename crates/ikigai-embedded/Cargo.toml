@@ -58,7 +58,7 @@ ikigai-throttle = { workspace = true }
 # mDNS announce/browse. The one sibling this host names by path rather than through
 # `[workspace.dependencies]`; the version is the LOCKSTEP version, not a floor (see the root
 # manifest for why, and `crates/ikigai-cli/tests/lockstep_pins.rs` for the check).
-ikigai-discovery = { path = "../ikigai-discovery", version = "0.5.1" }
+ikigai-discovery = { path = "../ikigai-discovery", version = "0.5.2" }
 # The plan resources — `urn:plan:eval`, `urn:plan:validate`, `urn:plan:requires` — live beside
 # the runner they share with the REPL's `run` (ledger #956). `plan-reader` is the feature that
 # can read a plan graph back; this native host has no wasm constraint keeping it off, and the
@@ -163,7 +163,7 @@ futures = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 # Match Steel's XDG data-home selection when preparing its missing parent.
 xdg = "3.0.0"
-ikigai-ipc = { path = "../ikigai-ipc", version = "0.5.1", optional = true }
+ikigai-ipc = { path = "../ikigai-ipc", version = "0.5.2", optional = true }
 
 [dev-dependencies]
 # `tests/layer_door.rs` and `layers.rs`'s own tests mint a throwaway age identity, the key a layer
