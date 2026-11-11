@@ -139,7 +139,7 @@ fn generate(home: &Path) -> PathBuf {
     let certs = home.join("certs");
     ok(
         spawn(
-            &home,
+            home,
             &["cert", "generate", "--dir", certs.to_str().unwrap()],
         )
         .stdin(Stdio::null())
