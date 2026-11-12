@@ -1,6 +1,6 @@
 # A page over the shared UI shell
 
-The REPL and the general served surface bind `ikigai-ui` 0.4.0. Try:
+The REPL and the general served surface bind `ikigai-ui` 0.5.0. Try:
 
 ```text
 source urn:iki:ui:tokens.css
@@ -26,8 +26,8 @@ urn:iki:ui:main:quakes:home = source urn:file:page.html
 ```
 
 **This needs ikigai-ui 0.4.1 or later.** A binary built with this repository's `Cargo.lock`
-(`--locked`) still has 0.4.0, where `/quakes` answers `404` naming
-`urn:iki:ui:chooser:quakes:auto`. On 0.4.0, add this line. On 0.4.1 it is never reached and does
+(`--locked`) has 0.5.0. On 0.4.0, `/quakes` answers `404` naming
+`urn:iki:ui:chooser:quakes:auto`; there, add this line. From 0.4.1 it is never reached and does
 no harm:
 
 ```text
