@@ -11,7 +11,7 @@ use ikigai_wire::{decode, encode, encode_reply_for_peer, Call, Reply, WireError}
 use libp2p::identity::Keypair;
 use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport};
-use libp2p::swarm::{ConnectionId, NetworkBehaviour, SwarmEvent};
+use libp2p::swarm::{ConnectionId, SwarmEvent};
 use libp2p::{dcutr, identify, ping, relay, tls, yamux, StreamProtocol, Swarm, SwarmBuilder};
 use tokio::sync::{mpsc, oneshot};
 
@@ -251,11 +251,33 @@ impl RelayPolicy {
     }
 }
 
-#[derive(NetworkBehaviour)]
-struct RelayBehaviour {
-    relay: relay::Behaviour,
-    identify: identify::Behaviour,
-    ping: ping::Behaviour,
+use behaviours::{RelayBehaviour, RelayBehaviourEvent};
+
+/// The swarm behaviours, in a module of their own only to scope one `allow`. Since rustc 1.100,
+/// `unreachable_code` fires inside `#[derive(NetworkBehaviour)]`'s expansion (libp2p-swarm-derive
+/// 0.36), where a relay member's handler types carry `Infallible`. A lint attribute on the struct
+/// does not reach the impl the derive writes beside it; one on this module does.
+#[allow(unreachable_code)]
+mod behaviours {
+    use super::WireCodec;
+    use libp2p::swarm::NetworkBehaviour;
+    use libp2p::{dcutr, identify, ping, relay, request_response};
+
+    #[derive(NetworkBehaviour)]
+    pub(super) struct RelayBehaviour {
+        pub(super) relay: relay::Behaviour,
+        pub(super) identify: identify::Behaviour,
+        pub(super) ping: ping::Behaviour,
+    }
+
+    #[derive(NetworkBehaviour)]
+    pub(super) struct PeerBehaviour {
+        pub(super) relay_client: relay::client::Behaviour,
+        pub(super) identify: identify::Behaviour,
+        pub(super) ping: ping::Behaviour,
+        pub(super) dcutr: dcutr::Behaviour,
+        pub(super) wire: request_response::Behaviour<WireCodec>,
+    }
 }
 
 /// Events a relay reports.
@@ -381,14 +403,7 @@ pub async fn run_relay(
 
 // ── a peer ─────────────────────────────────────────────────────────────────────────────
 
-#[derive(NetworkBehaviour)]
-struct PeerBehaviour {
-    relay_client: relay::client::Behaviour,
-    identify: identify::Behaviour,
-    ping: ping::Behaviour,
-    dcutr: dcutr::Behaviour,
-    wire: request_response::Behaviour<WireCodec>,
-}
+use behaviours::{PeerBehaviour, PeerBehaviourEvent};
 
 /// How a peer is set up.
 pub struct PeerConfig {
