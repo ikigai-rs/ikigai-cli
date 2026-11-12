@@ -371,3 +371,38 @@ fn a_named_page_composes_the_shared_ui_shell() {
         ikigai_ui::testkit::site::write(std::path::Path::new(&dir), &files).unwrap();
     }
 }
+
+/// Sequential local route loaders remain usable with the durable store configured.
+#[test]
+#[allow(clippy::disallowed_methods)] // Native binary test with a wall-clock watchdog.
+fn an_edit_to_the_route_file_reloads_the_table() {
+    let home = scratch("route-edit");
+    #[cfg(feature = "store")]
+    {
+        std::fs::write(config(&home).join("config.toml"), "serve.store = true\n").unwrap();
+        std::fs::write(
+            config(&home).join("store.toml"),
+            format!("path = {:?}\n", home.join("store")),
+        )
+        .unwrap();
+    }
+    let (_door, banner) = start(&home, &["--names", "config/ikigai/names", "--routes-only"]);
+    let port = bound_port(&banner);
+    assert_eq!(get(port, "/quakes").1, COMPOSED);
+    let routes = serde_json::json!({"routes": [
+        {"id": "other", "match": "/other", "target": "urn:file:other.html"}
+    ]});
+    std::fs::write(home.join("files/routes.json"), routes.to_string()).unwrap();
+    let deadline = Instant::now() + REBOUND_WITHIN;
+    loop {
+        let (status, body) = get(port, "/other");
+        if status.contains(" 200 ") && body == "<p>other</p>\n" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "route edit was not loaded: {status}\n{body}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}

@@ -64,10 +64,15 @@
 //! `DurableStore::open` on the same path **is refused inside one process too** (RocksDB
 //! keeps its own registry; POSIX advisory locks would not have caught it). This host
 //! builds more than one kernel per process in several modes — and its own test binaries
-//! build a dozen — so the open is memoised in `STORE_SPACE` and every kernel gets an
-//! `Arc` of the one space. Binding `ikigai_store::space(DurableStore::open(…))` per
-//! kernel, which is what the crate's README composition shows, panics on the second
-//! kernel.
+//! build a dozen — so the open is memoized in `STORE` and each kernel binds a fresh
+//! store space over a clone of that handle, paired with a fresh ledger space. Sharing
+//! one space would hide the extra kernels from the store and let their caches go stale
+//! after another kernel writes.
+//!
+//! Build every store-bearing kernel before the first store read. While multiple spaces
+//! live, store reads are uncached; a space bound after another cached a store read refuses
+//! requests rather than allowing writes beneath that cache. Reuse a kernel for later work
+//! instead of constructing one after reads have begun.
 //!
 //! # Two failures, two different answers
 //!
@@ -93,13 +98,9 @@ use ikigai_store::DurableStore;
 
 use crate::config;
 
-/// The one open, memoised for the life of the process. `None` = not configured for this
+/// The one open, memoized for the life of the process. `None` = not configured for this
 /// instance, or configured and held by somebody else. See the module note.
-///
-/// `dyn Space` rather than `EndpointSpace`: what is bound is a [`Fallback`] over two
-/// spaces — the store's and the ledger's — and the pair is what a kernel gets, always
-/// together.
-static STORE_SPACE: OnceLock<Option<Arc<dyn Space>>> = OnceLock::new();
+static STORE: OnceLock<Option<DurableStore>> = OnceLock::new();
 
 /// A directory to open instead of the configured one.
 static PATH_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
@@ -113,7 +114,7 @@ static PATH_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// seam a `--store <dir>` flag would use, if one is ever wanted.
 ///
 /// Process-global and effective only **before the first kernel is built** — the open is
-/// memoised, so a later call changes nothing and does not reopen anything.
+/// memoized, so a later call changes nothing and does not reopen anything.
 pub fn set_store_path(dir: PathBuf) {
     *PATH_OVERRIDE.lock().expect("store path lock") = Some(dir);
 }
@@ -128,22 +129,21 @@ pub fn set_store_path(dir: PathBuf) {
 /// one file. A held directory is *not* a misconfiguration and does not panic; see the
 /// module note.
 pub(crate) fn setup() -> Option<Arc<dyn Space>> {
-    STORE_SPACE.get_or_init(build).clone()
+    STORE.get_or_init(build).as_ref().map(|store| {
+        // Each kernel gets a distinct binding, so the store can account for every cache.
+        // Store first, matching ikigai-ledger's own composition.
+        Arc::new(Fallback::new(vec![
+            Arc::new(ikigai_store::space(store.clone())) as Arc<dyn Space>,
+            Arc::new(ikigai_ledger::space()) as Arc<dyn Space>,
+        ])) as Arc<dyn Space>
+    })
 }
 
 /// Read the configuration and open, once.
-fn build() -> Option<Arc<dyn Space>> {
+fn build() -> Option<DurableStore> {
     let path = path()?;
     match DurableStore::open(&path) {
-        // ★ **Store FIRST.** `Fallback` tries its spaces in order, and the two grammars do
-        // not overlap (`urn:iki:store:*` against `urn:iki:ledger:*`), so the order cannot
-        // change which endpoint answers — but it is the order `ikigai-ledger`'s own tests
-        // and README compose in, and a host that agrees with the crate it binds is one
-        // fewer difference to reason about if a future grammar ever does overlap.
-        Ok(store) => Some(Arc::new(Fallback::new(vec![
-            Arc::new(ikigai_store::space(store)) as Arc<dyn Space>,
-            Arc::new(ikigai_ledger::space()) as Arc<dyn Space>,
-        ]))),
+        Ok(store) => Some(store),
         // The typed transient: somebody else holds the directory. The binding is left out
         // so a mount can answer for it — and whether one *does* decides what to say.
         Err(e @ Error::Unavailable(_)) => {

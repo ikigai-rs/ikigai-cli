@@ -5256,10 +5256,9 @@ fn root_members(nature: &'static str) -> Vec<Arc<dyn Space>> {
     // load}), when `store = true` (or `<instance>.store = true`) configured it — see the
     // `store` module for the switch, the topology and what a held directory prints.
     //
-    // ⚠ It is pushed as an `Arc` of ONE space, memoised per process, because the dataset
-    // is opened once per process and not once per kernel: `DurableStore::open` refuses a
-    // second open on the same path even from the same process, and several modes here
-    // build more than one kernel (the test binaries build a dozen).
+    // Open the dataset once per process, but bind a fresh space for each kernel so the
+    // store can count their independent caches. Build them before the first store read;
+    // a late binding refuses requests beneath an existing cached read.
     //
     // NOT in `served_space` and not in the HTTP door: the dataset holds whatever this
     // host ever put in it, and a remote caller with `urn:cap:store:write` holds
@@ -5836,6 +5835,10 @@ fn subclass_axioms() -> Vec<(String, String)> {
 /// REPL's `cap` command attenuates it reversibly (`cap reset` widens back); before
 /// handing the session to an agent, `cap seal` makes the narrowing the session's floor,
 /// so the agent cannot widen it again.
+///
+/// With the `store` feature and a configured dataset, build all store-bearing kernels
+/// before the first store read. Each kernel has its own store space and cache; later
+/// bindings refuse store requests after a cached read. See the `store` module.
 ///
 /// A [`SystemClock`] is injected so the HTTP module's `Cache-Control: max-age`
 /// deadlines (`Expiry::At`) are honoured; without a clock those reads would stay

@@ -42,11 +42,9 @@ fn fixture_home() -> &'static Path {
     .as_path()
 }
 
-/// The one kernel this binary builds. ⚠ `OnceLock`, not a fresh kernel per test: the
-/// dataset is opened once per PROCESS (RocksDB refuses a second open on a path even from
-/// the same process), and while `ikigai_embedded::store` memoises that open, keeping the
-/// kernel here too makes the constraint visible at the point somebody would otherwise add
-/// a second `kernel()` call.
+/// Reuse one kernel for this binary: constructing a fresh store space after another
+/// kernel cached a read would refuse requests. The dataset itself is opened once per
+/// process, while each kernel binds its own space over the shared handle.
 fn kernel() -> &'static Kernel {
     static KERNEL: OnceLock<Kernel> = OnceLock::new();
     KERNEL.get_or_init(|| {
