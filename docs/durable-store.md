@@ -136,6 +136,18 @@ Everything else **is** a misconfiguration and **panics**: an unwritable director
 `store.toml` that cannot be parsed, a `store` value that is neither `true` nor `false`. A
 host that started anyway would be one whose durable store silently was not there.
 
+## Several kernels in one process
+
+The host opens one `DurableStore` per process and binds a fresh store and ledger space
+for each kernel. Build all store-bearing kernels before the first store read. While
+multiple kernels live, store reads are uncached because each kernel has its own cache
+and cannot invalidate another kernel's reads after a write. A kernel bound after another
+has cached a store read refuses store requests rather than risking stale answers.
+
+Reuse kernels for later work, or drop every store-bearing kernel before constructing
+replacements so no old cache remains. The public HTTP kernel binds no durable store;
+its local route loaders run sequentially and drop between loads.
+
 ## Typing at it
 
 ```sh

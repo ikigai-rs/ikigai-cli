@@ -2037,8 +2037,9 @@ ikigai-meeting = "0.8.0" # 0.8.0 = core 0.3.0 cascade (ledger #2975): the newest
 # an escaping `INSERT … WHERE` and through the refusal text. 0.2.6 needs the READ grant on every
 # graph a WHERE reads — which is why `store::grants_for(…, Purge)` now carries the graveyard's
 # read token (ledger #760): `ikigai-ledger`'s purge reads the graveyard. The one other behavior
-# a host can see is "two live spaces over one store forfeit coverage"; this host binds ONE space
-# per process (`STORE_SPACE`), so nothing here meets it. API: additive only.
+# a host can see is "two live spaces over one store forfeit coverage"; this host binds one space
+# per kernel over one memoized handle, so multiple kernels deliberately forfeit coverage.
+# Build them before the first store read; a late binding refuses requests. API: additive only.
 # ⚠ …and 0.2.7 (ledger #915), a SECURITY floor, and the one this line states now: through 0.2.6
 # oxigraph's recursive SPARQL parser ran inline on the caller's thread, so a ~3 KB query of
 # nested parentheses at any of the ten doors that parse caller text (the eight query IRIs and

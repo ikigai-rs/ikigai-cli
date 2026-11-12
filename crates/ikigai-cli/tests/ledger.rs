@@ -22,7 +22,7 @@
 #![cfg(feature = "store")]
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use futures::executor::block_on;
 use ikigai_engine::{Action, Engine};
@@ -53,12 +53,15 @@ fn fixture_home() -> &'static Path {
 
 /// A REPL engine over the composed embedded kernel — the same pair `ikigai -c '…'` builds.
 ///
-/// A fresh `Engine` per test and a fresh `Kernel` behind it: the DATASET is opened once
-/// per process and memoised in `ikigai_embedded::store`, so every kernel here shares the
-/// one open. That is the constraint `tests/store.rs` documents, working.
+/// A fresh `Engine` per test keeps session authority independent. All sessions share
+/// one kernel, so a later test cannot bind a store space after an earlier cached read.
 fn engine() -> Engine {
-    fixture_home();
-    Engine::new(ikigai_embedded::kernel())
+    static KERNEL: OnceLock<Arc<ikigai_core::Kernel>> = OnceLock::new();
+    let kernel = KERNEL.get_or_init(|| {
+        fixture_home();
+        Arc::new(ikigai_embedded::kernel())
+    });
+    Engine::new(Arc::clone(kernel))
 }
 
 /// Evaluate one typed line, expecting it to succeed, and return what the REPL printed.

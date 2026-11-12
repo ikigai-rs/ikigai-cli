@@ -5677,6 +5677,9 @@ fn serve_http(door: HttpDoor<'_>) -> ! {
 
             // Hot-reload: poll the watched file's mtime; on change re-query on a FRESH kernel
             // (so no stale cache) and swap the live handle.
+            // The public HTTP kernel binds no durable store. This startup loader drops
+            // at the end of this arm, and each reload loader drops before the next poll,
+            // so no live store cache remains beneath a later loader's fresh binding.
             if let Some(path) = route_load::watch_path(iri, &ikigai_embedded::file_root()) {
                 let iri_owned = iri.to_string();
                 runtime.spawn(async move {
