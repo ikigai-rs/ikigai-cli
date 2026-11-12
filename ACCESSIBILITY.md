@@ -123,8 +123,8 @@ ikigai-ui tests it, is in [ikigai-ui's ACCESSIBILITY.md](https://github.com/ikig
 
 Every named check has a result: Pass, Fail or Blocked, with evidence. A Pass covers only the
 stated check, not overall accessibility. Each Pass below was run on this repository's main on
-2026-11-12 with `cargo test --workspace --all-features --locked --no-fail-fast` (rustc and
-cargo 1.99.0, Linux), the same tests CI's `cargo test` job runs on Linux and macOS, unless the
+2026-11-12 with `cargo test --workspace --all-features --locked --no-fail-fast` under
+`umask 022` (rustc and cargo 1.99.0, Linux; the doors refuse group-writable scratch directories), the same tests CI's `cargo test` job runs on Linux and macOS, unless the
 row says otherwise. The socket and binary tests send raw HTTP or run the real binary; none of
 them renders a page in a browser. Earlier runs CI does not repeat are Blocked, with their date.
 
