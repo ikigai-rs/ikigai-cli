@@ -29,6 +29,13 @@ No CA, no TLS — the operating system already authenticates a local peer:
 - **`default_socket_path()`** places the socket in a `0700` per-user directory
   (`$XDG_RUNTIME_DIR`, else `$TMPDIR`/`/tmp` plus the uid; an empty or relative value
   counts as unset), and the socket itself is `0600`, so no other user can reach it.
+- **`bind`** (and `bind_shared`) walks the socket's directory by its real path up to `/` before
+  binding: the directory itself must be owned by this user and not writable by group or others,
+  and every directory above must be owned by this user or root and not writable by group or
+  others unless sticky (`/tmp`). Otherwise another account could remove or replace the socket,
+  for example through a `$TMPDIR/ikigai-<uid>` it created first. The refusal names the
+  directory, its owner or mode, and the fix. A stale socket is removed only when this user owns
+  it (ledger #3634).
 - **`serve`** additionally checks each peer's **kernel-verified UID** (`SO_PEERCRED`
   on Linux, `getpeereid` on macOS/BSD, read through the `nix` crate) and refuses any
   connection that isn't the server's own user — defense in depth over the directory mode.

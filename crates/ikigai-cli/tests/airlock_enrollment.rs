@@ -202,7 +202,20 @@ fn a_door_that_requires_enrollment_will_not_start_without_it() {
         "{stderr}"
     );
     // And a door that is not a QUIC door refuses the flag rather than ignoring it.
-    let sock = format!("/tmp/iki-ae-{}.sock", std::process::id());
+    // In a private 0700 directory: the door refuses to serve straight in a shared `/tmp`
+    // (ledger #3634).
+    let sock_dir = format!("/tmp/iki-ae-{}", std::process::id());
+    std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
+        .create(&sock_dir)
+        .or_else(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        })
+        .expect("the socket directory");
+    let sock = format!("{sock_dir}/s.sock");
     let out = run(&home, &["serve", &sock, "--require-enrollment"]);
     assert!(!out.status.success(), "{}", describe(&out));
     let _ = std::fs::remove_dir_all(&home);
@@ -355,7 +368,20 @@ fn a_door_that_allows_unenrolled_clients_says_so() {
     ];
     let out = run(&home, &both);
     assert!(!out.status.success(), "{}", describe(&out));
-    let sock = format!("/tmp/iki-ae-u-{}.sock", std::process::id());
+    // In a private 0700 directory: the door refuses to serve straight in a shared `/tmp`
+    // (ledger #3634).
+    let sock_dir = format!("/tmp/iki-ae-u-{}", std::process::id());
+    std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
+        .create(&sock_dir)
+        .or_else(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        })
+        .expect("the socket directory");
+    let sock = format!("{sock_dir}/s.sock");
     let out = run(&home, &["serve", &sock, "--allow-unenrolled"]);
     assert!(!out.status.success(), "{}", describe(&out));
     let _ = std::fs::remove_dir_all(&home);

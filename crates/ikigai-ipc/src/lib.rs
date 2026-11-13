@@ -96,6 +96,15 @@ pub fn serve_shared(kernel: Arc<Kernel>, path: &Path) -> io::Result<()> {
 /// reached. Anything at `path` that is not a socket (or a link to one) is refused too, never
 /// removed.
 ///
+/// ★ **The socket's directories must be this user's** (ledger #3634). Before anything is
+/// bound, the socket's directory is resolved to its real path and walked up to `/`: the
+/// directory itself must be owned by this user and not writable by group or others, and every
+/// directory above it must be owned by this user or root and not writable by group or others
+/// unless it is sticky (`/tmp`). Whoever can write a directory on the path can rename what is
+/// below it, and so remove or replace the socket. Anything else is refused with
+/// [`PermissionDenied`](io::ErrorKind::PermissionDenied), naming the directory, its owner or
+/// mode, and the fix. A stale socket is removed only when this user owns it.
+///
 /// The dial, the removal and the bind run under an exclusive lock on `<path>.lock` (an `flock`,
 /// held only for those three steps and released when this returns), so two servers starting at
 /// once cannot both find the old socket dead and remove each other's: the second waits, then
@@ -115,11 +124,22 @@ pub fn serve_shared(kernel: Arc<Kernel>, path: &Path) -> io::Result<()> {
 /// # Ok::<(), std::io::Error>(())
 /// ```
 pub fn bind(path: &Path) -> io::Result<UnixListener> {
+    bind_as(path, own_uid())
+}
+
+/// [`bind`] for a process whose uid is `me`: the tests pass another uid to stand in for a
+/// directory or a stale socket another account owns.
+fn bind_as(path: &Path, me: u32) -> io::Result<UnixListener> {
+    check_socket_dirs(path, me)?;
     let _held = bind_lock(path)?;
-    clear_stale(path)?;
+    clear_stale(path, me)?;
     // ambient: net: binds the socket path a host's door was given (`ikigai serve <path>` or its default, gonk's socket door), never a request name
     #[allow(clippy::disallowed_methods)]
     let listener = UnixListener::bind(path)?;
+    // The socket exists with the umask's mode until the next line narrows it to 0600. That
+    // window does not let another account talk to the door: every connection's peer uid is
+    // checked on accept (`SO_PEERCRED` / `getpeereid`) and anyone but this user is refused,
+    // and the directories above were just checked to be this user's alone.
     // ambient: fs: sets the mode of the socket this call just bound, at that same path, to 0600; no other path
     #[allow(clippy::disallowed_methods)]
     let restricted = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
@@ -142,7 +162,8 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
 ///
 /// Every directory above the parent must let the admitted UIDs search it too, or their
 /// `connect` fails with a permission error; this is not checked, since it does not widen who
-/// can connect. The per-user defaults ([`default_socket_path`]: `$XDG_RUNTIME_DIR`, macOS's
+/// can connect. What IS checked above it is the same as for [`bind`]: each is owned by this
+/// user or root and writable by nobody else unless sticky. The per-user defaults ([`default_socket_path`]: `$XDG_RUNTIME_DIR`, macOS's
 /// per-user `$TMPDIR`) are `0700` and cannot be shared: a shared door names its own path.
 ///
 /// # Errors
@@ -150,6 +171,11 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
 /// As [`bind`], and [`PermissionDenied`](io::ErrorKind::PermissionDenied) naming the directory,
 /// what is wrong with it and the fix.
 pub fn bind_shared(path: &Path, gid: u32) -> io::Result<UnixListener> {
+    bind_shared_as(path, gid, own_uid())
+}
+
+/// [`bind_shared`] for a process whose uid is `me` (see [`bind_as`]).
+fn bind_shared_as(path: &Path, gid: u32, me: u32) -> io::Result<UnixListener> {
     use std::os::unix::fs::MetadataExt;
     let dir = match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
@@ -163,7 +189,7 @@ pub fn bind_shared(path: &Path, gid: u32) -> io::Result<UnixListener> {
             format!("the socket directory {}: {e}", dir.display()),
         )
     })?;
-    if let Some(problem) = shared_dir_problem(meta.uid(), meta.gid(), meta.mode(), own_uid(), gid) {
+    if let Some(problem) = shared_dir_problem(meta.uid(), meta.gid(), meta.mode(), me, gid) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
@@ -173,8 +199,10 @@ pub fn bind_shared(path: &Path, gid: u32) -> io::Result<UnixListener> {
             ),
         ));
     }
+    // The directory itself passed the stricter check above; this walks the ones above it.
+    check_socket_dirs(path, me)?;
     let _held = bind_lock(path)?;
-    clear_stale(path)?;
+    clear_stale(path, me)?;
     // ambient: net: binds the shared door's socket path (`ikigai serve` when its principals table admits other accounts), never a request name
     #[allow(clippy::disallowed_methods)]
     let listener = UnixListener::bind(path)?;
@@ -273,6 +301,102 @@ pub fn gid_of_group(name: &str) -> io::Result<u32> {
     }
 }
 
+/// What `lstat` says about one directory on a socket's path (see [`socket_dirs_problem`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DirStat {
+    is_dir: bool,
+    uid: u32,
+    mode: u32,
+}
+
+/// Refuse to serve at `path` unless its directory and every one above it are safely this
+/// user's (see [`bind`]). The directory is resolved to its real path first, so a symlink on
+/// the way is judged by what it points at.
+fn check_socket_dirs(path: &Path, me: u32) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    // ambient: fs: resolves the directory of the socket path a host's door was given to its real path, to check who owns it and every directory above it
+    #[allow(clippy::disallowed_methods)]
+    let real = std::fs::canonicalize(dir).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("the socket directory {}: {e}", dir.display()),
+        )
+    })?;
+    let mut stat = |d: &Path| {
+        // ambient: fs: reads the owner and mode of one directory on that socket's real path (the socket's own directory or one above it), to refuse an unsafe one
+        #[allow(clippy::disallowed_methods)]
+        let meta = std::fs::symlink_metadata(d)?;
+        Ok(DirStat {
+            is_dir: meta.is_dir(),
+            uid: meta.uid(),
+            mode: meta.mode(),
+        })
+    };
+    match socket_dirs_problem(&real, me, &mut stat) {
+        Some(problem) => Err(io::Error::new(io::ErrorKind::PermissionDenied, problem)),
+        None => Ok(()),
+    }
+}
+
+/// What is wrong with `dir` (a real path) and the directories above it as the home of a
+/// socket served by uid `me`, reading each through `stat`; `None` when nothing is. `dir`
+/// itself must be a directory owned by `me` that group and others cannot write; each one
+/// above must be owned by `me` or root and not writable by group or others unless sticky.
+fn socket_dirs_problem(
+    dir: &Path,
+    me: u32,
+    stat: &mut dyn FnMut(&Path) -> io::Result<DirStat>,
+) -> Option<String> {
+    let mut current = Some(dir);
+    while let Some(d) = current {
+        let first = d == dir;
+        let shown = d.display();
+        let place = if first {
+            format!("refusing to serve a socket in {shown}")
+        } else {
+            format!("refusing to serve a socket under {shown}")
+        };
+        let st = match stat(d) {
+            Ok(st) => st,
+            Err(e) => return Some(format!("{place}: could not read it: {e}")),
+        };
+        if !st.is_dir {
+            return Some(format!("{place}: it is not a directory"));
+        }
+        if st.uid != me && (first || st.uid != 0) {
+            let fix = if st.uid == 0 {
+                let base = if d == Path::new("/") {
+                    String::new()
+                } else {
+                    shown.to_string()
+                };
+                format!("Serve in a directory of your own, such as {base}/ikigai-{me}")
+            } else {
+                format!("Remove {shown}, or serve in a directory of your own")
+            };
+            return Some(format!(
+                "{place}: it is owned by uid {}, not this user (uid {me}), so that account \
+                 could remove or replace the socket. {fix}",
+                st.uid
+            ));
+        }
+        let bits = st.mode & 0o7777;
+        if bits & 0o022 != 0 && (first || bits & 0o1000 == 0) {
+            return Some(format!(
+                "{place}: its mode is {bits:04o}, writable by group or others, who could \
+                 remove or replace the socket. Run `chmod go-w {shown}`, or serve in a \
+                 directory of your own"
+            ));
+        }
+        current = d.parent();
+    }
+    None
+}
+
 /// Take the exclusive lock that orders binders of `path` (see [`bind`]): `<path>.lock`, created
 /// `0600` if absent. The lock is released when the returned file drops.
 fn bind_lock(path: &Path) -> io::Result<std::fs::File> {
@@ -305,15 +429,16 @@ fn bind_lock(path: &Path) -> io::Result<std::fs::File> {
 }
 
 /// Make `path` free for a bind without taking it from anyone: nothing there is fine; a socket
-/// (or a link) nobody answers on is removed; a live server, or a file that is not a socket, is
+/// (or a link) owned by `me` that nobody answers on is removed; a live server, or a file that is not a socket, is
 /// an error. Called under [`bind_lock`].
-fn clear_stale(path: &Path) -> io::Result<()> {
+fn clear_stale(path: &Path, me: u32) -> io::Result<()> {
     use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::fs::MetadataExt;
     // ambient: fs: asks what is at the socket path a host's door was given (a socket, a link or something else), before it may be replaced
     #[allow(clippy::disallowed_methods)]
     let found = std::fs::symlink_metadata(path);
-    let kind = match found {
-        Ok(meta) => meta.file_type(),
+    let (kind, owner) = match found {
+        Ok(meta) => (meta.file_type(), meta.uid()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
@@ -355,7 +480,18 @@ fn clear_stale(path: &Path) -> io::Result<()> {
                 io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
             ) =>
         {
-            // ambient: fs: removes only that socket path, and only a socket or link nobody answers on (checked just above, under the bind lock)
+            if owner != me {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing to replace the stale socket {}: it is owned by uid {owner}, \
+                         not this user (uid {me}). Remove it as its owner, or serve on another \
+                         path",
+                        path.display()
+                    ),
+                ));
+            }
+            // ambient: fs: removes only that socket path, and only a socket or link of this user's that nobody answers on (checked just above, under the bind lock)
             #[allow(clippy::disallowed_methods)]
             let removed = std::fs::remove_file(path);
             match removed {
@@ -2080,7 +2216,9 @@ fn dispatch(kernel: &Kernel, call: Call, admission: &Admission) -> Reply {
 }
 
 /// The default per-user socket path: `<runtime-dir>/ikigai/kernel.sock`, with the
-/// `ikigai` directory created `0700` so only this user can reach the socket.
+/// `ikigai` directory created `0700` so only this user can reach the socket. Whether
+/// `<runtime-dir>` and the directories above it are this user's is checked when the socket is
+/// bound ([`bind`]): another account could have created `$TMPDIR/ikigai-<uid>` first.
 /// `<runtime-dir>` is `$XDG_RUNTIME_DIR`, else `$TMPDIR` or `/tmp` plus the uid, each only
 /// when absolute, so it is never relative to the working directory. `None` if the directory
 /// can't be created.
@@ -2090,16 +2228,27 @@ pub fn default_socket_path() -> Option<PathBuf> {
         std::env::var_os("TMPDIR"),
         own_uid(),
     );
+    socket_path_in(&base).ok()
+}
+
+/// Make `<base>/ikigai` (each missing directory `0700`), narrow it to `0700`, and return the
+/// socket path inside it. Who owns `base` and the directories above is not checked here but by
+/// [`bind`], which refuses with a sentence naming the directory and the fix.
+fn socket_path_in(base: &Path) -> io::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
     let dir = base.join("ikigai");
-    // ambient: fs: creates only `<runtime-dir>/ikigai`, the per-user socket directory, for `ikigai serve`/`ikigai --connect` when no socket path is given
+    // ambient: fs: creates only `<runtime-dir>/ikigai` (and `<runtime-dir>` when missing), 0700, the per-user socket directory, for `ikigai serve`/`ikigai --connect` when no socket path is given
     #[allow(clippy::disallowed_methods)]
-    let made = std::fs::create_dir_all(&dir);
-    made.ok()?;
+    let made = std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir);
+    made?;
     // ambient: fs: sets that same per-user socket directory to 0700, so only this user can reach the socket
     #[allow(clippy::disallowed_methods)]
     let restricted = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-    restricted.ok()?;
-    Some(dir.join("kernel.sock"))
+    restricted?;
+    Ok(dir.join("kernel.sock"))
 }
 
 /// `$XDG_RUNTIME_DIR` when it is absolute, else `$TMPDIR` when it is absolute, else `/tmp`,
@@ -2187,6 +2336,16 @@ fn peer_pid(_stream: &UnixStream) -> Option<i32> {
     None
 }
 
+/// A private (`0700`) directory of this test process's for its sockets: since ledger #3634 a
+/// socket is never bound straight in a shared `/tmp`, which another account can write.
+#[cfg(test)]
+fn test_socket_dir() -> PathBuf {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = std::env::temp_dir().join(format!("ikt-{}", std::process::id()));
+    let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+    dir
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2222,7 +2381,7 @@ mod tests {
     }
 
     fn socket_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("ikigai-ipc-{}-{}.sock", std::process::id(), name))
+        test_socket_dir().join(format!("ikigai-ipc-{}-{}.sock", std::process::id(), name))
     }
 
     fn upper(text: &str) -> Request {
@@ -2326,6 +2485,210 @@ mod tests {
         assert_eq!(client.issue(upper("still")).unwrap().0.bytes, b"STILL");
         drop(client);
         remove_socket(&path);
+    }
+
+    /// A scratch directory of this test's, `0700`, under the private test directory.
+    fn scratch(name: &str) -> PathBuf {
+        use std::os::unix::fs::DirBuilderExt;
+        let dir = test_socket_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        dir
+    }
+
+    fn chmod(path: &Path, mode: u32) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// ledger #3634, claim 1: `<TMPDIR>/ikigai-<uid>` made by another account first, here one
+    /// any account can write (`0777`, not sticky). The default path's `mkdir` and `chmod` of
+    /// `ikigai/` inside it succeed, and the door used to serve there; now `bind` refuses,
+    /// naming the directory, its mode and the fix.
+    #[test]
+    fn a_default_dir_under_a_writable_runtime_dir_is_refused() {
+        let base = scratch("d-open").join("ikigai-7");
+        std::fs::create_dir(&base).unwrap();
+        chmod(&base, 0o777);
+        let path = socket_path_in(&base).expect("the default directory is made");
+        let refused = bind(&path).expect_err("served under a directory others can write");
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+        let message = refused.to_string();
+        let real = std::fs::canonicalize(&base).unwrap();
+        assert!(
+            message.contains(&format!("under {}", real.display())),
+            "{message}"
+        );
+        assert!(message.contains("0777"), "{message}");
+        assert!(message.contains("chmod go-w"), "{message}");
+        assert!(!path.exists(), "nothing was bound");
+        chmod(&base, 0o700);
+    }
+
+    /// ledger #3634, claim 1 with an owner: a runtime directory owned by another uid (here this
+    /// process stands in as uid `me + 1`, so its own directories read as another account's).
+    #[test]
+    fn a_socket_dir_owned_by_another_uid_is_refused() {
+        let dir = scratch("d-owner");
+        let path = dir.join("k.sock");
+        let other = own_uid() + 1;
+        let refused = bind_as(&path, other).expect_err("served in another account's directory");
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+        let message = refused.to_string();
+        assert!(
+            message.contains(&format!("owned by uid {}", own_uid())),
+            "{message}"
+        );
+        assert!(message.contains(&format!("(uid {other})")), "{message}");
+        assert!(
+            message.contains("serve in a directory of your own"),
+            "{message}"
+        );
+        assert!(!path.exists(), "nothing was bound");
+    }
+
+    /// ledger #3634, claim 2: plain `bind` checks the socket's own directory: one group or
+    /// others can write is refused, and so is a writable directory above it.
+    #[test]
+    fn bind_refuses_a_writable_socket_dir_or_parent() {
+        let dir = scratch("d-own");
+        chmod(&dir, 0o770);
+        let refused = bind(&dir.join("k.sock")).expect_err("own directory group-writable");
+        assert!(refused.to_string().contains("in "), "{refused}");
+        assert!(refused.to_string().contains("0770"), "{refused}");
+        chmod(&dir, 0o700);
+
+        let inner = dir.join("in");
+        std::fs::DirBuilder::new().create(&inner).unwrap();
+        chmod(&inner, 0o700);
+        chmod(&dir, 0o1777);
+        // A sticky parent (`/tmp`) is fine, not sticky it is not.
+        let listener = bind(&inner.join("k.sock")).expect("a sticky parent is fine");
+        drop(listener);
+        remove_socket(&inner.join("k.sock"));
+        chmod(&dir, 0o777);
+        let refused = bind(&inner.join("k.sock")).expect_err("parent world-writable");
+        assert!(refused.to_string().contains("under "), "{refused}");
+        chmod(&dir, 0o700);
+    }
+
+    /// ledger #3634, claim 2 for `bind_shared`: it checked only the immediate parent; a
+    /// writable directory above it is now refused too.
+    #[test]
+    fn bind_shared_refuses_a_writable_directory_above_its_own() {
+        use std::os::unix::fs::MetadataExt;
+        let top = scratch("d-shared");
+        let dir = top.join("s");
+        std::fs::create_dir(&dir).unwrap();
+        let gid = std::fs::metadata(&dir).unwrap().gid();
+        chmod(&dir, 0o710);
+        chmod(&top, 0o777);
+        let refused = bind_shared(&dir.join("k.sock"), gid).expect_err("parent world-writable");
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+        let real = std::fs::canonicalize(&top).unwrap();
+        assert!(
+            refused
+                .to_string()
+                .contains(&format!("under {}", real.display())),
+            "{refused}"
+        );
+        chmod(&top, 0o700);
+    }
+
+    /// The walk's rules, on a fake `stat` where a second account and root are not available:
+    /// root may own a directory above (not the socket's own), a sticky one above may be
+    /// world-writable, and the first problem found names its directory.
+    #[test]
+    fn the_directory_walk_follows_the_rules() {
+        let me = 501;
+        let walk = |table: &[(&str, u32, u32)]| {
+            let table: Vec<(PathBuf, DirStat)> = table
+                .iter()
+                .map(|(p, uid, mode)| {
+                    let st = DirStat {
+                        is_dir: true,
+                        uid: *uid,
+                        mode: 0o40000 | mode,
+                    };
+                    (PathBuf::from(p), st)
+                })
+                .collect();
+            let mut stat = |d: &Path| {
+                table
+                    .iter()
+                    .find(|(p, _)| p == d)
+                    .map(|(_, st)| *st)
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+            };
+            socket_dirs_problem(Path::new("/tmp/ikigai-501/ikigai"), me, &mut stat)
+        };
+        let good = [
+            ("/tmp/ikigai-501/ikigai", 501, 0o700),
+            ("/tmp/ikigai-501", 501, 0o755),
+            ("/tmp", 0, 0o1777),
+            ("/", 0, 0o755),
+        ];
+        assert_eq!(walk(&good), None);
+
+        // Another account made `/tmp/ikigai-501` first.
+        let mut squatted = good;
+        squatted[1].1 = 502;
+        let problem = walk(&squatted).unwrap();
+        assert!(
+            problem.contains("under /tmp/ikigai-501: it is owned by uid 502"),
+            "{problem}"
+        );
+        assert!(problem.contains("Remove /tmp/ikigai-501"), "{problem}");
+
+        // Root may own a directory above, never the socket's own.
+        let mut rooted = good;
+        rooted[0].1 = 0;
+        let problem = walk(&rooted).unwrap();
+        assert!(
+            problem.contains("in /tmp/ikigai-501/ikigai: it is owned by uid 0"),
+            "{problem}"
+        );
+        assert!(
+            problem.contains("/tmp/ikigai-501/ikigai/ikigai-501"),
+            "{problem}"
+        );
+
+        // `/tmp` without its sticky bit.
+        let mut unsticky = good;
+        unsticky[2].2 = 0o777;
+        assert!(walk(&unsticky)
+            .unwrap()
+            .contains("under /tmp: its mode is 0777"));
+
+        // A sticky bit does not excuse the socket's own directory.
+        let mut own_sticky = good;
+        own_sticky[0].2 = 0o1777;
+        assert!(walk(&own_sticky)
+            .unwrap()
+            .contains("in /tmp/ikigai-501/ikigai: its mode"));
+
+        // Group-writable `/`.
+        let mut slash = good;
+        slash[3].2 = 0o775;
+        assert!(walk(&slash).unwrap().contains("under /: its mode is 0775"));
+    }
+
+    /// ledger #3634, claim 3: a stale socket is removed only when it is ours. Here this
+    /// process stands in as another uid, so its own stale socket reads as someone else's.
+    #[test]
+    fn a_stale_socket_of_another_uid_is_not_removed() {
+        let path = scratch("d-stale").join("k.sock");
+        drop(UnixListener::bind(&path).unwrap()); // the file stays; nobody listens
+        let refused = clear_stale(&path, own_uid() + 1).expect_err("another uid's socket");
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+        let message = refused.to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(
+            message.contains(&format!("owned by uid {}", own_uid())),
+            "{message}"
+        );
+        assert!(path.exists(), "the socket was left alone");
+        clear_stale(&path, own_uid()).expect("our own stale socket is removed");
+        assert!(!path.exists());
     }
 
     /// A socket nobody listens on (its server exited) is still replaced.
@@ -4495,7 +4858,7 @@ mod call_deadline {
     const STANDING: Duration = Duration::from_secs(30);
 
     fn socket(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("ik-cd-{}-{name}.sock", std::process::id()))
+        test_socket_dir().join(format!("ik-cd-{}-{name}.sock", std::process::id()))
     }
 
     /// How a scratch peer behaves once it has read a call.
@@ -4744,7 +5107,7 @@ mod principal_tests {
     }
 
     fn path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("ikp-{}-{name}.sock", std::process::id()))
+        test_socket_dir().join(format!("ikp-{}-{name}.sock", std::process::id()))
     }
 
     fn serve(path: &Path) {
@@ -4909,7 +5272,7 @@ mod uid_admission_tests {
     }
 
     fn path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("iku-{}-{name}.sock", std::process::id()))
+        test_socket_dir().join(format!("iku-{}-{name}.sock", std::process::id()))
     }
 
     fn node() -> Admission {
@@ -5047,7 +5410,7 @@ mod expected_server_tests {
     use std::thread;
 
     fn path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("ikx-{}-{name}.sock", std::process::id()))
+        test_socket_dir().join(format!("ikx-{}-{name}.sock", std::process::id()))
     }
 
     fn upper() -> Request {

@@ -202,7 +202,20 @@ fn the_ipc_door_serves_a_file_changed_on_disk_without_a_restart() {
     let files = home.join("files");
     // ⚠ A SHORT socket path: `sockaddr_un` fits 104 bytes on macOS and a temp dir there is
     // most of that on its own.
-    let sock = format!("/tmp/iki-sw{}.sock", std::process::id());
+    // In a private 0700 directory: the door refuses to serve straight in a shared `/tmp`
+    // (ledger #3634).
+    let sock_dir = format!("/tmp/iki-sw{}", std::process::id());
+    std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
+        .create(&sock_dir)
+        .or_else(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        })
+        .expect("the socket directory");
+    let sock = format!("{sock_dir}/s.sock");
     let _ = std::fs::remove_file(&sock);
     let (_door, banner) = start(&home, &["serve", &sock], "serving on");
     assert!(

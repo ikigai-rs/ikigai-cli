@@ -6712,8 +6712,8 @@ mod mount_cert_tests {
     #[test]
     fn a_config_mount_lines_tilde_socket_dials_the_peer() {
         use ikigai_core::{builtins, EndpointSpace, Exact, Kernel};
-        let home = std::env::temp_dir();
-        let name = format!("ikigai-tilde-{}.sock", std::process::id());
+        let home = private_socket_dir("tilde");
+        let name = "t.sock".to_string();
         let path = home.join(&name);
         let _ = std::fs::remove_file(&path);
         let kernel = Kernel::new(std::sync::Arc::new(
@@ -6751,8 +6751,7 @@ mod mount_cert_tests {
     #[test]
     fn a_prefer_mounts_entries_dial_a_live_peer() {
         use ikigai_core::{builtins, EndpointSpace, Exact, Kernel};
-        let path =
-            std::env::temp_dir().join(format!("ikigai-prefer-list-{}.sock", std::process::id()));
+        let path = private_socket_dir("prefer-list").join("p.sock");
         let _ = std::fs::remove_file(&path);
         let kernel = Kernel::new(std::sync::Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),
@@ -7864,7 +7863,7 @@ mod prefer_mount_capability_tests {
 
     #[test]
     fn a_prefer_mount_carries_a_narrowed_capability_to_its_peer() {
-        let path = std::env::temp_dir().join(format!("ikc-{}-prefer.sock", std::process::id()));
+        let path = super::private_socket_dir("prefer-cap").join("p.sock");
         let served = path.clone();
         // The listener runs for the life of the test process; `serve` only returns on a dead
         // listener, and nothing here kills it.
@@ -7951,4 +7950,14 @@ mod mcp_authority_tests {
         let (reloaded, _) = mcp_reloaded(&agent, &agent);
         assert_eq!(reloaded.principal(), Some("urn:example:agent"));
     }
+}
+
+/// A private (`0700`) scratch directory for one test's socket: the socket door refuses to
+/// serve straight in a shared `/tmp`, which another account can write (ledger #3634).
+#[cfg(all(test, feature = "ipc", unix))]
+fn private_socket_dir(case: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = std::env::temp_dir().join(format!("iks-{}-{case}", std::process::id()));
+    let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+    dir
 }
