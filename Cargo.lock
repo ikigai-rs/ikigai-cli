@@ -2847,7 +2847,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.56.0",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -3483,9 +3483,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-ledger"
-version = "0.21.1"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff0fb0a737cf2ad83ed4486bb0daa09777a48d85a1f84a30bae98114e5fa15cd"
+checksum = "3e43cf42c44f0aa66c7209266e302519a0af919d070f8a51445ea18c27a80127"
 dependencies = [
  "async-trait",
  "getrandom 0.3.4",
