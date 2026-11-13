@@ -205,7 +205,20 @@ fn a_serving_door_reports_the_mounts_it_composed() {
     );
     // ⚠ A SHORT socket path, not one under the scratch home: `sockaddr_un` fits 103 bytes
     // on macOS and a temp dir there is most of that on its own.
-    let sock = format!("/tmp/iki-hp-{}.sock", std::process::id());
+    // In a private 0700 directory: the door refuses to serve straight in a shared `/tmp`
+    // (ledger #3634).
+    let sock_dir = format!("/tmp/iki-hp-{}", std::process::id());
+    std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
+        .create(&sock_dir)
+        .or_else(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        })
+        .expect("the socket directory");
+    let sock = format!("{sock_dir}/s.sock");
     let _ = std::fs::remove_file(&sock);
     let (_door, banner) = start(&home, &["serve", &sock], "serving on");
     assert_bound(&sock);
@@ -267,7 +280,20 @@ fn a_declined_topology_is_reported_as_a_decline_not_as_emptiness() {
         "declined",
         &["prefer urn:iki:store:=/tmp/iki-hp-absent-c.sock"],
     );
-    let sock = format!("/tmp/iki-hp-d{}.sock", std::process::id());
+    // In a private 0700 directory: the door refuses to serve straight in a shared `/tmp`
+    // (ledger #3634).
+    let sock_dir = format!("/tmp/iki-hp-d{}", std::process::id());
+    std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
+        .create(&sock_dir)
+        .or_else(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        })
+        .expect("the socket directory");
+    let sock = format!("{sock_dir}/s.sock");
     let _ = std::fs::remove_file(&sock);
     let (_door, _) = start(&home, &["serve", &sock, "--no-config-mounts"], "serving on");
     assert_bound(&sock);
@@ -342,7 +368,24 @@ fn the_public_http_door_refuses_posture_and_a_granted_one_serves_it() {
 fn each_door_names_its_own_nature_in_host_info() {
     let home = scratch("nature", &[]);
 
-    let sock = format!("/tmp/iki-hn{}.sock", std::process::id());
+    // In a private 0700 directory: the door refuses to serve straight in a shared `/tmp`
+
+    // (ledger #3634).
+
+    let sock_dir = format!("/tmp/iki-hn{}", std::process::id());
+
+    std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
+        .create(&sock_dir)
+        .or_else(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        })
+        .expect("the socket directory");
+
+    let sock = format!("{sock_dir}/s.sock");
     let _ = std::fs::remove_file(&sock);
     let (_door, _) = start(&home, &["serve", &sock], "serving on");
     assert_bound(&sock);
