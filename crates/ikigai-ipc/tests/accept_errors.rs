@@ -73,7 +73,13 @@ fn assert_serves(path: &Path, what: &str) {
 fn exhaust_and_recover() {
     lower_soft_fd_limit(64);
     // Short: a Unix socket path must fit `sun_path` (104 bytes on macOS).
-    let path = std::env::temp_dir().join(format!("iki-acc-{}.sock", std::process::id()));
+    // A private directory: the door refuses to serve straight in a shared `/tmp` (ledger #3634).
+    let dir = std::env::temp_dir().join(format!("iki-acc-{}", std::process::id()));
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+    }
+    let path = dir.join("d.sock");
     let kernel = Kernel::new(Arc::new(
         EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),
     ));
