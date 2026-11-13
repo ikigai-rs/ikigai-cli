@@ -54,8 +54,8 @@ ikigai --connect ~/k.sock -c 'source urn:iki:fn:toUpper hi'
 ```
 
 An explicit path must be in a directory of your own that nobody else can write, under
-directories owned by you or root: the server refuses `/tmp/k.sock`, since any account can
-rename things in `/tmp`, and says which directory is wrong and how to fix it.
+directories owned by you or root: the server refuses `/tmp/k.sock`, since `/tmp` itself is
+shared with every account, and says which directory is wrong and how to fix it.
 
 The cache indicator then reflects the *server's* cache, so two clients sharing a
 server see each other's `cached` results. The socket lives in a `0700` per-user
