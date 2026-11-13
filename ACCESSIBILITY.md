@@ -10,7 +10,7 @@ how to report a barrier. It is not a conformance claim. Adapted from the
 | Status | Evaluation in progress. No conformance claim. |
 | Owner | the maintainers of this repository |
 | Report a barrier | [a GitHub issue](https://github.com/ikigai-rs/ikigai-cli/issues/new?labels=accessibility) with the `accessibility` label; anything security-sensitive through [private vulnerability reporting](https://github.com/ikigai-rs/ikigai-cli/security/advisories/new) |
-| Last reviewed | 2026-11-01 |
+| Last reviewed | 2026-11-12 |
 
 ## What it emits that people read
 
@@ -109,111 +109,47 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
 
 ## How it is tested
 
-- `crates/ikigai-cli/tests/runbook_text.rs` runs the binary in `-c` and line REPL modes
-  and compares an untyped runbook read to its explicit text face. It also checks explicit
-  HTML and JSON, quoted names and a pipeline. Unit tests check that the shared kernel
-  retains its HTML default. Resolver tests cover a second HTML-default resource family,
-  explicit HTML, a resource without a text face, unreadable contracts, `one_of` declarations,
-  and cache identity across scopes and capabilities.
-  No assistive technology evaluation was performed.
+Every check named here has a result: Pass, Fail or Blocked, with its evidence. A Pass covers
+only the stated check, on this repository's `main` as of the date given, not the output's
+accessibility as a whole. Every Pass below was run on 2026-11-12 on macOS 27.2 (arm64) with
+Rust and Cargo 1.99.1, by the command in its row; CI (`.github/workflows/ci.yml`) runs the same
+tests on every pull request under `cargo test --workspace --all-features` on Linux and macOS. A
+run that CI does not repeat (a browser, a checker, a PTY session) is Blocked with its date, not
+Pass. None of these tests is a browser or assistive technology evaluation.
 
-- `crates/ikigai-web/src/push.rs`'s
-  `a_zero_stream_cap_refuses_with_the_doors_accessible_error_page` pins the stream-cap
-  refusal: `503` with `Retry-After: 1`, the plain sentence "too many event streams",
-  and the same sentence on the browser's error page with `lang`, `main` and the status
-  heading. This is a socket test, with no browser or assistive technology evaluation.
+| Check | Result | Evidence |
+|---|---|---|
+| Error page shape: `lang`, title, one `h1` naming the status, `main`, escaped message, no style or script; which clients get a page; `Vary: Accept` | Pass | `cargo test -p ikigai-web --locked`: the unit tests in `error_page.rs`, `tests/error_pages.rs` (also an ordinary intake's pre-admission `413`, declared and chunked, with `HEAD`), `tests/streams.rs` (`416`), `tests/uploads.rs` (`413`), and `push.rs`'s `a_zero_stream_cap_refuses_with_the_doors_accessible_error_page` (`503`, `Retry-After: 1`, "too many event streams"). `tests/door_error_page.rs` pins that a door's own page keeps the status and headers, is served under the door's CSP, and never reaches a JSON client, curl or an htmx fragment request. Socket and unit tests; the markup is not rendered. |
+| Redirect page shape; a target that is not `http` or `https` is never a link; `410 Gone` page | Pass | `cargo test -p ikigai-web --locked --test redirect_answers`: raw HTTP pins each status and exact `Location`, an off-site target, percent-encoding, `HEAD` with no body, the page's `lang`, title, `main`, `h1`, escaped link and absence of style or script, and `text/plain` for other clients. Socket tests. |
+| Percent-decoding refusals name the byte offset in words | Pass | `cargo test -p ikigai-web -p ikigai-intake -p ikigai-embedded --locked`: `ikigai-web`'s `a_refused_target_names_the_byte_offset`, the intake's `a_malformed_form_body_is_refused_with_its_byte_offset` and `people.rs`'s `a_form_body_is_decoded_strictly` pin the sentences word for word. |
+| Post/Redirect/Get and read redirects | Pass | `cargo test -p ikigai-web --locked --test post_redirect_get --test read_redirects`, and `cargo test -p ikigai-cli --locked --all-features --test decision_prg`: the `303` and `Location`, a reload without another Sink, the htmx answer, failed writes and refusals; the `308` with unchanged query bytes and an empty body. Socket tests. |
+| Embedded-host and intake pages: `lang`, one `main`, linked same-origin stylesheet, no inline style or script, live status regions present before the script, labeled code field | Pass | `cargo test -p ikigai-embedded -p ikigai-intake --locked`: `decide.rs`'s `a_page_states_its_language_and_has_one_main_holding_its_content`, `the_page_shell_links_its_stylesheet_and_carries_no_inline_style` and `a_get_shows_the_decision_but_records_nothing`; `passkey.rs`'s `the_passkey_status_lines_are_live_regions_present_before_the_script` and `the_register_page_has_a_labeled_code_field_the_script_sends`; the intake's `with_a_redirect_the_response_is_an_html_page_to_the_url` and `the_redirect_shim_carries_no_inline_style_or_script`. Also `cargo test -p ikigai-cli --locked --all-features --test html_door_pages`: the stylesheet and script the pages name are served same-origin with their types. String checks of the markup; the `#666` gray's 5.7:1 is computed, not tested. |
+| Shared ikigai-ui shell page: landmarks, skip link, escaped title, one live status region, labeled theme chooser, same-origin assets with the SRI hash | Pass | `cargo test -p ikigai-cli --locked --all-features --test names_served`, with ikigai-ui 0.5.0 from `Cargo.lock`. Serves a named page over the shell and checks its markup as strings. It covers the fixture's `theme=auto` binding, not the recipe's `theme` input, author views or overrides. `crates/ikigai-embedded/tests/ui.rs` checks the override directory's read-only boundary, file jail and invalidation. |
+| Automated accessibility checker (axe) on the shared shell page | Blocked | Not run on `main`: this machine had no Node for ikigai-ui's `axe/check.mjs`, and CI does not run it. Historical: on 2026-11-01, with ikigai-ui 0.4.0, the page exported by `names_served` passed 19 axe rules with zero failures in light, dark and more-contrast media (ikigai-ui `axe/` at commit `adc0394bc6196ac417fddc06bcbd350af8c01b67`, macOS 27.0.1, Node 26.12.0, Chromium 156.0.8078.4, Playwright 1.64.0, axe 4.13.0). `Cargo.lock` now holds ikigai-ui 0.5.0, which has not been checked. [The recipe](docs/shared-ui.md) gives the export command. |
+| Automated accessibility checker on the error, redirect, embedded-host and intake pages | Blocked | No axe or other checker has been run on these pages, and CI runs none. |
+| Full-screen REPL: `NO_COLOR` removes every color, the clock keeps its colon, runbook notes are not dim, runbook scrolling, step picker and tab visibility | Pass | `cargo test -p ikigai-cli --locked --all-features --bin ikigai`, its `tui::` tests: `no_color_takes_every_color_escape_out_of_the_frame` writes a frame through the crossterm backend and finds no color escape under `NO_COLOR`, and some without it; `clock_colon_stays_visible_across_redraws`; the runbook note tests check every note cell for normal intensity with and without `NO_COLOR`; the runbook regressions render at 100×40 with eighteen pages and twelve steps and drive the same key handler as the event loop. Ratatui's test backend, not a terminal. |
+| Full-screen runbook in a real terminal | Blocked | Not repeated on `main`, and CI runs no PTY. Historical: on 2026-10-30 a Linux PTY at 100×40 ran `ikigai --demo` with a scratch config home and file root, checking runbook scrolling, Lisp step eleven, selected-tab visibility and page headings. |
+| Terminal reads choose the text face; `-c` and line REPL output | Pass | `cargo test -p ikigai-cli --locked --all-features --test runbook_text`: an untyped runbook read in `-c` and the line REPL equals its explicit `text/plain` face; explicit HTML and JSON, quoted names and a pipeline are kept. Resolver and kernel unit tests (`cargo test -p ikigai-cli --locked --all-features --bin ikigai`) cover the shared kernel's HTML default, explicit HTML, a resource without a text face, unreadable contracts and `one_of` declarations. The two limitations [the audit](docs/audits/terminal-resolver-3417.md) reproduced (a by-reference pipe's face, a second contract read) are ignored tests there, not part of this Pass. |
+| Terminal diagnostics are words, with no color escape | Pass | `cargo test -p ikigai-cli --locked --all-features --test broken_pipe --test lisp_bounds --test lobby_door --test config_toml --test llm_config --test batch_summary`, and `cargo test -p ikigai-ipc --locked` (`who_is_refused`). They pin the `ikigai:` and `error:` lines' words (in full, or the parts each row of the change history names); `lobby_door` also checks for no color escapes. `broken_pipe`'s check that another stdout failure produces an `ikigai:` line runs on Linux only, so it ran in CI, not on this machine. |
+| No-script theme Apply with the recipe's `theme` input | Blocked | No test covers it. Historical: one `GET /quakes?theme=dark` sent with `curl` through the door with ikigai-ui 0.4.1 on 2026-11-03; not repeated with 0.5.0, in a browser, or through axe. |
+| Browser rendering, reflow at 320 px and zoom of the HTML pages | Blocked | No browser run has been recorded for the error, redirect, embedded-host or intake pages; no browser was configured for this review. |
+| Manual keyboard | Blocked | No person has made a keyboard pass of the HTML pages or the full-screen REPL; no interactive session was available for this review. |
+| Screen reader | Blocked | No screen reader has been used on any of this output, including `--plain`; none was available for this review. |
+| Screen magnifier | Blocked | No screen magnifier has been used on this output; none was available for this review. |
+| Speech input | Blocked | No speech-input software has been used on this output; none was available for this review. |
+| Switch access | Blocked | No switch-access software has been used on this output; none was available for this review. |
+| Braille display | Blocked | No braille display has been used on this output, including `--plain`; none was available for this review. |
 
-- `crates/ikigai-cli/tests/broken_pipe.rs` runs the binary with closed stdout and a
-  consumer that closes after reading a response: help, version, batches, and the line REPL
-  exit quietly on a broken pipe. On Linux it also checks that another stdout failure
-  produces an `ikigai:` diagnostic and a failing exit status.
-- `crates/ikigai-cli/tests/lisp_bounds.rs` checks that successful `-e` evaluations under a
-  sparse HOME emit only their answer and cache verdict, without Steel's missing-parent
-  diagnostic. It covers default, XDG, existing `.steel` and explicit `STEEL_HOME` selection.
-- `crates/ikigai-web/tests/streams.rs` and `tests/uploads.rs` pin that a `416 Range Not
-  Satisfiable` and an upload's `413 Payload Too Large` are answered as the same page (`lang`,
-  `main`, `h1` naming the status) for a browser.
-- `crates/ikigai-web/tests/error_pages.rs` also pins an ordinary intake's pre-admission
-  `413 Payload Too Large`: declared and chunked bodies negotiate the built-in page, with
-  global security headers, without admission, identity, capability or custom page hooks;
-  plain clients keep the sentence, and `HEAD` carries the matching length without content.
-- `crates/ikigai-web/tests/redirect_answers.rs` sends raw HTTP to a read answering core's typed
-  redirect and pins each status and its exact `Location`, an off-site target, the percent-encoding
-  of what a URI cannot carry, `HEAD` with no body, and the page's `lang`, title, `main`, `h1`,
-  escaped link and absence of style or script; that a location not `http` or `https` is never a
-  link; that other clients get `text/plain`; and that `Error::Gone` is a `410` page. These are
-  socket tests, with no browser or assistive technology evaluation.
-- `crates/ikigai-web/tests/error_pages.rs` and the unit tests in `error_page.rs` pin the
-  page's shape (`lang`, title, `main`, `h1`), escaping, which clients get a page, `Vary: Accept`,
-  and that a JSON door and a success are left alone. `crates/ikigai-web/tests/door_error_page.rs`
-  pins that a door's own page keeps the status and headers, is served under the door's CSP, and
-  never reaches a JSON client, curl or an htmx fragment request.
-- `decide.rs` (`a_page_states_its_language_and_has_one_main_holding_its_content`, and the served
-  decision page in `a_get_shows_the_decision_but_records_nothing`) and the intake's
-  `with_a_redirect_the_response_is_an_html_page_to_the_url` pin `lang` and the one `main`;
-  `passkey.rs`'s `the_passkey_status_lines_are_live_regions_present_before_the_script` pins the
-  live regions, their place before the script, and that the script writes into them;
-  `the_page_shell_links_its_stylesheet_and_carries_no_inline_style` and
-  `crates/ikigai-cli/tests/html_door_pages.rs` pin that the pages carry no inline style or
-  script and that the stylesheet and script they name are served same-origin with their types,
-  and the intake's `the_redirect_shim_carries_no_inline_style_or_script` pins the same for the
-  redirect page;
-  `the_register_page_has_a_labeled_code_field_the_script_sends` pins that the enrollment code
-  field has a `<label>` tied to it by `for`, and comes before the button.
-- The full-screen REPL is rendered against ratatui's test backend in `tui.rs`'s tests, mostly for
-  layout and editing. `clock_colon_stays_visible_across_redraws` checks that the clock keeps
-  its colon across frames sampled over a second, covering the former blink phase.
-  `no_color_takes_every_color_escape_out_of_the_frame` writes a frame through
-  the crossterm backend and finds no color escape in the bytes under `NO_COLOR`, and finds some
-  without it. The runbook note tests render a step through the test backend and check every
-  note cell for normal intensity, with and without `NO_COLOR`.
-- Runbook regression tests in `tui.rs` render at 100×40 with eighteen synthetic pages
-  and twelve steps, including wrapped prose and output. They check the selected tab and
-  page heading, distinct step numbers, the line range, scrolling to the answer, and
-  selection/evaluation of every step through the same key handler the event loop uses.
-  On 2026-10-30, a Linux PTY at 100×40 also ran `ikigai --demo` with a scratch config
-  home and file root: runbook scrolling and Lisp step eleven were checked before and
-  after the fix, along with selected-tab visibility and page headings. This checkout
-  serves six Selection steps and eleven Lisp steps; it has no “The thread” page.
-  No assistive technology was used.
-- `crates/ikigai-web/src/lib.rs`'s `a_refused_target_names_the_byte_offset`, the intake's
-  `a_malformed_form_body_is_refused_with_its_byte_offset` and `people.rs`'s
-  `a_form_body_is_decoded_strictly` pin the percent-decoding sentences above word for word.
-- `crates/ikigai-web/tests/post_redirect_get.rs` sends raw HTTP form submissions and pins
-  the route's `303` and `Location`, follows the GET and reloads it without another Sink,
-  and checks the htmx answer, failed writes, page aliases, encoded captures, and refusals
-  before writing when a destination cannot be addressed. These are socket tests, not
-  browser or assistive technology tests.
-- `crates/ikigai-web/tests/read_redirects.rs` sends raw HTTP GET and HEAD requests and
-  checks the `308`, unchanged query bytes, empty body, security and route CORS/CSP headers,
-  and refusals before redirecting. POST still invokes its endpoint. These are socket tests;
-  no browser or assistive technology evaluation was performed.
-- `crates/ikigai-cli/tests/names_served.rs` serves a named page over ikigai-ui's shell and
-  checks its landmarks, skip link, escaped title and same-origin assets, that the page holds
-  exactly one live status region (one `role="status"`, one `aria-live`), and that its header
-  holds the theme chooser with a visible "Theme" label and the page's theme selected.
-  It checks the served htmx bytes against the shell's SRI hash. The fixture can be exported
-  through ikigai-ui's test kit for its shared browser/axe checker in
-  light, dark and more-contrast media. This evaluates the fixture, not arbitrary author views
-  or overrides. On 2026-11-01, with ikigai-ui 0.4.0, the exported page passed the shared
-  checker at ikigai-ui `v0.4.0` (its `axe/` is unchanged at commit
-  `adc0394bc6196ac417fddc06bcbd350af8c01b67`, where it was run) on macOS 27.0.1, using Node
-  26.12.0, Chromium 156.0.8078.4, Playwright 1.64.0 and axe 4.13.0: 19 rules passed in each of
-  the light, dark and more-contrast media settings, with zero failures. (At ikigai-ui 0.3.0,
-  before the chooser, 14 rules had passed.)
-  `crates/ikigai-embedded/tests/ui.rs` checks the override directory's read-only
-  boundary, file jail and golden-thread invalidation after an editor change.
-- `crates/ikigai-ipc/src/lib.rs`'s `who_is_refused` pins, word for word, the sentence that
-  refuses a socket server under another UID, which reaches the terminal as an `ikigai:` line.
-- `crates/ikigai-cli/tests/lobby_door.rs`'s
-  `a_denied_certificate_is_reported_as_a_connection_refusal` runs the client against an
-  in-process QUIC door using a real layer host's `deny.txt` decision. It pins the sentence
-  naming the door and saying the client certificate is not admitted, for both `--override`
-  and `--connect`, with no color escapes or Meta-renderer advice. Clearing the deny list
-  admits the same certificate, and a peer without a Meta renderer keeps its contract warning.
-  This is a socket test, with no assistive technology evaluation.
-- The other output above has had no automated accessibility checker or browser evaluation.
-  No assistive technology has been used on any of this output.
+### ikigai-ui's per-kind criteria
+
+ikigai-ui names accessibility criteria per kind of control
+(`urn:iki:ui:criterion:kind:{kind}:target:{target}`, ikigai-ui [PR 65](https://github.com/ikigai-rs/ikigai-ui/pull/65),
+[66](https://github.com/ikigai-rs/ikigai-ui/pull/66) and [67](https://github.com/ikigai-rs/ikigai-ui/pull/67)). This repository
+relies on none of them: it binds ikigai-ui 0.5.0 (`Cargo.lock`), whose source names no
+criterion, and it uses the page shell and its artifacts (tokens, palettes, the theme chooser, htmx). So
+no SEE check of a kind is verified by a test here, and every HEAR check is Blocked: no
+screen-reader job runs yet. ikigai-ui's own `ACCESSIBILITY.md` holds the results for its
+controls.
 
 ## Known limitations
 
@@ -226,14 +162,16 @@ Found by reading the source on 2026-10-15, not by testing:
   the choice applies at once. Found by a socket test on 2026-11-01. [The recipe](docs/shared-ui.md)
   now declares a `theme` input instead. Its `GET /quakes?theme=dark` was sent once through the door
   with `curl` on 2026-11-03, with ikigai-ui 0.4.1: not by a test, in a browser or through the axe
-  checker. This repository's `Cargo.lock` still holds ikigai-ui 0.4.0, which also needs the
-  chooser line the recipe gives.
-- Nothing above has been tried with a screen reader, magnifier or braille display.
+  checker. This repository's `Cargo.lock` now holds ikigai-ui 0.5.0, and the recipe has not been
+  sent through the door with it; the recipe's text still names 0.4.0 and 0.4.1.
+- Nothing above has been tried with a screen reader, magnifier, speech input, switch access or
+  braille display.
 
 ## Change history
 
 | Date | Change |
 |---|---|
+| 2026-11-12 | "How it is tested" becomes a Check, Result and Evidence table in the a11y sweep's Pass, Fail and Blocked form: every check names its result and evidence, each Pass was rerun on `main` with the command in its row, and runs CI does not repeat (the 2026-11-01 axe run, the 2026-10-30 PTY run, the 2026-11-03 `curl`) are Blocked with their dates. Screen reader, magnifier, speech input, switch access and braille display rows are Blocked. A section says this repository relies on none of ikigai-ui's per-kind criteria. The known limitation that said `Cargo.lock` holds ikigai-ui 0.4.0 now says 0.5.0. Docs only; no output changed. |
 | 2026-11-11 | The batch summary labels cache counts as “request outcomes” (ledger #2699), so pipeline and fan-out requests are distinguished from commands. A binary regression checks two commands with six request outcomes. No color is added; no assistive technology testing was performed. |
 | 2026-11-11 | A set `IKIGAI_LLM_CONFIG` that names no readable file, or is empty, stops startup with exit 2 and one plain `ikigai:` line on stderr naming the variable and the path, and saying to point it at an LLM registry JSON file or unset it to use the config home's `llm.json`. No color. `tests/llm_config.rs` pins the variable and the path in the line, not its full wording; no assistive technology testing was performed. |
 | 2026-11-10 | A layer door whose default state directory would join a `--name` that is not one plain file name stops startup with one plain `ikigai:` line on stderr quoting the name, naming `--name`, and naming `--layers-state` and `layers.state` as the other ways to set the directory. No color. A library test pins that the line names `--name` and `--layers-state`, not its full wording; no assistive technology testing was performed. |
@@ -280,8 +218,11 @@ Found by reading the source on 2026-10-15, not by testing:
 ## Contributing
 
 Read this file before changing any output listed above. A change to an HTML page keeps the rules
-above and adds a test that pins them; a change to terminal output keeps meaning in words. Say in
-the pull request what was tested, with what, and what was not.
+above and adds a test that pins them; a change to terminal output keeps meaning in words. In the
+pull request's `## Accessibility` section, give each check a row in a Check | Result | Evidence
+table: Pass, Fail or Blocked, with the test or command, the tool and its version, or why it could
+not run. Keep a check nobody ran as Blocked, including a screen reader nobody used; never call it
+"not applicable" and never leave it out.
 
 ## Reporting a barrier
 
