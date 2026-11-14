@@ -24,7 +24,8 @@ site values:
     "honeypot": "_honey",
     "redirect": "https://studio.example/thanks",
     "fixed_fields": {"site": "studio"},
-    "blocklist": "urn:decisions"
+    "blocklist": "urn:custom:blocklist",
+    "blocklist_key_file": "blocklist.key"
   },
   {
     "id": "workshop",
@@ -36,7 +37,8 @@ site values:
     "email_field": "email",
     "redirect": "https://workshop.example/thanks",
     "fixed_fields": {"site": "workshop"},
-    "blocklist": "urn:decisions"
+    "blocklist": "urn:custom:blocklist",
+    "blocklist_key_file": "blocklist.key"
   }
 ]
 ```
@@ -57,7 +59,17 @@ IRI receiving the validated tuple. Optional row keys are:
 | `email_field` | `null` | A declared submitted field to validate as an email address. |
 | `honeypot` | `null` | A body key that must be empty; a filled trap is silently discarded. |
 | `requires` | `urn:cap:contact:submit` | Capability required to submit. |
-| `blocklist` | `null` | Resource queried with `blocked=<email>`; requires `email_field`. Only a definite `yes` blocks; lookup errors fail open, as before. The submitting ceiling must permit the lookup. |
+| `blocklist` | `null` | Resource asked `Exists key=<hex>` (see below); requires `email_field` and `blocklist_key_file`. A successful `Exists` blocks; `NotFound` (absent or expired) admits, and every other failure fails open. The submitting ceiling must permit the lookup. |
+| `blocklist_key_file` | `null` | A file, relative to the config home, holding the blocklist's secret key as 64 hex digits (`openssl rand -hex 32`). Required with `blocklist`, refused without it. |
+
+The address is never sent to a configured blocklist. The host computes two lookup keys with
+keyed BLAKE3 (the `blake3` crate's keyed mode) under the key file's key, each sent as 64
+lowercase hex digits: first over the trimmed, lowercased address, then over
+`domain:<domain>` (the address's domain, lowercased). The blocklist is asked `Exists` on
+each in turn, so it stores and receives only these keys, and a block can name one sender or
+a whole domain. A blocked submission gets the same answer as an accepted one. The `"blocklist":
+"urn:decisions"` rows of earlier versions need a resource that answers keyed `Exists`; the
+decision log does not, and the absent-file compatibility intake still asks it by address.
 
 Each field requires `name`. Optional field keys are `required` (false), `summary` (the
 name), `one_of` (an empty list), `iana_zone` (false), and `max_len` (the intake's

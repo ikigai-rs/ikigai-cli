@@ -11,6 +11,8 @@ repository.workspace = true
 ikigai-core = { workspace = true }
 # `ikigai_fn::html`: the redirect shim escapes and checks its URL with the shared rule (ledger #1868).
 ikigai-fn = { workspace = true }
+# Keyed BLAKE3: a configured blocklist is asked by a keyed hash of the sender, never the address (ledger #3685).
+blake3 = "1"
 async-trait = "0.1"
 serde_json = { workspace = true }
 # The IANA time-zone database, so a submitted zone is checked against real tzdata at the
