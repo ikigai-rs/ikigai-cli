@@ -6901,6 +6901,7 @@ fn contact_intake() -> ikigai_intake::IntakeConfig {
         check_blocked: true,
         fixed_fields: Default::default(),
         blocklist: None,
+        block_key: None,
     }
 }
 
@@ -6989,6 +6990,7 @@ fn booking_intake() -> ikigai_intake::IntakeConfig {
         check_blocked: true,
         fixed_fields: Default::default(),
         blocklist: None,
+        block_key: None,
     }
 }
 

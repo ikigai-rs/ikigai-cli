@@ -16,6 +16,9 @@ serde_json = { workspace = true }
 # The IANA time-zone database, so a submitted zone is checked against real tzdata at the
 # door rather than trusted and blown up on later. Already in the tree via ikigai-tz.
 chrono-tz = "0.10"
+# Keyed BLAKE3 turns a sender address into the opaque key the blocklist is asked about, so
+# the address itself never leaves the door. Already in the tree via ikigai-web.
+blake3 = "1"
 
 [dev-dependencies]
 futures = { workspace = true }
