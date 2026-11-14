@@ -64,6 +64,7 @@ pub mod contactblock;
 pub mod decide;
 pub mod decisions;
 pub mod foaf;
+mod intakes;
 pub mod jsonl;
 pub mod layers;
 pub mod lisp;
@@ -1788,7 +1789,7 @@ fn served_space(nature: &'static str) -> impl Space {
 }
 
 fn served_endpoints(nature: &'static str) -> EndpointSpace {
-    base_space(nature)
+    intakes::bind(base_space(nature))
         .bind(
             UriTemplate::parse(ikigai_fs::FILE_TEMPLATE).expect("FILE_TEMPLATE is valid"),
             // Cacheable, so a file changed on disk outside the kernel is seen only through
@@ -1811,7 +1812,6 @@ fn served_endpoints(nature: &'static str) -> EndpointSpace {
         // un-routed path (a direct POST to some other space) is a 404, and grant a ceiling
         // of exactly {contact:submit, booking:submit, space:out}. Route table = the surface
         // allowlist, capability = the authority ceiling; a bug in one still leaves the other.
-        .bind(Exact::new("urn:contact:submit"), contact_submit())
         .bind(Exact::new("urn:booking:submit"), booking_submit())
         .bind(
             UriTemplate::parse(ikigai_intray::SPACE_TEMPLATE).expect("SPACE_TEMPLATE is valid"),
@@ -5145,14 +5145,10 @@ fn root_members(nature: &'static str) -> Vec<Arc<dyn Space>> {
             ));
             ikigai_email::space(config, transport)
         }) as Arc<dyn Space>,
-        // The public contact form's front door (urn:contact:submit): parses an untrusted
-        // urlencoded/JSON body, keeps only these declared fields, escapes them into a
-        // tuple, and drops it into the reactive `contact` space — where the handler emails
-        // it on. Field names match the form on bosatsu.net, `_honey` included.
-        Arc::new(
-            ikigai_core::EndpointSpace::new()
-                .bind(Exact::new("urn:contact:submit"), contact_submit()),
-        ) as Arc<dyn Space>,
+        // Configured contact front doors: validate an untrusted body, append fixed fields,
+        // and drop escaped data into the configured space. The first row keeps the legacy
+        // urn:contact:submit alias; an absent config file retains the built-in contact form.
+        Arc::new(intakes::bind(EndpointSpace::new())) as Arc<dyn Space>,
         // The booking front door (urn:booking:submit): the visitor offers THEIR hours and
         // zone; the reactive `bookings` space fires schedule.scm, which finds a mutually
         // free slot. Brian's freebusy never leaves the machine — the visitor never sees a
@@ -6835,15 +6831,7 @@ impl Endpoint for ClientIssue {
     }
 }
 
-/// The contact intake, loaded through `try_submit` so a configured redirect that is not a link
-/// target stops the host at startup with a sentence naming it (ledger #1878) instead of being
-/// ignored on every submission. The configuration is this file's constant, so a refusal is a
-/// defect in this file, and the tests that build either space reach it first.
-fn contact_submit() -> ikigai_intake::IntakeEndpoint {
-    ikigai_intake::try_submit(contact_intake()).unwrap_or_else(|e| panic!("{e}"))
-}
-
-/// The booking intake, loaded the way [`contact_submit`] loads the contact intake.
+/// The booking intake, validated before serving.
 fn booking_submit() -> ikigai_intake::IntakeEndpoint {
     ikigai_intake::try_submit(booking_intake()).unwrap_or_else(|e| panic!("{e}"))
 }
@@ -6873,6 +6861,8 @@ fn contact_intake() -> ikigai_intake::IntakeConfig {
         // there is no interstitial CSS here to keep in sync with the site.
         redirect: Some("https://www.bosatsu.net/thanks.html".to_string()),
         check_blocked: true,
+        fixed_fields: Default::default(),
+        blocklist: None,
     }
 }
 
@@ -6959,6 +6949,8 @@ fn booking_intake() -> ikigai_intake::IntakeConfig {
         // Reject a blocked scheduler at the edge, before the request drains to bug (bug's
         // booking-handler `blocked?` stays as backstop).
         check_blocked: true,
+        fixed_fields: Default::default(),
+        blocklist: None,
     }
 }
 

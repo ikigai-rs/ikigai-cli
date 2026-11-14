@@ -156,6 +156,12 @@ pub struct IntakeConfig {
     pub space: String,
     /// The accepted fields, in the order a generated form should show them.
     pub fields: Vec<IntakeField>,
+    /// Trusted values appended after validation. Submitted keys with these names are ignored
+    /// and are never advertised as form inputs.
+    pub fixed_fields: std::collections::BTreeMap<String, String>,
+    /// A blocklist resource queried with `blocked=<email>`. When set, overrides the legacy
+    /// `check_blocked` switch and its `urn:decisions` resource. Fail-open on lookup errors.
+    pub blocklist: Option<String>,
     /// A field validated as an email address, if any (also used as the handler's reply-to).
     pub email_field: Option<String>,
     /// A honeypot input that must arrive empty — bots fill it, humans never see it.
@@ -237,10 +243,10 @@ pub fn submit(config: IntakeConfig) -> IntakeEndpoint {
     IntakeEndpoint { config }
 }
 
-/// Build the intake endpoint described by `config`, refusing a configuration that cannot be
-/// served as written: a `redirect` that `ikigai_fn::html::safe_href` refuses (a script or data
-/// URL, another host's `//` target, a relative `thanks.html`). The refusal is an
-/// `InvalidArgument` on `redirect` whose sentence names the intake and the redirect.
+/// Build the intake endpoint described by `config`, refusing invalid resource IRIs, field
+/// names, email-field references, blocklist settings and redirects. Refusals name the intake.
+/// A `redirect` that `ikigai_fn::html::safe_href` refuses (a script or data URL, another host's
+/// `//` target, a relative `thanks.html`) is an `InvalidArgument` on `redirect`.
 ///
 /// ```
 /// use ikigai_intake::{try_submit, IntakeConfig};
@@ -248,6 +254,8 @@ pub fn submit(config: IntakeConfig) -> IntakeEndpoint {
 ///     id: "contact".into(),
 ///     space: "urn:space:contact".into(),
 ///     fields: Vec::new(),
+///     fixed_fields: Default::default(),
+///     blocklist: None,
 ///     email_field: None,
 ///     honeypot: None,
 ///     requires: "urn:cap:contact:submit".into(),
@@ -264,6 +272,71 @@ pub fn submit(config: IntakeConfig) -> IntakeEndpoint {
 /// );
 /// ```
 pub fn try_submit(config: IntakeConfig) -> Result<IntakeEndpoint> {
+    let invalid = |name: &str, detail: String| Error::InvalidArgument {
+        name: name.to_string(),
+        detail: format!("the intake `{}` {detail}", config.id.escape_debug()),
+    };
+    for (name, iri) in [
+        ("space", Some(&config.space)),
+        ("requires", Some(&config.requires)),
+        ("blocklist", config.blocklist.as_ref()),
+    ] {
+        if let Some(iri) = iri {
+            Iri::parse(iri).map_err(|e| {
+                invalid(
+                    name,
+                    format!("has invalid {name} `{}`: {e}", iri.escape_debug()),
+                )
+            })?;
+        }
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for field in &config.fields {
+        if !field_name(&field.name) || !names.insert(&field.name) {
+            return Err(invalid(
+                "fields",
+                format!(
+                    "has an invalid or repeated field name `{}`",
+                    field.name.escape_debug()
+                ),
+            ));
+        }
+        if field.max_len == 0 {
+            return Err(invalid(
+                "fields",
+                format!("has field `{}` with a zero maximum length", field.name),
+            ));
+        }
+    }
+    for name in config.fixed_fields.keys() {
+        if !field_name(name) || name == VIA_FIELD || name == "received" || name.starts_with("via-")
+        {
+            return Err(invalid(
+                "fixed_fields",
+                format!(
+                    "has invalid or reserved fixed field `{}`",
+                    name.escape_debug()
+                ),
+            ));
+        }
+    }
+    if let Some(email) = &config.email_field {
+        if !names.contains(email) || config.fixed_fields.contains_key(email) {
+            return Err(invalid(
+                "email_field",
+                format!(
+                    "must declare email field `{}` as a submitted field",
+                    email.escape_debug()
+                ),
+            ));
+        }
+    }
+    if config.blocklist.is_some() && config.email_field.is_none() {
+        return Err(invalid(
+            "blocklist",
+            "needs an email_field to check its blocklist".into(),
+        ));
+    }
     if let Some(redirect) = &config.redirect {
         if ikigai_fn::html::safe_href(redirect).is_none() {
             return Err(Error::InvalidArgument {
@@ -278,6 +351,15 @@ pub fn try_submit(config: IntakeConfig) -> Result<IntakeEndpoint> {
         }
     }
     Ok(submit(config))
+}
+
+/// Whether a name can be emitted as an s-expression field atom.
+pub fn field_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// The response to a submission the endpoint accepted (a real one, or a honeypot hit that must
@@ -542,7 +624,11 @@ impl Endpoint for IntakeEndpoint {
 
         // Only DECLARED fields are carried — an undeclared key never reaches the tuple.
         let mut carried: Vec<(String, String)> = Vec::new();
-        for field in &config.fields {
+        for field in config
+            .fields
+            .iter()
+            .filter(|f| !config.fixed_fields.contains_key(&f.name))
+        {
             let value = get(&field.name).filter(|v| !v.is_empty());
             match value {
                 Some(value) => {
@@ -612,14 +698,15 @@ impl Endpoint for IntakeEndpoint {
         // blocked"). Checked against the same `urn:decisions` the booking handler consults.
         // FAIL-OPEN: only a definite "yes" blocks; an unreachable or unauthorised log lets the
         // submission through, because a lost enquiry is worse than a leaked spam.
-        if config.check_blocked {
+        if config.check_blocked || config.blocklist.is_some() {
             if let Some(email_field) = &config.email_field {
                 if let Some((_, email)) = carried.iter().find(|(k, _)| k == email_field) {
                     let blocked = inv
                         .issue(
                             Request::new(
                                 Verb::Source,
-                                Iri::parse("urn:decisions").expect("literal"),
+                                Iri::parse(config.blocklist.as_deref().unwrap_or("urn:decisions"))
+                                    .map_err(|e| Error::Endpoint(format!("bad blocklist: {e}")))?,
                             )
                             .with_arg("blocked", ArgRef::Inline(email.as_bytes().to_vec())),
                         )
@@ -669,6 +756,16 @@ impl Endpoint for IntakeEndpoint {
             }
         }
 
+        // Fixed fields are host configuration, never stranger-supplied data. Apply them
+        // only after validation and after provenance has been attached.
+        carried.retain(|(key, _)| !config.fixed_fields.contains_key(key));
+        carried.extend(
+            config
+                .fixed_fields
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+
         // The tuple: an s-expression of escaped DATA, exactly what the handler's `read`
         // parses. Values cannot break out of their literal, so a hostile message is text.
         let tuple = format!(
@@ -704,7 +801,12 @@ impl Endpoint for IntakeEndpoint {
         // A `legacy()` field is the one asymmetry, and it is the point of that method: still
         // accepted above, no longer offered here, so a superseded field stops appearing on
         // the form without breaking the callers that still send it.
-        for field in self.config.fields.iter().filter(|f| f.advertised) {
+        for field in self
+            .config
+            .fields
+            .iter()
+            .filter(|f| f.advertised && !self.config.fixed_fields.contains_key(&f.name))
+        {
             let mut spec = ArgSpec::new(field.name.clone())
                 .summary(field.summary.clone())
                 .class(XSD_STRING);
@@ -824,6 +926,8 @@ mod tests {
             attests: Vec::new(),
             redirect: None,
             check_blocked: false,
+            fixed_fields: Default::default(),
+            blocklist: None,
         }
     }
 

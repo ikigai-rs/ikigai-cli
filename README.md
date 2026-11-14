@@ -408,6 +408,10 @@ view, and `<config home>/ui/` supplies read-only, watched overrides. See
 
 ## Hosting layers on the QUIC door
 
+Contact forms can declare multiple intakes in `<config home>/intakes.json`, each with its own
+endpoint, fields, destination space, redirect, fixed fields and blocklist. The first row keeps
+`urn:contact:submit` as an alias. See [configured contact intakes](docs/intakes.md).
+
 When the config home has a **`layers/` directory**, `ikigai serve quic://…` hosts
 [ikigai-layers](https://crates.io/crates/ikigai-layers): independent shared spaces
 (`urn:layer:{layer}`), each a channel (append-only messages) or a tuplespace (work taken
