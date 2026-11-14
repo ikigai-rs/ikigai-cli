@@ -107,6 +107,9 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
   pipeline and duplicate-contract-read limitations are documented in
   [the terminal resolver audit](docs/audits/terminal-resolver-3417.md).
 
+- A refused `intakes.json` stops startup with exit 2 and a plain `ikigai:` sentence naming
+  the file, the row's position and ID (when available), and the reason. No color is added.
+
 ## Shared UI criteria
 
 ikigai-ui publishes accessibility criteria per node kind and custom element
@@ -143,6 +146,7 @@ them renders a page in a browser. Earlier runs CI does not repeat are Blocked, w
 | ikigai-ui per-kind criteria, HEAR checks | Blocked | No screen-reader job runs yet. |
 | Full-screen REPL: color, `NO_COLOR`, steady clock and runbook pages | Pass | `tui.rs`'s tests against ratatui's test backend: `no_color_takes_every_color_escape_out_of_the_frame` (no color escape under `NO_COLOR`, some without it, through the crossterm backend), `clock_colon_stays_visible_across_redraws`, `runbook_note_has_normal_intensity_with_color` and `…_with_no_color`, and the runbook tests at 100×40 (`runbook_names_its_page_and_keeps_selected_tab_visible`, `runbook_scroll_reaches_wrapped_output_and_reports_position`, `runbook_steps_have_distinct_numbers_after_ten`, `runbook_picker_runs_every_step_and_reveals_its_answer`). Does not cover a real terminal or its colors' contrast. |
 | Full-screen REPL in a real terminal | Blocked | No current run. On 2026-10-30, a Linux PTY at 100×40 ran `ikigai --demo` with a scratch config home and file root, checking runbook scrolling, Lisp step eleven, selected-tab visibility and page headings. CI does not repeat it. |
+| Configured intake startup refusal | Pass | `cargo test -p ikigai-cli --test configured_intakes --locked`, rustc/cargo 1.99.0 on Linux, 2026-11-14: `a_bad_intake_row_refuses_start_and_names_the_row` pins exit 2 and the plain diagnostic naming the bad intake and redirect. No assistive technology session was run. |
 | Terminal text says its meaning in words | Pass | `crates/ikigai-cli/tests/runbook_text.rs` (an untyped runbook read in `-c` and the line REPL is its text face), `tests/broken_pipe.rs`, `tests/lisp_bounds.rs`, `tests/batch_summary.rs`, `tests/llm_config.rs`, `tests/config_toml.rs`, `tests/lobby_door.rs`'s `a_denied_certificate_is_reported_as_a_connection_refusal` (also no color escapes) and `crates/ikigai-ipc/src/lib.rs`'s `who_is_refused`. Covers the lines each pins, some word for word and some by the names they hold; not every line the binary writes. |
 | Browser rendering, focus, zoom and reflow of the HTML pages | Blocked | No browser has rendered the error, redirect, embedded-host or intake pages; no browser was available for this update. |
 | Manual keyboard | Blocked | No person has performed a keyboard pass of any page or either REPL. |
@@ -170,6 +174,7 @@ Found by reading the source on 2026-10-15, not by testing:
 
 | Date | Change |
 |---|---|
+| 2026-11-14 | Configured contact intakes (ledger #3684) refuse a bad row at startup with exit 2 and a plain `ikigai:` sentence naming the config-home file, row and reason. `crates/ikigai-cli/tests/configured_intakes.rs` pins the exit code and the diagnostic's intake name and redirect reason. No color is added; no assistive technology testing was performed. |
 | 2026-11-12 | The socket door refuses to bind where another account could remove or replace its socket (ledger #3634): a directory on the socket's path owned by another uid or writable by group or others, or a stale socket another uid owns. The refusal is one plain sentence naming the directory or socket, its owner uid or its octal mode, and the fix (`chmod go-w <dir>`, or serve in a directory of your own), shown by the binary after `ikigai:`. No color. Unit tests in `crates/ikigai-ipc/src/lib.rs` pin the path, owner or mode and fix in the sentence, not its full wording; no assistive technology testing was performed. |
 | 2026-11-12 | The record moves to Pass / Fail / Blocked form (the a11y sweep): every check has a row in a Check, Result, Evidence table; the Pass rows were run on main that day with `cargo test --workspace --all-features --locked`; the 2026-11-01 axe run, the 2026-10-30 PTY run and the 2026-11-03 `curl` become Blocked with their dates; screen reader, magnifier, speech input, switch access and braille display are Blocked rows. A new section says this repository relies on none of ikigai-ui's per-kind criteria. The ikigai-ui version is corrected to 0.5.0, here and in `docs/shared-ui.md`. Docs only; no output changed. |
 | 2026-11-11 | The batch summary labels cache counts as “request outcomes” (ledger #2699), so pipeline and fan-out requests are distinguished from commands. A binary regression checks two commands with six request outcomes. No color is added; no assistive technology testing was performed. |

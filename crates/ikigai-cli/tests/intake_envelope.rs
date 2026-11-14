@@ -40,6 +40,8 @@ fn intake() -> ikigai_intake::IntakeConfig {
         attests: Vec::new(),
         redirect: None,
         check_blocked: false,
+        fixed_fields: Default::default(),
+        blocklist: None,
     }
 }
 

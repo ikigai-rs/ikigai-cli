@@ -313,6 +313,7 @@ fn is_host_family(key: &str, instance: &str) -> bool {
 /// or anything after a string's closing quote is an unreadable line.
 pub fn check() -> Result<(), String> {
     check_keys()?;
+    crate::intakes::check()?;
     // The retry policy's values are read here too, so an unusable one stops the host
     // before it dials anything (ledger #3383).
     crate::retry::RetryPolicy::from_config().map(|_| ())
