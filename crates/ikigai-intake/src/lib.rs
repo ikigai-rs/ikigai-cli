@@ -159,9 +159,15 @@ pub struct IntakeConfig {
     /// Trusted values appended after validation. Submitted keys with these names are ignored
     /// and are never advertised as form inputs.
     pub fixed_fields: std::collections::BTreeMap<String, String>,
-    /// A blocklist resource queried with `blocked=<email>`. When set, overrides the legacy
-    /// `check_blocked` switch and its `urn:decisions` resource. Fail-open on lookup errors.
+    /// A blocklist resource asked `Exists key=<hex>` with keys computed by
+    /// [`BlocklistKey::address_key`] and [`BlocklistKey::domain_key`]; requires
+    /// `blocklist_key`. The address itself is never sent. When set, overrides the legacy
+    /// `check_blocked` switch and its `urn:decisions` resource. Only a successful `Exists`
+    /// blocks: `NotFound` (absent or expired) admits, and every other failure fails open.
     pub blocklist: Option<String>,
+    /// The secret key for the `blocklist` lookup keys. Required with `blocklist`, refused
+    /// without it.
+    pub blocklist_key: Option<BlocklistKey>,
     /// A field validated as an email address, if any (also used as the handler's reply-to).
     pub email_field: Option<String>,
     /// A honeypot input that must arrive empty — bots fill it, humans never see it.
@@ -212,6 +218,60 @@ pub struct IntakeConfig {
     pub check_blocked: bool,
 }
 
+/// The secret key a configured blocklist is asked by: keyed BLAKE3 over a sender's address
+/// (and, separately, over its domain), so the blocklist holds and receives only those keys,
+/// never an address. Its `Debug` form does not show the key.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BlocklistKey([u8; 32]);
+
+impl std::fmt::Debug for BlocklistKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BlocklistKey(..)")
+    }
+}
+
+impl BlocklistKey {
+    /// A key from its 32 bytes.
+    pub fn new(key: [u8; 32]) -> Self {
+        Self(key)
+    }
+
+    /// A key from the text of a key file: exactly 64 hexadecimal digits, with surrounding
+    /// whitespace ignored (what `openssl rand -hex 32` writes). The error never quotes the
+    /// file's text.
+    pub fn from_hex(text: &str) -> std::result::Result<Self, String> {
+        let text = text.trim();
+        if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("a blocklist key is 64 hexadecimal digits (32 bytes)".into());
+        }
+        let mut key = [0u8; 32];
+        for (i, byte) in key.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&text[2 * i..2 * i + 2], 16)
+                .map_err(|_| "a blocklist key is 64 hexadecimal digits (32 bytes)".to_string())?;
+        }
+        Ok(Self(key))
+    }
+
+    fn hash(&self, text: &str) -> String {
+        blake3::keyed_hash(&self.0, text.as_bytes())
+            .to_hex()
+            .to_string()
+    }
+
+    /// The lookup key for an address: keyed BLAKE3 over the trimmed, lowercased address, as
+    /// 64 lowercase hex digits.
+    pub fn address_key(&self, address: &str) -> String {
+        self.hash(&address.trim().to_lowercase())
+    }
+
+    /// The lookup key for an address's domain: keyed BLAKE3 over `domain:<domain>`, the
+    /// domain trimmed and lowercased, as 64 lowercase hex digits. `None` for no `@`.
+    pub fn domain_key(&self, address: &str) -> Option<String> {
+        let (_, domain) = address.trim().rsplit_once('@')?;
+        Some(self.hash(&format!("domain:{}", domain.to_lowercase())))
+    }
+}
+
 /// The query argument a link token arrives in (`…/booking/submit?k=TOKEN`).
 ///
 /// It rides the URL rather than the form so it never becomes a field in the generated UI,
@@ -256,6 +316,7 @@ pub fn submit(config: IntakeConfig) -> IntakeEndpoint {
 ///     fields: Vec::new(),
 ///     fixed_fields: Default::default(),
 ///     blocklist: None,
+///     blocklist_key: None,
 ///     email_field: None,
 ///     honeypot: None,
 ///     requires: "urn:cap:contact:submit".into(),
@@ -336,6 +397,21 @@ pub fn try_submit(config: IntakeConfig) -> Result<IntakeEndpoint> {
             "blocklist",
             "needs an email_field to check its blocklist".into(),
         ));
+    }
+    match (&config.blocklist, &config.blocklist_key) {
+        (Some(_), None) => {
+            return Err(invalid(
+                "blocklist_key",
+                "needs a blocklist_key to ask its blocklist".into(),
+            ))
+        }
+        (None, Some(_)) => {
+            return Err(invalid(
+                "blocklist_key",
+                "has a blocklist_key but no blocklist".into(),
+            ))
+        }
+        _ => {}
     }
     if let Some(redirect) = &config.redirect {
         if ikigai_fn::html::safe_href(redirect).is_none() {
@@ -698,17 +774,39 @@ impl Endpoint for IntakeEndpoint {
 
         // Reject a BLOCKED sender at the door, on either channel — a response byte-identical
         // to the honeypot's silent-accept, so a spammer learns nothing (no bounce, no "you're
-        // blocked"). Checked against the same `urn:decisions` the booking handler consults.
-        // FAIL-OPEN: only a definite "yes" blocks; an unreachable or unauthorised log lets the
-        // submission through, because a lost enquiry is worse than a leaked spam.
-        if config.check_blocked || config.blocklist.is_some() {
+        // blocked"). A configured blocklist is asked `Exists` on keyed hashes of the address
+        // and of its domain, never the address. Otherwise (the legacy `check_blocked`) it is
+        // the same `urn:decisions` the booking handler consults.
+        // FAIL-OPEN: only a definite answer blocks; an unreachable or unauthorised blocklist
+        // lets the submission through, because a lost enquiry is worse than a leaked spam.
+        if let (Some(blocklist), Some(key)) = (&config.blocklist, &config.blocklist_key) {
+            if let Some(email_field) = &config.email_field {
+                if let Some((_, email)) = carried.iter().find(|(k, _)| k == email_field) {
+                    let iri = Iri::parse(blocklist)
+                        .map_err(|e| Error::Endpoint(format!("bad blocklist: {e}")))?;
+                    let keys = std::iter::once(key.address_key(email)).chain(key.domain_key(email));
+                    for lookup in keys {
+                        let found = inv
+                            .issue(
+                                Request::new(Verb::Exists, iri.clone())
+                                    .with_arg("key", ArgRef::Inline(lookup.into_bytes())),
+                            )
+                            .await
+                            .is_ok();
+                        if found {
+                            return Ok(accepted(config));
+                        }
+                    }
+                }
+            }
+        } else if config.check_blocked {
             if let Some(email_field) = &config.email_field {
                 if let Some((_, email)) = carried.iter().find(|(k, _)| k == email_field) {
                     let blocked = inv
                         .issue(
                             Request::new(
                                 Verb::Source,
-                                Iri::parse(config.blocklist.as_deref().unwrap_or("urn:decisions"))
+                                Iri::parse("urn:decisions")
                                     .map_err(|e| Error::Endpoint(format!("bad blocklist: {e}")))?,
                             )
                             .with_arg("blocked", ArgRef::Inline(email.as_bytes().to_vec())),
@@ -931,6 +1029,7 @@ mod tests {
             check_blocked: false,
             fixed_fields: Default::default(),
             blocklist: None,
+            blocklist_key: None,
         }
     }
 
@@ -1876,5 +1975,169 @@ mod tests {
             matches!(err, Error::InvalidArgument { ref detail, .. } if detail.contains("at byte 4 ")),
             "{err:?}"
         );
+    }
+
+    /// The key the keyed-blocklist tests use (a test value, not a secret).
+    fn test_key() -> BlocklistKey {
+        BlocklistKey::new([7u8; 32])
+    }
+
+    /// A stand-in keyed blocklist: answers `Exists key=<hex>` for the keys in `present`,
+    /// `NotFound` for every other key (an absent or expired block), and records every request
+    /// it is sent as `<verb> <key>`.
+    struct KeyedBlocklist {
+        present: Vec<String>,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl Endpoint for KeyedBlocklist {
+        async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+            let key = inv.inline_str("key").unwrap_or_default().to_string();
+            self.seen.lock().unwrap().push(format!(
+                "{:?} {key} {:?}",
+                inv.request.verb,
+                inv.inline_str("blocked").ok()
+            ));
+            if inv.request.verb == Verb::Exists && self.present.contains(&key) {
+                Ok(Representation::new(ReprType::new("text/plain"), Vec::new()))
+            } else {
+                Err(Error::NotFound(format!("no block for {key}")))
+            }
+        }
+    }
+
+    /// What a stand-in records.
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    /// A kernel whose intake asks `urn:custom:blocklist` by key. `present` is `None` for an
+    /// unbound (unreachable) blocklist.
+    fn keyed_kernel(present: Option<Vec<String>>) -> (Kernel, Log, Log) {
+        let mut cfg = config();
+        cfg.blocklist = Some("urn:custom:blocklist".into());
+        cfg.blocklist_key = Some(test_key());
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut space = EndpointSpace::new()
+            .bind(Exact::new("urn:contact:submit"), try_submit(cfg).unwrap())
+            .bind(
+                Exact::new("urn:space:contact"),
+                RecordingSpace {
+                    dropped: dropped.clone(),
+                },
+            );
+        if let Some(present) = present {
+            space = space.bind(
+                Exact::new("urn:custom:blocklist"),
+                KeyedBlocklist {
+                    present,
+                    seen: seen.clone(),
+                },
+            );
+        }
+        (Kernel::new(Arc::new(space)), dropped, seen)
+    }
+
+    const SENDER: &str = "name=X&email=+Spammer%40X.example+&message=hi";
+
+    #[test]
+    fn a_blocked_key_drops_silently_and_the_blocklist_never_sees_the_address() {
+        let key = test_key().address_key("spammer@x.example");
+        let (k, dropped, seen) = keyed_kernel(Some(vec![key.clone()]));
+        let rep = block_on(k.issue(post(SENDER), &cap())).unwrap();
+        assert_eq!(rep.bytes, accepted(&config()).bytes, "silent accept");
+        assert!(
+            dropped.lock().unwrap().is_empty(),
+            "a blocked key must not drop"
+        );
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen, [format!("Exists {key} None")]);
+        assert!(
+            seen.iter().all(|s| !s.to_lowercase().contains("spammer")),
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn a_blocked_domain_key_drops_silently() {
+        let key = test_key().domain_key("anyone@X.Example").unwrap();
+        let (k, dropped, seen) = keyed_kernel(Some(vec![key.clone()]));
+        block_on(k.issue(post(SENDER), &cap())).unwrap();
+        assert!(
+            dropped.lock().unwrap().is_empty(),
+            "a blocked domain must not drop"
+        );
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "address first, then domain: {seen:?}");
+        assert_eq!(seen[1], format!("Exists {key} None"));
+    }
+
+    #[test]
+    fn an_expired_block_answering_not_found_admits() {
+        let (k, dropped, seen) = keyed_kernel(Some(Vec::new()));
+        block_on(k.issue(post(SENDER), &cap())).unwrap();
+        assert_eq!(dropped.lock().unwrap().len(), 1, "NotFound admits");
+        assert_eq!(seen.lock().unwrap().len(), 2, "both keys asked");
+    }
+
+    #[test]
+    fn an_unreachable_keyed_blocklist_admits() {
+        let (k, dropped, _) = keyed_kernel(None);
+        block_on(k.issue(post(SENDER), &cap())).unwrap();
+        assert_eq!(
+            dropped.lock().unwrap().len(),
+            1,
+            "unreachable blocklist -> fail open"
+        );
+    }
+
+    #[test]
+    fn lookup_keys_are_keyed_normalized_and_distinct() {
+        let key = test_key();
+        let a = key.address_key(" Spammer@X.Example ");
+        assert_eq!(a, key.address_key("spammer@x.example"));
+        assert_eq!(a.len(), 64);
+        assert_eq!(
+            a,
+            blake3::keyed_hash(&[7u8; 32], b"spammer@x.example")
+                .to_hex()
+                .to_string()
+        );
+        assert_eq!(
+            key.domain_key("a@X.example").unwrap(),
+            blake3::keyed_hash(&[7u8; 32], b"domain:x.example")
+                .to_hex()
+                .to_string()
+        );
+        assert_ne!(
+            a,
+            BlocklistKey::new([8u8; 32]).address_key("spammer@x.example")
+        );
+        assert_eq!(key.domain_key("no-at-sign"), None);
+        assert!(!format!("{key:?}").contains("07"));
+    }
+
+    #[test]
+    fn a_key_file_is_64_hex_digits() {
+        let hex = "07".repeat(32);
+        assert_eq!(
+            BlocklistKey::from_hex(&format!(" {hex}\n")).unwrap(),
+            test_key()
+        );
+        for bad in ["", "07", &"zz".repeat(32), &"07".repeat(33)] {
+            let err = BlocklistKey::from_hex(bad).unwrap_err();
+            assert_eq!(err, "a blocklist key is 64 hexadecimal digits (32 bytes)");
+        }
+    }
+
+    #[test]
+    fn a_blocklist_and_its_key_come_together() {
+        let mut cfg = config();
+        cfg.blocklist = Some("urn:custom:blocklist".into());
+        let err = try_submit(cfg.clone()).err().unwrap().to_string();
+        assert!(err.contains("needs a blocklist_key"), "{err}");
+        cfg.blocklist = None;
+        cfg.blocklist_key = Some(test_key());
+        let err = try_submit(cfg).err().unwrap().to_string();
+        assert!(err.contains("no blocklist"), "{err}");
     }
 }

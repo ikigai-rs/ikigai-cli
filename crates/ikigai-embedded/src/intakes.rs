@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
 use ikigai_core::{EndpointSpace, Exact};
-use ikigai_intake::{IntakeConfig, IntakeField};
+use std::path::Path;
+
+use ikigai_intake::{BlocklistKey, IntakeConfig, IntakeField};
 use serde::Deserialize;
 
 static CONFIGS: OnceLock<Result<Vec<IntakeConfig>, String>> = OnceLock::new();
@@ -21,6 +23,9 @@ struct Row {
     redirect: Option<String>,
     #[serde(default)]
     blocklist: Option<String>,
+    /// A file holding the blocklist's secret key (64 hex digits), relative to the config home.
+    #[serde(default)]
+    blocklist_key_file: Option<String>,
     #[serde(default)]
     email_field: Option<String>,
     #[serde(default)]
@@ -53,7 +58,16 @@ fn max_len() -> usize {
     ikigai_intake::DEFAULT_MAX_LEN
 }
 
-fn parse(text: &str) -> Result<Vec<IntakeConfig>, String> {
+/// Read a blocklist key file, `path` relative to `home`. The error names the file, never
+/// its contents.
+fn read_key(home: &Path, path: &str) -> Result<BlocklistKey, String> {
+    let path = home.join(path);
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read blocklist_key_file {}: {e}", path.display()))?;
+    BlocklistKey::from_hex(&text).map_err(|e| format!("blocklist_key_file {}: {e}", path.display()))
+}
+
+fn parse(text: &str, home: &Path) -> Result<Vec<IntakeConfig>, String> {
     // Decode rows separately so even a schema error names the row's id when available.
     let rows: Vec<serde_json::Value> = serde_json::from_str(text)
         .map_err(|e| format!("the intake list is not a JSON array: {e}"))?;
@@ -68,6 +82,12 @@ fn parse(text: &str) -> Result<Vec<IntakeConfig>, String> {
         if !ikigai_intake::field_name(&row.id) || !ids.insert(row.id.clone()) {
             return Err(format!("{at} needs a unique id made of letters, digits, underscores or hyphens, starting with a letter or underscore"));
         }
+        let blocklist_key = row
+            .blocklist_key_file
+            .as_deref()
+            .map(|path| read_key(home, path))
+            .transpose()
+            .map_err(|e| format!("{at} is refused: {e}"))?;
         let config = IntakeConfig {
             id: row.id,
             space: row.space,
@@ -85,6 +105,7 @@ fn parse(text: &str) -> Result<Vec<IntakeConfig>, String> {
             }).collect(),
             fixed_fields: row.fixed_fields,
             blocklist: row.blocklist,
+            blocklist_key,
             email_field: row.email_field,
             honeypot: row.honeypot,
             requires: row.requires,
@@ -110,7 +131,7 @@ fn read() -> Result<Vec<IntakeConfig>, String> {
     };
     let path = home.join("intakes.json");
     match std::fs::read_to_string(&path) {
-        Ok(text) => parse(&text).map_err(|e| format!("{}: {e}", path.display())),
+        Ok(text) => parse(&text, &home).map_err(|e| format!("{}: {e}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => compatibility_intake(),
         Err(e) => Err(format!("cannot read {}: {e}", path.display())),
     }
@@ -155,6 +176,20 @@ mod tests {
         Verb,
     };
     use std::sync::{Arc, Mutex};
+
+    /// Parse with a config home that has no files: rows naming a key file are refused.
+    fn parse(text: &str) -> Result<Vec<IntakeConfig>, String> {
+        super::parse(text, Path::new("/nonexistent-ikigai-config-home"))
+    }
+
+    /// A fresh config home holding `blocklist.key` with a test key of all 7s.
+    fn home_with_key(name: &str) -> std::path::PathBuf {
+        let home =
+            std::env::temp_dir().join(format!("ikigai-intakes-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("blocklist.key"), format!("{}\n", "07".repeat(32))).unwrap();
+        home
+    }
 
     const TWO: &str = r#"[
       {"id":"alpha","space":"urn:space:alpha","fields":[{"name":"message","required":true}],"fixed_fields":{"site":"alpha"}},
@@ -258,30 +293,62 @@ mod tests {
     }
 
     #[test]
-    fn configured_blocklist_is_the_resource_queried() {
-        let configs = parse(r#"[{"id":"a","space":"urn:space:a","fields":[{"name":"email","required":true}],"email_field":"email","blocklist":"urn:custom:blocklist"}]"#).unwrap();
-        let queried = Arc::new(Mutex::new(false));
+    fn configured_blocklist_is_asked_by_key_never_by_address() {
+        let home = home_with_key("asked");
+        let configs = super::parse(r#"[{"id":"a","space":"urn:space:a","fields":[{"name":"email","required":true}],"email_field":"email","blocklist":"urn:custom:blocklist","blocklist_key_file":"blocklist.key"}]"#, &home).unwrap();
+        std::fs::remove_dir_all(&home).ok();
+        let key = BlocklistKey::new([7u8; 32]).address_key("blocked@example.org");
+        let queried = Arc::new(Mutex::new(Vec::new()));
         let seen = queried.clone();
         let space = bind_configs(EndpointSpace::new(), &configs).bind(
             Exact::new("urn:custom:blocklist"),
             FnEndpoint::new("block", move |inv| {
-                assert_eq!(inv.inline_str("blocked")?, "blocked@example.org");
-                *seen.lock().unwrap() = true;
-                Ok(Representation::new(
-                    ReprType::new("text/plain"),
-                    b"yes".to_vec(),
-                ))
+                seen.lock().unwrap().push((
+                    inv.request.verb,
+                    inv.inline_str("key")?.to_string(),
+                    inv.inline_str("blocked").ok().map(str::to_string),
+                ));
+                Ok(Representation::new(ReprType::new("text/plain"), Vec::new()))
             }),
         );
         // No destination exists: a write would fail, while a blocked submission is accepted-looking.
         let kernel = Kernel::new(Arc::new(space));
         let response = block_on(kernel.issue(
-            post("urn:intake:id:a:submit", "email=blocked%40example.org"),
+            post("urn:intake:id:a:submit", "email=Blocked%40example.org"),
             &Capability::root(),
         ))
         .unwrap();
         assert_eq!(response.bytes, b"received\n");
-        assert!(*queried.lock().unwrap());
+        assert_eq!(*queried.lock().unwrap(), [(Verb::Exists, key, None)]);
+    }
+
+    #[test]
+    fn a_blocklist_needs_a_readable_well_formed_key_file() {
+        let home = home_with_key("refused");
+        std::fs::write(home.join("short.key"), "07").unwrap();
+        let row = |extra: &str| {
+            format!(
+                r#"[{{"id":"keyed","space":"urn:space:a","fields":[{{"name":"email"}}],"email_field":"email","blocklist":"urn:custom:blocklist"{extra}}}]"#
+            )
+        };
+        for (extra, expect) in [
+            ("", "needs a blocklist_key"),
+            (
+                r#","blocklist_key_file":"missing.key""#,
+                "cannot read blocklist_key_file",
+            ),
+            (
+                r#","blocklist_key_file":"short.key""#,
+                "64 hexadecimal digits",
+            ),
+        ] {
+            let error = super::parse(&row(extra), &home).unwrap_err();
+            assert!(
+                error.contains("intake row 1 (`keyed`)") && error.contains(expect),
+                "{error}"
+            );
+        }
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
