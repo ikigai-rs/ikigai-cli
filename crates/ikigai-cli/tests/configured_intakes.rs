@@ -58,8 +58,8 @@ fn the_config_home_binds_both_intakes_and_the_legacy_alias() {
         .env_remove("IKIGAI_GRANTS")
         .env_remove("IKIGAI_CLIENTS");
     for endpoint in [
-        "urn:intake:alpha:submit",
-        "urn:intake:beta:submit",
+        "urn:intake:id:alpha:submit",
+        "urn:intake:id:beta:submit",
         "urn:contact:submit",
     ] {
         command.args([

@@ -133,7 +133,7 @@ fn bind_configs(mut space: EndpointSpace, configs: &[IntakeConfig]) -> EndpointS
             space = space.bind_arc(Exact::new("urn:contact:submit"), endpoint.clone());
         }
         space = space.bind_arc(
-            Exact::new(format!("urn:intake:{}:submit", config.id)),
+            Exact::new(format!("urn:intake:id:{}:submit", config.id)),
             endpoint,
         );
     }
@@ -190,11 +190,11 @@ mod tests {
         let kernel = Kernel::new(Arc::new(space));
         for (endpoint, body) in [
             (
-                "urn:intake:alpha:submit",
+                "urn:intake:id:alpha:submit",
                 "message=hello&site=forged&undeclared=evil",
             ),
             (
-                "urn:intake:beta:submit",
+                "urn:intake:id:beta:submit",
                 r#"{"message":"hello","site":"forged","undeclared":"evil"}"#,
             ),
             ("urn:contact:submit", "message=hello&site=forged"),
@@ -219,7 +219,7 @@ mod tests {
             ]
         );
         assert!(block_on(kernel.issue(
-            post("urn:intake:alpha:submit", "site=forged"),
+            post("urn:intake:id:alpha:submit", "site=forged"),
             &Capability::root()
         ))
         .is_err());
@@ -251,7 +251,8 @@ mod tests {
         let kernel = Kernel::new(Arc::new(space));
         for body in ["", "site=forged"] {
             seen.lock().unwrap().clear();
-            block_on(kernel.issue(post("urn:intake:a:submit", body), &Capability::root())).unwrap();
+            block_on(kernel.issue(post("urn:intake:id:a:submit", body), &Capability::root()))
+                .unwrap();
             assert_eq!(*seen.lock().unwrap(), r#"((site "trusted"))"#);
         }
     }
@@ -275,7 +276,7 @@ mod tests {
         // No destination exists: a write would fail, while a blocked submission is accepted-looking.
         let kernel = Kernel::new(Arc::new(space));
         let response = block_on(kernel.issue(
-            post("urn:intake:a:submit", "email=blocked%40example.org"),
+            post("urn:intake:id:a:submit", "email=blocked%40example.org"),
             &Capability::root(),
         ))
         .unwrap();

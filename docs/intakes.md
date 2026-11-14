@@ -2,7 +2,7 @@
 
 Put a JSON array in `<config home>/intakes.json`. The host reads it once at startup, in
 both the local kernel and the general served kernel. Each row binds
-`urn:intake:<id>:submit`; `urn:contact:submit` is an alias of the **first** row. The file
+`urn:intake:id:<id>:submit`; `urn:contact:submit` is an alias of the **first** row. The file
 replaces the built-in contact intake. Without the file, the existing contact fields,
 space, redirect, client attribution and blocklist remain in use. The booking intake is
 unchanged. Restart the host after editing this file.
