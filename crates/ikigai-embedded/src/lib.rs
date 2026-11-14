@@ -83,6 +83,7 @@ pub mod posture;
 pub mod retry;
 pub mod scheduling;
 #[cfg(unix)]
+pub mod space_seal;
 pub mod spill;
 // The durable RDF store (`urn:iki:store:*`) and — with it — the work ledger. Behind the
 // `store` feature because a host that does not want a dataset should not carry one, and
@@ -1815,7 +1816,7 @@ fn served_endpoints(nature: &'static str) -> EndpointSpace {
         .bind(Exact::new("urn:booking:submit"), booking_submit())
         .bind(
             UriTemplate::parse(ikigai_intray::SPACE_TEMPLATE).expect("SPACE_TEMPLATE is valid"),
-            ikigai_intray::SpaceEndpoint::new(file_root().join("spaces")),
+            space_seal::endpoint(file_root().join("spaces")),
         )
         // The emailed decision links: /calendar-request/{approve,decline}. Public — the
         // signed token IS the authorisation, and this host only RECORDS the decision into a
@@ -5132,7 +5133,11 @@ fn root_members(nature: &'static str) -> Vec<Arc<dyn Space>> {
         // The intray / tuplespace (urn:space:{name}: out=Sink, rd=Source) — a dir-backed
         // space under file_root/spaces/. The scheduling booking-inbox drops into it; the
         // reactive/sealed slices land on top. Cap-gated (urn:cap:space:out / :read).
-        Arc::new(ikigai_intray::space(file_root().join("spaces"))) as Arc<dyn Space>,
+        // Sealed at rest when a space key is configured (ledger #3686, see [`space_seal`]).
+        Arc::new(EndpointSpace::new().bind(
+            UriTemplate::parse(ikigai_intray::SPACE_TEMPLATE).expect("SPACE_TEMPLATE is valid"),
+            space_seal::endpoint(file_root().join("spaces")),
+        )) as Arc<dyn Space>,
         // Outbound mail (urn:email:send) — a cap-gated Sink submitting to the LOCAL MTA,
         // which relays onward through a transactional service (so DKIM/SPF and relay
         // credentials stay in the MTA, not here). The contact-request handler and the
@@ -6365,7 +6370,13 @@ fn space_reactor(
     // fallback, or the first one refused for a given reason. Per-tuple refusals are already
     // loud through the dead-letter hook.
     let said = std::sync::Mutex::new(std::collections::HashSet::<String>::new());
-    ikigai_intray::SpaceReactor::new(root, resolver, tuplespace_verbs())
+    let reactor = ikigai_intray::SpaceReactor::new(root, resolver, tuplespace_verbs());
+    // The same codec as every `out` over this root (ledger #3686, see [`space_seal`]).
+    let reactor = match space_seal::space_codec() {
+        Some(codec) => reactor.with_codec(codec),
+        None => reactor,
+    };
+    reactor
         .with_host_authority(move |space| {
             authority_dir
                 .as_deref()

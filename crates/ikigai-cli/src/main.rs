@@ -115,6 +115,13 @@ usage:
                                host's age identity (`age-keygen -o <file>`), else `layers.key`
                                (<name>.layers.key) in config.toml. Required: without one the
                                door refuses to start, and a wrong key is refused at open
+  ikigai space-reseal          seal every tuple under <file root>/spaces that is in the clear (or
+                               sealed to an older key) with the SPACE KEY, in place; stop the
+                               daemon first. The space key (an age identity, `age-keygen -o`) is
+                               $CREDENTIALS_DIRECTORY/space.key (systemd) or <config home>/
+                               space.key; with one, every space is sealed at rest, and a key
+                               that cannot be used refuses every drop rather than store it in
+                               the clear. A reactor's .err/.out notes are NOT sealed
   ikigai serve <q> --layers-reseal  ONCE, over state an ikigai before 0.1.67 wrote (plaintext,
                                refused until then): seal every state file in place to the
                                --layers-key identity, then serve. Also rotates the key (new
@@ -1968,6 +1975,15 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 ikigai_embedded::names::set_names_path(path);
             }
             #[cfg(feature = "embedded")]
+            "space-reseal" => {
+                // Seal, in place, every tuple a space stored in the clear (or to an older
+                // key) with the space key (ledger #3686). Run it with the daemon stopped.
+                if argv.next().is_some() {
+                    return Err("space-reseal takes no arguments; flags go before it".to_string());
+                }
+                std::process::exit(space_reseal());
+            }
+            #[cfg(feature = "embedded")]
             "layers" => {
                 // Everything after it is the subcommand's; connection flags come before it.
                 repl.layers = Some(layer::parse(argv.by_ref())?);
@@ -2092,6 +2108,36 @@ fn check_homes(mode: &Mode) -> Result<(), String> {
 }
 
 #[cfg(feature = "embedded")]
+/// `ikigai space-reseal`: seal every space under the file root with the configured space key.
+#[cfg(feature = "embedded")]
+fn space_reseal() -> i32 {
+    use ikigai_embedded::space_seal;
+    let Some(key) = space_seal::space_key_path() else {
+        eprintln!(
+            "ikigai: space-reseal: no space key: put an age identity (`age-keygen -o`) at \
+             $CREDENTIALS_DIRECTORY/{0} or <config home>/{0}",
+            space_seal::SPACE_KEY_FILE
+        );
+        return 2;
+    };
+    let root = ikigai_embedded::file_root().join("spaces");
+    match space_seal::reseal(&root, &key) {
+        Ok(done) => {
+            for space in done {
+                println!(
+                    "space `{}`: {} pending and {} settled tuples sealed",
+                    space.space, space.pending, space.settled
+                );
+            }
+            0
+        }
+        Err(why) => {
+            eprintln!("ikigai: space-reseal: {why}");
+            1
+        }
+    }
+}
+
 fn main() {
     let mode = match parse_args() {
         Ok(Some(mode)) => mode,
