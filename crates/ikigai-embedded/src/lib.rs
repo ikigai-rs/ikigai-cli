@@ -80,6 +80,7 @@ mod ui;
 // `ikigai-cli` build its value and print from it: the banner and the resource are two faces
 // of one recorded fact, which is what keeps them from drifting into two spellings of it.
 pub mod posture;
+pub mod retention;
 pub mod retry;
 pub mod scheduling;
 #[cfg(unix)]
@@ -5995,6 +5996,14 @@ fn build_watched(mounts: Vec<MountSpec>, reactive: bool) -> Arc<Kernel> {
             );
         }
         Arc::new(reactor).watch();
+        // Outbox retention (ledger #3687): each space with a `space-retention/<space>` entry
+        // in the config home has its handled tuples and their notes deleted that long after
+        // the handler's receipt. Off for every other space. See [`retention`].
+        if let Some(dir) =
+            config::config_home().map(|home| home.join(retention::SPACE_RETENTION_DIR))
+        {
+            watch_retention(file_root().join("spaces"), dir);
+        }
     }
     // ★ Every host job below NAMES the authority it fires under (ledger #79). A job fires
     // under exactly the capability passed here, so each one states what it resolves — see
@@ -6052,6 +6061,24 @@ fn build_watched(mounts: Vec<MountSpec>, reactive: bool) -> Arc<Kernel> {
         );
     }
     kernel
+}
+
+/// Sweep the reactive spaces' outboxes now and then every [`retention::SWEEP_EVERY`], for the
+/// life of the process, saying on stderr what each sweep deleted (a count per space) and any
+/// retention entry it could not act on.
+fn watch_retention(spaces: PathBuf, retention_dir: PathBuf) {
+    let spawned = std::thread::Builder::new()
+        .name("ikigai-retention".to_string())
+        .spawn(move || loop {
+            let swept = retention::sweep(&spaces, &retention_dir, dead_letter_wall_clock());
+            for line in retention::sweep_lines(&swept) {
+                eprintln!("{} {line}", stamp());
+            }
+            std::thread::sleep(retention::SWEEP_EVERY);
+        });
+    if let Err(e) = spawned {
+        eprintln!("{} ikigai: outbox retention not started: {e}", stamp());
+    }
 }
 
 /// Where the host keeps each reactive space's handler authority:
@@ -11249,6 +11276,54 @@ mod space_authority_tests {
             std::fs::read_to_string(outbox.join(format!("{second}.out"))).unwrap(),
             "ran"
         );
+    }
+
+    /// Outbox retention over what the REAL reactor leaves (ledger #3687): a tuple it handled
+    /// sits in `outbox/` with its note until the host's sweep, under a `space-retention`
+    /// entry, deletes both once it is older than the entry; a tuple still pending in the
+    /// inbox is never touched, and with no entry the outbox is kept as the reactor left it.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // receipts are file times: the wall clock, native-only
+    fn the_host_expires_what_the_reactor_handled_and_nothing_pending() {
+        let (spaces, authority) = scratch("retention");
+        let config = authority.parent().unwrap().to_path_buf();
+        let kernel = kernel_over(&spaces);
+        std::fs::write(authority.join("jobs"), format!("{BEYOND}\n")).unwrap();
+        let reactor = space_reactor(
+            spaces.clone(),
+            Arc::clone(&kernel) as Arc<dyn ikigai_resolve::Resolver>,
+            Some(config.clone()),
+        );
+        let handled = drop_tuple(&kernel, b"handled");
+        assert_eq!(
+            reactor.process("jobs", &handled),
+            ikigai_intray::Outcome::Handled
+        );
+        let pending = drop_tuple(&kernel, b"pending");
+        let outbox = spaces.join("jobs").join("outbox");
+        let inbox = spaces.join("jobs").join("inbox");
+        let retention_dir = config.join(retention::SPACE_RETENTION_DIR);
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(8 * 86_400);
+
+        // Retention off (no entry): eight days on, the reactor's outbox is all still there.
+        assert_eq!(
+            retention::sweep(&spaces, &retention_dir, later),
+            retention::Swept::default()
+        );
+        assert!(outbox.join(format!("{handled}.tuple")).is_file());
+        assert!(outbox.join(format!("{handled}.out")).is_file());
+
+        // Seven days' retention: the handled tuple and its note go, the pending one stays.
+        std::fs::create_dir_all(&retention_dir).unwrap();
+        std::fs::write(retention_dir.join("jobs"), "7d\n").unwrap();
+        let swept = retention::sweep(&spaces, &retention_dir, later);
+        assert_eq!(
+            swept.expired,
+            vec![("jobs".to_string(), vec![handled.clone()])]
+        );
+        assert!(!outbox.join(format!("{handled}.tuple")).exists());
+        assert!(!outbox.join(format!("{handled}.out")).exists());
+        assert!(inbox.join(format!("{pending}.tuple")).is_file());
     }
 
     /// Non-escalation, pinned at the level the brief states it: a scope named only in the
