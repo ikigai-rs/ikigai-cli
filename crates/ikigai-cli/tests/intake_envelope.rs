@@ -42,6 +42,7 @@ fn intake() -> ikigai_intake::IntakeConfig {
         check_blocked: false,
         fixed_fields: Default::default(),
         blocklist: None,
+        block_key: None,
     }
 }
 
