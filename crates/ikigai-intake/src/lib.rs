@@ -607,6 +607,9 @@ impl Endpoint for IntakeEndpoint {
             .map_err(|_| Error::MissingArgument("content".to_string()))?;
         let fields = parse_body(body)?;
         let get = |name: &str| {
+            if config.fixed_fields.contains_key(name) {
+                return None;
+            }
             fields
                 .iter()
                 .find(|(k, _)| k == name)

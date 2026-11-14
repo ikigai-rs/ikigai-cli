@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn a_fixed_field_is_not_an_input_even_if_also_declared() {
-        let configs = parse(r#"[{"id":"a","space":"urn:space:a","fields":[{"name":"site","required":true}],"fixed_fields":{"site":"trusted"}}]"#).unwrap();
+        let configs = parse(r#"[{"id":"a","space":"urn:space:a","fields":[{"name":"site","required":true}],"fixed_fields":{"site":"trusted"},"honeypot":"site"}]"#).unwrap();
         let endpoint = ikigai_intake::try_submit(configs[0].clone()).unwrap();
         let action = endpoint.describe().action_specs().remove(0);
         assert!(!action.inputs.iter().any(|field| field.name == "site"));
@@ -250,6 +250,7 @@ mod tests {
         );
         let kernel = Kernel::new(Arc::new(space));
         for body in ["", "site=forged"] {
+            seen.lock().unwrap().clear();
             block_on(kernel.issue(post("urn:intake:a:submit", body), &Capability::root())).unwrap();
             assert_eq!(*seen.lock().unwrap(), r#"((site "trusted"))"#);
         }
