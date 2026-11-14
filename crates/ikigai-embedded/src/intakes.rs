@@ -1,10 +1,11 @@
 //! Contact intake rows from the config home's `intakes.json`, fixed for a host's lifetime.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::sync::OnceLock;
 
 use ikigai_core::{EndpointSpace, Exact};
-use ikigai_intake::{IntakeConfig, IntakeField};
+use ikigai_intake::{BlocklistKey, IntakeConfig, IntakeField};
 use serde::Deserialize;
 
 static CONFIGS: OnceLock<Result<Vec<IntakeConfig>, String>> = OnceLock::new();
@@ -21,6 +22,9 @@ struct Row {
     redirect: Option<String>,
     #[serde(default)]
     blocklist: Option<String>,
+    /// A file holding the blocklist key, relative to the config home unless absolute.
+    #[serde(default)]
+    blocklist_key: Option<String>,
     #[serde(default)]
     email_field: Option<String>,
     #[serde(default)]
@@ -53,7 +57,15 @@ fn max_len() -> usize {
     ikigai_intake::DEFAULT_MAX_LEN
 }
 
-fn parse(text: &str) -> Result<Vec<IntakeConfig>, String> {
+/// Read a row's blocklist key file. The error names the file, never its contents.
+fn read_key(home: &Path, file: &str) -> Result<BlocklistKey, String> {
+    let path = home.join(file);
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read blocklist_key {}: {e}", path.display()))?;
+    BlocklistKey::from_hex(&text).map_err(|e| format!("blocklist_key {}: {e}", path.display()))
+}
+
+fn parse(text: &str, home: &Path) -> Result<Vec<IntakeConfig>, String> {
     // Decode rows separately so even a schema error names the row's id when available.
     let rows: Vec<serde_json::Value> = serde_json::from_str(text)
         .map_err(|e| format!("the intake list is not a JSON array: {e}"))?;
@@ -68,6 +80,11 @@ fn parse(text: &str) -> Result<Vec<IntakeConfig>, String> {
         if !ikigai_intake::field_name(&row.id) || !ids.insert(row.id.clone()) {
             return Err(format!("{at} needs a unique id made of letters, digits, underscores or hyphens, starting with a letter or underscore"));
         }
+        let blocklist_key = row
+            .blocklist_key
+            .map(|file| read_key(home, &file))
+            .transpose()
+            .map_err(|e| format!("{at} is refused: {e}"))?;
         let config = IntakeConfig {
             id: row.id,
             space: row.space,
@@ -85,6 +102,7 @@ fn parse(text: &str) -> Result<Vec<IntakeConfig>, String> {
             }).collect(),
             fixed_fields: row.fixed_fields,
             blocklist: row.blocklist,
+            blocklist_key,
             email_field: row.email_field,
             honeypot: row.honeypot,
             requires: row.requires,
@@ -110,7 +128,7 @@ fn read() -> Result<Vec<IntakeConfig>, String> {
     };
     let path = home.join("intakes.json");
     match std::fs::read_to_string(&path) {
-        Ok(text) => parse(&text).map_err(|e| format!("{}: {e}", path.display())),
+        Ok(text) => parse(&text, &home).map_err(|e| format!("{}: {e}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => compatibility_intake(),
         Err(e) => Err(format!("cannot read {}: {e}", path.display())),
     }
@@ -168,7 +186,7 @@ mod tests {
 
     #[test]
     fn two_intakes_write_their_own_fixed_fields_and_the_alias_uses_the_first() {
-        let configs = parse(TWO).unwrap();
+        let configs = parse(TWO, Path::new("/nonexistent")).unwrap();
         let dropped = Arc::new(Mutex::new(Vec::new()));
         let mut space = bind_configs(EndpointSpace::new(), &configs);
         for config in &configs {
@@ -232,7 +250,7 @@ mod tests {
 
     #[test]
     fn a_fixed_field_is_not_an_input_even_if_also_declared() {
-        let configs = parse(r#"[{"id":"a","space":"urn:space:a","fields":[{"name":"site","required":true}],"fixed_fields":{"site":"trusted"},"honeypot":"site"}]"#).unwrap();
+        let configs = parse(r#"[{"id":"a","space":"urn:space:a","fields":[{"name":"site","required":true}],"fixed_fields":{"site":"trusted"},"honeypot":"site"}]"#, Path::new("/nonexistent")).unwrap();
         let endpoint = ikigai_intake::try_submit(configs[0].clone()).unwrap();
         let action = endpoint.describe().action_specs().remove(0);
         assert!(!action.inputs.iter().any(|field| field.name == "site"));
@@ -257,39 +275,66 @@ mod tests {
         }
     }
 
+    /// A config home holding `blocklist.key`, removed when dropped.
+    struct Home(std::path::PathBuf);
+    impl Home {
+        fn new(name: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("iki-intakes-{name}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("blocklist.key"), format!("{}\n", "07".repeat(32))).unwrap();
+            std::fs::write(dir.join("bad.key"), "not a key\n").unwrap();
+            Home(dir)
+        }
+    }
+    impl Drop for Home {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
-    fn configured_blocklist_is_the_resource_queried() {
-        let configs = parse(r#"[{"id":"a","space":"urn:space:a","fields":[{"name":"email","required":true}],"email_field":"email","blocklist":"urn:custom:blocklist"}]"#).unwrap();
-        let queried = Arc::new(Mutex::new(false));
-        let seen = queried.clone();
+    fn a_configured_blocklist_is_asked_exists_on_a_keyed_sender_hash() {
+        let home = Home::new("keyed");
+        let configs = parse(r#"[{"id":"a","space":"urn:space:a","fields":[{"name":"email","required":true}],"email_field":"email","blocklist":"urn:custom:blocklist:{key}","blocklist_key":"blocklist.key"}]"#, &home.0).unwrap();
+        let [blocked, _] = BlocklistKey::new([7; 32])
+            .sender_keys("blocked@example.org")
+            .unwrap();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let seen = asked.clone();
         let space = bind_configs(EndpointSpace::new(), &configs).bind(
-            Exact::new("urn:custom:blocklist"),
+            ikigai_core::UriTemplate::parse("urn:custom:blocklist:{key}").unwrap(),
             FnEndpoint::new("block", move |inv| {
-                assert_eq!(inv.inline_str("blocked")?, "blocked@example.org");
-                *seen.lock().unwrap() = true;
-                Ok(Representation::new(
-                    ReprType::new("text/plain"),
-                    b"yes".to_vec(),
-                ))
+                assert_eq!(inv.request.verb, Verb::Exists);
+                assert!(inv.request.args.is_empty());
+                seen.lock()
+                    .unwrap()
+                    .push(inv.request.target.as_str().to_string());
+                Ok(Representation::new(ReprType::new("text/plain"), Vec::new()))
             }),
         );
         // No destination exists: a write would fail, while a blocked submission is accepted-looking.
         let kernel = Kernel::new(Arc::new(space));
         let response = block_on(kernel.issue(
-            post("urn:intake:id:a:submit", "email=blocked%40example.org"),
+            post("urn:intake:id:a:submit", "email=Blocked%40example.org"),
             &Capability::root(),
         ))
         .unwrap();
         assert_eq!(response.bytes, b"received\n");
-        assert!(*queried.lock().unwrap());
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [format!("urn:custom:blocklist:{blocked}")]
+        );
     }
 
     #[test]
     fn bad_rows_are_refused_by_name() {
+        let dir = Home::new("bad");
+        let home = dir.0.as_path();
         for row in [
             r#"{"id":"broken","space":"urn:space:a","fields":[],"redirect":"javascript:alert(1)"}"#,
             r#"{"id":"broken","space":"not an iri","fields":[]}"#,
-            r#"{"id":"broken","space":"urn:space:a","fields":[],"blocklist":"not an iri"}"#,
+            r#"{"id":"broken","space":"urn:space:a","fields":[],"blocklist":"not an iri {key}"}"#,
             r#"{"id":"broken","space":"urn:space:a","fields":[],"fixed_fields":{"a) (evil":"x"}}"#,
             r#"{"id":"broken","space":"urn:space:a","fields":[],"fixed_fields":{"received":"x"}}"#,
             r#"{"id":"broken","space":"urn:space:a","fields":[{"name":"message","max_len":0}]}"#,
@@ -297,15 +342,23 @@ mod tests {
             r#"{"id":"broken","space":"urn:space:a","fields":[],"unexpected":true}"#,
             r#"{"id":"broken","space":"urn:space:a","fields":[{"name":"message","requird":true}]}"#,
             r#"{"id":"broken","space":"urn:space:a","fields":[],"email_field":"missing"}"#,
+            r#"{"id":"broken","space":"urn:space:a","fields":[{"name":"email"}],"email_field":"email","blocklist":"urn:decisions","blocklist_key":"blocklist.key"}"#,
+            r#"{"id":"broken","space":"urn:space:a","fields":[{"name":"email"}],"email_field":"email","blocklist":"urn:b:{key}"}"#,
+            r#"{"id":"broken","space":"urn:space:a","fields":[{"name":"email"}],"email_field":"email","blocklist":"urn:b:{key}","blocklist_key":"missing.key"}"#,
+            r#"{"id":"broken","space":"urn:space:a","fields":[{"name":"email"}],"email_field":"email","blocklist":"urn:b:{key}","blocklist_key":"bad.key"}"#,
         ] {
-            let error = parse(&format!("[{row}]")).unwrap_err();
+            let error = parse(&format!("[{row}]"), home).unwrap_err();
             assert!(error.contains("intake row 1 (`broken`)"), "{error}");
+            assert!(
+                !error.contains("not a key"),
+                "a key file's contents are never repeated: {error}"
+            );
         }
-        assert!(parse("[]").unwrap_err().contains("first row"));
+        assert!(parse("[]", home).unwrap_err().contains("first row"));
         let duplicate = TWO.replace("\"beta\"", "\"alpha\"");
-        assert!(parse(&duplicate)
+        assert!(parse(&duplicate, home)
             .unwrap_err()
             .contains("intake row 2 (`alpha`)"));
-        assert!(parse("{").is_err());
+        assert!(parse("{", home).is_err());
     }
 }

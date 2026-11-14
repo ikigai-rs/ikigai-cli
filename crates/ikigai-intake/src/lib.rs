@@ -159,9 +159,16 @@ pub struct IntakeConfig {
     /// Trusted values appended after validation. Submitted keys with these names are ignored
     /// and are never advertised as form inputs.
     pub fixed_fields: std::collections::BTreeMap<String, String>,
-    /// A blocklist resource queried with `blocked=<email>`. When set, overrides the legacy
-    /// `check_blocked` switch and its `urn:decisions` resource. Fail-open on lookup errors.
+    /// The block set, as an IRI template naming the key it is asked about:
+    /// `urn:blocklist:contact:{key}`. When set, the intake asks `Exists` on the template
+    /// expanded with each of the sender's [`BlocklistKey::sender_keys`], and a key that exists
+    /// drops the submission silently. The address itself is never sent. Requires
+    /// `blocklist_key` and `email_field`, and overrides the legacy `check_blocked` switch.
+    /// FAIL-OPEN: a key the set answers `NotFound` for (never blocked, or the block expired),
+    /// an unreachable set and a denied lookup all let the submission through.
     pub blocklist: Option<String>,
+    /// The secret the sender keys are computed with. See [`BlocklistKey`].
+    pub blocklist_key: Option<BlocklistKey>,
     /// A field validated as an email address, if any (also used as the handler's reply-to).
     pub email_field: Option<String>,
     /// A honeypot input that must arrive empty — bots fill it, humans never see it.
@@ -212,6 +219,70 @@ pub struct IntakeConfig {
     pub check_blocked: bool,
 }
 
+/// The secret that turns a sender's address into the keys a block set is asked about.
+///
+/// A keyed BLAKE3 hash (`blake3::keyed_hash`) of the address, lowercased and trimmed, and a
+/// second of `domain:<domain>`, so a block set can hold a mailbox or a whole domain without
+/// holding either in the clear, and without the key an entry cannot be checked against a
+/// guessed address. An address cannot contain `:` (see the email field's rule), so neither key
+/// can stand for the other. `Debug` never prints the key.
+#[derive(Clone)]
+pub struct BlocklistKey([u8; 32]);
+
+impl std::fmt::Debug for BlocklistKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BlocklistKey(..)")
+    }
+}
+
+impl BlocklistKey {
+    /// A key from its 32 bytes.
+    pub fn new(key: [u8; 32]) -> Self {
+        BlocklistKey(key)
+    }
+
+    /// A key from the text of a key file: 64 hexadecimal digits (`openssl rand -hex 32`),
+    /// with surrounding whitespace ignored. The error is a sentence that never repeats the
+    /// file's contents.
+    pub fn from_hex(text: &str) -> std::result::Result<Self, String> {
+        let text = text.trim();
+        let mut key = [0u8; 32];
+        if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("a blocklist key must be 64 hexadecimal digits".into());
+        }
+        for (byte, pair) in key.iter_mut().zip(text.as_bytes().chunks(2)) {
+            let pair = std::str::from_utf8(pair).expect("hex digits are ASCII");
+            *byte = u8::from_str_radix(pair, 16).expect("checked hex digits");
+        }
+        Ok(BlocklistKey(key))
+    }
+
+    /// The keys a block set is asked about for `address`, as lowercase hex: the address's,
+    /// then its domain's. `None` for a value with no `@`, which is not an address.
+    pub fn sender_keys(&self, address: &str) -> Option<[String; 2]> {
+        let address = address.trim().to_lowercase();
+        let (_, domain) = address.rsplit_once('@')?;
+        let domain = format!("domain:{domain}");
+        Some([
+            blake3::keyed_hash(&self.0, address.as_bytes())
+                .to_hex()
+                .to_string(),
+            blake3::keyed_hash(&self.0, domain.as_bytes())
+                .to_hex()
+                .to_string(),
+        ])
+    }
+}
+
+/// The variable a [`IntakeConfig::blocklist`] template names its key with.
+pub const BLOCKLIST_KEY_VAR: &str = "key";
+
+/// The block set's IRI for one key, from the configured template.
+fn blocklist_iri(template: &str, key: &str) -> Result<Iri> {
+    Iri::parse(template.replace("{key}", key))
+        .map_err(|e| Error::Endpoint(format!("bad blocklist: {e}")))
+}
+
 /// The query argument a link token arrives in (`…/booking/submit?k=TOKEN`).
 ///
 /// It rides the URL rather than the form so it never becomes a field in the generated UI,
@@ -256,6 +327,7 @@ pub fn submit(config: IntakeConfig) -> IntakeEndpoint {
 ///     fields: Vec::new(),
 ///     fixed_fields: Default::default(),
 ///     blocklist: None,
+///     blocklist_key: None,
 ///     email_field: None,
 ///     honeypot: None,
 ///     requires: "urn:cap:contact:submit".into(),
@@ -279,7 +351,6 @@ pub fn try_submit(config: IntakeConfig) -> Result<IntakeEndpoint> {
     for (name, iri) in [
         ("space", Some(&config.space)),
         ("requires", Some(&config.requires)),
-        ("blocklist", config.blocklist.as_ref()),
     ] {
         if let Some(iri) = iri {
             Iri::parse(iri).map_err(|e| {
@@ -331,11 +402,37 @@ pub fn try_submit(config: IntakeConfig) -> Result<IntakeEndpoint> {
             ));
         }
     }
-    if config.blocklist.is_some() && config.email_field.is_none() {
-        return Err(invalid(
-            "blocklist",
-            "needs an email_field to check its blocklist".into(),
-        ));
+    if let Some(template) = &config.blocklist {
+        let named = ikigai_core::UriTemplate::parse(template.as_str())
+            .is_ok_and(|t| t.variables().eq([BLOCKLIST_KEY_VAR]));
+        if !named {
+            return Err(invalid(
+                "blocklist",
+                format!(
+                    "has blocklist `{}`, which must name its key once, as `{{key}}`: \
+                     for example `urn:blocklist:contact:{{key}}`",
+                    template.escape_debug()
+                ),
+            ));
+        }
+        blocklist_iri(template, &"0".repeat(64)).map_err(|e| {
+            invalid(
+                "blocklist",
+                format!("has invalid blocklist `{}`: {e}", template.escape_debug()),
+            )
+        })?;
+        if config.email_field.is_none() {
+            return Err(invalid(
+                "blocklist",
+                "needs an email_field to check its blocklist".into(),
+            ));
+        }
+        if config.blocklist_key.is_none() {
+            return Err(invalid(
+                "blocklist_key",
+                "needs a blocklist_key to compute the keys its blocklist is asked about".into(),
+            ));
+        }
     }
     if let Some(redirect) = &config.redirect {
         if ikigai_fn::html::safe_href(redirect).is_none() {
@@ -698,29 +795,46 @@ impl Endpoint for IntakeEndpoint {
 
         // Reject a BLOCKED sender at the door, on either channel — a response byte-identical
         // to the honeypot's silent-accept, so a spammer learns nothing (no bounce, no "you're
-        // blocked"). Checked against the same `urn:decisions` the booking handler consults.
-        // FAIL-OPEN: only a definite "yes" blocks; an unreachable or unauthorised log lets the
-        // submission through, because a lost enquiry is worse than a leaked spam.
-        if config.check_blocked || config.blocklist.is_some() {
-            if let Some(email_field) = &config.email_field {
-                if let Some((_, email)) = carried.iter().find(|(k, _)| k == email_field) {
-                    let blocked = inv
-                        .issue(
-                            Request::new(
-                                Verb::Source,
-                                Iri::parse(config.blocklist.as_deref().unwrap_or("urn:decisions"))
-                                    .map_err(|e| Error::Endpoint(format!("bad blocklist: {e}")))?,
-                            )
-                            .with_arg("blocked", ArgRef::Inline(email.as_bytes().to_vec())),
-                        )
-                        .await
-                        .ok()
-                        .and_then(|r| String::from_utf8(r.bytes).ok())
-                        .is_some_and(|s| s.trim() == "yes");
-                    if blocked {
+        // blocked"). FAIL-OPEN: an unreachable or unauthorised blocklist lets the submission
+        // through, because a lost enquiry is worse than a leaked spam.
+        let email = config
+            .email_field
+            .as_ref()
+            .and_then(|field| carried.iter().find(|(k, _)| k == field))
+            .map(|(_, email)| email.as_str());
+        if let (Some(template), Some(email)) = (&config.blocklist, email) {
+            // A configured block set is asked `Exists` on a KEY, never the address: only a key
+            // that exists blocks, and `NotFound` (never blocked, or expired) or any failure
+            // admits. Without a key (`submit` skips `try_submit`'s check) nothing is asked.
+            if let Some(keys) = config
+                .blocklist_key
+                .as_ref()
+                .and_then(|key| key.sender_keys(email))
+            {
+                for key in keys {
+                    let iri = blocklist_iri(template, &key)?;
+                    if inv.issue(Request::new(Verb::Exists, iri)).await.is_ok() {
                         return Ok(accepted(config));
                     }
                 }
+            }
+        } else if let (true, Some(email)) = (config.check_blocked, email) {
+            // The legacy check, against the same `urn:decisions` the booking handler consults:
+            // only a definite "yes" blocks.
+            let blocked = inv
+                .issue(
+                    Request::new(
+                        Verb::Source,
+                        Iri::parse("urn:decisions").expect("a valid IRI"),
+                    )
+                    .with_arg("blocked", ArgRef::Inline(email.as_bytes().to_vec())),
+                )
+                .await
+                .ok()
+                .and_then(|r| String::from_utf8(r.bytes).ok())
+                .is_some_and(|s| s.trim() == "yes");
+            if blocked {
+                return Ok(accepted(config));
             }
         }
 
@@ -931,6 +1045,7 @@ mod tests {
             check_blocked: false,
             fixed_fields: Default::default(),
             blocklist: None,
+            blocklist_key: None,
         }
     }
 
@@ -1116,6 +1231,191 @@ mod tests {
             1,
             "unreachable blocklist -> fail open"
         );
+    }
+
+    type Recorded = Arc<Mutex<Vec<String>>>;
+
+    const BLOCK_SET: &str = "urn:blocklist:contact:{key}";
+
+    fn test_key() -> BlocklistKey {
+        BlocklistKey::new([7; 32])
+    }
+
+    /// A stand-in block set bound by its template: `Exists` answers for exactly the keys in
+    /// `held`, and `NotFound` otherwise (never blocked, or a block that expired). Every key it
+    /// is asked about is recorded, and so is every argument, which must be none.
+    struct StubBlockSet {
+        held: Vec<String>,
+        asked: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl Endpoint for StubBlockSet {
+        async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+            assert_eq!(inv.request.verb, Verb::Exists);
+            assert!(
+                inv.request.args.is_empty(),
+                "the key is named, not an argument"
+            );
+            let key = inv.bindings.get(BLOCKLIST_KEY_VAR).unwrap().to_string();
+            self.asked
+                .lock()
+                .unwrap()
+                .push(inv.request.target.as_str().to_string());
+            if self.held.contains(&key) {
+                Ok(Representation::new(ReprType::new("text/plain"), Vec::new()))
+            } else {
+                Err(Error::NotFound(key))
+            }
+        }
+    }
+
+    /// A kernel whose intake asks `BLOCK_SET`, holding `held` when `Some` and leaving it
+    /// unbound (unreachable) when `None`: the tuples dropped, and the IRIs the set was asked.
+    fn keyed_kernel(held: Option<Vec<String>>) -> (Kernel, Recorded, Recorded) {
+        let mut cfg = config();
+        cfg.blocklist = Some(BLOCK_SET.to_string());
+        cfg.blocklist_key = Some(test_key());
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let mut space = EndpointSpace::new()
+            .bind(Exact::new("urn:contact:submit"), try_submit(cfg).unwrap())
+            .bind(
+                Exact::new("urn:space:contact"),
+                RecordingSpace {
+                    dropped: dropped.clone(),
+                },
+            );
+        if let Some(held) = held {
+            space = space.bind(
+                UriTemplate::parse(BLOCK_SET).unwrap(),
+                StubBlockSet {
+                    held,
+                    asked: asked.clone(),
+                },
+            );
+        }
+        (Kernel::new(Arc::new(space)), dropped, asked)
+    }
+
+    #[test]
+    fn sender_keys_are_keyed_blake3_of_the_normalized_address_and_its_domain() {
+        let key = test_key();
+        let [address, domain] = key.sender_keys("  Spammer@X.Example \n").unwrap();
+        assert_eq!(
+            address,
+            blake3::keyed_hash(&[7; 32], b"spammer@x.example")
+                .to_hex()
+                .as_str()
+        );
+        assert_eq!(
+            domain,
+            blake3::keyed_hash(&[7; 32], b"domain:x.example")
+                .to_hex()
+                .as_str()
+        );
+        // Another key gives other keys: a set's entries cannot be checked without it.
+        assert_ne!(
+            BlocklistKey::new([8; 32])
+                .sender_keys("spammer@x.example")
+                .unwrap()[0],
+            address
+        );
+        assert_eq!(format!("{key:?}"), "BlocklistKey(..)");
+        let hex = "07".repeat(32);
+        assert_eq!(
+            BlocklistKey::from_hex(&format!("{hex}\n"))
+                .unwrap()
+                .sender_keys("a@b"),
+            key.sender_keys("a@b")
+        );
+        for bad in ["", "07", &"zz".repeat(32), &"07".repeat(33)] {
+            assert!(BlocklistKey::from_hex(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_blocked_key_drops_silently_and_the_address_is_never_sent() {
+        let [held, _] = test_key().sender_keys("spammer@x.example").unwrap();
+        let (k, dropped, asked) = keyed_kernel(Some(vec![held.clone()]));
+        let rep = block_on(k.issue(
+            post("name=Spammer&email=Spammer%40X.example&message=the+price"),
+            &cap(),
+        ))
+        .unwrap();
+        assert_eq!(String::from_utf8(rep.bytes).unwrap(), "received\n");
+        assert!(
+            dropped.lock().unwrap().is_empty(),
+            "a blocked sender must not drop"
+        );
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [format!("urn:blocklist:contact:{held}")],
+            "asked by IRI, with the address's key"
+        );
+    }
+
+    #[test]
+    fn a_blocked_domain_drops_every_address_in_it() {
+        let [_, held] = test_key().sender_keys("anyone@x.example").unwrap();
+        let (k, dropped, asked) = keyed_kernel(Some(vec![held]));
+        block_on(k.issue(
+            post("name=Other&email=other%40x.example&message=the+price"),
+            &cap(),
+        ))
+        .unwrap();
+        assert!(dropped.lock().unwrap().is_empty());
+        assert_eq!(
+            asked.lock().unwrap().len(),
+            2,
+            "the address, then its domain"
+        );
+        assert!(asked
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|iri| !iri.contains("x.example")));
+    }
+
+    #[test]
+    fn an_expired_block_admits() {
+        // The set holds a key, but not this sender's: it answers NotFound, as it does for a
+        // block that has expired, and the submission lands.
+        let (k, dropped, asked) = keyed_kernel(Some(vec!["0".repeat(64)]));
+        block_on(k.issue(
+            post("name=Ada&email=ada%40example.com&message=hello"),
+            &cap(),
+        ))
+        .unwrap();
+        assert_eq!(dropped.lock().unwrap().len(), 1, "NotFound admits");
+        assert_eq!(asked.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn an_unreachable_keyed_blocklist_admits() {
+        let (k, dropped, _) = keyed_kernel(None);
+        block_on(k.issue(post("name=X&email=x%40y.example&message=hi"), &cap())).unwrap();
+        assert_eq!(dropped.lock().unwrap().len(), 1, "unreachable -> fail open");
+    }
+
+    #[test]
+    fn a_blocklist_must_name_its_key_and_have_one() {
+        for (blocklist, key, refused) in [
+            ("urn:decisions", true, "blocklist"),
+            ("urn:blocklist:contact:{sender}", true, "blocklist"),
+            ("urn:blocklist:{key}:{key}", true, "blocklist"),
+            ("not an iri {key}", true, "blocklist"),
+            (BLOCK_SET, false, "blocklist_key"),
+        ] {
+            let mut cfg = config();
+            cfg.blocklist = Some(blocklist.to_string());
+            cfg.blocklist_key = key.then(test_key);
+            match try_submit(cfg) {
+                Err(Error::InvalidArgument { name, .. }) => {
+                    assert_eq!(name, refused, "{blocklist}")
+                }
+                other => panic!("`{blocklist}` must be refused, got {:?}", other.is_ok()),
+            }
+        }
     }
 
     /// A kernel whose contact intake redirects on success, plus the tuples it drops.
