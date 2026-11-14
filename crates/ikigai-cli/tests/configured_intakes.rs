@@ -67,12 +67,14 @@ fn the_config_home_binds_both_intakes_and_the_legacy_alias() {
             &format!("sink {endpoint} content=message=hello&site=forged"),
         ]);
     }
+    command.args(["-c", "source urn:iki:host:arrangement"]);
     let output = command.output().unwrap();
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("Not declarable as it stands"));
     assert_eq!(
         String::from_utf8_lossy(&output.stdout)
             .matches("received")

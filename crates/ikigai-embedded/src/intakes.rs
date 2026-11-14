@@ -126,15 +126,15 @@ pub(crate) fn check() -> Result<(), String> {
 
 fn bind_configs(mut space: EndpointSpace, configs: &[IntakeConfig]) -> EndpointSpace {
     for (index, config) in configs.iter().enumerate() {
+        // Both doors share one endpoint identity, so arrangement dumps can be reloaded.
+        let endpoint: std::sync::Arc<dyn ikigai_core::Endpoint> =
+            std::sync::Arc::new(ikigai_intake::submit(config.clone()));
         if index == 0 {
-            space = space.bind(
-                Exact::new("urn:contact:submit"),
-                ikigai_intake::submit(config.clone()),
-            );
+            space = space.bind_arc(Exact::new("urn:contact:submit"), endpoint.clone());
         }
-        space = space.bind(
+        space = space.bind_arc(
             Exact::new(format!("urn:intake:{}:submit", config.id)),
-            ikigai_intake::submit(config.clone()),
+            endpoint,
         );
     }
     space
