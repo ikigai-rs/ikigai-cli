@@ -20,6 +20,11 @@ jobs:
       # the transports), so the job is scoped to that one member.
       wasm-lib: true
       wasm-packages: "ikigai-time"
+      # `ci / no default features` (ledger #1543): clippy, test and doc across the workspace
+      # with `--no-default-features`. Off, nothing built `ikigai-cli` without `embedded`, and
+      # that build (the stub binary, alone or with `quic`, `web` or `ipc`) went 43 errors deep
+      # with every check green: `features: "*"` only ever ADDS to the defaults.
+      no-default-features: true
   # The native Windows PROBE (ledger #1162): what breaks when the whole workspace is built and
   # tested on Windows, and what the built binary does there. It REPORTS and does not gate:
   # every probe step carries `continue-on-error: true`, so a red step leaves the job (and the
