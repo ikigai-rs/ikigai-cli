@@ -344,6 +344,38 @@ mod tests {
         assert_eq!(limits.windows.lock().unwrap().len(), 2);
     }
 
+    /// A fact `docs/no-tracking-certificate.md` relies on: the limiter bounds the addresses
+    /// it holds by COUNT, not by time. A window that empties keeps its key, the address, in
+    /// memory until the table is full and a new source needs the place; nothing sweeps it
+    /// when its window ends. A certificate that says "held for one window" would be wrong.
+    #[test]
+    fn an_emptied_window_keeps_its_address_until_the_table_needs_the_place() {
+        let limits = SourceLimits::new(vec![SourceRate::new("urn:x", 5, secs(60))]).max_sources(2);
+        let held = |addr: &str| {
+            limits
+                .windows
+                .lock()
+                .unwrap()
+                .contains_key(&(0, addr.to_string()))
+        };
+        let t0 = start();
+        assert_eq!(limits.check_at("urn:x", "203.0.113.9", t0), None);
+        // An hour on, far past the 60s window, a second source arrives. The table has room,
+        // so nothing is reclaimed: the first address is still held.
+        assert_eq!(
+            limits.check_at("urn:x", "198.51.100.4", t0 + secs(3600)),
+            None
+        );
+        assert!(
+            held("203.0.113.9"),
+            "the emptied window is still keyed by its address"
+        );
+        // A third source finds the table full: the emptied window is reclaimed, the live one kept.
+        assert_eq!(limits.check_at("urn:x", "192.0.2.1", t0 + secs(3601)), None);
+        assert!(!held("203.0.113.9"), "reclaimed once its place was needed");
+        assert!(held("198.51.100.4"), "a live window is kept");
+    }
+
     #[test]
     fn retry_after_rounds_up_and_is_never_zero() {
         let rule = SourceRate::new("urn:x", 1, secs(60));
