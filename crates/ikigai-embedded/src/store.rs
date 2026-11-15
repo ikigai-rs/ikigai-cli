@@ -177,11 +177,16 @@ pub enum Authority {
     /// exist to draw — and the floor moved to 0.2.1 instead, where the per-graph family
     /// is declared there too. Exercised by
     /// `ikigai-cli/tests/ledger.rs::the_narrow_per_graph_grants_work_and_the_broad_store_key_does_not`.
+    ///
+    /// Since `ikigai-ledger` 0.23.0 (ledger #3661) it also reads the ledger's SESSION graph,
+    /// where an item's and the ledger's session summaries live.
     Read,
     /// …plus `append`, `comment`, `close`, `reopen`, `claim`, `defer`, `link`, `label`
-    /// and editing an item.
+    /// and editing an item, recording a session summary, and the `sessions` Sink that moves
+    /// the summaries 0.22.0 wrote into the session graph.
     Write,
-    /// …plus `Delete` on an item, which moves its quads to that ledger's graveyard.
+    /// …plus `Delete` on an item, which moves its quads, and its session summaries, to that
+    /// ledger's graveyard.
     Delete,
     /// …plus `purge`, which destroys the content in both graphs — and so also READS the
     /// graveyard, which is the one store token a delete does not carry.
@@ -208,12 +213,21 @@ pub enum Authority {
 /// built around the powerful token produces a ledger that cannot write, failing with a
 /// `Denied` that reads like a bug in the ledger. See `docs/durable-store.md`.
 ///
-/// ```no_run
+/// ⚠ **Every level carries the ledger's SESSION graph too** (`ikigai-ledger` 0.23.0, ledger
+/// #3661): session summaries live in `urn:iki:ledger:graph:{L}:session`, a graph of their own,
+/// so reading them needs that graph's read token and recording or moving them needs its write
+/// token. A delete moves an item's summaries to the graveyard and a purge destroys them, so
+/// both carry the session graph's read and write tokens as well.
+///
+/// ```
 /// # use ikigai_embedded::store::{grants_for, Authority};
 /// let grants = grants_for("default", Authority::Write).unwrap();
 /// assert!(grants.contains(&"urn:cap:ledger:write:default".to_string()));
 /// assert!(grants.contains(
 ///     &"urn:cap:store:write:graph:urn:iki:ledger:graph:default".to_string()
+/// ));
+/// assert!(grants.contains(
+///     &"urn:cap:store:write:graph:urn:iki:ledger:graph:default:session".to_string()
 /// ));
 /// ```
 ///
@@ -224,14 +238,25 @@ pub enum Authority {
 pub fn grants_for(ledger: &str, authority: Authority) -> Result<Vec<String>, Error> {
     let ledger = ikigai_ledger::Ledger::parse(ledger)?;
     let graph = ledger.graph();
+    // ★ Session summaries are in a graph of their own since `ikigai-ledger` 0.23.0 (ledger
+    // #3661), and a scoped grant cannot reach across graphs, so every level names it.
+    let sessions = ledger.session_graph();
     // Read is the floor: every level below reads, and a ledger you may write and not read
-    // is one whose own listing refuses.
-    let mut grants = vec![ledger.cap_read(), ikigai_store::cap_read_graph(&graph)];
+    // is one whose own listing refuses. Reading an item's sessions reads the session graph.
+    let mut grants = vec![
+        ledger.cap_read(),
+        ikigai_store::cap_read_graph(&graph),
+        ikigai_store::cap_read_graph(&sessions),
+    ];
     if authority == Authority::Read {
         return Ok(grants);
     }
     grants.push(ledger.cap_write());
     grants.push(ikigai_store::cap_write_graph(&graph));
+    // Recording a summary, and the `sessions` Sink that moves 0.22.0's summaries out of the
+    // ledger graph, write the session graph. Delete and purge inherit it: a delete moves an
+    // item's summaries to the graveyard and a purge destroys them.
+    grants.push(ikigai_store::cap_write_graph(&sessions));
     if authority == Authority::Write {
         return Ok(grants);
     }
@@ -483,8 +508,10 @@ mod tests {
             vec![
                 "urn:cap:ledger:read:acme",
                 "urn:cap:store:read:graph:urn:iki:ledger:graph:acme",
+                "urn:cap:store:read:graph:urn:iki:ledger:graph:acme:session",
                 "urn:cap:ledger:write:acme",
                 "urn:cap:store:write:graph:urn:iki:ledger:graph:acme",
+                "urn:cap:store:write:graph:urn:iki:ledger:graph:acme:session",
             ]
         );
         // ⚠ The whole point: the broad key is ABSENT. `urn:iki:store:graph-update` refuses
@@ -522,10 +549,20 @@ mod tests {
             ),
             "the graveyard's read token is purge's alone: {grants:?}"
         );
+        // ★ A delete moves the item's session summaries to the graveyard (ledger #3661), so it
+        // reads and writes the session graph; without these the ledger refuses it by name.
+        for token in [
+            "urn:cap:store:read:graph:urn:iki:ledger:graph:acme:session",
+            "urn:cap:store:write:graph:urn:iki:ledger:graph:acme:session",
+        ] {
+            assert!(grants.contains(&token.to_string()), "{token}: {grants:?}");
+        }
     }
 
     /// ★ The PURGE list, spelled out as literals for the same reason as the write list
-    /// above: these eight strings are what an operator's grant file carries.
+    /// above: these ten strings are what an operator's grant file carries. The two
+    /// `:session` tokens are ledger #3661 (`ikigai-ledger` 0.23.0): a purge destroys an
+    /// item's session summaries, which live in a graph of their own.
     ///
     /// The last one is ledger #760. `ikigai-ledger` 0.3.0+ purges a deleted item by reading
     /// the graveyard, and `ikigai-store` 0.2.6+ refuses an update whose WHERE reads a graph
@@ -539,8 +576,10 @@ mod tests {
             vec![
                 "urn:cap:ledger:read:acme",
                 "urn:cap:store:read:graph:urn:iki:ledger:graph:acme",
+                "urn:cap:store:read:graph:urn:iki:ledger:graph:acme:session",
                 "urn:cap:ledger:write:acme",
                 "urn:cap:store:write:graph:urn:iki:ledger:graph:acme",
+                "urn:cap:store:write:graph:urn:iki:ledger:graph:acme:session",
                 "urn:cap:ledger:delete:acme",
                 "urn:cap:store:write:graph:urn:iki:ledger:graph:acme:deleted",
                 "urn:cap:ledger:purge:acme",
@@ -559,6 +598,7 @@ mod tests {
             vec![
                 "urn:cap:ledger:read:default",
                 "urn:cap:store:read:graph:urn:iki:ledger:graph:default",
+                "urn:cap:store:read:graph:urn:iki:ledger:graph:default:session",
             ]
         );
     }

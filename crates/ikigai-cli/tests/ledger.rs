@@ -320,6 +320,71 @@ fn the_purge_grant_list_purges_a_deleted_item() {
     );
 }
 
+/// ★ **The session graph, exercised: a session holding exactly `grants_for(…, Write)` records
+/// an agent session's summary and reads it back, and the list without the session graph's
+/// tokens cannot** (ledger #3661).
+///
+/// Since `ikigai-ledger` 0.23.0 a ledger's session summaries live in
+/// `urn:iki:ledger:graph:{L}:session`, a graph of their own, and a scoped store grant cannot
+/// reach across graphs. A 0.22.0-shaped list (the ledger graph's tokens only) still files,
+/// comments and hands back, and is refused at the summary, which is the failure an operator
+/// copying an old grant file would meet. This is the line that makes the two `:session`
+/// tokens in `grants_for` a checked claim rather than a comment.
+#[test]
+fn the_write_grant_list_records_and_reads_a_session_summary() {
+    use ikigai_embedded::store::{grants_for, Authority};
+
+    let grants = grants_for("sessions-grant", Authority::Write).expect("a valid ledger name");
+    let summary = r#"{"session": "cli-0b5e41aa", "machineName": "lawnboy", "harness": "claude", "model": "claude-opus-5-5", "exitStatus": 0, "wallClockMs": 1830000, "turns": 41, "toolCalls": 118, "inputTokens": 5120, "cachedInputTokens": 880000, "cacheCreationTokens": 64000, "outputTokens": 21000}"#;
+
+    // The list as 0.22.0 needed it: everything but the session graph.
+    let old = engine();
+    let without: Vec<&str> = grants
+        .iter()
+        .map(String::as_str)
+        .filter(|g| !g.ends_with(":session"))
+        .collect();
+    assert_eq!(without.len() + 2, grants.len(), "{grants:?}");
+    line(&old, &format!("cap {}", without.join(" ")));
+    let filed = line(
+        &old,
+        "sink urn:iki:ledger:sessions-grant:append Hand back with a session summary",
+    );
+    assert!(filed.starts_with("sessions-grant#1 "), "{filed}");
+    line(
+        &old,
+        "sink urn:iki:ledger:sessions-grant:comment item=1 handback=true PR is up, CI green",
+    );
+    let denied = refused(
+        &old,
+        &format!("sink urn:iki:ledger:sessions-grant:item:1:sessions {summary}"),
+    );
+    assert!(
+        denied.contains("urn:iki:ledger:graph:sessions-grant:session")
+            || denied.to_lowercase().contains("denied"),
+        "the session graph is a graph of its own: {denied}"
+    );
+
+    // And the list `grants_for` issues now.
+    let new = engine();
+    line(&new, &format!("cap {}", grants.join(" ")));
+    let recorded = line(
+        &new,
+        &format!("sink urn:iki:ledger:sessions-grant:item:1:sessions {summary}"),
+    );
+    assert!(recorded.contains("cli-0b5e41aa"), "{recorded}");
+    let item = line(&new, "source urn:iki:ledger:sessions-grant:item:1:sessions");
+    assert!(
+        item.contains("cli-0b5e41aa"),
+        "one item's sessions read: {item}"
+    );
+    let all = line(&new, "source urn:iki:ledger:sessions-grant:sessions");
+    assert!(
+        all.contains("cli-0b5e41aa"),
+        "the ledger's sessions read: {all}"
+    );
+}
+
 /// The ledger's resources are in the composed catalog under the names the manifold
 /// advertises, so `urn:kernel:actions` offers them and the engine can route named
 /// arguments to them — which is what every line in the first test depends on.
