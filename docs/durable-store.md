@@ -270,13 +270,21 @@ halves** — the ledger's own grant and the store's token for that ledger's grap
 
 | to do this in `L` | at the ledger | …and at the store |
 | --- | --- | --- |
-| read | `urn:cap:ledger:read:L` | `urn:cap:store:read:graph:urn:iki:ledger:graph:L` |
-| write | `urn:cap:ledger:write:L` | the above **and** `urn:cap:store:write:graph:urn:iki:ledger:graph:L` |
-| delete | `urn:cap:ledger:delete:L` | both of those **and** `urn:cap:store:write:graph:urn:iki:ledger:graph:L:deleted` |
-| purge | `urn:cap:ledger:purge:L` | the same three as delete **and** `urn:cap:store:read:graph:urn:iki:ledger:graph:L:deleted` |
+| read | `urn:cap:ledger:read:L` | `urn:cap:store:read:graph:urn:iki:ledger:graph:L` **and** `urn:cap:store:read:graph:urn:iki:ledger:graph:L:session` |
+| write | `urn:cap:ledger:write:L` | the above **and** `urn:cap:store:write:graph:urn:iki:ledger:graph:L` **and** `urn:cap:store:write:graph:urn:iki:ledger:graph:L:session` |
+| delete | `urn:cap:ledger:delete:L` | all four of those **and** `urn:cap:store:write:graph:urn:iki:ledger:graph:L:deleted` |
+| purge | `urn:cap:ledger:purge:L` | the same five as delete **and** `urn:cap:store:read:graph:urn:iki:ledger:graph:L:deleted` |
 
-⚠ **Delete and purge need write authority over TWO graphs**: the graveyard is a second
-graph and a scoped write cannot reach across. That is the row an operator gets wrong.
+⚠ **Delete and purge need write authority over THREE graphs**: the graveyard is a second
+graph, the session graph a third, and a scoped write cannot reach across. That is the row
+an operator gets wrong.
+
+⚠ **Session summaries live in a graph of their own** (`ikigai-ledger` 0.23.0, ledger
+#3661): `urn:iki:ledger:graph:L:session`. Reading an item's or the ledger's sessions needs
+its read token, recording a summary and the `sessions` Sink that moves 0.22.0's summaries
+need its write token too, and a delete moves an item's summaries to the graveyard, so every
+row carries it. A grant file written for 0.22.0 still files and comments, and is refused
+at the first summary, naming the token.
 
 ⚠ **And purge needs the graveyard's READ grant as well** (ledger #760): since
 `ikigai-ledger` 0.3.0 a purge finds a deleted item through its tombstone and clears what the
