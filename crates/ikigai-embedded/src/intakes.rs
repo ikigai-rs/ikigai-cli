@@ -21,6 +21,9 @@ struct Row {
     redirect: Option<String>,
     #[serde(default)]
     blocklist: Option<String>,
+    /// An absolute path to the 64-hex-digit key sender addresses are hashed with for `blocklist`.
+    #[serde(default)]
+    block_key_file: Option<std::path::PathBuf>,
     #[serde(default)]
     email_field: Option<String>,
     #[serde(default)]
@@ -68,6 +71,13 @@ fn parse(text: &str) -> Result<Vec<IntakeConfig>, String> {
         if !ikigai_intake::field_name(&row.id) || !ids.insert(row.id.clone()) {
             return Err(format!("{at} needs a unique id made of letters, digits, underscores or hyphens, starting with a letter or underscore"));
         }
+        let block_key = match &row.block_key_file {
+            Some(path) if !path.is_absolute() => {
+                return Err(format!("{at} needs an absolute block_key_file, not `{}`", path.display()));
+            }
+            Some(path) => Some(ikigai_intake::BlockKey::load(path).map_err(|e| format!("{at} is refused: {e}"))?),
+            None => None,
+        };
         let config = IntakeConfig {
             id: row.id,
             space: row.space,
@@ -85,6 +95,7 @@ fn parse(text: &str) -> Result<Vec<IntakeConfig>, String> {
             }).collect(),
             fixed_fields: row.fixed_fields,
             blocklist: row.blocklist,
+            block_key,
             email_field: row.email_field,
             honeypot: row.honeypot,
             requires: row.requires,
@@ -257,20 +268,67 @@ mod tests {
         }
     }
 
+    /// A key file, mode 600, under a fresh directory; the directory lives as long as the guard.
+    /// A fresh directory, removed when dropped.
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new() -> TempDir {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("ikigai-intake-key-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn key_file(contents: &str) -> (TempDir, std::path::PathBuf) {
+        let dir = TempDir::new();
+        let path = dir.0.join("block.key");
+        std::fs::write(&path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        (dir, path)
+    }
+
+    const KEY: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+
     #[test]
-    fn configured_blocklist_is_the_resource_queried() {
-        let configs = parse(r#"[{"id":"a","space":"urn:space:a","fields":[{"name":"email","required":true}],"email_field":"email","blocklist":"urn:custom:blocklist"}]"#).unwrap();
-        let queried = Arc::new(Mutex::new(false));
-        let seen = queried.clone();
+    fn configured_blocklist_is_asked_by_keyed_member_iri_never_by_address() {
+        let (_dir, path) = key_file(KEY);
+        let row = format!(
+            r#"[{{"id":"a","space":"urn:space:a","fields":[{{"name":"email","required":true}}],"email_field":"email","blocklist":"urn:custom:blocked:{{key}}","block_key_file":{}}}]"#,
+            serde_json::to_string(&path).unwrap()
+        );
+        let configs = parse(&row).unwrap();
+        let key = ikigai_intake::BlockKey::from_hex(KEY).unwrap();
+        let member = format!(
+            "urn:custom:blocked:{}",
+            key.sender_keys("Blocked@Example.org")[0]
+        );
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let seen = asked.clone();
         let space = bind_configs(EndpointSpace::new(), &configs).bind(
-            Exact::new("urn:custom:blocklist"),
+            ikigai_core::UriTemplate::parse("urn:custom:blocked:{key}").unwrap(),
             FnEndpoint::new("block", move |inv| {
-                assert_eq!(inv.inline_str("blocked")?, "blocked@example.org");
-                *seen.lock().unwrap() = true;
-                Ok(Representation::new(
-                    ReprType::new("text/plain"),
-                    b"yes".to_vec(),
-                ))
+                let iri = inv.request.target.to_string();
+                seen.lock()
+                    .unwrap()
+                    .push((inv.request.verb, iri.clone(), inv.request.args.len()));
+                if iri == member {
+                    Ok(Representation::new(ReprType::new("text/plain"), Vec::new()))
+                } else {
+                    Err(ikigai_core::Error::NotFound(iri))
+                }
             }),
         );
         // No destination exists: a write would fail, while a blocked submission is accepted-looking.
@@ -281,7 +339,44 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(response.bytes, b"received\n");
-        assert!(*queried.lock().unwrap());
+        let asked = asked.lock().unwrap();
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert_eq!(asked[0].0, Verb::Exists);
+        assert_eq!(asked[0].2, 0, "the question carries no arguments");
+        assert!(
+            !asked[0].1.to_lowercase().contains("example.org"),
+            "{asked:?}"
+        );
+    }
+
+    #[test]
+    fn a_block_key_file_is_absolute_readable_private_and_a_key() {
+        let (_dir, good) = key_file(KEY);
+        let row = |file: &str| {
+            format!(
+                r#"[{{"id":"a","space":"urn:space:a","fields":[{{"name":"email"}}],"email_field":"email","blocklist":"urn:b:{{key}}","block_key_file":{file}}}]"#
+            )
+        };
+        assert!(parse(&row(&serde_json::to_string(&good).unwrap())).is_ok());
+        let error = parse(&row(r#""relative/block.key""#)).unwrap_err();
+        assert!(
+            error.contains("needs an absolute block_key_file"),
+            "{error}"
+        );
+        let (_bad_dir, bad) = key_file("not a key");
+        let error = parse(&row(&serde_json::to_string(&bad).unwrap())).unwrap_err();
+        assert!(error.contains("is not 64 hexadecimal digits"), "{error}");
+        assert!(
+            !error.contains("not a key"),
+            "the file's contents are never echoed: {error}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let error = parse(&row(&serde_json::to_string(&good).unwrap())).unwrap_err();
+            assert!(error.contains("so others can reach it"), "{error}");
+        }
     }
 
     #[test]
@@ -290,6 +385,8 @@ mod tests {
             r#"{"id":"broken","space":"urn:space:a","fields":[],"redirect":"javascript:alert(1)"}"#,
             r#"{"id":"broken","space":"not an iri","fields":[]}"#,
             r#"{"id":"broken","space":"urn:space:a","fields":[],"blocklist":"not an iri"}"#,
+            r#"{"id":"broken","space":"urn:space:a","fields":[{"name":"email"}],"email_field":"email","blocklist":"urn:decisions"}"#,
+            r#"{"id":"broken","space":"urn:space:a","fields":[{"name":"email"}],"email_field":"email","blocklist":"urn:b:{key}"}"#,
             r#"{"id":"broken","space":"urn:space:a","fields":[],"fixed_fields":{"a) (evil":"x"}}"#,
             r#"{"id":"broken","space":"urn:space:a","fields":[],"fixed_fields":{"received":"x"}}"#,
             r#"{"id":"broken","space":"urn:space:a","fields":[{"name":"message","max_len":0}]}"#,

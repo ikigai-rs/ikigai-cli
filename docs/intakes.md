@@ -24,7 +24,8 @@ site values:
     "honeypot": "_honey",
     "redirect": "https://studio.example/thanks",
     "fixed_fields": {"site": "studio"},
-    "blocklist": "urn:decisions"
+    "blocklist": "urn:blocked:owner:{key}",
+    "block_key_file": "/etc/ikigai/block.key"
   },
   {
     "id": "workshop",
@@ -36,7 +37,8 @@ site values:
     "email_field": "email",
     "redirect": "https://workshop.example/thanks",
     "fixed_fields": {"site": "workshop"},
-    "blocklist": "urn:decisions"
+    "blocklist": "urn:blocked:owner:{key}",
+    "block_key_file": "/etc/ikigai/block.key"
   }
 ]
 ```
@@ -57,7 +59,19 @@ IRI receiving the validated tuple. Optional row keys are:
 | `email_field` | `null` | A declared submitted field to validate as an email address. |
 | `honeypot` | `null` | A body key that must be empty; a filled trap is silently discarded. |
 | `requires` | `urn:cap:contact:submit` | Capability required to submit. |
-| `blocklist` | `null` | Resource queried with `blocked=<email>`; requires `email_field`. Only a definite `yes` blocks; lookup errors fail open, as before. The submitting ceiling must permit the lookup. |
+| `blocklist` | `null` | The block set, as an IRI template naming each member once as `{key}`; requires `email_field` and `block_key_file`. See below. |
+| `block_key_file` | `null` | Absolute path to the key sender addresses are hashed with for `blocklist`: 64 hexadecimal digits, mode 600 (or root-owned 640). |
+
+### The blocklist
+
+The intake never sends or stores a sender's address to check it. It computes two keys with
+keyed BLAKE3 under the key in `block_key_file`: one over the trimmed, lowercased address and
+one over `domain:<domain>` (the part after the `@`), each as 64 lowercase hexadecimal digits.
+It asks `Exists` on the `blocklist` template with each key filled in, the address first. If
+either member exists, the submission is silently discarded with the same answer as a real
+submission. Any other answer admits it: `NotFound` (an expired block, or none), or an
+unreachable or refused block set. The submitting ceiling must permit the lookup. A block set
+entry for an address is the same keyed hash, so whoever adds entries needs the same key.
 
 Each field requires `name`. Optional field keys are `required` (false), `summary` (the
 name), `one_of` (an empty list), `iana_zone` (false), and `max_len` (the intake's
@@ -73,9 +87,10 @@ The body and its message remain untrusted data; fixed fields do not turn them in
 These endpoints retain the existing tuplespace storage path and do not configure downstream
 scoring, layer routing or encryption; configure those separately before accepting public messages.
 
-An empty list, repeated ID, invalid IRI or redirect, invalid field, unknown configuration key,
-unreadable file or malformed JSON refuses startup. Row errors name their position and ID
-when available. The binary exits with code 2 and a plain sentence beginning `ikigai:`, for
+An empty list, repeated ID, invalid IRI or redirect, invalid field, blocklist without one `{key}`
+or a block key, block key file that is relative, unreadable, reachable by others or not a key,
+unknown configuration key, unreadable file or malformed JSON refuses startup. Row errors
+name their position and ID when available. The binary exits with code 2 and a plain sentence beginning `ikigai:`, for
 example:
 
 ```text
