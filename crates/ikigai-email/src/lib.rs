@@ -149,7 +149,13 @@ fn address_like(name: &str, value: &str) -> Result<String> {
     if !ok {
         return Err(Error::InvalidArgument {
             name: name.to_string(),
-            detail: format!("`{value}` is not an email address"),
+            // Never the value: a public form fills `reply_to`, and a refusal's text can be
+            // written in the clear (a dead-lettered tuple's `.err` note). Name the argument
+            // and the rule, so the sentence still says what to fix.
+            detail: format!(
+                "`{name}` is not an email address: it needs one @ with a name before it and a \
+                 domain with a dot after it, and no spaces or any of < > ( ) [ ] : ; , \" \\"
+            ),
         });
     }
     Ok(value)
@@ -307,18 +313,18 @@ fn build_message(message: &Outgoing) -> std::result::Result<lettre::Message, Mai
             message
                 .from
                 .parse()
-                .map_err(|e| MailError::Permanent(format!("bad From `{}`: {e}", message.from)))?,
+                .map_err(|e| MailError::Permanent(format!("bad From address: {e}")))?,
         )
         .to(message
             .to
             .parse()
-            .map_err(|e| MailError::Permanent(format!("bad To `{}`: {e}", message.to)))?)
+            .map_err(|e| MailError::Permanent(format!("bad To address: {e}")))?)
         .subject(message.subject.clone());
     if let Some(reply_to) = &message.reply_to {
         builder = builder.reply_to(
             reply_to
                 .parse()
-                .map_err(|e| MailError::Permanent(format!("bad Reply-To: {e}")))?,
+                .map_err(|e| MailError::Permanent(format!("bad Reply-To address: {e}")))?,
         );
     }
     match &message.ics {
@@ -563,6 +569,93 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(mail.sent.lock().unwrap().len(), 1);
+    }
+
+    /// A refusal never echoes the value it refused. A contact form feeds `reply_to` from a
+    /// stranger; when the send fails the reactor dead-letters the tuple and the error text
+    /// becomes a plaintext `.err` note, so whatever they typed would be written in the clear.
+    /// The sentence names the argument and the rule instead.
+    #[test]
+    fn a_refused_address_is_never_echoed() {
+        let mail = FakeMail::ok();
+        let k = kernel(mail.clone());
+        let secret = "visitor-secret";
+        for bad in [
+            "visitor-secret",
+            "visitor-secret@nodot",
+            "Your Bank<visitor-secret@x.example>",
+            "visitor-secret @x.example",
+        ] {
+            for field in ["to", "reply_to"] {
+                let mut args = vec![
+                    ("to", "owner@example.com"),
+                    ("subject", "Hi"),
+                    ("content", "b"),
+                ];
+                args.retain(|(n, _)| *n != field);
+                args.push((field, bad));
+                let err = block_on(k.issue(send_request(&args), &cap())).unwrap_err();
+                let Error::InvalidArgument {
+                    ref name,
+                    ref detail,
+                } = err
+                else {
+                    panic!("`{field}` should be an invalid argument, got: {err:?}");
+                };
+                assert_eq!(name, field);
+                let text = format!("{err} {detail} {err:?}");
+                assert!(
+                    !text.contains(secret),
+                    "the refused value is echoed: {text}"
+                );
+                assert_eq!(
+                    detail,
+                    &format!(
+                        "`{field}` is not an email address: it needs one @ with a name before \
+                         it and a domain with a dot after it, and no spaces or any of \
+                         < > ( ) [ ] : ; , \" \\"
+                    )
+                );
+            }
+        }
+        assert!(mail.sent.lock().unwrap().is_empty());
+    }
+
+    /// The transport's own refusals of an address name the header, not the value.
+    #[test]
+    fn a_transport_refusal_of_an_address_is_never_echoed() {
+        let message = Outgoing {
+            from: "site@example.com".to_string(),
+            to: "visitor-secret".to_string(),
+            reply_to: Some("visitor-secret".to_string()),
+            subject: "Hi".to_string(),
+            body: "b".to_string(),
+            ics: None,
+        };
+        let Err(MailError::Permanent(detail)) = build_message(&message) else {
+            panic!("a bare word is not an address");
+        };
+        assert!(!detail.contains("visitor-secret"), "To echoed: {detail}");
+        let message = Outgoing {
+            to: "owner@example.com".to_string(),
+            ..message
+        };
+        let Err(MailError::Permanent(detail)) = build_message(&message) else {
+            panic!("a bare word is not an address");
+        };
+        assert!(
+            !detail.contains("visitor-secret"),
+            "Reply-To echoed: {detail}"
+        );
+        let message = Outgoing {
+            from: "visitor-secret".to_string(),
+            reply_to: None,
+            ..message
+        };
+        let Err(MailError::Permanent(detail)) = build_message(&message) else {
+            panic!("a bare word is not an address");
+        };
+        assert!(!detail.contains("visitor-secret"), "From echoed: {detail}");
     }
 
     #[test]
