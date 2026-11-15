@@ -22,6 +22,14 @@
 //!
 //! Tuples stored before the key was configured are plaintext, and a sealed space refuses them
 //! until `ikigai space-reseal` seals them in place ([`reseal`]).
+//!
+//! ## A reseal changes ids, and leaves forwards
+//!
+//! A tuple's id is the hash of its STORED bytes, so sealing a plaintext tuple, or sealing it
+//! again to a rotated key, stores it under a new id, and anything that named the old id (an
+//! emailed contact link, ledger #3713) names nothing. [`reseal`] therefore writes one forward
+//! per moved tuple, `<space>/.resealed/<old id>`, holding the new id, and [`current_id`]
+//! follows them. A forward is a pair of ids, never tuple text, so it is stored in the clear.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -213,19 +221,82 @@ pub fn reseal(root: &Path, key: &Path) -> Result<Vec<Resealed>, String> {
     for name in names {
         let pending = endpoint
             .reencode(&name)
-            .map_err(|e| format!("space `{name}`: {e}"))?
-            .len();
+            .map_err(|e| format!("space `{name}`: {e}"))?;
+        for moved in &pending {
+            write_forward(root, &name, &moved.old, &moved.new)?;
+        }
         let settled = endpoint
             .reencode_settled(&name)
-            .map_err(|e| format!("space `{name}`: {e}"))?
-            .len();
+            .map_err(|e| format!("space `{name}`: {e}"))?;
+        for moved in &settled {
+            if let (Some(old), Some(new)) = (
+                moved.was.strip_suffix(TUPLE_SUFFIX),
+                moved.now.strip_suffix(TUPLE_SUFFIX),
+            ) {
+                if old != new {
+                    write_forward(root, &name, old, new)?;
+                }
+            }
+        }
         done.push(Resealed {
             space: name,
-            pending,
-            settled,
+            pending: pending.len(),
+            settled: settled.len(),
         });
     }
     Ok(done)
+}
+
+/// The directory, inside a space, where [`reseal`] records the forwards.
+pub const FORWARDS_DIR: &str = ".resealed";
+
+const TUPLE_SUFFIX: &str = ".tuple";
+
+/// How many forwards [`current_id`] follows: one per reseal since the tuple was stored, so a
+/// handful in practice. The bound only keeps a looping or hostile chain finite.
+const MAX_FORWARDS: usize = 16;
+
+/// Whether `id` has the shape of a tuple id: 64 lowercase hex digits, the only names a
+/// forward is written under or may point to.
+fn id_shaped(id: &str) -> bool {
+    id.len() == 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Record that the tuple `old` in `space` is stored as `new` since this reseal.
+fn write_forward(root: &Path, space: &str, old: &str, new: &str) -> Result<(), String> {
+    if !id_shaped(old) || !id_shaped(new) {
+        return Ok(());
+    }
+    let dir = root.join(space).join(FORWARDS_DIR);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let path = dir.join(old);
+    std::fs::write(&path, format!("{new}\n")).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The id the tuple once stored as `id` in `space` (under the spaces `root`) has now: `id`
+/// itself unless a [`reseal`] moved it, else the id at the end of its forwards. An id that is
+/// not tuple-shaped, a missing or unreadable forward, or a forward that names no id ends the
+/// walk where it stands, so the answer is always an id a caller may look up.
+pub fn current_id(root: &Path, space: &str, id: &str) -> String {
+    let mut id = id.to_string();
+    if !id_shaped(&id) || space.contains(['/', '\\', '.']) {
+        return id;
+    }
+    let dir = root.join(space).join(FORWARDS_DIR);
+    for _ in 0..MAX_FORWARDS {
+        let Ok(next) = std::fs::read_to_string(dir.join(&id)) else {
+            break;
+        };
+        let next = next.trim();
+        if !id_shaped(next) || next == id {
+            break;
+        }
+        id = next.to_string();
+    }
+    id
 }
 
 #[cfg(test)]

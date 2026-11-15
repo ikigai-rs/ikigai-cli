@@ -56,8 +56,21 @@
 //! A link names its enquiry by the enquiry tuple's id in the contact space (its content
 //! address, [`ikigai_intray::tuple_id`]), never by its text: the text stays on the edge, in
 //! `spaces/contact/outbox/<id>.tuple`, where the reactor left it. The minters take the enquiry
-//! tuple exactly as the reactor handed it to the handler and compute that id, because the
-//! handler holds the bytes and not the id. The apply reactor reads the text back through the
+//! tuple exactly as the reactor handed it to the handler, because the handler, a Lisp program,
+//! reads its tuple through `(input)` and cannot see the `tuple=<id>` the reactor passes beside
+//! it.
+//!
+//! That id is the hash of the STORED bytes. Under a sealed space ([`crate::space_seal`]) those
+//! are age ciphertext, so the hash of the text a minter is handed names no stored tuple (ledger
+//! #3713). The host therefore wraps the contact handler in [`HandlerTupleIds`]: while a pass
+//! runs it, the reactor's `tuple=` is noted against the hash of the tuple's text, and a minter
+//! handed that text names the noted id. Handed text no running pass noted (a minter called by
+//! hand), it names the hash of the text, which is the stored id whenever the space is not
+//! sealed. A reseal stores every tuple again under a new id and leaves a forward from the old
+//! one ([`crate::space_seal::current_id`]), and the link faces follow it when they record the
+//! click, so a link emailed before a reseal still names its enquiry after it.
+//!
+//! The apply reactor reads the text back through the
 //! kernel, `source urn:space:contact tuple=<id> state=outbox`, under the one-space grant
 //! `urn:cap:space:read:contact` ([`ikigai_intray::cap_read_space`]), and trains on it.
 //!
@@ -271,8 +284,116 @@ fn enquiry_of(inv: &Invocation<'_>, required: bool) -> Result<Option<String>> {
             ),
         });
     }
-    Ok(Some(ikigai_intray::tuple_id(text)))
+    Ok(Some(stored_id_of(text)))
 }
+
+// =====================================================================================
+// The stored id of the tuple a handler is handling (ledger #3713)
+// =====================================================================================
+
+/// The stored ids of the tuples handlers are running on now, by the hash of each one's text.
+/// A list per text: the same enquiry dropped twice is two tuples under a sealed space.
+static HANDLING: std::sync::Mutex<std::collections::BTreeMap<String, Vec<String>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn handling() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<String, Vec<String>>> {
+    HANDLING.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// The id the space stores the tuple whose text is `text` under: the reactor's `tuple=` for a
+/// pass running on it, else the hash of the text (the stored id when no codec is configured).
+fn stored_id_of(text: &[u8]) -> String {
+    let plain = ikigai_intray::tuple_id(text);
+    handling()
+        .get(&plain)
+        .and_then(|ids| ids.last().cloned())
+        .unwrap_or(plain)
+}
+
+/// Notes a running pass's stored id, and forgets it when the pass ends (or is dropped).
+struct Noted {
+    plain: String,
+    stored: String,
+}
+
+impl Noted {
+    fn new(plain: String, stored: String) -> Noted {
+        handling()
+            .entry(plain.clone())
+            .or_default()
+            .push(stored.clone());
+        Noted { plain, stored }
+    }
+}
+
+impl Drop for Noted {
+    fn drop(&mut self) {
+        let mut map = handling();
+        if let Some(ids) = map.get_mut(&self.plain) {
+            if let Some(at) = ids.iter().rposition(|id| *id == self.stored) {
+                ids.remove(at);
+            }
+            if ids.is_empty() {
+                map.remove(&self.plain);
+            }
+        }
+    }
+}
+
+/// A reactor's handler, wrapped so the minters it calls name the tuple by the id the space
+/// stores it under (see the [module docs](crate::contactblock)). Given the reactor's
+/// `tuple=<id>` and its `content` (or `in`), it notes the id against the hash of the content
+/// for as long as the handler runs; it changes nothing else about the call.
+pub struct HandlerTupleIds<E> {
+    inner: E,
+}
+
+impl<E> HandlerTupleIds<E> {
+    pub fn new(inner: E) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait::async_trait]
+impl<E: Endpoint> Endpoint for HandlerTupleIds<E> {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let stored = inv
+            .inline_str("tuple")
+            .ok()
+            .filter(|id| enquiry_id_shaped(id))
+            .map(str::to_string);
+        let text = inv
+            .inline_arg("content")
+            .or_else(|_| inv.inline_arg("in"))
+            .ok();
+        let _noted = match (stored, text) {
+            (Some(stored), Some(text)) => Some(Noted::new(ikigai_intray::tuple_id(text), stored)),
+            _ => None,
+        };
+        self.inner.invoke(inv).await
+    }
+
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn describe(&self) -> Description {
+        self.inner.describe()
+    }
+}
+
+/// The id the enquiry a clicked link names has now in the contact space: the same id unless a
+/// reseal moved the tuple since the link was minted ([`crate::space_seal::current_id`]). The
+/// token was checked against the id as minted; only the recorded intent carries the new one.
+fn current_enquiry(enquiry: &str) -> String {
+    if enquiry.is_empty() {
+        return String::new();
+    }
+    crate::space_seal::current_id(&file_root().join("spaces"), CONTACT_SPACE, enquiry)
+}
+
+/// The space the enquiries are dropped into, and which the links name them in.
+pub const CONTACT_SPACE: &str = "contact";
 
 fn enquiry_spec(summary: &str) -> ArgSpec {
     ArgSpec::new("enquiry")
@@ -652,7 +773,7 @@ impl Endpoint for ContactBlock {
                 let named = if enquiry.is_empty() {
                     String::new()
                 } else {
-                    format!(" (enquiry {})", quoted(&enquiry))
+                    format!(" (enquiry {})", quoted(&current_enquiry(&enquiry)))
                 };
                 let tuple = format!(
                     "((block-email {}){named} (exp {}))",
@@ -841,7 +962,7 @@ impl Endpoint for ContactLabel {
                 let tuple = format!(
                     "((label {}) (enquiry {}) (exp {}))",
                     quoted(&label),
-                    quoted(&enquiry),
+                    quoted(&current_enquiry(&enquiry)),
                     quoted(&exp.to_string())
                 );
                 let done = if label == "ham" { "ham" } else { "spam" };
@@ -1433,6 +1554,68 @@ mod endpoint_tests {
         let html = w.post_block("victim@example.com", exp, &token);
         assert!(html.contains("didn't work"), "{html}");
         assert!(w.dropped().is_empty(), "nothing recorded");
+    }
+
+    /// Ledger #3713: a reseal stores the enquiry again under a new id and leaves a forward;
+    /// a link minted before it still verifies (its token signs the old id) and the intent it
+    /// records names the id the tuple has now.
+    #[test]
+    fn a_link_minted_before_a_reseal_records_the_enquirys_new_id() {
+        let w = world("reseal-forward");
+        let text = "((message \"resealed since the email\"))";
+        let old = ikigai_intray::tuple_id(text.as_bytes());
+        let new = ikigai_intray::tuple_id(b"the ciphertext it is stored as now");
+        let forwards = file_root()
+            .join("spaces")
+            .join(CONTACT_SPACE)
+            .join(crate::space_seal::FORWARDS_DIR);
+        std::fs::create_dir_all(&forwards).unwrap();
+        std::fs::write(forwards.join(&old), format!("{new}\n")).unwrap();
+
+        let block = query(
+            &w.issue(
+                Verb::Source,
+                "urn:contactblock:link",
+                &[("email", EMAIL), ("enquiry", text)],
+            )
+            .unwrap(),
+        );
+        let label = query(
+            &w.issue(
+                Verb::Source,
+                "urn:contactlabel:link",
+                &[("label", "spam"), ("enquiry", text)],
+            )
+            .unwrap(),
+        );
+        assert_eq!(block["id"], old);
+        let body = format!(
+            "email={}&id={}&exp={}&t={}",
+            urlencode(EMAIL),
+            block["id"],
+            block["exp"],
+            urlencode(&block["t"])
+        );
+        assert!(w.post_form("urn:contact-block", &body).contains("Blocked"));
+        assert!(w
+            .post_label(
+                &label["id"],
+                "spam",
+                label["exp"].parse().unwrap(),
+                &label["t"]
+            )
+            .contains("spam"));
+        let _ = std::fs::remove_file(forwards.join(&old));
+
+        let dropped = w.dropped();
+        assert_eq!(dropped.len(), 2, "{dropped:?}");
+        for tuple in &dropped {
+            assert_eq!(
+                crate::decide::field(tuple, "enquiry").as_deref(),
+                Some(new.as_str()),
+                "{tuple}"
+            );
+        }
     }
 
     #[test]

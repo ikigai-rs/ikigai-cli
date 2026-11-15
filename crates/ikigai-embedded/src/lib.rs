@@ -5046,6 +5046,26 @@ pub const PROGRAMS: &[Program] = &[
     },
 ];
 
+/// A stored program bound as its endpoint. The contact handler is wrapped so the block and
+/// label links it mints name its enquiry by the id the contact space stores it under, which
+/// under a sealed space is not the hash of the text the program reads (ledger #3713, see
+/// [`contactblock::HandlerTupleIds`]).
+fn stored_program(program: &Program, text: String) -> ikigai_core::EndpointSpace {
+    let lisp = ikigai_lisp::program(program.id, text);
+    let space = ikigai_core::EndpointSpace::new();
+    if program.iri == CONTACT_HANDLER {
+        space.bind(
+            Exact::new(program.iri),
+            contactblock::HandlerTupleIds::new(lisp),
+        )
+    } else {
+        space.bind(Exact::new(program.iri), lisp)
+    }
+}
+
+/// The program the reactive `contact` space fires on each enquiry ([`PROGRAMS`]).
+const CONTACT_HANDLER: &str = "urn:contact:handle";
+
 /// The doors the root's Lisp governor fronts: the evaluator, the signed-run door, and every
 /// stored program ([`PROGRAMS`]).
 fn lisp_doors() -> Vec<String> {
@@ -5284,10 +5304,7 @@ fn root_members(nature: &'static str) -> Vec<Arc<dyn Space>> {
     // isn't bound. One space per program, in table order, as they always were.
     for program in PROGRAMS {
         if let Ok(text) = std::fs::read_to_string(file_root().join(program.file)) {
-            spaces.push(Arc::new(ikigai_core::EndpointSpace::new().bind(
-                Exact::new(program.iri),
-                ikigai_lisp::program(program.id, text),
-            )) as Arc<dyn Space>);
+            spaces.push(Arc::new(stored_program(program, text)) as Arc<dyn Space>);
         }
     }
     // The two halves of the decision loop that must stay on this machine: minting a link
@@ -12658,6 +12675,180 @@ mod contact_label_tests {
             read("urn:space:contact", &without),
             Err(Error::Denied(_))
         ));
+    }
+}
+
+/// Ledger #3713: under a sealed contact space a tuple's id is the hash of its CIPHERTEXT, so the
+/// links the handler mints must name that id, not the hash of the text it reads, and must still
+/// name their enquiry after a reseal stores it again under a new id.
+#[cfg(test)]
+mod sealed_contact_link_tests {
+    use super::*;
+    use ed25519_dalek::pkcs8::{spki::der::pem::LineEnding, EncodePrivateKey};
+    use futures::executor::block_on;
+    use ikigai_core::{Capability, Kernel, Request};
+
+    /// What `contact-handler.scm` does to mint its block and "not spam" links.
+    const MINT: &str = "(string-append \
+         (invoke 'source \"urn:contactblock:link\" \"email\" \"zoe@example.invalid\" \"enquiry\" (input)) \
+         (invoke 'source \"urn:contactlabel:link\" \"label\" \"ham\" \"enquiry\" (input)))";
+
+    fn age_key(path: &std::path::Path, identity: &age::x25519::Identity) {
+        use age::secrecy::ExposeSecret;
+        std::fs::write(path, format!("{}\n", identity.to_string().expose_secret())).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    fn ids_in(note: &str) -> Vec<String> {
+        note.split(['?', '&', '\n'])
+            .filter_map(|part| part.strip_prefix("id="))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn a_sealed_enquirys_links_name_its_stored_tuple_before_and_after_a_reseal() {
+        let base =
+            std::env::temp_dir().join(format!("ikigai-sealed-contact-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let spaces = base.join("spaces");
+        let config = base.join("config");
+        std::fs::create_dir_all(spaces.join("contact")).unwrap();
+        std::fs::create_dir_all(config.join(SPACE_AUTHORITY_DIR)).unwrap();
+        std::fs::write(
+            spaces.join("contact").join("handler"),
+            format!("{CONTACT_HANDLER}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            config.join(SPACE_AUTHORITY_DIR).join("contact"),
+            format!("urn:cap:lisp\n{}\n", contactblock::CAP_CONTACTBLOCK_MINT),
+        )
+        .unwrap();
+        let block_key = base.join("contact-block.key");
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        std::fs::write(
+            &block_key,
+            signing.to_pkcs8_pem(LineEnding::LF).unwrap().as_str(),
+        )
+        .unwrap();
+        let space_key = base.join(space_seal::SPACE_KEY_FILE);
+        age_key(&space_key, &age::x25519::Identity::generate());
+        let codec = || {
+            Arc::new(space_seal::SealCodec::load(&space_key).unwrap())
+                as Arc<dyn ikigai_intray::TupleCodec>
+        };
+
+        let program = PROGRAMS.iter().find(|p| p.iri == CONTACT_HANDLER).unwrap();
+        let kernel = Arc::new(Kernel::new(Arc::new(
+            stored_program(program, MINT.to_string())
+                .bind(
+                    UriTemplate::parse(ikigai_intray::SPACE_TEMPLATE).unwrap(),
+                    ikigai_intray::SpaceEndpoint::new(spaces.clone()).with_codec(codec()),
+                )
+                .bind(
+                    Exact::new("urn:contactblock:link"),
+                    contactblock::ContactBlockLink {
+                        key_path: block_key.clone(),
+                    },
+                )
+                .bind(
+                    Exact::new("urn:contactlabel:link"),
+                    contactblock::ContactLabelLink {
+                        key_path: block_key,
+                    },
+                ),
+        )));
+        let reactor = space_reactor(
+            spaces.clone(),
+            Arc::clone(&kernel) as Arc<dyn ikigai_resolve::Resolver>,
+            Some(config),
+        )
+        .with_codec(codec());
+
+        let enquiry = "((name \"Zoë\") (email \"zoe@example.invalid\") (message \"hello\"))\n";
+        let dropped = block_on(
+            kernel.issue(
+                Request::new(Verb::Sink, Iri::parse("urn:space:contact").unwrap())
+                    .with_arg("content", ArgRef::Inline(enquiry.as_bytes().to_vec())),
+                &Capability::scoped(vec![ikigai_intray::CAP_OUT.to_string()]),
+            ),
+        )
+        .unwrap();
+        let id = String::from_utf8(dropped.bytes).unwrap();
+        // Sealed: the stored id is not the hash of the text.
+        assert_ne!(id, ikigai_intray::tuple_id(enquiry.as_bytes()));
+        assert_eq!(
+            reactor.process("contact", &id),
+            ikigai_intray::Outcome::Handled
+        );
+
+        let note = std::fs::read_to_string(
+            spaces
+                .join("contact")
+                .join("outbox")
+                .join(format!("{id}.out")),
+        )
+        .unwrap();
+        let linked = ids_in(&note);
+        assert_eq!(
+            linked,
+            vec![id.clone(), id.clone()],
+            "block, then label: {note}"
+        );
+
+        // The apply side's read, by the id in the link, under the one-space grant.
+        let read = |tuple: &str| {
+            block_on(
+                kernel.issue(
+                    Request::new(Verb::Source, Iri::parse("urn:space:contact").unwrap())
+                        .with_arg("tuple", ArgRef::Inline(tuple.as_bytes().to_vec()))
+                        .with_arg("state", ArgRef::Inline(b"outbox".to_vec())),
+                    &Capability::scoped(vec![ikigai_intray::cap_read_space("contact")]),
+                ),
+            )
+            .map(|r| r.bytes)
+        };
+        assert_eq!(read(&linked[0]).unwrap(), enquiry.as_bytes());
+
+        // A rotation: the new identity first, the old one still listed, then a reseal.
+        let fresh = age::x25519::Identity::generate();
+        let old_key = std::fs::read_to_string(&space_key).unwrap();
+        {
+            use age::secrecy::ExposeSecret;
+            std::fs::write(
+                &space_key,
+                format!("{}\n{old_key}", fresh.to_string().expose_secret()),
+            )
+            .unwrap();
+        }
+        let resealed = space_seal::reseal(&spaces, &space_key).unwrap();
+        assert_eq!(resealed[0].settled, 2, "{resealed:?}"); // the tuple and its .out note
+        let now = space_seal::current_id(&spaces, "contact", &linked[0]);
+        assert_ne!(now, linked[0], "a reseal stores the tuple under a new id");
+        assert!(read(&linked[0]).is_err(), "the old id names nothing now");
+        let kernel_after = Kernel::new(Arc::new(
+            EndpointSpace::new().bind(
+                UriTemplate::parse(ikigai_intray::SPACE_TEMPLATE).unwrap(),
+                ikigai_intray::SpaceEndpoint::new(spaces.clone())
+                    .with_codec(Arc::new(space_seal::SealCodec::load(&space_key).unwrap())),
+            ),
+        ));
+        let after = block_on(
+            kernel_after.issue(
+                Request::new(Verb::Source, Iri::parse("urn:space:contact").unwrap())
+                    .with_arg("tuple", ArgRef::Inline(now.into_bytes()))
+                    .with_arg("state", ArgRef::Inline(b"outbox".to_vec())),
+                &Capability::scoped(vec![ikigai_intray::cap_read_space("contact")]),
+            ),
+        )
+        .unwrap();
+        assert_eq!(after.bytes, enquiry.as_bytes());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
 
