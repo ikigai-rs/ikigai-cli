@@ -168,6 +168,12 @@ const INHERITED: &[(&str, &str)] = &[
     ("ui-theme-chooser", "ikigai-ui"),
     // ikigai-ui 0.5: a page family's header chooser, a Source of HTML like the rest above.
     ("ui-chooser", "ikigai-ui"),
+    // ikigai-ui 0.5.1: two more bundled shell artifacts, the opt-in base stylesheet and the
+    // scene renderer the shell template links. The host serves every shell artifact and the
+    // tokens, palettes and choosers; the rest of the space (screens, lenses, forms,
+    // compilers) is narrowed out (`src/ui.rs`, `served`).
+    ("ui-base-css", "ikigai-ui"),
+    ("ui-scene-renderer-js", "ikigai-ui"),
     ("bookmarks", "ikigai-cms"),
     ("compose", "ikigai-fn"),
     ("diagram-arrangement", "ikigai-diagram"),

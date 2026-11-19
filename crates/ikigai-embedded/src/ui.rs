@@ -45,25 +45,31 @@ pub(super) fn space() -> impl Space {
     }
 }
 
-/// The ikigai-ui resources this host serves, by endpoint name: the shell, its tokens and
-/// template, htmx, and the theme and page choosers with their palettes. Everything the
-/// cli served under ikigai-ui 0.5.0, and `tests/conformance.rs` pins the set.
-pub(crate) const SERVED: [&str; 8] = [
-    "ui-chooser",
-    "ui-htmx",
-    "ui-shell-js",
-    "ui-template-shell",
-    "ui-template-tokens",
+/// The ikigai-ui resources this host serves beyond the shell's own artifacts, by endpoint
+/// name: the rendered tokens, the palettes, and the theme and page choosers.
+const SERVED_EXTRA: [&str; 4] = [
     "ui-tokens-css",
     "ui-palette",
     "ui-theme-chooser",
+    "ui-chooser",
 ];
 
-/// `ikigai_ui::space()` narrowed to [`SERVED`] in all three of resolution, entries and
+/// Whether this host serves the ikigai-ui endpoint named `name`: every bundled shell
+/// artifact ikigai-ui declares ([`ikigai_ui::ARTIFACTS`]: the shell template, its script,
+/// htmx, the tokens template, the opt-in base stylesheet and the scene renderer the shell
+/// links),
+/// so the shell keeps working as ikigai-ui grows it, plus [`SERVED_EXTRA`].
+/// `tests/conformance.rs` pins the resulting set.
+fn served(name: &str) -> bool {
+    SERVED_EXTRA.contains(&name) || ikigai_ui::ARTIFACTS.iter().any(|a| a.id == name)
+}
+
+/// `ikigai_ui::space()` narrowed to what [`served`] admits, in all three of resolution, entries and
 /// topology, so the catalog, the manifold and a dumped arrangement describe exactly what
 /// resolves. ★ ikigai-ui 0.5.1 binds 58 more resources in the same space (screens, lenses,
-/// forms, and the `outline`, `sexpr` and `lisp` compilers). A pin taken for the shell's
-/// restart retry must not quietly add them to every cli kernel; which of them the REPL
+/// forms, and the `outline`, `sexpr` and `lisp` compilers). Two of them, the base stylesheet
+/// and the scene renderer, are shell artifacts and are served. A pin taken for the shell's
+/// restart retry must not quietly add the other 56 to every cli kernel; which of them the REPL
 /// should offer is its own decision. ikigai-gonk narrows the same space the same way
 /// (its `doors.rs`, `UiShared`), and ikigai-ui offering this narrowed space itself would
 /// retire both copies.
@@ -72,7 +78,7 @@ struct Served(ikigai_core::EndpointSpace);
 impl Space for Served {
     fn resolve(&self, request: &Request, scope: &Scope) -> Resolution {
         match self.0.resolve(request, scope) {
-            Resolution::Hit(hit) if SERVED.contains(&hit.endpoint.name()) => Resolution::Hit(hit),
+            Resolution::Hit(hit) if served(hit.endpoint.name()) => Resolution::Hit(hit),
             _ => Resolution::Miss,
         }
     }
@@ -82,7 +88,7 @@ impl Space for Served {
             self.0
                 .entries()?
                 .into_iter()
-                .filter(|entry| SERVED.contains(&entry.endpoint.as_str()))
+                .filter(|entry| served(&entry.endpoint))
                 .collect(),
         )
     }
@@ -94,7 +100,7 @@ impl Space for Served {
     fn topology(&self) -> ikigai_core::Topology {
         let mut topology = self.0.topology();
         if let ikigai_core::SpaceKind::EndpointSpace { doors } = &mut topology.kind {
-            doors.retain(|door| SERVED.contains(&door.endpoint.as_str()));
+            doors.retain(|door| served(&door.endpoint));
         }
         topology
     }
