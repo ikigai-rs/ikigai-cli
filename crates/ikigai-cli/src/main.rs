@@ -275,6 +275,11 @@ usage:
                                home stores its hash, re-read on every request
   ikigai layers-token list     the tokens: id, the client each is bound to, label, minted
   ikigai layers-token revoke <id>  remove one; its next request is refused (401)
+  ikigai inquiry import-blocks --from <decisions log> [--days <n>]
+                               write the log's legacy `block` lines (an address or a domain) as
+                               keyed blocks into the block set `inquiry.json` names, holding <n>
+                               days (default its block_days, else 180). Prints counts only; the
+                               log is not edited, and a rerun writes nothing new
   ikigai [flags] layers post brief|issue|file <layer> …
                                post an ik:Brief, ik:Issue or ik:File to a layer, the entry composed
                                for you (the Turtle escaped; a file's SHA-256, size, and text or
@@ -559,6 +564,13 @@ enum Mode {
     /// `layers-token mint|list|revoke`: the bearer tokens of a layer door's HTTPS front (see
     /// `ikigai_embedded::tokens`).
     LayersToken(TokenCommand),
+    /// `inquiry import-blocks --from <decisions log> [--days <n>]`: the legacy `block` lines
+    /// of a contact host's decisions log, written as keyed blocks into the block set of the
+    /// config home's `inquiry.json` (ledger #3836).
+    InquiryImport {
+        from: String,
+        days: Option<u64>,
+    },
 }
 
 /// What `layers-token` was asked to do.
@@ -1356,6 +1368,35 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
     }
     let mut argv = args.into_iter().peekable();
 
+    if argv.peek().map(String::as_str) == Some("inquiry") {
+        argv.next();
+        let usage = "usage: `ikigai inquiry import-blocks --from <decisions log> [--days <n>]`";
+        if argv.next().as_deref() != Some("import-blocks") {
+            return Err(usage.to_string());
+        }
+        let (mut from, mut days) = (None, None);
+        while let Some(arg) = argv.next() {
+            match arg.as_str() {
+                "--from" => from = Some(argv.next().ok_or("--from needs a file")?),
+                "--days" => {
+                    let value = argv.next().ok_or("--days needs a number")?;
+                    days = Some(value.parse::<u64>().map_err(|_| {
+                        format!("--days takes a whole number of days, not `{value}`")
+                    })?);
+                }
+                other => {
+                    return Err(format!(
+                        "unexpected argument after `inquiry import-blocks`: {other}"
+                    ))
+                }
+            }
+        }
+        return Ok(Some(Mode::InquiryImport {
+            from: from.ok_or_else(|| usage.to_string())?,
+            days,
+        }));
+    }
+
     if argv.peek().map(String::as_str) == Some("layers-token") {
         argv.next();
         let usage = "usage: `ikigai layers-token mint <participant|fingerprint> [--label <l>]` | \
@@ -2099,7 +2140,7 @@ fn check_homes(mode: &Mode) -> Result<(), String> {
         Mode::Version { .. } => (false, false),
         Mode::CertGenerate { dir, .. } => (dir.is_none(), false),
         Mode::CertAddClient { cert_dir, .. } => (cert_dir.is_none(), false),
-        Mode::LayersToken(_) => (true, false),
+        Mode::LayersToken(_) | Mode::InquiryImport { .. } => (true, false),
         Mode::Repl(repl) => (true, repl.connect.is_none()),
         Mode::Daemon { .. } | Mode::Serve { .. } | Mode::Mcp { .. } => (true, true),
     };
@@ -2259,6 +2300,7 @@ fn main() {
             force,
         } => cert_add_client(&name, cert_dir, force),
         Mode::LayersToken(command) => layers_token(command),
+        Mode::InquiryImport { from, days } => inquiry_import(&from, days),
         Mode::Serve {
             target,
             certs,
@@ -5026,6 +5068,39 @@ fn spawn_layers_front(
 
 /// `ikigai layers-token mint|list|revoke`: the bearer tokens of a layer door's HTTPS front,
 /// kept hashed in `layer-tokens.json` beside `clients.json` (`ikigai_embedded::tokens`).
+/// `ikigai inquiry import-blocks`: counts on stdout, never an address; the log is only read.
+#[cfg(feature = "embedded")]
+fn inquiry_import(from: &str, days: Option<u64>) -> ! {
+    use ikigai_embedded::inquiry;
+    let result = (|| -> Result<inquiry::ImportCounts, String> {
+        let opened = inquiry::opened()?.ok_or_else(|| {
+            format!(
+                "no {} in the config home: the block set lives where it names",
+                inquiry::FILE
+            )
+        })?;
+        let log = std::fs::read_to_string(from).map_err(|e| format!("cannot read {from}: {e}"))?;
+        let now = ikigai_core::Clock::now(&ikigai_core::SystemClock);
+        inquiry::import_blocks(opened, &log, days.unwrap_or(opened.block_days), now)
+    })();
+    match result {
+        Ok(counts) => {
+            println!("{counts}");
+            std::process::exit(0)
+        }
+        Err(e) => {
+            eprintln!("ikigai: {e}");
+            std::process::exit(2)
+        }
+    }
+}
+
+#[cfg(not(feature = "embedded"))]
+fn inquiry_import(_from: &str, _days: Option<u64>) -> ! {
+    eprintln!("ikigai: `inquiry import-blocks` needs the `embedded` feature");
+    std::process::exit(1);
+}
+
 #[cfg(feature = "embedded")]
 fn layers_token(command: TokenCommand) -> ! {
     use ikigai_embedded::tokens;
