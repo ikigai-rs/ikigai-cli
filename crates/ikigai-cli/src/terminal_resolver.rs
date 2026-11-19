@@ -1,8 +1,11 @@
 //! Terminal face policy, applied only to the CLI engine's requests.
 //!
-//! A terminal asks for text/plain when the target contract offers it and the caller
-//! supplies no `as`, after parsing and before cache lookup/resolution.
-//! The underlying kernel, HTTP door, and nested endpoint requests keep their defaults.
+//! When the process's stdout is a terminal, a `source` with no `as` asks for text/plain
+//! if the target's contract offers it, after parsing and before cache lookup/resolution.
+//! When stdout is a pipe or a file (`ikigai -c 'source …' | jq`, a job writing a file),
+//! the request goes through unchanged and gets the target's own default face, as it did
+//! before 0.5.2 (ledger #3838). An explicit `as` always wins. The underlying kernel, HTTP
+//! door, and nested endpoint requests keep their defaults.
 
 use std::sync::Arc;
 
@@ -13,7 +16,35 @@ use ikigai_core::{
 };
 use ikigai_resolve::{CacheStatus, Resolver, RunContext};
 
-pub struct TerminalResolver<R>(pub R);
+pub struct TerminalResolver<R> {
+    inner: R,
+    /// Whether the policy applies: stdout is a terminal. The one gate, read by
+    /// [`TerminalResolver::contract_request`].
+    terminal: bool,
+}
+
+impl<R> TerminalResolver<R> {
+    /// The adapter for this process: the policy applies only when stdout is a terminal.
+    pub fn for_stdout(inner: R) -> Self {
+        use std::io::IsTerminal;
+        Self::new(inner, std::io::stdout().is_terminal())
+    }
+
+    /// The adapter with the terminal decision made by the caller.
+    pub fn new(inner: R, terminal: bool) -> Self {
+        Self { inner, terminal }
+    }
+
+    /// The contract request for `request` when the policy applies to it: stdout is a
+    /// terminal and the request is a `source` with no `as`. `None` passes it through.
+    fn contract_request(&self, request: &Request) -> Option<Request> {
+        if self.terminal {
+            contract_request(request)
+        } else {
+            None
+        }
+    }
+}
 
 // Use the same Meta request as the engine's argument routing. The underlying
 // resolver owns contract caching and invalidation; this adapter adds no second cache.
@@ -76,10 +107,11 @@ fn json_description(repr: Representation) -> Option<ikigai_core::Description> {
 }
 
 fn prepare(
+    meta: Option<Request>,
     request: Request,
     fetch: impl FnOnce(Request) -> Result<(Representation, CacheStatus), Error>,
 ) -> Request {
-    let description = contract_request(&request)
+    let description = meta
         .and_then(|meta| fetch(meta).ok())
         .and_then(|(repr, _)| json_description(repr));
     terminal_request(request, description)
@@ -88,10 +120,11 @@ fn prepare(
 async fn prepare_async<
     F: std::future::Future<Output = Result<(Representation, CacheStatus), Error>>,
 >(
+    meta: Option<Request>,
     request: Request,
     fetch: impl FnOnce(Request) -> F,
 ) -> Request {
-    let description = match contract_request(&request) {
+    let description = match meta {
         Some(meta) => fetch(meta)
             .await
             .ok()
@@ -104,7 +137,10 @@ async fn prepare_async<
 #[async_trait]
 impl<R: Resolver> Resolver for TerminalResolver<R> {
     fn issue(&self, request: Request) -> Result<(Representation, CacheStatus), Error> {
-        self.0.issue(prepare(request, |meta| self.0.issue(meta)))
+        self.inner
+            .issue(prepare(self.contract_request(&request), request, |meta| {
+                self.inner.issue(meta)
+            }))
     }
 
     fn issue_as(
@@ -112,8 +148,10 @@ impl<R: Resolver> Resolver for TerminalResolver<R> {
         request: Request,
         capability: &Capability,
     ) -> Result<(Representation, CacheStatus), Error> {
-        self.0.issue_as(
-            prepare(request, |meta| self.0.issue_as(meta, capability)),
+        self.inner.issue_as(
+            prepare(self.contract_request(&request), request, |meta| {
+                self.inner.issue_as(meta, capability)
+            }),
             capability,
         )
     }
@@ -124,10 +162,10 @@ impl<R: Resolver> Resolver for TerminalResolver<R> {
         capability: &Capability,
         run: &RunContext,
     ) -> Result<(Representation, CacheStatus), Error> {
-        let request = prepare(request, |meta| {
-            self.0.issue_as_in_run(meta, capability, run)
+        let request = prepare(self.contract_request(&request), request, |meta| {
+            self.inner.issue_as_in_run(meta, capability, run)
         });
-        self.0.issue_as_in_run(request, capability, run)
+        self.inner.issue_as_in_run(request, capability, run)
     }
 
     async fn issue_as_async(
@@ -135,8 +173,11 @@ impl<R: Resolver> Resolver for TerminalResolver<R> {
         request: Request,
         capability: &Capability,
     ) -> Result<(Representation, CacheStatus), Error> {
-        let request = prepare_async(request, |meta| self.0.issue_as_async(meta, capability)).await;
-        self.0.issue_as_async(request, capability).await
+        let request = prepare_async(self.contract_request(&request), request, |meta| {
+            self.inner.issue_as_async(meta, capability)
+        })
+        .await;
+        self.inner.issue_as_async(request, capability).await
     }
 
     async fn issue_body_as_in_run(
@@ -145,8 +186,8 @@ impl<R: Resolver> Resolver for TerminalResolver<R> {
         capability: &Capability,
         run: &RunContext,
     ) -> Result<(Representation<Body>, CacheStatus), Error> {
-        let description = if let Some(meta) = contract_request(&request) {
-            match self.0.issue_body_as_in_run(meta, capability, run).await {
+        let description = if let Some(meta) = self.contract_request(&request) {
+            match self.inner.issue_body_as_in_run(meta, capability, run).await {
                 Ok((repr, _))
                     if repr
                         .repr_type
@@ -168,7 +209,9 @@ impl<R: Resolver> Resolver for TerminalResolver<R> {
             None
         };
         let request = terminal_request(request, description);
-        self.0.issue_body_as_in_run(request, capability, run).await
+        self.inner
+            .issue_body_as_in_run(request, capability, run)
+            .await
     }
 
     async fn issue_as_async_with_incoming(
@@ -177,8 +220,11 @@ impl<R: Resolver> Resolver for TerminalResolver<R> {
         capability: &Capability,
         incoming: Provenance,
     ) -> Result<(Representation, CacheStatus), Error> {
-        let request = prepare_async(request, |meta| self.0.issue_as_async(meta, capability)).await;
-        self.0
+        let request = prepare_async(self.contract_request(&request), request, |meta| {
+            self.inner.issue_as_async(meta, capability)
+        })
+        .await;
+        self.inner
             .issue_as_async_with_incoming(request, capability, incoming)
             .await
     }
@@ -190,12 +236,12 @@ impl<R: Resolver> Resolver for TerminalResolver<R> {
         incoming: Option<Provenance>,
         scope: Scope,
     ) -> Result<(Representation, CacheStatus), Error> {
-        let request = prepare_async(request, |meta| {
-            self.0
+        let request = prepare_async(self.contract_request(&request), request, |meta| {
+            self.inner
                 .issue_as_async_in(meta, capability, None, scope.clone())
         })
         .await;
-        self.0
+        self.inner
             .issue_as_async_in(request, capability, incoming, scope)
             .await
     }
@@ -211,13 +257,13 @@ impl<R: Resolver> Resolver for TerminalResolver<R> {
         let request = if attach.as_ref().is_some_and(|(name, _)| name == "as") {
             request
         } else {
-            prepare_async(request, |meta| {
-                self.0
+            prepare_async(self.contract_request(&request), request, |meta| {
+                self.inner
                     .issue_as_async_in(meta, capability, None, scope.clone())
             })
             .await
         };
-        self.0
+        self.inner
             .issue_attached_in(request, capability, incoming, scope, attach)
             .await
     }
@@ -233,23 +279,23 @@ impl<R: Resolver> Resolver for TerminalResolver<R> {
         let request = if attach.as_ref().is_some_and(|(name, _)| name == "as") {
             request
         } else {
-            prepare_async(request, |meta| {
-                self.0
+            prepare_async(self.contract_request(&request), request, |meta| {
+                self.inner
                     .issue_as_async_in(meta, capability, None, scope.clone())
             })
             .await
         };
-        self.0
+        self.inner
             .issue_body_attached_in(request, capability, incoming, scope, attach)
             .await
     }
 
     fn set_tracer(&self, tracer: Arc<dyn Tracer>) {
-        self.0.set_tracer(tracer);
+        self.inner.set_tracer(tracer);
     }
 
     fn clear_tracer(&self) {
-        self.0.clear_tracer();
+        self.inner.clear_tracer();
     }
 
     fn is_cached(&self, request: &Request, capability: &Capability) -> bool {
@@ -257,8 +303,8 @@ impl<R: Resolver> Resolver for TerminalResolver<R> {
     }
 
     fn is_cached_in(&self, request: &Request, capability: &Capability, scope: &Scope) -> bool {
-        if contract_request(request).is_none() {
-            return self.0.is_cached_in(request, capability, scope);
+        if self.contract_request(request).is_none() {
+            return self.inner.is_cached_in(request, capability, scope);
         }
         // Resolver's cache probe is synchronous, including when the engine calls it
         // inside eval_async. Fetch on a scoped thread to avoid nesting its executor.
@@ -266,12 +312,15 @@ impl<R: Resolver> Resolver for TerminalResolver<R> {
         std::thread::scope(|threads| {
             threads
                 .spawn(|| {
-                    let request =
-                        futures::executor::block_on(prepare_async(request.clone(), |meta| {
-                            self.0
+                    let request = futures::executor::block_on(prepare_async(
+                        self.contract_request(request),
+                        request.clone(),
+                        |meta| {
+                            self.inner
                                 .issue_as_async_in(meta, capability, None, scope.clone())
-                        }));
-                    self.0.is_cached_in(&request, capability, scope)
+                        },
+                    ));
+                    self.inner.is_cached_in(&request, capability, scope)
                 })
                 .join()
                 .expect("terminal contract cache probe")
@@ -279,15 +328,15 @@ impl<R: Resolver> Resolver for TerminalResolver<R> {
     }
 
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
-        self.0.entries()
+        self.inner.entries()
     }
 
     fn try_entries(&self) -> Result<Option<Vec<SpaceEntry>>, Error> {
-        self.0.try_entries()
+        self.inner.try_entries()
     }
 
     fn transport(&self) -> String {
-        self.0.transport()
+        self.inner.transport()
     }
 }
 
@@ -295,6 +344,11 @@ impl<R: Resolver> Resolver for TerminalResolver<R> {
 mod tests {
     use super::*;
     use ikigai_core::Iri;
+
+    /// The adapter as it is when stdout is a terminal.
+    fn terminal<R>(inner: R) -> TerminalResolver<R> {
+        TerminalResolver::new(inner, true)
+    }
 
     struct JsonRenderer;
     impl ikigai_core::MetaRenderer for JsonRenderer {
@@ -375,16 +429,18 @@ mod tests {
             // Each form runs separately because Error is not Clone.
             let prepared = match answer {
                 Ok((repr, status)) => {
-                    let sync = prepare(request.clone(), |meta| {
+                    let sync = prepare(contract_request(&request), request.clone(), |meta| {
                         assert_eq!(Some(meta), contract_request(&request));
                         Ok((repr.clone(), status))
                     });
                     assert_eq!(sync, request);
-                    block_on(prepare_async(request.clone(), |_| async {
-                        Ok((repr, status))
-                    }))
+                    block_on(prepare_async(
+                        contract_request(&request),
+                        request.clone(),
+                        |_| async { Ok((repr, status)) },
+                    ))
                 }
-                Err(error) => prepare(request.clone(), |_| Err(error)),
+                Err(error) => prepare(contract_request(&request), request.clone(), |_| Err(error)),
             };
             assert_eq!(prepared, request);
         }
@@ -402,7 +458,7 @@ mod tests {
             ("application/json", "text/plain"),
             ("Application/JSON", "text/plain"),
         ] {
-            let resolver = TerminalResolver(Kernel::with_meta_renderer(
+            let resolver = terminal(Kernel::with_meta_renderer(
                 Arc::new(
                     EndpointSpace::new().bind(
                         Exact::new("urn:test:page"),
@@ -455,7 +511,7 @@ mod tests {
         use ikigai_core::{ArgSpec, Description};
 
         for face in ["text/plain;charset=utf-8", "Text/Plain"] {
-            let resolver = TerminalResolver(page_kernel(
+            let resolver = terminal(page_kernel(
                 Description::new("page")
                     .verb(Verb::Source)
                     .input(ArgSpec::new("as").optional().one_of(["text/html", face]))
@@ -464,6 +520,50 @@ mod tests {
             let request = Request::new(Verb::Source, Iri::parse("urn:test:page").unwrap());
             assert_eq!(resolver.issue(request).unwrap().0.bytes, face.as_bytes());
         }
+    }
+
+    /// Stdout a pipe or a file (ledger #3838): every path keeps the target's default face.
+    #[test]
+    fn off_a_terminal_an_untyped_source_keeps_its_default_face() {
+        use futures::executor::block_on;
+        use ikigai_core::Description;
+
+        let description = Description::new("page")
+            .verb(Verb::Source)
+            .output("text/html")
+            .output("text/plain");
+        let piped = TerminalResolver::new(page_kernel(description.clone()), false);
+        let request = Request::new(Verb::Source, Iri::parse("urn:test:page").unwrap());
+        assert!(piped.contract_request(&request).is_none());
+        let capability = Capability::root();
+        let run = RunContext::default();
+        let sync = piped.issue(request.clone()).unwrap().0.bytes;
+        let asynchronous =
+            block_on(piped.issue_as_async_in(request.clone(), &capability, None, Scope::default()))
+                .unwrap()
+                .0
+                .bytes;
+        let body = block_on(async {
+            piped
+                .issue_body_as_in_run(request.clone(), &capability, &run)
+                .await
+                .unwrap()
+                .0
+                .bytes
+                .collect(1024)
+                .await
+                .unwrap()
+        });
+        for (path, bytes) in [
+            ("sync", sync.as_slice()),
+            ("async", asynchronous.as_slice()),
+            ("body", body.as_ref()),
+        ] {
+            assert_eq!(bytes, b"text/html", "{path}");
+        }
+        // The same adapter on a terminal picks the text face.
+        let on_terminal = terminal(page_kernel(description));
+        assert_eq!(on_terminal.issue(request).unwrap().0.bytes, b"text/plain");
     }
 
     // Manual audit reproductions: these need an engine/Resolver seam change, not
@@ -504,7 +604,7 @@ mod tests {
         }
 
         let calls = Arc::new(AtomicUsize::new(0));
-        let engine = ikigai_engine::Engine::new(TerminalResolver(CountMeta {
+        let engine = ikigai_engine::Engine::new(terminal(CountMeta {
             kernel: page_kernel(
                 ikigai_core::Description::new("page")
                     .verb(Verb::Source)
@@ -555,7 +655,7 @@ mod tests {
                 .transreptor(["text/html", "text/plain"], ["text/plain"])
                 .incremental(),
         );
-        let engine = ikigai_engine::Engine::new(TerminalResolver(Kernel::with_meta_renderer(
+        let engine = ikigai_engine::Engine::new(terminal(Kernel::with_meta_renderer(
             Arc::new(
                 EndpointSpace::new()
                     .bind(
@@ -603,7 +703,7 @@ mod tests {
             space.clone(),
             Arc::new(JsonRenderer),
         ));
-        let resolver = TerminalResolver(kernel.clone());
+        let resolver = terminal(kernel.clone());
         let request = Request::new(Verb::Source, Iri::parse("urn:test:page").unwrap());
         assert_eq!(kernel.issue(request.clone()).unwrap().0.bytes, b"text/html");
         assert_eq!(
@@ -627,7 +727,7 @@ mod tests {
         use futures::executor::block_on;
         use ikigai_core::{ArgSpec, Description};
 
-        let resolver = TerminalResolver(page_kernel(
+        let resolver = terminal(page_kernel(
             Description::new("page")
                 .verb(Verb::Source)
                 .input(
@@ -641,7 +741,7 @@ mod tests {
         let request = Request::new(Verb::Source, Iri::parse("urn:test:page").unwrap());
         let capability = Capability::root();
         let attachment = || Some(("as".into(), Body::from(b"text/html".to_vec())));
-        let baseline = block_on(resolver.0.issue_attached_in(
+        let baseline = block_on(resolver.inner.issue_attached_in(
             request.clone(),
             &capability,
             None,
@@ -682,7 +782,7 @@ mod tests {
                 .output("text/plain"),
         ));
         let request = Request::new(Verb::Source, Iri::parse("urn:test:page").unwrap());
-        let resolver = Arc::new(TerminalResolver(Arc::clone(&kernel)));
+        let resolver = Arc::new(terminal(Arc::clone(&kernel)));
         assert_eq!(resolver.issue(request).unwrap().0.bytes, b"text/plain");
         let engine = ikigai_engine::Engine::new(resolver);
         assert_eq!(output(&engine, "source urn:test:page"), "text/plain");
@@ -699,7 +799,7 @@ mod tests {
 
     #[test]
     fn a_resource_without_a_text_face_keeps_its_default() {
-        let engine = ikigai_engine::Engine::new(TerminalResolver(page_kernel(
+        let engine = ikigai_engine::Engine::new(terminal(page_kernel(
             ikigai_core::Description::new("page")
                 .verb(Verb::Source)
                 .output("text/html"),
@@ -715,7 +815,7 @@ mod tests {
             (vec!["text/html"], "text/html"),
             (vec!["text/html", "text/plain"], "text/plain"),
         ] {
-            let engine = ikigai_engine::Engine::new(TerminalResolver(page_kernel(
+            let engine = ikigai_engine::Engine::new(terminal(page_kernel(
                 Description::new("page")
                     .verb(Verb::Source)
                     .output("text/html")
@@ -753,7 +853,7 @@ mod tests {
                 ),
             ),
         );
-        let resolver = Arc::new(TerminalResolver(kernel));
+        let resolver = Arc::new(terminal(kernel));
         let capability = Capability::scoped(["urn:cap:test"]);
         let engine =
             ikigai_engine::Engine::with_identity(Arc::clone(&resolver), capability.clone())
@@ -768,7 +868,7 @@ mod tests {
 
     #[test]
     fn an_unreadable_contract_keeps_the_original_request() {
-        let resolver = TerminalResolver(ikigai_core::Kernel::new(Arc::new(
+        let resolver = terminal(ikigai_core::Kernel::new(Arc::new(
             ikigai_core::EndpointSpace::new().bind(
                 ikigai_core::Exact::new("urn:test:page"),
                 page(
@@ -843,13 +943,13 @@ mod tests {
             ),
             Arc::new(JsonRenderer),
         );
-        let resolver = TerminalResolver(kernel);
+        let resolver = terminal(kernel);
         let request = Request::new(Verb::Source, Iri::parse("urn:test:page").unwrap());
         let cap = Capability::root();
         assert!(!resolver.is_cached(&request, &cap));
         resolver.issue_as(request.clone(), &cap).unwrap();
         assert!(resolver.is_cached(&request, &cap));
         assert!(resolver.is_cached_in(&request, &cap, &Scope::default()));
-        assert!(!resolver.0.is_cached(&request, &cap));
+        assert!(!resolver.inner.is_cached(&request, &cap));
     }
 }

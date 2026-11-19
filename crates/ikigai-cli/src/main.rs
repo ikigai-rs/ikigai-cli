@@ -3081,7 +3081,7 @@ fn build_engine(
             let names = ikigai_embedded::names::active().map(|_| {
                 ikigai_core::Iri::parse(ikigai_embedded::names::RESOURCE).expect("a constant IRI")
             });
-            let resolver = TerminalResolver(local_resolver::LocalResolver::new(kernel));
+            let resolver = TerminalResolver::for_stdout(local_resolver::LocalResolver::new(kernel));
             let engine = match names {
                 Some(atom) => Engine::new(resolver).with_names_atom(atom),
                 None => Engine::new(resolver),
@@ -5209,13 +5209,13 @@ fn connect_quic(target: &str, certs: &Certs) -> Result<Engine, String> {
     // for; a refusal such as Denied still fails at once), and every later call goes through
     // a cache-less issuer over the governed resolver, so reads stay as fresh as without it.
     match ikigai_embedded::retry::RetryPolicy::from_config()? {
-        None => Ok(with_profiles(Engine::new(TerminalResolver(
+        None => Ok(with_profiles(Engine::new(TerminalResolver::for_stdout(
             dial().map_err(|e| e.to_string())?,
         )))),
         Some(policy) => {
             let resolver =
                 ikigai_embedded::retry::first_dial(&policy, dial).map_err(|e| e.to_string())?;
-            Ok(with_profiles(Engine::new(TerminalResolver(
+            Ok(with_profiles(Engine::new(TerminalResolver::for_stdout(
                 ikigai_embedded::retry::connect_issuer(
                     &policy,
                     std::sync::Arc::new(resolver),
@@ -5492,7 +5492,9 @@ fn connect_ipc(path: Option<String>) -> Result<Engine, String> {
     if let Some(bound) = call_timeout() {
         resolver = resolver.with_call_timeout(bound);
     }
-    Ok(with_profiles(Engine::new(TerminalResolver(resolver))))
+    Ok(with_profiles(Engine::new(TerminalResolver::for_stdout(
+        resolver,
+    ))))
 }
 
 /// True when a mount target dials this process's own QUIC bind address — the
@@ -7680,9 +7682,10 @@ mod adapter_gate_tests {
     #[test]
     fn terminal_runbook_policy_leaves_the_shared_kernels_html_default_alone() {
         let s = session("terminal-runbook");
-        let terminal = Engine::new(TerminalResolver(local_resolver::LocalResolver::new(
-            Arc::clone(&s.kernel),
-        )));
+        let terminal = Engine::new(TerminalResolver::new(
+            local_resolver::LocalResolver::new(Arc::clone(&s.kernel)),
+            true,
+        ));
         let command = "source urn:runbook:basics";
         let html = run(&s.engine, command).unwrap();
         assert!(html.contains("hx-get="), "{html}");

@@ -1199,6 +1199,10 @@ members = ["crates/*"]
 # `ikigai inquiry import-blocks` moves the decisions log's plaintext blocks into the keyed block set,
 # printing counts only. With no inquiry.json nothing changes. Locks ikigai-inquiry 0.1.1 and ikigai-fn
 # 0.11.0 beside 0.10.0. A deploy change: rebuild --locked.
+# Next release: piped and redirected output gets the target's own default face again
+# (`ikigai -c 'source <iri>' | jq` reads JSON where JSON is the default, ledger #3838). 0.5.2,
+# 0.5.3 and 0.5.4 gave the text/plain face whenever the contract offered one, even off a terminal; the text
+# face is now chosen only when stdout is a terminal, and an explicit `as=` always wins.
 version = "0.5.4"
 edition = "2021"
 license = "MIT OR Apache-2.0"

@@ -96,8 +96,10 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
 - `--plain` is a line-oriented REPL with no full-screen redraw, so a screen reader or braille
   display can read it as ordinary terminal output; `--quiet` prints only the answers. (Not yet
   tried with either; see below.)
-- Terminal reads choose `text/plain` when no `as` is supplied and the target's Source
-  contract offers that face, including `-c` and the line REPL. Faces come from the `as`
+- Terminal reads choose `text/plain` when no `as` is supplied, stdout is a terminal and the
+  target's Source contract offers that face, including `-c` and the line REPL. When stdout
+  is a pipe or a file, an untyped read gets the target's own default face, so a script that
+  pipes `ikigai -c 'source …'` reads what it read before 0.5.2. Faces come from the `as`
   input's `one_of` list, or the action's outputs when there is no such list. Explicit types
   are preserved. Without a text face or a readable contract, the request keeps its default.
   An explicit face supplied as an attached body is also preserved.
@@ -152,7 +154,7 @@ them renders a page in a browser. Earlier runs CI does not repeat are Blocked, w
 | Full-screen REPL in a real terminal | Blocked | No current run. On 2026-10-30, a Linux PTY at 100×40 ran `ikigai --demo` with a scratch config home and file root, checking runbook scrolling, Lisp step eleven, selected-tab visibility and page headings. CI does not repeat it. |
 | Configured intake startup refusal | Pass | `cargo test -p ikigai-cli --test configured_intakes --locked`, rustc/cargo 1.99.0 on Linux, 2026-11-14: `a_bad_intake_row_refuses_start_and_names_the_row` pins exit 2 and the plain diagnostic naming the bad intake and redirect. No assistive technology session was run. |
 | Retired exec scope startup refusal | Pass | `cargo test -p ikigai-cli --test retired_exec_scopes --locked`, rustc/cargo 1.99.1 on macOS, 2026-11-19: pins exit 2, no tool list served, and a diagnostic naming the file, the grant (or the `--scope` flag), each retired scope and its replacement; the file is left byte for byte as written. No assistive technology session was run. |
-| Terminal text says its meaning in words | Pass | `crates/ikigai-cli/tests/runbook_text.rs` (an untyped runbook read in `-c` and the line REPL is its text face), `tests/broken_pipe.rs`, `tests/lisp_bounds.rs`, `tests/batch_summary.rs`, `tests/llm_config.rs`, `tests/config_toml.rs`, `tests/lobby_door.rs`'s `a_denied_certificate_is_reported_as_a_connection_refusal` (also no color escapes) and `crates/ikigai-ipc/src/lib.rs`'s `who_is_refused`. Covers the lines each pins, some word for word and some by the names they hold; not every line the binary writes. |
+| Terminal text says its meaning in words | Pass | `crates/ikigai-cli/tests/runbook_text.rs` (an untyped runbook read in `-c` and the line REPL is its text face on a pseudo-terminal, and its HTML default when piped), `tests/broken_pipe.rs`, `tests/lisp_bounds.rs`, `tests/batch_summary.rs`, `tests/llm_config.rs`, `tests/config_toml.rs`, `tests/lobby_door.rs`'s `a_denied_certificate_is_reported_as_a_connection_refusal` (also no color escapes) and `crates/ikigai-ipc/src/lib.rs`'s `who_is_refused`. Covers the lines each pins, some word for word and some by the names they hold; not every line the binary writes. |
 | Browser rendering, focus, zoom and reflow of the HTML pages | Blocked | No browser has rendered the error, redirect, embedded-host or intake pages; no browser was available for this update. |
 | Manual keyboard | Blocked | No person has performed a keyboard pass of any page or either REPL. |
 | Screen reader (including the line REPL, `--plain`) | Blocked | No screen reader has been used on this output; no screen-reader session was run for this update. |
@@ -179,6 +181,7 @@ Found by reading the source on 2026-10-15, not by testing:
 
 | Date | Change |
 |---|---|
+| 2026-11-19 | Terminal reads choose the text face only when stdout is a terminal (ledger #3838). Piped or redirected, an untyped read gets the target's own default face, as before 0.5.2; 0.5.2 through 0.5.4 gave text there too, which broke `ikigai -c 'source …' \| jq`. Binary regressions run `-c` and the line REPL with stdout piped (the runbook's HTML default; failed before the fix) and on a pseudo-terminal (its text face, unchanged). No color is added; no assistive technology testing was performed. |
 | 2026-11-19 | The contact-inquiry edge half (ledger #3836): a refused `inquiry.json` stops startup with exit 2 and a plain `ikigai:` sentence naming the file and the problem; `ikigai inquiry import-blocks` prints one plain line of counts on stdout (`read N, written N, already present N, unreadable N`), never an address, and every refusal on stderr starting with `ikigai:`. No color. `crates/ikigai-cli/tests/inquiry_edge.rs` pins the exit code, the file name in the refusal and the count line word for word; no assistive technology testing was performed. |
 | 2026-11-14 | `urn:email:send` (ledger #3714) refuses a malformed `to` or `reply_to` without quoting it: "`reply_to` is not an email address: it needs one @ with a name before it and a domain with a dot after it, and no spaces or any of < > ( ) [ ] : ; , \" \\", a sentence naming the argument and the fix. A bad From, To or Reply-To at message build names the header, not the address. `crates/ikigai-email/src/lib.rs`'s `a_refused_address_is_never_echoed` pins the sentence word for word; no assistive technology testing was performed. |
 | 2026-11-14 | Configured contact intakes (ledger #3684) refuse a bad row at startup with exit 2 and a plain `ikigai:` sentence naming the config-home file, row and reason. `crates/ikigai-cli/tests/configured_intakes.rs` pins the exit code and the diagnostic's intake name and redirect reason. No color is added; no assistive technology testing was performed. |
