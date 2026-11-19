@@ -109,6 +109,10 @@ example `urn:iki:foaf`'s HTML face, from the operator's `urn:file:foaf.xsl`).
 
 - A refused `intakes.json` stops startup with exit 2 and a plain `ikigai:` sentence naming
   the file, the row's position and ID (when available), and the reason. No color is added.
+- A grant naming a retired exec scope (`urn:cap:exec:git`, `urn:cap:exec:gh`,
+  `urn:cap:exec:cargo`, `urn:cap:exec:just`) stops startup with exit 2 and a plain `ikigai:`
+  line per scope naming the grants file, the grant, the scope and what to write instead; a
+  `--scope` or `--cap` naming one is refused the same way, naming the flag. No color is added.
 
 ## Shared UI criteria
 
@@ -147,6 +151,7 @@ them renders a page in a browser. Earlier runs CI does not repeat are Blocked, w
 | Full-screen REPL: color, `NO_COLOR`, steady clock and runbook pages | Pass | `tui.rs`'s tests against ratatui's test backend: `no_color_takes_every_color_escape_out_of_the_frame` (no color escape under `NO_COLOR`, some without it, through the crossterm backend), `clock_colon_stays_visible_across_redraws`, `runbook_note_has_normal_intensity_with_color` and `…_with_no_color`, and the runbook tests at 100×40 (`runbook_names_its_page_and_keeps_selected_tab_visible`, `runbook_scroll_reaches_wrapped_output_and_reports_position`, `runbook_steps_have_distinct_numbers_after_ten`, `runbook_picker_runs_every_step_and_reveals_its_answer`). Does not cover a real terminal or its colors' contrast. |
 | Full-screen REPL in a real terminal | Blocked | No current run. On 2026-10-30, a Linux PTY at 100×40 ran `ikigai --demo` with a scratch config home and file root, checking runbook scrolling, Lisp step eleven, selected-tab visibility and page headings. CI does not repeat it. |
 | Configured intake startup refusal | Pass | `cargo test -p ikigai-cli --test configured_intakes --locked`, rustc/cargo 1.99.0 on Linux, 2026-11-14: `a_bad_intake_row_refuses_start_and_names_the_row` pins exit 2 and the plain diagnostic naming the bad intake and redirect. No assistive technology session was run. |
+| Retired exec scope startup refusal | Pass | `cargo test -p ikigai-cli --test retired_exec_scopes --locked`, rustc/cargo 1.99.1 on macOS, 2026-11-19: pins exit 2, no tool list served, and a diagnostic naming the file, the grant (or the `--scope` flag), each retired scope and its replacement; the file is left byte for byte as written. No assistive technology session was run. |
 | Terminal text says its meaning in words | Pass | `crates/ikigai-cli/tests/runbook_text.rs` (an untyped runbook read in `-c` and the line REPL is its text face), `tests/broken_pipe.rs`, `tests/lisp_bounds.rs`, `tests/batch_summary.rs`, `tests/llm_config.rs`, `tests/config_toml.rs`, `tests/lobby_door.rs`'s `a_denied_certificate_is_reported_as_a_connection_refusal` (also no color escapes) and `crates/ikigai-ipc/src/lib.rs`'s `who_is_refused`. Covers the lines each pins, some word for word and some by the names they hold; not every line the binary writes. |
 | Browser rendering, focus, zoom and reflow of the HTML pages | Blocked | No browser has rendered the error, redirect, embedded-host or intake pages; no browser was available for this update. |
 | Manual keyboard | Blocked | No person has performed a keyboard pass of any page or either REPL. |

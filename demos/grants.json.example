@@ -12,7 +12,6 @@
   ],
   "dev": [
     "urn:cap:exec:read:git",
-    "urn:cap:exec:read:gh",
-    "urn:cap:exec:cargo"
+    "urn:cap:exec:read:gh"
   ]
 }
