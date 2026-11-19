@@ -1622,7 +1622,7 @@ ikigai-sexpr = "0.4.0" # 0.4.0 = core 0.3.0 cascade (ledger #2975): the newest r
 # and carry no role), the `--line`/`--rule` border tokens, a theme chooser in every page's
 # header (`urn:iki:ui:theme-chooser:{theme}`), and ikigai-fn 0.9, so the host links one
 # ikigai-fn (ledger #2854). A minor, so `"0.3.0"` was a ceiling below it.
-ikigai-ui = "0.5.0" # 0.5.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.5.0"` is `<0.6.0`. Beneath it: 0.4.0.
+ikigai-ui = "0.5.2" # 0.5.2: lens doors are URI templates, so the dumped arrangement carries them (ledger #3814; `the_dumped_default_binds_the_file_space` fails on 0.5.1). 0.5.1: the shell rides out a restart (ledger #3810). `"0.5.2"` is `<0.6.0`. Beneath it: 0.5.0 (core 0.3.0 cascade, ledger #2975).
 ikigai-diagram = "0.4.0" # 0.4.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.4.0"` is `<0.5.0`. Beneath it: 0.3.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.0"` is `<0.4.0`. Beneath it: 0.2.0 = names its `space()` `urn:iki:space:diagram` (ledger #987), so `answered_by`,
 # `urn:kernel:topology` and `urn:diagram:*` show that name where this host mounts it plain, and
 # the cache partitions under it. Under 0.x the old caret was a CEILING below the named release.
