@@ -5081,12 +5081,7 @@ fn inquiry_import(from: &str, days: Option<u64>) -> ! {
         })?;
         let log = std::fs::read_to_string(from).map_err(|e| format!("cannot read {from}: {e}"))?;
         let now = ikigai_core::Clock::now(&ikigai_core::SystemClock);
-        inquiry::import_blocks(
-            opened,
-            &log,
-            days.unwrap_or(opened.block_days),
-            now,
-        )
+        inquiry::import_blocks(opened, &log, days.unwrap_or(opened.block_days), now)
     })();
     match result {
         Ok(counts) => {
