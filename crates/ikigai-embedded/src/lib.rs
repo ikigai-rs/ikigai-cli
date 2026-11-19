@@ -9913,14 +9913,51 @@ mod tests {
         );
     }
 
+    /// The shipped `dev` demo grant reaches every typed `urn:repo:*` git and gh
+    /// facade the host binds. Since ikigai-repo 0.6.0 (the exec split, ledger
+    /// #3818) they declare `urn:cap:exec:read:git` / `urn:cap:exec:read:gh`, and the
+    /// old `urn:cap:exec:git` / `urn:cap:exec:gh` spellings grant nothing there.
+    #[test]
+    fn demo_dev_grant_reaches_every_repo_facade() {
+        let grants: serde_json::Value =
+            serde_json::from_str(include_str!("../../../demos/grants.json.example"))
+                .expect("the demo grants file is JSON");
+        let dev = Capability::scoped(grant_entry_scopes(&grants["dev"]));
+        let kernel = kernel();
+        for iri in [
+            "urn:repo:status",
+            "urn:repo:log",
+            "urn:repo:branch",
+            "urn:repo:show",
+            "urn:repo:pr:list",
+            "urn:repo:pr:view",
+            "urn:repo:pr:files",
+            "urn:repo:pr:diff",
+            "urn:repo:pr:checks",
+        ] {
+            let description = kernel
+                .describe_pattern(iri)
+                .unwrap_or_else(|| panic!("{iri} describes itself"));
+            assert!(
+                !description.requires.is_empty(),
+                "{iri} declares its exec grant"
+            );
+            assert_eq!(
+                description.unsatisfied_scopes(ikigai_core::Verb::Source, &dev),
+                Vec::<String>::new(),
+                "the demo dev grant reaches {iri}"
+            );
+        }
+    }
+
     #[test]
     fn grant_entry_parses_both_shapes() {
         // Array form: scopes only, no visibility (backward compatible).
-        let arr = serde_json::json!(["urn:cap:exec:git", "urn:cap:fs:read:*"]);
+        let arr = serde_json::json!(["urn:cap:exec:read:git", "urn:cap:fs:read:*"]);
         assert_eq!(
             scopes_of(&arr),
             vec![
-                "urn:cap:exec:git".to_string(),
+                "urn:cap:exec:read:git".to_string(),
                 "urn:cap:fs:read:*".to_string()
             ]
         );
@@ -9928,11 +9965,11 @@ mod tests {
 
         // Object form: scopes under "scopes", plus show/hide visibility globs.
         let obj = serde_json::json!({
-            "scopes": ["urn:cap:exec:git"],
+            "scopes": ["urn:cap:exec:read:git"],
             "hide": ["wc", "greet"],
             "show": ["sparql"]
         });
-        assert_eq!(scopes_of(&obj), vec!["urn:cap:exec:git".to_string()]);
+        assert_eq!(scopes_of(&obj), vec!["urn:cap:exec:read:git".to_string()]);
         assert_eq!(
             visibility_of(&obj),
             (
