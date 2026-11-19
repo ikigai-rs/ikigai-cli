@@ -131,6 +131,14 @@ fn configs() -> Result<&'static [IntakeConfig], String> {
     CONFIGS.get_or_init(read).as_deref().map_err(Clone::clone)
 }
 
+/// The configured rows' block keys, by row id, for `inquiry.json`'s one-key check.
+pub(crate) fn block_keys() -> Result<Vec<(String, ikigai_intake::BlockKey)>, String> {
+    Ok(configs()?
+        .iter()
+        .filter_map(|c| Some((c.id.clone(), c.block_key.clone()?)))
+        .collect())
+}
+
 pub(crate) fn check() -> Result<(), String> {
     configs().map(|_| ())
 }

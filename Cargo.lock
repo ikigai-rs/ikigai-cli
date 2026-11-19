@@ -3085,7 +3085,7 @@ dependencies = [
  "futures-core",
  "ikigai-a11y",
  "ikigai-core",
- "ikigai-fn",
+ "ikigai-fn 0.10.0",
  "ikigai-store",
  "notify",
  "oxigraph",
@@ -3202,7 +3202,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec1e013bb169cb1a4a2282ab8053b829dec228457b98a16071aa363ae98ebeb8"
 dependencies = [
  "ikigai-core",
- "ikigai-fn",
+ "ikigai-fn 0.10.0",
  "oxrdf",
  "oxttl",
 ]
@@ -3247,9 +3247,10 @@ dependencies = [
  "ikigai-email",
  "ikigai-encrypt",
  "ikigai-engine",
- "ikigai-fn",
+ "ikigai-fn 0.10.0",
  "ikigai-fs",
  "ikigai-http",
+ "ikigai-inquiry",
  "ikigai-intake",
  "ikigai-intray",
  "ikigai-ipc",
@@ -3344,6 +3345,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ikigai-fn"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64b6ffa33b80f59fb49acfc2d60337517bade163b8fe03e2e9eedf29f906eed5"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "html5ever",
+ "ikigai-core",
+ "pulldown-cmark",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ikigai-fs"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3375,6 +3391,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ikigai-inquiry"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "48d8eee23193d0909c0af62fcd458f9b33ba789b22030e9952711bae8d327a34"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "blake3",
+ "getrandom 0.3.4",
+ "ikigai-core",
+ "ikigai-fn 0.11.0",
+ "oxrdf",
+ "oxttl",
+ "serde_json",
+]
+
+[[package]]
 name = "ikigai-intake"
 version = "0.5.3"
 dependencies = [
@@ -3383,7 +3416,7 @@ dependencies = [
  "chrono-tz",
  "futures",
  "ikigai-core",
- "ikigai-fn",
+ "ikigai-fn 0.10.0",
  "serde_json",
 ]
 
@@ -3688,7 +3721,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40370ad27e9171822ca6e27190511fdd7017410a1d18ac5ff0781311968c0b92"
 dependencies = [
  "ikigai-core",
- "ikigai-fn",
+ "ikigai-fn 0.10.0",
  "serde",
  "serde_json",
 ]
@@ -3873,7 +3906,7 @@ dependencies = [
  "futures-executor",
  "ikigai-a11y",
  "ikigai-core",
- "ikigai-fn",
+ "ikigai-fn 0.10.0",
  "ikigai-sexpr",
  "serde",
  "serde_json",
@@ -3918,7 +3951,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "ikigai-core",
- "ikigai-fn",
+ "ikigai-fn 0.10.0",
  "ikigai-fs",
  "ikigai-http",
  "libc",
@@ -6852,6 +6885,17 @@ checksum = "4dcd034599e63b970727f70d79e02d62390a4a84f7c6b827c27c46d5ac3fa622"
 dependencies = [
  "ar_archive_writer",
  "cc",
+]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.13.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3db2be46835f013dd3f4fa7f5f7402c537787b54ebb6fe2b94bbdd7e2669bb7b"
+dependencies = [
+ "bitflags 2.13.2",
+ "memchr",
+ "unicase",
 ]
 
 [[package]]

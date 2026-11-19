@@ -56,6 +56,8 @@ pub mod socket;
 // with a state directory and named models. One writer per state directory, so one open per
 // process; see the module note.
 pub mod bayes;
+// The contact-inquiry edge half (`urn:iki:inquiry:*`, ledger #3836): bound when the config home
+// has an `inquiry.json`; the local root binds all of it, the served kernel the block set and apply.
 mod browse;
 pub mod cache;
 pub mod clients;
@@ -64,6 +66,7 @@ pub mod contactblock;
 pub mod decide;
 pub mod decisions;
 pub mod foaf;
+pub mod inquiry;
 mod intakes;
 pub mod jsonl;
 pub mod layers;
@@ -1906,10 +1909,14 @@ fn local_space(nature: &'static str) -> EndpointSpace {
 /// and the capability path-ACL refuses any other segment. The personal space stays OFF
 /// the wire — owner-only, no per-tenant story yet.
 fn served_space(nature: &'static str) -> impl Space {
-    Fallback::new(vec![
-        Arc::new(ui::space()),
-        Arc::new(served_endpoints(nature)),
-    ])
+    let mut members: Vec<Arc<dyn Space>> =
+        vec![Arc::new(ui::space()), Arc::new(served_endpoints(nature))];
+    // Only what a configured intake (the block set's `Exists`) and the airlock (apply) reach,
+    // when the config home has an `inquiry.json`; never a route of the HTTP door.
+    if let Some(space) = inquiry::served_space() {
+        members.push(space);
+    }
+    Fallback::new(members)
 }
 
 fn served_endpoints(nature: &'static str) -> EndpointSpace {
@@ -5419,6 +5426,11 @@ fn root_members(nature: &'static str) -> Vec<Arc<dyn Space>> {
     // even inside this process. A process that never armed it (a served door, a test binary)
     // binds nothing here. NOT in `served_space`: the public face must never hold the model.
     if let Some(space) = bayes::space() {
+        spaces.push(space);
+    }
+    // The contact-inquiry edge half (`urn:iki:inquiry:*`), when the config home has an
+    // `inquiry.json` — see the `inquiry` module. Without the file nothing is bound here.
+    if let Some(space) = inquiry::local_space() {
         spaces.push(space);
     }
     // The stored programs (`PROGRAMS`): each bound as an endpoint — the program IS the

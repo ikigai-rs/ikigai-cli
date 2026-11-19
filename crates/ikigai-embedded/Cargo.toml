@@ -113,6 +113,9 @@ ikigai-layers = { workspace = true }
 # so a feature would buy no build time and would add a configuration CI has to cover (field
 # guide 9c). The SWITCH is the state directory plus the models, as `layers/` is for the layer host.
 ikigai-bayes = { workspace = true }
+# The contact-inquiry edge half (`urn:iki:inquiry:*`, `src/inquiry.rs`, ledger #3836), bound only when
+# the config home has an `inquiry.json`.
+ikigai-inquiry = { workspace = true }
 # LLM inference (urn:llm:ask + urn:llm:<provider>:ask), on the native ureq transport.
 ikigai-llm = { workspace = true }
 # Video-conference scheduling (urn:meeting:schedule + urn:meeting:zoom:schedule), on the same

@@ -64,6 +64,9 @@ IRI receiving the validated tuple. Optional row keys are:
 
 ### The blocklist
 
+To use the contact-inquiry edge half's block set, see [inquiry.md](inquiry.md): point
+`blocklist` at `urn:iki:inquiry:block:key:{key}` and name the same key file in both.
+
 The intake never sends or stores a sender's address to check it. It computes two keys with
 keyed BLAKE3 under the key in `block_key_file`: one over the trimmed, lowercased address and
 one over `domain:<domain>` (the part after the `@`), each as 64 lowercase hexadecimal digits.
