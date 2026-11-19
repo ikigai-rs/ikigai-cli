@@ -3865,9 +3865,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-ui"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f40b1f2a4b40615f4a1ff5cdfd7781c135e90d484b7a0abfea64d2d0fcb3b511"
+checksum = "74252111b4c016c455d9f6f7db9ad40b6a144a428d8ec4d11788c1b879f792b0"
 dependencies = [
  "chrono",
  "futures-executor",
