@@ -1787,7 +1787,7 @@ ikigai-cms = "0.4.0" # 0.4.0 = core 0.3.0 cascade (ledger #2975): the newest rel
 # 0.1.1 = stitch wrapped bookmark titles (no dropped entries)
 # Dev-tooling seam: git/gh as resources (urn:repo:*). Since 0.3 it serves no low-level
 # `urn:system:exec`, only the fixed facades.
-ikigai-repo = "0.5.0" # 0.5.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.5.0"` is `<0.6.0`. Beneath it: 0.3.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.1"` is `<0.4.0`. Beneath it: 0.2.0 = naming only: names its `space()` `urn:iki:space:repo` (ledger #987), so `answered_by`,
+ikigai-repo = "0.6.0" # 0.6.0 = the exec split (ledger #3818): the git facades declare and enforce `urn:cap:exec:read:git` and the `pr:*` facades `urn:cap:exec:read:gh`; the old `urn:cap:exec:git` / `urn:cap:exec:gh` grant nothing (ledger #3821). `"0.6.0"` is `<0.7.0`. Beneath it: 0.5.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.5.0"` is `<0.6.0`. Beneath it: 0.3.1 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.3.1"` is `<0.4.0`. Beneath it: 0.2.0 = naming only: names its `space()` `urn:iki:space:repo` (ledger #987), so `answered_by`,
 # `urn:kernel:topology` and `urn:diagram:*` show that name where this host mounts it plain, and
 # the cache partitions under it. Under 0.x the old caret was a CEILING below the named release.
 # Beneath it, still true: A floor a test in this repo actually holds, rather than an argument:
