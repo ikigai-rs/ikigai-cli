@@ -1638,10 +1638,11 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 continue;
             }
             if arg == "--cap" {
-                caps.push(
-                    argv.next()
-                        .ok_or_else(|| "--cap needs a capability IRI".to_string())?,
-                );
+                let cap = argv
+                    .next()
+                    .ok_or_else(|| "--cap needs a capability IRI".to_string())?;
+                ikigai_embedded::check_retired_scopes("--cap", [&cap])?;
+                caps.push(cap);
                 continue;
             }
             // Wire-eval L1.5: whose signatures this host will run programs for.
@@ -1840,10 +1841,13 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                     argv.next()
                         .ok_or_else(|| "--grant needs a name".to_string())?,
                 ),
-                "--scope" => scopes.push(
-                    argv.next()
-                        .ok_or_else(|| "--scope needs a capability IRI".to_string())?,
-                ),
+                "--scope" => {
+                    let scope = argv
+                        .next()
+                        .ok_or_else(|| "--scope needs a capability IRI".to_string())?;
+                    ikigai_embedded::check_retired_scopes("--scope", [&scope])?;
+                    scopes.push(scope);
+                }
                 "--principal" => {
                     principal = Some(argv.next().ok_or_else(|| {
                         "--principal needs an agent IRI (an entry of the grants file's \
@@ -2034,6 +2038,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                     let scope = argv
                         .next()
                         .ok_or_else(|| "--cap requires a capability scope".to_string())?;
+                    ikigai_embedded::check_retired_scopes("--cap", [&scope])?;
                     command.push_str(&format!(" cap={scope}"));
                 }
                 repl.commands.push(command);
@@ -2153,6 +2158,7 @@ fn main() {
 
     if !matches!(mode, Mode::Version { .. }) {
         if let Err(e) = ikigai_embedded::check_grants_flag()
+            .and_then(|()| ikigai_embedded::check_grants_retired_scopes())
             .and(ikigai_embedded::clients::clients_path().map(drop))
         {
             eprintln!("ikigai: {e}");

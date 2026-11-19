@@ -1187,6 +1187,122 @@ pub(crate) fn missing_grants_flag(path: &std::path::Path) -> String {
     )
 }
 
+/// The exec scopes no facade serves any more, each with what to write instead (ledger #3828).
+/// ikigai-repo 0.6.0 (the exec split, ledger #3818) serves git and gh under
+/// `urn:cap:exec:read:git` / `urn:cap:exec:read:gh` and grants nothing for the old spellings;
+/// nothing has served `urn:cap:exec:cargo` or `urn:cap:exec:just` since ikigai-repo 0.3.0.
+const RETIRED_EXEC_SCOPES: [(&str, &str); 4] = [
+    (
+        "urn:cap:exec:git",
+        "replace it with `urn:cap:exec:read:git`",
+    ),
+    ("urn:cap:exec:gh", "replace it with `urn:cap:exec:read:gh`"),
+    ("urn:cap:exec:cargo", "remove it; nothing serves it"),
+    ("urn:cap:exec:just", "remove it; nothing serves it"),
+];
+
+/// What to do about `scope` if it is a retired exec scope: `None` for any other scope.
+///
+/// ```
+/// use ikigai_embedded::retired_scope_advice;
+///
+/// assert_eq!(
+///     retired_scope_advice("urn:cap:exec:git"),
+///     Some("replace it with `urn:cap:exec:read:git`")
+/// );
+/// assert_eq!(retired_scope_advice("urn:cap:exec:read:git"), None);
+/// ```
+#[must_use]
+pub fn retired_scope_advice(scope: &str) -> Option<&'static str> {
+    RETIRED_EXEC_SCOPES
+        .iter()
+        .find(|(retired, _)| *retired == scope)
+        .map(|(_, advice)| *advice)
+}
+
+/// Refuse a scope list that names a retired exec scope. `whose` says where the list came
+/// from (a file and a grant, or a flag), and the refusal names it, the scope and the
+/// replacement. A retired scope grants nothing, so a list still naming one would lose what it
+/// meant to grant without a word; the list is refused instead, and never rewritten.
+///
+/// ```
+/// use ikigai_embedded::check_retired_scopes;
+///
+/// let refused = check_retired_scopes("--scope", ["urn:cap:exec:gh"]).unwrap_err();
+/// assert!(refused.contains("`urn:cap:exec:read:gh`"));
+/// assert!(check_retired_scopes("--scope", ["urn:cap:exec:read:gh"]).is_ok());
+/// ```
+///
+/// # Errors
+///
+/// One line per retired scope in `scopes`.
+pub fn check_retired_scopes<S: AsRef<str>>(
+    whose: &str,
+    scopes: impl IntoIterator<Item = S>,
+) -> std::result::Result<(), String> {
+    let refusals: Vec<String> = scopes
+        .into_iter()
+        .filter_map(|scope| {
+            let scope = scope.as_ref();
+            retired_scope_advice(scope)
+                .map(|advice| format!("{whose} names the retired exec scope `{scope}`: {advice}"))
+        })
+        .collect();
+    if refusals.is_empty() {
+        Ok(())
+    } else {
+        Err(refusals.join("\n"))
+    }
+}
+
+/// Refuse a parsed grants document any of whose grants names a retired exec scope
+/// ([`check_retired_scopes`]), naming `path` and each grant.
+pub(crate) fn check_retired_grants(
+    path: &std::path::Path,
+    document: &serde_json::Value,
+) -> std::result::Result<(), String> {
+    let Some(grants) = document.as_object() else {
+        return Ok(());
+    };
+    let refusals: Vec<String> = grants
+        .iter()
+        .filter(|(name, _)| name.as_str() != agents::PRINCIPALS_KEY)
+        .filter_map(|(name, entry)| {
+            check_retired_scopes(
+                &format!("{}: grant `{name}`", path.display()),
+                grant_entry_scopes(entry),
+            )
+            .err()
+        })
+        .collect();
+    if refusals.is_empty() {
+        Ok(())
+    } else {
+        Err(refusals.join("\n"))
+    }
+}
+
+/// Refuse to start on a grants file any of whose grants names a retired exec scope. Every host
+/// checks it at start, beside [`check_grants_flag`]. A file that is absent, unreadable or not
+/// JSON is left to the readers that already refuse it.
+///
+/// # Errors
+///
+/// The refusal from [`grants_path`], or one naming the file, each grant, its retired scope and
+/// the replacement.
+pub fn check_grants_retired_scopes() -> std::result::Result<(), String> {
+    let Some(path) = grants_path()? else {
+        return Ok(());
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Ok(());
+    };
+    check_retired_grants(&path, &document)
+}
+
 /// The grants file, parsed: `Ok(None)` when the config home has none. A door that serves from
 /// it reads it whole once at start, so a file it could not use stops the door rather than
 /// leaving every grant it names quietly empty ([`grant_scopes`] reads an unusable file as no
@@ -1218,6 +1334,7 @@ pub fn grants_document() -> std::result::Result<Option<serde_json::Value>, Strin
             path.display()
         ));
     }
+    check_retired_grants(&path, &document)?;
     Ok(Some(document))
 }
 
@@ -1240,11 +1357,16 @@ pub(crate) fn grant_entry_scopes(entry: &serde_json::Value) -> Vec<String> {
 ///
 /// # Errors
 ///
-/// Returns the configuration refusal from [`grants_path`].
+/// Returns the configuration refusal from [`grants_path`], or a grant naming a retired exec
+/// scope ([`check_retired_scopes`]).
 pub fn grant_scopes(name: &str) -> std::result::Result<Vec<String>, String> {
-    Ok(grant_entry(name)?
+    let scopes = grant_entry(name)?
         .map(|e| scopes_of(&e))
-        .unwrap_or_default())
+        .unwrap_or_default();
+    if let Some(path) = grants_path()? {
+        check_retired_scopes(&format!("{}: grant `{name}`", path.display()), &scopes)?;
+    }
+    Ok(scopes)
 }
 
 /// The visibility profile of a named MCP grant — the `show`/`hide` glob lists from
@@ -9948,6 +10070,36 @@ mod tests {
                 "the demo dev grant reaches {iri}"
             );
         }
+    }
+
+    /// Each retired exec spelling, in either grant shape, refuses the grants document,
+    /// naming the file, the grant, the scope and the replacement (ledger #3828); a document of
+    /// new spellings passes, and so does the principals table, which names grants, not scopes.
+    #[test]
+    fn a_grant_naming_a_retired_exec_scope_is_refused() {
+        let path = std::path::Path::new("/config/ikigai/grants.json");
+        for (scope, advice) in [
+            ("urn:cap:exec:git", "`urn:cap:exec:read:git`"),
+            ("urn:cap:exec:gh", "`urn:cap:exec:read:gh`"),
+            ("urn:cap:exec:cargo", "remove it; nothing serves it"),
+            ("urn:cap:exec:just", "remove it; nothing serves it"),
+        ] {
+            for document in [
+                serde_json::json!({"claude": [scope]}),
+                serde_json::json!({"claude": {"scopes": ["urn:cap:fs:read:*", scope]}}),
+            ] {
+                let refused = check_retired_grants(path, &document).unwrap_err();
+                for part in ["/config/ikigai/grants.json", "`claude`", scope, advice] {
+                    assert!(refused.contains(part), "no `{part}` in: {refused}");
+                }
+            }
+        }
+        let current = serde_json::json!({
+            "_doc": "a comment",
+            "claude": {"scopes": ["urn:cap:exec:read:git", "urn:cap:exec:read:gh"]},
+            "principals": {"urn:example:hub": {"kind": "agent", "grant": "claude"}}
+        });
+        assert_eq!(check_retired_grants(path, &current), Ok(()));
     }
 
     #[test]

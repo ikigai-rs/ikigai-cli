@@ -163,6 +163,7 @@ fn scopes_of_grants(
             &doc[name.as_str()]
         };
         let scopes = crate::grant_entry_scopes(entry);
+        crate::check_retired_scopes(&format!("grant `{name}`"), &scopes)?;
         if scopes.is_empty() {
             undecided.push(format!("`{name}`"));
         }
@@ -827,5 +828,23 @@ mod tests {
             return;
         }
         assert_eq!(check_protected(hosts), Ok(()));
+    }
+
+    /// A grant the agent session reads naming a retired exec scope refuses the session,
+    /// naming the grant and the replacement (ledger #3828).
+    #[test]
+    fn a_retired_exec_scope_in_a_grant_refuses_the_session() {
+        let grants = r#"{
+          "brian":  ["urn:cap:exec:read:git"],
+          "claude": ["urn:cap:exec:git"],
+          "principals": {
+            "urn:example:brian": {"kind": "person", "grant": "brian"},
+            "urn:example:hub": {"kind": "agent", "acts_for": "urn:example:brian", "grant": "claude"}
+          }
+        }"#;
+        let refused = agent_session(grants, "urn:example:hub", &[], &[]).unwrap_err();
+        for part in ["`claude`", "`urn:cap:exec:git`", "`urn:cap:exec:read:git`"] {
+            assert!(refused.contains(part), "no {part} in: {refused}");
+        }
     }
 }
