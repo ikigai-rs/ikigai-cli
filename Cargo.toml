@@ -1210,8 +1210,10 @@ members = ["crates/*"]
 # Next release: `ikigai --daemon` starts when a `--mount`/`--override` target (or a config-home `mount`
 # line) does not answer at start (ledger #3847): one warning line names the target, calls through it
 # fail as they do when a connected peer goes away, and each call dials again, so the peer is picked up
-# with no restart. Before, the daemon exited 2 and a supervisor restarted it in a loop. `-c`, the REPL,
-# `mcp` and `serve` (without `--pending`) still refuse to start. A deploy change: rebuild --locked.
+# with no restart. Before, the daemon exited 2 and a supervisor restarted it in a loop. Only a peer that
+# does not answer is tolerated: a bad address, unreadable certificates, an unenrolled `peer:`, a missing
+# transport feature, or a live peer refusing admission still exit 2. `-c`, the REPL, `mcp` and `serve`
+# (without `--pending`) still refuse to start. A deploy change: rebuild --locked.
 version = "0.5.5"
 edition = "2021"
 license = "MIT OR Apache-2.0"

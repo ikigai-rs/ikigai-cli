@@ -315,6 +315,16 @@ fn read(explicit: Option<String>, default_name: &str, certs: &Certs) -> Result<S
     })
 }
 
+/// Whether `target` is `quic://<host>:<port>` with a non-empty host and a port that fits in
+/// 16 bits: what can be said of it WITHOUT a name lookup (ledger #3847). [`parse_addr`] can
+/// still fail on such a target when the host name does not resolve.
+pub fn addr_is_well_formed(target: &str) -> bool {
+    target
+        .strip_prefix("quic://")
+        .and_then(|hostport| hostport.rsplit_once(':'))
+        .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok())
+}
+
 /// Parse and resolve a `quic://host:port` target into a socket address.
 pub fn parse_addr(target: &str) -> Result<SocketAddr, String> {
     let hostport = target

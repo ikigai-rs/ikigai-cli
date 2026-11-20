@@ -161,3 +161,64 @@ fn a_daemon_starts_when_its_override_quic_target_does_not_answer() {
     drop(daemon);
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// Start `ikigai <args> --daemon` expecting it to REFUSE: it must exit, with code 2, before
+/// its banner, naming `says`. Round 2 of ledger #3847: only a peer that does not answer is
+/// tolerated, and every check that needs no peer stays fatal, as on main.
+#[cfg(feature = "quic")]
+fn assert_daemon_refuses(home: &Path, args: &[&str], says: &str) {
+    let (mut daemon, banner) = start_daemon(home, args);
+    assert!(
+        !banner.contains("daemon up") && !banner.contains("not reachable at start"),
+        "a misconfiguration must not start the daemon: {banner}"
+    );
+    let status = daemon.0.wait().expect("the daemon's status");
+    assert_eq!(status.code(), Some(2), "{banner}");
+    assert!(banner.contains(says), "names the cause ({says}): {banner}");
+}
+
+/// `--cert-dir /typo`: the client identity cannot be read, which no wait fixes.
+#[cfg(feature = "quic")]
+#[test]
+fn a_daemon_with_a_missing_cert_dir_still_exits_2() {
+    let home = scratch("nocert");
+    let missing = home.join("no-such-certs");
+    assert_daemon_refuses(
+        &home,
+        &[
+            "--override",
+            "urn:layer:=quic://127.0.0.1:9",
+            "--cert-dir",
+            missing.to_str().unwrap(),
+        ],
+        "client.crt",
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A `quic://` address that does not parse (no port) is a typo, not an absent peer.
+#[cfg(feature = "quic")]
+#[test]
+fn a_daemon_with_an_unparseable_quic_address_still_exits_2() {
+    let home = scratch("badaddr");
+    assert_daemon_refuses(
+        &home,
+        &["--override", "urn:layer:=quic://no-port-here"],
+        "no-port-here",
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A `peer:<name>` this machine holds no pinned certificate for is refused before any browse,
+/// so it is not mistaken for a peer that is away.
+#[cfg(feature = "quic")]
+#[test]
+fn a_daemon_with_an_unenrolled_peer_still_exits_2() {
+    let home = scratch("unenrolled");
+    assert_daemon_refuses(
+        &home,
+        &["--override", "urn:layer:=peer:nobody-enrolled"],
+        "holds no pinned certificate",
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
