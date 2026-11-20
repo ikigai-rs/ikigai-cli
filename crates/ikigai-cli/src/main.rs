@@ -166,7 +166,11 @@ usage:
                                 resolves here (a name resolves under the request's capability;
                                 the file is never served; an edit rebinds). Without it the door
                                 serves no names, and the config home's `names` is not read]
-  ikigai --daemon              headless: timers, the watcher, and the standing sync — for launchd
+  ikigai --daemon              headless: timers, the watcher, and the standing sync — for launchd.
+                               A --mount/--override that does not answer at start is a warning
+                               line, not a stop: calls through it fail and dial it again until
+                               it answers (-c, the REPL and mcp still refuse to start). A bad
+                               address, unreadable certs or a refusal from the peer still stop it
   ikigai --name <instance>     name this instance (scopes <name>.* config properties; defaults
                                repl / daemon / serve by mode)
   ikigai --grants <file>       read grants and socket accounts from <file> (all local hosts);
@@ -659,7 +663,8 @@ struct Mount {
     kind: MountKind,
     /// `--pending` on a served `--mount`/`--override` (ledger #3169): dial on first use, as
     /// `--prefer` always does, so the host may start before its peer. Off, the mount dials
-    /// while the process starts and a peer that does not answer stops the start.
+    /// while the process starts and a peer that does not answer stops the start, except under
+    /// `--daemon`, which keeps it with a warning ([`resolve_daemon_mount`], ledger #3847).
     pending: bool,
 }
 
@@ -2524,13 +2529,19 @@ fn daemon(mounts: Mounts) {
     } else {
         let mut resolved = Vec::new();
         for mount in mounts {
-            // Each mount connects with ITS OWN certificates.
-            match resolve_mount(mount) {
-                Ok(specs) => resolved.extend(specs),
-                // A mount that will not connect is fatal here: the daemon's whole reason to
-                // hold a mount is the drain, and a silent no-op is the failure mode this is
-                // fixing. Say so and exit rather than park looking healthy. (A --prefer
-                // mount never lands here — it connects on demand, by design.)
+            // Each mount connects with ITS OWN certificates. A target that does not answer
+            // at start no longer stops the daemon (ledger #3847): see `resolve_daemon_mount`.
+            match resolve_daemon_mount(mount) {
+                Ok((specs, warning)) => {
+                    if let Some(warning) = warning {
+                        eprintln!("ikigai: {warning}");
+                    }
+                    resolved.extend(specs);
+                }
+                // Anything but a peer that does not answer: a misconfiguration (a malformed
+                // prefix list or address, certificates that cannot be read, an unenrolled
+                // peer, a transport this build lacks) or a live peer's refusal. No wait fixes
+                // either, so it stays fatal, as on main.
                 Err(e) => {
                     eprintln!("ikigai: {e}");
                     std::process::exit(2);
@@ -3275,7 +3286,8 @@ fn home_dir() -> std::path::PathBuf {
 /// across machines), else a Unix socket path (a same-machine peer).
 ///
 /// `--mount` and `--override` connect NOW: you named that peer because you want
-/// its namespace, and a silent no-op is the failure mode worth being loud about.
+/// its namespace, and a silent no-op is the failure mode worth being loud about. (The
+/// daemon goes through [`resolve_daemon_mount`], which keeps one that does not answer.)
 /// `--prefer` connects on demand — its whole contract is that the peer may be
 /// absent, so an absent peer at startup is normal operation, not an error. A served
 /// `--mount` or `--override` that says `--pending` connects on demand too: the operator
@@ -3285,6 +3297,13 @@ fn home_dir() -> std::path::PathBuf {
 /// prefixes ([`mount_prefixes`]) is one connection serving all of them, not one per prefix.
 #[cfg(feature = "embedded")]
 fn resolve_mount(mount: Mount) -> Result<Vec<ikigai_embedded::MountSpec>, String> {
+    resolve_mount_classified(mount).map_err(|e| e.message)
+}
+
+/// [`resolve_mount`], keeping whether a failure was the peer not answering
+/// ([`DialError::unreachable`]) or anything else, which [`resolve_daemon_mount`] reads.
+#[cfg(feature = "embedded")]
+fn resolve_mount_classified(mount: Mount) -> Result<Vec<ikigai_embedded::MountSpec>, DialError> {
     let Mount {
         prefix,
         target,
@@ -3304,7 +3323,7 @@ fn resolve_mount(mount: Mount) -> Result<Vec<ikigai_embedded::MountSpec>, String
             entries_failed: std::sync::Mutex::new(None),
         })
     } else {
-        connect_mount(&target, &certs, kind, alias_hello(kind, &prefixes))?
+        dial_mount(&target, &certs, kind, alias_hello(kind, &prefixes))?
     };
     Ok(prefixes
         .into_iter()
@@ -3315,6 +3334,116 @@ fn resolve_mount(mount: Mount) -> Result<Vec<ikigai_embedded::MountSpec>, String
             kind,
         })
         .collect())
+}
+
+/// [`resolve_mount`] for the long-running `--daemon` (ledger #3847): a `--mount` or
+/// `--override` whose target does not ANSWER at start is kept, dialing again on each use as a
+/// `--pending` one does, with one warning line (the second value) naming the target.
+///
+/// Why the daemon and not the one-shot: a daemon is restarted by launchd/systemd, so
+/// exiting on an absent peer turned "the peer is down" into a restart loop that also stopped
+/// everything else the daemon does (timers, watchers, the drain of every other prefix). Each
+/// call through the mount still fails, as `Unavailable` naming the flag and the target, while
+/// the peer is away, which is the same thing a connected mount does when its peer goes later;
+/// once the peer answers the next call reaches it, with no restart.
+///
+/// ONLY an unreachable peer is tolerated (ledger #3847, round 2). Everything that can be
+/// checked without the peer is checked first and stays fatal, because no wait fixes it: the
+/// prefix list, a `quic://` address that does not parse, a client identity or pinned server
+/// certificate that cannot be read (`--cert-dir /typo`), a `peer:<name>` this machine holds
+/// no certificate for, a transport this build lacks. So is a peer that ANSWERS and refuses:
+/// a door that does not admit this client, a pinned certificate the peer does not match, a
+/// wire version neither side speaks, a socket served by another user. What goes pending is a
+/// dial that times out or finds nothing listening (see [`DialError`]). The dial is still
+/// tried at start, so a peer that IS up is connected as before. `-c`, the REPL, `mcp` and
+/// `serve` keep failing on an unreachable peer too (`serve` has `--pending` to opt in).
+#[cfg(feature = "embedded")]
+fn resolve_daemon_mount(
+    mount: Mount,
+) -> Result<(Vec<ikigai_embedded::MountSpec>, Option<String>), String> {
+    if mount.pending || mount.kind == MountKind::Prefer {
+        return resolve_mount(mount).map(|specs| (specs, None));
+    }
+    match resolve_mount_classified(mount.clone()) {
+        Ok(specs) => Ok((specs, None)),
+        Err(e) if e.unreachable => {
+            let warning = format!(
+                "{} — {} {} is not reachable at start; the daemon keeps running, calls \
+                 through it fail until {} answers, and each one dials it again",
+                e.message,
+                mount_flag(mount.kind),
+                mount.prefix,
+                mount.target,
+            );
+            let specs = resolve_mount(Mount {
+                pending: true,
+                ..mount
+            })?;
+            Ok((specs, Some(warning)))
+        }
+        Err(e) => Err(e.message),
+    }
+}
+
+/// Why a mount's dial failed, and whether the cause was the peer not answering.
+///
+/// `unreachable` is set only where the peer was not heard from at all: a `quic://` dial that
+/// timed out, a socket with nothing listening (absent, refused, hung up before its hello), a
+/// `peer:<name>` nobody is announcing, a `quic://` host name that does not resolve (a
+/// `.local` name is answered by the peer itself). Every other failure, a misconfiguration or a
+/// live peer's refusal, is not, and that is the default: [`From<String>`] builds one.
+#[cfg(feature = "embedded")]
+struct DialError {
+    message: String,
+    unreachable: bool,
+}
+
+#[cfg(feature = "embedded")]
+impl From<String> for DialError {
+    fn from(message: String) -> Self {
+        DialError {
+            message,
+            unreachable: false,
+        }
+    }
+}
+
+#[cfg(feature = "embedded")]
+impl DialError {
+    /// A failure to reach the peer at all.
+    #[cfg_attr(not(feature = "quic"), allow(dead_code))]
+    fn unreachable(message: String) -> Self {
+        DialError {
+            message,
+            unreachable: true,
+        }
+    }
+
+    /// A dial's I/O error, unreachable when its kind says nothing answered.
+    #[cfg_attr(
+        not(any(feature = "quic", all(feature = "ipc", unix))),
+        allow(dead_code)
+    )]
+    fn from_io(message: String, kind: std::io::ErrorKind) -> Self {
+        use std::io::ErrorKind;
+        DialError {
+            message,
+            unreachable: matches!(
+                kind,
+                ErrorKind::NotFound
+                    | ErrorKind::ConnectionRefused
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::NotConnected
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::UnexpectedEof
+                    | ErrorKind::TimedOut
+                    | ErrorKind::HostUnreachable
+                    | ErrorKind::NetworkUnreachable
+                    | ErrorKind::NetworkDown
+            ),
+        }
+    }
 }
 
 /// Whether a mount's connection says `HelloMode::Alias` (names arrive prefix-stripped) to
@@ -3517,6 +3646,17 @@ fn connect_mount(
     kind: MountKind,
     alias_hello: bool,
 ) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
+    dial_mount(target, certs, kind, alias_hello).map_err(|e| e.message)
+}
+
+/// [`connect_mount`], keeping whether the failure was the peer not answering ([`DialError`]).
+#[cfg(feature = "embedded")]
+fn dial_mount(
+    target: &str,
+    certs: &Certs,
+    kind: MountKind,
+    alias_hello: bool,
+) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, DialError> {
     // The connect error names the flag the operator actually wrote: a down
     // prefer-mount peer surfacing at first use as `--mount: connect …` sent the
     // reader hunting for a flag that was never typed.
@@ -3525,8 +3665,7 @@ fn connect_mount(
     // (bug's `ipconfig getifaddr en0` came back empty during the mail work, because it was
     // on another interface); a name does not.
     if let Some(name) = target.strip_prefix("peer:") {
-        let (resolved, certs) = resolve_peer(name, certs)?;
-        return connect_mount_quic(&resolved, &certs, flag);
+        return connect_mount_peer(name, certs, flag);
     }
     if is_quic(target) {
         connect_mount_quic(target, certs, flag)
@@ -3561,13 +3700,41 @@ const PEER_DISCOVERY_WAIT: std::time::Duration = std::time::Duration::from_milli
 /// That convention is also why this is ergonomic: the name determines both the address (by
 /// announcement) and the identity (by directory), so `--prefer urn:llm:=peer:plasma` needs
 /// no address and no `--cert-dir`.
-#[cfg(all(feature = "embedded", feature = "quic"))]
+#[cfg(all(test, feature = "embedded", feature = "quic"))]
 fn resolve_peer(name: &str, certs: &Certs) -> Result<(String, Certs), String> {
-    // Settled BEFORE the browse: a name that can name no certificate directory is refused
-    // without making the operator wait out a discovery window first.
+    let certs = peer_certs(name, certs)?;
+    let addr = discover_peer(name)?;
+    Ok((format!("quic://{addr}"), certs))
+}
+
+/// The certificates a `peer:<name>` mount dials with, settled WITHOUT the network: a name
+/// that can name no certificate directory, or one this machine holds no pinned certificate
+/// for, is refused before any browse, so the operator does not wait out a discovery window
+/// first, and a daemon does not mistake an unenrolled peer for an absent one (ledger #3847).
+#[cfg(all(feature = "embedded", feature = "quic"))]
+fn peer_certs(name: &str, certs: &Certs) -> Result<Certs, String> {
     let conventional = (certs.cert_dir.is_none() && certs.server_cert.is_none())
         .then(|| peer_cert_dir(name))
         .transpose()?;
+    let mut certs = certs.clone();
+    if let Some(dir) = conventional {
+        if !dir.join("server.crt").exists() {
+            return Err(format!(
+                "peer:{name}: this machine holds no pinned certificate for it \
+                 ({}/server.crt). Discovery supplies an address, never trust — enroll the \
+                 peer first (on {name}: `ikigai cert add-client <this host>`, then copy its \
+                 server.crt here), or pass --cert-dir.",
+                dir.display()
+            ));
+        }
+        certs.cert_dir = Some(dir.display().to_string());
+    }
+    Ok(certs)
+}
+
+/// Where `peer:<name>` is announcing from, by browsing this network for it.
+#[cfg(all(feature = "embedded", feature = "quic"))]
+fn discover_peer(name: &str) -> Result<std::net::SocketAddr, String> {
     let browser = ikigai_discovery::Browser::start()
         .map_err(|e| format!("peer:{name}: could not browse this network: {e}"))?;
     std::thread::sleep(PEER_DISCOVERY_WAIT);
@@ -3577,24 +3744,24 @@ fn resolve_peer(name: &str, certs: &Certs) -> Result<(String, Certs), String> {
              (`source urn:peer:list` shows who is). The peer must serve with `--announce`."
         )
     })?;
-    let addr = peer
-        .socket_addr()
-        .ok_or_else(|| format!("peer:{name}: announced no usable address"))?;
+    peer.socket_addr()
+        .ok_or_else(|| format!("peer:{name}: announced no usable address"))
+}
 
-    let mut certs = certs.clone();
-    if let Some(dir) = conventional {
-        if !dir.join("server.crt").exists() {
-            return Err(format!(
-                "peer:{name}: found it at {addr}, but this machine holds no pinned \
-                 certificate for it ({}/server.crt). Discovery supplies an address, never \
-                 trust — enroll the peer first (on {name}: `ikigai cert add-client <this \
-                 host>`, then copy its server.crt here), or pass --cert-dir.",
-                dir.display()
-            ));
-        }
-        certs.cert_dir = Some(dir.display().to_string());
-    }
-    Ok((format!("quic://{addr}"), certs))
+/// Dial `peer:<name>`: its certificates are settled and READ first, which needs no peer, so a
+/// misconfiguration is fatal; only then is the network browsed, and a peer nobody announces
+/// is unreachable ([`DialError`]).
+#[cfg(all(feature = "embedded", feature = "quic"))]
+fn connect_mount_peer(
+    name: &str,
+    certs: &Certs,
+    flag: &'static str,
+) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, DialError> {
+    let certs = peer_certs(name, certs)?;
+    let identity = quic::client_identity(&certs)?;
+    let trusted = quic::trusted_server_cert(&certs)?;
+    let addr = discover_peer(name).map_err(DialError::unreachable)?;
+    dial_mount_quic(addr, &format!("quic://{addr}"), &identity, &trusted, flag)
 }
 
 /// The conventional per-peer certificate directory: `<config home>/quic-<name>/`.
@@ -3623,10 +3790,12 @@ fn peer_cert_dir(name: &str) -> Result<std::path::PathBuf, String> {
 
 /// Without the `quic` feature there is nothing to dial a discovered peer with.
 #[cfg(all(feature = "embedded", not(feature = "quic")))]
-fn resolve_peer(name: &str, _certs: &Certs) -> Result<(String, Certs), String> {
-    Err(format!(
-        "peer:{name}: mounting a discovered peer needs the `quic` feature"
-    ))
+fn connect_mount_peer(
+    name: &str,
+    _certs: &Certs,
+    _flag: &'static str,
+) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, DialError> {
+    Err(format!("peer:{name}: mounting a discovered peer needs the `quic` feature").into())
 }
 
 /// The deadline a mounted peer's SELF-DESCRIPTION runs under: `describe.timeout`
@@ -3762,19 +3931,50 @@ fn connect_mount_quic(
     target: &str,
     certs: &Certs,
     flag: &'static str,
-) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
-    let addr = quic::parse_addr(target)?;
+) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, DialError> {
+    // Read the certificates before resolving the host: neither needs the peer, and a host
+    // name that does not resolve may be a peer that is away (a `.local` name is answered by
+    // the peer itself), while a certificate that cannot be read is a mistake.
+    let well_formed = quic::addr_is_well_formed(target);
+    if !well_formed {
+        quic::parse_addr(target)?;
+    }
     let identity = quic::client_identity(certs)?;
     let trusted = quic::trusted_server_cert(certs)?;
-    let mut resolver = ikigai_quic::connect_with(addr, &identity, &trusted, quic_idle_timeout())
-        .map_err(|e| format!("{flag}: connect {target}: {e}"))?
+    let addr = quic::parse_addr(target).map_err(|e| DialError {
+        message: format!("{flag}: connect {target}: {e}"),
+        unreachable: well_formed,
+    })?;
+    dial_mount_quic(addr, target, &identity, &trusted, flag)
+}
+
+/// The network half of [`connect_mount_quic`]: the dial and the door's admission check.
+/// A dial that times out (or is refused) is unreachable; a TLS failure against the pinned
+/// certificate, a wire-version mismatch and a refused admission are a live peer's answer,
+/// and are not ([`DialError`]).
+#[cfg(all(feature = "embedded", feature = "quic"))]
+fn dial_mount_quic(
+    addr: std::net::SocketAddr,
+    target: &str,
+    identity: &ikigai_quic::Identity,
+    trusted: &str,
+    flag: &'static str,
+) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, DialError> {
+    let mut resolver = ikigai_quic::connect_with(addr, identity, trusted, quic_idle_timeout())
+        .map_err(|e| DialError::from_io(format!("{flag}: connect {target}: {e}"), e.kind()))?
         .with_describe_timeout(describe_timeout(ikigai_quic::DEFAULT_DESCRIBE_TIMEOUT));
     if let Some(bound) = call_timeout() {
         resolver = resolver.with_call_timeout(bound);
     }
-    resolver
-        .check_admission()
-        .map_err(|e| format!("{flag}: {e}"))?;
+    resolver.check_admission().map_err(|e| DialError {
+        // The peer answered the dial; it is unreachable only if it went away before the
+        // admission check did. `Denied` (not admitted) and every other answer are fatal.
+        unreachable: matches!(
+            e,
+            ikigai_core::Error::Unavailable(_) | ikigai_core::Error::Timeout(_)
+        ),
+        message: format!("{flag}: {e}"),
+    })?;
     Ok(std::sync::Arc::new(resolver))
 }
 
@@ -3783,10 +3983,8 @@ fn connect_mount_quic(
     _target: &str,
     _certs: &Certs,
     flag: &'static str,
-) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
-    Err(format!(
-        "{flag} of a quic:// target needs the `quic` feature"
-    ))
+) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, DialError> {
+    Err(format!("{flag} of a quic:// target needs the `quic` feature").into())
 }
 
 #[cfg(all(feature = "embedded", feature = "ipc", unix))]
@@ -3794,7 +3992,7 @@ fn connect_mount_ipc(
     socket: &str,
     alias_hello: bool,
     flag: &'static str,
-) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
+) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, DialError> {
     // The hello declares how this mount will address the peer, so a
     // prefix-canonical peer (ikigai-python) lists its entries in the form the
     // mount expects — a first-segment alias mount strips and re-prefixes, the
@@ -3805,13 +4003,16 @@ fn connect_mount_ipc(
         ikigai_ipc::HelloMode::Verbatim
     };
     let expected = ikigai_embedded::socket::expected_server()?;
+    // Nothing listening (absent, refused, hung up before the hello) is unreachable; a server
+    // under another user (`PermissionDenied`) or a wire version neither side speaks
+    // (`InvalidData`) is a live answer, and fatal ([`DialError::from_io`]).
     let mut resolver = ikigai_ipc::connect_expecting(
         std::path::Path::new(socket),
         Some(ikigai_ipc::DEFAULT_TIMEOUT),
         mode,
         expected,
     )
-    .map_err(|e| format!("{flag}: connect {socket}: {e}"))?
+    .map_err(|e| DialError::from_io(format!("{flag}: connect {socket}: {e}"), e.kind()))?
     .with_describe_timeout(describe_timeout(ikigai_ipc::DEFAULT_DESCRIBE_TIMEOUT));
     if let Some(bound) = call_timeout() {
         resolver = resolver.with_call_timeout(bound);
@@ -3826,10 +4027,8 @@ fn connect_mount_ipc(
     _socket: &str,
     _alias_hello: bool,
     flag: &'static str,
-) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, String> {
-    Err(format!(
-        "{flag} of a Unix socket needs the `ipc` feature on a Unix platform"
-    ))
+) -> Result<std::sync::Arc<dyn ikigai_resolve::Resolver>, DialError> {
+    Err(format!("{flag} of a Unix socket needs the `ipc` feature on a Unix platform").into())
 }
 
 /// Drive the engine: one-shot `-c`, else the full-screen TUI on a terminal, else
@@ -7016,6 +7215,188 @@ mod mount_cert_tests {
         assert!(first.pending && !second.pending);
         let spec = resolve_one_mount(first.clone()).expect("a pending mount does not dial");
         assert!(spec.resolver.transport().contains("not connected"));
+    }
+
+    /// The daemon's mount (ledger #3847): an `--override` whose peer is absent at start is
+    /// kept with one warning naming the target, a call through it fails as Unavailable naming
+    /// the flag, and once the peer binds the SAME spec reaches it, with no restart.
+    #[cfg(all(feature = "ipc", unix))]
+    #[test]
+    fn a_daemon_override_absent_at_start_is_dialed_again_on_use() {
+        use ikigai_core::{EndpointSpace, Exact, FnEndpoint, Kernel, ReprType, Representation};
+        let path = private_socket_dir("daemon-later").join("d.sock");
+        let _ = std::fs::remove_file(&path);
+        let target = path.display().to_string();
+        let (mut specs, warning) = resolve_daemon_mount(Mount {
+            prefix: "urn:test:".to_string(),
+            target: target.clone(),
+            certs: Certs::default(),
+            kind: MountKind::Override,
+            pending: false,
+        })
+        .expect("an absent peer does not stop the daemon");
+        let warning = warning.expect("an absent peer is said once");
+        assert!(
+            warning.contains("--override urn:test:") && warning.contains(&target),
+            "{warning}"
+        );
+        assert_eq!(specs.len(), 1);
+        let spec = specs.remove(0);
+        let request = || {
+            ikigai_core::Request::new(
+                ikigai_core::Verb::Source,
+                ikigai_core::Iri::parse("urn:test:hello").expect("static IRI"),
+            )
+        };
+        let err = spec
+            .resolver
+            .issue(request())
+            .expect_err("nothing listens yet");
+        assert!(matches!(err, ikigai_core::Error::Unavailable(_)), "{err}");
+        assert!(err.to_string().contains("--override: connect"), "{err}");
+
+        let hello = FnEndpoint::new("hello", |_inv| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                b"Hello, Ada".to_vec(),
+            ))
+        });
+        let kernel = Kernel::new(std::sync::Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:test:hello"), hello),
+        ));
+        let served = path.clone();
+        std::thread::spawn(move || {
+            let _ = ikigai_ipc::serve(kernel, &served);
+        });
+        for _ in 0..250 {
+            if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let (answer, _) = spec
+            .resolver
+            .issue(request())
+            .expect("the same mount reaches the peer once it answers");
+        assert_eq!(answer.bytes, b"Hello, Ada");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Round 2 of ledger #3847: a peer that ANSWERS and refuses this client is not an absent
+    /// peer. A live QUIC door whose minter admits nobody stops the daemon's mount, as on main,
+    /// instead of becoming a pending one that retries a refusal on every call.
+    #[cfg(all(feature = "quic", unix))]
+    #[test]
+    fn a_daemon_override_refused_by_a_live_door_stays_fatal() {
+        use ikigai_core::{builtins, EndpointSpace, Exact, Kernel};
+        let server = ikigai_quic::generate();
+        let client = ikigai_quic::generate();
+        let dir = private_socket_dir("daemon-refused");
+        std::fs::write(dir.join("client.crt"), &client.cert_pem).unwrap();
+        std::fs::write(dir.join("client.key"), &client.key_pem).unwrap();
+        std::fs::write(dir.join("server.crt"), &server.cert_pem).unwrap();
+        let socket = ikigai_quic::bind("127.0.0.1:0".parse().unwrap()).expect("a UDP socket");
+        let addr = socket.local_addr().unwrap();
+        let kernel = std::sync::Arc::new(Kernel::new(std::sync::Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),
+        )));
+        let trusted = vec![client.cert_pem.clone()];
+        let refuse_all: ikigai_quic::Minter = std::sync::Arc::new(|_| None);
+        std::thread::spawn(move || {
+            let _ = ikigai_quic::serve_shared_on(
+                kernel,
+                socket,
+                &server,
+                &trusted,
+                refuse_all,
+                ikigai_quic::DEFAULT_IDLE_TIMEOUT,
+                None,
+            );
+        });
+        let target = format!("quic://{addr}");
+        let err = match resolve_daemon_mount(Mount {
+            prefix: "urn:test:".to_string(),
+            target: target.clone(),
+            certs: Certs {
+                cert_dir: Some(dir.display().to_string()),
+                ..Certs::default()
+            },
+            kind: MountKind::Override,
+            pending: false,
+        }) {
+            Ok((_, warning)) => panic!("a refusal must not start the daemon: {warning:?}"),
+            Err(e) => e,
+        };
+        assert!(err.contains("not admitted"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Which dial failures mean "nothing answered" ([`DialError::from_io`]): an absent or
+    /// refusing socket, a hang-up before the hello, a timed-out dial. A server under another
+    /// user and a wire version neither side speaks are live answers.
+    #[test]
+    fn only_a_peer_that_does_not_answer_is_unreachable() {
+        use std::io::ErrorKind;
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::TimedOut,
+        ] {
+            assert!(
+                DialError::from_io(String::new(), kind).unreachable,
+                "{kind:?}"
+            );
+        }
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidData,
+            ErrorKind::InvalidInput,
+            ErrorKind::Other,
+        ] {
+            assert!(
+                !DialError::from_io(String::new(), kind).unreachable,
+                "{kind:?}"
+            );
+        }
+        assert!(!DialError::from("a typo".to_string()).unreachable);
+    }
+
+    /// A daemon mount whose peer IS up connects at start, as before, and says nothing.
+    #[cfg(all(feature = "ipc", unix))]
+    #[test]
+    fn a_daemon_override_with_its_peer_up_connects_at_start() {
+        use ikigai_core::{builtins, EndpointSpace, Exact, Kernel};
+        let path = private_socket_dir("daemon-up").join("u.sock");
+        let _ = std::fs::remove_file(&path);
+        let kernel = Kernel::new(std::sync::Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),
+        ));
+        let served = path.clone();
+        std::thread::spawn(move || {
+            let _ = ikigai_ipc::serve(kernel, &served);
+        });
+        for _ in 0..250 {
+            if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let (specs, warning) = resolve_daemon_mount(Mount {
+            prefix: "urn:test:".to_string(),
+            target: path.display().to_string(),
+            certs: Certs::default(),
+            kind: MountKind::Override,
+            pending: false,
+        })
+        .expect("a live peer connects");
+        assert!(warning.is_none(), "{warning:?}");
+        assert!(
+            !specs[0].resolver.transport().contains("not connected"),
+            "{}",
+            specs[0].resolver.transport()
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A `--pending` with no mount to apply to, or after a `--prefer`, is a typo, said by name.

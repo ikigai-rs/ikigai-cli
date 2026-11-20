@@ -552,7 +552,17 @@ stops the start. On `ikigai serve`, `--pending` after one of them (`ikigai serve
 urn:x:=/tmp/x.sock --pending`) defers that mount's dial to first use instead: the host starts
 without the peer, a read answers `Unavailable` until the peer does, and no restart is needed.
 The startup banner's line for such a mount says `[pending: …]`. A `list` that found the peer
-absent does not look again for 30 seconds. A served host's mount flags go after the word
+absent does not look again for 30 seconds. `ikigai --daemon` needs no flag for this (ledger
+#3847): it still dials each `--mount` and `--override` (flag or `mount` line) at start, and one
+that does not answer (the dial times out, or no socket is listening) is kept rather than fatal.
+The daemon prints one warning line naming the target and starts; calls through that mount fail
+until the peer answers, and each one dials it again, so a peer that comes back is used with no
+restart. Only an unreachable peer is tolerated: a `quic://` address that does not parse, a
+certificate that cannot be read (`--cert-dir` naming the wrong directory), a `peer:<name>` this
+machine holds no certificate for, a transport the build lacks, and a peer that answers and
+refuses this client (not admitted, a certificate that does not match the pin, another wire
+version) still stop the daemon with exit 2, as before. The one-shot `-c`, the REPL and `mcp`
+still refuse to start on an unreachable peer too. A served host's mount flags go after the word
 `serve`; `ikigai --mount … serve <s>` is refused as an unknown argument.
 
 An alias mount at a whole first segment (`--mount urn:quakes:=…`) strips it: the peer
