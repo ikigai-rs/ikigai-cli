@@ -763,8 +763,8 @@ that shows a confirm page and a POST that only drops a tuple into `urn:space:con
 | link | minted by (edge daemon) | the click drops | the apply reactor |
 |---|---|---|---|
 | `/contact-block?email=…&id=…` | `urn:contactblock:link email= enquiry=` | `((block-email …) (enquiry …) (exp …))` | writes the block, trains `spam` |
-| `/contact-label?id=…&label=ham` | `urn:contactlabel:link label=ham enquiry=` | `((label "ham") (enquiry …) (exp …))` | trains `ham` |
-| `/contact-label?id=…&label=spam` | `urn:contactlabel:link label=spam enquiry=` | `((label "spam") (enquiry …) (exp …))` | trains `spam` |
+| `/contact-label?id=…&label=ham&class=…` | `urn:contactlabel:link label=ham class= enquiry=` | `((label "ham") (enquiry …) (exp …) (class …))` | trains `ham` |
+| `/contact-label?id=…&label=spam&class=…` | `urn:contactlabel:link label=spam class= enquiry=` | `((label "spam") (enquiry …) (exp …) (class …))` | trains `spam` |
 
 - **A link names its enquiry, never carries it.** `id` is the enquiry tuple's id in the contact
   space (its content address, `ikigai_intray::tuple_id`); the minter is handed the tuple exactly as
@@ -778,6 +778,12 @@ that shows a confirm page and a POST that only drops a tuple into `urn:space:con
   spam" link edited to say `spam` is refused; every bad link answers the same "That link didn't
   work" page. A block link minted before this change (it signed the bare `<email>|<exp>`) still
   blocks for its week, and trains nothing.
+- **A label link carries the filter's class, signed.** `class` (optional; one of `spam`, `unsure`,
+  `ham`, `unscored`) is the class the filter gave the enquiry when it was emailed. The label link
+  signs `contact-label|<label>|<enquiry>|<class>|<exp>` (the class empty when not given), so a link
+  cannot be re-pointed at another class, and the click's drop carries it as `class`. A label link
+  minted before this signed `contact-label|<label>|<enquiry>|<exp>`: it still records for its week,
+  with no class.
 - **The public door gains nothing that touches the model.** `urn:contact-label` verifies a link
   and drops a tuple, under the same ceiling as `urn:contact-block` (`urn:cap:space:out`).
   Training is the apply reactor's, under its own authority file.
