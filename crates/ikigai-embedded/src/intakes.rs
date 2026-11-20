@@ -131,12 +131,20 @@ fn configs() -> Result<&'static [IntakeConfig], String> {
     CONFIGS.get_or_init(read).as_deref().map_err(Clone::clone)
 }
 
-/// The configured rows' block keys, by row id, for `inquiry.json`'s one-key check.
+/// Every configured intake's block key, named for an error sentence (`intake row `<id>``,
+/// then the booking intake's), for `inquiry.json`'s one-key check.
 pub(crate) fn block_keys() -> Result<Vec<(String, ikigai_intake::BlockKey)>, String> {
-    Ok(configs()?
+    let mut keys: Vec<_> = configs()?
         .iter()
-        .filter_map(|c| Some((c.id.clone(), c.block_key.clone()?)))
-        .collect())
+        .filter_map(|c| Some((format!("intake row `{}`", c.id), c.block_key.clone()?)))
+        .collect();
+    if let Some(block) = crate::booking::configured()? {
+        keys.push((
+            format!("the booking intake (`{}`)", crate::booking::FILE),
+            block.key.clone(),
+        ));
+    }
+    Ok(keys)
 }
 
 pub(crate) fn check() -> Result<(), String> {

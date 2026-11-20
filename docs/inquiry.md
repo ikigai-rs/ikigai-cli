@@ -71,8 +71,9 @@ needs them.
 
 An intake asks its `blocklist` with keyed BLAKE3 hashes under its `block_key_file`; the edge
 half writes blocks under `sender_key_file`. They must be the same key. Name the same file in
-both. When any intake row names a `block_key_file` that hashes a sender differently from
-`sender_key_file`, the start is refused, naming the row. Point the intake at the edge half's
+both. When any intake row, or the booking intake's `booking.json`, names a `block_key_file`
+that hashes a sender differently from `sender_key_file`, the start is refused, naming the row
+or the booking intake. Point the intake at the edge half's
 block set with:
 
 ```json
@@ -110,7 +111,7 @@ problem when:
   or `owner`;
 - `sender_key_file` or `store` is relative;
 - the key file is missing, unreadable, open to its group or others, or not a key;
-- the key file and an intake row's `block_key_file` hold different keys;
+- the key file and an intake row's or `booking.json`'s `block_key_file` hold different keys;
 - the owner, a layer name or the model name is not one the edge accepts;
 - `block_days` is outside 1 to 3650;
 - the store cannot be created, or its block set document is damaged.

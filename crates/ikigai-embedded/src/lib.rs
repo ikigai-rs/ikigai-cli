@@ -56,6 +56,7 @@ pub mod socket;
 // with a state directory and named models. One writer per state directory, so one open per
 // process; see the module note.
 pub mod bayes;
+mod booking;
 // The contact-inquiry edge half (`urn:iki:inquiry:*`, ledger #3836): bound when the config home
 // has an `inquiry.json`; the local root binds all of it, the served kernel the block set and apply.
 mod browse;
@@ -7020,9 +7021,13 @@ impl Endpoint for ClientIssue {
     }
 }
 
-/// The booking intake, validated before serving.
+/// The booking intake, validated before serving, asking the keyed block set when the config
+/// home's `booking.json` names one.
 fn booking_submit() -> ikigai_intake::IntakeEndpoint {
-    ikigai_intake::try_submit(booking_intake()).unwrap_or_else(|e| panic!("{e}"))
+    // The CLI checks before constructing a kernel; library constructors have no Result
+    // channel and follow the host's fail-fast convention, as `intakes::bind` does.
+    let block = booking::configured().unwrap_or_else(|e| panic!("{e}"));
+    ikigai_intake::try_submit(booking_intake_with(block)).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// The public contact form's accepted fields. Each `summary` is human-facing on purpose:
@@ -7058,8 +7063,15 @@ fn contact_intake() -> ikigai_intake::IntakeConfig {
 
 /// The public booking request's accepted fields. The visitor offers THEIR hours and zone;
 /// the handler finds a mutually free slot. The host's freebusy never leaves the machine —
-/// a visitor never sees a calendar, they only propose availability.
+/// a visitor never sees a calendar, they only propose availability. Without a block set, as
+/// a host with no `booking.json` serves it.
+#[cfg(test)]
 fn booking_intake() -> ikigai_intake::IntakeConfig {
+    booking_intake_with(None)
+}
+
+/// [`booking_intake`], asking `block`'s keyed block set instead of `urn:decisions` when given.
+fn booking_intake_with(block: Option<&booking::Block>) -> ikigai_intake::IntakeConfig {
     use ikigai_intake::IntakeField as F;
     ikigai_intake::IntakeConfig {
         id: "booking".to_string(),
@@ -7137,11 +7149,12 @@ fn booking_intake() -> ikigai_intake::IntakeConfig {
         // (there is no slot to show yet). Left un-redirected deliberately.
         redirect: None,
         // Reject a blocked scheduler at the edge, before the request drains to bug (bug's
-        // booking-handler `blocked?` stays as backstop).
+        // booking-handler `blocked?` stays as backstop). A configured `blocklist` overrides
+        // the legacy `urn:decisions` check; without `booking.json` that check is the one asked.
         check_blocked: true,
         fixed_fields: Default::default(),
-        blocklist: None,
-        block_key: None,
+        blocklist: block.map(|block| block.blocklist.clone()),
+        block_key: block.map(|block| block.key.clone()),
     }
 }
 

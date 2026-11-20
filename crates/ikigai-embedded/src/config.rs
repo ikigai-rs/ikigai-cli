@@ -314,6 +314,7 @@ fn is_host_family(key: &str, instance: &str) -> bool {
 pub fn check() -> Result<(), String> {
     check_keys()?;
     crate::intakes::check()?;
+    crate::booking::check()?;
     // After the intakes: `inquiry.json`'s key file must agree with theirs.
     crate::inquiry::check()?;
     // The retry policy's values are read here too, so an unusable one stops the host
