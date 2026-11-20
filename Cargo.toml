@@ -1826,7 +1826,7 @@ ikigai-repo = "0.6.0" # 0.6.0 = the exec split (ledger #3818): the git facades d
 # Repository browsing (urn:repo:{root}:tree/file/state/hash/explain +
 # urn:iki:annotation:*) over configured roots — opt-in via `browse.root` config lines
 # (embedded host).
-ikigai-browse = "0.22.0" # 0.22.0 = annotations_through takes store 0.5 SharedWriter; ^0.22.0 stays below 0.23.0. Previously: 0.21.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.21.0"` is `<0.22.0`. Beneath it: 0.20.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.20.0"` is `<0.21.0`. Beneath it: 0.19.0 = the review pass and the judge loop stop at the first `Refused` or `RetryAfter`,
+ikigai-browse = "0.23.1" # 0.23.1 = git-ignored paths skipped when hashing (ledger #3839); 0.23.0 = PR panels need urn:cap:exec:read:gh (exec split, ledger #3819). `"0.23.1"` is `<0.24.0`. Previously: 0.22.0 = annotations_through takes store 0.5 SharedWriter; ^0.22.0 stays below 0.23.0. Previously: 0.21.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.21.0"` is `<0.22.0`. Beneath it: 0.20.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.20.0"` is `<0.21.0`. Beneath it: 0.19.0 = the review pass and the judge loop stop at the first `Refused` or `RetryAfter`,
 # as they already stopped at a `Denied`, and return that error with its class kept (ledger #1932). This host mounts
 # browse's review family over its `browse.root`s, so a model call refused (an llm 0.16 backend 401) or rate-limited
 # (a 429, or the throttle's budget) now answers ONE typed error carrying its delay, instead of being collapsed region
