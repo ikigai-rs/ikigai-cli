@@ -4,8 +4,10 @@ Put a JSON array in `<config home>/intakes.json`. The host reads it once at star
 both the local kernel and the general served kernel. Each row binds
 `urn:intake:id:<id>:submit`; `urn:contact:submit` is an alias of the **first** row. The file
 replaces the built-in contact intake. Without the file, the existing contact fields,
-space, redirect, client attribution and blocklist remain in use. The booking intake is
-unchanged. Restart the host after editing this file.
+space, redirect, client attribution and blocklist remain in use. The booking intake's
+fields are not configured here; its block set is set in `booking.json` (see
+[The booking intake's blocklist](#the-booking-intakes-blocklist)). Restart the host after
+editing this file.
 
 For example, two sites can write into the same owner's contact space with distinct trusted
 site values:
@@ -75,6 +77,35 @@ either member exists, the submission is silently discarded with the same answer 
 submission. Any other answer admits it: `NotFound` (an expired block, or none), or an
 unreachable or refused block set. The submitting ceiling must permit the lookup. A block set
 entry for an address is the same keyed hash, so whoever adds entries needs the same key.
+
+### The booking intake's blocklist
+
+The booking intake (`urn:booking:submit`) keeps its built-in fields. By default it checks a
+sender by asking `urn:decisions` whether the address is `blocked`, which reads the plaintext
+`block` lines in the decisions log. To have it ask the keyed block set instead, put a JSON
+object in `<config home>/booking.json`:
+
+```json
+{
+  "blocklist": "urn:iki:inquiry:block:key:{key}",
+  "block_key_file": "/etc/ikigai/block.key"
+}
+```
+
+Both keys are required and have the same meaning as in an intake row. The check is the same
+as the contact intake's, described above: the same two keyed hashes, `Exists` on the
+template, a blocked booking discarded with the same answer as a real one, and any other answer
+admitting it. With `booking.json` in place, the booking intake no longer asks
+`urn:decisions`. The submitting ceiling must permit the lookup (`urn:cap:inquiry:block:check`
+for the edge half's block set). Without the file, the legacy `urn:decisions` check is
+unchanged.
+
+When `inquiry.json` is also configured, `booking.json`'s `block_key_file` must hold the same
+key as its `sender_key_file`, as an intake row's must. The host reads `booking.json` once at
+startup: restart it after editing the file. A file that is not a JSON object with exactly these
+two keys, a `blocklist` that is not an IRI template with one `{key}`, or a `block_key_file`
+that is relative, unreadable, reachable by others or not a key refuses startup, naming
+`booking.json`.
 
 Each field requires `name`. Optional field keys are `required` (false), `summary` (the
 name), `one_of` (an empty list), `iana_zone` (false), and `max_len` (the intake's

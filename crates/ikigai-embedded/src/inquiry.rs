@@ -7,8 +7,8 @@
 //! naming the file and the problem.
 //!
 //! **One key, both sides.** The edge half hashes senders under `sender_key_file`; a configured
-//! intake asks its `blocklist` under its `block_key_file`. When any intake row names a
-//! `block_key_file`, it must give the same keyed hashes as `sender_key_file`, or the start is
+//! intake asks its `blocklist` under its `block_key_file`. When any intake row, or the booking
+//! intake's `booking.json`, names a `block_key_file`, it must give the same keyed hashes as `sender_key_file`, or the start is
 //! refused: a block written here would otherwise never be found there.
 //!
 //! **Where it is bound.** The local root binds the whole edge half. The served kernel binds
@@ -87,14 +87,14 @@ fn absolute<'a>(key: &str, path: &'a Path) -> Result<&'a Path, String> {
 }
 
 /// Open the edge from `inquiry.json`'s text. `block_keys` are the configured intakes' block
-/// keys, by row id, each checked against the sender-key file.
+/// keys, each named as an error sentence names it, each checked against the sender-key file.
 fn open(text: &str, block_keys: &[(String, ikigai_intake::BlockKey)]) -> Result<Opened, String> {
     let file: File = serde_json::from_str(text).map_err(|e| format!("cannot be read: {e}"))?;
     let keys = SenderKeys::from_file(absolute("sender_key_file", &file.sender_key_file)?)?;
-    for (id, block_key) in block_keys {
+    for (intake, block_key) in block_keys {
         if !same_key(&keys, block_key) {
             return Err(format!(
-                "`sender_key_file` and intake row `{id}`'s `block_key_file` hold different \
+                "`sender_key_file` and {intake}'s `block_key_file` hold different \
                  keys: a block written by the edge would never be found by the intake. Name \
                  one key file in both"
             ));
@@ -547,11 +547,27 @@ mod tests {
     }
 
     #[test]
+    fn a_booking_key_file_unlike_the_sender_key_refuses_the_start() {
+        let dir = TempDir::new();
+        let key = dir.key("sender.key", KEY);
+        let same = ikigai_intake::BlockKey::from_hex(KEY).unwrap();
+        let other = ikigai_intake::BlockKey::from_hex(&"ab".repeat(32)).unwrap();
+        let booking = "the booking intake (`booking.json`)".to_string();
+        assert!(open(&dir.config(&key), &[(booking.clone(), same)]).is_ok());
+        let error = open(&dir.config(&key), &[(booking, other)]).unwrap_err();
+        assert!(
+            error.contains("the booking intake (`booking.json`)'s"),
+            "{error}"
+        );
+        assert!(error.contains("different keys"), "{error}");
+    }
+
+    #[test]
     fn different_key_files_refuse_the_start() {
         let dir = TempDir::new();
         let key = dir.key("sender.key", KEY);
         let other = ikigai_intake::BlockKey::from_hex(&"ab".repeat(32)).unwrap();
-        let error = open(&dir.config(&key), &[("studio".into(), other)]).unwrap_err();
+        let error = open(&dir.config(&key), &[("intake row `studio`".into(), other)]).unwrap_err();
         assert!(error.contains("intake row `studio`"), "{error}");
         assert!(error.contains("different keys"), "{error}");
     }
