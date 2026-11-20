@@ -1257,7 +1257,7 @@ fn a_widened_layer_door_still_binds_no_link_and_no_passkey_endpoint() {
     );
     let label_link = format!(
         "label=ham&id={enquiry}&exp={exp}&t={}",
-        signed(&block, &format!("contact-label|ham|{enquiry}|{exp}"))
+        signed(&block, &format!("contact-label|ham|{enquiry}||{exp}"))
     );
     let unbound = "no endpoint resolved";
     let show =
