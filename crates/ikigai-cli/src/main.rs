@@ -166,7 +166,10 @@ usage:
                                 resolves here (a name resolves under the request's capability;
                                 the file is never served; an edit rebinds). Without it the door
                                 serves no names, and the config home's `names` is not read]
-  ikigai --daemon              headless: timers, the watcher, and the standing sync — for launchd
+  ikigai --daemon              headless: timers, the watcher, and the standing sync — for launchd.
+                               A --mount/--override that does not answer at start is a warning
+                               line, not a stop: calls through it fail and dial it again until
+                               it answers (-c, the REPL and mcp still refuse to start)
   ikigai --name <instance>     name this instance (scopes <name>.* config properties; defaults
                                repl / daemon / serve by mode)
   ikigai --grants <file>       read grants and socket accounts from <file> (all local hosts);
@@ -659,7 +662,8 @@ struct Mount {
     kind: MountKind,
     /// `--pending` on a served `--mount`/`--override` (ledger #3169): dial on first use, as
     /// `--prefer` always does, so the host may start before its peer. Off, the mount dials
-    /// while the process starts and a peer that does not answer stops the start.
+    /// while the process starts and a peer that does not answer stops the start, except under
+    /// `--daemon`, which keeps it with a warning ([`resolve_daemon_mount`], ledger #3847).
     pending: bool,
 }
 
@@ -2524,13 +2528,17 @@ fn daemon(mounts: Mounts) {
     } else {
         let mut resolved = Vec::new();
         for mount in mounts {
-            // Each mount connects with ITS OWN certificates.
-            match resolve_mount(mount) {
-                Ok(specs) => resolved.extend(specs),
-                // A mount that will not connect is fatal here: the daemon's whole reason to
-                // hold a mount is the drain, and a silent no-op is the failure mode this is
-                // fixing. Say so and exit rather than park looking healthy. (A --prefer
-                // mount never lands here — it connects on demand, by design.)
+            // Each mount connects with ITS OWN certificates. A target that does not answer
+            // at start no longer stops the daemon (ledger #3847): see `resolve_daemon_mount`.
+            match resolve_daemon_mount(mount) {
+                Ok((specs, warning)) => {
+                    if let Some(warning) = warning {
+                        eprintln!("ikigai: {warning}");
+                    }
+                    resolved.extend(specs);
+                }
+                // What is left is a mount that cannot mean anything (a malformed prefix list),
+                // which no wait will fix.
                 Err(e) => {
                     eprintln!("ikigai: {e}");
                     std::process::exit(2);
@@ -3275,7 +3283,8 @@ fn home_dir() -> std::path::PathBuf {
 /// across machines), else a Unix socket path (a same-machine peer).
 ///
 /// `--mount` and `--override` connect NOW: you named that peer because you want
-/// its namespace, and a silent no-op is the failure mode worth being loud about.
+/// its namespace, and a silent no-op is the failure mode worth being loud about. (The
+/// daemon goes through [`resolve_daemon_mount`], which keeps one that does not answer.)
 /// `--prefer` connects on demand — its whole contract is that the peer may be
 /// absent, so an absent peer at startup is normal operation, not an error. A served
 /// `--mount` or `--override` that says `--pending` connects on demand too: the operator
@@ -3315,6 +3324,45 @@ fn resolve_mount(mount: Mount) -> Result<Vec<ikigai_embedded::MountSpec>, String
             kind,
         })
         .collect())
+}
+
+/// [`resolve_mount`] for the long-running `--daemon` (ledger #3847): a `--mount` or
+/// `--override` whose target does not answer at start is KEPT, dialing again on each use as a
+/// `--pending` one does, with one warning line (the second value) naming the target.
+///
+/// Why the daemon and not the one-shot: a daemon is restarted by launchd/systemd, so
+/// exiting on an absent peer turned "the peer is down" into a restart loop that also stopped
+/// everything else the daemon does (timers, watchers, the drain of every other prefix). Each
+/// call through the mount still fails, as `Unavailable` naming the flag and the target, while
+/// the peer is away, which is the same thing a connected mount does when its peer goes later;
+/// once the peer answers the next call reaches it, with no restart. The dial is still tried
+/// at start, so a peer that IS up is connected as before and a misconfiguration is said at
+/// once rather than at first use. `-c`, the REPL, `mcp` and `serve` keep failing loudly
+/// (`serve` has `--pending` to opt in).
+#[cfg(feature = "embedded")]
+fn resolve_daemon_mount(
+    mount: Mount,
+) -> Result<(Vec<ikigai_embedded::MountSpec>, Option<String>), String> {
+    if mount.pending || mount.kind == MountKind::Prefer {
+        return resolve_mount(mount).map(|specs| (specs, None));
+    }
+    match resolve_mount(mount.clone()) {
+        Ok(specs) => Ok((specs, None)),
+        Err(e) => {
+            let warning = format!(
+                "{e} — {} {} is not reachable at start; the daemon keeps running, calls \
+                 through it fail until {} answers, and each one dials it again",
+                mount_flag(mount.kind),
+                mount.prefix,
+                mount.target,
+            );
+            let specs = resolve_mount(Mount {
+                pending: true,
+                ..mount
+            })?;
+            Ok((specs, Some(warning)))
+        }
+    }
 }
 
 /// Whether a mount's connection says `HelloMode::Alias` (names arrive prefix-stripped) to
@@ -7016,6 +7064,108 @@ mod mount_cert_tests {
         assert!(first.pending && !second.pending);
         let spec = resolve_one_mount(first.clone()).expect("a pending mount does not dial");
         assert!(spec.resolver.transport().contains("not connected"));
+    }
+
+    /// The daemon's mount (ledger #3847): an `--override` whose peer is absent at start is
+    /// kept with one warning naming the target, a call through it fails as Unavailable naming
+    /// the flag, and once the peer binds the SAME spec reaches it, with no restart.
+    #[cfg(all(feature = "ipc", unix))]
+    #[test]
+    fn a_daemon_override_absent_at_start_is_dialed_again_on_use() {
+        use ikigai_core::{EndpointSpace, Exact, FnEndpoint, Kernel, ReprType, Representation};
+        let path = private_socket_dir("daemon-later").join("d.sock");
+        let _ = std::fs::remove_file(&path);
+        let target = path.display().to_string();
+        let (mut specs, warning) = resolve_daemon_mount(Mount {
+            prefix: "urn:test:".to_string(),
+            target: target.clone(),
+            certs: Certs::default(),
+            kind: MountKind::Override,
+            pending: false,
+        })
+        .expect("an absent peer does not stop the daemon");
+        let warning = warning.expect("an absent peer is said once");
+        assert!(
+            warning.contains("--override urn:test:") && warning.contains(&target),
+            "{warning}"
+        );
+        assert_eq!(specs.len(), 1);
+        let spec = specs.remove(0);
+        let request = || {
+            ikigai_core::Request::new(
+                ikigai_core::Verb::Source,
+                ikigai_core::Iri::parse("urn:test:hello").expect("static IRI"),
+            )
+        };
+        let err = spec
+            .resolver
+            .issue(request())
+            .expect_err("nothing listens yet");
+        assert!(matches!(err, ikigai_core::Error::Unavailable(_)), "{err}");
+        assert!(err.to_string().contains("--override: connect"), "{err}");
+
+        let hello = FnEndpoint::new("hello", |_inv| {
+            Ok(Representation::new(
+                ReprType::new("text/plain"),
+                b"Hello, Ada".to_vec(),
+            ))
+        });
+        let kernel = Kernel::new(std::sync::Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:test:hello"), hello),
+        ));
+        let served = path.clone();
+        std::thread::spawn(move || {
+            let _ = ikigai_ipc::serve(kernel, &served);
+        });
+        for _ in 0..250 {
+            if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let (answer, _) = spec
+            .resolver
+            .issue(request())
+            .expect("the same mount reaches the peer once it answers");
+        assert_eq!(answer.bytes, b"Hello, Ada");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A daemon mount whose peer IS up connects at start, as before, and says nothing.
+    #[cfg(all(feature = "ipc", unix))]
+    #[test]
+    fn a_daemon_override_with_its_peer_up_connects_at_start() {
+        use ikigai_core::{builtins, EndpointSpace, Exact, Kernel};
+        let path = private_socket_dir("daemon-up").join("u.sock");
+        let _ = std::fs::remove_file(&path);
+        let kernel = Kernel::new(std::sync::Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),
+        ));
+        let served = path.clone();
+        std::thread::spawn(move || {
+            let _ = ikigai_ipc::serve(kernel, &served);
+        });
+        for _ in 0..250 {
+            if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let (specs, warning) = resolve_daemon_mount(Mount {
+            prefix: "urn:test:".to_string(),
+            target: path.display().to_string(),
+            certs: Certs::default(),
+            kind: MountKind::Override,
+            pending: false,
+        })
+        .expect("a live peer connects");
+        assert!(warning.is_none(), "{warning:?}");
+        assert!(
+            !specs[0].resolver.transport().contains("not connected"),
+            "{}",
+            specs[0].resolver.transport()
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A `--pending` with no mount to apply to, or after a `--prefer`, is a typo, said by name.
