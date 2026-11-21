@@ -2226,7 +2226,11 @@ age = { version = "0.11.1", default-features = false }
 # this host calls (`Bayes::open`, `ModelConfig::new`, `space`, `model_iri`). It brings no new
 # third-party crate: its dependencies are ikigai-core, serde and serde_json, already here.
 # ⚠ `"0.1.0"` is `<0.2.0`: raise it when the module reaches 0.2.
-ikigai-inquiry = "0.1.1" # The contact-inquiry edge half (ledger #3836): `edge_space`, mounted from the config home's `inquiry.json`.
+# ★ 0.1.2 (ledger #3850, #3851): a BEHAVIOR floor. `inq:sender` is held to the 64-hex keyed hash in the
+# shapes, and the block set is ONE set across processes (re-read on change, written under a lock), so
+# the door, the contact daemon and `import-blocks` agree on it. Every process that opens the set must
+# run 0.1.2 before the edge's path unit retires. `"0.1.2"` is `<0.2.0`.
+ikigai-inquiry = "0.1.2" # The contact-inquiry edge half (ledger #3836): `edge_space`, mounted from the config home's `inquiry.json`.
 ikigai-bayes = "0.4.0" # 0.4.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.4.0"` is `<0.5.0`. Beneath it: 0.2.0 = core 0.2.0 sweep (ledger #2356): the newest release, on ikigai-core 0.2.x. `"0.2.0"` is `<0.3.0`. Beneath it: 0.1.0.
 # The resolver seam, the engine and the intray, from github.com/ikigai-rs/ikigai-engine (ledger
 # #2316, #2317). They were members here through 0.1.69 and left at 0.1.70, whose sources are

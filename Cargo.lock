@@ -3392,9 +3392,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-inquiry"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48d8eee23193d0909c0af62fcd458f9b33ba789b22030e9952711bae8d327a34"
+checksum = "e9508a571030bff7ab36e7f67e652945f3dc9e0aec5aa70c4f2f334578cbd257"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
