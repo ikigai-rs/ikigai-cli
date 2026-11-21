@@ -3482,9 +3482,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-layers"
-version = "0.10.2"
+version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69911a28ecb0ff7a93bd07a3c6e7bdc0e60e61a0e37bae942560e171178125ef"
+checksum = "b3c62080be140b9c3c6a1b42079e3dce4e590241abc287887026aec1ff38107a"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
