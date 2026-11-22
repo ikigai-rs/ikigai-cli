@@ -489,3 +489,92 @@ fn the_shared_breaker_opens_and_recovers_after_its_cooloff() {
     );
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A live hub and a client home under the connect policy, so `--connect` goes through the
+/// policy's cache-less issuer.
+fn a_live_hub_under_the_policy(case: &str) -> (PathBuf, PathBuf, String, Door) {
+    let (home, certs, address) = a_dead_hub(case, CONNECT_POLICY);
+    let back = hub_back_after(&home, &certs, &address, Duration::ZERO);
+    let hub = back.recv_timeout(PATIENCE).expect("the hub serves");
+    (home, certs, address, hub)
+}
+
+/// Under the policy, a call that NAMES an argument is routed by the target's contract, which
+/// the engine reads with Meta as `application/json`. The policy's issuer must render it
+/// (ledger #4037): it once had no Meta renderer, so every named call failed while
+/// argument-free reads still worked.
+#[test]
+fn connect_under_the_policy_routes_a_named_argument() {
+    let (home, certs, address, _hub) = a_live_hub_under_the_policy("cnamed");
+    let out = connect(
+        &home,
+        &certs,
+        &address,
+        "source urn:iki:fn:toUpper in=hello",
+    );
+    let all = text_of(&out);
+    let text = ok(out, "a named argument over --connect under the policy");
+    // Routed by name, `in` holds `hello`. With no contract the word stays positional text
+    // and fails open to `in` whole, so the answer would be `IN=HELLO`.
+    assert_eq!(text.trim(), "HELLO", "the hub answered: {all}");
+    assert!(!all.contains("contract"), "the contract was read: {all}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Two named arguments, neither of them `in`: with no contract both stay text and the call
+/// fails outright instead of answering (ledger #4037).
+#[test]
+fn connect_under_the_policy_routes_two_named_arguments() {
+    let (home, certs, address, _hub) = a_live_hub_under_the_policy("ctwo");
+    let out = connect(
+        &home,
+        &certs,
+        &address,
+        "source urn:tz:convert in=2026-01-01T12:00:00Z to=Asia/Tokyo",
+    );
+    let all = text_of(&out);
+    let text = ok(out, "two named arguments over --connect under the policy");
+    assert!(
+        text.contains("2026-01-01T21:00:00"),
+        "the hub answered: {all}"
+    );
+    assert!(!all.contains("contract"), "the contract was read: {all}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The same through a saved `.iki` script given named parameters, the shape a script runner
+/// takes over `--connect` (ledger #4037).
+#[test]
+fn connect_under_the_policy_runs_a_script_with_named_parameters() {
+    let (home, certs, address, _hub) = a_live_hub_under_the_policy("cscript");
+    let script = home.join("shout.iki");
+    std::fs::write(
+        &script,
+        "# @param word\nsource urn:iki:fn:toUpper in={word}\n",
+    )
+    .expect("the script");
+    let out = spawn(
+        &home,
+        &[
+            "--connect",
+            &address,
+            "--cert-dir",
+            certs.to_str().unwrap(),
+            "--plain",
+            "--script",
+            script.to_str().unwrap(),
+            "word=quiet",
+        ],
+    )
+    .stdin(Stdio::null())
+    .output()
+    .expect("the client runs");
+    let all = text_of(&out);
+    let text = ok(
+        out,
+        "a script with named parameters over --connect under the policy",
+    );
+    assert_eq!(text.trim(), "QUIET", "the hub answered: {all}");
+    assert!(!all.contains("contract"), "the contract was read: {all}");
+    let _ = std::fs::remove_dir_all(&home);
+}
