@@ -103,6 +103,7 @@ fn main() -> Result<(), BoxError> {
     })
 }
 
+#[allow(clippy::disallowed_methods)] // internal: the example's own kernel, which routes no user arguments
 fn demo_kernel() -> Kernel {
     let cal = FnEndpoint::new("cal", |inv: &Invocation<'_>| {
         let body = if inv.capability.allows("urn:cap:demo:detail") {

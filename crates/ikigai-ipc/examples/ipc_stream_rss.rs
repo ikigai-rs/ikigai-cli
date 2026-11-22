@@ -105,6 +105,8 @@ fn main() {
     let path = std::path::PathBuf::from(format!("/tmp/ikr{}", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path).expect("bind");
+    #[allow(clippy::disallowed_methods)]
+    // internal: the example's own kernel, which routes no user arguments
     let kernel = Kernel::new(Arc::new(
         EndpointSpace::new()
             .bind(Exact::new("urn:rss:lazy"), Hundred { lazy: true })

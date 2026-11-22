@@ -214,6 +214,8 @@ mod tests {
                 }),
             );
         }
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(space));
         for (endpoint, body) in [
             (
@@ -275,6 +277,8 @@ mod tests {
                 ))
             }),
         );
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(space));
         for body in ["", "site=forged"] {
             seen.lock().unwrap().clear();
@@ -348,6 +352,8 @@ mod tests {
             }),
         );
         // No destination exists: a write would fail, while a blocked submission is accepted-looking.
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(space));
         let response = block_on(kernel.issue(
             post("urn:intake:id:a:submit", "email=blocked%40example.org"),

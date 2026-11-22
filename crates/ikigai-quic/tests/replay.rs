@@ -46,6 +46,8 @@ fn a_sink_whose_reply_is_lost_runs_once() {
         ))
     })
     .with_description(Description::new("append").verb(Verb::Sink));
+    #[allow(clippy::disallowed_methods)]
+    // internal: a test fixture's kernel; it routes no user arguments
     let kernel = Kernel::new(Arc::new(
         EndpointSpace::new().bind(Exact::new("urn:test:append"), append),
     ));
@@ -108,6 +110,8 @@ fn a_sink_on_an_idled_out_connection_reconnects_and_runs_once() {
         ))
     })
     .with_description(Description::new("append").verb(Verb::Sink));
+    #[allow(clippy::disallowed_methods)]
+    // internal: a test fixture's kernel; it routes no user arguments
     let kernel = Kernel::new(Arc::new(
         EndpointSpace::new().bind(Exact::new("urn:test:append"), append),
     ));

@@ -796,6 +796,7 @@ mod tests {
 
     /// A kernel binding only this endpoint, for the two tests that need to go through the
     /// kernel's capability gate rather than call the renderer.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn posture_kernel() -> ikigai_core::Kernel {
         ikigai_core::Kernel::new(std::sync::Arc::new(
             crate::EndpointSpace::new().bind(crate::Exact::new("urn:host:posture"), host_posture()),

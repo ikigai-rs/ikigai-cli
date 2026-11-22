@@ -152,6 +152,7 @@ mod tests {
         decisions: Arc<Mutex<usize>>,
     }
 
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn edge(block: Option<&Block>, blocked: &[&str]) -> Edge {
         let key = ikigai_intake::BlockKey::from_hex(KEY).unwrap();
         let members: Vec<String> = blocked

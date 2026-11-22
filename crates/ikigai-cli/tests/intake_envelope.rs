@@ -47,6 +47,7 @@ fn intake() -> ikigai_intake::IntakeConfig {
 }
 
 /// The intake at `urn:enquiry:submit` in front of a space that records every tuple dropped.
+#[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
 fn kernel() -> (Arc<Kernel>, Arc<Mutex<Vec<String>>>) {
     let dropped = Arc::new(Mutex::new(Vec::new()));
     let seen = Arc::clone(&dropped);

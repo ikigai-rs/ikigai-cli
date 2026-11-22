@@ -80,6 +80,8 @@ fn exhaust_and_recover() {
         let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
     }
     let path = dir.join("d.sock");
+    #[allow(clippy::disallowed_methods)]
+    // internal: a test fixture's kernel; it routes no user arguments
     let kernel = Kernel::new(Arc::new(
         EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),
     ));

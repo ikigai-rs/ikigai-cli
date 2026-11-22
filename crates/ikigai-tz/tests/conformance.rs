@@ -34,6 +34,8 @@ const NOW: u64 = 1_790_512_496_000;
 #[test]
 fn conforms() {
     let space = Arc::new(ikigai_tz::space());
+    #[allow(clippy::disallowed_methods)]
+    // internal: a test fixture's kernel; it routes no user arguments
     let kernel = Kernel::new(space.clone()).with_clock(Arc::new(FixedClock::at(NOW)));
     let report = Suite::new()
         .fixture(

@@ -728,6 +728,8 @@ fn a_denied_certificate_is_reported_as_a_connection_refusal() {
     std::thread::spawn(move || {
         // Deliberately no Meta renderer: an admitted connection must still get the
         // existing missing-contract diagnostic, distinct from a refused connection.
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(EndpointSpace::new().bind(
             Exact::new("urn:test:ok"),
             FnEndpoint::new("ok", |_: &Invocation<'_>| {

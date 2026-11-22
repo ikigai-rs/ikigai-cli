@@ -906,6 +906,8 @@ mod tests {
 
     #[test]
     fn the_stylesheet_is_served_as_text_css() {
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = ikigai_core::Kernel::new(std::sync::Arc::new(
             ikigai_core::EndpointSpace::new().bind(ikigai_core::Exact::new(PAGE_CSS_IRI), PageCss),
         ));
@@ -1136,6 +1138,8 @@ mod endpoint_tests {
         std::fs::write(&key_path, pem).unwrap();
 
         let recorder = Recorder::default();
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(
             EndpointSpace::new()
                 .bind(
@@ -1330,6 +1334,8 @@ mod endpoint_tests {
         let (exp, token) = w.valid("approve");
         w.post_form("approve", ID, exp, &token);
         let tuple = w.dropped().pop().expect("the edge recorded the decision");
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(
             EndpointSpace::new()
                 .bind(
@@ -1368,6 +1374,8 @@ mod endpoint_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let ask = |key_path: std::path::PathBuf| {
+            #[allow(clippy::disallowed_methods)]
+            // internal: a test fixture's kernel; it routes no user arguments
             let kernel = Kernel::new(Arc::new(EndpointSpace::new().bind(
                 UriTemplate::parse("urn:calendar-request:{action}").unwrap(),
                 CalendarRequest { key_path },

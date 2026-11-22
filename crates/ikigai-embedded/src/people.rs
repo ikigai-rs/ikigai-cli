@@ -235,6 +235,7 @@ mod tests {
     use ikigai_core::{ArgRef, Capability, EndpointSpace, Exact, Iri, Kernel, Request};
     use std::sync::Arc;
 
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn kernel(name: &str) -> Kernel {
         let dir = std::env::temp_dir().join(format!("ikigai-people-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

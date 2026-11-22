@@ -54,6 +54,7 @@ impl Held {
 
 /// A kernel whose `urn:test:hold` runs until the test releases it (a stand-in for a long
 /// poll) and whose `urn:test:quick` answers at once.
+#[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
 fn kernel(held: Arc<Held>) -> Kernel {
     let hold = FnEndpoint::new("hold", move |_inv: &Invocation<'_>| {
         held.running.fetch_add(1, Ordering::SeqCst);

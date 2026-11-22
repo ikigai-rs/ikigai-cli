@@ -17,6 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// A page to read, and a sink that answers with the content it was handed.
+#[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
 fn kernel() -> Arc<Kernel> {
     let page = FnEndpoint::new("page", |_inv: &Invocation<'_>| {
         Ok(Representation::new(

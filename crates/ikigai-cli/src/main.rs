@@ -7044,6 +7044,8 @@ mod mount_cert_tests {
         let name = "t.sock".to_string();
         let path = home.join(&name);
         let _ = std::fs::remove_file(&path);
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(std::sync::Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),
         ));
@@ -7081,6 +7083,8 @@ mod mount_cert_tests {
         use ikigai_core::{builtins, EndpointSpace, Exact, Kernel};
         let path = private_socket_dir("prefer-list").join("p.sock");
         let _ = std::fs::remove_file(&path);
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(std::sync::Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),
         ));
@@ -7261,6 +7265,8 @@ mod mount_cert_tests {
                 b"Hello, Ada".to_vec(),
             ))
         });
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(std::sync::Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:test:hello"), hello),
         ));
@@ -7297,6 +7303,8 @@ mod mount_cert_tests {
         std::fs::write(dir.join("server.crt"), &server.cert_pem).unwrap();
         let socket = ikigai_quic::bind("127.0.0.1:0".parse().unwrap()).expect("a UDP socket");
         let addr = socket.local_addr().unwrap();
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = std::sync::Arc::new(Kernel::new(std::sync::Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),
         )));
@@ -7369,6 +7377,8 @@ mod mount_cert_tests {
         use ikigai_core::{builtins, EndpointSpace, Exact, Kernel};
         let path = private_socket_dir("daemon-up").join("u.sock");
         let _ = std::fs::remove_file(&path);
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(std::sync::Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),
         ));
@@ -8351,6 +8361,7 @@ mod prefer_mount_capability_tests {
 
     /// A peer whose one endpoint declares nothing and checks `SECRET` itself, answering with
     /// the scopes it received.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn peer() -> Kernel {
         Kernel::new(Arc::new(
             EndpointSpace::new().bind(
@@ -8395,6 +8406,8 @@ mod prefer_mount_capability_tests {
             pending: false,
         })
         .expect("a prefer mount never dials at startup");
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let local = Kernel::new(Arc::new(ikigai_resolve::MountedRemote::overriding(
             spec.resolver,
             "urn:peer:",

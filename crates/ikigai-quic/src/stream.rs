@@ -1151,6 +1151,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn kernel(dropped: Arc<AtomicBool>) -> Kernel {
         let echo = FnEndpoint::new("echo", |inv: &Invocation<'_>| {
             Ok(Representation::new(

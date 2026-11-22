@@ -290,6 +290,8 @@ mod tests {
 
     /// Convert `input` with the given args through a real kernel; return the body text.
     fn convert_ok(input: &str, args: &[(&str, &str)]) -> String {
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(space()));
         let mut req = Request::new(Verb::Source, Iri::parse("urn:tz:convert").unwrap())
             .with_arg("in", ArgRef::Inline(input.as_bytes().to_vec()));
@@ -301,6 +303,8 @@ mod tests {
     }
 
     fn convert_err(input: &str, args: &[(&str, &str)]) -> bool {
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(space()));
         let mut req = Request::new(Verb::Source, Iri::parse("urn:tz:convert").unwrap())
             .with_arg("in", ArgRef::Inline(input.as_bytes().to_vec()));
@@ -382,6 +386,8 @@ mod tests {
     /// invalid argument naming it, as core's `inline_str` says, never "missing".
     #[test]
     fn a_present_but_unreadable_zone_is_invalid_not_missing() {
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(space()));
         let request = Request::new(Verb::Source, Iri::parse("urn:tz:convert").unwrap())
             .with_arg("in", ArgRef::Inline(b"2026-07-21T12:00:00Z".to_vec()))
@@ -400,6 +406,8 @@ mod tests {
     /// caller can tell its own omission from a failure of the endpoint.
     #[test]
     fn a_missing_datetime_is_a_typed_missing_in() {
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(space()));
         let request = Request::new(Verb::Source, Iri::parse("urn:tz:convert").unwrap())
             .with_arg("to", ArgRef::Inline(b"UTC".to_vec()));
@@ -412,6 +420,8 @@ mod tests {
     /// The piped form still works: `content` stands in for `in` when `in` is absent.
     #[test]
     fn a_piped_datetime_still_converts() {
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(space()));
         let request = Request::new(Verb::Source, Iri::parse("urn:tz:convert").unwrap())
             .with_arg("content", ArgRef::Inline(b"2026-07-21T12:00:00Z".to_vec()))
@@ -424,6 +434,8 @@ mod tests {
     /// through to `content` and come back as "missing".
     #[test]
     fn a_present_but_unreadable_datetime_is_invalid_not_missing() {
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(space()));
         let request = Request::new(Verb::Source, Iri::parse("urn:tz:convert").unwrap())
             .with_arg("in", ArgRef::Inline(vec![0xff, 0xfe]))
@@ -474,6 +486,8 @@ mod tests {
 
     #[test]
     fn a_live_clock_reads_the_kernels_time_and_caches_to_the_minute() {
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(space())).with_clock(Arc::new(FixedClock::at(LIVE)));
         let rep = block_on(kernel.issue(now_in_utc(), &open())).unwrap();
         assert_eq!(rep.bytes, b"2026-09-27T12:34:56+00:00");
@@ -485,6 +499,8 @@ mod tests {
     /// computes, and the answer — a pure function of the corridor's name — is `Never`.
     #[test]
     fn a_temporal_corridor_pins_the_answer_and_makes_it_immutable() {
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(space())).with_clock(Arc::new(FixedClock::at(LIVE)));
         let rep = block_on(kernel.issue_in(now_in_utc(), &open(), pinned_at(PINNED))).unwrap();
         assert_eq!(rep.bytes, b"2026-09-25T18:00:00+00:00");
@@ -501,6 +517,8 @@ mod tests {
     /// what calling `Utc::now()` directly made impossible.)
     #[test]
     fn a_corridor_that_binds_nothing_still_pins_the_roots_door() {
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(space())).with_clock(Arc::new(FixedClock::at(LIVE)));
         let empty_corridor = Scope::empty().with_named_at(
             Iri::parse("urn:ctx:time:2026-09-25T18:00:00Z").unwrap(),
@@ -516,6 +534,8 @@ mod tests {
     #[test]
     fn a_kernel_without_a_clock_falls_back_to_the_os_clock() {
         let before = Utc::now();
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let rep = block_on(Kernel::new(Arc::new(space())).issue(now_in_utc(), &open())).unwrap();
         let read = DateTime::parse_from_rfc3339(std::str::from_utf8(&rep.bytes).unwrap())
             .unwrap()

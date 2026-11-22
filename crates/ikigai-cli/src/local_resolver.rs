@@ -181,6 +181,8 @@ mod tests {
     #[test]
     fn traced_requests_keep_cache_status_and_failure_events() {
         use ikigai_core::{Error, Expiry};
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Arc::new(Kernel::new(Arc::new(
             EndpointSpace::new()
                 .bind(
@@ -230,6 +232,8 @@ mod tests {
                 ))
             })
         };
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Arc::new(Kernel::new(Arc::new(
             EndpointSpace::new()
                 .bind(Exact::new("urn:test:first"), answer())
@@ -309,6 +313,8 @@ mod tests {
                 ))
             })
         };
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Arc::new(Kernel::new(Arc::new(
             EndpointSpace::new()
                 .bind(Exact::new("urn:test:root"), root)

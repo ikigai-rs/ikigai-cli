@@ -1364,6 +1364,8 @@ fn the_jobs_graph_uses_exactly_thirteen_undefined_terms() {
         })
         .with_description(Description::new("x").verb(Verb::Source)),
     );
+    #[allow(clippy::disallowed_methods)]
+    // internal: a test fixture's kernel; it routes no user arguments
     let kernel = Arc::new(Kernel::new(Arc::new(space)));
     registry.set_resolver(Arc::clone(&kernel) as Arc<dyn Resolver>);
     let every = Schedule::Every(Duration::from_secs(1));

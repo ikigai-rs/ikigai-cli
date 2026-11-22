@@ -28,6 +28,7 @@ const PATIENCE: Duration = Duration::from_secs(30);
 
 /// `urn:demo:cal` projects on the session capability — DETAIL with the detail scope,
 /// freebusy otherwise — and counts every time it actually runs.
+#[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
 fn gated_kernel(runs: Arc<AtomicUsize>) -> Kernel {
     let cal = FnEndpoint::new("cal", move |inv: &Invocation<'_>| {
         runs.fetch_add(1, Ordering::SeqCst);

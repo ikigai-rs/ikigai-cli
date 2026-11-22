@@ -59,6 +59,8 @@ fn exhaust_and_recover() {
         .enable_all()
         .build()
         .unwrap();
+    #[allow(clippy::disallowed_methods)]
+    // internal: a test fixture's kernel; it routes no user arguments
     let kernel = Arc::new(ikigai_core::Kernel::new(Arc::new(
         ikigai_core::EndpointSpace::new(),
     )));

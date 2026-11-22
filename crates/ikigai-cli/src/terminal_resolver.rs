@@ -868,6 +868,8 @@ mod tests {
 
     #[test]
     fn an_unreadable_contract_keeps_the_original_request() {
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let resolver = terminal(ikigai_core::Kernel::new(Arc::new(
             ikigai_core::EndpointSpace::new().bind(
                 ikigai_core::Exact::new("urn:test:page"),

@@ -20,6 +20,7 @@ use ikigai_quic::{
 use ikigai_resolve::Resolver;
 
 /// A kernel with one endpoint, so a connection can prove it was served.
+#[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
 fn kernel() -> Kernel {
     let hello = FnEndpoint::new("hello", |_inv: &Invocation<'_>| {
         Ok(Representation::new(

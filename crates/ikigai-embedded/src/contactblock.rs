@@ -1499,6 +1499,8 @@ mod endpoint_tests {
         std::fs::write(&private, key.to_pkcs8_pem(LineEnding::LF).unwrap().as_str()).unwrap();
 
         let recorder = Recorder::default();
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(
             EndpointSpace::new()
                 .bind(
@@ -2135,6 +2137,8 @@ mod endpoint_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let key_path = dir.join("contact-block.pub");
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(
             EndpointSpace::new()
                 .bind(

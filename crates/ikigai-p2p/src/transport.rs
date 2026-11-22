@@ -861,6 +861,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ikigai-p2p-{test}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let backend = Arc::new(ikigai_secret::FileBackend::new(&dir));
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(ikigai_secret::space(backend.clone())));
         (backend, kernel, dir)
     }

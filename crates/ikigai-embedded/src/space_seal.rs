@@ -340,6 +340,7 @@ mod tests {
         path
     }
 
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn kernel(space: SpaceEndpoint) -> Kernel {
         Kernel::new(Arc::new(EndpointSpace::new().bind(
             UriTemplate::parse(ikigai_intray::SPACE_TEMPLATE).unwrap(),

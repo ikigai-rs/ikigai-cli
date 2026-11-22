@@ -968,6 +968,7 @@ impl ikigai_layers::gateway::Door for QuicDoor {
 }
 
 /// The resolving kernel: `urn:test:hello` answers `hello`.
+#[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
 fn hello_kernel() -> ikigai_core::Kernel {
     use ikigai_core::{Description, EndpointSpace, Exact, FnEndpoint, ReprType};
     let hello = FnEndpoint::new("hello", |_inv: &ikigai_core::Invocation<'_>| {

@@ -4284,6 +4284,7 @@ mod tests {
     // A kernel exercising the verbs: a Source-only resource, a cap-denied one, a
     // Sink that echoes its piped `content`, a Source that echoes a query arg, and a
     // Delete. Verbs are declared so the Allow list and the 405 gate are exercised.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn test_kernel() -> Arc<Kernel> {
         let hello = FnEndpoint::new("hello", |_inv: &Invocation<'_>| {
             Ok(Representation::new(
@@ -5188,6 +5189,8 @@ mod tests {
             ))
         })
         .with_description(Description::new("counted").verb(Verb::Sink));
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Arc::new(Kernel::new(Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:test:counted"), counted),
         )));
@@ -6993,6 +6996,8 @@ mod tests {
         .with_description(
             Description::new("mnt").action(ActionSpec::new(Verb::Source).summary("read it")),
         );
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Arc::new(Kernel::new(Arc::new(Mounted(Arc::new(endpoint)))));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -8095,6 +8100,7 @@ mod tests {
             counted_kernel().0
         }
 
+        #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
         fn counted_kernel() -> (Arc<Kernel>, Arc<std::sync::atomic::AtomicUsize>) {
             let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec!["one".to_string()]));

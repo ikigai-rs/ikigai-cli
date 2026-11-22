@@ -175,6 +175,8 @@ fn signed_run_door(_governed_2s: &ikigai_core::Kernel) {
     let kernel = &ikigai_embedded::calendar_server_kernel_with_eval();
     // Sign the program through a scratch kernel holding the PRIVATE key — the
     // author's side; the served kernel only ever sees the public half.
+    #[allow(clippy::disallowed_methods)]
+    // internal: a test fixture's kernel; it routes no user arguments
     let author = ikigai_core::Kernel::new(std::sync::Arc::new(ikigai_sign::space().bind(
         ikigai_core::Exact::new("urn:author:key"),
         StaticKey(K1_PRIV),

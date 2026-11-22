@@ -63,6 +63,7 @@ impl Enrolment {
 
 /// A kernel whose `urn:test:who` answers the principal the call resolved under, and whose
 /// `urn:test:slow` Sink counts its runs and takes `slow` to answer.
+#[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
 fn kernel(runs: Arc<AtomicUsize>, slow: Duration) -> Kernel {
     let who = FnEndpoint::new("who", |inv: &Invocation<'_>| {
         Ok(Representation::new(

@@ -50,6 +50,7 @@ struct Runs {
 
 /// A kernel named `name`: `urn:test:who` answers the name, the Sink `urn:test:append` counts
 /// its runs, and the Source `urn:test:hold` counts its runs and takes `hold` to answer.
+#[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
 fn kernel(name: &'static str, runs: &Arc<Runs>, hold: Duration) -> Kernel {
     let who = FnEndpoint::new("who", move |_: &Invocation<'_>| Ok(text(name.as_bytes())))
         .with_description(Description::new("who").verb(Verb::Source));
@@ -324,6 +325,8 @@ fn the_serve_function_returns_within_the_cap_when_a_call_never_finishes() {
         Ok(text(b"late"))
     })
     .with_description(Description::new("append").verb(Verb::Sink));
+    #[allow(clippy::disallowed_methods)]
+    // internal: a test fixture's kernel; it routes no user arguments
     let kernel = Kernel::new(Arc::new(
         EndpointSpace::new().bind(Exact::new("urn:test:append"), wedged),
     ));

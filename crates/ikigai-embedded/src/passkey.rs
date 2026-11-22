@@ -1524,6 +1524,8 @@ mod tests {
 
     /// A minimal invocation carrying a urlencoded body as `content` (how a POST arrives).
     fn post_inv(body: &str) -> (Kernel, Request) {
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(std::sync::Arc::new(ikigai_core::EndpointSpace::new()));
         let req = Request::new(Verb::Sink, Iri::parse("urn:x").unwrap())
             .with_arg("content", ArgRef::Inline(body.as_bytes().to_vec()));
@@ -1549,6 +1551,8 @@ mod tests {
                 Description::new("gate").verb(Verb::Sink)
             }
         }
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(std::sync::Arc::new(
             ikigai_core::EndpointSpace::new().bind(ikigai_core::Exact::new("urn:x"), Gate),
         ));
@@ -1907,6 +1911,8 @@ mod tests {
         verb: Verb,
         body: Option<&str>,
     ) -> Result<Representation> {
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(std::sync::Arc::new(
             ikigai_core::EndpointSpace::new().bind(ikigai_core::Exact::new(iri), endpoint),
         ));
@@ -2167,6 +2173,8 @@ mod tests {
         isolate("enroll");
         assert!(!enrollment_open(), "closed by default");
         // Opening requires the cap.
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(std::sync::Arc::new(ikigai_core::EndpointSpace::new().bind(
             ikigai_core::Exact::new("urn:passkey:enroll-open"),
             PasskeyEnrollOpen,
@@ -2194,6 +2202,8 @@ mod tests {
         isolate("caps");
         TEST_RP.with(|r| *r.borrow_mut() = Some(test_relying_party()));
         open_window();
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(std::sync::Arc::new(
             ikigai_core::EndpointSpace::new()
                 .bind(
@@ -2377,6 +2387,8 @@ mod tests {
     #[test]
     fn opening_a_window_writes_it_owner_only() {
         isolate("enroll-mode");
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(std::sync::Arc::new(ikigai_core::EndpointSpace::new().bind(
             ikigai_core::Exact::new("urn:passkey:enroll-open"),
             PasskeyEnrollOpen,
@@ -2564,6 +2576,8 @@ mod tests {
     #[test]
     fn opening_a_window_answers_with_a_code_the_file_holds_only_the_digest_of() {
         isolate("code-open");
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(std::sync::Arc::new(ikigai_core::EndpointSpace::new().bind(
             ikigai_core::Exact::new("urn:passkey:enroll-open"),
             PasskeyEnrollOpen,
