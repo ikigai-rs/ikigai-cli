@@ -203,6 +203,11 @@ impl Space for Slot {
 /// A cache-less issuer around one remote resolver, for `--connect` (ledger #3383): a kernel
 /// over the governed remote whose cache admits nothing, so every read still goes to the hub
 /// and freshness is the hub's, exactly as without the policy.
+///
+/// It carries the host's Meta renderer, as the mount path's kernel does: the engine routes a
+/// named, piped or positional argument by the target's contract, read with Meta as
+/// `application/json`, and a kernel with no renderer cannot answer that, so every call that
+/// named an argument was routed as text (ledger #4037).
 pub fn connect_issuer(
     policy: &RetryPolicy,
     resolver: Arc<dyn ikigai_resolve::Resolver>,
@@ -214,7 +219,8 @@ pub fn connect_issuer(
         origin.to_string(),
     ));
     let governed = policy.govern(vec![Arc::clone(&remote)]);
-    Kernel::new(governed.slot(remote)).with_cache_policy(Arc::new(NoCache))
+    Kernel::with_meta_renderer(governed.slot(remote), Arc::new(crate::CliRenderer))
+        .with_cache_policy(Arc::new(NoCache))
 }
 
 /// Run `attempt` (a `--connect` dial and its admission check) under the policy's
