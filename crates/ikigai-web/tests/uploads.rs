@@ -245,6 +245,24 @@ async fn an_upload_past_its_bound_is_413_and_leaves_no_spill_file() {
     );
 }
 
+/// A grace too long for the clock to reach (`Duration::MAX`, "no deadline") is a deadline that
+/// never comes, not an overflow: the upload is taken. Before the fix the door's deadline
+/// arithmetic panicked and every upload's connection was dropped unanswered.
+#[tokio::test]
+async fn an_upload_under_a_grace_past_the_clock_is_taken() {
+    let door = upload_door("endless-grace", Some(1 << 20), Some((1, Duration::MAX))).await;
+    let body = vec![7u8; 3000];
+    let out = tokio::time::timeout(
+        Duration::from_secs(10),
+        send(door.addr, &put("/t/upload", &body)),
+    )
+    .await
+    .expect("the door should answer");
+    assert!(out.starts_with("HTTP/1.1 200 "), "{out:?}");
+    let id = ContentId::of(&body);
+    assert_eq!(split(&out).1, format!("content-id {id} 3000 {id}"), "{out}");
+}
+
 #[tokio::test]
 async fn a_too_slow_upload_is_cut_and_leaves_no_spill_file() {
     // 100 KiB a second after a 300 ms grace.
