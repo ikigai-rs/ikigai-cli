@@ -2736,6 +2736,7 @@ mod tests {
         assert_eq!(source("[2001:db8::1]:50003"), "2001:db8::1");
     }
 
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn kernel() -> Kernel {
         Kernel::new(Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),
@@ -2745,6 +2746,7 @@ mod tests {
     /// A kernel whose `urn:demo:cal` projects on the session capability — full DETAIL at
     /// root, the minimized `freebusy` otherwise — so a test can see which authority a
     /// connection actually resolved under.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn gated_kernel() -> Kernel {
         let cal = FnEndpoint::new("cal", |inv: &Invocation<'_>| {
             let body = if inv.capability.allows("urn:cap:demo:detail") {
@@ -2890,6 +2892,8 @@ mod tests {
             Arc::new(EndpointSpace::new()) as Arc<dyn Space>,
             Arc::new(RemoteSpace::new(Arc::new(client))) as Arc<dyn Space>,
         ]);
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let local_kernel = Kernel::new(Arc::new(local));
         let cal = Request::new(Verb::Source, Iri::parse("urn:demo:cal").unwrap());
         let (representation, _) =
@@ -2965,6 +2969,8 @@ mod tests {
                 )
             })
         };
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let peer = Arc::new(Kernel::new(Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:test:cell"), cell),
         )));
@@ -2997,6 +3003,8 @@ mod tests {
             });
         });
         let client = connect(server_addr, &client_id, &server_id.cert_pem).unwrap();
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let mounting = Kernel::new(Arc::new(Fallback::new(vec![
             Arc::new(EndpointSpace::new()) as Arc<dyn Space>,
             Arc::new(MountedRemote::overriding(
@@ -3031,6 +3039,7 @@ mod tests {
     /// `urn:file:{path}` echoes the (localized) path it received, gated by a prefix ACL
     /// over the session's `urn:cap:fs:read:<segment>` scopes — as ikigai-fs does for real
     /// (the live fs is exercised by the CLI end-to-end).
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn files_kernel() -> Kernel {
         let files = FnEndpoint::new("file", |inv: &Invocation<'_>| {
             let path = inv.bindings.get("path").unwrap_or_default().to_string();
@@ -3156,6 +3165,8 @@ mod tests {
                 b"eventually".to_vec(),
             ))
         });
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Arc::new(Kernel::new(Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:demo:slow"), slow),
         )));
@@ -3356,6 +3367,7 @@ mod tests {
     /// none), whether the capability it ran under still holds the scope a host could have
     /// used to TAG the connection with its identity (`tagged`/`untagged`, the channel gonk
     /// used before ledger #879), and which projection that capability reached.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn whoami_kernel() -> Kernel {
         let whoami = FnEndpoint::new("whoami", |inv: &Invocation<'_>| {
             let who = inv.inline_str(PRINCIPAL_ARG).unwrap_or("-").to_string();
@@ -3618,6 +3630,8 @@ mod tests {
     /// stored: a principal-stamped read is reported cached after it resolves.
     #[test]
     fn is_cached_asks_about_the_key_the_stamped_issue_stored() {
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),
         ));
@@ -3779,6 +3793,7 @@ mod tests {
 
     // ---- wire v8 over QUIC: the ALPN is the version (ledger #583) ----
 
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn conflict_kernel() -> Kernel {
         let taken = FnEndpoint::new("taken", |_inv: &Invocation<'_>| {
             Err(Error::Conflict("x".into()))
@@ -3843,6 +3858,7 @@ mod tests {
 
     /// A kernel whose one endpoint reports the run it sees: `{retries},{time_left_ms}`, `-`
     /// for a half the run does not carry; a retry budget (ceiling 3) so a pool exists.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn run_kernel() -> Kernel {
         let left = FnEndpoint::new("left", |inv: &Invocation<'_>| {
             let retries = inv
@@ -3917,6 +3933,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn gave_up_crosses_typed_at_v11_and_untyped_for_every_older_peer() {
         for version in ikigai_wire::MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION {
             let (server_id, client_id) = (generate(), generate());
@@ -3943,6 +3960,8 @@ mod tests {
                     Iri::parse("urn:test:gaveup").unwrap(),
                 ))
                 .unwrap_err();
+            #[allow(clippy::disallowed_methods)]
+            // internal: a test fixture's kernel; it routes no user arguments
             let local = Kernel::new(Arc::new(ikigai_resolve::RemoteSpace::new(Arc::new(client))));
             let mounted = Resolver::issue_as(
                 &local,
@@ -4129,6 +4148,8 @@ mod reconnect_tests {
                     file_segment: String::new(),
                     principal: None,
                 };
+                #[allow(clippy::disallowed_methods)]
+                // internal: a test fixture's kernel; it routes no user arguments
                 let kernel = Arc::new(Kernel::new(Arc::new(
                     ikigai_core::EndpointSpace::new().bind(
                         ikigai_core::Exact::new("urn:test:upper"),
@@ -4238,6 +4259,7 @@ mod runtime_reentrancy {
     use std::sync::Arc;
     use std::thread;
 
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn kernel() -> Kernel {
         Kernel::new(Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),
@@ -4341,6 +4363,8 @@ mod runtime_reentrancy {
                 panic!("the endpoint fell over")
             },
         );
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(
             EndpointSpace::new()
                 .bind(Exact::new("urn:test:upper"), builtins::to_upper())
@@ -4516,6 +4540,8 @@ mod restart {
                 Err(e) => panic!("bind {addr}: {e}"),
             }
         };
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Arc::new(Kernel::new(Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),
         )));
@@ -4709,6 +4735,8 @@ mod call_deadline {
                 b"slow".to_vec(),
             ))
         });
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Arc::new(Kernel::new(Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:test:slow"), slow),
         )));
@@ -5038,6 +5066,8 @@ mod keep_alive {
                 b"slow".to_vec(),
             ))
         });
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Arc::new(Kernel::new(Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:test:slow"), slow),
         )));
@@ -5527,6 +5557,8 @@ mod async_mount {
                 b"done".to_vec(),
             ))
         });
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Arc::new(Kernel::new(Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:demo:slow"), slow),
         )));
@@ -5573,6 +5605,8 @@ mod async_mount {
             let ticks = Arc::clone(&ticks);
             async move {
                 let client = connect(server_addr, &client_id, &server_cert).unwrap();
+                #[allow(clippy::disallowed_methods)]
+                // internal: a test fixture's kernel; it routes no user arguments
                 let local_kernel = Kernel::new(Arc::new(Fallback::new(vec![
                     Arc::new(EndpointSpace::new()) as Arc<dyn Space>,
                     Arc::new(RemoteSpace::new(Arc::new(client))) as Arc<dyn Space>,

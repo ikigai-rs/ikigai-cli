@@ -2111,6 +2111,8 @@ mod tests {
         entered: Arc<AtomicU64>,
     ) -> Arc<ikigai_core::Kernel> {
         let space = space(registry.clone()).bind(Exact::new("urn:x"), gated_target(entered));
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Arc::new(ikigai_core::Kernel::new(Arc::new(space)));
         registry.set_resolver(Arc::clone(&kernel) as Arc<dyn Resolver>);
         kernel

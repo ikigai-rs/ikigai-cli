@@ -1070,6 +1070,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn kernel() -> (Kernel, Arc<Mutex<Vec<String>>>) {
         let dropped = Arc::new(Mutex::new(Vec::new()));
         let space = EndpointSpace::new()
@@ -1111,6 +1112,7 @@ mod tests {
     }
 
     /// A kernel whose intake checks a blocklist that blocks exactly `blocked_email`.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn blocking_kernel(blocked_email: &str) -> (Kernel, Arc<Mutex<Vec<String>>>) {
         let mut cfg = config();
         cfg.check_blocked = true;
@@ -1245,6 +1247,8 @@ mod tests {
                     dropped: dropped.clone(),
                 },
             );
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let k = Kernel::new(Arc::new(space));
         block_on(k.issue(post("name=X&email=x%40y.example&message=hi"), &cap())).unwrap();
         assert_eq!(
@@ -1284,6 +1288,7 @@ mod tests {
     /// A configured block set (`Some(present)`, or unbound with `None`), the kernel over it,
     /// the tuples dropped and the questions the set was asked.
     #[allow(clippy::type_complexity)]
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn keyed_kernel(
         present: Option<Vec<String>>,
     ) -> (Kernel, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<Request>>>) {
@@ -1462,6 +1467,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn redirecting_kernel(url: &str) -> (Kernel, Arc<Mutex<Vec<String>>>) {
         let mut cfg = config();
         cfg.redirect = Some(url.to_string());
@@ -1724,6 +1730,7 @@ mod tests {
     type TokenedKernel = (Kernel, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>);
 
     /// An intake that resolves link tokens, plus the registry's record of lookups.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn tokened_kernel() -> TokenedKernel {
         let mut cfg = config();
         cfg.clients = Some("urn:client:{token}".to_string());
@@ -1818,6 +1825,7 @@ mod tests {
     }
 
     /// An intake with a zone field, to exercise the tzdata check.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn zoned_kernel() -> (Kernel, Arc<Mutex<Vec<String>>>) {
         let mut cfg = config();
         cfg.fields
@@ -2013,6 +2021,7 @@ mod tests {
     }
 
     /// An intake with one tightly bounded field, to exercise the door's length check.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn bounded_kernel() -> (Kernel, Arc<Mutex<Vec<String>>>) {
         let mut cfg = config();
         cfg.fields
@@ -2096,6 +2105,7 @@ mod tests {
     }
 
     /// An intake whose `message` has been superseded but is still accepted.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn legacy_kernel() -> (Kernel, Arc<Mutex<Vec<String>>>) {
         let mut cfg = config();
         for field in &mut cfg.fields {

@@ -375,6 +375,7 @@ mod tests {
         ikigai_core::Time::from_millis(1_790_000_000_000)
     }
 
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn kernel(space: impl Space + 'static) -> Kernel {
         Kernel::new(Arc::new(space)).with_clock(Arc::new(ikigai_core::SystemClock))
     }

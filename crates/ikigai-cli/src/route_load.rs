@@ -493,6 +493,8 @@ routes:
                 ttl.clone().into_bytes(),
             ))
         });
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(std::sync::Arc::new(
             ikigai_sparql::space().bind(Exact::new("urn:test:routes"), doc),
         ));

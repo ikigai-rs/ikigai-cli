@@ -142,6 +142,8 @@ async fn main() {
         .bind(Exact::new("urn:rss:upload"), counting_sink())
         .bind(Exact::new("urn:rss:collect"), counting_sink());
     let store = Arc::new(MemoryContentStore::new(2 * TOTAL));
+    #[allow(clippy::disallowed_methods)]
+    // internal: the example's own kernel, which routes no user arguments
     let mut kernel = Kernel::new(Arc::new(space)).with_content_store(store.clone());
     if mode == "upload-spilled" {
         let dir = std::env::args()

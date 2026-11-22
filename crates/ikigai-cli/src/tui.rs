@@ -2617,6 +2617,7 @@ mod tests {
 
     /// A minimal engine whose `urn:lisp:eval` echoes its `in` argument — enough to
     /// observe that a key routed through `scratch_key` reaches the eval path.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn echo_lisp_engine() -> Session {
         use ikigai_core::{
             EndpointSpace, Exact, FnEndpoint, Invocation, Kernel, ReprType, Representation,

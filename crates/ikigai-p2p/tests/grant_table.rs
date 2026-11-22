@@ -25,6 +25,7 @@ use tokio::sync::mpsc;
 
 const LOOPBACK: &str = "/ip4/127.0.0.1/udp/0/quic-v1";
 
+#[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
 fn kernel() -> Kernel {
     let cal = FnEndpoint::new("cal", |inv: &Invocation<'_>| {
         let body = if inv.capability.allows("urn:cap:demo:detail") {

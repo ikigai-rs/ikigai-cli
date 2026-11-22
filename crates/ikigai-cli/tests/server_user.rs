@@ -41,6 +41,8 @@ fn serve(socket: &Path) {
             b"Hello, Ada".to_vec(),
         ))
     });
+    #[allow(clippy::disallowed_methods)]
+    // internal: a test fixture's kernel; it routes no user arguments
     let kernel = Kernel::new(Arc::new(
         EndpointSpace::new().bind(Exact::new("urn:hello"), hello),
     ));

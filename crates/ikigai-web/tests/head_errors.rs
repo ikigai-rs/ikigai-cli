@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
 fn kernel() -> Arc<Kernel> {
     let page = FnEndpoint::new("page", |_inv: &ikigai_core::Invocation<'_>| {
         Ok(Representation::new(

@@ -399,6 +399,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn kernel(transport: Arc<dyn MailTransport>) -> Kernel {
         let config = EmailConfig {
             host: "localhost".to_string(),
@@ -455,6 +456,8 @@ mod tests {
             from: "   ".to_string(),
         };
         let mail = FakeMail::ok();
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let k = Kernel::new(Arc::new(space(config, mail.clone())));
         let err = block_on(k.issue(
             send_request(&[
@@ -774,6 +777,8 @@ mod ics_tests {
                 Ok("250".into())
             }
         }
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(std::sync::Arc::new(space(
             EmailConfig::default(),
             std::sync::Arc::new(Rec(sent.clone())),

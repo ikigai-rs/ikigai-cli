@@ -31,6 +31,7 @@ fn raw_envelope(block: &str, body: &str) -> Representation {
     )
 }
 
+#[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
 fn kernel() -> Arc<Kernel> {
     // A sign-in: a write that mints a session and sets it as an HttpOnly cookie.
     let login = FnEndpoint::new("login", |_inv: &Invocation<'_>| {
@@ -387,6 +388,8 @@ async fn a_tab_cannot_turn_a_write_redirect_off_site() {
         UriTemplate::parse("urn:t:redirect:{kind}").unwrap(),
         redirect,
     );
+    #[allow(clippy::disallowed_methods)]
+    // internal: a test fixture's kernel; it routes no user arguments
     let kernel = Arc::new(Kernel::new(Arc::new(space)));
     let addr = start(kernel, EdgeConfig::default(), public_cap()).await;
     for kind in ["tab-authority", "tabs-authority", "tab-inside"] {

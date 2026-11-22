@@ -656,6 +656,7 @@ fn view_config() -> ViewConfig {
 /// Wire an in-memory kernel: the shared calendar, the fixed org agenda (DESIRED),
 /// a faithful diff, and the real [`DeriveEndpoint`] under test. Returns the kernel
 /// and a handle on the store for asserting the post-pass view.
+#[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
 fn harness(desired_org: &str) -> (Kernel, FakeCalendar) {
     let calendar = FakeCalendar::default();
     let cal_arc: Arc<dyn Endpoint> = Arc::new(calendar.clone());
@@ -876,6 +877,8 @@ fn derive_without_config_reports_the_missing_config() {
     // Config absent (host had no calendar.json) → a clean error naming the config
     // resource, not a panic.
     let space = EndpointSpace::new().bind(Exact::new("urn:view:derive"), DeriveEndpoint::new(None));
+    #[allow(clippy::disallowed_methods)]
+    // internal: a test fixture's kernel; it routes no user arguments
     let kernel = Kernel::new(Arc::new(space));
     let request = Request::new(
         Verb::Source,

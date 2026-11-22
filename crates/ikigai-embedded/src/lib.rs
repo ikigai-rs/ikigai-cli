@@ -2053,10 +2053,24 @@ pub fn calendar_server_space(nature: &'static str) -> EndpointSpace {
         )
 }
 
+/// The one constructor for a kernel that issues USER requests: the REPL's, a `-c` run's, a
+/// door's, a `--connect` client's. Every such kernel needs the host's Meta renderer, which
+/// answers `Meta` as `application/json`: the engine reads a target's parameter contract that
+/// way to route a named, piped or positional argument, and a kernel built with bare
+/// `Kernel::new` has no renderer, so every named argument is routed as text or refused
+/// (ledger #4037). Both constructors compile and only this one routes arguments, so
+/// `Kernel::new` is a disallowed method in the workspace's `clippy.toml` (ledger #4038).
+///
+/// `cache` is the caller's cache policy: the host surfaces take the configured LRU (see
+/// [`cache::configure`]), a `--connect` issuer one that admits nothing.
+pub fn user_kernel(root: Arc<dyn Space>, cache: Arc<dyn ikigai_core::CachePolicy>) -> Kernel {
+    Kernel::with_meta_renderer(root, Arc::new(CliRenderer)).with_cache_policy(cache)
+}
+
 // Every host surface uses the same representation cache policy. Keep configuration here so
 // new surfaces cannot accidentally inherit a different capacity.
 fn host_kernel(root: Arc<dyn Space>) -> Kernel {
-    cache::apply(Kernel::with_meta_renderer(root, Arc::new(CliRenderer)))
+    user_kernel(root, cache::policy())
 }
 
 /// The kernel a calendar-federation server runs. See [`calendar_server_space`].
@@ -2280,6 +2294,7 @@ mod codekey_tests {
     use futures::executor::block_on;
     use ikigai_core::{Capability, Kernel, Request};
 
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn kernel(dir: &Path) -> Kernel {
         Kernel::new(Arc::new(EndpointSpace::new().bind(
             UriTemplate::parse("urn:codekey:{path}").expect("valid template"),
@@ -7900,6 +7915,8 @@ mod tests {
     /// indented `key value` lines, the nature exactly as the composer passed it.
     #[test]
     fn host_info_names_the_nature_it_was_given() {
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:host:info"), host_info("Odd (Label)")),
         ));
@@ -7918,6 +7935,8 @@ mod tests {
     /// chars". Installed list, gate and ask must all be `urn:llm:ollama:*`.
     #[test]
     fn the_jury_asks_the_provider_it_listed_its_jurors_from() {
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(
             EndpointSpace::new()
                 .bind(
@@ -8016,6 +8035,8 @@ mod tests {
         std::fs::write(root.join("a.rs"), "fn one() {}\nfn two() {}\n").expect("test file");
         let store = Arc::new(ikigai_sparql::Store::new().expect("in-memory store"));
         let space = ikigai_browse::space_with_annotations(vec![("demo".to_string(), root)], store);
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(space));
         match table {
             Some(t) => kernel.with_aliases(t),
@@ -8312,6 +8333,41 @@ mod tests {
         assert!(
             kernel.is_cached(&cached, &Capability::root()),
             "the old spelling must hit the entry the canonical name populated"
+        );
+    }
+
+    /// The one constructor for user-facing kernels answers Meta as `application/json`, the
+    /// contract the engine reads to route a named argument (ledger #4037, #4038), under any
+    /// cache policy the caller passes. A bare `Kernel::new` over the same space cannot, which
+    /// is why clippy disallows it: the ablation shows the assertion is load-bearing.
+    #[test]
+    fn the_user_kernel_answers_meta_as_json() {
+        let space = || -> Arc<dyn Space> {
+            Arc::new(EndpointSpace::new().bind(Exact::new("urn:data:page"), page()))
+        };
+        let meta = || {
+            Request::new(Verb::Meta, Iri::parse("urn:data:page").expect("valid IRI"))
+                .with_arg("as", ArgRef::Inline(b"application/json".to_vec()))
+        };
+        for policy in [
+            cache::policy(),
+            Arc::new(retry::NoCache) as Arc<dyn ikigai_core::CachePolicy>,
+        ] {
+            let kernel = user_kernel(space(), policy);
+            let answer = block_on(kernel.issue(meta(), &Capability::root()))
+                .expect("the user kernel answers Meta as JSON");
+            assert_eq!(answer.repr_type.media_type, "application/json");
+            let description: serde_json::Value =
+                serde_json::from_slice(&answer.bytes).expect("the answer is JSON");
+            assert_eq!(description["title"], "Demo page", "{description}");
+        }
+        #[allow(clippy::disallowed_methods)] // internal: the ablation this test exists to show
+        let bare = Kernel::new(space());
+        let refused = block_on(bare.issue(meta(), &Capability::root()));
+        assert!(
+            refused.map_or(true, |answer| answer.repr_type.media_type
+                != "application/json"),
+            "a kernel with no Meta renderer must not answer Meta as JSON"
         );
     }
 
@@ -8643,6 +8699,8 @@ mod tests {
     #[test]
     fn steel_itself_reads_back_a_prelude_generated_from_hostile_iris() {
         let eval = |src: String| {
+            #[allow(clippy::disallowed_methods)]
+            // internal: a test fixture's kernel; it routes no user arguments
             let kernel = Kernel::new(Arc::new(ikigai_lisp::space()));
             let request = Request::new(
                 Verb::Source,
@@ -9261,6 +9319,8 @@ mod tests {
         // Clock: the EMPTY capability — and it really does resolve the host's clock.
         let clock = host_job_authority(HostJob::Clock);
         assert_eq!(clock.scopes().map(|s| s.len()), Some(0), "no scopes at all");
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(base_space("test")));
         let now = block_on(kernel.issue(
             Request::new(Verb::Source, Iri::parse("urn:time:now").unwrap()),
@@ -9508,6 +9568,8 @@ mod tests {
     /// the table ships, and no alias can save it. Mounts move one way, route gates outside
     /// the kernel move the other.
     fn probe(space: &Arc<dyn Space>, iri: &str) -> std::result::Result<String, ikigai_core::Error> {
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::clone(space));
         let request = Request::new(Verb::Source, Iri::parse(iri).unwrap())
             .with_arg("in", ArgRef::Inline(b"hi".to_vec()));
@@ -9927,6 +9989,7 @@ mod tests {
     }
 
     /// A kernel with just the client endpoints, rooted at a scratch directory.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn client_kernel(root: std::path::PathBuf) -> Kernel {
         let space = EndpointSpace::new()
             .bind(
@@ -10571,6 +10634,8 @@ mod tests {
         std::fs::write(root.join("barrier.txt"), b"b").unwrap();
 
         // A cacheable file space over the temp root, with the watcher behind it.
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Arc::new(Kernel::new(Arc::new(ikigai_fs::cacheable_space(&root))));
         // Held to the end of the test and dropped there, which stops the watch.
         let _watch = WorkspaceWatch::start(Arc::downgrade(&kernel), root.clone())
@@ -10635,6 +10700,8 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let root = root.canonicalize().unwrap();
         std::fs::write(root.join("notes.txt"), b"v1").unwrap();
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(ikigai_fs::cacheable_space(&root)));
         let cap = Capability::root();
         let target = Iri::parse("urn:file:notes.txt").unwrap();
@@ -10689,6 +10756,8 @@ mod tests {
         std::fs::write(root.join("docs").join("a.txt"), b"a1").unwrap();
         let root = root.canonicalize().unwrap();
 
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(ikigai_fs::cacheable_space(&root)));
         let cap = Capability::root();
         let source = |name: &str| {
@@ -10766,6 +10835,7 @@ mod tests {
 
     /// The real `booking_intake()` in front of a recording space — the production field set,
     /// so these tests fail if the declaration changes underneath them.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn booking_kernel() -> (Kernel, Arc<std::sync::Mutex<Vec<String>>>) {
         let dropped = Arc::new(std::sync::Mutex::new(Vec::new()));
         let space = EndpointSpace::new()
@@ -11215,6 +11285,8 @@ mod tests {
             ServedSurface::default(),
             Arc::new(base_space("Test (QUIC)")),
         );
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(root).with_aliases(Arc::new(
             AliasTable::new()
                 .exact("urn:cal:mine", "urn:personal:calendar")
@@ -11445,6 +11517,7 @@ mod space_authority_tests {
         (spaces, authority)
     }
 
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn kernel_over(spaces: &Path) -> Arc<Kernel> {
         Arc::new(Kernel::new(Arc::new(
             ikigai_intray::space(spaces.to_path_buf()).bind(Exact::new("urn:test:beyond"), Beyond),
@@ -11656,6 +11729,8 @@ mod space_authority_tests {
     fn a_retargeted_handler_file_does_not_choose_what_fires() {
         let (spaces, authority) = scratch("retarget");
         let config = authority.parent().unwrap().to_path_buf();
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Arc::new(Kernel::new(Arc::new(
             ikigai_intray::space(spaces.clone())
                 .bind(Exact::new("urn:test:beyond"), Beyond)
@@ -11707,6 +11782,7 @@ mod space_authority_tests {
     }
 
     /// The kernel the handler tests drive: `jobs`'s legitimate handler and a second bound one.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn kernel_with_other(spaces: &Path) -> Arc<Kernel> {
         Arc::new(Kernel::new(Arc::new(
             ikigai_intray::space(spaces.to_path_buf())
@@ -12811,6 +12887,8 @@ mod contact_label_tests {
             key.to_pkcs8_pem(LineEnding::LF).unwrap().as_str(),
         )
         .unwrap();
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Arc::new(Kernel::new(Arc::new(
             ikigai_intray::space(spaces.clone())
                 .bind(
@@ -12958,6 +13036,8 @@ mod sealed_contact_link_tests {
         };
 
         let program = PROGRAMS.iter().find(|p| p.iri == CONTACT_HANDLER).unwrap();
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Arc::new(Kernel::new(Arc::new(
             stored_program(program, MINT.to_string())
                 .bind(
@@ -13045,6 +13125,8 @@ mod sealed_contact_link_tests {
         let now = space_seal::current_id(&spaces, "contact", &linked[0]);
         assert_ne!(now, linked[0], "a reseal stores the tuple under a new id");
         assert!(read(&linked[0]).is_err(), "the old id names nothing now");
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel_after = Kernel::new(Arc::new(
             EndpointSpace::new().bind(
                 UriTemplate::parse(ikigai_intray::SPACE_TEMPLATE).unwrap(),
@@ -13137,6 +13219,8 @@ mod http_body_budget_tests {
     fn native_http_names_ikigai_as_the_default_user_agent() {
         use ikigai_core::{ArgRef, Capability};
         let (url, server) = captured_request();
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(http_space()));
         let request = Request::new(Verb::Source, Iri::parse("urn:http:get").unwrap())
             .with_arg("url", ArgRef::Inline(url.into_bytes()));
@@ -13242,6 +13326,8 @@ mod http_body_budget_tests {
         use ikigai_core::{ArgRef, Capability};
         let (url, release, server) =
             stalled_server(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhalf_");
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(one_second_transport().into_space()));
         let request = Request::new(Verb::Source, Iri::parse("urn:http:get").unwrap())
             .with_arg("url", ArgRef::Inline(url.into_bytes()));
@@ -13284,6 +13370,8 @@ mod http_body_budget_tests {
         use ikigai_core::{ArgRef, Capability};
         let expected = vec![b'x'; 12 * 1024 * 1024];
         let (url, server) = response(expected.clone());
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(http_space()));
         let request = Request::new(Verb::Source, Iri::parse("urn:http:get").unwrap())
             .with_arg("url", ArgRef::Inline(url.into_bytes()));
@@ -13365,6 +13453,8 @@ mod http_body_budget_tests {
     fn native_http_endpoint_returns_a_typed_budget_refusal() {
         use ikigai_core::{ArgRef, Capability};
         let (url, server) = response(b"abcde".to_vec());
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(
             UreqTransport {
                 max_response_bytes: 4,

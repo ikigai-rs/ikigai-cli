@@ -25,6 +25,8 @@ async fn door_answering(
 ) -> SocketAddr {
     let endpoint = FnEndpoint::new("x", move |_inv: &Invocation<'_>| answer())
         .with_description(Description::new("x").verb(Verb::Source));
+    #[allow(clippy::disallowed_methods)]
+    // internal: a test fixture's kernel; it routes no user arguments
     let kernel = Kernel::new(Arc::new(
         EndpointSpace::new().bind(Exact::new("urn:t:x"), endpoint),
     ));
@@ -320,6 +322,8 @@ impl Endpoint for StreamedRedirect {
 /// Core's reader reads no stream, so the door collects this type first, as it does an envelope.
 #[tokio::test]
 async fn a_streamed_redirect_answers_like_a_buffered_one() {
+    #[allow(clippy::disallowed_methods)]
+    // internal: a test fixture's kernel; it routes no user arguments
     let kernel = Kernel::new(Arc::new(
         EndpointSpace::new().bind(Exact::new("urn:t:x"), StreamedRedirect),
     ));
@@ -340,6 +344,8 @@ async fn a_streamed_redirect_answers_like_a_buffered_one() {
 async fn door_writing(answer: impl Fn() -> Representation + Send + Sync + 'static) -> SocketAddr {
     let endpoint = FnEndpoint::new("w", move |_inv: &Invocation<'_>| Ok(answer()))
         .with_description(Description::new("w").verb(Verb::Sink));
+    #[allow(clippy::disallowed_methods)]
+    // internal: a test fixture's kernel; it routes no user arguments
     let kernel = Kernel::new(Arc::new(
         EndpointSpace::new().bind(Exact::new("urn:t:w"), endpoint),
     ));
@@ -419,6 +425,8 @@ async fn gone_keeps_its_word_on_a_json_door() {
         },
     )
     .with_description(Description::new("x").verb(Verb::Source));
+    #[allow(clippy::disallowed_methods)]
+    // internal: a test fixture's kernel; it routes no user arguments
     let kernel = Kernel::new(Arc::new(
         EndpointSpace::new().bind(Exact::new("urn:t:x"), endpoint),
     ));

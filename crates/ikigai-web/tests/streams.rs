@@ -81,6 +81,7 @@ impl Endpoint for Bodies {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
 fn reading_kernel() -> Arc<Kernel> {
     let space = EndpointSpace::new()
         .bind(Exact::new("urn:t:seekable"), Bodies)

@@ -32,7 +32,18 @@
 # The reason comment is not optional: an `#[allow]` with no stated reason is how a
 # deny-by-default rule decays into cargo-culted noise, and this one exists to stop a class of
 # bug that already cost three weeks.
+#
+# ★ `ikigai_core::Kernel::new` is BANNED too (ledger #4038). It builds a kernel with no Meta
+# renderer, and the engine routes a named, piped or positional argument by the target's
+# contract, read with Meta as `application/json`: a kernel without the renderer cannot answer
+# that, so every named argument is routed as text or refused. `--connect` under a retry policy
+# shipped exactly that (ledger #4037), because `Kernel::new` and `Kernel::with_meta_renderer`
+# both compile and only one routes arguments. A kernel that issues USER requests is built by
+# `ikigai_embedded::user_kernel`. A kernel that routes no arguments (a dial slot, a test
+# fixture, a transport's own inner kernel) carries `#[allow(clippy::disallowed_methods)]` on
+# the smallest item, with an `// internal: <why>` comment, the same pattern as the clock gate.
 disallowed-methods = [
+  { path = "ikigai_core::Kernel::new", reason = "a kernel with no Meta renderer cannot route named arguments (ledger #4037); build a user-facing kernel with ikigai_embedded::user_kernel, or #[allow] with an `// internal: <why>` comment if it issues no user requests" },
   { path = "std::time::Instant::now", reason = "compiles on wasm32-unknown-unknown and panics at runtime; take the timestamp from the injected ikigai_core::Clock instead, or #[allow] with a reason if the site is native-only" },
   { path = "std::time::SystemTime::now", reason = "compiles on wasm32-unknown-unknown and panics at runtime just like Instant::now; take the timestamp from the injected ikigai_core::Clock instead, or #[allow] with a reason if the site is native-only" },
 ]

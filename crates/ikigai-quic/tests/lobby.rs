@@ -26,6 +26,7 @@ const SAY: &str = "urn:cap:test:say";
 
 /// A kernel with three endpoints: `urn:test:say` (requires [`SAY`]), `urn:test:other`
 /// (requires another capability) and `urn:test:admin` (requires a third).
+#[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
 fn kernel() -> Kernel {
     let endpoint = |name: &'static str, requires: &'static str| {
         FnEndpoint::new(name, move |_inv: &Invocation<'_>| {

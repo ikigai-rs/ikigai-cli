@@ -409,6 +409,8 @@ mod tests {
             "a governed door the root does not bind"
         );
         // The ungoverned door still answers through the composed space.
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(govern(
             root,
             Duration::from_secs(5),

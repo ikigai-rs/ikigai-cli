@@ -8,6 +8,7 @@ use ikigai_core::{
 use ikigai_engine::{Action, Engine};
 use std::sync::Arc;
 
+#[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
 fn engine() -> Engine {
     let gone = FnEndpoint::new("gone", |_: &Invocation<'_>| {
         Err::<Representation, _>(Error::Gone("urn:t:gone was retired in 2024".into()))

@@ -138,6 +138,8 @@ async fn upload_door_as(
     let space = EndpointSpace::new()
         .bind(Exact::new("urn:t:upload"), measuring_sink())
         .bind(Exact::new("urn:t:who"), who_reads_sink(store.clone()));
+    #[allow(clippy::disallowed_methods)]
+    // internal: a test fixture's kernel; it routes no user arguments
     let kernel = Kernel::new(Arc::new(space))
         .with_spill(Arc::new(ikigai_fs::FileSpill::new(&spill.0).unwrap()))
         .with_content_store(store.clone());
@@ -298,6 +300,7 @@ async fn without_a_spill_grant_an_upload_route_takes_the_body_into_memory() {
 
 /// The door will not start over a kernel that cannot carry its uploads.
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
 async fn uploads_refuse_a_kernel_without_a_spill_or_with_another_store() {
     let listener = || async { tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap() };
     let store = Arc::new(MemoryContentStore::new(1 << 20));

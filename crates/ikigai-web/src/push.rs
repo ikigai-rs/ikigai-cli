@@ -566,6 +566,7 @@ mod tests {
 
     /// Cells that store what is written to them; a board that hangs from every cell's
     /// thread (a composite the page shows); a secret only a signed-in session may read.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn kernel() -> Arc<Kernel> {
         let cells: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::default();
         let store = Arc::clone(&cells);

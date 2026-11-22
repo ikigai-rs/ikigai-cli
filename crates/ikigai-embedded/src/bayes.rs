@@ -288,6 +288,8 @@ pub fn startup_line(counts: &[(&str, u64, u64)], state: &Path, source: Source) -
 /// One model's (spam, ham) message counts, read through its own `stats` door as root: the
 /// counts are the module's to derive, never this host's to recompute from its file.
 fn model_counts(space: &Arc<dyn Space>, model: &str) -> Result<(u64, u64), String> {
+    #[allow(clippy::disallowed_methods)]
+    // internal: reads a model's stats as root with `as` set inline; it routes no user arguments
     let kernel = Kernel::new(Arc::clone(space));
     let iri = Iri::parse(ikigai_bayes::model_iri(model, "stats"))
         .map_err(|e| format!("bayes: model `{model}`: {e}"))?;

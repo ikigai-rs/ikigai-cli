@@ -219,8 +219,7 @@ pub fn connect_issuer(
         origin.to_string(),
     ));
     let governed = policy.govern(vec![Arc::clone(&remote)]);
-    Kernel::with_meta_renderer(governed.slot(remote), Arc::new(crate::CliRenderer))
-        .with_cache_policy(Arc::new(NoCache))
+    crate::user_kernel(governed.slot(remote), Arc::new(NoCache))
 }
 
 /// Run `attempt` (a `--connect` dial and its admission check) under the policy's
@@ -247,6 +246,8 @@ pub fn first_dial<T: Send + 'static>(
         ))
     });
     let space = ikigai_core::EndpointSpace::new().bind(ikigai_core::Exact::new(DIAL), endpoint);
+    #[allow(clippy::disallowed_methods)]
+    // internal: the dial slot, one argument-less read of its own dial endpoint
     let kernel = Kernel::new(Arc::new(policy.retry(space))).with_cache_policy(Arc::new(NoCache));
     let read = Request::new(
         ikigai_core::Verb::Source,
@@ -258,7 +259,7 @@ pub fn first_dial<T: Send + 'static>(
 }
 
 /// A cache that stores nothing.
-struct NoCache;
+pub(crate) struct NoCache;
 
 impl CachePolicy for NoCache {
     fn admit(&self, _: &EntryFacts<'_>) -> bool {

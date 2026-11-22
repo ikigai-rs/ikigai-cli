@@ -454,6 +454,8 @@ mod tests {
             Arc::new(ikigai_jsonld::space()),
             Arc::new(ikigai_fs::cacheable_space(root)),
         ];
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(Fallback::new(spaces)))
             .with_clock(Arc::new(SystemClock))
             .with_aliases(crate::base_alias_table());
@@ -778,6 +780,8 @@ mod tests {
             Arc::new(EndpointSpace::new().bind(Exact::new(RESOURCE), Foaf)),
             Arc::new(ikigai_http::space(web as Arc<dyn HttpTransport>)),
         ];
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let bare = Kernel::new(Arc::new(Fallback::new(spaces)));
         let err =
             block_on(bare.issue(request_at("urn:foaf", IDENTIFIER, &[]), &Capability::root()))

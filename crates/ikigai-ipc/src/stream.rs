@@ -761,6 +761,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn kernel() -> Kernel {
         let size = FnEndpoint::new("size", |inv: &ikigai_core::Invocation<'_>| {
             let n = inv.inline_arg("content")?.len();
@@ -1184,6 +1185,8 @@ mod tests {
     /// as the Endpoint text it has always received.
     #[test]
     fn a_v9_peer_gets_the_collected_answer_or_over_budget() {
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let huge = Kernel::new(Arc::new(EndpointSpace::new().bind(
             Exact::new("urn:test:huge"),
             FnEndpoint::new("huge", |_: &ikigai_core::Invocation<'_>| {

@@ -30,6 +30,8 @@ pub fn keypair(name: &str, keystore: Option<String>) -> Result<Keypair, BoxError
         Some(dir) => FileBackend::new(dir),
         None => FileBackend::in_data_dir()?,
     };
+    #[allow(clippy::disallowed_methods)]
+    // internal: the example's own kernel, which routes no user arguments
     let kernel = Kernel::new(Arc::new(ikigai_secret::space(Arc::new(backend))));
     // Exactly this one secret: read it, and write it on the run that mints it.
     let capability = Capability::scoped([
