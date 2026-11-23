@@ -8099,13 +8099,21 @@ mod adapter_gate_tests {
     /// Every `hx-get="/k/<command>"` the rendered tab carries, in order, minus the tab
     /// strip's own navigation and the `clear` button — the same slice the page's
     /// `htmx:beforeRequest` handler takes.
+    ///
+    /// Each command is read back the way `ikigai serve`'s `/k/` reads it: the attribute
+    /// escaping reversed, then the path percent-decoded with the shared
+    /// [`ikigai_fn::html::percent_decode`], `+` left as `+` (it is not a space in a path).
+    /// Runbook 0.5.1 percent-encodes the command (ikigai-runbook PR 47); 0.5.0 and earlier
+    /// write it raw, and decoding a raw command changes it only if it holds a literal `%`.
     fn steps(html: &str) -> Vec<String> {
         let mut out = Vec::new();
         let mut rest = html;
         while let Some(at) = rest.find("hx-get=\"/k/") {
             rest = &rest[at + "hx-get=\"/k/".len()..];
             let end = rest.find('"').expect("a closed attribute");
-            let cmd = unescape(&rest[..end]);
+            let path = unescape(&rest[..end]);
+            let cmd = ikigai_fn::html::percent_decode(&path, false)
+                .unwrap_or_else(|e| panic!("`{path}` is not a percent-encoded path: {e:?}"));
             rest = &rest[end..];
             if cmd == "clear" || cmd.starts_with("source urn:runbook:") {
                 continue;
@@ -8113,6 +8121,35 @@ mod adapter_gate_tests {
             out.push(cmd);
         }
         out
+    }
+
+    /// A step rendered the way runbook 0.5.1 renders it (ikigai-runbook PR 47): the command
+    /// percent-encoded as one path segment, so `?` and `#` cannot cut the URL. Encoded with
+    /// [`ikigai_fn::html::url_segment`], the same path-segment encoding, since 0.5.1 is not yet
+    /// what this workspace resolves. A space, `?`, `#` and a literal `%` all come back unchanged.
+    #[test]
+    fn an_encoded_step_survives_the_round_trip_unchanged() {
+        let command = "source urn:iki:fn:echo text=what? #1 at 100% & <more>";
+        let encoded = ikigai_fn::html::url_segment(command);
+        assert!(!encoded.contains([' ', '?', '#']), "{encoded}");
+        let html = format!(
+            "<button hx-get=\"/k/{}\">Tab</button>\
+             <button class=\"rb-step\" hx-get=\"/k/{encoded}\">Run</button>\
+             <button hx-get=\"/k/clear\">Clear</button>",
+            // The tab strip's own navigation, as PR 47 writes it (every non-alphanumeric byte
+            // encoded), so the decoded command is what the tab filter compares.
+            "source%20urn%3Arunbook%3Abasics%20as%3Dtext%2Fhtml",
+        );
+        assert_eq!(steps(&html), vec![command.to_string()]);
+    }
+
+    /// Runbook 0.5.0 and earlier write the command raw (attribute-escaped only). Decoding a
+    /// command with no `%` in it changes nothing, so the same helper reads both renderings.
+    #[test]
+    fn an_unencoded_step_still_reads_as_written() {
+        let html = "<button hx-get=\"/k/source urn:runbook:basics as=text/html\">Tab</button>\
+                    <button hx-get=\"/k/sink urn:file:note.txt &quot;a+b&quot; &amp; c\">Run</button>";
+        assert_eq!(steps(html), vec!["sink urn:file:note.txt \"a+b\" & c"]);
     }
 
     /// The same Sink the step issues, at the kernel, under `capability` — the TYPED answer,
