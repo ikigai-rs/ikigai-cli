@@ -3877,7 +3877,7 @@ mod tests {
         let space = EndpointSpace::new().bind(
             Exact::new("urn:demo:gated"),
             ikigai_core::FnEndpoint::new("gated", |_inv| {
-                Err(Error::Denied("needs urn:cap:x".to_string()))
+                Err(Error::Denied("needs urn:cap:x".into()))
             }),
         );
         let path = socket_path("typed-denied");

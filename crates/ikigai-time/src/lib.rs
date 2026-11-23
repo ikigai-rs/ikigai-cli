@@ -1371,10 +1371,13 @@ pub fn space(registry: JobRegistry) -> EndpointSpace {
                     CancelOutcome::NotFound => Ok(text(format!("no job #{id}\n"))),
                     // Typed, so a caller can tell "not yours" from "not there" without
                     // parsing prose — and so a trace records it as the refusal it is.
-                    CancelOutcome::Withheld => Err(Error::Denied(format!(
-                        "job #{id} was scheduled under authority you do not hold; \
-                         cancelling it needs a capability that covers it"
-                    ))),
+                    CancelOutcome::Withheld => Err(Error::Denied(
+                        format!(
+                            "job #{id} was scheduled under authority you do not hold; \
+                             cancelling it needs a capability that covers it"
+                        )
+                        .into(),
+                    )),
                 }
             })
             .with_description(

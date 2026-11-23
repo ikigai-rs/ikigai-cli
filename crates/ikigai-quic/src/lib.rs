@@ -2096,7 +2096,7 @@ fn quic_error(e: io::Error) -> Error {
     // `Unavailable` means "nothing is listening", `Timeout` means "it is listening and
     // silent", and only the second says a degraded catalog is hiding real resources.
     if e.kind() == io::ErrorKind::PermissionDenied {
-        return Error::Denied(e.to_string());
+        return Error::Denied(e.to_string().into());
     }
     if e.kind() == io::ErrorKind::TimedOut {
         return Error::Timeout(format!("quic transport: {e}"));
@@ -3056,9 +3056,9 @@ mod tests {
                     path.into_bytes(),
                 ))
             } else {
-                Err(Error::Denied(format!(
-                    "capability does not grant read on `{path}`"
-                )))
+                Err(Error::Denied(
+                    format!("capability does not grant read on `{path}`").into(),
+                ))
             }
         });
         Kernel::new(Arc::new(
@@ -3778,7 +3778,7 @@ mod tests {
             let error = client.check_admission().unwrap_err();
             if code == UNAUTHORIZED {
                 assert!(
-                    matches!(&error, Error::Denied(message) if message == &format!(
+                    matches!(&error, Error::Denied(message) if **message == format!(
                         "the door at quic://{addr} refused the connection: the client certificate is not admitted"
                     )),
                     "{error}"
