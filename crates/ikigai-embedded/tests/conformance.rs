@@ -184,10 +184,14 @@ const INHERITED: &[(&str, &str)] = &[
     ("conditional", "ikigai-fn"),
     // ikigai-fn 0.7: `urn:iki:fn:each`.
     ("each", "ikigai-fn"),
+    // ikigai-fn 0.12 (the core 0.4.0 cascade, ledger #4088): `urn:iki:fn:digest`.
+    ("digest", "ikigai-fn"),
     ("echo", "ikigai-fn"),
     ("greet", "ikigai-fn"),
     // ikigai-fn 0.7.2: `urn:iki:fn:html-to-text` (ledger #2528).
     ("html-to-text", "ikigai-fn"),
+    // ikigai-fn 0.11: `urn:iki:fn:markdown`, reached by this host with the core 0.4.0 cascade (ledger #4088).
+    ("markdown", "ikigai-fn"),
     ("reverseList", "ikigai-fn"),
     ("split", "ikigai-fn"),
     ("toUpper", "ikigai-fn"),
@@ -223,8 +227,11 @@ const INHERITED: &[(&str, &str)] = &[
     ("jsonld-prune", "ikigai-jsonld"),
     ("llm-ask", "ikigai-llm"),
     ("llm-config", "ikigai-llm"),
+    // ikigai-llm 0.21 (the core 0.4.0 cascade, ledger #4088): the embedding endpoints.
+    ("llm-embed", "ikigai-llm"),
     ("llm-models", "ikigai-llm"),
     ("llm-ollama-ask", "ikigai-llm"),
+    ("llm-ollama-embed", "ikigai-llm"),
     ("llm-ollama-installed", "ikigai-llm"),
     ("llm-ollama-model", "ikigai-llm"),
     ("llm-ollama-up", "ikigai-llm"),

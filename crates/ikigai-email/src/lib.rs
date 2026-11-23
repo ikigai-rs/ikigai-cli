@@ -165,7 +165,9 @@ fn address_like(name: &str, value: &str) -> Result<String> {
 impl Endpoint for SendEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         if !inv.capability.allows(CAP_SEND) {
-            return Err(Error::Denied(format!("sending mail requires `{CAP_SEND}`")));
+            return Err(Error::Denied(
+                format!("sending mail requires `{CAP_SEND}`").into(),
+            ));
         }
         if inv.request.verb != Verb::Sink {
             return Err(Error::Endpoint(format!(

@@ -96,6 +96,7 @@ impl Session {
             input: input.to_string(),
             result: Err("session is refusing after a failed `cap`; enter a valid `cap <scope or profile>` or `cap reset` to resume".to_string()),
             cache: CacheStats::default(),
+            error: None,
         })
     }
 }

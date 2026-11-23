@@ -259,6 +259,7 @@ fn event_loop(
             input: String::new(),
             result: Ok(topology.join("\n")),
             cache: CacheStats::default(),
+            error: None,
         });
     }
     // Preload persisted command history when persistence is on — the flag is seeded
@@ -1218,6 +1219,7 @@ fn submit(state: &mut State, engine: &Session) -> bool {
             input: line,
             result: Ok(HELP.to_string()),
             cache: CacheStats::default(),
+            error: None,
         }),
         Action::Output(entry) => state.transcript.push(entry),
         // Drop the scrollback transcript; `state.history` (line recall) is untouched,
@@ -1245,6 +1247,7 @@ fn run_script(
                 input: line.to_string(),
                 result: Ok(HELP.to_string()),
                 cache: CacheStats::default(),
+                error: None,
             },
             Action::Clear | Action::Quit | Action::Noop => return,
         });
@@ -1257,6 +1260,7 @@ fn run_script(
                 input: command.to_string(),
                 result: Err(message),
                 cache: CacheStats::default(),
+                error: None,
             }),
         }
     }
@@ -1765,11 +1769,13 @@ mod tests {
             input: "source urn:time:now".into(),
             result: Ok("12:34".into()),
             cache: CacheStats::default(),
+            error: None,
         });
         state.transcript.push(Entry {
             input: "source urn:nope".into(),
             result: Err("no endpoint resolved".into()),
             cache: CacheStats::default(),
+            error: None,
         });
         state
     }
@@ -1818,12 +1824,14 @@ mod tests {
             input: String::new(),
             result: Ok("mount   prefer urn:llm: -> peer:plasma".to_string()),
             cache: CacheStats::default(),
+            error: None,
         }]);
         assert_eq!(note.len(), 1, "no prompt line for a host note: {note:?}");
         let typed = transcript_lines(&[Entry {
             input: "source urn:time:now".to_string(),
             result: Ok("12:00".to_string()),
             cache: CacheStats::default(),
+            error: None,
         }]);
         assert_eq!(typed.len(), 2, "a submitted line still gets its prompt");
     }
@@ -1878,11 +1886,13 @@ mod tests {
             input: "source urn:iki:fn:toUpper hi".into(),
             result: Ok("line one\nline two".into()),
             cache: CacheStats::default(),
+            error: None,
         });
         state.transcript.push(Entry {
             input: "source urn:iki:fn:nope".into(),
             result: Err("no endpoint resolved".into()),
             cache: CacheStats::default(),
+            error: None,
         });
         render(80, 5, &state); // transcript taller than the area → scrolled
         render(80, 24, &state);

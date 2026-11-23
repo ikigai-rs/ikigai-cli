@@ -261,9 +261,9 @@ pub struct DecideLink;
 impl Endpoint for DecideLink {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         if !inv.capability.allows(CAP_DECIDE_MINT) {
-            return Err(Error::Denied(format!(
-                "minting a decide link requires `{CAP_DECIDE_MINT}`"
-            )));
+            return Err(Error::Denied(
+                format!("minting a decide link requires `{CAP_DECIDE_MINT}`").into(),
+            ));
         }
         let id = inv
             .inline_str("id")
@@ -745,9 +745,9 @@ pub struct DecideAccept {
 impl Endpoint for DecideAccept {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         if !inv.capability.allows(CAP_DECIDE_ACCEPT) {
-            return Err(Error::Denied(format!(
-                "acting on a decision requires `{CAP_DECIDE_ACCEPT}`"
-            )));
+            return Err(Error::Denied(
+                format!("acting on a decision requires `{CAP_DECIDE_ACCEPT}`").into(),
+            ));
         }
         let tuple = inv
             .inline_str("content")
@@ -761,9 +761,10 @@ impl Endpoint for DecideAccept {
         // one with a calendar; a decision that isn't signed by our own key gets no further.
         let key = verifying_key_at(&self.key_path)?;
         if !token_valid(&id, &action, exp, &token, &key, now_secs()) {
-            return Err(Error::Denied(format!(
-                "decision for `{id}` is not signed by this host — refusing to act on it"
-            )));
+            return Err(Error::Denied(
+                format!("decision for `{id}` is not signed by this host — refusing to act on it")
+                    .into(),
+            ));
         }
 
         // Hand it to the same program a person would use at the terminal.

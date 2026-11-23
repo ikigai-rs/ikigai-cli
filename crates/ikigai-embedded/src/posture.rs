@@ -503,10 +503,13 @@ pub(crate) fn host_posture() -> FnEndpoint {
     FnEndpoint::new("host-posture", |inv: &Invocation<'_>| {
         // Declared = enforced: the ActionSpec below requires exactly this.
         if !inv.capability.allows(CAP_HOST_POSTURE) {
-            return Err(ikigai_core::Error::Denied(format!(
-                "reading this host's posture requires `{CAP_HOST_POSTURE}` — it reports \
+            return Err(ikigai_core::Error::Denied(
+                format!(
+                    "reading this host's posture requires `{CAP_HOST_POSTURE}` — it reports \
                  filesystem and socket paths, which describe the machine"
-            )));
+                )
+                .into(),
+            ));
         }
         let turtle = inv
             .inline_str("as")
