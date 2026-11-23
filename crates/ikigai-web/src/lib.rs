@@ -4606,7 +4606,7 @@ mod tests {
                 inv.capability.principal().unwrap_or("-")
             );
             if inv.request.verb == Verb::Delete {
-                return Err(Error::Denied(seen));
+                return Err(Error::Denied(seen.into()));
             }
             Ok(Representation::new(
                 ReprType::new("text/plain"),

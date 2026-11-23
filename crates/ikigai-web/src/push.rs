@@ -455,9 +455,9 @@ pub(crate) fn open(
             // A denial names the token the stream needs, in whichever body the door speaks:
             // the bare sentence as text, a `denied` object carrying it as JSON.
             let e = match e {
-                ikigai_core::Error::Denied(_) => {
-                    ikigai_core::Error::Denied(format!("an event stream needs `{CAP_LISTEN}`"))
-                }
+                ikigai_core::Error::Denied(denial) => ikigai_core::Error::Denied(
+                    denial.reworded(format!("an event stream needs `{CAP_LISTEN}`")),
+                ),
                 other => other,
             };
             let mut resp = error_resp(config, &e);
@@ -590,7 +590,7 @@ mod tests {
         .with_description(Description::new("board").verb(Verb::Source));
         let secret = FnEndpoint::new("secret", |inv: &Invocation<'_>| {
             if !inv.capability.allows(SECRET) {
-                return Err(ikigai_core::Error::Denied(format!("needs {SECRET}")));
+                return Err(ikigai_core::Error::Denied(format!("needs {SECRET}").into()));
             }
             Ok(text(b"secret").cacheable())
         })
