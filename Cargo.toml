@@ -1,6 +1,16 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+# RELEASE BRANCH ONLY (release/0.6-leaf, ledger #4088): the workspace is trimmed to the five
+# leaf crates, which depend on no other member, so they can move to ikigai-core 0.4 and release
+# before ikigai-ui (which ikigai-embedded needs, and which needs ikigai-web) can. Every other
+# crate directory is untouched on disk. main must NOT take this trim.
+members = [
+    "crates/ikigai-ipc",
+    "crates/ikigai-quic",
+    "crates/ikigai-time",
+    "crates/ikigai-web",
+    "crates/ikigai-wire",
+]
 
 [workspace.package]
 # 0.3.0 removes IKIGAI_GRANTS: use the global --grants <file> flag instead.
