@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 const BROWSER: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
 
+#[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
 fn kernel() -> Arc<Kernel> {
     let hostile = FnEndpoint::new("hostile", |_inv: &Invocation<'_>| {
         Err(Error::NotFound("<script>alert('x')</script> & co".into()))

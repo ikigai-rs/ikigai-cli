@@ -145,7 +145,7 @@ fn settings() -> &'static Result<Settings, String> {
         settings_from(&crate::config::entries_under("lisp.")).map_err(|e| {
             format!(
                 "{e} (in {}; see the `lisp.*` keys in ikigai-cli's README)",
-                crate::config::config_path().display()
+                crate::config::config_path_shown()
             )
         })
     })
@@ -187,7 +187,10 @@ fn prepare_steel_home_parent() {
         {
             return;
         }
-        if let Some(parent) = xdg::BaseDirectories::new().data_home {
+        if let Some(parent) = xdg::BaseDirectories::new()
+            .data_home
+            .filter(|parent| parent.is_absolute())
+        {
             // Best effort: a read-only home must not prevent pure evaluation.
             let _ = std::fs::create_dir_all(parent);
         }
@@ -406,6 +409,8 @@ mod tests {
             "a governed door the root does not bind"
         );
         // The ungoverned door still answers through the composed space.
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(govern(
             root,
             Duration::from_secs(5),

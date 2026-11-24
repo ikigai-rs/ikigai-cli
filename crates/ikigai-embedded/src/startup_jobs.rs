@@ -256,6 +256,7 @@ mod tests {
         serde_json::json!({"instance":"judge", "target":target, "method":"Sink", "every":"1s", "scopes":scopes}).to_string()
     }
 
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn fixture(case: &str) -> (StartupJobs, Arc<Manual>) {
         let ticks = Arc::new(Manual::default());
         let registry = JobRegistry::new(ticks.clone(), Arc::new(SystemClock));

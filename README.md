@@ -49,9 +49,13 @@ running in **another process** over IPC — same REPL, same commands:
 ```bash
 ikigai serve                    # run a kernel server on the default per-user socket
 ikigai --connect                # attach the REPL to it
-ikigai serve /tmp/k.sock        # …or an explicit socket path, on both sides
-ikigai --connect /tmp/k.sock -c 'source urn:iki:fn:toUpper hi'
+ikigai serve ~/k.sock           # …or an explicit socket path, on both sides
+ikigai --connect ~/k.sock -c 'source urn:iki:fn:toUpper hi'
 ```
+
+An explicit path must be in a directory of your own that nobody else can write, under
+directories owned by you or root: the server refuses `/tmp/k.sock`, since `/tmp` itself is
+shared with every account, and says which directory is wrong and how to fix it.
 
 The cache indicator then reflects the *server's* cache, so two clients sharing a
 server see each other's `cached` results. The socket lives in a `0700` per-user
@@ -64,9 +68,17 @@ Across a **network**, the same `serve` / `--connect` work over QUIC (built with
 
 ```bash
 ikigai cert generate                       # writes server/client certs to your config dir
-ikigai serve quic://0.0.0.0:4433           # run a QUIC kernel server
+ikigai serve quic://0.0.0.0:4433           # run a QUIC kernel server (needs clients.json)
 ikigai --connect quic://host:4433          # attach the REPL over QUIC
 ```
+
+**A QUIC door needs an enrollment.** It starts only when `<config home>/clients.json` (or the
+file `--clients` names) enrolls client certificates: each fingerprint maps to a grant in
+`grants.json`, and a certificate with no entry is refused. `ikigai cert add-client` prints the
+fingerprint to enroll. Without the file the door stops at start and names it. To serve every
+trusted certificate without one, start the door with `--allow-unenrolled`: each certificate is
+then served under the one `--cap` ceiling, or, with no `--cap`, in its own writable workspace,
+and the door prints a warning saying so. (Before this release that posture was the default.)
 
 A `quic://host:port` target selects QUIC; a plain path stays a Unix socket. Each
 side presents its own self-signed cert and pins the exact peer cert — no CA. On
@@ -317,6 +329,22 @@ The scheme is configurable — set `keybindings` from inside the REPL with
 (falling back to `~/.config/ikigai/config.toml` — the one shared config home, the
 same file the host reads `mail.*`, `mount` and `scheduler` from).
 
+`config.toml` holds flat `key = value` lines, one setting per line; `mount` and the other
+repeating keys take one line each. A value is a `"basic"` or `'literal'` TOML string, or a
+bare number or word, and a `#` after it starts a comment. A `[table]` header, a line with no
+`=`, an unclosed string, or anything after a string's closing quote stops startup with an
+`ikigai:` line naming the file and the line number, whichever program's key the line holds.
+
+The config home is shared with other programs, so the host checks keys only in its own
+families: a bare key (`files`, `store`, `mount`, `scheduler`, `keybindings`, ...), a key under
+`browse`, `bayes`, `cache`, `call`, `describe`, `http`, `ipc`, `layers`, `lisp`, `mail`,
+`passkey`, `quic` or `show`, and anything after one of the host's own instance names. An
+unknown key there (`mounts` for `mount`, `http.timeut`) stops startup the same way. The host's
+instance names are the one it runs under (`--name`) and the mode defaults `repl`, `serve`,
+`daemon` and `mcp`; any other first segment (`gonk.`, `web.`) is another program's namespace,
+and its keys are that program's to read and check. An instance named after another program
+(`--name gonk`) reads that program's keys as its own, so pick a name of its own.
+
 `--config-home <dir>` names the config home outright, in every mode (REPL, `-c`, `serve`,
 `mcp`, `--daemon`, `--connect`, `cert`), so a scratch run needs no environment variable:
 `ikigai --config-home ./scratch -c config`. `<dir>` IS the config home (it holds
@@ -324,6 +352,12 @@ same file the host reads `mail.*`, `mount` and `scheduler` from).
 directory. **The flag wins**: when both it and `XDG_CONFIG_HOME` are set, the environment is
 not read for the config home. It moves the config home only; the data home (`~/.ikigai`)
 stays put.
+
+An empty or relative `XDG_CONFIG_HOME` or `XDG_RUNTIME_DIR` counts as unset, as the XDG
+spec says, and `HOME` and `TMPDIR` are held to the same rule. A host with no usable config
+home stops with a message naming the variables and `--config-home`, and one with no usable
+home for its default workspace stops with a message naming `--files`; neither path is ever
+taken from the working directory.
 
 ```toml
 keybindings = "emacs"   # "emacs" (default) · "vi" · "native"
@@ -374,6 +408,11 @@ view, and `<config home>/ui/` supplies read-only, watched overrides. See
 
 ## Hosting layers on the QUIC door
 
+Contact forms can declare multiple intakes in `<config home>/intakes.json`, each with its own
+endpoint, fields, destination space, redirect, fixed fields and blocklist. The first row keeps
+`urn:contact:submit` as an alias. The booking intake can ask the same keyed block set
+through `<config home>/booking.json`. See [configured contact intakes](docs/intakes.md).
+
 When the config home has a **`layers/` directory**, `ikigai serve quic://…` hosts
 [ikigai-layers](https://crates.io/crates/ikigai-layers): independent shared spaces
 (`urn:layer:{layer}`), each a channel (append-only messages) or a tuplespace (work taken
@@ -411,7 +450,9 @@ ikigai serve quic://0.0.0.0:4434 --name layers
 - **State location** (entries, tuples, receipts, feeds), first match wins:
   `--layers-state <dir>` on `serve`; `layers.state = "<dir>"` in `config.toml`
   (instance-scoped as `<name>.layers.state`; relative to the config home, a leading `~` to `$HOME`);
-  else `~/.ikigai/layers/<name>` under the data home. No environment variable names it. One
+  else `~/.ikigai/layers/<name>` under the data home, where `<name>` (`--name`) must be one
+  plain file name (no separator, `..` or drive prefix) or the door refuses to start. No
+  environment variable names it. One
   door per state directory: the host holds `<state>/host.lock` while it lives, and a second
   door over the same directory is refused with the holder's pid.
 - **Encryption at rest** (ikigai-cli 0.1.67+, ikigai-layers 0.3.0): every file the
@@ -505,6 +546,24 @@ the one this process builds; `<target>` is a Unix socket path, `quic://host:port
 they FOLLOW, so two peers never share a certificate set. The config home's `mount` lines
 (`mount = "override urn:x:=quic://host:4433 ~/certs/x"`) say the same thing for the whole
 machine.
+
+`--mount` and `--override` dial while the process starts, and a peer that does not answer
+stops the start. On `ikigai serve`, `--pending` after one of them (`ikigai serve <s> --mount
+urn:x:=/tmp/x.sock --pending`) defers that mount's dial to first use instead: the host starts
+without the peer, a read answers `Unavailable` until the peer does, and no restart is needed.
+The startup banner's line for such a mount says `[pending: …]`. A `list` that found the peer
+absent does not look again for 30 seconds. `ikigai --daemon` needs no flag for this (ledger
+#3847): it still dials each `--mount` and `--override` (flag or `mount` line) at start, and one
+that does not answer (the dial times out, or no socket is listening) is kept rather than fatal.
+The daemon prints one warning line naming the target and starts; calls through that mount fail
+until the peer answers, and each one dials it again, so a peer that comes back is used with no
+restart. Only an unreachable peer is tolerated: a `quic://` address that does not parse, a
+certificate that cannot be read (`--cert-dir` naming the wrong directory), a `peer:<name>` this
+machine holds no certificate for, a transport the build lacks, and a peer that answers and
+refuses this client (not admitted, a certificate that does not match the pin, another wire
+version) still stop the daemon with exit 2, as before. The one-shot `-c`, the REPL and `mcp`
+still refuse to start on an unreachable peer too. A served host's mount flags go after the word
+`serve`; `ikigai --mount … serve <s>` is refused as an unknown argument.
 
 An alias mount at a whole first segment (`--mount urn:quakes:=…`) strips it: the peer
 receives `urn:quakes:regions` as `urn:regions`. An alias mount DEEPER than one segment
@@ -714,8 +773,8 @@ that shows a confirm page and a POST that only drops a tuple into `urn:space:con
 | link | minted by (edge daemon) | the click drops | the apply reactor |
 |---|---|---|---|
 | `/contact-block?email=…&id=…` | `urn:contactblock:link email= enquiry=` | `((block-email …) (enquiry …) (exp …))` | writes the block, trains `spam` |
-| `/contact-label?id=…&label=ham` | `urn:contactlabel:link label=ham enquiry=` | `((label "ham") (enquiry …) (exp …))` | trains `ham` |
-| `/contact-label?id=…&label=spam` | `urn:contactlabel:link label=spam enquiry=` | `((label "spam") (enquiry …) (exp …))` | trains `spam` |
+| `/contact-label?id=…&label=ham&class=…` | `urn:contactlabel:link label=ham class= enquiry=` | `((label "ham") (enquiry …) (exp …) (class …))` | trains `ham` |
+| `/contact-label?id=…&label=spam&class=…` | `urn:contactlabel:link label=spam class= enquiry=` | `((label "spam") (enquiry …) (exp …) (class …))` | trains `spam` |
 
 - **A link names its enquiry, never carries it.** `id` is the enquiry tuple's id in the contact
   space (its content address, `ikigai_intray::tuple_id`); the minter is handed the tuple exactly as
@@ -729,6 +788,12 @@ that shows a confirm page and a POST that only drops a tuple into `urn:space:con
   spam" link edited to say `spam` is refused; every bad link answers the same "That link didn't
   work" page. A block link minted before this change (it signed the bare `<email>|<exp>`) still
   blocks for its week, and trains nothing.
+- **A label link carries the filter's class, signed.** `class` (optional; one of `spam`, `unsure`,
+  `ham`, `unscored`) is the class the filter gave the enquiry when it was emailed. The label link
+  signs `contact-label|<label>|<enquiry>|<class>|<exp>` (the class empty when not given), so a link
+  cannot be re-pointed at another class, and the click's drop carries it as `class`. A label link
+  minted before this signed `contact-label|<label>|<enquiry>|<exp>`: it still records for its week,
+  with no class.
 - **The public door gains nothing that touches the model.** `urn:contact-label` verifies a link
   and drops a tuple, under the same ceiling as `urn:contact-block` (`urn:cap:space:out`).
   Training is the apply reactor's, under its own authority file.
@@ -743,7 +808,8 @@ so one segment cannot reach a deeper resource; `{+var}` opts into carrying them 
 `Accept` becomes the `as=` face, query parameters become named
 arguments, and every request resolves under the `--cap` ceiling. Besides the public
 intakes (`urn:contact:submit`, `urn:booking:submit` — validated forms that drop a
-tuple into a space), the emailed decision links and the passkey ceremony (whose two
+tuple into a space; the tuple stores the declared fields and the time received, never the
+submitter's IP address), the emailed decision links and the passkey ceremony (whose two
 endpoints declare `urn:cap:passkey:challenge` and `urn:cap:passkey:register` since the
 release after 0.1.63, so a ceiling that serves the ceremony lists both), it carries
 **`urn:iki:foaf`**: one FOAF document (`src=`), every face by negotiation — the RDF/XML as
@@ -1202,3 +1268,50 @@ introduced. The grants file's existing account protection checks still apply.
 Socket hosts can reuse the account-to-admission policy through
 `ikigai_embedded::socket` with the `ipc` feature enabled. `grants_path()` now
 returns `Result<Option<PathBuf>, String>` so hosts can report retired configuration.
+
+### Client enrollment configuration
+
+`IKIGAI_CLIENTS` is no longer supported. A set variable, including an empty one, stops
+host startup with a migration message; unset it and pass `--clients <file>` instead. The
+flag applies to `ikigai serve quic://…`, `ikigai layers-token` and `ikigai cert add-client`,
+and any other mode refuses it. Without it, the enrollment is read from
+`<config home>/clients.json`, which may be absent. A file named by `--clients` must exist:
+a missing one stops the door, and if it goes away while the door serves, every client is
+refused until it is back.
+
+`ikigai_embedded::clients::clients_path()` now returns
+`Result<Option<PathBuf>, String>`, and `clients::set_clients_path` sets the explicit path.
+
+## Several tools on one machine: a served host with mounts, under one retry policy
+
+The recommended shape for several tools on one machine is ONE local served host that mounts
+the hub (`ikigai serve <socket> --mount urn:hub:=quic://hub:4433`), with every tool connecting
+to that host. Its link to the hub then rides out an outage the same way for every tool, under
+one circuit breaker. Configure it in `config.toml` (every key optional; no key means no policy,
+today's behavior):
+
+```toml
+connect.retry.limit_minutes = 2            # overall time limit for one call (default 1)
+connect.retry.initial_backoff_ms = 100     # first backoff, doubling (default 100)
+connect.retry.max_backoff_ms = 10000       # largest backoff (default 10000)
+connect.retry.jitter = true                # full jitter (default true)
+connect.retry.breaker_threshold = 5        # consecutive failures that open a circuit (default: no breaker)
+connect.retry.breaker_cooloff_seconds = 30 # how long a circuit stays open (default 30)
+```
+
+The policy covers `--mount` and `--override` mounts (one shared breaker for all of them) and
+`--connect quic://…` (through a cache-less issuer, so reads stay as fresh as without it; the
+first dial and admission check ride the same policy, so a client started while its hub is down
+waits for it within the limit, while a refusal such as `Denied` still fails at once). A
+`--prefer` mount is left as it was: it already falls back to the local binding. Only what is
+safe is resent: reads, calls the transport proved never ran, and Sinks whose contract declares a
+resend safe (with the declared key present). A final failure is the typed `GaveUp`, which names
+the attempts and the elapsed time.
+
+Under `--connect`, a call's contract read (the `Meta` the REPL routes named, piped and
+positional arguments by) is retried under the same policy when the hub cannot be reached
+(ledger #4084), so a call made while the hub is down is routed by its contract once the hub is
+back, and never as text. A hub that stays down answers the transport's error, as the typed
+`GaveUp`, in the contract note and in the call's own `error:` line. That contract read and the
+call each get the policy's whole limit, so a hub that stays down is reported after up to twice
+`connect.retry.limit_minutes`.

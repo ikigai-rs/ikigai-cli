@@ -124,6 +124,7 @@ fn peer(home: &Path, certs: &Path, bind: &str, name: &str) -> Result<(Door, Stri
         &[
             "serve",
             bind,
+            "--allow-unenrolled",
             "--name",
             name,
             "--cert-dir",

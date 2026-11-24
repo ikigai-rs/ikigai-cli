@@ -113,6 +113,18 @@ space fires under the fallback is logged too, so a space created (or retargeted)
 start-up is not silent. A pinned space no longer needs its `handler` file, and the
 heartbeat still counts its dead letters.
 
+### Outbox retention
+
+A handled tuple stays in `<workspace>/spaces/<space>/outbox/` with its `<id>.out`
+note until something deletes it, and by default nothing does. To expire them, put
+one duration in `space-retention/<space>` in the config home: `7d`, `36h` or `90m`
+(`#` comments allowed; `off`, an empty file or no file keeps everything). The writer
+sweeps at start-up and then hourly, deleting each `outbox/<id>.tuple` received longer
+ago than that, then its note. It never touches `inbox/`, `.processing/` or `error/`.
+A space whose outbox something still reads, such as training, keeps it by having no
+entry. Each sweep that deletes something logs a count per space, and an entry that is
+not a duration logs a line and keeps the whole outbox.
+
 ## License
 
 MIT OR Apache-2.0.

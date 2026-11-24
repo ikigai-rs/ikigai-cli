@@ -92,6 +92,32 @@ host's deadline fires inside the client's and its answer names the peer
 (`the peer at quic://… did not describe itself within 20s`) instead of the client blaming
 the host (ledger #1288).
 
+## Draining a door
+
+A process that stops ends every call in flight, and a client whose write fails with a
+transport error cannot tell whether it applied. A host that means to stop or restart serves
+through `serve_draining_on` with a `Drain`, and calls `drain.trigger(cap)` once:
+
+```rust
+let drain = ikigai_quic::Drain::new();
+// hand a clone to whatever notices the shutdown signal, then:
+let served = ikigai_quic::serve_draining_on(kernel, socket, &id, admission, minter, idle, None, &drain)?;
+// `Served::Drained { cut_off: 0 }` is a clean drain; `Err` is a door that failed.
+```
+
+Triggering sends every live connection down the path a connection past its age bound takes:
+calls in progress finish and their replies are delivered, a new call is turned away unread
+(its stream reset under code 3), and the connection closes. A handshake that arrives is
+ignored rather than refused, so the client retransmits and connects to the next process on
+the port. The serve function returns once its connections have closed or `cap` has passed;
+a connection still working at the cap is closed, and counted in `cut_off`.
+
+A client treats a stream reset under code 3 as a call that never ran, so a turned-away Sink
+or Delete is sent again on a new connection. Any other lost reply stays the caller's to
+decide, as before. The streamed form (`issue_streamed`) does not re-send; a call turned away
+there fails as a transient. ⚠ The re-send's redial is bounded by the five-second connect
+timeout, so a next process that takes longer surfaces as a transient error.
+
 ## Build
 
 Native only, opt-in behind the CLI's `quic` feature. Built on **quinn + rustls +

@@ -53,6 +53,8 @@ async fn door(routes: Vec<Route>, routes_only: bool) -> (std::net::SocketAddr, A
     let page = FnEndpoint::new("page", |_inv: &Invocation<'_>| {
         Ok(Representation::new(ReprType::new("text/html"), b"<!doctype html><html lang=\"en\"><title>Note</title><main><h1>Note</h1><p>Saved</p></main></html>".to_vec()))
     }).with_description(Description::new("page").verb(Verb::Source));
+    #[allow(clippy::disallowed_methods)]
+    // internal: a test fixture's kernel; it routes no user arguments
     let kernel = Arc::new(Kernel::new(Arc::new(
         EndpointSpace::new()
             .bind(Exact::new("urn:test:note"), note)
@@ -270,6 +272,8 @@ async fn a_write_uses_one_route_snapshot_when_the_table_changes_during_the_sink(
         ))
     })
     .with_description(Description::new("note").verb(Verb::Sink));
+    #[allow(clippy::disallowed_methods)]
+    // internal: a test fixture's kernel; it routes no user arguments
     let kernel = Arc::new(Kernel::new(Arc::new(
         EndpointSpace::new().bind(Exact::new("urn:test:note"), note),
     )));

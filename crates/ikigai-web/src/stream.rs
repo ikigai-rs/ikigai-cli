@@ -8,6 +8,7 @@
 //! |---|---|
 //! | a buffer ([`Body::Bytes`]) | whole, exactly as before |
 //! | an [`HTTP_ENTITY`](crate::HTTP_ENTITY) envelope, any shape | whole: its headers ride inside it |
+//! | core's redirect answer ([`REDIRECT_MEDIA_TYPE`]), any shape | whole: core's reader takes no stream |
 //! | a [`Replay`] of known length up to [`BUFFER_BELOW`], read as a write's answer or with no content id | whole |
 //! | any other [`Replay`], or a one-shot [`Body::Once`] | streamed |
 //!
@@ -41,7 +42,9 @@ use crate::{
     HttpRequest, Resp, HTTP_ENTITY,
 };
 use futures_core::Stream;
-use ikigai_core::{Body, ByteStream, Bytes, Representation};
+use ikigai_core::{
+    media_type_essence, Body, ByteStream, Bytes, Representation, REDIRECT_MEDIA_TYPE,
+};
 use ikigai_http::range::{ContentRange, IfRange, Range};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -78,9 +81,10 @@ pub(crate) async fn settle(
     ranged: bool,
 ) -> ikigai_core::Result<Settled> {
     let envelope = repr.repr_type.media_type.eq_ignore_ascii_case(HTTP_ENTITY);
+    let redirect = media_type_essence(&repr.repr_type.media_type) == REDIRECT_MEDIA_TYPE;
     let whole = match &repr.bytes {
         Body::Bytes(_) => true,
-        _ if envelope => true,
+        _ if envelope || redirect => true,
         Body::Replay(replay) => match replay.len_hint() {
             Some(len) if len <= BUFFER_BELOW => !(ranged && replay.validator().is_some()),
             _ => false,

@@ -1,6 +1,6 @@
 {
   "about": "The ikigai wire's shared vectors (ikigai-wire, ledger #3165), computed by crates/ikigai-wire/tests/wire_vectors.rs, which fails if this file differs from what the codec writes. Faces copy this file verbatim. Hex is lowercase. `postcard` holds the postcard bytes of each type that crosses the wire, named by `type`; `value` describes the value in JSON (a u64 past 2^53 is a decimal string; bytes are {\"hex\": …} or {\"utf8\": …}; an enum is its variant name, or an object naming it; a Capability is \"root\" or {\"scoped\": [...]}). `hello` holds the hello payloads, which are NOT postcard: \"IKWH\", a u32 big-endian version, a u8 mode (0 Verbatim, 1 Alias), trailing bytes ignored. `exchanges` holds whole IPC exchanges: each side's framed hello, then one framed call and one framed reply; every frame is a u32 big-endian length, then the payload. The streamed frames of wire v10 are stream_frames.json.",
-  "protocol_version": 10,
+  "protocol_version": 11,
   "min_protocol_version": 7,
   "hello_magic": "494b5748",
   "max_frame": 67108864,
@@ -558,6 +558,21 @@
       "hex": "0d00086e6f20636c6f636b"
     },
     {
+      "name": "WireError/GaveUp",
+      "type": "WireError",
+      "value": {
+        "GaveUp": {
+          "attempts": 9,
+          "elapsed": {
+            "secs": 120,
+            "nanos": 123456789
+          },
+          "detail": "down"
+        }
+      },
+      "hex": "0e0978959aef3a04646f776e"
+    },
+    {
       "name": "Call/Issue",
       "type": "Call",
       "value": {
@@ -784,18 +799,18 @@
     {
       "name": "client/verbatim",
       "about": "a plain client's hello",
-      "version": 10,
+      "version": 11,
       "mode": "Verbatim",
-      "payload": "494b57480000000a00",
-      "framed": "00000009494b57480000000a00"
+      "payload": "494b57480000000b00",
+      "framed": "00000009494b57480000000b00"
     },
     {
       "name": "client/alias",
       "about": "an alias mount's hello",
-      "version": 10,
+      "version": 11,
       "mode": "Alias",
-      "payload": "494b57480000000a01",
-      "framed": "00000009494b57480000000a01"
+      "payload": "494b57480000000b01",
+      "framed": "00000009494b57480000000b01"
     },
     {
       "name": "client/oldest",
@@ -808,17 +823,17 @@
     {
       "name": "server/answer",
       "about": "a server's answer omits the mode byte; a reader defaults it to Verbatim",
-      "version": 10,
+      "version": 11,
       "mode": "Verbatim",
-      "payload": "494b57480000000a",
-      "framed": "00000008494b57480000000a"
+      "payload": "494b57480000000b",
+      "framed": "00000008494b57480000000b"
     }
   ],
   "exchanges": [
     {
-      "name": "v10/Source",
+      "name": "v11/Source",
       "transport": "ipc",
-      "peer_version": 10,
+      "peer_version": 11,
       "about": "a call under the root capability (Call::IssueAs) and a representative answer",
       "call": {
         "IssueAs": [
@@ -832,13 +847,13 @@
       },
       "call_payload": "03001075726e3a6578616d706c653a6e6f74650000",
       "reply_payload": "000a746578742f706c61696e000568656c6c6f0201",
-      "client_writes": "00000009494b57480000000a000000001503001075726e3a6578616d706c653a6e6f74650000",
-      "server_writes": "00000008494b57480000000a00000015000a746578742f706c61696e000568656c6c6f0201"
+      "client_writes": "00000009494b57480000000b000000001503001075726e3a6578616d706c653a6e6f74650000",
+      "server_writes": "00000008494b57480000000b00000015000a746578742f706c61696e000568656c6c6f0201"
     },
     {
-      "name": "v10/Sink",
+      "name": "v11/Sink",
       "transport": "ipc",
-      "peer_version": 10,
+      "peer_version": 11,
       "about": "a call under the root capability (Call::IssueAs) and a representative answer",
       "call": {
         "IssueAs": [
@@ -852,13 +867,13 @@
       },
       "call_payload": "03011075726e3a6578616d706c653a6e6f74650000",
       "reply_payload": "000a746578742f706c61696e000673746f7265640002",
-      "client_writes": "00000009494b57480000000a000000001503011075726e3a6578616d706c653a6e6f74650000",
-      "server_writes": "00000008494b57480000000a00000016000a746578742f706c61696e000673746f7265640002"
+      "client_writes": "00000009494b57480000000b000000001503011075726e3a6578616d706c653a6e6f74650000",
+      "server_writes": "00000008494b57480000000b00000016000a746578742f706c61696e000673746f7265640002"
     },
     {
-      "name": "v10/Exists",
+      "name": "v11/Exists",
       "transport": "ipc",
-      "peer_version": 10,
+      "peer_version": 11,
       "about": "a call under the root capability (Call::IssueAs) and a representative answer",
       "call": {
         "IssueAs": [
@@ -872,13 +887,13 @@
       },
       "call_payload": "03021075726e3a6578616d706c653a6e6f74650000",
       "reply_payload": "000a746578742f706c61696e00000200",
-      "client_writes": "00000009494b57480000000a000000001503021075726e3a6578616d706c653a6e6f74650000",
-      "server_writes": "00000008494b57480000000a00000010000a746578742f706c61696e00000200"
+      "client_writes": "00000009494b57480000000b000000001503021075726e3a6578616d706c653a6e6f74650000",
+      "server_writes": "00000008494b57480000000b00000010000a746578742f706c61696e00000200"
     },
     {
-      "name": "v10/Delete",
+      "name": "v11/Delete",
       "transport": "ipc",
-      "peer_version": 10,
+      "peer_version": 11,
       "about": "a call under the root capability (Call::IssueAs) and a representative answer",
       "call": {
         "IssueAs": [
@@ -892,13 +907,13 @@
       },
       "call_payload": "03031075726e3a6578616d706c653a6e6f74650000",
       "reply_payload": "000a746578742f706c61696e00000002",
-      "client_writes": "00000009494b57480000000a000000001503031075726e3a6578616d706c653a6e6f74650000",
-      "server_writes": "00000008494b57480000000a00000010000a746578742f706c61696e00000002"
+      "client_writes": "00000009494b57480000000b000000001503031075726e3a6578616d706c653a6e6f74650000",
+      "server_writes": "00000008494b57480000000b00000010000a746578742f706c61696e00000002"
     },
     {
-      "name": "v10/Meta",
+      "name": "v11/Meta",
       "transport": "ipc",
-      "peer_version": 10,
+      "peer_version": 11,
       "about": "a call under the root capability (Call::IssueAs) and a representative answer",
       "call": {
         "IssueAs": [
@@ -912,13 +927,13 @@
       },
       "call_payload": "03041075726e3a6578616d706c653a6e6f74650000",
       "reply_payload": "00106170706c69636174696f6e2f6a736f6e00027b7d0002",
-      "client_writes": "00000009494b57480000000a000000001503041075726e3a6578616d706c653a6e6f74650000",
-      "server_writes": "00000008494b57480000000a0000001800106170706c69636174696f6e2f6a736f6e00027b7d0002"
+      "client_writes": "00000009494b57480000000b000000001503041075726e3a6578616d706c653a6e6f74650000",
+      "server_writes": "00000008494b57480000000b0000001800106170706c69636174696f6e2f6a736f6e00027b7d0002"
     },
     {
-      "name": "v10/Source/not-found",
+      "name": "v11/Source/not-found",
       "transport": "ipc",
-      "peer_version": 10,
+      "peer_version": 11,
       "about": "a failure crosses as Reply::ErrorTyped with its taxonomy",
       "call": {
         "IssueAs": [
@@ -932,13 +947,13 @@
       },
       "call_payload": "03001075726e3a6578616d706c653a6e6f74650000",
       "reply_payload": "05050c6e6f2073756368206e6f7465",
-      "client_writes": "00000009494b57480000000a000000001503001075726e3a6578616d706c653a6e6f74650000",
-      "server_writes": "00000008494b57480000000a0000000f05050c6e6f2073756368206e6f7465"
+      "client_writes": "00000009494b57480000000b000000001503001075726e3a6578616d706c653a6e6f74650000",
+      "server_writes": "00000008494b57480000000b0000000f05050c6e6f2073756368206e6f7465"
     },
     {
-      "name": "v10/IsCached",
+      "name": "v11/IsCached",
       "transport": "ipc",
-      "peer_version": 10,
+      "peer_version": 11,
       "about": "whether the server's cache holds an answer",
       "call": {
         "IsCached": {
@@ -949,24 +964,24 @@
       },
       "call_payload": "01001075726e3a6578616d706c653a6e6f746500",
       "reply_payload": "0100",
-      "client_writes": "00000009494b57480000000a000000001401001075726e3a6578616d706c653a6e6f746500",
-      "server_writes": "00000008494b57480000000a000000020100"
+      "client_writes": "00000009494b57480000000b000000001401001075726e3a6578616d706c653a6e6f746500",
+      "server_writes": "00000008494b57480000000b000000020100"
     },
     {
-      "name": "v10/Entries",
+      "name": "v11/Entries",
       "transport": "ipc",
-      "peer_version": 10,
+      "peer_version": 11,
       "about": "the server's bindings",
       "call": "Entries",
       "call_payload": "02",
       "reply_payload": "0201011075726e3a6578616d706c653a6e6f7465046e6f746500",
-      "client_writes": "00000009494b57480000000a000000000102",
-      "server_writes": "00000008494b57480000000a0000001a0201011075726e3a6578616d706c653a6e6f7465046e6f746500"
+      "client_writes": "00000009494b57480000000b000000000102",
+      "server_writes": "00000008494b57480000000b0000001a0201011075726e3a6578616d706c653a6e6f7465046e6f746500"
     },
     {
-      "name": "v10/IssueTraced",
+      "name": "v11/IssueTraced",
       "transport": "ipc",
-      "peer_version": 10,
+      "peer_version": 11,
       "about": "a recorded call, answered with the server's spans",
       "call": {
         "IssueTraced": [
@@ -990,13 +1005,13 @@
       },
       "call_payload": "04000e75726e3a746573743a75707065720102696e01026869000700",
       "reply_payload": "040a746578742f706c61696e000248490001010e75726e3a746573743a75707065720e696b696761692d73636865642d3001e80701e20900010001010c75726e3a6361703a64656d6f01056d6f64656c0b6c6c616d61332e323a3362",
-      "client_writes": "00000009494b57480000000a000000001c04000e75726e3a746573743a75707065720102696e01026869000700",
-      "server_writes": "00000008494b57480000000a0000005c040a746578742f706c61696e000248490001010e75726e3a746573743a75707065720e696b696761692d73636865642d3001e80701e20900010001010c75726e3a6361703a64656d6f01056d6f64656c0b6c6c616d61332e323a3362"
+      "client_writes": "00000009494b57480000000b000000001c04000e75726e3a746573743a75707065720102696e01026869000700",
+      "server_writes": "00000008494b57480000000b0000005c040a746578742f706c61696e000248490001010e75726e3a746573743a75707065720e696b696761692d73636865642d3001e80701e20900010001010c75726e3a6361703a64656d6f01056d6f64656c0b6c6c616d61332e323a3362"
     },
     {
-      "name": "v10/IssueWith",
+      "name": "v11/IssueWith",
       "transport": "ipc",
-      "peer_version": 10,
+      "peer_version": 11,
       "about": "a call carrying its run's context, answered with a typed RetryAfter",
       "call": {
         "IssueWith": [
@@ -1019,8 +1034,8 @@
       },
       "call_payload": "05001075726e3a6578616d706c653a6e6f74650001010975726e3a6361703a6100010101dc0b",
       "reply_payload": "050a01d00f0c726174652d6c696d69746564",
-      "client_writes": "00000009494b57480000000a000000002605001075726e3a6578616d706c653a6e6f74650001010975726e3a6361703a6100010101dc0b",
-      "server_writes": "00000008494b57480000000a00000012050a01d00f0c726174652d6c696d69746564"
+      "client_writes": "00000009494b57480000000b000000002605001075726e3a6578616d706c653a6e6f74650001010975726e3a6361703a6100010101dc0b",
+      "server_writes": "00000008494b57480000000b00000012050a01d00f0c726174652d6c696d69746564"
     },
     {
       "name": "v8/IssueWith",

@@ -40,10 +40,14 @@ fn intake() -> ikigai_intake::IntakeConfig {
         attests: Vec::new(),
         redirect: None,
         check_blocked: false,
+        fixed_fields: Default::default(),
+        blocklist: None,
+        block_key: None,
     }
 }
 
 /// The intake at `urn:enquiry:submit` in front of a space that records every tuple dropped.
+#[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
 fn kernel() -> (Arc<Kernel>, Arc<Mutex<Vec<String>>>) {
     let dropped = Arc::new(Mutex::new(Vec::new()));
     let seen = Arc::clone(&dropped);

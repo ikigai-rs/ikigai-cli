@@ -138,6 +138,8 @@ async fn upload_door_as(
     let space = EndpointSpace::new()
         .bind(Exact::new("urn:t:upload"), measuring_sink())
         .bind(Exact::new("urn:t:who"), who_reads_sink(store.clone()));
+    #[allow(clippy::disallowed_methods)]
+    // internal: a test fixture's kernel; it routes no user arguments
     let kernel = Kernel::new(Arc::new(space))
         .with_spill(Arc::new(ikigai_fs::FileSpill::new(&spill.0).unwrap()))
         .with_content_store(store.clone());
@@ -245,6 +247,24 @@ async fn an_upload_past_its_bound_is_413_and_leaves_no_spill_file() {
     );
 }
 
+/// A grace too long for the clock to reach (`Duration::MAX`, "no deadline") is a deadline that
+/// never comes, not an overflow: the upload is taken. Before the fix the door's deadline
+/// arithmetic panicked and every upload's connection was dropped unanswered.
+#[tokio::test]
+async fn an_upload_under_a_grace_past_the_clock_is_taken() {
+    let door = upload_door("endless-grace", Some(1 << 20), Some((1, Duration::MAX))).await;
+    let body = vec![7u8; 3000];
+    let out = tokio::time::timeout(
+        Duration::from_secs(10),
+        send(door.addr, &put("/t/upload", &body)),
+    )
+    .await
+    .expect("the door should answer");
+    assert!(out.starts_with("HTTP/1.1 200 "), "{out:?}");
+    let id = ContentId::of(&body);
+    assert_eq!(split(&out).1, format!("content-id {id} 3000 {id}"), "{out}");
+}
+
 #[tokio::test]
 async fn a_too_slow_upload_is_cut_and_leaves_no_spill_file() {
     // 100 KiB a second after a 300 ms grace.
@@ -298,6 +318,7 @@ async fn without_a_spill_grant_an_upload_route_takes_the_body_into_memory() {
 
 /// The door will not start over a kernel that cannot carry its uploads.
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
 async fn uploads_refuse_a_kernel_without_a_spill_or_with_another_store() {
     let listener = || async { tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap() };
     let store = Arc::new(MemoryContentStore::new(1 << 20));

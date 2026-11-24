@@ -170,6 +170,8 @@ pub struct ComposedMount {
     pub prefix: String,
     pub target: String,
     pub cert_dir: Option<String>,
+    /// A mount that said `--pending`: not dialed at startup, so its peer may not be up.
+    pub pending: bool,
 }
 
 /// One trusted client certificate, as the process holds it.
@@ -247,8 +249,13 @@ fn mount_line(mount: &ComposedMount) -> String {
         Some(dir) => format!("  [certs {dir}]"),
         None => String::new(),
     };
+    let pending = if mount.pending {
+        "  [pending: dials on first use, Unavailable until the peer answers]"
+    } else {
+        ""
+    };
     format!(
-        "mount   {} {} -> {}{unchanged}{certs}",
+        "mount   {} {} -> {}{unchanged}{pending}{certs}",
         mount.mode, mount.prefix, mount.target
     )
 }
@@ -496,10 +503,13 @@ pub(crate) fn host_posture() -> FnEndpoint {
     FnEndpoint::new("host-posture", |inv: &Invocation<'_>| {
         // Declared = enforced: the ActionSpec below requires exactly this.
         if !inv.capability.allows(CAP_HOST_POSTURE) {
-            return Err(ikigai_core::Error::Denied(format!(
-                "reading this host's posture requires `{CAP_HOST_POSTURE}` — it reports \
+            return Err(ikigai_core::Error::Denied(
+                format!(
+                    "reading this host's posture requires `{CAP_HOST_POSTURE}` — it reports \
                  filesystem and socket paths, which describe the machine"
-            )));
+                )
+                .into(),
+            ));
         }
         let turtle = inv
             .inline_str("as")
@@ -556,6 +566,7 @@ mod tests {
             prefix: prefix.to_string(),
             target: target.to_string(),
             cert_dir: None,
+            pending: false,
         }
     }
 
@@ -629,6 +640,7 @@ mod tests {
             prefix: prefix.to_string(),
             target: "/tmp/quakes.sock".to_string(),
             cert_dir: None,
+            pending: false,
         };
         assert_eq!(
             mount_line(&mount("urn:quakes:near:")),
@@ -787,6 +799,7 @@ mod tests {
 
     /// A kernel binding only this endpoint, for the two tests that need to go through the
     /// kernel's capability gate rather than call the renderer.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn posture_kernel() -> ikigai_core::Kernel {
         ikigai_core::Kernel::new(std::sync::Arc::new(
             crate::EndpointSpace::new().bind(crate::Exact::new("urn:host:posture"), host_posture()),

@@ -761,6 +761,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn kernel() -> Kernel {
         let size = FnEndpoint::new("size", |inv: &ikigai_core::Invocation<'_>| {
             let n = inv.inline_arg("content")?.len();
@@ -895,6 +896,38 @@ mod tests {
         drop(client);
         server.join().unwrap();
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_trailing_gave_up_is_downgraded_only_for_v10() {
+        let original = Error::GaveUp {
+            attempts: u32::MAX,
+            elapsed: std::time::Duration::MAX,
+            detail: "\"quoted\"\n雪".into(),
+        };
+        for version in [10, 11] {
+            let body = Body::once(futures::stream::iter([
+                Ok(Bytes::from_static(b"partial")),
+                Err(original.clone()),
+            ]));
+            let mut out = Vec::new();
+            pump(body, &mut out, version).unwrap();
+            let mut frames = &out[..];
+            assert_eq!(
+                ikigai_wire::decode_body_frame(&read_frame(&mut frames).unwrap()).unwrap(),
+                BodyFrame::Chunk(Bytes::from_static(b"partial"))
+            );
+            let expected = if version == 10 {
+                WireError::Endpoint(original.to_string())
+            } else {
+                WireError::from(&original)
+            };
+            assert_eq!(
+                ikigai_wire::decode_body_frame(&read_frame(&mut frames).unwrap()).unwrap(),
+                BodyFrame::Abort(expected)
+            );
+            assert!(frames.is_empty());
+        }
     }
 
     /// The caller's body crosses as chunks and becomes the Sink's `content`, larger than one
@@ -1152,6 +1185,8 @@ mod tests {
     /// as the Endpoint text it has always received.
     #[test]
     fn a_v9_peer_gets_the_collected_answer_or_over_budget() {
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let huge = Kernel::new(Arc::new(EndpointSpace::new().bind(
             Exact::new("urn:test:huge"),
             FnEndpoint::new("huge", |_: &ikigai_core::Invocation<'_>| {

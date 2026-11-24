@@ -109,7 +109,12 @@ pub(crate) fn setup() -> Option<Browse> {
     let store_path = scoped("browse.store")
         .map(|p| expand_home("browse.store", &p))
         .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+            let home = crate::config::user_home().unwrap_or_else(|| {
+                panic!(
+                    "ikigai: HOME is not an absolute path, so browse.store has no default — \
+                     set browse.store in the config home"
+                )
+            });
             home.join(".ikigai").join("browse-store")
         });
     let store = Arc::new(Store::open(&store_path).unwrap_or_else(|e| {
@@ -275,12 +280,8 @@ fn ceiling(key: &str) -> Option<u32> {
 /// every other broken browse setting here does: before, it became a path under the working
 /// directory, which for `browse.store` is an archive nobody meant to open.
 fn expand_home(key: &str, path: &str) -> PathBuf {
-    expand_home_in(
-        key,
-        path,
-        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
-    )
-    .unwrap_or_else(|e| panic!("ikigai: {e} — fix the config"))
+    expand_home_in(key, path, crate::config::user_home().as_deref())
+        .unwrap_or_else(|e| panic!("ikigai: {e} — fix the config"))
 }
 
 /// [`expand_home`] with the home passed in, so the rule is testable without `$HOME`.

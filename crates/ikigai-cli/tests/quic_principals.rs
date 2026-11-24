@@ -294,6 +294,7 @@ fn the_airlock_shape_drains_as_before_and_names_its_client() {
         &home,
         &certs,
         &[
+            "--allow-unenrolled",
             "--cap",
             "urn:cap:space:read",
             "--cap",

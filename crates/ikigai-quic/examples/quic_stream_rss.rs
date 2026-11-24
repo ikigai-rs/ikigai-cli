@@ -106,6 +106,8 @@ fn main() {
     // Port 0, read back from the bound socket.
     let socket = ikigai_quic::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
     let addr = socket.local_addr().expect("bound address");
+    #[allow(clippy::disallowed_methods)]
+    // internal: the example's own kernel, which routes no user arguments
     let kernel = Kernel::new(Arc::new(
         EndpointSpace::new()
             .bind(Exact::new("urn:rss:lazy"), Hundred { lazy: true })

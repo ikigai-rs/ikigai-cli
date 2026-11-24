@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use ikigai_core::{CacheBound, Kernel, Lru};
+use ikigai_core::{CacheBound, CachePolicy, Lru};
 
 /// Validate the cache settings before any mode starts. Omitted bounds retain core's defaults.
 /// Embedded callers also validate when constructing a host kernel.
@@ -13,7 +13,9 @@ pub fn configure() -> Result<(), String> {
 fn bound() -> &'static Result<CacheBound, String> {
     static BOUND: OnceLock<Result<CacheBound, String>> = OnceLock::new();
     BOUND.get_or_init(|| {
-        let path = crate::config::config_path();
+        let Some(path) = crate::config::config_path() else {
+            return Ok(CacheBound::default());
+        };
         let result = match std::fs::read_to_string(&path) {
             Ok(text) => bound_from(&text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(CacheBound::default()),
@@ -23,9 +25,10 @@ fn bound() -> &'static Result<CacheBound, String> {
     })
 }
 
-pub(crate) fn apply(kernel: Kernel) -> Kernel {
+/// The configured representation cache policy every host surface takes.
+pub(crate) fn policy() -> Arc<dyn CachePolicy> {
     let bound = bound().as_ref().unwrap_or_else(|e| panic!("{e}"));
-    kernel.with_cache_policy(Arc::new(Lru::with_bound(*bound)))
+    Arc::new(Lru::with_bound(*bound))
 }
 
 // Not `config::entries_under_in`, on purpose: that reader skips a line with no `=` and strips

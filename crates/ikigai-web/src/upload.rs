@@ -160,7 +160,8 @@ impl Uploads {
     /// deadline is `grace` plus one second for every `bytes_per_second` received so far (the
     /// rule of Apache's `mod_reqtimeout` `MinRate`), so a client may pause while it is ahead;
     /// one that falls behind is cut with `408`. A rate of `0` is taken as `1`: there is always
-    /// a rate.
+    /// a rate. A deadline past what the clock can reach (a `grace` of `Duration::MAX`) is set
+    /// about 30 years out instead, so it never comes.
     pub fn min_rate(mut self, bytes_per_second: u64, grace: Duration) -> Uploads {
         self.min_rate = bytes_per_second.max(1);
         self.grace = grace;
@@ -415,7 +416,7 @@ impl<B> Paced<B> {
             grace,
             rate: rate.max(1),
             received: 0,
-            deadline: Box::pin(tokio::time::sleep_until(started + grace)),
+            deadline: Box::pin(tokio::time::sleep_until(after(started, grace))),
             cut,
         }
     }
@@ -424,7 +425,7 @@ impl<B> Paced<B> {
     fn due(&self) -> tokio::time::Instant {
         let earned_ms = u128::from(self.received) * 1000 / u128::from(self.rate);
         let earned = Duration::from_millis(u64::try_from(earned_ms).unwrap_or(u64::MAX));
-        self.started + self.grace.saturating_add(earned)
+        after(self.started, self.grace.saturating_add(earned))
     }
 
     fn end(&self, why: Cut) {
@@ -484,6 +485,18 @@ where
     }
 }
 
+/// How far off a deadline the clock cannot reach is set instead: about 30 years, tokio's own
+/// "far future" for a sleep too long to add.
+const FAR_FUTURE: Duration = Duration::from_secs(86_400 * 365 * 30);
+
+/// `start + wait`, or [`FAR_FUTURE`] from `start` when the clock cannot reach it: a grace of
+/// `Duration::MAX` is a deadline that never comes, not an overflow that panics the connection.
+fn after(start: tokio::time::Instant, wait: Duration) -> tokio::time::Instant {
+    start
+        .checked_add(wait)
+        .unwrap_or_else(|| start + FAR_FUTURE.min(wait))
+}
+
 /// `Paced` is `Unpin` (its body and timer are boxed), so its pin is a plain `&mut`.
 fn unsafe_free_mut<B>(paced: Pin<&mut Paced<B>>) -> &mut Paced<B> {
     Pin::into_inner(paced)
@@ -529,6 +542,23 @@ mod tests {
         assert!(matches!(ended, Err(Error::Timeout(_))), "{ended:?}");
         assert_eq!(*cut.lock().unwrap(), Some(Cut::Slow { rate: 1000 }));
         assert!(tokio::time::Instant::now() >= paced.started + Duration::from_millis(3001));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_grace_past_the_clock_is_a_deadline_that_never_comes() {
+        // Before the fix, `Instant + Duration::MAX` panicked here, and again in `due`.
+        let (mut tx, body) = channel();
+        let cut = Arc::new(Mutex::new(None));
+        let mut paced = Paced::new(body, 1, Duration::MAX, Arc::clone(&cut));
+        use futures::SinkExt;
+        tx.send(Ok(http_body::Frame::data(Bytes::from_static(b"abc"))))
+            .await
+            .unwrap();
+        assert_eq!(paced.next().await.unwrap().unwrap().len(), 3);
+        tokio::time::advance(Duration::from_secs(86_400 * 365)).await;
+        drop(tx);
+        assert!(paced.next().await.is_none(), "a year on, still not cut");
+        assert_eq!(*cut.lock().unwrap(), None);
     }
 
     #[tokio::test]

@@ -18,6 +18,7 @@ use std::sync::Arc;
 const DOOR: &str = "https://door.example";
 
 /// A note a page reads and writes, and a second page served under its own route.
+#[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
 fn kernel() -> Arc<Kernel> {
     let note = FnEndpoint::new("note", |inv: &Invocation<'_>| {
         let body = if inv.request.verb == Verb::Sink {

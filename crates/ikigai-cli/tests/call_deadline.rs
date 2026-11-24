@@ -123,6 +123,7 @@ fn a_silent_peer_costs_the_call_deadline_and_is_named() {
         &[
             "serve",
             "quic://127.0.0.1:0",
+            "--allow-unenrolled",
             "--name",
             "peer",
             "--cert-dir",

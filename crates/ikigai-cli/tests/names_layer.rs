@@ -305,7 +305,11 @@ fn edits_to_the_query_file_and_the_names_file_recompute() {
         "urn:quakes:count = source urn:json:query src=<urn:file:quakes.json> q=\".type\"\n",
     )
     .expect("edit the names");
+    // Stdout is piped, so an untyped read is the query's own JSON default, quotes and all
+    // (the text face is chosen only on a terminal, ledger #3838).
     until("source urn:quakes:count", "\"FeatureCollection\"");
+    // The rebound query's text face is still there for a caller who names it.
+    until("source urn:quakes:count as=text/plain", "FeatureCollection");
 
     drop(stdin);
     let _ = child.wait();

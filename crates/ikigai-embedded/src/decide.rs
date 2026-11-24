@@ -261,9 +261,9 @@ pub struct DecideLink;
 impl Endpoint for DecideLink {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         if !inv.capability.allows(CAP_DECIDE_MINT) {
-            return Err(Error::Denied(format!(
-                "minting a decide link requires `{CAP_DECIDE_MINT}`"
-            )));
+            return Err(Error::Denied(
+                format!("minting a decide link requires `{CAP_DECIDE_MINT}`").into(),
+            ));
         }
         let id = inv
             .inline_str("id")
@@ -745,9 +745,9 @@ pub struct DecideAccept {
 impl Endpoint for DecideAccept {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         if !inv.capability.allows(CAP_DECIDE_ACCEPT) {
-            return Err(Error::Denied(format!(
-                "acting on a decision requires `{CAP_DECIDE_ACCEPT}`"
-            )));
+            return Err(Error::Denied(
+                format!("acting on a decision requires `{CAP_DECIDE_ACCEPT}`").into(),
+            ));
         }
         let tuple = inv
             .inline_str("content")
@@ -761,9 +761,10 @@ impl Endpoint for DecideAccept {
         // one with a calendar; a decision that isn't signed by our own key gets no further.
         let key = verifying_key_at(&self.key_path)?;
         if !token_valid(&id, &action, exp, &token, &key, now_secs()) {
-            return Err(Error::Denied(format!(
-                "decision for `{id}` is not signed by this host — refusing to act on it"
-            )));
+            return Err(Error::Denied(
+                format!("decision for `{id}` is not signed by this host — refusing to act on it")
+                    .into(),
+            ));
         }
 
         // Hand it to the same program a person would use at the terminal.
@@ -906,6 +907,8 @@ mod tests {
 
     #[test]
     fn the_stylesheet_is_served_as_text_css() {
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = ikigai_core::Kernel::new(std::sync::Arc::new(
             ikigai_core::EndpointSpace::new().bind(ikigai_core::Exact::new(PAGE_CSS_IRI), PageCss),
         ));
@@ -1136,6 +1139,8 @@ mod endpoint_tests {
         std::fs::write(&key_path, pem).unwrap();
 
         let recorder = Recorder::default();
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(
             EndpointSpace::new()
                 .bind(
@@ -1330,6 +1335,8 @@ mod endpoint_tests {
         let (exp, token) = w.valid("approve");
         w.post_form("approve", ID, exp, &token);
         let tuple = w.dropped().pop().expect("the edge recorded the decision");
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(
             EndpointSpace::new()
                 .bind(
@@ -1368,6 +1375,8 @@ mod endpoint_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let ask = |key_path: std::path::PathBuf| {
+            #[allow(clippy::disallowed_methods)]
+            // internal: a test fixture's kernel; it routes no user arguments
             let kernel = Kernel::new(Arc::new(EndpointSpace::new().bind(
                 UriTemplate::parse("urn:calendar-request:{action}").unwrap(),
                 CalendarRequest { key_path },

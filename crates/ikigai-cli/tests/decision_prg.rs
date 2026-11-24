@@ -109,7 +109,7 @@ fn forms(keys: &Keys) -> Vec<Form> {
     let enquiry = "a".repeat(64);
     let decide = signed(&keys.decide, &format!("{BOOKING}|decline|{exp}"));
     let block = signed(&keys.block, &format!("contact-block|{SENDER}||{exp}"));
-    let label = signed(&keys.block, &format!("contact-label|spam|{enquiry}|{exp}"));
+    let label = signed(&keys.block, &format!("contact-label|spam|{enquiry}||{exp}"));
     vec![
         Form {
             path: "/calendar-request/decline".to_string(),

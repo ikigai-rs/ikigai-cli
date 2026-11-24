@@ -6,6 +6,7 @@ use ikigai_web::{public_cap, EdgeConfig, ReadRedirect};
 use std::sync::Arc;
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
 async fn get_and_head_keep_the_raw_query() {
     let addr = start(
         Arc::new(Kernel::new(Arc::new(EndpointSpace::new()))),
@@ -44,6 +45,7 @@ fn config() -> EdgeConfig {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
 async fn request(config: EdgeConfig, method: &str, path: &str, extra: &str) -> String {
     let addr = start(
         Arc::new(Kernel::new(Arc::new(EndpointSpace::new()))),
@@ -102,6 +104,7 @@ async fn writes_options_and_default_configuration_are_unchanged() {
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
 async fn admission_and_bounded_intake_refuse_before_redirecting() {
     let mut refused = config();
     refused.admit_fn = Some(Arc::new(|_| {
@@ -205,6 +208,8 @@ async fn a_post_to_a_redirect_path_still_invokes_the_endpoint() {
         ))
     })
     .with_description(Description::new("note").verb(Verb::Sink));
+    #[allow(clippy::disallowed_methods)]
+    // internal: a test fixture's kernel; it routes no user arguments
     let kernel = Arc::new(Kernel::new(Arc::new(
         EndpointSpace::new().bind(Exact::new("urn:old"), endpoint),
     )));

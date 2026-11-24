@@ -75,6 +75,8 @@ fn peer(socket: &Path) {
             format!("{retries},{left}").into_bytes(),
         ))
     });
+    #[allow(clippy::disallowed_methods)]
+    // internal: a test fixture's kernel; it routes no user arguments
     let kernel = Kernel::new(Arc::new(
         EndpointSpace::new().bind(Exact::new("urn:rec:probe"), probe),
     ))

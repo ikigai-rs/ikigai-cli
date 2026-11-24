@@ -112,6 +112,8 @@ fn mint_key(path: &Path) -> age::x25519::Identity {
         path.to_path_buf(),
         age::secrecy::ExposeSecret::expose_secret(&identity.to_string()),
     );
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
     identity
 }
 
@@ -908,9 +910,10 @@ fn a_layer_door_without_per_identity_grants_refuses_to_start() {
         assert!(!stderr.contains("serving on"), "{extra:?}: {stderr}");
     }
 
-    // The same config home without `layers/` is the door it always was.
+    // The same config home without `layers/` serves the shared posture when asked by name.
     std::fs::remove_dir_all(config_home(&home).join("layers")).unwrap();
-    let banner = start_or_refuse(&home, &certs, &[]).expect("a door without layers/ serves");
+    let banner = start_or_refuse(&home, &certs, &["--allow-unenrolled"])
+        .expect("a door without layers/ serves");
     assert!(banner.contains("per-client workspaces"), "{banner}");
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -1254,7 +1257,7 @@ fn a_widened_layer_door_still_binds_no_link_and_no_passkey_endpoint() {
     );
     let label_link = format!(
         "label=ham&id={enquiry}&exp={exp}&t={}",
-        signed(&block, &format!("contact-label|ham|{enquiry}|{exp}"))
+        signed(&block, &format!("contact-label|ham|{enquiry}||{exp}"))
     );
     let unbound = "no endpoint resolved";
     let show =

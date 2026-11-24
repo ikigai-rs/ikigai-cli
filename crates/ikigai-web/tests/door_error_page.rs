@@ -20,6 +20,7 @@ use std::time::Duration;
 const BROWSER: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
 const DOOR_PAGE: &str = "<!DOCTYPE html><title>the door's own page</title>";
 
+#[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
 fn kernel() -> Arc<Kernel> {
     let denied = FnEndpoint::new(
         "denied",

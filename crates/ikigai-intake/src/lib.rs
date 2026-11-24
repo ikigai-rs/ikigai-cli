@@ -25,6 +25,11 @@
 //! - **A honeypot field must stay empty.** Bots fill every input; humans never see it.
 //!   The rejection is deliberately indistinguishable from success to the submitter.
 //!
+//! - **No submitter is tracked.** The stored tuple holds the declared fields, the link
+//!   token's resolved client id (and attested fields) when one came along, and the transport's
+//!   `received` time. It never holds the submitter's IP address: the web layer passes one as
+//!   `client`, and it is not copied (ledger #3490).
+//!
 //! What this does NOT do is authorise: the endpoint is capability-gated, and rate limiting
 //! belongs in an overlay above it. CORS is browser-side only and is not a defence here.
 #![forbid(unsafe_code)]
@@ -151,6 +156,20 @@ pub struct IntakeConfig {
     pub space: String,
     /// The accepted fields, in the order a generated form should show them.
     pub fields: Vec<IntakeField>,
+    /// Trusted values appended after validation. Submitted keys with these names are ignored
+    /// and are never advertised as form inputs.
+    pub fixed_fields: std::collections::BTreeMap<String, String>,
+    /// The block set, as an IRI template naming each member by its key: it holds exactly one
+    /// [`BLOCK_KEY_PLACEHOLDER`] (`{key}`), e.g. `urn:blocked:owner:{key}`. The door asks
+    /// `Exists` on the template with a key filled in, once for the sender's address and once
+    /// for its domain (see [`BlockKey::sender_keys`]); either answering present drops the
+    /// submission silently. The address is never sent, only the keyed hash. When set,
+    /// overrides the legacy `check_blocked` switch and its `urn:decisions` resource, and needs
+    /// `block_key`. Fail-open: any answer but present (a `NotFound`, an unreachable or denied
+    /// set) admits the submission.
+    pub blocklist: Option<String>,
+    /// The key the host hashes sender addresses with for `blocklist`.
+    pub block_key: Option<BlockKey>,
     /// A field validated as an email address, if any (also used as the handler's reply-to).
     pub email_field: Option<String>,
     /// A honeypot input that must arrive empty — bots fill it, humans never see it.
@@ -201,6 +220,93 @@ pub struct IntakeConfig {
     pub check_blocked: bool,
 }
 
+/// The placeholder a `blocklist` template names its member key with.
+pub const BLOCK_KEY_PLACEHOLDER: &str = "{key}";
+
+/// The secret key for the keyed BLAKE3 hash that turns a sender's address into the key the
+/// block set is asked about. Without it, a block set's keys cannot be tied back to addresses
+/// by hashing a list of guesses, and with it the host never needs the address stored or sent.
+///
+/// Its `Debug` form never shows the key.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BlockKey([u8; blake3::KEY_LEN]);
+
+impl std::fmt::Debug for BlockKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BlockKey(..)")
+    }
+}
+
+impl BlockKey {
+    /// A key from its 32 bytes.
+    pub fn new(bytes: [u8; blake3::KEY_LEN]) -> BlockKey {
+        BlockKey(bytes)
+    }
+
+    /// A key from its text form: 64 hexadecimal digits, surrounding whitespace ignored.
+    pub fn from_hex(text: &str) -> std::result::Result<BlockKey, String> {
+        let text = text.trim();
+        if text.len() != blake3::KEY_LEN * 2 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("is not 64 hexadecimal digits (32 bytes)".to_string());
+        }
+        let mut bytes = [0u8; blake3::KEY_LEN];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16)
+                .map_err(|_| "is not 64 hexadecimal digits (32 bytes)".to_string())?;
+        }
+        Ok(BlockKey(bytes))
+    }
+
+    /// Read a key file holding 64 hexadecimal digits. Refused, never echoing its contents,
+    /// when it cannot be read, is not a key or, on unix, when group or others can reach it
+    /// (a root-owned file may be group-readable, as systemd's credential store writes it).
+    pub fn load(path: &std::path::Path) -> std::result::Result<BlockKey, String> {
+        let refuse = |why: String| format!("the block key {}: {why}", path.display());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta =
+                std::fs::metadata(path).map_err(|e| refuse(format!("cannot be read ({e})")))?;
+            let mode = meta.mode() & 0o777;
+            let allowed = if meta.uid() == 0 { 0o740 } else { 0o700 };
+            if mode & !allowed != 0 {
+                return Err(refuse(format!(
+                    "is mode {mode:o}, so others can reach it (fix: chmod 600 {})",
+                    path.display()
+                )));
+            }
+        }
+        let text =
+            std::fs::read_to_string(path).map_err(|e| refuse(format!("cannot be read ({e})")))?;
+        BlockKey::from_hex(&text).map_err(refuse)
+    }
+
+    /// The two keys a sender is looked up by, as lowercase hex: the keyed BLAKE3 hash of the
+    /// trimmed, lowercased address, then of `domain:<domain>` (its part after the `@`), so one
+    /// entry can block a whole domain. An address with no `@` has only the first.
+    pub fn sender_keys(&self, address: &str) -> Vec<String> {
+        let address = address.trim().to_lowercase();
+        let mut keys = vec![blake3::keyed_hash(&self.0, address.as_bytes())
+            .to_hex()
+            .to_string()];
+        if let Some((_, domain)) = address.rsplit_once('@') {
+            let domain = format!("domain:{domain}");
+            keys.push(
+                blake3::keyed_hash(&self.0, domain.as_bytes())
+                    .to_hex()
+                    .to_string(),
+            );
+        }
+        keys
+    }
+}
+
+/// The member IRI of a block set `template` for one `key`.
+fn block_member(template: &str, key: &str) -> Result<Iri> {
+    Iri::parse(template.replace(BLOCK_KEY_PLACEHOLDER, key))
+        .map_err(|e| Error::Endpoint(format!("bad blocklist: {e}")))
+}
+
 /// The query argument a link token arrives in (`…/booking/submit?k=TOKEN`).
 ///
 /// It rides the URL rather than the form so it never becomes a field in the generated UI,
@@ -232,10 +338,10 @@ pub fn submit(config: IntakeConfig) -> IntakeEndpoint {
     IntakeEndpoint { config }
 }
 
-/// Build the intake endpoint described by `config`, refusing a configuration that cannot be
-/// served as written: a `redirect` that `ikigai_fn::html::safe_href` refuses (a script or data
-/// URL, another host's `//` target, a relative `thanks.html`). The refusal is an
-/// `InvalidArgument` on `redirect` whose sentence names the intake and the redirect.
+/// Build the intake endpoint described by `config`, refusing invalid resource IRIs, field
+/// names, email-field references, blocklist settings and redirects. Refusals name the intake.
+/// A `redirect` that `ikigai_fn::html::safe_href` refuses (a script or data URL, another host's
+/// `//` target, a relative `thanks.html`) is an `InvalidArgument` on `redirect`.
 ///
 /// ```
 /// use ikigai_intake::{try_submit, IntakeConfig};
@@ -243,6 +349,9 @@ pub fn submit(config: IntakeConfig) -> IntakeEndpoint {
 ///     id: "contact".into(),
 ///     space: "urn:space:contact".into(),
 ///     fields: Vec::new(),
+///     fixed_fields: Default::default(),
+///     blocklist: None,
+///     block_key: None,
 ///     email_field: None,
 ///     honeypot: None,
 ///     requires: "urn:cap:contact:submit".into(),
@@ -259,6 +368,94 @@ pub fn submit(config: IntakeConfig) -> IntakeEndpoint {
 /// );
 /// ```
 pub fn try_submit(config: IntakeConfig) -> Result<IntakeEndpoint> {
+    let invalid = |name: &str, detail: String| Error::InvalidArgument {
+        name: name.to_string(),
+        detail: format!("the intake `{}` {detail}", config.id.escape_debug()),
+    };
+    for (name, iri) in [("space", &config.space), ("requires", &config.requires)] {
+        Iri::parse(iri).map_err(|e| {
+            invalid(
+                name,
+                format!("has invalid {name} `{}`: {e}", iri.escape_debug()),
+            )
+        })?;
+    }
+    if let Some(template) = &config.blocklist {
+        if template.matches(BLOCK_KEY_PLACEHOLDER).count() != 1 {
+            return Err(invalid(
+                "blocklist",
+                format!(
+                    "has blocklist `{}`, which must name its key exactly once as \
+                     `{BLOCK_KEY_PLACEHOLDER}`, e.g. `urn:blocked:{BLOCK_KEY_PLACEHOLDER}`",
+                    template.escape_debug()
+                ),
+            ));
+        }
+        block_member(template, &"0".repeat(blake3::OUT_LEN * 2)).map_err(|e| {
+            invalid(
+                "blocklist",
+                format!("has invalid blocklist `{}`: {e}", template.escape_debug()),
+            )
+        })?;
+        if config.block_key.is_none() {
+            return Err(invalid(
+                "blocklist",
+                "needs a block key to hash sender addresses with".into(),
+            ));
+        }
+    } else if config.block_key.is_some() {
+        return Err(invalid(
+            "block_key",
+            "has a block key but no blocklist to ask".into(),
+        ));
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for field in &config.fields {
+        if !field_name(&field.name) || !names.insert(&field.name) {
+            return Err(invalid(
+                "fields",
+                format!(
+                    "has an invalid or repeated field name `{}`",
+                    field.name.escape_debug()
+                ),
+            ));
+        }
+        if field.max_len == 0 {
+            return Err(invalid(
+                "fields",
+                format!("has field `{}` with a zero maximum length", field.name),
+            ));
+        }
+    }
+    for name in config.fixed_fields.keys() {
+        if !field_name(name) || name == VIA_FIELD || name == "received" || name.starts_with("via-")
+        {
+            return Err(invalid(
+                "fixed_fields",
+                format!(
+                    "has invalid or reserved fixed field `{}`",
+                    name.escape_debug()
+                ),
+            ));
+        }
+    }
+    if let Some(email) = &config.email_field {
+        if !names.contains(email) || config.fixed_fields.contains_key(email) {
+            return Err(invalid(
+                "email_field",
+                format!(
+                    "must declare email field `{}` as a submitted field",
+                    email.escape_debug()
+                ),
+            ));
+        }
+    }
+    if config.blocklist.is_some() && config.email_field.is_none() {
+        return Err(invalid(
+            "blocklist",
+            "needs an email_field to check its blocklist".into(),
+        ));
+    }
     if let Some(redirect) = &config.redirect {
         if ikigai_fn::html::safe_href(redirect).is_none() {
             return Err(Error::InvalidArgument {
@@ -273,6 +470,15 @@ pub fn try_submit(config: IntakeConfig) -> Result<IntakeEndpoint> {
         }
     }
     Ok(submit(config))
+}
+
+/// Whether a name can be emitted as an s-expression field atom.
+pub fn field_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// The response to a submission the endpoint accepted (a real one, or a honeypot hit that must
@@ -476,13 +682,25 @@ fn sexpr_string(value: &str) -> String {
     out
 }
 
+/// RFC 5322 `specials` other than `@` and `.`. A bare address (an addr-spec in dot-atom
+/// form, which is what an email box holds) never contains one; they only appear in display
+/// names (`Bob <a@x>`), groups (`g: a@x;`), comments, quoted local parts, domain literals
+/// and address lists.
+const ADDRESS_SPECIALS: &[char] = &['<', '>', '(', ')', '[', ']', ':', ';', ',', '"', '\\'];
+
 /// A minimal address shape check — one `@`, something either side, a dotted domain, no
-/// spaces. The MTA is the real authority; this turns obvious junk into a typed rejection.
+/// spaces, no control characters and none of the [`ADDRESS_SPECIALS`]. The MTA is the real
+/// authority; this turns obvious junk into a typed rejection, and keeps the value ONE bare
+/// address: `x<blocked@x.example>` names the same mailbox as `blocked@x.example`, but would
+/// not match it on the blocklist, and would carry a display name the submitter chose into the
+/// handler's Reply-To.
 fn address_like(value: &str) -> bool {
     let mut parts = value.split('@');
     matches!((parts.next(), parts.next(), parts.next()), (Some(local), Some(domain), None)
         if !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.'))
-        && !value.contains(char::is_whitespace)
+        && !value.contains(|c: char| {
+            c.is_whitespace() || c.is_control() || ADDRESS_SPECIALS.contains(&c)
+        })
 }
 
 #[async_trait]
@@ -490,10 +708,13 @@ impl Endpoint for IntakeEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         let config = &self.config;
         if !inv.capability.allows(&config.requires) {
-            return Err(Error::Denied(format!(
-                "submitting to `{}` requires `{}`",
-                config.space, config.requires
-            )));
+            return Err(Error::Denied(
+                format!(
+                    "submitting to `{}` requires `{}`",
+                    config.space, config.requires
+                )
+                .into(),
+            ));
         }
         if inv.request.verb != Verb::Sink {
             return Err(Error::Endpoint(format!(
@@ -508,6 +729,9 @@ impl Endpoint for IntakeEndpoint {
             .map_err(|_| Error::MissingArgument("content".to_string()))?;
         let fields = parse_body(body)?;
         let get = |name: &str| {
+            if config.fixed_fields.contains_key(name) {
+                return None;
+            }
             fields
                 .iter()
                 .find(|(k, _)| k == name)
@@ -525,7 +749,11 @@ impl Endpoint for IntakeEndpoint {
 
         // Only DECLARED fields are carried — an undeclared key never reaches the tuple.
         let mut carried: Vec<(String, String)> = Vec::new();
-        for field in &config.fields {
+        for field in config
+            .fields
+            .iter()
+            .filter(|f| !config.fixed_fields.contains_key(&f.name))
+        {
             let value = get(&field.name).filter(|v| !v.is_empty());
             match value {
                 Some(value) => {
@@ -592,28 +820,45 @@ impl Endpoint for IntakeEndpoint {
 
         // Reject a BLOCKED sender at the door, on either channel — a response byte-identical
         // to the honeypot's silent-accept, so a spammer learns nothing (no bounce, no "you're
-        // blocked"). Checked against the same `urn:decisions` the booking handler consults.
-        // FAIL-OPEN: only a definite "yes" blocks; an unreachable or unauthorised log lets the
-        // submission through, because a lost enquiry is worse than a leaked spam.
-        if config.check_blocked {
-            if let Some(email_field) = &config.email_field {
-                if let Some((_, email)) = carried.iter().find(|(k, _)| k == email_field) {
-                    let blocked = inv
-                        .issue(
-                            Request::new(
-                                Verb::Source,
-                                Iri::parse("urn:decisions").expect("literal"),
-                            )
-                            .with_arg("blocked", ArgRef::Inline(email.as_bytes().to_vec())),
-                        )
+        // blocked"). FAIL-OPEN: only a definite "blocked" drops; an unreachable or
+        // unauthorized blocklist lets the submission through, because a lost enquiry is worse
+        // than a leaked spam.
+        let email = config
+            .email_field
+            .as_ref()
+            .and_then(|field| carried.iter().find(|(k, _)| k == field))
+            .map(|(_, email)| email.as_str());
+        if let (Some(template), Some(email)) = (&config.blocklist, email) {
+            // A configured block set is asked `Exists` on a member named by a keyed hash, for
+            // the address and then its domain. The address itself is never sent. With no key
+            // (only `submit`, never `try_submit`, builds that) nothing is asked.
+            if let Some(key) = &config.block_key {
+                for member in key.sender_keys(email) {
+                    let present = inv
+                        .issue(Request::new(Verb::Exists, block_member(template, &member)?))
                         .await
-                        .ok()
-                        .and_then(|r| String::from_utf8(r.bytes).ok())
-                        .is_some_and(|s| s.trim() == "yes");
-                    if blocked {
+                        .is_ok();
+                    if present {
                         return Ok(accepted(config));
                     }
                 }
+            }
+        } else if let (true, Some(email)) = (config.check_blocked, email) {
+            // The legacy check: the `urn:decisions` log the booking handler consults.
+            let blocked = inv
+                .issue(
+                    Request::new(
+                        Verb::Source,
+                        Iri::parse("urn:decisions").expect("valid IRI"),
+                    )
+                    .with_arg("blocked", ArgRef::Inline(email.as_bytes().to_vec())),
+                )
+                .await
+                .ok()
+                .and_then(|r| String::from_utf8(r.bytes).ok())
+                .is_some_and(|s| s.trim() == "yes");
+            if blocked {
+                return Ok(accepted(config));
             }
         }
 
@@ -635,19 +880,32 @@ impl Endpoint for IntakeEndpoint {
             }
         }
 
-        // PROVENANCE comes from the TRANSPORT, never the body. The web layer sets these
-        // from the connection (`client` from the proxy's forwarded-for, `received` from
-        // its clock); a submitter cannot forge them, because only DECLARED body fields are
-        // carried above — a `client=` input in the form is simply dropped like any other
+        // PROVENANCE comes from the TRANSPORT, never the body. The web layer sets `received`
+        // from its clock; a submitter cannot forge it, because only DECLARED body fields are
+        // carried above — a `received=` input in the form is simply dropped like any other
         // undeclared key. Keeping the two sources separate is the whole point.
-        for name in ["received", "client"] {
-            if let Ok(value) = inv.inline_str(name) {
-                let value = value.trim();
-                if !value.is_empty() {
-                    carried.push((name.to_string(), value.to_string()));
-                }
+        //
+        // ★ The web layer also hands every write the submitter's address as `client`. It is
+        // deliberately NOT copied into the tuple (ledger #3490): nothing tracks individuals,
+        // so a stored submission carries no IP address. Abuse is handled at the door, whose
+        // per-source rate limit (`ikigai-web`'s `source_limit`) holds an address in memory
+        // only for its window and never writes it anywhere.
+        if let Ok(value) = inv.inline_str("received") {
+            let value = value.trim();
+            if !value.is_empty() {
+                carried.push(("received".to_string(), value.to_string()));
             }
         }
+
+        // Fixed fields are host configuration, never stranger-supplied data. Apply them
+        // only after validation and after provenance has been attached.
+        carried.retain(|(key, _)| !config.fixed_fields.contains_key(key));
+        carried.extend(
+            config
+                .fixed_fields
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
 
         // The tuple: an s-expression of escaped DATA, exactly what the handler's `read`
         // parses. Values cannot break out of their literal, so a hostile message is text.
@@ -684,7 +942,12 @@ impl Endpoint for IntakeEndpoint {
         // A `legacy()` field is the one asymmetry, and it is the point of that method: still
         // accepted above, no longer offered here, so a superseded field stops appearing on
         // the form without breaking the callers that still send it.
-        for field in self.config.fields.iter().filter(|f| f.advertised) {
+        for field in self
+            .config
+            .fields
+            .iter()
+            .filter(|f| f.advertised && !self.config.fixed_fields.contains_key(&f.name))
+        {
             let mut spec = ArgSpec::new(field.name.clone())
                 .summary(field.summary.clone())
                 .class(XSD_STRING);
@@ -804,9 +1067,13 @@ mod tests {
             attests: Vec::new(),
             redirect: None,
             check_blocked: false,
+            fixed_fields: Default::default(),
+            blocklist: None,
+            block_key: None,
         }
     }
 
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn kernel() -> (Kernel, Arc<Mutex<Vec<String>>>) {
         let dropped = Arc::new(Mutex::new(Vec::new()));
         let space = EndpointSpace::new()
@@ -848,6 +1115,7 @@ mod tests {
     }
 
     /// A kernel whose intake checks a blocklist that blocks exactly `blocked_email`.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn blocking_kernel(blocked_email: &str) -> (Kernel, Arc<Mutex<Vec<String>>>) {
         let mut cfg = config();
         cfg.check_blocked = true;
@@ -890,6 +1158,68 @@ mod tests {
         );
     }
 
+    /// A blocked sender cannot step around the blocklist by wrapping the address in a
+    /// display name or angle brackets: `x<spammer@x.example>` names the same mailbox (it is
+    /// what lands in the handler's Reply-To), but is not the string the log was asked about.
+    /// Only a bare address is an address here, so the wrapped forms are refused at the door.
+    #[test]
+    fn a_blocked_sender_cannot_wrap_the_address_to_slip_the_blocklist() {
+        for wrapped in [
+            "x%3Cspammer%40x.example%3E",
+            "%3Cspammer%40x.example%3E",
+            "%22Your+Bank%22%3Cspammer%40x.example%3E",
+        ] {
+            let (k, dropped) = blocking_kernel("spammer@x.example");
+            let outcome = block_on(k.issue(
+                post(&format!("name=Spammer&email={wrapped}&message=the+price")),
+                &block_cap(),
+            ));
+            assert_eq!(
+                dropped.lock().unwrap().as_slice(),
+                &[] as &[String],
+                "`{wrapped}` slipped the blocklist and dropped a tuple"
+            );
+            assert!(
+                matches!(outcome, Err(Error::InvalidArgument { ref name, .. }) if name == "email"),
+                "`{wrapped}` must be refused as an email address, got: {outcome:?}"
+            );
+        }
+    }
+
+    /// An email field carries ONE bare address: RFC 5322 specials other than `@` and `.`
+    /// (`< > ( ) [ ] : ; , " \`) only appear in display names, groups, comments, quoted local
+    /// parts and address lists, none of which a contact form's email box should produce.
+    #[test]
+    fn an_email_field_is_one_bare_address() {
+        let (k, dropped) = kernel();
+        for bad in [
+            "Bob<a@x.example>",
+            "<a@x.example>",
+            "a,b@x.example",
+            "a@x.example,b",
+            "g:a@x.example;",
+            "a(c)@x.example",
+            "\"a\"@x.example",
+            "a\\b@x.example",
+            "a@[192.0.2.1]",
+        ] {
+            let body = serde_json::json!({"name": "A", "message": "hi", "email": bad}).to_string();
+            let outcome = block_on(k.issue(post(&body), &cap()));
+            assert!(
+                matches!(outcome, Err(Error::InvalidArgument { ref name, .. }) if name == "email"),
+                "`{bad}` must be refused, got: {outcome:?}"
+            );
+        }
+        assert!(dropped.lock().unwrap().is_empty());
+        // An ordinary address with the atext a real one uses still lands.
+        block_on(k.issue(
+            post("name=A&message=hi&email=o%27brien%2Btag%40mail.x.example"),
+            &cap(),
+        ))
+        .unwrap();
+        assert_eq!(dropped.lock().unwrap().len(), 1);
+    }
+
     #[test]
     fn an_unblocked_sender_still_drops() {
         let (k, dropped) = blocking_kernel("spammer@x.example");
@@ -920,6 +1250,8 @@ mod tests {
                     dropped: dropped.clone(),
                 },
             );
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let k = Kernel::new(Arc::new(space));
         block_on(k.issue(post("name=X&email=x%40y.example&message=hi"), &cap())).unwrap();
         assert_eq!(
@@ -930,6 +1262,215 @@ mod tests {
     }
 
     /// A kernel whose contact intake redirects on success, plus the tuples it drops.
+    const BLOCK_SET: &str = "urn:blocked:owner:{key}";
+
+    fn block_key() -> BlockKey {
+        BlockKey::new([7; 32])
+    }
+
+    /// A stand-in block set: present for exactly the member keys in `present`, `NotFound`
+    /// otherwise. It records every question, so a test can see what reached it.
+    struct StubBlockSet {
+        present: Vec<String>,
+        asked: Arc<Mutex<Vec<Request>>>,
+    }
+    #[async_trait]
+    impl Endpoint for StubBlockSet {
+        async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+            self.asked.lock().unwrap().push(inv.request.clone());
+            let iri = inv.request.target.to_string();
+            let member = iri.rsplit(':').next().unwrap_or_default();
+            if inv.request.verb == Verb::Exists && self.present.iter().any(|k| k == member) {
+                Ok(Representation::new(ReprType::new("text/plain"), Vec::new()))
+            } else {
+                Err(Error::NotFound(iri))
+            }
+        }
+    }
+
+    /// A configured block set (`Some(present)`, or unbound with `None`), the kernel over it,
+    /// the tuples dropped and the questions the set was asked.
+    #[allow(clippy::type_complexity)]
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
+    fn keyed_kernel(
+        present: Option<Vec<String>>,
+    ) -> (Kernel, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<Request>>>) {
+        let mut cfg = config();
+        cfg.blocklist = Some(BLOCK_SET.to_string());
+        cfg.block_key = Some(block_key());
+        let endpoint = try_submit(cfg).expect("a keyed block set is a valid configuration");
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let mut space = EndpointSpace::new()
+            .bind(Exact::new("urn:contact:submit"), endpoint)
+            .bind(
+                Exact::new("urn:space:contact"),
+                RecordingSpace {
+                    dropped: dropped.clone(),
+                },
+            );
+        if let Some(present) = present {
+            space = space.bind(
+                UriTemplate::parse(BLOCK_SET).unwrap(),
+                StubBlockSet {
+                    present,
+                    asked: asked.clone(),
+                },
+            );
+        }
+        (Kernel::new(Arc::new(space)), dropped, asked)
+    }
+
+    fn keyed_cap() -> Capability {
+        Capability::scoped(["urn:cap:contact:submit"])
+    }
+
+    #[test]
+    fn sender_keys_hash_the_trimmed_lowercased_address_and_then_its_domain() {
+        let key = block_key();
+        let keys = key.sender_keys("  Spam@Example.ORG ");
+        assert_eq!(
+            keys,
+            vec![
+                blake3::keyed_hash(&[7; 32], b"spam@example.org")
+                    .to_hex()
+                    .to_string(),
+                blake3::keyed_hash(&[7; 32], b"domain:example.org")
+                    .to_hex()
+                    .to_string(),
+            ]
+        );
+        assert_eq!(keys, key.sender_keys("spam@example.org"));
+        assert_ne!(
+            keys,
+            BlockKey::new([8; 32]).sender_keys("spam@example.org"),
+            "the hash is keyed"
+        );
+        assert_eq!(
+            format!("{key:?}"),
+            "BlockKey(..)",
+            "Debug never shows the key"
+        );
+    }
+
+    #[test]
+    fn a_blocked_key_drops_silently() {
+        let blocked = block_key().sender_keys("spam@example.org")[0].clone();
+        let (k, dropped, asked) = keyed_kernel(Some(vec![blocked]));
+        let honest = block_on(k.issue(
+            post("name=X&email=ok%40example.org&message=hi"),
+            &keyed_cap(),
+        ))
+        .unwrap();
+        let r = block_on(k.issue(
+            post("name=X&email=SPAM%40example.org&message=buy"),
+            &keyed_cap(),
+        ))
+        .unwrap();
+        assert_eq!(r.bytes, honest.bytes, "a blocked sender learns nothing");
+        assert_eq!(
+            dropped.lock().unwrap().len(),
+            1,
+            "only the honest sender lands"
+        );
+        assert!(!dropped.lock().unwrap()[0].contains("SPAM"));
+        // Every question is an Exists on a member IRI with no arguments, and neither the
+        // address nor its domain appears in any of them.
+        for request in asked.lock().unwrap().iter() {
+            assert_eq!(request.verb, Verb::Exists);
+            assert!(request.args.is_empty(), "{request:?}");
+            let iri = request.target.to_string().to_lowercase();
+            assert!(iri.starts_with("urn:blocked:owner:"), "{iri}");
+            assert!(!iri.contains("example") && !iri.contains('@'), "{iri}");
+        }
+    }
+
+    #[test]
+    fn a_blocked_domain_drops_every_address_in_it() {
+        let domain = block_key().sender_keys("anyone@spam.example")[1].clone();
+        let (k, dropped, _) = keyed_kernel(Some(vec![domain]));
+        for email in ["a%40spam.example", "B%40Spam.Example"] {
+            block_on(k.issue(
+                post(&format!("name=X&email={email}&message=buy")),
+                &keyed_cap(),
+            ))
+            .unwrap();
+        }
+        assert!(dropped.lock().unwrap().is_empty());
+        block_on(k.issue(
+            post("name=X&email=a%40ham.example&message=hi"),
+            &keyed_cap(),
+        ))
+        .unwrap();
+        assert_eq!(dropped.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_expired_block_not_found_admits() {
+        // The set answers NotFound for every key: a block that has expired, or never was.
+        let (k, dropped, asked) = keyed_kernel(Some(Vec::new()));
+        block_on(k.issue(
+            post("name=X&email=once%40spam.example&message=hi"),
+            &keyed_cap(),
+        ))
+        .unwrap();
+        assert_eq!(dropped.lock().unwrap().len(), 1, "NotFound admits");
+        assert_eq!(
+            asked.lock().unwrap().len(),
+            2,
+            "the address and then its domain"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_keyed_blocklist_admits() {
+        let (k, dropped, _) = keyed_kernel(None);
+        block_on(k.issue(post("name=X&email=x%40y.example&message=hi"), &keyed_cap())).unwrap();
+        assert_eq!(
+            dropped.lock().unwrap().len(),
+            1,
+            "unreachable blocklist -> fail open"
+        );
+    }
+
+    #[test]
+    fn try_submit_refuses_a_block_set_without_a_key_placeholder_or_key() {
+        let refused = |blocklist: Option<&str>, key: Option<BlockKey>| {
+            let mut cfg = config();
+            cfg.blocklist = blocklist.map(str::to_string);
+            cfg.block_key = key;
+            try_submit(cfg).err().map(|e| e.to_string())
+        };
+        assert!(refused(Some(BLOCK_SET), Some(block_key())).is_none());
+        for (blocklist, key, needle) in [
+            (Some("urn:decisions"), Some(block_key()), "exactly once"),
+            (Some("urn:b:{key}:{key}"), Some(block_key()), "exactly once"),
+            (
+                Some("not an iri {key}"),
+                Some(block_key()),
+                "invalid blocklist",
+            ),
+            (Some(BLOCK_SET), None, "needs a block key"),
+            (None, Some(block_key()), "no blocklist"),
+        ] {
+            let error = refused(blocklist, key).expect("refused");
+            assert!(error.contains(needle), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_block_key_is_64_hex_digits() {
+        let hex = "07".repeat(32);
+        assert_eq!(
+            BlockKey::from_hex(&format!(" {hex}\n")).unwrap(),
+            block_key()
+        );
+        for bad in ["", "07", &"zz".repeat(32), &"07".repeat(33)] {
+            assert!(BlockKey::from_hex(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn redirecting_kernel(url: &str) -> (Kernel, Arc<Mutex<Vec<String>>>) {
         let mut cfg = config();
         cfg.redirect = Some(url.to_string());
@@ -1192,6 +1733,7 @@ mod tests {
     type TokenedKernel = (Kernel, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>);
 
     /// An intake that resolves link tokens, plus the registry's record of lookups.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn tokened_kernel() -> TokenedKernel {
         let mut cfg = config();
         cfg.clients = Some("urn:client:{token}".to_string());
@@ -1286,6 +1828,7 @@ mod tests {
     }
 
     /// An intake with a zone field, to exercise the tzdata check.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn zoned_kernel() -> (Kernel, Arc<Mutex<Vec<String>>>) {
         let mut cfg = config();
         cfg.fields
@@ -1432,24 +1975,40 @@ mod tests {
     #[test]
     fn provenance_comes_from_the_transport_and_cannot_be_forged_in_the_body() {
         let (k, dropped) = kernel();
-        // The body TRIES to claim a different client; the transport arg is the real one.
-        let request = post("name=X&email=x%40y.com&message=hi&client=1.2.3.4")
-            .with_arg("client", ArgRef::Inline(b"203.0.113.9".to_vec()))
+        // The body TRIES to claim a different arrival time; the transport arg is the real one.
+        let request = post("name=X&email=x%40y.com&message=hi&received=1999-01-01T00:00:00Z")
             .with_arg("received", ArgRef::Inline(b"2026-07-22T19:40:00Z".to_vec()));
         block_on(k.issue(request, &cap())).unwrap();
         let tuple = dropped.lock().unwrap()[0].clone();
         assert!(
-            tuple.contains(r#"(client "203.0.113.9")"#),
-            "the transport's client wins: {tuple}"
+            tuple.contains(r#"(received "2026-07-22T19:40:00Z")"#),
+            "the transport's clock wins: {tuple}"
         );
         assert!(
-            !tuple.contains("1.2.3.4"),
+            !tuple.contains("1999"),
             "a body field cannot forge provenance: {tuple}"
         );
-        assert!(
-            tuple.contains(r#"(received "2026-07-22T19:40:00Z")"#),
-            "{tuple}"
-        );
+    }
+
+    /// Ledger #3490: nothing tracks individuals, so a dropped tuple carries no address —
+    /// neither the one the transport attaches as `client` nor one a body tries to smuggle in.
+    #[test]
+    fn a_dropped_tuple_carries_no_ip_address() {
+        let (k, dropped) = kernel();
+        for transport in ["203.0.113.9", "2001:db8::7"] {
+            let request = post("name=X&email=x%40y.com&message=hi&client=198.51.100.4")
+                .with_arg("client", ArgRef::Inline(transport.as_bytes().to_vec()))
+                .with_arg("received", ArgRef::Inline(b"2026-07-22T19:40:00Z".to_vec()));
+            block_on(k.issue(request, &cap())).unwrap();
+            let tuple = dropped.lock().unwrap().last().unwrap().clone();
+            assert!(!tuple.contains("(client "), "no client field: {tuple}");
+            assert!(!tuple.contains(transport), "no transport address: {tuple}");
+            assert!(!tuple.contains("198.51.100.4"), "no body address: {tuple}");
+            assert!(
+                tuple.contains(r#"(received "2026-07-22T19:40:00Z")"#),
+                "the arrival time is still recorded: {tuple}"
+            );
+        }
     }
 
     #[test]
@@ -1465,6 +2024,7 @@ mod tests {
     }
 
     /// An intake with one tightly bounded field, to exercise the door's length check.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn bounded_kernel() -> (Kernel, Arc<Mutex<Vec<String>>>) {
         let mut cfg = config();
         cfg.fields
@@ -1548,6 +2108,7 @@ mod tests {
     }
 
     /// An intake whose `message` has been superseded but is still accepted.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn legacy_kernel() -> (Kernel, Arc<Mutex<Vec<String>>>) {
         let mut cfg = config();
         for field in &mut cfg.fields {

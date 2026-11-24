@@ -29,6 +29,7 @@
 
 mod accept;
 
+use std::ffi::OsString;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -95,6 +96,15 @@ pub fn serve_shared(kernel: Arc<Kernel>, path: &Path) -> io::Result<()> {
 /// reached. Anything at `path` that is not a socket (or a link to one) is refused too, never
 /// removed.
 ///
+/// ★ **The socket's directories must be this user's** (ledger #3634). Before anything is
+/// bound, the socket's directory is resolved to its real path and walked up to `/`: the
+/// directory itself must be owned by this user and not writable by group or others, and every
+/// directory above it must be owned by this user or root and not writable by group or others
+/// unless it is sticky (`/tmp`). Whoever can write a directory on the path can rename what is
+/// below it, and so remove or replace the socket. Anything else is refused with
+/// [`PermissionDenied`](io::ErrorKind::PermissionDenied), naming the directory, its owner or
+/// mode, and the fix. A stale socket is removed only when this user owns it.
+///
 /// The dial, the removal and the bind run under an exclusive lock on `<path>.lock` (an `flock`,
 /// held only for those three steps and released when this returns), so two servers starting at
 /// once cannot both find the old socket dead and remove each other's: the second waits, then
@@ -114,11 +124,22 @@ pub fn serve_shared(kernel: Arc<Kernel>, path: &Path) -> io::Result<()> {
 /// # Ok::<(), std::io::Error>(())
 /// ```
 pub fn bind(path: &Path) -> io::Result<UnixListener> {
+    bind_as(path, own_uid())
+}
+
+/// [`bind`] for a process whose uid is `me`: the tests pass another uid to stand in for a
+/// directory or a stale socket another account owns.
+fn bind_as(path: &Path, me: u32) -> io::Result<UnixListener> {
+    check_socket_dirs(path, me)?;
     let _held = bind_lock(path)?;
-    clear_stale(path)?;
+    clear_stale(path, me)?;
     // ambient: net: binds the socket path a host's door was given (`ikigai serve <path>` or its default, gonk's socket door), never a request name
     #[allow(clippy::disallowed_methods)]
     let listener = UnixListener::bind(path)?;
+    // The socket exists with the umask's mode until the next line narrows it to 0600. That
+    // window does not let another account talk to the door: every connection's peer uid is
+    // checked on accept (`SO_PEERCRED` / `getpeereid`) and anyone but this user is refused,
+    // and the directories above were just checked to be this user's alone.
     // ambient: fs: sets the mode of the socket this call just bound, at that same path, to 0600; no other path
     #[allow(clippy::disallowed_methods)]
     let restricted = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
@@ -141,7 +162,8 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
 ///
 /// Every directory above the parent must let the admitted UIDs search it too, or their
 /// `connect` fails with a permission error; this is not checked, since it does not widen who
-/// can connect. The per-user defaults ([`default_socket_path`]: `$XDG_RUNTIME_DIR`, macOS's
+/// can connect. What IS checked above it is the same as for [`bind`]: each is owned by this
+/// user or root and writable by nobody else unless sticky. The per-user defaults ([`default_socket_path`]: `$XDG_RUNTIME_DIR`, macOS's
 /// per-user `$TMPDIR`) are `0700` and cannot be shared: a shared door names its own path.
 ///
 /// # Errors
@@ -149,6 +171,11 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
 /// As [`bind`], and [`PermissionDenied`](io::ErrorKind::PermissionDenied) naming the directory,
 /// what is wrong with it and the fix.
 pub fn bind_shared(path: &Path, gid: u32) -> io::Result<UnixListener> {
+    bind_shared_as(path, gid, own_uid())
+}
+
+/// [`bind_shared`] for a process whose uid is `me` (see [`bind_as`]).
+fn bind_shared_as(path: &Path, gid: u32, me: u32) -> io::Result<UnixListener> {
     use std::os::unix::fs::MetadataExt;
     let dir = match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
@@ -162,7 +189,7 @@ pub fn bind_shared(path: &Path, gid: u32) -> io::Result<UnixListener> {
             format!("the socket directory {}: {e}", dir.display()),
         )
     })?;
-    if let Some(problem) = shared_dir_problem(meta.uid(), meta.gid(), meta.mode(), own_uid(), gid) {
+    if let Some(problem) = shared_dir_problem(meta.uid(), meta.gid(), meta.mode(), me, gid) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
@@ -172,8 +199,10 @@ pub fn bind_shared(path: &Path, gid: u32) -> io::Result<UnixListener> {
             ),
         ));
     }
+    // The directory itself passed the stricter check above; this walks the ones above it.
+    check_socket_dirs(path, me)?;
     let _held = bind_lock(path)?;
-    clear_stale(path)?;
+    clear_stale(path, me)?;
     // ambient: net: binds the shared door's socket path (`ikigai serve` when its principals table admits other accounts), never a request name
     #[allow(clippy::disallowed_methods)]
     let listener = UnixListener::bind(path)?;
@@ -272,6 +301,102 @@ pub fn gid_of_group(name: &str) -> io::Result<u32> {
     }
 }
 
+/// What `lstat` says about one directory on a socket's path (see [`socket_dirs_problem`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DirStat {
+    is_dir: bool,
+    uid: u32,
+    mode: u32,
+}
+
+/// Refuse to serve at `path` unless its directory and every one above it are safely this
+/// user's (see [`bind`]). The directory is resolved to its real path first, so a symlink on
+/// the way is judged by what it points at.
+fn check_socket_dirs(path: &Path, me: u32) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    // ambient: fs: resolves the directory of the socket path a host's door was given to its real path, to check who owns it and every directory above it
+    #[allow(clippy::disallowed_methods)]
+    let real = std::fs::canonicalize(dir).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("the socket directory {}: {e}", dir.display()),
+        )
+    })?;
+    let mut stat = |d: &Path| {
+        // ambient: fs: reads the owner and mode of one directory on that socket's real path (the socket's own directory or one above it), to refuse an unsafe one
+        #[allow(clippy::disallowed_methods)]
+        let meta = std::fs::symlink_metadata(d)?;
+        Ok(DirStat {
+            is_dir: meta.is_dir(),
+            uid: meta.uid(),
+            mode: meta.mode(),
+        })
+    };
+    match socket_dirs_problem(&real, me, &mut stat) {
+        Some(problem) => Err(io::Error::new(io::ErrorKind::PermissionDenied, problem)),
+        None => Ok(()),
+    }
+}
+
+/// What is wrong with `dir` (a real path) and the directories above it as the home of a
+/// socket served by uid `me`, reading each through `stat`; `None` when nothing is. `dir`
+/// itself must be a directory owned by `me` that group and others cannot write; each one
+/// above must be owned by `me` or root and not writable by group or others unless sticky.
+fn socket_dirs_problem(
+    dir: &Path,
+    me: u32,
+    stat: &mut dyn FnMut(&Path) -> io::Result<DirStat>,
+) -> Option<String> {
+    let mut current = Some(dir);
+    while let Some(d) = current {
+        let first = d == dir;
+        let shown = d.display();
+        let place = if first {
+            format!("refusing to serve a socket in {shown}")
+        } else {
+            format!("refusing to serve a socket under {shown}")
+        };
+        let st = match stat(d) {
+            Ok(st) => st,
+            Err(e) => return Some(format!("{place}: could not read it: {e}")),
+        };
+        if !st.is_dir {
+            return Some(format!("{place}: it is not a directory"));
+        }
+        if st.uid != me && (first || st.uid != 0) {
+            let fix = if st.uid == 0 {
+                let base = if d == Path::new("/") {
+                    String::new()
+                } else {
+                    shown.to_string()
+                };
+                format!("Serve in a directory of your own, such as {base}/ikigai-{me}")
+            } else {
+                format!("Remove {shown}, or serve in a directory of your own")
+            };
+            return Some(format!(
+                "{place}: it is owned by uid {}, not this user (uid {me}), so that account \
+                 could remove or replace the socket. {fix}",
+                st.uid
+            ));
+        }
+        let bits = st.mode & 0o7777;
+        if bits & 0o022 != 0 && (first || bits & 0o1000 == 0) {
+            return Some(format!(
+                "{place}: its mode is {bits:04o}, writable by group or others, who could \
+                 remove or replace the socket. Run `chmod go-w {shown}`, or serve in a \
+                 directory of your own"
+            ));
+        }
+        current = d.parent();
+    }
+    None
+}
+
 /// Take the exclusive lock that orders binders of `path` (see [`bind`]): `<path>.lock`, created
 /// `0600` if absent. The lock is released when the returned file drops.
 fn bind_lock(path: &Path) -> io::Result<std::fs::File> {
@@ -304,15 +429,16 @@ fn bind_lock(path: &Path) -> io::Result<std::fs::File> {
 }
 
 /// Make `path` free for a bind without taking it from anyone: nothing there is fine; a socket
-/// (or a link) nobody answers on is removed; a live server, or a file that is not a socket, is
+/// (or a link) owned by `me` that nobody answers on is removed; a live server, or a file that is not a socket, is
 /// an error. Called under [`bind_lock`].
-fn clear_stale(path: &Path) -> io::Result<()> {
+fn clear_stale(path: &Path, me: u32) -> io::Result<()> {
     use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::fs::MetadataExt;
     // ambient: fs: asks what is at the socket path a host's door was given (a socket, a link or something else), before it may be replaced
     #[allow(clippy::disallowed_methods)]
     let found = std::fs::symlink_metadata(path);
-    let kind = match found {
-        Ok(meta) => meta.file_type(),
+    let (kind, owner) = match found {
+        Ok(meta) => (meta.file_type(), meta.uid()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
@@ -354,7 +480,18 @@ fn clear_stale(path: &Path) -> io::Result<()> {
                 io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
             ) =>
         {
-            // ambient: fs: removes only that socket path, and only a socket or link nobody answers on (checked just above, under the bind lock)
+            if owner != me {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing to replace the stale socket {}: it is owned by uid {owner}, \
+                         not this user (uid {me}). Remove it as its owner, or serve on another \
+                         path",
+                        path.display()
+                    ),
+                ));
+            }
+            // ambient: fs: removes only that socket path, and only a socket or link of this user's that nobody answers on (checked just above, under the bind lock)
             #[allow(clippy::disallowed_methods)]
             let removed = std::fs::remove_file(path);
             match removed {
@@ -538,12 +675,12 @@ pub fn serve_shared_on(kernel: Arc<Kernel>, listener: UnixListener) -> io::Resul
 ///   One past it is answered, not dropped: the door reads its hello and its first call, each
 ///   within a second, and answers that call with a typed
 ///   [`Unavailable`](Error::Unavailable) naming the cap, a transient a Retry overlay acts on.
-///   (A connection closed without a word reads to the client as a server that predates wire
-///   v6, which would misreport a busy door.) That exchange runs on the accept loop, so while
-///   the door is full it takes at most about two seconds per refused connection, and it spawns
-///   no thread.
+///   This distinguishes a busy door from a lost connection. That exchange runs on the accept
+///   loop, so while the door is full it takes at most about two seconds per refused connection,
+///   and it spawns no thread.
 /// - **A hello timeout.** A connection that has not sent its hello within
-///   `limits.hello_timeout()` is closed.
+///   `limits.hello_timeout()` is closed. The bound is on the whole hello, not on each read,
+///   so a peer that trickles its hello cannot hold its place past it.
 /// - **An idle timeout.** A connection silent between calls for `limits.idle_timeout()` is
 ///   closed, and so is one whose reply cannot be written for that long.
 ///
@@ -785,26 +922,36 @@ impl Drop for Slot {
 
 /// Turn away a connection that arrived with the door full: answer its hello, then answer its
 /// first call with a typed [`Unavailable`](Error::Unavailable), then close. Each step waits at
-/// most [`REFUSAL_TIMEOUT`], since this runs on the accept loop. A client that sends no call in
-/// that time finds the socket closed when it does, and a healing [`IpcResolver`] redials and
-/// replays straight into this refusal, so it still reads the typed answer.
+/// most [`REFUSAL_TIMEOUT`] IN ALL, since this runs on the accept loop. A client that sends no
+/// call in that time finds the socket closed when it does, and a healing [`IpcResolver`]
+/// redials and replays straight into this refusal, so it still reads the typed answer.
+///
+/// ★ Each step is a [`Deadline`], not a socket timeout (ledger #3476). `SO_RCVTIMEO` bounds
+/// ONE read, so a peer that trickled its hello a byte at a time, each inside the timeout, held
+/// the accept loop (and with it every other client of the door) for as long as it liked.
 fn refuse_over_capacity(stream: UnixStream, cap: usize) {
-    let _ = stream.set_read_timeout(Some(REFUSAL_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(REFUSAL_TIMEOUT));
-    let mut stream = &stream;
-    let Some(version) = answer_hello(&mut stream) else {
+    let step = || Deadline::new(REFUSAL_TIMEOUT, false);
+    let bounded = |deadline| Bounded {
+        stream: &stream,
+        standing: Some(REFUSAL_TIMEOUT),
+        deadline: Some(deadline),
+    };
+    let hello = step();
+    let Some(version) = answer_hello(&mut bounded(&hello)) else {
         return;
     };
     // Any first frame, a plain call or a streamed call's head: the refusal answers it either
     // way (a streamed caller still writing its body meets the close, and reads this answer).
-    if read_frame(&mut stream).is_err() {
+    let call = step();
+    if read_frame(&mut bounded(&call)).is_err() {
         return;
     }
     let refusal = Error::Unavailable(format!(
         "the kernel server is at its limit of {cap} connections; try again shortly"
     ));
+    let answer = step();
     let _ = stream::write_reply(
-        &mut stream,
+        &mut bounded(&answer),
         Reply::ErrorTyped(WireError::from(&refusal)),
         version,
     );
@@ -869,8 +1016,8 @@ pub fn connect_with_timeout(path: &Path, timeout: Option<Duration>) -> io::Resul
 /// The full connect: dial, then exchange the version [`Hello`] — REQUIRED
 /// since v7 (the v6 legacy-reconnect tolerance is gone). A v7 server is met by
 /// redialing at 7 (see the private `handshake`). A peer outside the spoken
-/// range errors naming BOTH versions; a peer that hangs up on the hello
-/// predates v6 entirely and is refused with that diagnosis.
+/// range errors naming BOTH versions; a peer that hangs up on the hello is
+/// unavailable (it may be restarting or predate v6). No legacy reconnect is attempted.
 ///
 /// The server must run as this user; [`connect_expecting`] names another account as well. Every
 /// dial checks that before it sends anything, so a call's arguments never reach a server under
@@ -1037,8 +1184,8 @@ fn hello_at(
                 "the kernel server answered the version hello with something else entirely",
             )),
         },
-        // Silence is a HANG (the server may be overloaded — do not misdiagnose
-        // it as ancient); a hang-up (EOF/reset) is the pre-v6 signature.
+        // Silence is a timeout; a hang-up is unavailable. A pre-v6 server also
+        // closes on a hello it cannot decode, so EOF alone cannot prove its version.
         Err(e)
             if matches!(
                 e.kind(),
@@ -1050,14 +1197,15 @@ fn hello_at(
                 "no answer to the version hello within the deadline (server hung or overloaded)",
             ))
         }
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
+        Err(e) if is_dead_connection(&e) => Err(io::Error::new(
+            e.kind(),
             format!(
-                "the kernel server at {} hung up on the version hello — it predates wire v6 \
-                 and cannot speak v{PROTOCOL_VERSION}; update the server",
+                "the kernel server at {} closed during the version hello (it may be restarting \
+                 or predate wire v6); retry or update the server",
                 path.display()
             ),
         )),
+        Err(e) => Err(e),
     }
 }
 
@@ -1785,16 +1933,31 @@ fn handle_connection(kernel: &Kernel, stream: UnixStream) {
 
 /// Serve one connection: the version hello first, then calls until the peer
 /// hangs up, falls silent past `limits` (see [`serve_shared_on_with`]), or sends a wire error.
+///
+/// ★ The hello (reading it and answering it) is bounded by `limits.hello_timeout()` IN ALL,
+/// a [`Deadline`], not a socket timeout (ledger #3478). `SO_RCVTIMEO` bounds ONE read, so
+/// peers that trickled their hellos a byte at a time, each inside the timeout, held their
+/// places for as long as they liked, and enough of them filled the cap: every later client,
+/// the owner included, was refused as over capacity.
+///
+/// The calls after the hello keep the idle timeout per read. An admitted peer may hold its
+/// place indefinitely by making real calls inside the idle timeout, so bounding a call's
+/// frame in total would take nothing from a trickler and would cut off a slow honest one.
 fn serve_connection(kernel: &Kernel, stream: UnixStream, limits: &Limits, admission: &Admission) {
-    // Ignored on failure: a socket the peer already closed refuses `setsockopt` on macOS, and
-    // the read below reports that death properly.
-    let _ = stream.set_read_timeout(Some(limits.hello_timeout));
-    let _ = stream.set_write_timeout(Some(limits.idle_timeout));
-    let mut stream = &stream;
-    let Some(peer_version) = answer_hello(&mut stream) else {
+    let hello = Deadline::new(limits.hello_timeout, false);
+    let peer_version = answer_hello(&mut Bounded {
+        stream: &stream,
+        standing: Some(limits.hello_timeout),
+        deadline: Some(&hello),
+    });
+    let Some(peer_version) = peer_version else {
         return;
     };
+    // Ignored on failure: a socket the peer already closed refuses `setsockopt` on macOS, and
+    // the read below reports that death properly.
     let _ = stream.set_read_timeout(Some(limits.idle_timeout));
+    let _ = stream.set_write_timeout(Some(limits.idle_timeout));
+    let mut stream = &stream;
     loop {
         // EOF, a malformed frame, or silence past the idle timeout ends the session.
         let Ok(payload) = read_frame(&mut stream) else {
@@ -1832,7 +1995,7 @@ fn serve_connection(kernel: &Kernel, stream: UnixStream, limits: &Limits, admiss
 /// variant. A hello outside the range gets our own version (so the CLIENT can
 /// name both in its error) and a close. A frame WITHOUT the magic is a ≤v5
 /// client and is refused.
-fn answer_hello(stream: &mut &UnixStream) -> Option<u32> {
+fn answer_hello(stream: &mut (impl io::Read + io::Write)) -> Option<u32> {
     let first = read_frame(stream).ok()?;
     match decode_hello(&first) {
         Some(hello) => {
@@ -2053,27 +2216,55 @@ fn dispatch(kernel: &Kernel, call: Call, admission: &Admission) -> Reply {
 }
 
 /// The default per-user socket path: `<runtime-dir>/ikigai/kernel.sock`, with the
-/// `ikigai` directory created `0700` so only this user can reach the socket.
-/// `<runtime-dir>` is `$XDG_RUNTIME_DIR` when set, else `$TMPDIR`/`/tmp` plus the
-/// uid. `None` if the directory can't be created.
+/// `ikigai` directory created `0700` so only this user can reach the socket. Whether
+/// `<runtime-dir>` and the directories above it are this user's is checked when the socket is
+/// bound ([`bind`]): another account could have created `$TMPDIR/ikigai-<uid>` first.
+/// `<runtime-dir>` is `$XDG_RUNTIME_DIR`, else `$TMPDIR` or `/tmp` plus the uid, each only
+/// when absolute, so it is never relative to the working directory. `None` if the directory
+/// can't be created.
 pub fn default_socket_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let tmp =
-                std::env::var_os("TMPDIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
-            tmp.join(format!("ikigai-{}", own_uid()))
-        });
+    let base = runtime_dir(
+        std::env::var_os("XDG_RUNTIME_DIR"),
+        std::env::var_os("TMPDIR"),
+        own_uid(),
+    );
+    socket_path_in(&base).ok()
+}
+
+/// Make `<base>/ikigai` (each missing directory `0700`), narrow it to `0700`, and return the
+/// socket path inside it. Who owns `base` and the directories above is not checked here but by
+/// [`bind`], which refuses with a sentence naming the directory and the fix.
+fn socket_path_in(base: &Path) -> io::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
     let dir = base.join("ikigai");
-    // ambient: fs: creates only `<runtime-dir>/ikigai`, the per-user socket directory, for `ikigai serve`/`ikigai --connect` when no socket path is given
+    // ambient: fs: creates only `<runtime-dir>/ikigai` (and `<runtime-dir>` when missing), 0700, the per-user socket directory, for `ikigai serve`/`ikigai --connect` when no socket path is given
     #[allow(clippy::disallowed_methods)]
-    let made = std::fs::create_dir_all(&dir);
-    made.ok()?;
+    let made = std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir);
+    made?;
     // ambient: fs: sets that same per-user socket directory to 0700, so only this user can reach the socket
     #[allow(clippy::disallowed_methods)]
     let restricted = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-    restricted.ok()?;
-    Some(dir.join("kernel.sock"))
+    restricted?;
+    Ok(dir.join("kernel.sock"))
+}
+
+/// `$XDG_RUNTIME_DIR` when it is absolute, else `$TMPDIR` when it is absolute, else `/tmp`,
+/// the last two plus the uid. An empty or relative value counts as unset, as the XDG base
+/// directory spec says.
+fn runtime_dir(xdg_runtime: Option<OsString>, tmpdir: Option<OsString>, uid: u32) -> PathBuf {
+    let absolute = |value: Option<OsString>| {
+        value
+            .map(PathBuf::from)
+            .filter(|path: &PathBuf| path.is_absolute())
+    };
+    absolute(xdg_runtime).unwrap_or_else(|| {
+        absolute(tmpdir)
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join(format!("ikigai-{uid}"))
+    })
 }
 
 /// This process's real user id.
@@ -2145,6 +2336,16 @@ fn peer_pid(_stream: &UnixStream) -> Option<i32> {
     None
 }
 
+/// A private (`0700`) directory of this test process's for its sockets: since ledger #3634 a
+/// socket is never bound straight in a shared `/tmp`, which another account can write.
+#[cfg(test)]
+fn test_socket_dir() -> PathBuf {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = std::env::temp_dir().join(format!("ikt-{}", std::process::id()));
+    let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+    dir
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2155,14 +2356,33 @@ mod tests {
         builtins, ArgRef, Capability, EndpointSpace, Exact, FnEndpoint, Iri, ReprType, Verb,
     };
 
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn kernel() -> Kernel {
         Kernel::new(Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),
         ))
     }
 
+    /// An empty or relative runtime directory counts as unset, so the default socket is
+    /// never under the working directory.
+    #[test]
+    fn the_runtime_dir_is_always_absolute() {
+        let dir = |xdg: Option<&str>, tmp: Option<&str>| {
+            runtime_dir(xdg.map(Into::into), tmp.map(Into::into), 7)
+        };
+        assert_eq!(dir(Some("/run/u"), Some("/t")), PathBuf::from("/run/u"));
+        assert_eq!(dir(None, Some("/t")), PathBuf::from("/t/ikigai-7"));
+        assert_eq!(dir(None, None), PathBuf::from("/tmp/ikigai-7"));
+        for empty_or_relative in ["", "run", "./run", "../run"] {
+            let unset = Some(empty_or_relative);
+            assert_eq!(dir(unset, Some("/t")), PathBuf::from("/t/ikigai-7"));
+            assert_eq!(dir(unset, unset), PathBuf::from("/tmp/ikigai-7"));
+            assert_eq!(dir(None, unset), PathBuf::from("/tmp/ikigai-7"));
+        }
+    }
+
     fn socket_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("ikigai-ipc-{}-{}.sock", std::process::id(), name))
+        test_socket_dir().join(format!("ikigai-ipc-{}-{}.sock", std::process::id(), name))
     }
 
     fn upper(text: &str) -> Request {
@@ -2266,6 +2486,210 @@ mod tests {
         assert_eq!(client.issue(upper("still")).unwrap().0.bytes, b"STILL");
         drop(client);
         remove_socket(&path);
+    }
+
+    /// A scratch directory of this test's, `0700`, under the private test directory.
+    fn scratch(name: &str) -> PathBuf {
+        use std::os::unix::fs::DirBuilderExt;
+        let dir = test_socket_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        dir
+    }
+
+    fn chmod(path: &Path, mode: u32) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// ledger #3634, claim 1: `<TMPDIR>/ikigai-<uid>` made by another account first, here one
+    /// any account can write (`0777`, not sticky). The default path's `mkdir` and `chmod` of
+    /// `ikigai/` inside it succeed, and the door used to serve there; now `bind` refuses,
+    /// naming the directory, its mode and the fix.
+    #[test]
+    fn a_default_dir_under_a_writable_runtime_dir_is_refused() {
+        let base = scratch("d-open").join("ikigai-7");
+        std::fs::create_dir(&base).unwrap();
+        chmod(&base, 0o777);
+        let path = socket_path_in(&base).expect("the default directory is made");
+        let refused = bind(&path).expect_err("served under a directory others can write");
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+        let message = refused.to_string();
+        let real = std::fs::canonicalize(&base).unwrap();
+        assert!(
+            message.contains(&format!("under {}", real.display())),
+            "{message}"
+        );
+        assert!(message.contains("0777"), "{message}");
+        assert!(message.contains("chmod go-w"), "{message}");
+        assert!(!path.exists(), "nothing was bound");
+        chmod(&base, 0o700);
+    }
+
+    /// ledger #3634, claim 1 with an owner: a runtime directory owned by another uid (here this
+    /// process stands in as uid `me + 1`, so its own directories read as another account's).
+    #[test]
+    fn a_socket_dir_owned_by_another_uid_is_refused() {
+        let dir = scratch("d-owner");
+        let path = dir.join("k.sock");
+        let other = own_uid() + 1;
+        let refused = bind_as(&path, other).expect_err("served in another account's directory");
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+        let message = refused.to_string();
+        assert!(
+            message.contains(&format!("owned by uid {}", own_uid())),
+            "{message}"
+        );
+        assert!(message.contains(&format!("(uid {other})")), "{message}");
+        assert!(
+            message.contains("serve in a directory of your own"),
+            "{message}"
+        );
+        assert!(!path.exists(), "nothing was bound");
+    }
+
+    /// ledger #3634, claim 2: plain `bind` checks the socket's own directory: one group or
+    /// others can write is refused, and so is a writable directory above it.
+    #[test]
+    fn bind_refuses_a_writable_socket_dir_or_parent() {
+        let dir = scratch("d-own");
+        chmod(&dir, 0o770);
+        let refused = bind(&dir.join("k.sock")).expect_err("own directory group-writable");
+        assert!(refused.to_string().contains("in "), "{refused}");
+        assert!(refused.to_string().contains("0770"), "{refused}");
+        chmod(&dir, 0o700);
+
+        let inner = dir.join("in");
+        std::fs::DirBuilder::new().create(&inner).unwrap();
+        chmod(&inner, 0o700);
+        chmod(&dir, 0o1777);
+        // A sticky parent (`/tmp`) is fine, not sticky it is not.
+        let listener = bind(&inner.join("k.sock")).expect("a sticky parent is fine");
+        drop(listener);
+        remove_socket(&inner.join("k.sock"));
+        chmod(&dir, 0o777);
+        let refused = bind(&inner.join("k.sock")).expect_err("parent world-writable");
+        assert!(refused.to_string().contains("under "), "{refused}");
+        chmod(&dir, 0o700);
+    }
+
+    /// ledger #3634, claim 2 for `bind_shared`: it checked only the immediate parent; a
+    /// writable directory above it is now refused too.
+    #[test]
+    fn bind_shared_refuses_a_writable_directory_above_its_own() {
+        use std::os::unix::fs::MetadataExt;
+        let top = scratch("d-shared");
+        let dir = top.join("s");
+        std::fs::create_dir(&dir).unwrap();
+        let gid = std::fs::metadata(&dir).unwrap().gid();
+        chmod(&dir, 0o710);
+        chmod(&top, 0o777);
+        let refused = bind_shared(&dir.join("k.sock"), gid).expect_err("parent world-writable");
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+        let real = std::fs::canonicalize(&top).unwrap();
+        assert!(
+            refused
+                .to_string()
+                .contains(&format!("under {}", real.display())),
+            "{refused}"
+        );
+        chmod(&top, 0o700);
+    }
+
+    /// The walk's rules, on a fake `stat` where a second account and root are not available:
+    /// root may own a directory above (not the socket's own), a sticky one above may be
+    /// world-writable, and the first problem found names its directory.
+    #[test]
+    fn the_directory_walk_follows_the_rules() {
+        let me = 501;
+        let walk = |table: &[(&str, u32, u32)]| {
+            let table: Vec<(PathBuf, DirStat)> = table
+                .iter()
+                .map(|(p, uid, mode)| {
+                    let st = DirStat {
+                        is_dir: true,
+                        uid: *uid,
+                        mode: 0o40000 | mode,
+                    };
+                    (PathBuf::from(p), st)
+                })
+                .collect();
+            let mut stat = |d: &Path| {
+                table
+                    .iter()
+                    .find(|(p, _)| p == d)
+                    .map(|(_, st)| *st)
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+            };
+            socket_dirs_problem(Path::new("/tmp/ikigai-501/ikigai"), me, &mut stat)
+        };
+        let good = [
+            ("/tmp/ikigai-501/ikigai", 501, 0o700),
+            ("/tmp/ikigai-501", 501, 0o755),
+            ("/tmp", 0, 0o1777),
+            ("/", 0, 0o755),
+        ];
+        assert_eq!(walk(&good), None);
+
+        // Another account made `/tmp/ikigai-501` first.
+        let mut squatted = good;
+        squatted[1].1 = 502;
+        let problem = walk(&squatted).unwrap();
+        assert!(
+            problem.contains("under /tmp/ikigai-501: it is owned by uid 502"),
+            "{problem}"
+        );
+        assert!(problem.contains("Remove /tmp/ikigai-501"), "{problem}");
+
+        // Root may own a directory above, never the socket's own.
+        let mut rooted = good;
+        rooted[0].1 = 0;
+        let problem = walk(&rooted).unwrap();
+        assert!(
+            problem.contains("in /tmp/ikigai-501/ikigai: it is owned by uid 0"),
+            "{problem}"
+        );
+        assert!(
+            problem.contains("/tmp/ikigai-501/ikigai/ikigai-501"),
+            "{problem}"
+        );
+
+        // `/tmp` without its sticky bit.
+        let mut unsticky = good;
+        unsticky[2].2 = 0o777;
+        assert!(walk(&unsticky)
+            .unwrap()
+            .contains("under /tmp: its mode is 0777"));
+
+        // A sticky bit does not excuse the socket's own directory.
+        let mut own_sticky = good;
+        own_sticky[0].2 = 0o1777;
+        assert!(walk(&own_sticky)
+            .unwrap()
+            .contains("in /tmp/ikigai-501/ikigai: its mode"));
+
+        // Group-writable `/`.
+        let mut slash = good;
+        slash[3].2 = 0o775;
+        assert!(walk(&slash).unwrap().contains("under /: its mode is 0775"));
+    }
+
+    /// ledger #3634, claim 3: a stale socket is removed only when it is ours. Here this
+    /// process stands in as another uid, so its own stale socket reads as someone else's.
+    #[test]
+    fn a_stale_socket_of_another_uid_is_not_removed() {
+        let path = scratch("d-stale").join("k.sock");
+        drop(UnixListener::bind(&path).unwrap()); // the file stays; nobody listens
+        let refused = clear_stale(&path, own_uid() + 1).expect_err("another uid's socket");
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+        let message = refused.to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(
+            message.contains(&format!("owned by uid {}", own_uid())),
+            "{message}"
+        );
+        assert!(path.exists(), "the socket was left alone");
+        clear_stale(&path, own_uid()).expect("our own stale socket is removed");
+        assert!(!path.exists());
     }
 
     /// A socket nobody listens on (its server exited) is still replaced.
@@ -2390,6 +2814,62 @@ mod tests {
         remove_socket(&path);
     }
 
+    /// ledger #3476: turning away a connection past the cap runs ON THE ACCEPT LOOP, and each
+    /// step was bounded only by `SO_RCVTIMEO`, which bounds ONE read. A peer past the cap that
+    /// trickled its hello a byte at a time, each inside [`REFUSAL_TIMEOUT`], held the accept
+    /// loop for as long as it liked: once the place came back, no other client was accepted.
+    #[test]
+    fn a_trickling_peer_past_the_cap_does_not_hold_the_accept_loop() {
+        use std::io::Write;
+        let path = socket_path("trickle");
+        serve_limited(&path, Limits::default().with_max_connections(1));
+
+        let holder = connect(&path).unwrap();
+        assert_eq!(holder.issue(upper("one")).unwrap().0.bytes, b"ONE");
+
+        // Past the cap: a hello frame that announces 1 KiB and sends it a byte every 300ms
+        // (each read returns well inside the one-second step), for up to 12 seconds.
+        let mut trickler = UnixStream::connect(&path).unwrap();
+        trickler.write_all(&1024u32.to_be_bytes()).unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let trickling = thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || {
+                for _ in 0..40 {
+                    if stop.load(Ordering::SeqCst) || trickler.write_all(&[0]).is_err() {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(300));
+                }
+            }
+        });
+        thread::sleep(Duration::from_millis(200)); // the accept loop is in the refusal now
+        drop(holder); // the place comes back
+
+        // A new client must be accepted and served within the refusal's own bound (a second
+        // per step) plus slack, not after the trickler gives up.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dial = path.clone();
+        thread::spawn(move || {
+            let answer = connect(&dial).and_then(|client| {
+                client
+                    .issue(upper("next"))
+                    .map(|(representation, _)| representation.bytes)
+                    .map_err(io::Error::other)
+            });
+            let _ = tx.send(answer);
+        });
+        let served = rx.recv_timeout(Duration::from_secs(5));
+        stop.store(true, Ordering::SeqCst);
+        let _ = trickling.join();
+        match served {
+            Ok(Ok(bytes)) => assert_eq!(bytes, b"NEXT"),
+            Ok(Err(e)) => panic!("the next client failed: {e}"),
+            Err(_) => panic!("a trickling peer past the cap held the accept loop for over 5s"),
+        }
+        remove_socket(&path);
+    }
+
     /// ledger #1665: a connection that never sends its hello is closed after the hello
     /// timeout. Before, it held its thread for as long as it stayed open.
     #[test]
@@ -2409,6 +2889,61 @@ mod tests {
             matches!(read, Ok(0)),
             "the door hangs up on a connection that says nothing: {read:?}"
         );
+        remove_socket(&path);
+    }
+
+    /// ledger #3478: an ADMITTED connection's hello was bounded only by `SO_RCVTIMEO`, which
+    /// bounds ONE read. Peers that trickled their hellos a byte at a time, each inside the hello
+    /// timeout, held their places for as long as they liked, and with the cap full every later
+    /// client, the owner included, was refused as over capacity. The hello is now bounded in all.
+    #[test]
+    fn tricklers_inside_the_cap_do_not_hold_their_places_past_the_hello_timeout() {
+        use std::io::Write;
+        let path = socket_path("hello-trickle");
+        let hello_timeout = Duration::from_millis(500);
+        serve_limited(
+            &path,
+            Limits::default()
+                .with_max_connections(2)
+                .with_hello_timeout(hello_timeout),
+        );
+
+        // Fill the cap: each trickler announces a 1 KiB hello frame and sends it a byte every
+        // 100ms (each read returns well inside the hello timeout), for up to 12 seconds.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tricklers: Vec<_> = (0..2)
+            .map(|_| {
+                let mut trickler = UnixStream::connect(&path).unwrap();
+                trickler.write_all(&1024u32.to_be_bytes()).unwrap();
+                let stop = Arc::clone(&stop);
+                thread::spawn(move || {
+                    for _ in 0..120 {
+                        if stop.load(Ordering::SeqCst) || trickler.write_all(&[0]).is_err() {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                })
+            })
+            .collect();
+
+        // Well past the hello bound, both places must be free again: a client is served, not
+        // refused as over capacity.
+        thread::sleep(hello_timeout * 3);
+        let served = connect(&path)
+            .map_err(wire_error)
+            .and_then(|client| client.issue(upper("owner")));
+        stop.store(true, Ordering::SeqCst);
+        for trickling in tricklers {
+            let _ = trickling.join();
+        }
+        match served {
+            Ok((representation, _)) => assert_eq!(representation.bytes, b"OWNER"),
+            Err(e) => panic!(
+                "tricklers held the cap for over {:?} (hello timeout {hello_timeout:?}): {e:?}",
+                hello_timeout * 3
+            ),
+        }
         remove_socket(&path);
     }
 
@@ -2464,6 +2999,8 @@ mod tests {
                     .cacheable(),
             )
         });
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Arc::new(Kernel::new(Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:test:counter"), counter),
         )));
@@ -2507,6 +3044,8 @@ mod tests {
         use ikigai_core::{Fallback, Limit, Space};
 
         let path = socket_path("limited");
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(Fallback::new(vec![
             Arc::new(Limit::new("urn:personal:")) as Arc<dyn Space>,
             Arc::new(
@@ -2588,6 +3127,8 @@ mod tests {
             Arc::new(EndpointSpace::new()) as Arc<dyn Space>,
             Arc::new(RemoteSpace::new(Arc::new(client))) as Arc<dyn Space>,
         ]);
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let local_kernel = Kernel::new(Arc::new(local));
 
         let (representation, _status) =
@@ -2615,6 +3156,8 @@ mod tests {
             Arc::new(EndpointSpace::new()) as Arc<dyn Space>,
             Arc::new(RemoteSpace::new(Arc::new(client))) as Arc<dyn Space>,
         ]);
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let local_kernel = Kernel::new(Arc::new(local));
 
         // Trace the LOCAL kernel resolving a remote-only resource. The forward is
@@ -2672,6 +3215,8 @@ mod tests {
                 )
             })
         };
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let peer = Arc::new(Kernel::new(Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:test:cell"), cell),
         )));
@@ -2686,6 +3231,8 @@ mod tests {
         });
 
         let client = connect(&path).unwrap();
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let mounting = Kernel::new(Arc::new(Fallback::new(vec![
             Arc::new(EndpointSpace::new()) as Arc<dyn Space>,
             Arc::new(MountedRemote::overriding(
@@ -2727,6 +3274,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
         // A "server" that accepts the connection but never replies.
+        let (done, hold) = std::sync::mpsc::channel();
         let server = thread::spawn(move || {
             if let Ok((stream, _)) = listener.accept() {
                 let mut s = &stream;
@@ -2738,7 +3286,8 @@ mod tests {
                         mode: HelloMode::Verbatim,
                     },
                 );
-                std::thread::sleep(Duration::from_millis(400)); // hold it, write nothing
+                // Keep the stream and listener alive through the client's timeout.
+                let _ = hold.recv();
                 drop(stream);
             }
         });
@@ -2758,6 +3307,7 @@ mod tests {
         assert!(err.is_transient());
 
         drop(client);
+        done.send(()).unwrap();
         server.join().unwrap();
         let _ = std::fs::remove_file(&path);
     }
@@ -2770,6 +3320,7 @@ mod tests {
         let path = socket_path("mount-hang");
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
+        let (done, hold) = std::sync::mpsc::channel();
         let server = thread::spawn(move || {
             if let Ok((stream, _)) = listener.accept() {
                 let mut s = &stream;
@@ -2781,7 +3332,9 @@ mod tests {
                         mode: HelloMode::Verbatim,
                     },
                 );
-                std::thread::sleep(Duration::from_millis(400));
+                // Mount construction probes the peer and can redial after a timeout.
+                // Keep the listener too: queued hellos must time out, not see EOF.
+                let _ = hold.recv();
                 drop(stream);
             }
         });
@@ -2792,18 +3345,22 @@ mod tests {
             Arc::new(EndpointSpace::new()) as Arc<dyn Space>,
             Arc::new(RemoteSpace::new(Arc::new(client))) as Arc<dyn Space>,
         ]);
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(local));
 
         // Resolving a remote-only resource against the hung server yields a TRANSIENT
         // error — so a Retry/Failover overlay above this kernel would act on it, the
         // whole point of the structured Resolver boundary.
         let err = Resolver::issue_as(&kernel, upper("hi"), &Capability::root()).unwrap_err();
+        assert!(matches!(err, Error::Timeout(_)), "{err:?}");
         assert!(
             err.is_transient(),
             "the mount forwards the hang as transient: {err:?}"
         );
 
         drop(kernel);
+        done.send(()).unwrap();
         server.join().unwrap();
         let _ = std::fs::remove_file(&path);
     }
@@ -2863,30 +3420,88 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// v7: a client dialing a pre-hello server gets a CLEAR refusal naming the
-    /// diagnosis — no silent legacy reconnect.
+    /// A pre-v6 server decodes a hello as a Call, fails, and closes without a reply.
+    /// That is indistinguishable from a restarting server, so it is retryable,
+    /// with an old server mentioned as a possibility. No legacy reconnect.
     #[test]
-    fn a_pre_hello_server_is_diagnosed_not_tolerated() {
+    fn a_pre_hello_server_is_refused_without_claiming_its_version() {
         let path = socket_path("legacy-server");
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
-        // A ≤v5 server: cannot decode the hello, hangs up silently.
+        // The pre-v6 read loop (479af94^): read_message::<_, Call>, return on Err.
+        // The Call variants are append-only, so the current decoder also rejects
+        // the hello's IKWH magic as an unknown variant, just as the v5 decoder did.
         let server = thread::spawn(move || {
             let Ok((stream, _)) = listener.accept() else {
                 return;
             };
             let mut s = &stream;
-            let _ = read_frame(&mut s);
+            let err = read_message::<_, Call>(&mut s).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         });
 
-        let message = match connect(&path) {
-            Err(err) => err.to_string(),
-            Ok(_) => panic!("a pre-hello server must be refused"),
-        };
-        assert!(message.contains("predates wire v6"), "{message}");
+        let err = connect(&path)
+            .err()
+            .expect("a pre-hello server must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("may be restarting or predate wire v6"),
+            "{message}"
+        );
+        assert!(matches!(wire_error(err), Error::Unavailable(_)));
 
         server.join().unwrap();
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A current server can close mid-hello too: EOF does not prove its version.
+    #[test]
+    fn a_server_closing_mid_hello_is_transient() {
+        let path = socket_path("hello-close");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let hello = decode_hello(&read_frame(&mut stream).unwrap()).unwrap();
+            assert_eq!(hello.version, PROTOCOL_VERSION);
+            // A modern server starts its answer, then shuts down before completing it.
+            use std::io::Write;
+            stream.write_all(&9_u32.to_be_bytes()).unwrap();
+            stream.write_all(b"IKWH").unwrap();
+        });
+
+        let err = connect(&path).err().expect("an incomplete hello must fail");
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            matches!(wire_error(err), Error::Unavailable(_)),
+            "a server closing during its hello must be retryable"
+        );
+    }
+
+    #[test]
+    fn a_server_closing_during_the_redial_hello_is_unavailable() {
+        let path = socket_path("redial-hello-close");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let hello = decode_hello(&read_frame(&mut stream).unwrap()).unwrap();
+            write_hello(&mut stream, &hello).unwrap();
+            // Close after receiving a read-only call: the client will redial and replay.
+            let _ = read_message::<_, Call>(&mut stream).unwrap();
+            drop(stream);
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(decode_hello(&read_frame(&mut stream).unwrap()).is_some());
+            // Restart before answering the redial's hello.
+        });
+
+        let client = connect(&path).unwrap();
+        let err = client.issue(upper("hi")).unwrap_err();
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(err, Error::Unavailable(_)), "{err:?}");
+        assert!(err.is_transient());
     }
 
     /// A version MISMATCH against a hello-speaking server errors immediately,
@@ -2896,7 +3511,7 @@ mod tests {
         let path = socket_path("mismatch");
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
-        // A future v11 server: answers the hello with its own version, closes.
+        // A future server: answers the hello with its own version, closes.
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut s = &stream;
@@ -2904,7 +3519,7 @@ mod tests {
             write_hello(
                 &mut s,
                 &Hello {
-                    version: 11,
+                    version: PROTOCOL_VERSION + 1,
                     mode: HelloMode::Verbatim,
                 },
             )
@@ -2915,7 +3530,10 @@ mod tests {
             Err(err) => err.to_string(),
             Ok(_) => panic!("a version mismatch must refuse the connection"),
         };
-        assert!(message.contains("v11"), "{message}");
+        assert!(
+            message.contains(&format!("v{}", PROTOCOL_VERSION + 1)),
+            "{message}"
+        );
         assert!(
             message.contains(&format!("v{PROTOCOL_VERSION}")),
             "{message}"
@@ -2928,6 +3546,7 @@ mod tests {
     // ---- wire v8: backward-compatible negotiation (ledger #583) ----
 
     /// A kernel whose one endpoint refuses by STATE — core's `Error::Conflict`.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn conflict_kernel() -> Kernel {
         let taken = FnEndpoint::new("taken", |_inv: &ikigai_core::Invocation<'_>| {
             Err(Error::Conflict("x".into()))
@@ -2984,11 +3603,11 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A hello outside the spoken range (6 below, 11 above) gets OUR version, so the
+    /// A hello outside the spoken range (6 below, the next version above) gets OUR version, so the
     /// client can name both, and the connection closes without serving.
     #[test]
-    fn a_hello_outside_7_to_10_is_answered_10_and_refused() {
-        for (n, offered) in [6u32, 11].into_iter().enumerate() {
+    fn a_hello_outside_the_spoken_range_is_answered_and_refused() {
+        for (n, offered) in [6u32, PROTOCOL_VERSION + 1].into_iter().enumerate() {
             let path = socket_path(&format!("v-out-{n}"));
             let server = serve_one(&path, kernel());
             let (stream, answer) = raw_hello(&path, offered);
@@ -3098,6 +3717,7 @@ mod tests {
     /// A kernel whose one endpoint reports the run it sees: `{retries},{time_left_ms}`,
     /// `-` for a half the run does not carry. It has a retry budget (ceiling 3), so a pool
     /// exists for the carried count to narrow.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn run_kernel() -> Kernel {
         let left = FnEndpoint::new("left", |inv: &ikigai_core::Invocation<'_>| {
             let retries = inv
@@ -3257,10 +3877,12 @@ mod tests {
         let space = EndpointSpace::new().bind(
             Exact::new("urn:demo:gated"),
             ikigai_core::FnEndpoint::new("gated", |_inv| {
-                Err(Error::Denied("needs urn:cap:x".to_string()))
+                Err(Error::Denied("needs urn:cap:x".into()))
             }),
         );
         let path = socket_path("typed-denied");
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let server = serve_one(&path, Kernel::new(Arc::new(space)));
         let client = connect(&path).unwrap();
         let err = client
@@ -3282,6 +3904,8 @@ mod tests {
             }),
         );
         let path = socket_path("typed-timeout");
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let server = serve_one(&path, Kernel::new(Arc::new(space)));
         let client = connect(&path).unwrap();
         let err = client
@@ -3362,6 +3986,7 @@ mod tests {
     /// A kernel whose `urn:demo:box` Sink counts its executions — shared memory
     /// with the test (server threads are in-process), so the test can assert
     /// exactly how many times a mutation actually ran across a break.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn counting_sink_kernel(executed: Arc<AtomicUsize>) -> Kernel {
         let sink = FnEndpoint::new("box", move |_inv| {
             executed.fetch_add(1, Ordering::SeqCst);
@@ -3431,6 +4056,8 @@ mod tests {
         // An override-style mount: IRIs forwarded unchanged (the prefer/override
         // mount the personal daemon runs).
         let mounted = MountedRemote::overriding(Arc::new(client), "urn:test:", "test://dev.sock");
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let local = Kernel::new(Arc::new(mounted));
         let (representation, _) =
             Resolver::issue_as(&local, upper("one"), &Capability::root()).unwrap();
@@ -3673,6 +4300,7 @@ mod tests {
             format!("ipc:{}", path.display())
         }
 
+        #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
         fn kernel_with_a_silent_mount(path: &Path) -> Kernel {
             let client = connect_with_timeout(path, Some(Duration::from_secs(30)))
                 .unwrap()
@@ -3806,6 +4434,8 @@ mod tests {
                 .unwrap()
                 .with_describe_timeout(Some(BOUND));
 
+            #[allow(clippy::disallowed_methods)]
+            // internal: a test fixture's kernel; it routes no user arguments
             let kernel = Kernel::new(Arc::new(Fallback::new(vec![
                 Arc::new(MountedRemote::new(
                     Arc::new(silent),
@@ -3883,6 +4513,8 @@ mod tests {
                         .with_clock(Arc::clone(&clock)),
                 ));
             }
+            #[allow(clippy::disallowed_methods)]
+            // internal: a test fixture's kernel; it routes no user arguments
             let kernel = Kernel::new(Arc::new(Fallback::new(mounts)));
 
             let named: Vec<String> = kernel
@@ -4255,7 +4887,7 @@ mod call_deadline {
     const STANDING: Duration = Duration::from_secs(30);
 
     fn socket(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("ik-cd-{}-{name}.sock", std::process::id()))
+        test_socket_dir().join(format!("ik-cd-{}-{name}.sock", std::process::id()))
     }
 
     /// How a scratch peer behaves once it has read a call.
@@ -4489,6 +5121,7 @@ mod principal_tests {
     use std::thread;
 
     /// An endpoint that answers `<capability principal>|<principal argument>`, `-` for none.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn whoami_kernel() -> Kernel {
         let whoami = FnEndpoint::new("whoami", |inv: &ikigai_core::Invocation<'_>| {
             let held = inv.capability.principal().unwrap_or("-").to_string();
@@ -4504,7 +5137,7 @@ mod principal_tests {
     }
 
     fn path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("ikp-{}-{name}.sock", std::process::id()))
+        test_socket_dir().join(format!("ikp-{}-{name}.sock", std::process::id()))
     }
 
     fn serve(path: &Path) {
@@ -4575,6 +5208,8 @@ mod principal_tests {
                 .verb(Verb::Source)
                 .requires("urn:cap:demo:write"),
         );
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Arc::new(Kernel::new(Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:test:guarded"), guarded),
         )));
@@ -4651,6 +5286,7 @@ mod uid_admission_tests {
         own_uid().wrapping_add(1)
     }
 
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn whoami_kernel() -> Arc<Kernel> {
         let whoami = FnEndpoint::new("whoami", |inv: &ikigai_core::Invocation<'_>| {
             let held = inv.capability.principal().unwrap_or("-").to_string();
@@ -4669,7 +5305,7 @@ mod uid_admission_tests {
     }
 
     fn path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("iku-{}-{name}.sock", std::process::id()))
+        test_socket_dir().join(format!("iku-{}-{name}.sock", std::process::id()))
     }
 
     fn node() -> Admission {
@@ -4807,7 +5443,7 @@ mod expected_server_tests {
     use std::thread;
 
     fn path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("ikx-{}-{name}.sock", std::process::id()))
+        test_socket_dir().join(format!("ikx-{}-{name}.sock", std::process::id()))
     }
 
     fn upper() -> Request {
@@ -4815,6 +5451,7 @@ mod expected_server_tests {
             .with_arg("in", ArgRef::Inline(b"secret argument".to_vec()))
     }
 
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn kernel() -> Kernel {
         Kernel::new(Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:test:upper"), builtins::to_upper()),

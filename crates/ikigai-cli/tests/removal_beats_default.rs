@@ -484,6 +484,8 @@ fn a_token_bound_to_a_removed_client_is_refused_under_a_default() {
         key.clone(),
         age::secrecy::ExposeSecret::expose_secret(&age::x25519::Identity::generate().to_string()),
     );
+    #[cfg(unix)]
+    std::fs::set_permissions(&key, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
     let (_door, banner) = serve(
         &home,
         &certs,

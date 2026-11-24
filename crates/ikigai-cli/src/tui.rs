@@ -259,6 +259,7 @@ fn event_loop(
             input: String::new(),
             result: Ok(topology.join("\n")),
             cache: CacheStats::default(),
+            error: None,
         });
     }
     // Preload persisted command history when persistence is on — the flag is seeded
@@ -560,7 +561,7 @@ fn run_step(state: &mut State, engine: &Session, idx: usize) {
                     .unwrap_or_default();
                 format!("{text}{tag}")
             }
-            Err(e) => format!("error: {}", crate::restate_build_line(&e)),
+            Err(e) => format!("error: {e}"),
         },
         Action::Help => HELP.to_string(),
         Action::Clear => {
@@ -1218,13 +1219,9 @@ fn submit(state: &mut State, engine: &Session) -> bool {
             input: line,
             result: Ok(HELP.to_string()),
             cache: CacheStats::default(),
+            error: None,
         }),
-        Action::Output(mut entry) => {
-            if let Err(err) = &mut entry.result {
-                *err = crate::restate_build_line(err).into_owned();
-            }
-            state.transcript.push(entry)
-        }
+        Action::Output(entry) => state.transcript.push(entry),
         // Drop the scrollback transcript; `state.history` (line recall) is untouched,
         // and the `clear` line itself was already pushed to it above.
         Action::Clear => state.transcript.clear(),
@@ -1250,18 +1247,20 @@ fn run_script(
                 input: line.to_string(),
                 result: Ok(HELP.to_string()),
                 cache: CacheStats::default(),
+                error: None,
             },
             Action::Clear | Action::Quit | Action::Noop => return,
         });
     });
     if let Err(error) = ran {
-        let message = crate::restate_build_line(&error.to_string()).into_owned();
+        let message = error.to_string();
         match (error.line, entries.last_mut()) {
             (Some(_), Some(failed)) => failed.result = Err(message),
             _ => entries.push(Entry {
                 input: command.to_string(),
                 result: Err(message),
                 cache: CacheStats::default(),
+                error: None,
             }),
         }
     }
@@ -1770,11 +1769,13 @@ mod tests {
             input: "source urn:time:now".into(),
             result: Ok("12:34".into()),
             cache: CacheStats::default(),
+            error: None,
         });
         state.transcript.push(Entry {
             input: "source urn:nope".into(),
             result: Err("no endpoint resolved".into()),
             cache: CacheStats::default(),
+            error: None,
         });
         state
     }
@@ -1823,12 +1824,14 @@ mod tests {
             input: String::new(),
             result: Ok("mount   prefer urn:llm: -> peer:plasma".to_string()),
             cache: CacheStats::default(),
+            error: None,
         }]);
         assert_eq!(note.len(), 1, "no prompt line for a host note: {note:?}");
         let typed = transcript_lines(&[Entry {
             input: "source urn:time:now".to_string(),
             result: Ok("12:00".to_string()),
             cache: CacheStats::default(),
+            error: None,
         }]);
         assert_eq!(typed.len(), 2, "a submitted line still gets its prompt");
     }
@@ -1883,11 +1886,13 @@ mod tests {
             input: "source urn:iki:fn:toUpper hi".into(),
             result: Ok("line one\nline two".into()),
             cache: CacheStats::default(),
+            error: None,
         });
         state.transcript.push(Entry {
             input: "source urn:iki:fn:nope".into(),
             result: Err("no endpoint resolved".into()),
             cache: CacheStats::default(),
+            error: None,
         });
         render(80, 5, &state); // transcript taller than the area → scrolled
         render(80, 24, &state);
@@ -2622,6 +2627,7 @@ mod tests {
 
     /// A minimal engine whose `urn:lisp:eval` echoes its `in` argument — enough to
     /// observe that a key routed through `scratch_key` reaches the eval path.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn echo_lisp_engine() -> Session {
         use ikigai_core::{
             EndpointSpace, Exact, FnEndpoint, Invocation, Kernel, ReprType, Representation,

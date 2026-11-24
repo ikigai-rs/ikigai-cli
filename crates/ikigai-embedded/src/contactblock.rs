@@ -18,7 +18,7 @@
 //!
 //! | | `decide` (booking) | `contactblock` (this) |
 //! |---|---|---|
-//! | signs | `<id>\|<action>\|<exp>` | `contact-block\|<email>\|<enquiry>\|<exp>`, `contact-label\|<label>\|<enquiry>\|<exp>` |
+//! | signs | `<id>\|<action>\|<exp>` | `contact-block\|<email>\|<enquiry>\|<exp>`, `contact-label\|<label>\|<enquiry>\|<class>\|<exp>` |
 //! | key | `urn:secret:booking-decide`, **Mac-only**, Keychain | `contact-block.key`, **edge-local file** |
 //! | worst case if forged | approve/decline a booking | block an enquiry sender, or nudge the spam model |
 //! | who acts | the **Mac** re-verifies, then writes the calendar | an edge reactor writes the edge blocklist and trains the model |
@@ -28,7 +28,7 @@
 //! | endpoint | runs on | authority | does |
 //! |---|---|---|---|
 //! | `urn:contactblock:link` | edge daemon | `urn:cap:contactblock:mint` | mints the signed block URL to email |
-//! | `urn:contactlabel:link` | edge daemon | `urn:cap:contactblock:mint` | mints a signed label URL (`spam`/`ham`) to email |
+//! | `urn:contactlabel:link` | edge daemon | `urn:cap:contactblock:mint` | mints a signed label URL (`spam`/`ham`, with the filter's class) to email |
 //! | `urn:contact-block` | edge http face | public (route ceiling) | GET shows, POST records a block |
 //! | `urn:contact-label` | edge http face | public (route ceiling) | GET shows, POST records a label |
 //! | `urn:contactblock:apply` | edge daemon reactor | its space's authority file | drains the space: writes the block, trains the model |
@@ -43,7 +43,8 @@
 //! payload: every payload STARTS with its action (`contact-block|`, `contact-label|`), so a
 //! signature over one can never verify as the other, and every variable part has a fixed
 //! grammar (an address with no `|`, a 64-hex enquiry id or nothing, a label from a closed set,
-//! a number), so no field can be stretched to imitate the next.
+//! a class from a closed set or nothing, a number), so no field can be stretched to imitate the
+//! next.
 //!
 //! A block link minted before ledger #1513 signed the bare `<email>|<exp>`. It is still
 //! accepted, ONLY when the link names no enquiry, so a link already in someone's inbox keeps
@@ -51,13 +52,38 @@
 //! `contact-label|`, and an address may not contain `|`). Remove that branch once every such
 //! link has expired: seven days after the edge runs this.
 //!
+//! ## The filter's class travels in the label link
+//!
+//! Since ledger #3868 a label link also signs the CLASS the spam filter gave the enquiry when
+//! it was emailed (`spam`, `unsure`, `ham` or `unscored`, or empty when the minter was given
+//! none), and the click's drop carries it as `class`. The apply program cannot read the contact
+//! outbox's notes, and scoring the enquiry again would give today's class, not the one the
+//! email showed; signing it means a link cannot be re-pointed at another class. A label link
+//! minted before that signed the 4-field `contact-label|<label>|<enquiry>|<exp>`: it is still
+//! accepted, ONLY when the link carries no class, and its drop carries none. Remove that branch
+//! once every such link has expired: seven days after the edge runs this, so no earlier than
+//! 2026-11-27.
+//!
 //! ## Naming the enquiry, never carrying it
 //!
 //! A link names its enquiry by the enquiry tuple's id in the contact space (its content
 //! address, [`ikigai_intray::tuple_id`]), never by its text: the text stays on the edge, in
 //! `spaces/contact/outbox/<id>.tuple`, where the reactor left it. The minters take the enquiry
-//! tuple exactly as the reactor handed it to the handler and compute that id, because the
-//! handler holds the bytes and not the id. The apply reactor reads the text back through the
+//! tuple exactly as the reactor handed it to the handler, because the handler, a Lisp program,
+//! reads its tuple through `(input)` and cannot see the `tuple=<id>` the reactor passes beside
+//! it.
+//!
+//! That id is the hash of the STORED bytes. Under a sealed space ([`crate::space_seal`]) those
+//! are age ciphertext, so the hash of the text a minter is handed names no stored tuple (ledger
+//! #3713). The host therefore wraps the contact handler in [`HandlerTupleIds`]: while a pass
+//! runs it, the reactor's `tuple=` is noted against the hash of the tuple's text, and a minter
+//! handed that text names the noted id. Handed text no running pass noted (a minter called by
+//! hand), it names the hash of the text, which is the stored id whenever the space is not
+//! sealed. A reseal stores every tuple again under a new id and leaves a forward from the old
+//! one ([`crate::space_seal::current_id`]), and the link faces follow it when they record the
+//! click, so a link emailed before a reseal still names its enquiry after it.
+//!
+//! The apply reactor reads the text back through the
 //! kernel, `source urn:space:contact tuple=<id> state=outbox`, under the one-space grant
 //! `urn:cap:space:read:contact` ([`ikigai_intray::cap_read_space`]), and trains on it.
 //!
@@ -105,6 +131,10 @@ const TTL_SECONDS: i64 = 7 * 24 * 3600;
 
 /// The labels a label link can teach. A closed set: the model's own two classes.
 pub const LABELS: [&str; 2] = ["spam", "ham"];
+
+/// The classes the spam filter can have given an enquiry when it was emailed, which a label
+/// link carries signed (ledger #3868). A closed set; a link may also carry none.
+pub const CLASSES: [&str; 4] = ["spam", "unsure", "ham", "unscored"];
 
 /// The largest enquiry a minter accepts, in bytes. The intake's own field bounds keep a real
 /// enquiry far below it; past it the mint is refused, never truncated (a truncated tuple would
@@ -154,8 +184,19 @@ fn legacy_block_payload(email: &str, exp: i64) -> String {
     format!("{email}|{exp}")
 }
 
-/// What a label link signs: the action, the label, the enquiry's tuple id and an expiry.
-fn label_payload(label: &str, enquiry: &str, exp: i64) -> String {
+/// What a label link signs: the action, the label, the enquiry's tuple id, the class the
+/// filter gave the enquiry when it was emailed (empty when the link carries none) and an
+/// expiry. The class is IN the payload, so a link cannot be re-pointed at another class.
+/// The bytes are pinned by `the_signed_payloads_start_with_their_action`.
+fn label_payload(label: &str, enquiry: &str, class: &str, exp: i64) -> String {
+    format!("{LABEL_ACTION}|{label}|{enquiry}|{class}|{exp}")
+}
+
+/// The payload a label link signed before ledger #3868: `contact-label|<label>|<enquiry>|<exp>`,
+/// no class. Verified only, never minted, and only for a link that carries no class. Remove it
+/// (and its branch in [`label_valid`]) once every such link has expired: seven days after the
+/// edge runs this, so no earlier than 2026-11-27.
+fn legacy_label_payload(label: &str, enquiry: &str, exp: i64) -> String {
     format!("{LABEL_ACTION}|{label}|{enquiry}|{exp}")
 }
 
@@ -200,8 +241,8 @@ fn mint_block(email: &str, enquiry: &str, exp: i64, key: &SigningKey) -> String 
     sign(&block_payload(email, enquiry, exp), key)
 }
 
-fn mint_label(label: &str, enquiry: &str, exp: i64, key: &SigningKey) -> String {
-    sign(&label_payload(label, enquiry, exp), key)
+fn mint_label(label: &str, enquiry: &str, class: &str, exp: i64, key: &SigningKey) -> String {
+    sign(&label_payload(label, enquiry, class, exp), key)
 }
 
 /// Is `token` a block signature this key made over exactly this address, enquiry and expiry,
@@ -223,20 +264,28 @@ fn block_valid(
         || (enquiry.is_empty() && signed(&legacy_block_payload(email, exp), token, key))
 }
 
-/// Is `token` a label signature this key made over exactly this label, enquiry and expiry, still
-/// in date? Same uniform `false` as [`block_valid`].
+/// Is `token` a label signature this key made over exactly this label, enquiry, class (empty
+/// for none) and expiry, still in date? Same uniform `false` as [`block_valid`].
 fn label_valid(
     label: &str,
     enquiry: &str,
+    class: &str,
     exp: i64,
     token: &str,
     key: &VerifyingKey,
     now: i64,
 ) -> bool {
-    LABELS.contains(&label)
-        && enquiry_id_shaped(enquiry)
-        && exp > now
-        && signed(&label_payload(label, enquiry, exp), token, key)
+    if !LABELS.contains(&label)
+        || !enquiry_id_shaped(enquiry)
+        || !(class.is_empty() || CLASSES.contains(&class))
+        || exp <= now
+    {
+        return false;
+    }
+    signed(&label_payload(label, enquiry, class, exp), token, key)
+        // A link minted before the class (ledger #3868): it carried no class, so it may carry
+        // none now. Remove once every such link has expired, no earlier than 2026-11-27.
+        || (class.is_empty() && signed(&legacy_label_payload(label, enquiry, exp), token, key))
 }
 
 fn read_signing_key(path: &std::path::Path) -> Result<SigningKey> {
@@ -271,8 +320,116 @@ fn enquiry_of(inv: &Invocation<'_>, required: bool) -> Result<Option<String>> {
             ),
         });
     }
-    Ok(Some(ikigai_intray::tuple_id(text)))
+    Ok(Some(stored_id_of(text)))
 }
+
+// =====================================================================================
+// The stored id of the tuple a handler is handling (ledger #3713)
+// =====================================================================================
+
+/// The stored ids of the tuples handlers are running on now, by the hash of each one's text.
+/// A list per text: the same enquiry dropped twice is two tuples under a sealed space.
+static HANDLING: std::sync::Mutex<std::collections::BTreeMap<String, Vec<String>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn handling() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<String, Vec<String>>> {
+    HANDLING.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// The id the space stores the tuple whose text is `text` under: the reactor's `tuple=` for a
+/// pass running on it, else the hash of the text (the stored id when no codec is configured).
+fn stored_id_of(text: &[u8]) -> String {
+    let plain = ikigai_intray::tuple_id(text);
+    handling()
+        .get(&plain)
+        .and_then(|ids| ids.last().cloned())
+        .unwrap_or(plain)
+}
+
+/// Notes a running pass's stored id, and forgets it when the pass ends (or is dropped).
+struct Noted {
+    plain: String,
+    stored: String,
+}
+
+impl Noted {
+    fn new(plain: String, stored: String) -> Noted {
+        handling()
+            .entry(plain.clone())
+            .or_default()
+            .push(stored.clone());
+        Noted { plain, stored }
+    }
+}
+
+impl Drop for Noted {
+    fn drop(&mut self) {
+        let mut map = handling();
+        if let Some(ids) = map.get_mut(&self.plain) {
+            if let Some(at) = ids.iter().rposition(|id| *id == self.stored) {
+                ids.remove(at);
+            }
+            if ids.is_empty() {
+                map.remove(&self.plain);
+            }
+        }
+    }
+}
+
+/// A reactor's handler, wrapped so the minters it calls name the tuple by the id the space
+/// stores it under (see the [module docs](crate::contactblock)). Given the reactor's
+/// `tuple=<id>` and its `content` (or `in`), it notes the id against the hash of the content
+/// for as long as the handler runs; it changes nothing else about the call.
+pub struct HandlerTupleIds<E> {
+    inner: E,
+}
+
+impl<E> HandlerTupleIds<E> {
+    pub fn new(inner: E) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait::async_trait]
+impl<E: Endpoint> Endpoint for HandlerTupleIds<E> {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let stored = inv
+            .inline_str("tuple")
+            .ok()
+            .filter(|id| enquiry_id_shaped(id))
+            .map(str::to_string);
+        let text = inv
+            .inline_arg("content")
+            .or_else(|_| inv.inline_arg("in"))
+            .ok();
+        let _noted = match (stored, text) {
+            (Some(stored), Some(text)) => Some(Noted::new(ikigai_intray::tuple_id(text), stored)),
+            _ => None,
+        };
+        self.inner.invoke(inv).await
+    }
+
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn describe(&self) -> Description {
+        self.inner.describe()
+    }
+}
+
+/// The id the enquiry a clicked link names has now in the contact space: the same id unless a
+/// reseal moved the tuple since the link was minted ([`crate::space_seal::current_id`]). The
+/// token was checked against the id as minted; only the recorded intent carries the new one.
+fn current_enquiry(enquiry: &str) -> String {
+    if enquiry.is_empty() {
+        return String::new();
+    }
+    crate::space_seal::current_id(&file_root().join("spaces"), CONTACT_SPACE, enquiry)
+}
+
+/// The space the enquiries are dropped into, and which the links name them in.
+pub const CONTACT_SPACE: &str = "contact";
 
 fn enquiry_spec(summary: &str) -> ArgSpec {
     ArgSpec::new("enquiry")
@@ -291,9 +448,9 @@ fn require_mint(inv: &Invocation<'_>, what: &str) -> Result<()> {
     if inv.capability.allows(CAP_CONTACTBLOCK_MINT) {
         Ok(())
     } else {
-        Err(Error::Denied(format!(
-            "minting a {what} link requires `{CAP_CONTACTBLOCK_MINT}`"
-        )))
+        Err(Error::Denied(
+            format!("minting a {what} link requires `{CAP_CONTACTBLOCK_MINT}`").into(),
+        ))
     }
 }
 
@@ -419,13 +576,33 @@ impl Endpoint for ContactLabelLink {
                 detail: format!("`{label}` is not a label ({})", LABELS.join(", ")),
             });
         }
+        // The class the filter gave the enquiry, optional. Given, it must be one of the set
+        // (an empty value is not "none": a caller that has no class leaves the argument out).
+        let class = match inv.inline_str("class") {
+            Ok(c) => {
+                let c = c.trim().to_string();
+                if !CLASSES.contains(&c.as_str()) {
+                    return Err(Error::InvalidArgument {
+                        name: "class".to_string(),
+                        detail: format!("`{c}` is not a class ({})", CLASSES.join(", ")),
+                    });
+                }
+                c
+            }
+            Err(_) => String::new(),
+        };
         let enquiry = enquiry_of(inv, true)?.unwrap_or_default();
 
         let key = read_signing_key(&self.key_path)?;
         let exp = now_secs() + TTL_SECONDS;
-        let token = mint_label(&label, &enquiry, exp, &key);
+        let token = mint_label(&label, &enquiry, &class, exp, &key);
+        let class_param = if class.is_empty() {
+            String::new()
+        } else {
+            format!("&class={class}")
+        };
         Ok(url_answer(format!(
-            "{}?id={enquiry}&label={label}&exp={exp}&t={}\n",
+            "{}?id={enquiry}&label={label}{class_param}&exp={exp}&t={}\n",
             label_link_base(),
             urlencode(&token)
         )))
@@ -441,7 +618,9 @@ impl Endpoint for ContactLabelLink {
             .summary(
                 "A signed, expiring URL that teaches the edge's spam filter one enquiry's label \
                  (`ham` = not spam, `spam` = spam after all) — ready to drop into the enquiry \
-                 email. Names the enquiry by its id; never carries its text.",
+                 email. Names the enquiry by its id; never carries its text. Given `class`, the \
+                 class the filter gave the enquiry, the link signs it and the click's drop \
+                 carries it as `class`.",
             )
             .action(
                 ActionSpec::new(Verb::Source)
@@ -452,6 +631,16 @@ impl Endpoint for ContactLabelLink {
                             .summary("the label the link teaches")
                             .class(crate::XSD_STRING)
                             .one_of(LABELS),
+                    )
+                    .input(
+                        ArgSpec::new("class")
+                            .summary(
+                                "optional: the class the filter gave the enquiry when it was \
+                                 emailed; signed into the link and carried by its drop",
+                            )
+                            .class(crate::XSD_STRING)
+                            .one_of(CLASSES)
+                            .optional(),
                     )
                     .input(enquiry_spec(
                         "the enquiry tuple exactly as the reactor handed it; the link names it \
@@ -652,7 +841,7 @@ impl Endpoint for ContactBlock {
                 let named = if enquiry.is_empty() {
                     String::new()
                 } else {
-                    format!(" (enquiry {})", quoted(&enquiry))
+                    format!(" (enquiry {})", quoted(&current_enquiry(&enquiry)))
                 };
                 let tuple = format!(
                     "((block-email {}){named} (exp {}))",
@@ -785,11 +974,12 @@ impl Endpoint for ContactLabel {
         }
         let label = param(inv, "label")?;
         let enquiry = param(inv, "id")?;
+        let class = param(inv, "class")?;
         let token = param(inv, "t")?;
         let exp: i64 = param(inv, "exp")?.parse().unwrap_or(0);
 
         let key = verifying_key_at(&self.key_path)?;
-        if !label_valid(&label, &enquiry, exp, &token, &key, now_secs()) {
+        if !label_valid(&label, &enquiry, &class, exp, &token, &key, now_secs()) {
             return Ok(match inv.request.verb {
                 Verb::Sink => prg::see_other(INVALID, bad_link()),
                 _ => bad_link(),
@@ -817,12 +1007,11 @@ impl Endpoint for ContactLabel {
         match inv.request.verb {
             Verb::Source => {
                 let exp = exp.to_string();
-                let fields = [
-                    ("id", enquiry.as_str()),
-                    ("label", label.as_str()),
-                    ("exp", exp.as_str()),
-                    ("t", token.as_str()),
-                ];
+                let mut fields = vec![("id", enquiry.as_str()), ("label", label.as_str())];
+                if !class.is_empty() {
+                    fields.push(("class", class.as_str()));
+                }
+                fields.extend([("exp", exp.as_str()), ("t", token.as_str())]);
                 Ok(page(
                     title,
                     &format!(
@@ -838,10 +1027,18 @@ impl Endpoint for ContactLabel {
                 if crate::passkey::require_passkey(inv).is_err() {
                     return Ok(prg::see_other(PASSKEY, label_outcome(PASSKEY)));
                 }
+                // A link that carried the filter's class drops it too (ledger #3868), read by
+                // the apply program as `(get req 'class "")`. Only a verified class from the
+                // closed set reaches here.
+                let class_field = if class.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (class {})", quoted(&class))
+                };
                 let tuple = format!(
-                    "((label {}) (enquiry {}) (exp {}))",
+                    "((label {}) (enquiry {}) (exp {}){class_field})",
                     quoted(&label),
-                    quoted(&enquiry),
+                    quoted(&current_enquiry(&enquiry)),
                     quoted(&exp.to_string())
                 );
                 let done = if label == "ham" { "ham" } else { "spam" };
@@ -881,6 +1078,15 @@ impl Endpoint for ContactLabel {
                     .one_of(LABELS),
             )
             .input(
+                ArgSpec::new("class")
+                    .summary(
+                        "optional: the class the filter gave the enquiry, signed into the link",
+                    )
+                    .class(crate::XSD_STRING)
+                    .one_of(CLASSES)
+                    .optional(),
+            )
+            .input(
                 ArgSpec::new("exp")
                     .summary("expiry, unix seconds")
                     .class(crate::XSD_INTEGER),
@@ -896,7 +1102,8 @@ impl Endpoint for ContactLabel {
             .title("Label an enquiry for the spam filter")
             .summary(
                 "The emailed label link. GET verifies the token and shows what it would teach; \
-                 POST records the label for the edge to train on. Records intent only.",
+                 POST records the label, and the filter's class when the link carries one, for \
+                 the edge to train on. Records intent only.",
             )
             .action(
                 inputs(
@@ -963,8 +1170,9 @@ mod tests {
             assert!(label_valid(
                 label,
                 &q,
+                "",
                 EXP,
-                &mint_label(label, &q, EXP, &k),
+                &mint_label(label, &q, "", EXP, &k),
                 &v,
                 NOW
             ));
@@ -978,10 +1186,81 @@ mod tests {
             block_payload("a@example.invalid", "", 1_800_000_000),
             "contact-block|a@example.invalid||1800000000"
         );
+        // Since ledger #3868 a label signs the filter's class, empty when the link has none.
         assert_eq!(
-            label_payload("ham", &"a".repeat(64), 1_800_000_000),
+            label_payload("ham", &"a".repeat(64), "unsure", 1_800_000_000),
+            format!("contact-label|ham|{}|unsure|1800000000", "a".repeat(64))
+        );
+        assert_eq!(
+            label_payload("ham", &"a".repeat(64), "", 1_800_000_000),
+            format!("contact-label|ham|{}||1800000000", "a".repeat(64))
+        );
+        // The 4-field form a label link signed before then, verified only.
+        assert_eq!(
+            legacy_label_payload("ham", &"a".repeat(64), 1_800_000_000),
             format!("contact-label|ham|{}|1800000000", "a".repeat(64))
         );
+    }
+
+    #[test]
+    fn a_label_token_is_bound_to_its_class() {
+        let k = key();
+        let v = k.verifying_key();
+        let q = enquiry();
+        for class in CLASSES {
+            let t = mint_label("ham", &q, class, EXP, &k);
+            assert!(label_valid("ham", &q, class, EXP, &t, &v, NOW), "{class}");
+            // Re-pointed at any other class, or stripped of it, the link fails.
+            for other in CLASSES.iter().filter(|c| **c != class) {
+                assert!(
+                    !label_valid("ham", &q, other, EXP, &t, &v, NOW),
+                    "{class}->{other}"
+                );
+            }
+            assert!(
+                !label_valid("ham", &q, "", EXP, &t, &v, NOW),
+                "{class} stripped"
+            );
+        }
+        // A link minted with no class cannot have one added.
+        let none = mint_label("spam", &q, "", EXP, &k);
+        assert!(label_valid("spam", &q, "", EXP, &none, &v, NOW));
+        for class in CLASSES {
+            assert!(
+                !label_valid("spam", &q, class, EXP, &none, &v, NOW),
+                "{class}"
+            );
+        }
+        // A class outside the set never verifies, even one we signed by mistake.
+        let odd = mint_label("ham", &q, "eggs", EXP, &k);
+        assert!(!label_valid("ham", &q, "eggs", EXP, &odd, &v, NOW));
+    }
+
+    #[test]
+    fn a_label_link_minted_before_the_class_still_verifies_with_no_class() {
+        let k = key();
+        let v = k.verifying_key();
+        let q = enquiry();
+        for label in LABELS {
+            let old = sign(&legacy_label_payload(label, &q, EXP), &k);
+            assert!(label_valid(label, &q, "", EXP, &old, &v, NOW), "{label}");
+            // It carried no class, so it cannot be given one.
+            for class in CLASSES {
+                assert!(
+                    !label_valid(label, &q, class, EXP, &old, &v, NOW),
+                    "{label} {class}"
+                );
+            }
+            // Still bound to its label, enquiry and expiry, and still expires.
+            let other = if label == "ham" { "spam" } else { "ham" };
+            assert!(!label_valid(other, &q, "", EXP, &old, &v, NOW));
+            assert!(!label_valid(label, &"b".repeat(64), "", EXP, &old, &v, NOW));
+            assert!(!label_valid(label, &q, "", EXP + 1, &old, &v, NOW));
+            assert!(!label_valid(label, &q, "", EXP, &old, &v, EXP));
+            // And an old label signature is never a block one.
+            assert!(!block_valid(EMAIL, &q, EXP, &old, &v, NOW));
+            assert!(!block_valid(EMAIL, "", EXP, &old, &v, NOW));
+        }
     }
 
     #[test]
@@ -1003,14 +1282,14 @@ mod tests {
         let k = key();
         let v = k.verifying_key();
         let q = enquiry();
-        let ham = mint_label("ham", &q, EXP, &k);
+        let ham = mint_label("ham", &q, "", EXP, &k);
         // A SWAPPED ACTION: a "not spam" link edited to say spam (and the reverse) is refused.
-        assert!(!label_valid("spam", &q, EXP, &ham, &v, NOW));
-        let spam = mint_label("spam", &q, EXP, &k);
-        assert!(!label_valid("ham", &q, EXP, &spam, &v, NOW));
+        assert!(!label_valid("spam", &q, "", EXP, &ham, &v, NOW));
+        let spam = mint_label("spam", &q, "", EXP, &k);
+        assert!(!label_valid("ham", &q, "", EXP, &spam, &v, NOW));
         // Another enquiry, or a stretched expiry.
-        assert!(!label_valid("ham", &"b".repeat(64), EXP, &ham, &v, NOW));
-        assert!(!label_valid("ham", &q, EXP + 1, &ham, &v, NOW));
+        assert!(!label_valid("ham", &"b".repeat(64), "", EXP, &ham, &v, NOW));
+        assert!(!label_valid("ham", &q, "", EXP + 1, &ham, &v, NOW));
     }
 
     #[test]
@@ -1024,23 +1303,32 @@ mod tests {
         let legacy = sign(&legacy_block_payload(EMAIL, EXP), &k);
         for t in [&block, &legacy] {
             for label in LABELS {
-                assert!(!label_valid(label, &q, EXP, t, &v, NOW), "{label}");
+                for class in std::iter::once("").chain(CLASSES) {
+                    assert!(
+                        !label_valid(label, &q, class, EXP, t, &v, NOW),
+                        "{label} {class}"
+                    );
+                }
             }
         }
         // The action tag ALONE separates them: a block payload whose address slot holds a label
         // (no minter signs one; the address check refuses it) still never verifies as that label.
         for label in LABELS {
             let t = sign(&block_payload(label, &q, EXP), &k);
-            assert!(!label_valid(label, &q, EXP, &t, &v, NOW), "{label}");
+            assert!(!label_valid(label, &q, "", EXP, &t, &v, NOW), "{label}");
         }
         for label in LABELS {
-            let t = mint_label(label, &q, EXP, &k);
-            assert!(!block_valid(EMAIL, &q, EXP, &t, &v, NOW));
-            assert!(!block_valid(EMAIL, "", EXP, &t, &v, NOW));
-            // Even a replayer who rewrites the address into the label payload's own prefix:
-            // an address may not carry `|`, so it never reaches the signature check.
-            let forged_email = format!("{LABEL_ACTION}|{label}|{q}");
-            assert!(!block_valid(&forged_email, "", EXP, &t, &v, NOW));
+            for class in std::iter::once("").chain(CLASSES) {
+                let t = mint_label(label, &q, class, EXP, &k);
+                assert!(!block_valid(EMAIL, &q, EXP, &t, &v, NOW));
+                assert!(!block_valid(EMAIL, "", EXP, &t, &v, NOW));
+                // Even a replayer who rewrites the address into the label payload's own
+                // prefix: an address may not carry `|`, so it never reaches the signature check.
+                let forged_email = format!("{LABEL_ACTION}|{label}|{q}");
+                assert!(!block_valid(&forged_email, "", EXP, &t, &v, NOW));
+                let forged_email = format!("{LABEL_ACTION}|{label}|{q}|{class}");
+                assert!(!block_valid(&forged_email, "", EXP, &t, &v, NOW));
+            }
         }
     }
 
@@ -1061,8 +1349,8 @@ mod tests {
         let q = enquiry();
         let t = mint_block(EMAIL, &q, EXP, &k);
         assert!(!block_valid(EMAIL, &q, EXP, &t, &v, EXP + 1));
-        let l = mint_label("ham", &q, EXP, &k);
-        assert!(!label_valid("ham", &q, EXP, &l, &v, EXP));
+        let l = mint_label("ham", &q, "", EXP, &k);
+        assert!(!label_valid("ham", &q, "", EXP, &l, &v, EXP));
     }
 
     #[test]
@@ -1081,8 +1369,9 @@ mod tests {
         assert!(!label_valid(
             "ham",
             &q,
+            "",
             EXP,
-            &mint_label("ham", &q, EXP, &theirs),
+            &mint_label("ham", &q, "", EXP, &theirs),
             &v,
             NOW
         ));
@@ -1094,7 +1383,7 @@ mod tests {
         let q = enquiry();
         for bad in ["", "!!!!", "c2hvcnQ", &"A".repeat(200)] {
             assert!(!block_valid(EMAIL, "", EXP, bad, &v, NOW), "{bad}");
-            assert!(!label_valid("ham", &q, EXP, bad, &v, NOW), "{bad}");
+            assert!(!label_valid("ham", &q, "", EXP, bad, &v, NOW), "{bad}");
         }
     }
 
@@ -1127,8 +1416,8 @@ mod tests {
         let v = k.verifying_key();
         let q = enquiry();
         // A label outside the model's two classes, even one we signed by mistake.
-        let odd = mint_label("eggs", &q, EXP, &k);
-        assert!(!label_valid("eggs", &q, EXP, &odd, &v, NOW));
+        let odd = mint_label("eggs", &q, "", EXP, &k);
+        assert!(!label_valid("eggs", &q, "", EXP, &odd, &v, NOW));
         // An enquiry id that is not a tuple id: short, upper-case, a path, empty.
         for bad in [
             "abc".to_string(),
@@ -1137,8 +1426,8 @@ mod tests {
             String::new(),
         ] {
             assert!(!enquiry_id_shaped(&bad), "{bad:?}");
-            let t = mint_label("ham", &bad, EXP, &k);
-            assert!(!label_valid("ham", &bad, EXP, &t, &v, NOW), "{bad:?}");
+            let t = mint_label("ham", &bad, "", EXP, &k);
+            assert!(!label_valid("ham", &bad, "", EXP, &t, &v, NOW), "{bad:?}");
             if !bad.is_empty() {
                 let t = mint_block(EMAIL, &bad, EXP, &k);
                 assert!(!block_valid(EMAIL, &bad, EXP, &t, &v, NOW), "{bad:?}");
@@ -1210,6 +1499,8 @@ mod endpoint_tests {
         std::fs::write(&private, key.to_pkcs8_pem(LineEnding::LF).unwrap().as_str()).unwrap();
 
         let recorder = Recorder::default();
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(
             EndpointSpace::new()
                 .bind(
@@ -1435,6 +1726,68 @@ mod endpoint_tests {
         assert!(w.dropped().is_empty(), "nothing recorded");
     }
 
+    /// Ledger #3713: a reseal stores the enquiry again under a new id and leaves a forward;
+    /// a link minted before it still verifies (its token signs the old id) and the intent it
+    /// records names the id the tuple has now.
+    #[test]
+    fn a_link_minted_before_a_reseal_records_the_enquirys_new_id() {
+        let w = world("reseal-forward");
+        let text = "((message \"resealed since the email\"))";
+        let old = ikigai_intray::tuple_id(text.as_bytes());
+        let new = ikigai_intray::tuple_id(b"the ciphertext it is stored as now");
+        let forwards = file_root()
+            .join("spaces")
+            .join(CONTACT_SPACE)
+            .join(crate::space_seal::FORWARDS_DIR);
+        std::fs::create_dir_all(&forwards).unwrap();
+        std::fs::write(forwards.join(&old), format!("{new}\n")).unwrap();
+
+        let block = query(
+            &w.issue(
+                Verb::Source,
+                "urn:contactblock:link",
+                &[("email", EMAIL), ("enquiry", text)],
+            )
+            .unwrap(),
+        );
+        let label = query(
+            &w.issue(
+                Verb::Source,
+                "urn:contactlabel:link",
+                &[("label", "spam"), ("enquiry", text)],
+            )
+            .unwrap(),
+        );
+        assert_eq!(block["id"], old);
+        let body = format!(
+            "email={}&id={}&exp={}&t={}",
+            urlencode(EMAIL),
+            block["id"],
+            block["exp"],
+            urlencode(&block["t"])
+        );
+        assert!(w.post_form("urn:contact-block", &body).contains("Blocked"));
+        assert!(w
+            .post_label(
+                &label["id"],
+                "spam",
+                label["exp"].parse().unwrap(),
+                &label["t"]
+            )
+            .contains("spam"));
+        let _ = std::fs::remove_file(forwards.join(&old));
+
+        let dropped = w.dropped();
+        assert_eq!(dropped.len(), 2, "{dropped:?}");
+        for tuple in &dropped {
+            assert_eq!(
+                crate::decide::field(tuple, "enquiry").as_deref(),
+                Some(new.as_str()),
+                "{tuple}"
+            );
+        }
+    }
+
     #[test]
     fn a_minted_block_link_names_its_enquiry_and_its_post_records_it() {
         let w = world("block-enquiry");
@@ -1536,6 +1889,113 @@ mod endpoint_tests {
             Some("ham")
         );
         assert_eq!(crate::decide::field(&dropped[0], "enquiry"), Some(id));
+        // Minted with no class: the link carries none and neither does its drop.
+        assert!(!q.contains_key("class"), "{url}");
+        assert_eq!(crate::decide::field(&dropped[0], "class"), None);
+    }
+
+    /// Ledger #3868: a link minted with the filter's class signs it, shows it on, and drops it.
+    #[test]
+    fn a_label_link_with_a_class_drops_that_class_exactly() {
+        for class in CLASSES {
+            let w = world(&format!("label-class-{class}"));
+            let url = w
+                .issue(
+                    Verb::Source,
+                    "urn:contactlabel:link",
+                    &[("label", "spam"), ("class", class), ("enquiry", ENQUIRY)],
+                )
+                .unwrap();
+            let q = query(&url);
+            assert_eq!(q.get("class").map(String::as_str), Some(class), "{url}");
+            let id = ikigai_intray::tuple_id(ENQUIRY.as_bytes());
+            let exp: i64 = q["exp"].parse().unwrap();
+            // The token is the signature over the 5-field payload, class and all.
+            assert_eq!(q["t"], mint_label("spam", &id, class, exp, &w.key));
+
+            // GET carries the class on into the confirm form.
+            let get = w
+                .issue(
+                    Verb::Source,
+                    "urn:contact-label",
+                    &[
+                        ("id", &id),
+                        ("label", "spam"),
+                        ("class", class),
+                        ("exp", &q["exp"]),
+                        ("t", &q["t"]),
+                    ],
+                )
+                .unwrap();
+            assert!(get.contains("Spam after all?"), "{get}");
+            assert!(
+                get.contains(&format!("<input type=hidden name=class value=\"{class}\">")),
+                "{get}"
+            );
+
+            // Re-pointed at another class (or stripped of it), the click records nothing.
+            for other in CLASSES.iter().filter(|c| **c != class) {
+                let body = format!(
+                    "id={id}&label=spam&class={other}&exp={exp}&t={}",
+                    urlencode(&q["t"])
+                );
+                let html = w.post_form("urn:contact-label", &body);
+                assert!(html.contains("didn't work"), "{class}->{other}: {html}");
+            }
+            assert!(w
+                .post_label(&id, "spam", exp, &q["t"])
+                .contains("didn't work"));
+            assert!(w.dropped().is_empty(), "{:?}", w.dropped());
+
+            // The real click drops exactly one tuple, its class exactly the signed one, and
+            // the rest of the drop as before.
+            let body = format!(
+                "id={id}&label=spam&class={class}&exp={exp}&t={}",
+                urlencode(&q["t"])
+            );
+            let html = w.post_form("urn:contact-label", &body);
+            assert!(html.contains("Marked as spam"), "{html}");
+            let dropped = w.dropped();
+            assert_eq!(dropped.len(), 1, "{dropped:?}");
+            assert_eq!(
+                dropped[0],
+                format!(
+                    "((label \"spam\") (enquiry \"{id}\") (exp \"{exp}\") (class \"{class}\"))"
+                )
+            );
+            assert_eq!(
+                crate::decide::field(&dropped[0], "class").as_deref(),
+                Some(class)
+            );
+        }
+    }
+
+    /// A label link minted before ledger #3868 signed `contact-label|<label>|<enquiry>|<exp>`.
+    /// Clicked now, it still records, and its drop carries no class.
+    #[test]
+    fn an_old_label_link_still_records_and_drops_no_class() {
+        let w = world("label-legacy");
+        let id = ikigai_intray::tuple_id(ENQUIRY.as_bytes());
+        let exp = now_secs() + 600;
+        let old = sign(&legacy_label_payload("ham", &id, exp), &w.key);
+        // Given a class it never signed, it fails.
+        let body = format!(
+            "id={id}&label=ham&class=spam&exp={exp}&t={}",
+            urlencode(&old)
+        );
+        assert!(w
+            .post_form("urn:contact-label", &body)
+            .contains("didn't work"));
+        assert!(w.dropped().is_empty());
+        let html = w.post_label(&id, "ham", exp, &old);
+        assert!(html.contains("Marked as not spam"), "{html}");
+        let dropped = w.dropped();
+        assert_eq!(dropped.len(), 1, "{dropped:?}");
+        assert_eq!(
+            dropped[0],
+            format!("((label \"ham\") (enquiry \"{id}\") (exp \"{exp}\"))")
+        );
+        assert_eq!(crate::decide::field(&dropped[0], "class"), None);
     }
 
     /// Every refusal the label face makes, each answering the same bad-link page and recording
@@ -1546,13 +2006,13 @@ mod endpoint_tests {
         let w = world("label-refusals");
         let id = ikigai_intray::tuple_id(ENQUIRY.as_bytes());
         let exp = now_secs() + 600;
-        let good = mint_label("ham", &id, exp, &w.key);
+        let good = mint_label("ham", &id, "", exp, &w.key);
 
         // A wrong signature: another key.
-        let forged = mint_label("ham", &id, exp, &SigningKey::from_bytes(&[9u8; 32]));
+        let forged = mint_label("ham", &id, "", exp, &SigningKey::from_bytes(&[9u8; 32]));
         // Expired.
         let stale_exp = now_secs() - 1;
-        let stale = mint_label("ham", &id, stale_exp, &w.key);
+        let stale = mint_label("ham", &id, "", stale_exp, &w.key);
         // A block token for this very enquiry, replayed at the label door.
         let block = mint_block(EMAIL, &id, exp, &w.key);
         let other = "c".repeat(64);
@@ -1600,7 +2060,7 @@ mod endpoint_tests {
         let id = ikigai_intray::tuple_id(ENQUIRY.as_bytes());
         let exp = now_secs() + 600;
         for label in LABELS {
-            let t = mint_label(label, &id, exp, &w.key);
+            let t = mint_label(label, &id, "", exp, &w.key);
             let body = format!(
                 "email={}&id={id}&exp={exp}&t={}",
                 urlencode(EMAIL),
@@ -1640,6 +2100,18 @@ mod endpoint_tests {
             matches!(bad_label, Err(Error::InvalidArgument { ref name, .. }) if name == "label"),
             "{bad_label:?}"
         );
+        // A class outside the filter's closed set, or given empty, is refused.
+        for bad in ["eggs", "", "SPAM", "spam|ham"] {
+            let bad_class = w.issue(
+                Verb::Source,
+                "urn:contactlabel:link",
+                &[("label", "ham"), ("class", bad), ("enquiry", ENQUIRY)],
+            );
+            assert!(
+                matches!(bad_class, Err(Error::InvalidArgument { ref name, .. }) if name == "class"),
+                "{bad:?}: {bad_class:?}"
+            );
+        }
         let no_enquiry = w.issue(Verb::Source, "urn:contactlabel:link", &[("label", "ham")]);
         assert!(
             matches!(no_enquiry, Err(Error::MissingArgument(ref n)) if n == "enquiry"),
@@ -1665,6 +2137,8 @@ mod endpoint_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let key_path = dir.join("contact-block.pub");
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(
             EndpointSpace::new()
                 .bind(

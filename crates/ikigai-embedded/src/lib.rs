@@ -49,12 +49,16 @@ const XSD_BOOLEAN: &str = "http://www.w3.org/2001/XMLSchema#boolean";
 // kernel, and `urn:iki:host:arrangement`, the root's arrangement as a declaration.
 pub mod agents;
 pub mod arrangement;
+pub mod authority;
 #[cfg(all(feature = "ipc", unix))]
 pub mod socket;
 // The spam filter (`urn:bayes:*`, ledger #1512): bound in the local root when the binary arms it
 // with a state directory and named models. One writer per state directory, so one open per
 // process; see the module note.
 pub mod bayes;
+mod booking;
+// The contact-inquiry edge half (`urn:iki:inquiry:*`, ledger #3836): bound when the config home
+// has an `inquiry.json`; the local root binds all of it, the served kernel the block set and apply.
 mod browse;
 pub mod cache;
 pub mod clients;
@@ -63,10 +67,13 @@ pub mod contactblock;
 pub mod decide;
 pub mod decisions;
 pub mod foaf;
+pub mod inquiry;
+mod intakes;
 pub mod jsonl;
 pub mod layers;
 pub mod lisp;
 pub mod names;
+mod orgfile;
 pub mod passkey;
 pub mod people;
 mod prg;
@@ -78,8 +85,11 @@ mod ui;
 // `ikigai-cli` build its value and print from it: the banner and the resource are two faces
 // of one recorded fact, which is what keeps them from drifting into two spellings of it.
 pub mod posture;
+pub mod retention;
+pub mod retry;
 pub mod scheduling;
 #[cfg(unix)]
+pub mod space_seal;
 pub mod spill;
 // The durable RDF store (`urn:iki:store:*`) and — with it — the work ledger. Behind the
 // `store` feature because a host that does not want a dataset should not carry one, and
@@ -429,9 +439,9 @@ fn toggle_write(inv: &Invocation<'_>, cap: &str) -> ikigai_core::Result<Option<b
         return Ok(None);
     }
     if !inv.capability.allows(cap) {
-        return Err(Error::Denied(format!(
-            "changing this host's setting requires `{cap}`"
-        )));
+        return Err(Error::Denied(
+            format!("changing this host's setting requires `{cap}`").into(),
+        ));
     }
     let value = inv.inline_str("content")?;
     Ok(Some(matches!(
@@ -477,16 +487,18 @@ fn toggle_description(
 /// not write the home: `history_flag()` is seeded through this, so every caller of the flag,
 /// a test included, created `~/.ikigai` as a side effect and failed `just hermetic` (ledger
 /// #1264). The two writers create it: [`ikigai_home_for_writing`].
-fn ikigai_home() -> PathBuf {
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    home.join(".ikigai")
+///
+/// `None` with no usable home ([`config::user_home`]): nothing is kept then, rather than
+/// kept under the working directory.
+fn ikigai_home() -> Option<PathBuf> {
+    Some(config::user_home()?.join(".ikigai"))
 }
 
 /// [`ikigai_home`], created, for the paths that are about to write into it.
-fn ikigai_home_for_writing() -> PathBuf {
-    let dir = ikigai_home();
+fn ikigai_home_for_writing() -> Option<PathBuf> {
+    let dir = ikigai_home()?;
     let _ = std::fs::create_dir_all(&dir);
-    dir
+    Some(dir)
 }
 
 /// Process-global flag: persist command history across invocations? Mirrors
@@ -496,15 +508,19 @@ fn ikigai_home_for_writing() -> PathBuf {
 pub fn history_flag() -> Arc<AtomicBool> {
     static HISTORY: OnceLock<Arc<AtomicBool>> = OnceLock::new();
     HISTORY
-        .get_or_init(|| Arc::new(AtomicBool::new(history_marker().exists())))
+        .get_or_init(|| {
+            Arc::new(AtomicBool::new(
+                history_marker().is_some_and(|m| m.exists()),
+            ))
+        })
         .clone()
 }
 
 /// The marker whose presence means persistence is on, so the toggle survives across
 /// invocations (the flag is seeded from it). Kept separate from the history file, so
 /// turning persistence off never discards the lines already recorded.
-fn history_marker() -> PathBuf {
-    ikigai_home().join("history.on")
+fn history_marker() -> Option<PathBuf> {
+    Some(ikigai_home()?.join("history.on"))
 }
 
 /// The history file within a given config dir — one line per command. Split from
@@ -539,7 +555,7 @@ fn write_history(dir: &Path, line: &str) {
 /// The persisted command history, oldest first — what a fresh session preloads into
 /// its line recall. Empty if nothing has been saved (or the file can't be read).
 pub fn load_history() -> Vec<String> {
-    read_history(&ikigai_home())
+    ikigai_home().map_or_else(Vec::new, |home| read_history(&home))
 }
 
 /// Append one command to the persisted history — a no-op when persistence is off or
@@ -548,15 +564,21 @@ pub fn append_history(line: &str) {
     if !history_flag().load(Ordering::Relaxed) {
         return;
     }
-    write_history(&ikigai_home_for_writing(), line);
+    if let Some(home) = ikigai_home_for_writing() {
+        write_history(&home, line);
+    }
 }
 
 /// Turn history persistence on or off, updating both the live flag and the on-disk
 /// marker that makes the choice stick across invocations. Turning it off leaves the
 /// recorded lines in place.
 pub fn set_history(on: bool) {
+    // With no home there is nowhere to persist to, so the flag stays off and says so.
+    let Some(marker) = history_marker() else {
+        history_flag().store(false, Ordering::SeqCst);
+        return;
+    };
     history_flag().store(on, Ordering::SeqCst);
-    let marker = history_marker();
     if on {
         ikigai_home_for_writing();
         let _ = std::fs::File::create(&marker); // presence is the signal; empty is fine
@@ -906,21 +928,11 @@ pub fn file_root() -> PathBuf {
     let root = tests::thread_file_root();
     #[cfg(not(test))]
     let root = {
-        let instance = instance_name();
-        let configured =
-            config::get(&format!("{instance}.{FILES_KEY}")).or_else(|| config::get(FILES_KEY));
-        file_root_from(
-            configured.as_deref(),
-            std::env::var_os("IKIGAI_FILES").as_deref(),
-            config::config_home().as_deref(),
-            std::env::var_os("HOME")
-                .as_deref()
-                .map(std::path::Path::new),
-        )
-        // The config home's other refusals stop the process the same way (`browse.root`,
-        // `store`): a file root nobody meant is worse than no start, and the kernel build
-        // reaches this before any request does.
-        .unwrap_or_else(|e| panic!("ikigai: {e} — fix the config"))
+        configured_file_root()
+            // The config home's other refusals stop the process the same way (`browse.root`,
+            // `store`): a file root nobody meant is worse than no start, and the kernel build
+            // reaches this before any request does.
+            .unwrap_or_else(|e| panic!("ikigai: {e} — fix the config"))
     };
     create_workspace(&root);
     root
@@ -938,7 +950,8 @@ pub const FILES_KEY: &str = "files";
 ///    is, by the workspace's one rule ([`ikigai_resolve::expand_home`], ledger #1379): a `~`
 ///    it cannot expand (`~bob/ws`, or any `~` with no `home`) is an `Err` naming the key.
 /// 2. `env`: `$IKIGAI_FILES`, the fallback it always was.
-/// 3. `<home>/.ikigai/workspace` (`./.ikigai/workspace` with no `home`).
+/// 3. `<home>/.ikigai/workspace`, or an `Err` with no `home`: the root is never relative to
+///    the working directory by default.
 ///
 /// ⚠ The config home is SHARED by every process on the machine, so an unscoped `files` line
 /// moves the root of every one of them (the daemon, a served door, the REPL); scope it to
@@ -956,6 +969,7 @@ pub const FILES_KEY: &str = "files";
 /// assert!(file_root_from(Some("~/ws"), None, cfg, None).is_err());
 /// assert_eq!(file_root_from(None, Some("/env".as_ref()), cfg, home), Ok(PathBuf::from("/env")));
 /// assert_eq!(file_root_from(None, None, cfg, home), Ok(PathBuf::from("/h/.ikigai/workspace")));
+/// assert!(file_root_from(None, None, cfg, None).unwrap_err().contains("--files"));
 /// ```
 pub fn file_root_from(
     configured: Option<&str>,
@@ -974,10 +988,36 @@ pub fn file_root_from(
     if let Some(env) = env.filter(|v| !v.is_empty()) {
         return Ok(PathBuf::from(env));
     }
-    Ok(home
-        .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf)
-        .join(".ikigai")
-        .join("workspace"))
+    match home {
+        Some(home) => Ok(home.join(".ikigai").join("workspace")),
+        None => Err(NO_FILE_ROOT.to_string()),
+    }
+}
+
+/// Why [`file_root_from`] has no default root.
+const NO_FILE_ROOT: &str = "no file root: HOME and USERPROFILE are each unset, empty or not an \
+     absolute path, so there is no default workspace; set one to an absolute path, or name the \
+     root with --files <dir>";
+
+/// Stop before a kernel is built when it would have no file root and none was named.
+pub fn check_file_root() -> std::result::Result<(), String> {
+    if FILE_ROOT_OVERRIDE.lock().expect("file root lock").is_some() {
+        return Ok(());
+    }
+    configured_file_root().map(drop)
+}
+
+/// [`file_root_from`] over this process's config home and environment.
+fn configured_file_root() -> std::result::Result<PathBuf, String> {
+    let instance = instance_name();
+    let configured =
+        config::get(&format!("{instance}.{FILES_KEY}")).or_else(|| config::get(FILES_KEY));
+    file_root_from(
+        configured.as_deref(),
+        std::env::var_os("IKIGAI_FILES").as_deref(),
+        config::config_home().as_deref(),
+        config::user_home().as_deref(),
+    )
 }
 
 /// Create the workspace directory PRIVATE (`0700`) if it does not exist yet, whatever the
@@ -1067,7 +1107,7 @@ fn org_config() -> Option<(PathBuf, Vec<String>)> {
     let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     // The workspace's one `~` rule (ledger #1379). A `~` it cannot expand gives no org
     // config, the failure this function already had for an unset HOME.
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = config::user_home();
     let dir = ikigai_resolve::expand_home(v["org_dir"].as_str()?, home.as_deref()).ok()?;
     let files = v["org_files"]
         .as_array()?
@@ -1115,6 +1155,193 @@ pub fn set_grants_path(path: PathBuf) {
     *GRANTS_PATH_OVERRIDE.lock().expect("grants path lock") = Some(path);
 }
 
+/// Refuse a `--grants` that names a file that is not there. Every host reads the flag, so a
+/// host started with one checks it before it serves: a missing explicit file is a mistyped path,
+/// not "no grants", and serving as though no file was named would hide it.
+///
+/// # Errors
+///
+/// The refusal from [`grants_path`], or a `--grants` naming a file that does not exist.
+pub fn check_grants_flag() -> std::result::Result<(), String> {
+    let path = grants_path()?;
+    if !grants_path_is_explicit() {
+        return Ok(());
+    }
+    match path.map(std::fs::metadata) {
+        Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(missing_grants_flag(&grants_path()?.unwrap_or_default()))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Whether [`grants_path`] is the file `--grants` named rather than the config home's.
+pub(crate) fn grants_path_is_explicit() -> bool {
+    GRANTS_PATH_OVERRIDE
+        .lock()
+        .expect("grants path lock")
+        .is_some()
+}
+
+/// The refusal for a `--grants` that names a file that is not there.
+pub(crate) fn missing_grants_flag(path: &std::path::Path) -> String {
+    format!(
+        "--grants names a file that does not exist: {}",
+        path.display()
+    )
+}
+
+/// The exec scopes no facade serves any more, each with what to write instead (ledger #3828).
+/// ikigai-repo 0.6.0 (the exec split, ledger #3818) serves git and gh under
+/// `urn:cap:exec:read:git` / `urn:cap:exec:read:gh` and grants nothing for the old spellings;
+/// nothing has served `urn:cap:exec:cargo` or `urn:cap:exec:just` since ikigai-repo 0.3.0.
+const RETIRED_EXEC_SCOPES: [(&str, &str); 4] = [
+    (
+        "urn:cap:exec:git",
+        "replace it with `urn:cap:exec:read:git`",
+    ),
+    ("urn:cap:exec:gh", "replace it with `urn:cap:exec:read:gh`"),
+    ("urn:cap:exec:cargo", "remove it; nothing serves it"),
+    ("urn:cap:exec:just", "remove it; nothing serves it"),
+];
+
+/// What to do about `scope` if it is a retired exec scope: `None` for any other scope.
+///
+/// ```
+/// use ikigai_embedded::retired_scope_advice;
+///
+/// assert_eq!(
+///     retired_scope_advice("urn:cap:exec:git"),
+///     Some("replace it with `urn:cap:exec:read:git`")
+/// );
+/// assert_eq!(retired_scope_advice("urn:cap:exec:read:git"), None);
+/// ```
+#[must_use]
+pub fn retired_scope_advice(scope: &str) -> Option<&'static str> {
+    RETIRED_EXEC_SCOPES
+        .iter()
+        .find(|(retired, _)| *retired == scope)
+        .map(|(_, advice)| *advice)
+}
+
+/// Refuse a scope list that names a retired exec scope. `whose` says where the list came
+/// from (a file and a grant, or a flag), and the refusal names it, the scope and the
+/// replacement. A retired scope grants nothing, so a list still naming one would lose what it
+/// meant to grant without a word; the list is refused instead, and never rewritten.
+///
+/// ```
+/// use ikigai_embedded::check_retired_scopes;
+///
+/// let refused = check_retired_scopes("--scope", ["urn:cap:exec:gh"]).unwrap_err();
+/// assert!(refused.contains("`urn:cap:exec:read:gh`"));
+/// assert!(check_retired_scopes("--scope", ["urn:cap:exec:read:gh"]).is_ok());
+/// ```
+///
+/// # Errors
+///
+/// One line per retired scope in `scopes`.
+pub fn check_retired_scopes<S: AsRef<str>>(
+    whose: &str,
+    scopes: impl IntoIterator<Item = S>,
+) -> std::result::Result<(), String> {
+    let refusals: Vec<String> = scopes
+        .into_iter()
+        .filter_map(|scope| {
+            let scope = scope.as_ref();
+            retired_scope_advice(scope)
+                .map(|advice| format!("{whose} names the retired exec scope `{scope}`: {advice}"))
+        })
+        .collect();
+    if refusals.is_empty() {
+        Ok(())
+    } else {
+        Err(refusals.join("\n"))
+    }
+}
+
+/// Refuse a parsed grants document any of whose grants names a retired exec scope
+/// ([`check_retired_scopes`]), naming `path` and each grant.
+pub(crate) fn check_retired_grants(
+    path: &std::path::Path,
+    document: &serde_json::Value,
+) -> std::result::Result<(), String> {
+    let Some(grants) = document.as_object() else {
+        return Ok(());
+    };
+    let refusals: Vec<String> = grants
+        .iter()
+        .filter(|(name, _)| name.as_str() != agents::PRINCIPALS_KEY)
+        .filter_map(|(name, entry)| {
+            check_retired_scopes(
+                &format!("{}: grant `{name}`", path.display()),
+                grant_entry_scopes(entry),
+            )
+            .err()
+        })
+        .collect();
+    if refusals.is_empty() {
+        Ok(())
+    } else {
+        Err(refusals.join("\n"))
+    }
+}
+
+/// Refuse to start on a grants file any of whose grants names a retired exec scope. Every host
+/// checks it at start, beside [`check_grants_flag`]. A file that is absent, unreadable or not
+/// JSON is left to the readers that already refuse it.
+///
+/// # Errors
+///
+/// The refusal from [`grants_path`], or one naming the file, each grant, its retired scope and
+/// the replacement.
+pub fn check_grants_retired_scopes() -> std::result::Result<(), String> {
+    let Some(path) = grants_path()? else {
+        return Ok(());
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Ok(());
+    };
+    check_retired_grants(&path, &document)
+}
+
+/// The grants file, parsed: `Ok(None)` when the config home has none. A door that serves from
+/// it reads it whole once at start, so a file it could not use stops the door rather than
+/// leaving every grant it names quietly empty ([`grant_scopes`] reads an unusable file as no
+/// grants).
+///
+/// # Errors
+///
+/// The refusal from [`grants_path`]; a `--grants` naming a file that does not exist; a file
+/// that cannot be read, does not parse as JSON, or is not an object of grant name to scopes.
+pub fn grants_document() -> std::result::Result<Option<serde_json::Value>, String> {
+    let Some(path) = grants_path()? else {
+        return Ok(None);
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if grants_path_is_explicit() {
+                return Err(missing_grants_flag(&path));
+            }
+            return Ok(None);
+        }
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    let document = serde_json::from_str::<serde_json::Value>(&text)
+        .map_err(|e| format!("{} does not parse as JSON: {e}", path.display()))?;
+    if !document.is_object() {
+        return Err(format!(
+            "{} is not a grants file: it must be a JSON object of grant name → scopes",
+            path.display()
+        ));
+    }
+    check_retired_grants(&path, &document)?;
+    Ok(Some(document))
+}
+
 /// The scopes of one grant entry of a parsed grants document (either shape); empty for
 /// anything else. The reader [`grant_scopes`] and [`agents`] share.
 pub(crate) fn grant_entry_scopes(entry: &serde_json::Value) -> Vec<String> {
@@ -1134,11 +1361,16 @@ pub(crate) fn grant_entry_scopes(entry: &serde_json::Value) -> Vec<String> {
 ///
 /// # Errors
 ///
-/// Returns the configuration refusal from [`grants_path`].
+/// Returns the configuration refusal from [`grants_path`], or a grant naming a retired exec
+/// scope ([`check_retired_scopes`]).
 pub fn grant_scopes(name: &str) -> std::result::Result<Vec<String>, String> {
-    Ok(grant_entry(name)?
+    let scopes = grant_entry(name)?
         .map(|e| scopes_of(&e))
-        .unwrap_or_default())
+        .unwrap_or_default();
+    if let Some(path) = grants_path()? {
+        check_retired_scopes(&format!("{}: grant `{name}`", path.display()), &scopes)?;
+    }
+    Ok(scopes)
 }
 
 /// The visibility profile of a named MCP grant — the `show`/`hide` glob lists from
@@ -1658,7 +1890,7 @@ fn local_space(nature: &'static str) -> EndpointSpace {
             // The org files, jailed to the configured org_dir and read THROUGH
             // the kernel by urn:org:agenda (capability-gated; golden-thread-ready).
             UriTemplate::parse("urn:orgfile:{path}").expect("valid template"),
-            ikigai_fs::FileEndpoint::new(org_config().map(|(dir, _)| dir).unwrap_or_default()),
+            orgfile::OrgFileEndpoint::new(org_config().map(|(dir, _)| dir).unwrap_or_default()),
         )
         .bind(
             UriTemplate::parse(ikigai_fs::FILE_TEMPLATE).expect("FILE_TEMPLATE is valid"),
@@ -1678,14 +1910,18 @@ fn local_space(nature: &'static str) -> EndpointSpace {
 /// and the capability path-ACL refuses any other segment. The personal space stays OFF
 /// the wire — owner-only, no per-tenant story yet.
 fn served_space(nature: &'static str) -> impl Space {
-    Fallback::new(vec![
-        Arc::new(ui::space()),
-        Arc::new(served_endpoints(nature)),
-    ])
+    let mut members: Vec<Arc<dyn Space>> =
+        vec![Arc::new(ui::space()), Arc::new(served_endpoints(nature))];
+    // Only what a configured intake (the block set's `Exists`) and the airlock (apply) reach,
+    // when the config home has an `inquiry.json`; never a route of the HTTP door.
+    if let Some(space) = inquiry::served_space() {
+        members.push(space);
+    }
+    Fallback::new(members)
 }
 
 fn served_endpoints(nature: &'static str) -> EndpointSpace {
-    base_space(nature)
+    intakes::bind(base_space(nature))
         .bind(
             UriTemplate::parse(ikigai_fs::FILE_TEMPLATE).expect("FILE_TEMPLATE is valid"),
             // Cacheable, so a file changed on disk outside the kernel is seen only through
@@ -1708,11 +1944,10 @@ fn served_endpoints(nature: &'static str) -> EndpointSpace {
         // un-routed path (a direct POST to some other space) is a 404, and grant a ceiling
         // of exactly {contact:submit, booking:submit, space:out}. Route table = the surface
         // allowlist, capability = the authority ceiling; a bug in one still leaves the other.
-        .bind(Exact::new("urn:contact:submit"), contact_submit())
         .bind(Exact::new("urn:booking:submit"), booking_submit())
         .bind(
             UriTemplate::parse(ikigai_intray::SPACE_TEMPLATE).expect("SPACE_TEMPLATE is valid"),
-            ikigai_intray::SpaceEndpoint::new(file_root().join("spaces")),
+            space_seal::endpoint(file_root().join("spaces")),
         )
         // The emailed decision links: /calendar-request/{approve,decline}. Public — the
         // signed token IS the authorisation, and this host only RECORDS the decision into a
@@ -1818,10 +2053,24 @@ pub fn calendar_server_space(nature: &'static str) -> EndpointSpace {
         )
 }
 
+/// The one constructor for a kernel that issues USER requests: the REPL's, a `-c` run's, a
+/// door's, a `--connect` client's. Every such kernel needs the host's Meta renderer, which
+/// answers `Meta` as `application/json`: the engine reads a target's parameter contract that
+/// way to route a named, piped or positional argument, and a kernel built with bare
+/// `Kernel::new` has no renderer, so every named argument is routed as text or refused
+/// (ledger #4037). Both constructors compile and only this one routes arguments, so
+/// `Kernel::new` is a disallowed method in the workspace's `clippy.toml` (ledger #4038).
+///
+/// `cache` is the caller's cache policy: the host surfaces take the configured LRU (see
+/// [`cache::configure`]), a `--connect` issuer one that admits nothing.
+pub fn user_kernel(root: Arc<dyn Space>, cache: Arc<dyn ikigai_core::CachePolicy>) -> Kernel {
+    Kernel::with_meta_renderer(root, Arc::new(CliRenderer)).with_cache_policy(cache)
+}
+
 // Every host surface uses the same representation cache policy. Keep configuration here so
 // new surfaces cannot accidentally inherit a different capacity.
 fn host_kernel(root: Arc<dyn Space>) -> Kernel {
-    cache::apply(Kernel::with_meta_renderer(root, Arc::new(CliRenderer)))
+    user_kernel(root, cache::policy())
 }
 
 /// The kernel a calendar-federation server runs. See [`calendar_server_space`].
@@ -2045,6 +2294,7 @@ mod codekey_tests {
     use futures::executor::block_on;
     use ikigai_core::{Capability, Kernel, Request};
 
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn kernel(dir: &Path) -> Kernel {
         Kernel::new(Arc::new(EndpointSpace::new().bind(
             UriTemplate::parse("urn:codekey:{path}").expect("valid template"),
@@ -2336,7 +2586,7 @@ fn http_timeout_setting() -> std::result::Result<std::time::Duration, String> {
     http_timeout(config::get("http.timeout").as_deref()).map_err(|e| {
         format!(
             "{e} (in {}; see `http.timeout` in ikigai-cli's README)",
-            config::config_path().display()
+            config::config_path_shown()
         )
     })
 }
@@ -3368,10 +3618,12 @@ const HEARTBEAT_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 /// answer. The writer daemon serves no socket — its jobs live inside it — so an external
 /// checker cannot ask it anything. It can, however, notice that a file stopped changing,
 /// which is the one signal a dead process still emits.
-fn heartbeat_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join(".ikigai/health")
-        .join(format!("{}.txt", instance_name()))
+fn heartbeat_path() -> Option<std::path::PathBuf> {
+    Some(
+        ikigai_home()?
+            .join("health")
+            .join(format!("{}.txt", instance_name())),
+    )
 }
 
 /// `urn:host:heartbeat` — write this host's health where a watcher can find it.
@@ -3385,9 +3637,9 @@ struct HostHeartbeat;
 impl Endpoint for HostHeartbeat {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         if !inv.capability.allows(CAP_KERNEL_INSPECT) {
-            return Err(Error::Denied(format!(
-                "writing a heartbeat requires `{CAP_KERNEL_INSPECT}`"
-            )));
+            return Err(Error::Denied(
+                format!("writing a heartbeat requires `{CAP_KERNEL_INSPECT}`").into(),
+            ));
         }
         let jobs = time_registry().health();
         let peers = BROWSER
@@ -3396,7 +3648,9 @@ impl Endpoint for HostHeartbeat {
             .map(|browser| browser.peers())
             .unwrap_or_default();
         let report = health_text(&jobs, &peers, &HealthContext::now());
-        let path = heartbeat_path();
+        let path = heartbeat_path().ok_or_else(|| {
+            Error::Endpoint("heartbeat: HOME is not an absolute path".to_string())
+        })?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)
                 .map_err(|e| Error::Endpoint(format!("heartbeat dir: {e}")))?;
@@ -3460,9 +3714,9 @@ struct KernelHealth;
 impl Endpoint for KernelHealth {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         if !inv.capability.allows(CAP_KERNEL_INSPECT) {
-            return Err(Error::Denied(format!(
-                "reading kernel health requires `{CAP_KERNEL_INSPECT}`"
-            )));
+            return Err(Error::Denied(
+                format!("reading kernel health requires `{CAP_KERNEL_INSPECT}`").into(),
+            ));
         }
         let jobs = time_registry().health();
         // Peers only if a browse is ALREADY running: health must not start a background
@@ -3966,9 +4220,9 @@ fn holds_cert_for_in(home: &std::path::Path, name: &str) -> bool {
 impl Endpoint for PeerList {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         if !inv.capability.allows(CAP_NET_DISCOVER) {
-            return Err(Error::Denied(format!(
-                "listing peers requires `{CAP_NET_DISCOVER}`"
-            )));
+            return Err(Error::Denied(
+                format!("listing peers requires `{CAP_NET_DISCOVER}`").into(),
+            ));
         }
         let (browser, fresh) = browse_in(&BROWSER, ikigai_discovery::Browser::start)?;
         if fresh {
@@ -4129,10 +4383,15 @@ impl ikigai_meeting::SecretReader for HostSecrets {
 }
 
 /// The LLM provider registry: a hand-editable JSON file pointed at by
-/// `IKIGAI_LLM_CONFIG` (see ikigai-llm's `Registry::from_json`), else a local
-/// Ollama default. Load-time — a config edit needs a restart; live-reload (the
-/// config as a golden-thread resource) is a follow-up. A bad path/JSON warns and
-/// falls back rather than failing the kernel build.
+/// `IKIGAI_LLM_CONFIG` (see ikigai-llm's `Registry::from_json`), else the config
+/// home's `llm.json`, else a local Ollama default. Load-time — a config edit needs a
+/// restart; live-reload (the config as a golden-thread resource) is a follow-up.
+///
+/// A set `IKIGAI_LLM_CONFIG` that names no readable file is an error: the `ikigai` binary
+/// refuses to start on it ([`check_llm_config`]) before any kernel is built. A host that
+/// skips that check gets the error on stderr here and the built-in default, never the
+/// config home's `llm.json`. JSON that does not parse warns and falls back rather than
+/// failing the kernel build.
 fn llm_registry() -> ikigai_llm::Registry {
     let mut registry = llm_declared_registry();
     // The annotation graph (IKIGAI_LLM_ANNOTATIONS, Turtle) completes or CORRECTS
@@ -4174,8 +4433,15 @@ fn llm_declared_registry() -> ikigai_llm::Registry {
     // urn:llm:big:ask`. `calendar.json` has always loaded from the config home; llm.json
     // was the odd one out.
     for (path, source) in llm_config_candidates() {
-        let Ok(json) = std::fs::read_to_string(&path) else {
-            continue;
+        let json = match std::fs::read_to_string(&path) {
+            Ok(json) => json,
+            // A set variable names the file to use; one that is not there is an error, never
+            // a cue to try the next place.
+            Err(e) if source == "IKIGAI_LLM_CONFIG" => {
+                eprintln!("ikigai: {}", llm_config_unreadable(&path, &e));
+                return ikigai_llm::Registry::single(ollama_default());
+            }
+            Err(_) => continue,
         };
         match ikigai_llm::Registry::from_json(&json) {
             Ok(registry) => return registry,
@@ -4185,6 +4451,11 @@ fn llm_declared_registry() -> ikigai_llm::Registry {
             Err(e) => eprintln!("ikigai: {source} ({path}) parse error: {e:?} — using the default"),
         }
     }
+    ikigai_llm::Registry::single(ollama_default())
+}
+
+/// The built-in provider when nothing declares one: a local Ollama.
+fn ollama_default() -> ikigai_llm::OpenAiConfig {
     let mut ollama = ikigai_llm::OpenAiConfig::ollama("llama3.2:3b");
     // The declared trait profile urn:llm:models reports (and selection reasons
     // over): a 3B text model with a 128k window. vendor "ollama" (set by the
@@ -4192,7 +4463,39 @@ fn llm_declared_registry() -> ikigai_llm::Registry {
     ollama.caps.context = Some(131_072);
     ollama.caps.modalities = vec!["text".to_string()];
     ollama.caps.params = Some("3B".to_string());
-    ikigai_llm::Registry::single(ollama)
+    ollama
+}
+
+/// Refuses a set `IKIGAI_LLM_CONFIG` that names no readable file, including an empty value.
+/// Unset, the config home's `llm.json` (or the built-in default) is used as before.
+///
+/// # Errors
+///
+/// The message names the variable, the path it holds and why it could not be read.
+pub fn check_llm_config() -> std::result::Result<(), String> {
+    let Some(path) = std::env::var_os("IKIGAI_LLM_CONFIG") else {
+        return Ok(());
+    };
+    let path = std::path::PathBuf::from(path);
+    match std::fs::File::open(&path).and_then(|f| f.metadata()) {
+        Ok(meta) if meta.is_file() => Ok(()),
+        Ok(_) => Err(format!(
+            "IKIGAI_LLM_CONFIG names something that is not a file: {}. Point it at an LLM \
+             registry JSON file, or unset it to use the config home's llm.json.",
+            path.display()
+        )),
+        Err(e) => Err(llm_config_unreadable(&path.display().to_string(), &e)),
+    }
+}
+
+/// The refusal for a set `IKIGAI_LLM_CONFIG` whose file cannot be read.
+fn llm_config_unreadable(path: &str, e: &std::io::Error) -> String {
+    let what = if path.is_empty() {
+        "IKIGAI_LLM_CONFIG is set but empty".to_string()
+    } else {
+        format!("IKIGAI_LLM_CONFIG names a file that cannot be read: {path} ({e})")
+    };
+    format!("{what}. Point it at an LLM registry JSON file, or unset it to use the config home's llm.json.")
 }
 
 /// Facts from the `IKIGAI_LLM_ANNOTATIONS` Turtle file, as `(subject, predicate,
@@ -4888,6 +5191,26 @@ pub const PROGRAMS: &[Program] = &[
     },
 ];
 
+/// A stored program bound as its endpoint. The contact handler is wrapped so the block and
+/// label links it mints name its enquiry by the id the contact space stores it under, which
+/// under a sealed space is not the hash of the text the program reads (ledger #3713, see
+/// [`contactblock::HandlerTupleIds`]).
+fn stored_program(program: &Program, text: String) -> ikigai_core::EndpointSpace {
+    let lisp = ikigai_lisp::program(program.id, text);
+    let space = ikigai_core::EndpointSpace::new();
+    if program.iri == CONTACT_HANDLER {
+        space.bind(
+            Exact::new(program.iri),
+            contactblock::HandlerTupleIds::new(lisp),
+        )
+    } else {
+        space.bind(Exact::new(program.iri), lisp)
+    }
+}
+
+/// The program the reactive `contact` space fires on each enquiry ([`PROGRAMS`]).
+const CONTACT_HANDLER: &str = "urn:contact:handle";
+
 /// The doors the root's Lisp governor fronts: the evaluator, the signed-run door, and every
 /// stored program ([`PROGRAMS`]).
 fn lisp_doors() -> Vec<String> {
@@ -4976,7 +5299,11 @@ fn root_members(nature: &'static str) -> Vec<Arc<dyn Space>> {
         // The intray / tuplespace (urn:space:{name}: out=Sink, rd=Source) — a dir-backed
         // space under file_root/spaces/. The scheduling booking-inbox drops into it; the
         // reactive/sealed slices land on top. Cap-gated (urn:cap:space:out / :read).
-        Arc::new(ikigai_intray::space(file_root().join("spaces"))) as Arc<dyn Space>,
+        // Sealed at rest when a space key is configured (ledger #3686, see [`space_seal`]).
+        Arc::new(EndpointSpace::new().bind(
+            UriTemplate::parse(ikigai_intray::SPACE_TEMPLATE).expect("SPACE_TEMPLATE is valid"),
+            space_seal::endpoint(file_root().join("spaces")),
+        )) as Arc<dyn Space>,
         // Outbound mail (urn:email:send) — a cap-gated Sink submitting to the LOCAL MTA,
         // which relays onward through a transactional service (so DKIM/SPF and relay
         // credentials stay in the MTA, not here). The contact-request handler and the
@@ -4989,14 +5316,10 @@ fn root_members(nature: &'static str) -> Vec<Arc<dyn Space>> {
             ));
             ikigai_email::space(config, transport)
         }) as Arc<dyn Space>,
-        // The public contact form's front door (urn:contact:submit): parses an untrusted
-        // urlencoded/JSON body, keeps only these declared fields, escapes them into a
-        // tuple, and drops it into the reactive `contact` space — where the handler emails
-        // it on. Field names match the form on bosatsu.net, `_honey` included.
-        Arc::new(
-            ikigai_core::EndpointSpace::new()
-                .bind(Exact::new("urn:contact:submit"), contact_submit()),
-        ) as Arc<dyn Space>,
+        // Configured contact front doors: validate an untrusted body, append fixed fields,
+        // and drop escaped data into the configured space. The first row keeps the legacy
+        // urn:contact:submit alias; an absent config file retains the built-in contact form.
+        Arc::new(intakes::bind(EndpointSpace::new())) as Arc<dyn Space>,
         // The booking front door (urn:booking:submit): the visitor offers THEIR hours and
         // zone; the reactive `bookings` space fires schedule.scm, which finds a mutually
         // free slot. Brian's freebusy never leaves the machine — the visitor never sees a
@@ -5100,10 +5423,9 @@ fn root_members(nature: &'static str) -> Vec<Arc<dyn Space>> {
     // load}), when `store = true` (or `<instance>.store = true`) configured it — see the
     // `store` module for the switch, the topology and what a held directory prints.
     //
-    // ⚠ It is pushed as an `Arc` of ONE space, memoised per process, because the dataset
-    // is opened once per process and not once per kernel: `DurableStore::open` refuses a
-    // second open on the same path even from the same process, and several modes here
-    // build more than one kernel (the test binaries build a dozen).
+    // Open the dataset once per process, but bind a fresh space for each kernel so the
+    // store can count their independent caches. Build them before the first store read;
+    // a late binding refuses requests beneath an existing cached read.
     //
     // NOT in `served_space` and not in the HTTP door: the dataset holds whatever this
     // host ever put in it, and a remote caller with `urn:cap:store:write` holds
@@ -5122,15 +5444,17 @@ fn root_members(nature: &'static str) -> Vec<Arc<dyn Space>> {
     if let Some(space) = bayes::space() {
         spaces.push(space);
     }
+    // The contact-inquiry edge half (`urn:iki:inquiry:*`), when the config home has an
+    // `inquiry.json` — see the `inquiry` module. Without the file nothing is bound here.
+    if let Some(space) = inquiry::local_space() {
+        spaces.push(space);
+    }
     // The stored programs (`PROGRAMS`): each bound as an endpoint — the program IS the
     // endpoint — IF the workspace provides its file. Absent the file, the endpoint simply
     // isn't bound. One space per program, in table order, as they always were.
     for program in PROGRAMS {
         if let Ok(text) = std::fs::read_to_string(file_root().join(program.file)) {
-            spaces.push(Arc::new(ikigai_core::EndpointSpace::new().bind(
-                Exact::new(program.iri),
-                ikigai_lisp::program(program.id, text),
-            )) as Arc<dyn Space>);
+            spaces.push(Arc::new(stored_program(program, text)) as Arc<dyn Space>);
         }
     }
     // The two halves of the decision loop that must stay on this machine: minting a link
@@ -5280,8 +5604,35 @@ fn compose_mounts(mut spaces: Vec<Arc<dyn Space>>, mounts: Vec<MountSpec>) -> Ar
         }
     }
     deeper.sort_by_key(|mount| std::cmp::Reverse(mount.prefix.len()));
+    // Ordered by prefix LENGTH, so the most specific mount wins regardless of
+    // declaration order: `--override urn:llm:=peerA --override urn:llm:ask=peerB`
+    // sends `urn:llm:ask` to peerB and the rest of `urn:llm:*` to peerA. A whole
+    // IRI is simply the most specific prefix there is, which is what makes
+    // single-RESOURCE overrides work.
+    fronting.sort_by_key(|mount| std::cmp::Reverse(mount.prefix.len()));
+    // Every remote space, built before any is placed, so the `connect.retry.*` policy can
+    // govern them all with ONE breaker (ledger #3383).
+    let fronting: Vec<(String, MountKind, Arc<dyn Space>)> = fronting
+        .into_iter()
+        .map(
+            |MountSpec {
+                 prefix,
+                 origin,
+                 resolver,
+                 kind,
+             }| {
+                let remote = Arc::new(
+                    ikigai_resolve::MountedRemote::overriding(resolver, prefix.clone(), origin)
+                        .sharing(&peers)
+                        .with_clock(Arc::clone(&clock)),
+                ) as Arc<dyn Space>;
+                (prefix, kind, remote)
+            },
+        )
+        .collect();
+    let mut aliases: Vec<Arc<dyn Space>> = Vec::new();
     for mount in deeper {
-        spaces.push(Arc::new(
+        aliases.push(Arc::new(
             ikigai_resolve::MountedRemote::overriding(mount.resolver, mount.prefix, mount.origin)
                 .sharing(&peers)
                 .with_clock(Arc::clone(&clock)),
@@ -5294,35 +5645,50 @@ fn compose_mounts(mut spaces: Vec<Arc<dyn Space>>, mounts: Vec<MountSpec>) -> Ar
             inner: mount.resolver,
             prefix: mount.prefix.clone(),
         });
-        spaces.push(Arc::new(
+        aliases.push(Arc::new(
             ikigai_resolve::MountedRemote::new(resolver, mount.prefix, mount.origin)
                 .sharing(&peers)
                 .with_clock(Arc::clone(&clock)),
         ));
     }
+    // The retry policy (ledger #3383): override and alias mounts resolve through one shared
+    // Retry and CircuitBreaker, combined in the order this composition tries them, so the
+    // mount a request reaches is the one that answers it. A `--prefer` mount is left as it
+    // was: it already falls back to the local space on a transient failure, and retrying
+    // first would only delay that answer.
+    let (fronting, aliases) = match retry::RetryPolicy::from_config().ok().flatten() {
+        None => (fronting, aliases),
+        Some(policy) => {
+            let governed = policy.govern(
+                fronting
+                    .iter()
+                    .filter(|(_, kind, _)| *kind != MountKind::Prefer)
+                    .map(|(_, _, remote)| Arc::clone(remote))
+                    .chain(aliases.iter().cloned())
+                    .collect(),
+            );
+            (
+                fronting
+                    .into_iter()
+                    .map(|(prefix, kind, remote)| match kind {
+                        MountKind::Prefer => (prefix, kind, remote),
+                        _ => (prefix, kind, governed.slot(remote)),
+                    })
+                    .collect(),
+                aliases
+                    .into_iter()
+                    .map(|space| governed.slot(space))
+                    .collect(),
+            )
+        }
+    };
+    spaces.extend(aliases);
     if fronting.is_empty() {
         return Arc::new(Fallback::new(spaces));
     }
-    // Ordered by prefix LENGTH, so the most specific mount wins regardless of
-    // declaration order: `--override urn:llm:=peerA --override urn:llm:ask=peerB`
-    // sends `urn:llm:ask` to peerB and the rest of `urn:llm:*` to peerA. A whole
-    // IRI is simply the most specific prefix there is, which is what makes
-    // single-RESOURCE overrides work.
-    fronting.sort_by_key(|mount| std::cmp::Reverse(mount.prefix.len()));
     let local: Arc<dyn Space> = Arc::new(Fallback::new(spaces));
     let mut ordered: Vec<Arc<dyn Space>> = Vec::new();
-    for MountSpec {
-        prefix,
-        origin,
-        resolver,
-        kind,
-    } in fronting
-    {
-        let remote = Arc::new(
-            ikigai_resolve::MountedRemote::overriding(resolver, prefix.clone(), origin)
-                .sharing(&peers)
-                .with_clock(Arc::clone(&clock)),
-        ) as Arc<dyn Space>;
+    for (prefix, kind, remote) in fronting {
         ordered.push(match kind {
             // The failover pair must stay INSIDE the prefix. `Failover` resolves
             // every target, so an unguarded `[remote, local]` would also answer
@@ -5639,6 +6005,10 @@ fn subclass_axioms() -> Vec<(String, String)> {
 /// handing the session to an agent, `cap seal` makes the narrowing the session's floor,
 /// so the agent cannot widen it again.
 ///
+/// With the `store` feature and a configured dataset, build all store-bearing kernels
+/// before the first store read. Each kernel has its own store space and cache; later
+/// bindings refuse store requests after a cached read. See the `store` module.
+///
 /// A [`SystemClock`] is injected so the HTTP module's `Cache-Control: max-age`
 /// deadlines (`Expiry::At`) are honoured; without a clock those reads would stay
 /// uncacheable. The root is a [`Fallback`] over the local space then the HTTP space.
@@ -5794,6 +6164,14 @@ fn build_watched(mounts: Vec<MountSpec>, reactive: bool) -> Arc<Kernel> {
             );
         }
         Arc::new(reactor).watch();
+        // Outbox retention (ledger #3687): each space with a `space-retention/<space>` entry
+        // in the config home has its handled tuples and their notes deleted that long after
+        // the handler's receipt. Off for every other space. See [`retention`].
+        if let Some(dir) =
+            config::config_home().map(|home| home.join(retention::SPACE_RETENTION_DIR))
+        {
+            watch_retention(file_root().join("spaces"), dir);
+        }
     }
     // ★ Every host job below NAMES the authority it fires under (ledger #79). A job fires
     // under exactly the capability passed here, so each one states what it resolves — see
@@ -5851,6 +6229,24 @@ fn build_watched(mounts: Vec<MountSpec>, reactive: bool) -> Arc<Kernel> {
         );
     }
     kernel
+}
+
+/// Sweep the reactive spaces' outboxes now and then every [`retention::SWEEP_EVERY`], for the
+/// life of the process, saying on stderr what each sweep deleted (a count per space) and any
+/// retention entry it could not act on.
+fn watch_retention(spaces: PathBuf, retention_dir: PathBuf) {
+    let spawned = std::thread::Builder::new()
+        .name("ikigai-retention".to_string())
+        .spawn(move || loop {
+            let swept = retention::sweep(&spaces, &retention_dir, dead_letter_wall_clock());
+            for line in retention::sweep_lines(&swept) {
+                eprintln!("{} {line}", stamp());
+            }
+            std::thread::sleep(retention::SWEEP_EVERY);
+        });
+    if let Err(e) = spawned {
+        eprintln!("{} ikigai: outbox retention not started: {e}", stamp());
+    }
 }
 
 /// Where the host keeps each reactive space's handler authority:
@@ -6164,7 +6560,13 @@ fn space_reactor(
     // fallback, or the first one refused for a given reason. Per-tuple refusals are already
     // loud through the dead-letter hook.
     let said = std::sync::Mutex::new(std::collections::HashSet::<String>::new());
-    ikigai_intray::SpaceReactor::new(root, resolver, tuplespace_verbs())
+    let reactor = ikigai_intray::SpaceReactor::new(root, resolver, tuplespace_verbs());
+    // The same codec as every `out` over this root (ledger #3686, see [`space_seal`]).
+    let reactor = match space_seal::space_codec() {
+        Some(codec) => reactor.with_codec(codec),
+        None => reactor,
+    };
+    reactor
         .with_host_authority(move |space| {
             authority_dir
                 .as_deref()
@@ -6338,9 +6740,9 @@ impl ClientRegistry {
 impl Endpoint for ClientRegistry {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         if !inv.capability.allows(CAP_CLIENT_READ) {
-            return Err(Error::Denied(format!(
-                "reading a client record requires `{CAP_CLIENT_READ}`"
-            )));
+            return Err(Error::Denied(
+                format!("reading a client record requires `{CAP_CLIENT_READ}`").into(),
+            ));
         }
         if inv.request.verb != Verb::Source {
             return Err(Error::Endpoint(format!(
@@ -6449,9 +6851,9 @@ struct ClientIssue {
 impl Endpoint for ClientIssue {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         if !inv.capability.allows(CAP_CLIENT_ISSUE) {
-            return Err(Error::Denied(format!(
-                "issuing a client link requires `{CAP_CLIENT_ISSUE}`"
-            )));
+            return Err(Error::Denied(
+                format!("issuing a client link requires `{CAP_CLIENT_ISSUE}`").into(),
+            ));
         }
         if inv.request.verb != Verb::Sink {
             return Err(Error::Endpoint(format!(
@@ -6634,17 +7036,13 @@ impl Endpoint for ClientIssue {
     }
 }
 
-/// The contact intake, loaded through `try_submit` so a configured redirect that is not a link
-/// target stops the host at startup with a sentence naming it (ledger #1878) instead of being
-/// ignored on every submission. The configuration is this file's constant, so a refusal is a
-/// defect in this file, and the tests that build either space reach it first.
-fn contact_submit() -> ikigai_intake::IntakeEndpoint {
-    ikigai_intake::try_submit(contact_intake()).unwrap_or_else(|e| panic!("{e}"))
-}
-
-/// The booking intake, loaded the way [`contact_submit`] loads the contact intake.
+/// The booking intake, validated before serving, asking the keyed block set when the config
+/// home's `booking.json` names one.
 fn booking_submit() -> ikigai_intake::IntakeEndpoint {
-    ikigai_intake::try_submit(booking_intake()).unwrap_or_else(|e| panic!("{e}"))
+    // The CLI checks before constructing a kernel; library constructors have no Result
+    // channel and follow the host's fail-fast convention, as `intakes::bind` does.
+    let block = booking::configured().unwrap_or_else(|e| panic!("{e}"));
+    ikigai_intake::try_submit(booking_intake_with(block)).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// The public contact form's accepted fields. Each `summary` is human-facing on purpose:
@@ -6672,13 +7070,23 @@ fn contact_intake() -> ikigai_intake::IntakeConfig {
         // there is no interstitial CSS here to keep in sync with the site.
         redirect: Some("https://www.bosatsu.net/thanks.html".to_string()),
         check_blocked: true,
+        fixed_fields: Default::default(),
+        blocklist: None,
+        block_key: None,
     }
 }
 
 /// The public booking request's accepted fields. The visitor offers THEIR hours and zone;
 /// the handler finds a mutually free slot. The host's freebusy never leaves the machine —
-/// a visitor never sees a calendar, they only propose availability.
+/// a visitor never sees a calendar, they only propose availability. Without a block set, as
+/// a host with no `booking.json` serves it.
+#[cfg(test)]
 fn booking_intake() -> ikigai_intake::IntakeConfig {
+    booking_intake_with(None)
+}
+
+/// [`booking_intake`], asking `block`'s keyed block set instead of `urn:decisions` when given.
+fn booking_intake_with(block: Option<&booking::Block>) -> ikigai_intake::IntakeConfig {
     use ikigai_intake::IntakeField as F;
     ikigai_intake::IntakeConfig {
         id: "booking".to_string(),
@@ -6756,8 +7164,12 @@ fn booking_intake() -> ikigai_intake::IntakeConfig {
         // (there is no slot to show yet). Left un-redirected deliberately.
         redirect: None,
         // Reject a blocked scheduler at the edge, before the request drains to bug (bug's
-        // booking-handler `blocked?` stays as backstop).
+        // booking-handler `blocked?` stays as backstop). A configured `blocklist` overrides
+        // the legacy `urn:decisions` check; without `booking.json` that check is the one asked.
         check_blocked: true,
+        fixed_fields: Default::default(),
+        blocklist: block.map(|block| block.blocklist.clone()),
+        block_key: block.map(|block| block.key.clone()),
     }
 }
 
@@ -7147,7 +7559,7 @@ fn watch_store(kernel: Arc<Kernel>) {
     // EKEventStoreChangedNotification needs a serviced MAIN runloop this CLI
     // doesn't have — ikigai_personal::observe_calendar_changes remains for
     // hosts that do.)
-    let Some(home) = std::env::var("HOME").ok() else {
+    let Some(home) = config::user_home() else {
         return;
     };
     // Both store locations: the classic path and the modern group container.
@@ -7503,6 +7915,8 @@ mod tests {
     /// indented `key value` lines, the nature exactly as the composer passed it.
     #[test]
     fn host_info_names_the_nature_it_was_given() {
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:host:info"), host_info("Odd (Label)")),
         ));
@@ -7521,6 +7935,8 @@ mod tests {
     /// chars". Installed list, gate and ask must all be `urn:llm:ollama:*`.
     #[test]
     fn the_jury_asks_the_provider_it_listed_its_jurors_from() {
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(
             EndpointSpace::new()
                 .bind(
@@ -7619,6 +8035,8 @@ mod tests {
         std::fs::write(root.join("a.rs"), "fn one() {}\nfn two() {}\n").expect("test file");
         let store = Arc::new(ikigai_sparql::Store::new().expect("in-memory store"));
         let space = ikigai_browse::space_with_annotations(vec![("demo".to_string(), root)], store);
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(space));
         match table {
             Some(t) => kernel.with_aliases(t),
@@ -7915,6 +8333,41 @@ mod tests {
         assert!(
             kernel.is_cached(&cached, &Capability::root()),
             "the old spelling must hit the entry the canonical name populated"
+        );
+    }
+
+    /// The one constructor for user-facing kernels answers Meta as `application/json`, the
+    /// contract the engine reads to route a named argument (ledger #4037, #4038), under any
+    /// cache policy the caller passes. A bare `Kernel::new` over the same space cannot, which
+    /// is why clippy disallows it: the ablation shows the assertion is load-bearing.
+    #[test]
+    fn the_user_kernel_answers_meta_as_json() {
+        let space = || -> Arc<dyn Space> {
+            Arc::new(EndpointSpace::new().bind(Exact::new("urn:data:page"), page()))
+        };
+        let meta = || {
+            Request::new(Verb::Meta, Iri::parse("urn:data:page").expect("valid IRI"))
+                .with_arg("as", ArgRef::Inline(b"application/json".to_vec()))
+        };
+        for policy in [
+            cache::policy(),
+            Arc::new(retry::NoCache) as Arc<dyn ikigai_core::CachePolicy>,
+        ] {
+            let kernel = user_kernel(space(), policy);
+            let answer = block_on(kernel.issue(meta(), &Capability::root()))
+                .expect("the user kernel answers Meta as JSON");
+            assert_eq!(answer.repr_type.media_type, "application/json");
+            let description: serde_json::Value =
+                serde_json::from_slice(&answer.bytes).expect("the answer is JSON");
+            assert_eq!(description["title"], "Demo page", "{description}");
+        }
+        #[allow(clippy::disallowed_methods)] // internal: the ablation this test exists to show
+        let bare = Kernel::new(space());
+        let refused = block_on(bare.issue(meta(), &Capability::root()));
+        assert!(
+            refused.map_or(true, |answer| answer.repr_type.media_type
+                != "application/json"),
+            "a kernel with no Meta renderer must not answer Meta as JSON"
         );
     }
 
@@ -8246,6 +8699,8 @@ mod tests {
     #[test]
     fn steel_itself_reads_back_a_prelude_generated_from_hostile_iris() {
         let eval = |src: String| {
+            #[allow(clippy::disallowed_methods)]
+            // internal: a test fixture's kernel; it routes no user arguments
             let kernel = Kernel::new(Arc::new(ikigai_lisp::space()));
             let request = Request::new(
                 Verb::Source,
@@ -8864,6 +9319,8 @@ mod tests {
         // Clock: the EMPTY capability — and it really does resolve the host's clock.
         let clock = host_job_authority(HostJob::Clock);
         assert_eq!(clock.scopes().map(|s| s.len()), Some(0), "no scopes at all");
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(base_space("test")));
         let now = block_on(kernel.issue(
             Request::new(Verb::Source, Iri::parse("urn:time:now").unwrap()),
@@ -8957,6 +9414,52 @@ mod tests {
         let jobs = registry.health();
         assert!(!job_is_stale(&jobs[0], up.uptime));
         assert_eq!(jobs[0].asleep_since_last, Some(std::time::Duration::ZERO));
+    }
+
+    /// A stuck synchronous peer used to stay STALE forever with zero failures.
+    #[test]
+    fn timed_out_job_reaches_failing_while_peer_is_still_blocked() {
+        struct Blocked(std::sync::Mutex<std::sync::mpsc::Receiver<()>>);
+        impl ikigai_resolve::Resolver for Blocked {
+            fn issue(&self, _: Request) -> Result<(Representation, ikigai_resolve::CacheStatus)> {
+                let _ = self.0.lock().unwrap().recv();
+                Ok((
+                    Representation::new(ReprType::new("text/plain"), b"late".to_vec()),
+                    ikigai_resolve::CacheStatus::Uncacheable,
+                ))
+            }
+            fn is_cached(&self, _: &Request, _: &Capability) -> bool {
+                false
+            }
+            fn entries(&self) -> Option<Vec<ikigai_core::SpaceEntry>> {
+                None
+            }
+        }
+        let ticks = Arc::new(Ticks::default());
+        let registry = JobRegistry::new(ticks.clone(), Arc::new(SystemClock));
+        let (release, blocked) = std::sync::mpsc::channel();
+        registry.set_resolver(Arc::new(Blocked(std::sync::Mutex::new(blocked))));
+        registry
+            .schedule_with_timeout(
+                "urn:booking:drain".into(),
+                Verb::Source,
+                ikigai_time::Schedule::Every(std::time::Duration::from_secs(30)),
+                true,
+                Capability::root(),
+                std::time::Duration::from_millis(20),
+            )
+            .unwrap();
+        // The first attempt times out; subsequent ticks fail without duplicating work.
+        for _ in 0..STALE_CADENCES {
+            ticks.fire();
+        }
+        let jobs = registry.health();
+        let up = context(600, false);
+        assert_eq!(job_status(&jobs[0], up.uptime), "FAILING");
+        let report = health_text(&jobs, &[], &up);
+        assert!(report.starts_with("FAILING"), "{report}");
+        assert!(report.contains("3 failed in a row"), "{report}");
+        release.send(()).unwrap();
     }
 
     /// The bound is unchanged where there is no evidence: without a sleep measurement the
@@ -9065,6 +9568,8 @@ mod tests {
     /// the table ships, and no alias can save it. Mounts move one way, route gates outside
     /// the kernel move the other.
     fn probe(space: &Arc<dyn Space>, iri: &str) -> std::result::Result<String, ikigai_core::Error> {
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::clone(space));
         let request = Request::new(Verb::Source, Iri::parse(iri).unwrap())
             .with_arg("in", ArgRef::Inline(b"hi".to_vec()));
@@ -9131,7 +9636,9 @@ mod tests {
     /// boundary into a suggestion.
     #[test]
     fn a_prefer_mount_does_not_swallow_a_denial() {
-        let (spec, _) = mount("urn:iki:fn:", MountKind::Prefer, ikigai_core::Error::Denied);
+        let (spec, _) = mount("urn:iki:fn:", MountKind::Prefer, |m| {
+            ikigai_core::Error::Denied(m.into())
+        });
         let space = root_space_with_mounts(vec![spec]);
         let err = probe(&space, "urn:iki:fn:toUpper").expect_err("a denial must propagate");
         assert!(matches!(err, ikigai_core::Error::Denied(_)), "{err:?}");
@@ -9484,6 +9991,7 @@ mod tests {
     }
 
     /// A kernel with just the client endpoints, rooted at a scratch directory.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn client_kernel(root: std::path::PathBuf) -> Kernel {
         let space = EndpointSpace::new()
             .bind(
@@ -9617,14 +10125,81 @@ mod tests {
         );
     }
 
+    /// The shipped `dev` demo grant reaches every typed `urn:repo:*` git and gh
+    /// facade the host binds. Since ikigai-repo 0.6.0 (the exec split, ledger
+    /// #3818) they declare `urn:cap:exec:read:git` / `urn:cap:exec:read:gh`, and the
+    /// old `urn:cap:exec:git` / `urn:cap:exec:gh` spellings grant nothing there.
+    #[test]
+    fn demo_dev_grant_reaches_every_repo_facade() {
+        let grants: serde_json::Value =
+            serde_json::from_str(include_str!("../../../demos/grants.json.example"))
+                .expect("the demo grants file is JSON");
+        let dev = Capability::scoped(grant_entry_scopes(&grants["dev"]));
+        let kernel = kernel();
+        for iri in [
+            "urn:repo:status",
+            "urn:repo:log",
+            "urn:repo:branch",
+            "urn:repo:show",
+            "urn:repo:pr:list",
+            "urn:repo:pr:view",
+            "urn:repo:pr:files",
+            "urn:repo:pr:diff",
+            "urn:repo:pr:checks",
+        ] {
+            let description = kernel
+                .describe_pattern(iri)
+                .unwrap_or_else(|| panic!("{iri} describes itself"));
+            assert!(
+                !description.requires.is_empty(),
+                "{iri} declares its exec grant"
+            );
+            assert_eq!(
+                description.unsatisfied_scopes(ikigai_core::Verb::Source, &dev),
+                Vec::<String>::new(),
+                "the demo dev grant reaches {iri}"
+            );
+        }
+    }
+
+    /// Each retired exec spelling, in either grant shape, refuses the grants document,
+    /// naming the file, the grant, the scope and the replacement (ledger #3828); a document of
+    /// new spellings passes, and so does the principals table, which names grants, not scopes.
+    #[test]
+    fn a_grant_naming_a_retired_exec_scope_is_refused() {
+        let path = std::path::Path::new("/config/ikigai/grants.json");
+        for (scope, advice) in [
+            ("urn:cap:exec:git", "`urn:cap:exec:read:git`"),
+            ("urn:cap:exec:gh", "`urn:cap:exec:read:gh`"),
+            ("urn:cap:exec:cargo", "remove it; nothing serves it"),
+            ("urn:cap:exec:just", "remove it; nothing serves it"),
+        ] {
+            for document in [
+                serde_json::json!({"claude": [scope]}),
+                serde_json::json!({"claude": {"scopes": ["urn:cap:fs:read:*", scope]}}),
+            ] {
+                let refused = check_retired_grants(path, &document).unwrap_err();
+                for part in ["/config/ikigai/grants.json", "`claude`", scope, advice] {
+                    assert!(refused.contains(part), "no `{part}` in: {refused}");
+                }
+            }
+        }
+        let current = serde_json::json!({
+            "_doc": "a comment",
+            "claude": {"scopes": ["urn:cap:exec:read:git", "urn:cap:exec:read:gh"]},
+            "principals": {"urn:example:hub": {"kind": "agent", "grant": "claude"}}
+        });
+        assert_eq!(check_retired_grants(path, &current), Ok(()));
+    }
+
     #[test]
     fn grant_entry_parses_both_shapes() {
         // Array form: scopes only, no visibility (backward compatible).
-        let arr = serde_json::json!(["urn:cap:exec:git", "urn:cap:fs:read:*"]);
+        let arr = serde_json::json!(["urn:cap:exec:read:git", "urn:cap:fs:read:*"]);
         assert_eq!(
             scopes_of(&arr),
             vec![
-                "urn:cap:exec:git".to_string(),
+                "urn:cap:exec:read:git".to_string(),
                 "urn:cap:fs:read:*".to_string()
             ]
         );
@@ -9632,11 +10207,11 @@ mod tests {
 
         // Object form: scopes under "scopes", plus show/hide visibility globs.
         let obj = serde_json::json!({
-            "scopes": ["urn:cap:exec:git"],
+            "scopes": ["urn:cap:exec:read:git"],
             "hide": ["wc", "greet"],
             "show": ["sparql"]
         });
-        assert_eq!(scopes_of(&obj), vec!["urn:cap:exec:git".to_string()]);
+        assert_eq!(scopes_of(&obj), vec!["urn:cap:exec:read:git".to_string()]);
         assert_eq!(
             visibility_of(&obj),
             (
@@ -10061,6 +10636,8 @@ mod tests {
         std::fs::write(root.join("barrier.txt"), b"b").unwrap();
 
         // A cacheable file space over the temp root, with the watcher behind it.
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Arc::new(Kernel::new(Arc::new(ikigai_fs::cacheable_space(&root))));
         // Held to the end of the test and dropped there, which stops the watch.
         let _watch = WorkspaceWatch::start(Arc::downgrade(&kernel), root.clone())
@@ -10125,6 +10702,8 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let root = root.canonicalize().unwrap();
         std::fs::write(root.join("notes.txt"), b"v1").unwrap();
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(ikigai_fs::cacheable_space(&root)));
         let cap = Capability::root();
         let target = Iri::parse("urn:file:notes.txt").unwrap();
@@ -10179,6 +10758,8 @@ mod tests {
         std::fs::write(root.join("docs").join("a.txt"), b"a1").unwrap();
         let root = root.canonicalize().unwrap();
 
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(ikigai_fs::cacheable_space(&root)));
         let cap = Capability::root();
         let source = |name: &str| {
@@ -10256,6 +10837,7 @@ mod tests {
 
     /// The real `booking_intake()` in front of a recording space — the production field set,
     /// so these tests fail if the declaration changes underneath them.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn booking_kernel() -> (Kernel, Arc<std::sync::Mutex<Vec<String>>>) {
         let dropped = Arc::new(std::sync::Mutex::new(Vec::new()));
         let space = EndpointSpace::new()
@@ -10705,6 +11287,8 @@ mod tests {
             ServedSurface::default(),
             Arc::new(base_space("Test (QUIC)")),
         );
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(root).with_aliases(Arc::new(
             AliasTable::new()
                 .exact("urn:cal:mine", "urn:personal:calendar")
@@ -10935,6 +11519,7 @@ mod space_authority_tests {
         (spaces, authority)
     }
 
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn kernel_over(spaces: &Path) -> Arc<Kernel> {
         Arc::new(Kernel::new(Arc::new(
             ikigai_intray::space(spaces.to_path_buf()).bind(Exact::new("urn:test:beyond"), Beyond),
@@ -11002,6 +11587,54 @@ mod space_authority_tests {
             std::fs::read_to_string(outbox.join(format!("{second}.out"))).unwrap(),
             "ran"
         );
+    }
+
+    /// Outbox retention over what the REAL reactor leaves (ledger #3687): a tuple it handled
+    /// sits in `outbox/` with its note until the host's sweep, under a `space-retention`
+    /// entry, deletes both once it is older than the entry; a tuple still pending in the
+    /// inbox is never touched, and with no entry the outbox is kept as the reactor left it.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // receipts are file times: the wall clock, native-only
+    fn the_host_expires_what_the_reactor_handled_and_nothing_pending() {
+        let (spaces, authority) = scratch("retention");
+        let config = authority.parent().unwrap().to_path_buf();
+        let kernel = kernel_over(&spaces);
+        std::fs::write(authority.join("jobs"), format!("{BEYOND}\n")).unwrap();
+        let reactor = space_reactor(
+            spaces.clone(),
+            Arc::clone(&kernel) as Arc<dyn ikigai_resolve::Resolver>,
+            Some(config.clone()),
+        );
+        let handled = drop_tuple(&kernel, b"handled");
+        assert_eq!(
+            reactor.process("jobs", &handled),
+            ikigai_intray::Outcome::Handled
+        );
+        let pending = drop_tuple(&kernel, b"pending");
+        let outbox = spaces.join("jobs").join("outbox");
+        let inbox = spaces.join("jobs").join("inbox");
+        let retention_dir = config.join(retention::SPACE_RETENTION_DIR);
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(8 * 86_400);
+
+        // Retention off (no entry): eight days on, the reactor's outbox is all still there.
+        assert_eq!(
+            retention::sweep(&spaces, &retention_dir, later),
+            retention::Swept::default()
+        );
+        assert!(outbox.join(format!("{handled}.tuple")).is_file());
+        assert!(outbox.join(format!("{handled}.out")).is_file());
+
+        // Seven days' retention: the handled tuple and its note go, the pending one stays.
+        std::fs::create_dir_all(&retention_dir).unwrap();
+        std::fs::write(retention_dir.join("jobs"), "7d\n").unwrap();
+        let swept = retention::sweep(&spaces, &retention_dir, later);
+        assert_eq!(
+            swept.expired,
+            vec![("jobs".to_string(), vec![handled.clone()])]
+        );
+        assert!(!outbox.join(format!("{handled}.tuple")).exists());
+        assert!(!outbox.join(format!("{handled}.out")).exists());
+        assert!(inbox.join(format!("{pending}.tuple")).is_file());
     }
 
     /// Non-escalation, pinned at the level the brief states it: a scope named only in the
@@ -11098,6 +11731,8 @@ mod space_authority_tests {
     fn a_retargeted_handler_file_does_not_choose_what_fires() {
         let (spaces, authority) = scratch("retarget");
         let config = authority.parent().unwrap().to_path_buf();
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Arc::new(Kernel::new(Arc::new(
             ikigai_intray::space(spaces.clone())
                 .bind(Exact::new("urn:test:beyond"), Beyond)
@@ -11149,6 +11784,7 @@ mod space_authority_tests {
     }
 
     /// The kernel the handler tests drive: `jobs`'s legitimate handler and a second bound one.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn kernel_with_other(spaces: &Path) -> Arc<Kernel> {
         Arc::new(Kernel::new(Arc::new(
             ikigai_intray::space(spaces.to_path_buf())
@@ -11684,15 +12320,13 @@ mod arrangement_tests {
             let ambiguous = harvest.ambiguous.contains_key(&door.endpoint);
             assert!(registered ^ ambiguous, "{door:?}");
         }
-        // On every machine: two jails under `file`. (`llm-*` join it wherever llm.json declares
-        // a second provider.) `meeting` and `org-agenda` each named two doors until ikigai-meeting
-        // 0.7 and ikigai-org 0.3 gave every door its own id, so each of those is one endpoint.
-        assert!(
-            harvest.ambiguous.contains_key("file"),
-            "file: {:?}",
-            harvest.ambiguous
-        );
+        // Each file jail has its own endpoint identity. Configured LLM backends can
+        // still share names, which the generic ambiguity checks above must preserve.
+        assert!(!harvest.ambiguous.contains_key("file"));
+        assert!(!harvest.ambiguous.contains_key("orgfile"));
         for name in [
+            "file",
+            "orgfile",
             "calendar",
             "availability",
             "meeting-schedule",
@@ -11707,17 +12341,20 @@ mod arrangement_tests {
         }
     }
 
-    /// The dump as it stands names `file`, and the refusal says why in the host's words.
+    /// Both file jails survive a dump and rebuild with their distinct identities.
     #[test]
-    fn the_whole_dump_is_refused_on_a_name_that_cannot_say_which() {
+    fn the_dumped_file_doors_bind_distinct_endpoints() {
         let (root, harvest) = default_root();
-        let Err(refused) = arrangement::arrange(&harvest, &dumped(&root)) else {
-            panic!("`file` names two endpoints; the dump must not build")
-        };
-        assert!(
-            refused.contains("different endpoints in this host"),
-            "{refused}"
-        );
+        let (declaration, _) = declarable(&root, &harvest);
+        let built = arrangement::arrange(&harvest, &declaration).expect("file doors build");
+        for (pattern, name) in [
+            ("urn:file:{path}", "file"),
+            ("urn:orgfile:{path}", "orgfile"),
+        ] {
+            assert_eq!(door(&declaration, pattern).unwrap().endpoint, name);
+            let iri = concrete(pattern).unwrap();
+            assert_eq!(answer(root.as_ref(), &iri), answer(built.as_ref(), &iri));
+        }
     }
 
     /// ★ THE ROUND TRIP. The declarable part of the dumped arrangement, built over the harvested
@@ -11739,7 +12376,13 @@ mod arrangement_tests {
             .collect();
         expected.sort();
         expected.dedup();
-        assert!(!expected.is_empty());
+        // The file jails are now declarable and must participate in the full
+        // name-by-name comparison rather than being among the dropped doors.
+        for pattern in ["urn:file:{path}", "urn:orgfile:{path}"] {
+            let iri = concrete(pattern).unwrap();
+            assert!(names.contains(&iri), "{iri} is compared");
+            assert!(!expected.contains(&iri), "{iri} remains bound");
+        }
         assert_eq!(differing(&root, &built, &names), expected);
         for name in &expected {
             assert_eq!(
@@ -12246,6 +12889,8 @@ mod contact_label_tests {
             key.to_pkcs8_pem(LineEnding::LF).unwrap().as_str(),
         )
         .unwrap();
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Arc::new(Kernel::new(Arc::new(
             ikigai_intray::space(spaces.clone())
                 .bind(
@@ -12327,6 +12972,184 @@ mod contact_label_tests {
     }
 }
 
+/// Ledger #3713: under a sealed contact space a tuple's id is the hash of its CIPHERTEXT, so the
+/// links the handler mints must name that id, not the hash of the text it reads, and must still
+/// name their enquiry after a reseal stores it again under a new id.
+#[cfg(test)]
+mod sealed_contact_link_tests {
+    use super::*;
+    use ed25519_dalek::pkcs8::{spki::der::pem::LineEnding, EncodePrivateKey};
+    use futures::executor::block_on;
+    use ikigai_core::{Capability, Kernel, Request};
+
+    /// What `contact-handler.scm` does to mint its block and "not spam" links.
+    const MINT: &str = "(string-append \
+         (invoke 'source \"urn:contactblock:link\" \"email\" \"zoe@example.invalid\" \"enquiry\" (input)) \
+         (invoke 'source \"urn:contactlabel:link\" \"label\" \"ham\" \"enquiry\" (input)))";
+
+    fn age_key(path: &std::path::Path, identity: &age::x25519::Identity) {
+        use age::secrecy::ExposeSecret;
+        std::fs::write(path, format!("{}\n", identity.to_string().expose_secret())).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    fn ids_in(note: &str) -> Vec<String> {
+        note.split(['?', '&', '\n'])
+            .filter_map(|part| part.strip_prefix("id="))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn a_sealed_enquirys_links_name_its_stored_tuple_before_and_after_a_reseal() {
+        let base =
+            std::env::temp_dir().join(format!("ikigai-sealed-contact-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let spaces = base.join("spaces");
+        let config = base.join("config");
+        std::fs::create_dir_all(spaces.join("contact")).unwrap();
+        std::fs::create_dir_all(config.join(SPACE_AUTHORITY_DIR)).unwrap();
+        std::fs::write(
+            spaces.join("contact").join("handler"),
+            format!("{CONTACT_HANDLER}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            config.join(SPACE_AUTHORITY_DIR).join("contact"),
+            format!("urn:cap:lisp\n{}\n", contactblock::CAP_CONTACTBLOCK_MINT),
+        )
+        .unwrap();
+        let block_key = base.join("contact-block.key");
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        std::fs::write(
+            &block_key,
+            signing.to_pkcs8_pem(LineEnding::LF).unwrap().as_str(),
+        )
+        .unwrap();
+        let space_key = base.join(space_seal::SPACE_KEY_FILE);
+        age_key(&space_key, &age::x25519::Identity::generate());
+        let codec = || {
+            Arc::new(space_seal::SealCodec::load(&space_key).unwrap())
+                as Arc<dyn ikigai_intray::TupleCodec>
+        };
+
+        let program = PROGRAMS.iter().find(|p| p.iri == CONTACT_HANDLER).unwrap();
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
+        let kernel = Arc::new(Kernel::new(Arc::new(
+            stored_program(program, MINT.to_string())
+                .bind(
+                    UriTemplate::parse(ikigai_intray::SPACE_TEMPLATE).unwrap(),
+                    ikigai_intray::SpaceEndpoint::new(spaces.clone()).with_codec(codec()),
+                )
+                .bind(
+                    Exact::new("urn:contactblock:link"),
+                    contactblock::ContactBlockLink {
+                        key_path: block_key.clone(),
+                    },
+                )
+                .bind(
+                    Exact::new("urn:contactlabel:link"),
+                    contactblock::ContactLabelLink {
+                        key_path: block_key,
+                    },
+                ),
+        )));
+        let reactor = space_reactor(
+            spaces.clone(),
+            Arc::clone(&kernel) as Arc<dyn ikigai_resolve::Resolver>,
+            Some(config),
+        )
+        .with_codec(codec());
+
+        let enquiry = "((name \"Zoë\") (email \"zoe@example.invalid\") (message \"hello\"))\n";
+        let dropped = block_on(
+            kernel.issue(
+                Request::new(Verb::Sink, Iri::parse("urn:space:contact").unwrap())
+                    .with_arg("content", ArgRef::Inline(enquiry.as_bytes().to_vec())),
+                &Capability::scoped(vec![ikigai_intray::CAP_OUT.to_string()]),
+            ),
+        )
+        .unwrap();
+        let id = String::from_utf8(dropped.bytes).unwrap();
+        // Sealed: the stored id is not the hash of the text.
+        assert_ne!(id, ikigai_intray::tuple_id(enquiry.as_bytes()));
+        assert_eq!(
+            reactor.process("contact", &id),
+            ikigai_intray::Outcome::Handled
+        );
+
+        let note = std::fs::read_to_string(
+            spaces
+                .join("contact")
+                .join("outbox")
+                .join(format!("{id}.out")),
+        )
+        .unwrap();
+        let linked = ids_in(&note);
+        assert_eq!(
+            linked,
+            vec![id.clone(), id.clone()],
+            "block, then label: {note}"
+        );
+
+        // The apply side's read, by the id in the link, under the one-space grant.
+        let read = |tuple: &str| {
+            block_on(
+                kernel.issue(
+                    Request::new(Verb::Source, Iri::parse("urn:space:contact").unwrap())
+                        .with_arg("tuple", ArgRef::Inline(tuple.as_bytes().to_vec()))
+                        .with_arg("state", ArgRef::Inline(b"outbox".to_vec())),
+                    &Capability::scoped(vec![ikigai_intray::cap_read_space("contact")]),
+                ),
+            )
+            .map(|r| r.bytes)
+        };
+        assert_eq!(read(&linked[0]).unwrap(), enquiry.as_bytes());
+
+        // A rotation: the new identity first, the old one still listed, then a reseal.
+        let fresh = age::x25519::Identity::generate();
+        let old_key = std::fs::read_to_string(&space_key).unwrap();
+        {
+            use age::secrecy::ExposeSecret;
+            std::fs::write(
+                &space_key,
+                format!("{}\n{old_key}", fresh.to_string().expose_secret()),
+            )
+            .unwrap();
+        }
+        let resealed = space_seal::reseal(&spaces, &space_key).unwrap();
+        assert_eq!(resealed[0].settled, 2, "{resealed:?}"); // the tuple and its .out note
+        let now = space_seal::current_id(&spaces, "contact", &linked[0]);
+        assert_ne!(now, linked[0], "a reseal stores the tuple under a new id");
+        assert!(read(&linked[0]).is_err(), "the old id names nothing now");
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
+        let kernel_after = Kernel::new(Arc::new(
+            EndpointSpace::new().bind(
+                UriTemplate::parse(ikigai_intray::SPACE_TEMPLATE).unwrap(),
+                ikigai_intray::SpaceEndpoint::new(spaces.clone())
+                    .with_codec(Arc::new(space_seal::SealCodec::load(&space_key).unwrap())),
+            ),
+        ));
+        let after = block_on(
+            kernel_after.issue(
+                Request::new(Verb::Source, Iri::parse("urn:space:contact").unwrap())
+                    .with_arg("tuple", ArgRef::Inline(now.into_bytes()))
+                    .with_arg("state", ArgRef::Inline(b"outbox".to_vec())),
+                &Capability::scoped(vec![ikigai_intray::cap_read_space("contact")]),
+            ),
+        )
+        .unwrap();
+        assert_eq!(after.bytes, enquiry.as_bytes());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
 #[cfg(test)]
 mod http_body_budget_tests {
     use super::*;
@@ -12398,6 +13221,8 @@ mod http_body_budget_tests {
     fn native_http_names_ikigai_as_the_default_user_agent() {
         use ikigai_core::{ArgRef, Capability};
         let (url, server) = captured_request();
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(http_space()));
         let request = Request::new(Verb::Source, Iri::parse("urn:http:get").unwrap())
             .with_arg("url", ArgRef::Inline(url.into_bytes()));
@@ -12503,6 +13328,8 @@ mod http_body_budget_tests {
         use ikigai_core::{ArgRef, Capability};
         let (url, release, server) =
             stalled_server(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhalf_");
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(one_second_transport().into_space()));
         let request = Request::new(Verb::Source, Iri::parse("urn:http:get").unwrap())
             .with_arg("url", ArgRef::Inline(url.into_bytes()));
@@ -12545,6 +13372,8 @@ mod http_body_budget_tests {
         use ikigai_core::{ArgRef, Capability};
         let expected = vec![b'x'; 12 * 1024 * 1024];
         let (url, server) = response(expected.clone());
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(http_space()));
         let request = Request::new(Verb::Source, Iri::parse("urn:http:get").unwrap())
             .with_arg("url", ArgRef::Inline(url.into_bytes()));
@@ -12626,6 +13455,8 @@ mod http_body_budget_tests {
     fn native_http_endpoint_returns_a_typed_budget_refusal() {
         use ikigai_core::{ArgRef, Capability};
         let (url, server) = response(b"abcde".to_vec());
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(
             UreqTransport {
                 max_response_bytes: 4,

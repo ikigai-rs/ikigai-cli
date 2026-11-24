@@ -182,7 +182,7 @@ fn named() -> std::result::Result<Option<(PathBuf, ArrangementSource)>, String> 
     else {
         return Ok(None);
     };
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = crate::config::user_home();
     let path = config_relative(
         &value,
         home.as_deref(),
@@ -241,6 +241,8 @@ pub(crate) fn read_declaration(path: &Path) -> std::result::Result<String, Strin
     ]));
     // The host's synchronous issuer (the one the REPL and the reactor drive), under root: the
     // host reading its own configuration.
+    #[allow(clippy::disallowed_methods)]
+    // internal: the host reading its own configuration file as root; it routes no user arguments
     let kernel = Kernel::new(Arc::clone(&root));
     let issue = |request: Request| {
         ikigai_resolve::Resolver::issue(&kernel, request)

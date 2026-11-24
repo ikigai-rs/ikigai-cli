@@ -73,6 +73,14 @@ fn aborts() -> Vec<(&'static str, Error)> {
             Error::Unavailable("the origin went away".into()),
         ),
         (
+            "transient/gave-up",
+            Error::GaveUp {
+                attempts: 9,
+                elapsed: Duration::new(120, 123_456_789),
+                detail: "down".into(),
+            },
+        ),
+        (
             "retry-after",
             Error::RetryAfter {
                 delay: Some(Duration::from_secs(2)),

@@ -31,10 +31,9 @@ mod keystore;
 
 fn main() -> Result<(), BoxError> {
     let flags = Flags::parse()?;
-    // Spike-only clients override, set before the runtime exists. The grants flag
-    // uses the host's explicit path override, shared with the CLI.
+    // The clients and grants flags use the host's explicit path overrides, shared with the CLI.
     if let Some(clients) = flags.all("clients").pop() {
-        std::env::set_var("IKIGAI_CLIENTS", clients);
+        ikigai_embedded::clients::set_clients_path(clients.into());
     }
     if let Some(grants) = flags.all("grants").pop() {
         ikigai_embedded::set_grants_path(grants.into());
@@ -55,7 +54,7 @@ fn main() -> Result<(), BoxError> {
     }
     println!(
         "grant table: {}",
-        ikigai_embedded::clients::clients_path()
+        ikigai_embedded::clients::clients_path()?
             .map_or_else(|| "(none)".to_string(), |p| p.display().to_string())
     );
     for relay in &relays {
@@ -104,6 +103,7 @@ fn main() -> Result<(), BoxError> {
     })
 }
 
+#[allow(clippy::disallowed_methods)] // internal: the example's own kernel, which routes no user arguments
 fn demo_kernel() -> Kernel {
     let cal = FnEndpoint::new("cal", |inv: &Invocation<'_>| {
         let body = if inv.capability.allows("urn:cap:demo:detail") {

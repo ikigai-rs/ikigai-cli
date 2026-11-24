@@ -13,11 +13,12 @@ pub struct SharedSocket {
 }
 
 /// Read [`SharedSocket`] from the grants file, or `None` when no principal names an account
-/// (or there is no grants file): the door then admits only its own user, as before.
+/// (or the config home has no grants file): the door then admits only its own user, as before.
 ///
 /// # Errors
 ///
-/// Every reason the table cannot be honored, named: a grants file that does not parse or fails
+/// Every reason the table cannot be honored, named: a `--grants` naming a file that does not
+/// exist, a grants file that does not parse or fails
 /// a session check, an account that does not exist or is this user, a grants file the account
 /// could write, and a missing or unknown `ipc.group`.
 pub fn shared_socket() -> Result<Option<SharedSocket>, String> {
@@ -26,7 +27,12 @@ pub fn shared_socket() -> Result<Option<SharedSocket>, String> {
     };
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if crate::grants_path_is_explicit() {
+                return Err(crate::missing_grants_flag(&path));
+            }
+            return Ok(None);
+        }
         Err(e) => return Err(format!("{}: {e}", path.display())),
     };
     let peers =
@@ -60,7 +66,7 @@ pub fn shared_socket_from(
                 "{} admits other accounts to the socket, so it needs a group to share the socket \
              with: set `ipc.group = \"<group>\"` in {}, a group those accounts are in",
                 path.display(),
-                crate::config::config_path().display()
+                crate::config::config_path_shown()
             )
         })?;
     let gid = match group.parse::<u32>() {

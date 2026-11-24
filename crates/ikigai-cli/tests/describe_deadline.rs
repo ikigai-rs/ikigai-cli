@@ -113,6 +113,7 @@ fn a_silent_peer_is_named_by_the_host_not_blamed_on_it() {
         &[
             "serve",
             "quic://127.0.0.1:0",
+            "--allow-unenrolled",
             "--name",
             "peer",
             "--cert-dir",

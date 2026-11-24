@@ -85,6 +85,32 @@ fn the_flag_runs_the_declared_arrangement() {
     );
 }
 
+/// A declaration can bind the workspace file jail by its endpoint name.
+#[test]
+fn a_declared_arrangement_binds_the_file_space_by_name() {
+    let home = scratch("file-name");
+    std::fs::write(home.join("files/probe.txt"), "workspace probe").unwrap();
+    let declaration = Topology::new(SpaceKind::EndpointSpace {
+        doors: vec![Door::new("urn:file:{path}", MatchKind::Template, "file")],
+    });
+    std::fs::write(home.join("root.ttl"), declaration.to_turtle()).unwrap();
+    let out = run(
+        &home,
+        &[
+            "--arrangement",
+            "root.ttl",
+            "-c",
+            "source urn:file:probe.txt",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("workspace probe"),
+        "{}",
+        text(&out.stdout)
+    );
+}
+
 /// The config home names it too — relative to the config home — and the host's own resource
 /// answers the arrangement it is running, header and all.
 #[test]
@@ -165,30 +191,72 @@ fn an_unbuildable_declaration_stops_the_start() {
     );
 }
 
-/// ★ The built-in root dumped and fed back is REFUSED on this host, and says why: `file` names
-/// two different endpoints (the org-file jail and the workspace jail), so a door naming it cannot
-/// say which. Pinned end to end so the day a module gives each its own name, this test is what
-/// changes.
+/// The default dump can be loaded again, including its workspace file door.
 #[test]
-fn the_dumped_default_is_refused_on_an_ambiguous_name() {
+fn the_dumped_default_binds_the_file_space() {
     let home = scratch("dump");
+    std::fs::write(home.join("files/probe.txt"), "dumped workspace").unwrap();
     let dump = run(&home, &["-c", "source urn:iki:host:arrangement"]);
+    assert_eq!(dump.status.code(), Some(0), "{}", text(&dump.stderr));
     let turtle = text(&dump.stdout);
-    assert!(
-        turtle.contains("⚠ Not declarable as it stands: `file`"),
-        "{turtle}"
-    );
+    assert!(!turtle.contains("Not declarable as it stands"), "{turtle}");
     std::fs::write(home.join("root.ttl"), &turtle).unwrap();
     let out = run(
         &home,
-        &["--arrangement", "root.ttl", "-c", "source urn:host:demo"],
+        &[
+            "--arrangement",
+            "root.ttl",
+            "-c",
+            "source urn:file:probe.txt",
+        ],
     );
-    let stderr = text(&out.stderr);
-    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert!(
-        stderr.contains("binds `file`, which names 2 different endpoints in this host"),
-        "{stderr}"
+        text(&out.stdout).contains("dumped workspace"),
+        "{}",
+        text(&out.stdout)
     );
+}
+
+/// The same relative path reaches different configured jails through named doors.
+#[test]
+fn declared_file_and_orgfile_doors_keep_their_own_jails() {
+    let home = scratch("file-jails");
+    let org = home.join("org");
+    std::fs::create_dir_all(&org).unwrap();
+    std::fs::write(home.join("files/probe.txt"), "workspace contents").unwrap();
+    std::fs::write(org.join("probe.txt"), "org contents").unwrap();
+    std::fs::write(
+        home.join("config/ikigai/calendar.json"),
+        serde_json::json!({"org_dir": org, "org_files": []}).to_string(),
+    )
+    .unwrap();
+    let declaration = Topology::new(SpaceKind::EndpointSpace {
+        doors: vec![
+            Door::new("urn:file:{path}", MatchKind::Template, "file"),
+            Door::new("urn:orgfile:{path}", MatchKind::Template, "orgfile"),
+        ],
+    });
+    std::fs::write(home.join("root.ttl"), declaration.to_turtle()).unwrap();
+    for (iri, expected, other) in [
+        ("urn:file:probe.txt", "workspace contents", "org contents"),
+        (
+            "urn:orgfile:probe.txt",
+            "org contents",
+            "workspace contents",
+        ),
+    ] {
+        let out = run(
+            &home,
+            &["--arrangement", "root.ttl", "-c", &format!("source {iri}")],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        let stdout = text(&out.stdout);
+        assert!(
+            stdout.contains(expected) && !stdout.contains(other),
+            "{stdout}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

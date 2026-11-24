@@ -210,7 +210,20 @@ fn serve_composes_the_flag_s_topology() {
     );
     let flag = home.join("flag");
     // A SHORT socket path: `sockaddr_un` fits 104 bytes on macOS (field guide 9h).
-    let sock = format!("/tmp/iki-ch-{}.sock", std::process::id());
+    // In a private 0700 directory: the door refuses to serve straight in a shared `/tmp`
+    // (ledger #3634).
+    let sock_dir = format!("/tmp/iki-ch-{}", std::process::id());
+    std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
+        .create(&sock_dir)
+        .or_else(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        })
+        .expect("the socket directory");
+    let sock = format!("{sock_dir}/s.sock");
     let _ = std::fs::remove_file(&sock);
     let mut child = command(
         &home,

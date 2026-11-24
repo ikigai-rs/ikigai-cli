@@ -22,7 +22,7 @@
 #![cfg(feature = "store")]
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use futures::executor::block_on;
 use ikigai_engine::{Action, Engine};
@@ -53,12 +53,15 @@ fn fixture_home() -> &'static Path {
 
 /// A REPL engine over the composed embedded kernel — the same pair `ikigai -c '…'` builds.
 ///
-/// A fresh `Engine` per test and a fresh `Kernel` behind it: the DATASET is opened once
-/// per process and memoised in `ikigai_embedded::store`, so every kernel here shares the
-/// one open. That is the constraint `tests/store.rs` documents, working.
+/// A fresh `Engine` per test keeps session authority independent. All sessions share
+/// one kernel, so a later test cannot bind a store space after an earlier cached read.
 fn engine() -> Engine {
-    fixture_home();
-    Engine::new(ikigai_embedded::kernel())
+    static KERNEL: OnceLock<Arc<ikigai_core::Kernel>> = OnceLock::new();
+    let kernel = KERNEL.get_or_init(|| {
+        fixture_home();
+        Arc::new(ikigai_embedded::kernel())
+    });
+    Engine::new(Arc::clone(kernel))
 }
 
 /// Evaluate one typed line, expecting it to succeed, and return what the REPL printed.
@@ -88,6 +91,34 @@ fn refused(engine: &Engine, input: &str) -> String {
         // `source`/`sink`/`cap` — so the fact of it is the whole finding.
         _ => panic!("`{input}` produced a REPL control action rather than output"),
     }
+}
+
+#[test]
+fn ledger_upgrade_preserves_labels_and_exposes_claim_epochs() {
+    let engine = engine();
+    line(
+        &engine,
+        "sink urn:iki:ledger:upgrade:append labels=cli Upgrade the ledger",
+    );
+    let error = refused(
+        &engine,
+        "sink urn:iki:ledger:upgrade:label item=1 content=\"repo:x worker:y\"",
+    );
+    assert!(error.contains("label"), "{error}");
+    let detail = line(
+        &engine,
+        "source urn:iki:ledger:upgrade:item:1 as=application/json",
+    );
+    let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+    assert_eq!(detail["item"]["labels"], serde_json::json!(["cli"]));
+
+    line(&engine, "sink urn:iki:ledger:upgrade:claim item=1 cli-test");
+    let detail = line(
+        &engine,
+        "source urn:iki:ledger:upgrade:item:1 as=application/json",
+    );
+    let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+    assert_eq!(detail["item"]["claim"]["epoch"], 1);
 }
 
 /// ★ **The arc's deliverable, as a test.** Append, list, comment, rank and close — the
@@ -286,6 +317,71 @@ fn the_purge_grant_list_purges_a_deleted_item() {
     assert!(
         purged.contains("archived quad(s) destroyed"),
         "the purge reached the graveyard under exactly the published grants: {purged}"
+    );
+}
+
+/// ★ **The session graph, exercised: a session holding exactly `grants_for(…, Write)` records
+/// an agent session's summary and reads it back, and the list without the session graph's
+/// tokens cannot** (ledger #3661).
+///
+/// Since `ikigai-ledger` 0.23.0 a ledger's session summaries live in
+/// `urn:iki:ledger:graph:{L}:session`, a graph of their own, and a scoped store grant cannot
+/// reach across graphs. A 0.22.0-shaped list (the ledger graph's tokens only) still files,
+/// comments and hands back, and is refused at the summary, which is the failure an operator
+/// copying an old grant file would meet. This is the line that makes the two `:session`
+/// tokens in `grants_for` a checked claim rather than a comment.
+#[test]
+fn the_write_grant_list_records_and_reads_a_session_summary() {
+    use ikigai_embedded::store::{grants_for, Authority};
+
+    let grants = grants_for("sessions-grant", Authority::Write).expect("a valid ledger name");
+    let summary = r#"{"session": "cli-0b5e41aa", "machineName": "lawnboy", "harness": "claude", "model": "claude-opus-5-5", "exitStatus": 0, "wallClockMs": 1830000, "turns": 41, "toolCalls": 118, "inputTokens": 5120, "cachedInputTokens": 880000, "cacheCreationTokens": 64000, "outputTokens": 21000}"#;
+
+    // The list as 0.22.0 needed it: everything but the session graph.
+    let old = engine();
+    let without: Vec<&str> = grants
+        .iter()
+        .map(String::as_str)
+        .filter(|g| !g.ends_with(":session"))
+        .collect();
+    assert_eq!(without.len() + 2, grants.len(), "{grants:?}");
+    line(&old, &format!("cap {}", without.join(" ")));
+    let filed = line(
+        &old,
+        "sink urn:iki:ledger:sessions-grant:append Hand back with a session summary",
+    );
+    assert!(filed.starts_with("sessions-grant#1 "), "{filed}");
+    line(
+        &old,
+        "sink urn:iki:ledger:sessions-grant:comment item=1 handback=true PR is up, CI green",
+    );
+    let denied = refused(
+        &old,
+        &format!("sink urn:iki:ledger:sessions-grant:item:1:sessions {summary}"),
+    );
+    assert!(
+        denied.contains("urn:iki:ledger:graph:sessions-grant:session")
+            || denied.to_lowercase().contains("denied"),
+        "the session graph is a graph of its own: {denied}"
+    );
+
+    // And the list `grants_for` issues now.
+    let new = engine();
+    line(&new, &format!("cap {}", grants.join(" ")));
+    let recorded = line(
+        &new,
+        &format!("sink urn:iki:ledger:sessions-grant:item:1:sessions {summary}"),
+    );
+    assert!(recorded.contains("cli-0b5e41aa"), "{recorded}");
+    let item = line(&new, "source urn:iki:ledger:sessions-grant:item:1:sessions");
+    assert!(
+        item.contains("cli-0b5e41aa"),
+        "one item's sessions read: {item}"
+    );
+    let all = line(&new, "source urn:iki:ledger:sessions-grant:sessions");
+    assert!(
+        all.contains("cli-0b5e41aa"),
+        "the ledger's sessions read: {all}"
     );
 }
 

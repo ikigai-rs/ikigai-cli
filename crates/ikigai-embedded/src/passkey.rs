@@ -315,7 +315,7 @@ pub fn max_challenges_from(value: Option<&str>) -> std::result::Result<usize, St
 pub fn check_config() -> std::result::Result<(), String> {
     max_challenges_from(crate::config::get(MAX_CHALLENGES_KEY).as_deref())
         .map(|_| ())
-        .map_err(|e| format!("{e} (in {})", crate::config::config_path().display()))
+        .map_err(|e| format!("{e} (in {})", crate::config::config_path_shown()))
 }
 
 /// The bound in force: the config home's `passkey.max_challenges`, read once. An invalid value
@@ -838,7 +838,7 @@ impl Endpoint for PasskeyJs {
 /// On success the challenge is consumed (single-use) and any advanced signature counter persisted.
 /// Every failure is one `Denied` — a prober learns nothing from which check tripped.
 pub fn require_passkey(inv: &Invocation<'_>) -> Result<()> {
-    let denied = || Error::Denied("this action needs your passkey".to_string());
+    let denied = || Error::Denied("this action needs your passkey".into());
 
     // One lock from load to save, so a concurrent assertion cannot write back a stale copy.
     let held = credential_lock();
@@ -1015,9 +1015,9 @@ pub struct PasskeyEnrollOpen;
 impl Endpoint for PasskeyEnrollOpen {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         if !inv.capability.allows(CAP_PASSKEY_ENROLL) {
-            return Err(Error::Denied(format!(
-                "opening enrollment requires `{CAP_PASSKEY_ENROLL}`"
-            )));
+            return Err(Error::Denied(
+                format!("opening enrollment requires `{CAP_PASSKEY_ENROLL}`").into(),
+            ));
         }
         let code = enrollment_code()?;
         let window = EnrollWindow {
@@ -1246,7 +1246,7 @@ impl Endpoint for PasskeyRegister {
                 // is nothing correct to bind it to (the old default silently chose production).
                 if relying_party().is_none() {
                     return Err(Error::Denied(
-                        "this edge has no passkey relying party configured".to_string(),
+                        "this edge has no passkey relying party configured".into(),
                     ));
                 }
                 // ONE lock from judging the window to spending it, so two registrations in one
@@ -1263,12 +1263,12 @@ impl Endpoint for PasskeyRegister {
                         return Err(Error::Denied(
                             "this enrollment window has already been used — open a new one at \
                              the box"
-                                .to_string(),
+                                .into(),
                         ));
                     }
                     WindowState::Closed => {
                         return Err(Error::Denied(
-                            "no enrollment window is open — open one at the box first".to_string(),
+                            "no enrollment window is open — open one at the box first".into(),
                         ));
                     }
                 };
@@ -1284,7 +1284,7 @@ impl Endpoint for PasskeyRegister {
                     return Err(Error::Denied(
                         "a registration needs the one-time code shown at the box when the \
                          window was opened"
-                            .to_string(),
+                            .into(),
                     ));
                 }
                 let (id_b64, spki_b64) = (param(inv, "id")?, param(inv, "spki")?);
@@ -1524,6 +1524,8 @@ mod tests {
 
     /// A minimal invocation carrying a urlencoded body as `content` (how a POST arrives).
     fn post_inv(body: &str) -> (Kernel, Request) {
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(std::sync::Arc::new(ikigai_core::EndpointSpace::new()));
         let req = Request::new(Verb::Sink, Iri::parse("urn:x").unwrap())
             .with_arg("content", ArgRef::Inline(body.as_bytes().to_vec()));
@@ -1549,6 +1551,8 @@ mod tests {
                 Description::new("gate").verb(Verb::Sink)
             }
         }
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(std::sync::Arc::new(
             ikigai_core::EndpointSpace::new().bind(ikigai_core::Exact::new("urn:x"), Gate),
         ));
@@ -1907,6 +1911,8 @@ mod tests {
         verb: Verb,
         body: Option<&str>,
     ) -> Result<Representation> {
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(std::sync::Arc::new(
             ikigai_core::EndpointSpace::new().bind(ikigai_core::Exact::new(iri), endpoint),
         ));
@@ -2167,6 +2173,8 @@ mod tests {
         isolate("enroll");
         assert!(!enrollment_open(), "closed by default");
         // Opening requires the cap.
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(std::sync::Arc::new(ikigai_core::EndpointSpace::new().bind(
             ikigai_core::Exact::new("urn:passkey:enroll-open"),
             PasskeyEnrollOpen,
@@ -2194,6 +2202,8 @@ mod tests {
         isolate("caps");
         TEST_RP.with(|r| *r.borrow_mut() = Some(test_relying_party()));
         open_window();
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(std::sync::Arc::new(
             ikigai_core::EndpointSpace::new()
                 .bind(
@@ -2377,6 +2387,8 @@ mod tests {
     #[test]
     fn opening_a_window_writes_it_owner_only() {
         isolate("enroll-mode");
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(std::sync::Arc::new(ikigai_core::EndpointSpace::new().bind(
             ikigai_core::Exact::new("urn:passkey:enroll-open"),
             PasskeyEnrollOpen,
@@ -2564,6 +2576,8 @@ mod tests {
     #[test]
     fn opening_a_window_answers_with_a_code_the_file_holds_only_the_digest_of() {
         isolate("code-open");
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(std::sync::Arc::new(ikigai_core::EndpointSpace::new().bind(
             ikigai_core::Exact::new("urn:passkey:enroll-open"),
             PasskeyEnrollOpen,

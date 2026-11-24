@@ -38,7 +38,6 @@ fn the_http_surface_sources_the_shared_shell_and_watches_read_only_overrides() {
     let shell = directory.join("shell.html");
     std::fs::write(&shell, "<main>First shell</main>").unwrap();
     let kernel = Arc::new(ikigai_embedded::kernel_for("ui-test"));
-    let _watch = ikigai_embedded::watch_workspace(&kernel).unwrap().unwrap();
     // Overrides are published resources: a public viewer needs no filesystem authority.
     assert_eq!(
         source(&kernel, ikigai_ui::SHELL),
@@ -57,20 +56,24 @@ fn the_http_surface_sources_the_shared_shell_and_watches_read_only_overrides() {
     let page = block_on(kernel.issue(composed.clone(), &public)).unwrap();
     assert_eq!(page.bytes, b"<main>First shell</main>");
     assert!(kernel.is_cached(&composed, &public));
+    // Check cacheability before starting the watcher: a delayed setup notification
+    // can otherwise cut the first read between Source and is_cached (notably on macOS).
+    // Once watching, synchronize edits with the cut instead of elapsed time.
+    let watch = ikigai_embedded::watch_workspace(&kernel).unwrap().unwrap();
     std::fs::write(&shell, "<main>Edited shell</main>").unwrap();
     let until = Instant::now() + Duration::from_secs(20);
-    while kernel.is_cached(&read, &public) {
+    while kernel.is_cached(&read, &public) || kernel.is_cached(&composed, &public) {
         assert!(
             Instant::now() < until,
-            "the editor change did not cut the shell's thread"
+            "the editor change did not cut the shell and composition threads"
         );
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::yield_now();
     }
     assert_eq!(
         source(&kernel, ikigai_ui::SHELL),
         "<main>Edited shell</main>"
     );
-    let page = block_on(kernel.issue(composed, &public)).unwrap();
+    let page = block_on(kernel.issue(composed.clone(), &public)).unwrap();
     assert_eq!(page.bytes, b"<main>Edited shell</main>");
     // Missing overrides keep the other compiled artifacts available.
     assert!(source(&kernel, "urn:iki:ui:htmx").contains("htmx"));
@@ -111,14 +114,14 @@ fn the_http_surface_sources_the_shared_shell_and_watches_read_only_overrides() {
     }
     std::fs::remove_file(&shell).unwrap();
     let until = Instant::now() + Duration::from_secs(20);
-    while kernel.is_cached(&read, &public) {
+    while kernel.is_cached(&read, &public) || kernel.is_cached(&composed, &public) {
         assert!(
             Instant::now() < until,
-            "removing the override did not cut its thread"
+            "removing the override did not cut the shell and composition threads"
         );
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::yield_now();
     }
     assert!(source(&kernel, ikigai_ui::SHELL).contains("Skip to content"));
-    drop(_watch);
+    drop(watch);
     std::fs::remove_dir_all(home).unwrap();
 }

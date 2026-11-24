@@ -7,7 +7,9 @@
 //! hands a child `/dev/null` and so does an agent's shell, so a scripted run listed cache rows
 //! an interactive session never makes (the ikigai Book's replay saw 5 where a reader sees 3,
 //! ikigai-rs/ikigai-tutorial PR 109). Now a stdin already at its end with nothing is told apart
-//! without reading it, and nothing is fetched for its sake.
+//! without reading it, and nothing is fetched for its sake. Terminal face selection reads each
+//! Source contract independently of stdin, but only when stdout is a terminal (ledger #3838);
+//! these runs pipe stdout, so they fetch no contract for it either.
 //!
 //! ★ HERMETIC BY THE CHILD'S ENVIRONMENT, as in `sink_stdin.rs`: `HOME`, `XDG_CONFIG_HOME` and
 //! `IKIGAI_FILES` are set on the spawned process only.
@@ -95,7 +97,7 @@ fn stdout(output: &Output) -> String {
 }
 
 /// The batch every case runs: a bare `source` (no arguments, so only stdin could have made
-/// it fetch a contract), then the cache listing.
+/// it fetch a contract; stdout is piped, so face selection does not), then the cache listing.
 const BATCH: [&str; 4] = [
     "-c",
     "source urn:kernel:scheduler",
@@ -112,8 +114,27 @@ fn entries(listing: &str) -> &str {
         .trim()
 }
 
+/// Pin target and type for every cache row, ignoring sizes and display padding.
+fn cache_rows(listing: &str) -> Vec<(String, String)> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let target = fields.next()?;
+            if !target.starts_with("urn:") {
+                return None;
+            }
+            assert_eq!(fields.next(), Some("live"), "{line}");
+            Some((
+                target.to_string(),
+                fields.next().expect("cache media type").to_string(),
+            ))
+        })
+        .collect()
+}
+
 /// `/dev/null`, a closed empty pipe and an empty file each hold nothing: the batch caches
-/// nothing, exactly as the same two lines typed at a prompt do.
+/// nothing, exactly as the same lines in the REPL do.
 #[test]
 fn a_batch_on_an_empty_stdin_caches_what_it_asked_for_and_nothing_else() {
     let home = scratch("empty");
@@ -127,6 +148,13 @@ fn a_batch_on_an_empty_stdin_caches_what_it_asked_for_and_nothing_else() {
         std::fs::File::open(&file).expect("open"),
     );
 
+    let replay = piped(
+        ikigai(&home, &["--quiet"]),
+        b"source urn:kernel:scheduler\nsource urn:kernel:cache\n",
+    );
+    assert!(replay.status.success(), "{replay:?}");
+    let expected: Vec<(String, String)> = Vec::new();
+    assert_eq!(cache_rows(&stdout(&replay)), expected);
     for (case, output) in [
         ("/dev/null", &null),
         ("closed empty pipe", &pipe),
@@ -137,6 +165,11 @@ fn a_batch_on_an_empty_stdin_caches_what_it_asked_for_and_nothing_else() {
         assert!(
             entries(&listing).starts_with("entries  0 /"),
             "{case}: a contract was fetched for an empty stdin's sake:\n{listing}"
+        );
+        assert_eq!(
+            cache_rows(&listing),
+            expected,
+            "{case}: same rows as the REPL"
         );
     }
     let _ = std::fs::remove_dir_all(&home);
@@ -159,7 +192,8 @@ fn a_batch_stdin_with_bytes_still_fills_the_required_argument() {
 /// Ledger #1310: `--quiet` on a piped stdin prints the answers and nothing else. No version
 /// banner, no topology lines, no prompts, and no blank line at EOF, so the session can be
 /// compared line for line with what was typed. And it is a REPL, not a batch: the bare
-/// `source` fetched no contract, so the cache holds only what `toUpper` asked for.
+/// `source` fetched no contract (stdout is piped, so no face selection either), so the cache
+/// holds only what `toUpper` asked for.
 #[test]
 fn a_quiet_repl_on_a_pipe_prints_only_its_answers() {
     let home = scratch("quiet");
@@ -184,6 +218,17 @@ fn a_quiet_repl_on_a_pipe_prints_only_its_answers() {
     assert!(
         entries(&out).starts_with("entries  2 /"),
         "only toUpper's contract and answer are cached:\n{out}"
+    );
+
+    assert_eq!(
+        cache_rows(&out),
+        vec![
+            (
+                "urn:iki:fn:toUpper".to_string(),
+                "application/json".to_string()
+            ),
+            ("urn:iki:fn:toUpper".to_string(), "text/plain".to_string()),
+        ]
     );
 
     // Without `--quiet` the same session greets and prompts, as before.

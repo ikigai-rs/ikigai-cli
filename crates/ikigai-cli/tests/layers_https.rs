@@ -93,6 +93,9 @@ fn mint_key(path: &Path) {
             age::secrecy::ExposeSecret::expose_secret(&identity.to_string()),
         )
         .unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
     }
 }
 
@@ -965,6 +968,7 @@ impl ikigai_layers::gateway::Door for QuicDoor {
 }
 
 /// The resolving kernel: `urn:test:hello` answers `hello`.
+#[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
 fn hello_kernel() -> ikigai_core::Kernel {
     use ikigai_core::{Description, EndpointSpace, Exact, FnEndpoint, ReprType};
     let hello = FnEndpoint::new("hello", |_inv: &ikigai_core::Invocation<'_>| {

@@ -248,6 +248,15 @@ fn wire_errors() -> Vec<(&'static str, Value, WireError)> {
                 detail: "no clock".into(),
             },
         ),
+        (
+            "GaveUp",
+            json!({"GaveUp": {"attempts": 9, "elapsed": {"secs": 120, "nanos": 123456789}, "detail": "down"}}),
+            WireError::GaveUp {
+                attempts: 9,
+                elapsed: std::time::Duration::new(120, 123_456_789),
+                detail: "down".into(),
+            },
+        ),
     ]
 }
 

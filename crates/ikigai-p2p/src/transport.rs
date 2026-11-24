@@ -7,11 +7,11 @@ use futures::{AsyncReadExt, AsyncWriteExt, StreamExt};
 use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request, Verb};
 use ikigai_quic::Session;
 use ikigai_resolve::Resolver;
-use ikigai_wire::{decode, encode, Call, Reply, WireError};
+use ikigai_wire::{decode, encode, encode_reply_for_peer, Call, Reply, WireError};
 use libp2p::identity::Keypair;
 use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport};
-use libp2p::swarm::{ConnectionId, NetworkBehaviour, SwarmEvent};
+use libp2p::swarm::{ConnectionId, SwarmEvent};
 use libp2p::{dcutr, identify, ping, relay, tls, yamux, StreamProtocol, Swarm, SwarmBuilder};
 use tokio::sync::{mpsc, oneshot};
 
@@ -21,7 +21,7 @@ pub use libp2p::{Multiaddr, PeerId};
 /// transport SPEAKS — a mismatched peer fails protocol negotiation, just as a mismatched ALPN
 /// fails the QUIC handshake. (A `&'static str` because `StreamProtocol::new` wants one; a test
 /// pins it.) ⚠ It stays at 9, below the wire's [`PROTOCOL_VERSION`](ikigai_wire::PROTOCOL_VERSION)
-/// of 10: v10 is the stream frames, which this transport does not carry yet (it reads each
+/// of 11: v10 added the stream frames, which this transport does not carry yet (it reads each
 /// message whole; ledger #2452), and a peer must never be told a version whose frames it
 /// would then be refused.
 pub const WIRE_PROTOCOL: &str = "/ikigai/wire/9";
@@ -70,7 +70,8 @@ pub type PeerMinter = Arc<dyn Fn(&PeerId) -> Option<Session> + Send + Sync>;
 /// Postcard [`Call`]/[`Reply`] framed by the stream itself, exactly as on QUIC: the writer
 /// closes its half after one message, so the reader reads to end. A reply is encoded at
 /// the version its stream NEGOTIATED ([`Reply::for_peer`]) — the codec is handed the
-/// protocol, which makes it the one place on this door that knows it.
+/// protocol, which makes it the one place on this door that knows it. An oversized reply
+/// becomes a bounded size refusal, so the peer can read every response this codec writes.
 #[derive(Clone, Default)]
 pub struct WireCodec;
 
@@ -128,8 +129,8 @@ impl request_response::Codec for WireCodec {
     where
         T: futures::AsyncWrite + Unpin + Send,
     {
-        let reply = reply.for_peer(version_of_protocol(protocol));
-        io.write_all(&encode(&reply)?).await
+        let bytes = encode_reply_for_peer(reply, version_of_protocol(protocol))?;
+        io.write_all(&bytes).await
     }
 }
 
@@ -250,11 +251,33 @@ impl RelayPolicy {
     }
 }
 
-#[derive(NetworkBehaviour)]
-struct RelayBehaviour {
-    relay: relay::Behaviour,
-    identify: identify::Behaviour,
-    ping: ping::Behaviour,
+use behaviours::{RelayBehaviour, RelayBehaviourEvent};
+
+/// The swarm behaviours, in a module of their own only to scope one `allow`. Since rustc 1.100,
+/// `unreachable_code` fires inside `#[derive(NetworkBehaviour)]`'s expansion (libp2p-swarm-derive
+/// 0.36), where a relay member's handler types carry `Infallible`. A lint attribute on the struct
+/// does not reach the impl the derive writes beside it; one on this module does.
+#[allow(unreachable_code)]
+mod behaviours {
+    use super::WireCodec;
+    use libp2p::swarm::NetworkBehaviour;
+    use libp2p::{dcutr, identify, ping, relay, request_response};
+
+    #[derive(NetworkBehaviour)]
+    pub(super) struct RelayBehaviour {
+        pub(super) relay: relay::Behaviour,
+        pub(super) identify: identify::Behaviour,
+        pub(super) ping: ping::Behaviour,
+    }
+
+    #[derive(NetworkBehaviour)]
+    pub(super) struct PeerBehaviour {
+        pub(super) relay_client: relay::client::Behaviour,
+        pub(super) identify: identify::Behaviour,
+        pub(super) ping: ping::Behaviour,
+        pub(super) dcutr: dcutr::Behaviour,
+        pub(super) wire: request_response::Behaviour<WireCodec>,
+    }
 }
 
 /// Events a relay reports.
@@ -380,14 +403,7 @@ pub async fn run_relay(
 
 // ── a peer ─────────────────────────────────────────────────────────────────────────────
 
-#[derive(NetworkBehaviour)]
-struct PeerBehaviour {
-    relay_client: relay::client::Behaviour,
-    identify: identify::Behaviour,
-    ping: ping::Behaviour,
-    dcutr: dcutr::Behaviour,
-    wire: request_response::Behaviour<WireCodec>,
-}
+use behaviours::{PeerBehaviour, PeerBehaviourEvent};
 
 /// How a peer is set up.
 pub struct PeerConfig {
@@ -796,6 +812,37 @@ mod tests {
     }
 
     #[test]
+    fn an_oversized_gave_up_detail_is_a_decodable_bounded_refusal() {
+        use request_response::Codec;
+
+        for id in WIRE_PROTOCOLS {
+            let protocol = StreamProtocol::new(id);
+            let reply = Reply::ErrorTyped(WireError::GaveUp {
+                attempts: u32::MAX,
+                elapsed: Duration::MAX,
+                detail: "x".repeat(MAX_MESSAGE),
+            });
+            let mut out = futures::io::Cursor::new(Vec::new());
+            futures::executor::block_on(WireCodec.write_response(&protocol, &mut out, reply))
+                .unwrap();
+            assert!(
+                out.get_ref().len() <= MAX_MESSAGE,
+                "{id}: oversized response"
+            );
+            out.set_position(0);
+            let reply = futures::executor::block_on(WireCodec.read_response(&protocol, &mut out))
+                .expect("the peer can read the response we wrote");
+            match reply {
+                Reply::ErrorTyped(WireError::OverBudget(_)) if id == WIRE_PROTOCOL => {}
+                Reply::ErrorTyped(WireError::Endpoint(detail)) if id != WIRE_PROTOCOL => {
+                    assert!(detail.starts_with("over budget: "));
+                }
+                other => panic!("{id}: expected a size refusal, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn a_circuit_address_names_the_relay_then_the_target() {
         let relay_id = Keypair::generate_ed25519().public().to_peer_id();
         let target = Keypair::generate_ed25519().public().to_peer_id();
@@ -814,6 +861,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ikigai-p2p-{test}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let backend = Arc::new(ikigai_secret::FileBackend::new(&dir));
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(ikigai_secret::space(backend.clone())));
         (backend, kernel, dir)
     }

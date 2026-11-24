@@ -168,6 +168,12 @@ const INHERITED: &[(&str, &str)] = &[
     ("ui-theme-chooser", "ikigai-ui"),
     // ikigai-ui 0.5: a page family's header chooser, a Source of HTML like the rest above.
     ("ui-chooser", "ikigai-ui"),
+    // ikigai-ui 0.5.1: two more bundled shell artifacts, the opt-in base stylesheet and the
+    // scene renderer the shell template links. The host serves every shell artifact and the
+    // tokens, palettes and choosers; the rest of the space (screens, lenses, forms,
+    // compilers) is narrowed out (`src/ui.rs`, `served`).
+    ("ui-base-css", "ikigai-ui"),
+    ("ui-scene-renderer-js", "ikigai-ui"),
     ("bookmarks", "ikigai-cms"),
     ("compose", "ikigai-fn"),
     ("diagram-arrangement", "ikigai-diagram"),
@@ -178,10 +184,14 @@ const INHERITED: &[(&str, &str)] = &[
     ("conditional", "ikigai-fn"),
     // ikigai-fn 0.7: `urn:iki:fn:each`.
     ("each", "ikigai-fn"),
+    // ikigai-fn 0.12 (the core 0.4.0 cascade, ledger #4088): `urn:iki:fn:digest`.
+    ("digest", "ikigai-fn"),
     ("echo", "ikigai-fn"),
     ("greet", "ikigai-fn"),
     // ikigai-fn 0.7.2: `urn:iki:fn:html-to-text` (ledger #2528).
     ("html-to-text", "ikigai-fn"),
+    // ikigai-fn 0.11: `urn:iki:fn:markdown`, reached by this host with the core 0.4.0 cascade (ledger #4088).
+    ("markdown", "ikigai-fn"),
     ("reverseList", "ikigai-fn"),
     ("split", "ikigai-fn"),
     ("toUpper", "ikigai-fn"),
@@ -193,6 +203,9 @@ const INHERITED: &[(&str, &str)] = &[
     ("contacts", "ikigai-personal"),
     ("eval", "ikigai-lisp"),
     ("file", "ikigai-fs"),
+    // The host gives the org jail a distinct id; its contract and both invocation
+    // paths are still delegated to the published file endpoint.
+    ("orgfile", "ikigai-fs"),
     ("http-delete", "ikigai-http"),
     ("http-get", "ikigai-http"),
     ("http-head", "ikigai-http"),
@@ -214,8 +227,11 @@ const INHERITED: &[(&str, &str)] = &[
     ("jsonld-prune", "ikigai-jsonld"),
     ("llm-ask", "ikigai-llm"),
     ("llm-config", "ikigai-llm"),
+    // ikigai-llm 0.21 (the core 0.4.0 cascade, ledger #4088): the embedding endpoints.
+    ("llm-embed", "ikigai-llm"),
     ("llm-models", "ikigai-llm"),
     ("llm-ollama-ask", "ikigai-llm"),
+    ("llm-ollama-embed", "ikigai-llm"),
     ("llm-ollama-installed", "ikigai-llm"),
     ("llm-ollama-model", "ikigai-llm"),
     ("llm-ollama-up", "ikigai-llm"),
@@ -380,6 +396,7 @@ fn fixture_home() -> &'static Path {
                     prefix: "urn:iki:store:".to_string(),
                     target: "/tmp/conformance.sock".to_string(),
                     cert_dir: Some("/tmp/conformance/quic".to_string()),
+                    pending: false,
                 },
             ]),
             clients: vec![ikigai_embedded::posture::TrustedIdentity {
@@ -1354,6 +1371,8 @@ fn the_jobs_graph_uses_exactly_thirteen_undefined_terms() {
         })
         .with_description(Description::new("x").verb(Verb::Source)),
     );
+    #[allow(clippy::disallowed_methods)]
+    // internal: a test fixture's kernel; it routes no user arguments
     let kernel = Arc::new(Kernel::new(Arc::new(space)));
     registry.set_resolver(Arc::clone(&kernel) as Arc<dyn Resolver>);
     let every = Schedule::Every(Duration::from_secs(1));

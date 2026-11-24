@@ -10,7 +10,7 @@
 //! ⚠ **`tests/conformance.rs` does NOT walk these resources, and that is not an
 //! oversight.** Its fixture home carries no `store` line, so the composed kernel it walks
 //! binds no dataset and its catalog is unchanged by this feature — which is also why
-//! adding the feature needed no opt-out there. The seven store resources are walked by
+//! adding the feature needed no opt-out there. The store resources are walked by
 //! `ikigai-store`'s own conformance suite, over the same `space()` this host binds; what
 //! is left for THIS crate to state is the composition, and that is what this file is.
 #![cfg(feature = "store")]
@@ -42,11 +42,9 @@ fn fixture_home() -> &'static Path {
     .as_path()
 }
 
-/// The one kernel this binary builds. ⚠ `OnceLock`, not a fresh kernel per test: the
-/// dataset is opened once per PROCESS (RocksDB refuses a second open on a path even from
-/// the same process), and while `ikigai_embedded::store` memoises that open, keeping the
-/// kernel here too makes the constraint visible at the point somebody would otherwise add
-/// a second `kernel()` call.
+/// Reuse one kernel for this binary: constructing a fresh store space after another
+/// kernel cached a read would refuse requests. The dataset itself is opened once per
+/// process, while each kernel binds its own space over the shared handle.
 fn kernel() -> &'static Kernel {
     static KERNEL: OnceLock<Kernel> = OnceLock::new();
     KERNEL.get_or_init(|| {
@@ -147,7 +145,7 @@ fn reading_the_store_needs_the_stores_own_read_scope() {
     .expect("urn:cap:store:read reads");
 }
 
-/// The seven store resources are in the composed catalog, under the names the manifold
+/// The store resources are in the composed catalog, under the names the manifold
 /// advertises — so `urn:kernel:actions` offers them and the engine can route named
 /// arguments to them.
 #[test]
@@ -166,6 +164,7 @@ fn the_store_resources_join_the_composed_catalog() {
         "urn:iki:store:info",
         "urn:iki:store:update",
         "urn:iki:store:load",
+        "urn:iki:store:graph-written:{graph}",
     ] {
         assert!(
             patterns.iter().any(|p| p == iri),

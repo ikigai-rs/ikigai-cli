@@ -666,15 +666,27 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
     // value by name HERE, before anything reads it as missing: as a selector it was
     // misreported as "required", and as an optional binding it was dropped and the call
     // answered another resource. `null` stays what a JSON client means by it: not given.
-    let named = action
-        .inputs
+    //
+    // On an OPEN argument set every other name the caller gives is passed through as a request
+    // argument too, so it is held to the same rule: an object there reached the endpoint as an
+    // empty string.
+    let open = matches!(action.arguments, ikigai_core::Arguments::Open(_));
+    let inputs = &action.inputs;
+    let named = inputs
         .iter()
         .map(|i| i.name.as_str())
-        .chain(shape.synthesized.iter().map(|a| a.name.as_str()));
+        .chain(shape.synthesized.iter().map(|a| a.name.as_str()))
+        .chain(
+            args_map
+                .keys()
+                .map(String::as_str)
+                .filter(move |name| open && !inputs.iter().any(|i| i.name == *name)),
+        );
     //
     // A LIST argument (ledger #1547) is the one exception: it takes an ARRAY of scalars,
     // which is joined below with its separator's canonical character, exactly as the engine
-    // joins `graph=A graph=B`.
+    // joins `graph=A graph=B`. A `null` item is not one either: it is not an absent list, and
+    // read as a scalar it became an empty item.
     let is_list = |arg: &str| {
         action
             .inputs
@@ -686,7 +698,7 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
             Some(Value::Array(items)) if is_list(arg) => {
                 if items
                     .iter()
-                    .any(|item| matches!(item, Value::Array(_) | Value::Object(_)))
+                    .any(|item| matches!(item, Value::Null | Value::Array(_) | Value::Object(_)))
                 {
                     return tool_error(format!(
                         "`{arg}` is a list of values (strings, numbers or booleans), and an \
@@ -754,13 +766,15 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
     // turn the row's template into ANOTHER endpoint's IRI, so the target is checked below to
     // still reach this tool's endpoint (ledger #86). Delimiters themselves are legitimate,
     // since `urn:file:{path}` and `urn:repo:{repo}:file:{path}` take `/` and `:`; what is
-    // refused is a call answered by an endpoint the tool does not name.
+    // refused is a call answered by an endpoint the tool does not name. An EMPTY value
+    // changes the structure as surely as a delimiter does: `urn:demo:user:{name}` with
+    // `name=""` is `urn:demo:user:`, which another endpoint may be bound at.
     let mut structural: Vec<&str> = Vec::new();
     for (name, value) in joined.pairs() {
         let input = action.inputs.iter().find(|i| i.name == name);
         match input {
             Some(input) if input.source == ikigai_core::InputSource::Binding => {
-                if value.contains([':', '/', '?', '#', '[', ']', '@']) {
+                if value.is_empty() || value.contains([':', '/', '?', '#', '[', ']', '@']) {
                     structural.push(&input.name);
                 }
                 target = target.replace(&format!("{{{}}}", input.name), value);
@@ -1173,6 +1187,7 @@ mod tests {
             .collect()
     }
 
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn kernel() -> Kernel {
         let echo = FnEndpoint::new("echo", |inv| {
             let text = inv.inline_str("in").unwrap_or("");
@@ -1192,6 +1207,7 @@ mod tests {
     }
 
     /// An endpoint with an OPTIONAL by-value argument, echoing what reached it.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn pick_kernel() -> Kernel {
         let pick = FnEndpoint::new("pick", |inv| {
             let graph = inv.inline_str("graph").unwrap_or("-");
@@ -1214,6 +1230,7 @@ mod tests {
     /// LIST `graph` beside a plain `query` (Source), an OPEN `compose` whose extra names are
     /// template arguments (Source), and an ENVELOPE `submit` whose fields arrive inside
     /// `content` (Sink).
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn shape_kernel() -> Kernel {
         use ikigai_core::ListSeparator;
         let arg = |inv: &ikigai_core::Invocation<'_>, name: &str| {
@@ -1292,6 +1309,8 @@ mod tests {
         let repr = Representation::new(ReprType::new(media_type), bytes);
         let endpoint = FnEndpoint::new("answer", move |_| Ok(repr.clone()))
             .with_description(Description::new("answer").verb(Verb::Source));
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:demo:answer"), endpoint),
         ));
@@ -1479,6 +1498,56 @@ mod tests {
         );
         let (error, text) = call_text(&k, "graphs__source", json!({"title": "Hi"}));
         assert!(error && text.contains("unknown argument `title`"), "{text}");
+    }
+
+    /// A `null` ITEM of a list is not a value: read as a scalar it became an empty item, and
+    /// `["urn:a", null]` reached the endpoint as `graph=urn:a,`. Refused by name instead.
+    #[test]
+    fn a_null_item_of_a_list_is_refused_not_sent_empty() {
+        let k = shape_kernel();
+        let (error, text) = call_text(&k, "graphs__source", json!({"graph": ["urn:a", null]}));
+        assert!(error && text.contains("an item of it is not one"), "{text}");
+        // A `null` list is still what a JSON client means by it: not given.
+        assert_eq!(
+            call_text(&k, "graphs__source", json!({"graph": null})),
+            (false, "graph=- query=-".to_string())
+        );
+    }
+
+    /// An OPEN action passes its undeclared names through as request arguments, so they take
+    /// one value like a declared one: an object there reached the endpoint as an EMPTY string
+    /// (`title=`) and the call answered as if the caller had sent it.
+    #[test]
+    fn an_open_actions_extra_name_takes_one_value_too() {
+        let k = shape_kernel();
+        let (error, text) = call_text(
+            &k,
+            "compose__source",
+            json!({"src": "urn:x", "title": {"text": "Hi"}}),
+        );
+        assert!(
+            error && text.contains("`title` takes one value") && text.contains("an object"),
+            "{text}"
+        );
+        let (error, text) = call_text(
+            &k,
+            "compose__source",
+            json!({"src": "urn:x", "title": [["Hi"]]}),
+        );
+        assert!(error && text.contains("`title` takes one value"), "{text}");
+        // `null` is not given; a scalar passes through as before.
+        assert_eq!(
+            call_text(
+                &k,
+                "compose__source",
+                json!({"src": "urn:x", "title": null})
+            ),
+            (false, "src=urn:x title=-".to_string())
+        );
+        assert_eq!(
+            call_text(&k, "compose__source", json!({"src": "urn:x", "title": 7})),
+            (false, "src=urn:x title=7".to_string())
+        );
     }
 
     /// ledger #1547 (#358): an ENVELOPE action's fields are serialized into its carrier, as
@@ -1671,6 +1740,8 @@ mod tests {
         let space = EndpointSpace::new()
             .bind(Exact::new("urn:demo:one"), ep("llm:config"))
             .bind(Exact::new("urn:demo:two"), ep("llm.config"));
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let k = Kernel::new(Arc::new(space));
         let cap = Capability::root();
 
@@ -1734,6 +1805,8 @@ mod tests {
             Arc::new(EndpointSpace::new().bind(Exact::new("urn:demo:echo"), echo("(")))
                 as Arc<dyn ikigai_core::Space>,
         ]);
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let k = Kernel::new(Arc::new(root));
         let cap = Capability::root();
         let resp = handle(
@@ -1792,6 +1865,8 @@ mod tests {
         );
         let space =
             EndpointSpace::new().bind(UriTemplate::parse("urn:demo:echo/{message}").unwrap(), echo);
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let k = Kernel::new(Arc::new(space));
         let cap = Capability::root();
 
@@ -1834,6 +1909,7 @@ mod tests {
     /// `urn:repo:<root>:tree:{path}` (templated), one pair per root. One tool
     /// must front all four rows and keep each reachable by call. The endpoint
     /// echoes its resolved target so a test can see which row a call reached.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn per_root_kernel() -> Kernel {
         use ikigai_core::{Endpoint, UriTemplate};
         let tree: Arc<dyn Endpoint> = Arc::new(
@@ -2004,6 +2080,8 @@ mod tests {
         let space = EndpointSpace::new()
             .bind_arc(Exact::new("urn:repo:alpha:state"), Arc::clone(&state))
             .bind_arc(Exact::new("urn:repo:beta:state"), state);
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let k = Kernel::new(Arc::new(space));
         let cap = Capability::root();
         let resp = handle(
@@ -2292,6 +2370,8 @@ mod tests {
             },
             append,
         );
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let k = Kernel::new(Arc::new(space));
         let omitted = call_tool(&k, "ledger-append__sink", json!({}));
         assert_eq!(omitted["isError"], false, "{omitted}");
@@ -2322,6 +2402,8 @@ mod tests {
             },
             note,
         );
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let k = Kernel::new(Arc::new(space));
         let omitted = call_tool(&k, "note__sink", json!({}));
         assert_eq!(omitted["isError"], false, "{omitted}");
@@ -2344,6 +2426,8 @@ mod tests {
                 ikigai_core::UriTemplate::parse("urn:demo:x:{v}").unwrap(),
                 named_only,
             );
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let k = Kernel::new(Arc::new(space));
         let resp = call_tool(&k, "named-only__sink", json!({}));
         assert_eq!(resp["isError"], true, "{resp}");
@@ -2369,6 +2453,8 @@ mod tests {
                 ikigai_core::UriTemplate::parse("urn:demo:user:{name}").unwrap(),
                 user,
             );
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let k = Kernel::new(Arc::new(space));
         let resp = call_tool(&k, "user__sink", json!({ "name": "alice:private" }));
         assert_eq!(resp["isError"], true, "{resp}");
@@ -2386,6 +2472,36 @@ mod tests {
         assert_eq!(resp["content"][0]["text"], "urn:demo:user:alice name=alice");
     }
 
+    /// ledger #86 without a delimiter: an EMPTY binding value turns `urn:demo:user:{name}`
+    /// into `urn:demo:user:`, and the endpoint bound THERE answered a call to `user__sink`.
+    #[test]
+    fn an_empty_binding_value_that_reaches_another_endpoint_is_refused() {
+        let user = reporting("user", "name", ArgSpec::new("name").binding());
+        let index = reporting("index", "name", ArgSpec::new("unused").optional());
+        let space = EndpointSpace::new()
+            .bind(Exact::new("urn:demo:user:"), index)
+            .bind(
+                ikigai_core::UriTemplate::parse("urn:demo:user:{name}").unwrap(),
+                user,
+            );
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
+        let k = Kernel::new(Arc::new(space));
+        let resp = call_tool(&k, "user__sink", json!({ "name": "" }));
+        assert_eq!(resp["isError"], true, "{resp}");
+        let text = resp["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("`name`") && text.contains("`index`"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("name=-"),
+            "never answered by another endpoint: {text}"
+        );
+        let resp = call_tool(&k, "user__sink", json!({ "name": "alice" }));
+        assert_eq!(resp["content"][0]["text"], "urn:demo:user:alice name=alice");
+    }
+
     /// …and the guard is about WHICH endpoint answers, not about the characters: a value with
     /// `/` and `:` that the tool's own template carries (a file path, an IRI) still works,
     /// as `urn:file:{path}` and `urn:repo:{repo}:file:{path}` need it to.
@@ -2396,6 +2512,8 @@ mod tests {
             ikigai_core::UriTemplate::parse("urn:demo:file:{path}").unwrap(),
             file,
         );
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let k = Kernel::new(Arc::new(space));
         let resp = call_tool(&k, "file__sink", json!({ "path": "docs/a:b.md" }));
         assert_eq!(resp["isError"], false, "{resp}");
@@ -2414,6 +2532,8 @@ mod tests {
             ikigai_core::UriTemplate::parse("urn:demo:echo/{message}").unwrap(),
             echo,
         );
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let k = Kernel::new(Arc::new(space));
         let resp = call_tool(&k, "slash-echo__sink", json!({}));
         assert_eq!(resp["isError"], true, "{resp}");
@@ -2474,6 +2594,8 @@ mod manifold_identity_948 {
             })
         })
         .with_description(Description::new("limited").verb(Verb::Source));
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let k = Kernel::new(Arc::new(
             EndpointSpace::new().bind(Exact::new("urn:test:limited"), limited),
         ));
@@ -2490,6 +2612,8 @@ mod manifold_identity_948 {
         let space = EndpointSpace::new()
             .bind(Exact::new("urn:iki:fn:toUpper"), upper("local", false))
             .bind(Exact::new("urn:narrow:iki:fn:toUpper"), upper("peer", true));
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let k = Kernel::new(Arc::new(space));
         let list = handle(
             &k,
@@ -2559,6 +2683,8 @@ mod manifold_identity_948 {
                 Exact::new("urn:narrow:iki:fn:toUpper"),
                 upper("peer", false),
             );
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
         let k = Kernel::new(Arc::new(space));
         let list = handle(
             &k,
@@ -2585,6 +2711,7 @@ mod jsonrpc_1309 {
     use ikigai_core::EndpointSpace;
 
     /// `ping` is all these tests call, and it needs no endpoint.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn kernel() -> Kernel {
         Kernel::new(std::sync::Arc::new(EndpointSpace::new()))
     }
@@ -2727,6 +2854,7 @@ mod concurrent_1695 {
     /// rather than hang it). No sleep decides the order: the slow call answers only AFTER the
     /// output says the calls behind it were answered, which a server that runs one line at a
     /// time can never do.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn kernel_with_slow(output: &Shared, release: &'static str) -> Kernel {
         let seen = output.clone();
         let slow = FnEndpoint::new("slow", move |_inv| {
@@ -2888,6 +3016,7 @@ mod principal_tests {
 
     /// A Source that DECLARES a `principal` input (as a host reading the stamp might), and
     /// answers `<capability principal>|<principal argument>`, `-` for none.
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
     fn kernel() -> Kernel {
         let whoami = FnEndpoint::new("whoami", |inv: &ikigai_core::Invocation<'_>| {
             let held = inv.capability.principal().unwrap_or("-").to_string();
