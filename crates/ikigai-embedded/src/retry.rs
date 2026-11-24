@@ -7,14 +7,18 @@
 //! call the transport proved never ran (it fails transient), and a Sink whose contract
 //! declares a resend safe, with its declared key present. Anything else that may have run
 //! comes back to the caller as it failed. A final failure after retrying is core's typed
-//! [`Error::GaveUp`](ikigai_core::Error::GaveUp), naming the attempts and the elapsed time.
+//! [`Error::GaveUp`], naming the attempts and the elapsed time.
 //!
 //! No `connect.retry.*` key means no policy: the host behaves exactly as before.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use ikigai_core::{CachePolicy, EntryFacts, Fallback, Kernel, Request, Resolution, Scope, Space};
+use ikigai_core::{
+    Body, CachePolicy, Capability, EntryFacts, Error, Fallback, Kernel, Provenance, Representation,
+    Request, Resolution, Scope, Space, Verb,
+};
+use ikigai_resolve::CacheStatus;
 use ikigai_throttle::{CircuitBreaker, Jitter, Retry};
 
 /// The config keys of the policy, every one of them optional.
@@ -208,18 +212,260 @@ impl Space for Slot {
 /// named, piped or positional argument by the target's contract, read with Meta as
 /// `application/json`, and a kernel with no renderer cannot answer that, so every call that
 /// named an argument was routed as text (ledger #4037).
+///
+/// And it re-issues a contract read the hub could not answer under the same policy (ledger
+/// #4084): see [`ConnectIssuer`].
 pub fn connect_issuer(
     policy: &RetryPolicy,
     resolver: Arc<dyn ikigai_resolve::Resolver>,
     origin: &str,
-) -> Kernel {
+) -> ConnectIssuer {
     let remote: Arc<dyn Space> = Arc::new(ikigai_resolve::MountedRemote::overriding(
         resolver,
         "urn:".to_string(),
         origin.to_string(),
     ));
     let governed = policy.govern(vec![Arc::clone(&remote)]);
-    crate::user_kernel(governed.slot(remote), Arc::new(NoCache))
+    ConnectIssuer {
+        kernel: Arc::new(crate::user_kernel(governed.slot(remote), Arc::new(NoCache))),
+        policy: policy.clone(),
+    }
+}
+
+/// A request's answer as a [`Resolver`](ikigai_resolve::Resolver) gives it.
+type Answer = Result<(Representation, CacheStatus), Error>;
+/// [`Answer`], on the body face.
+type BodyAnswer = Result<(Representation<Body>, CacheStatus), Error>;
+
+/// The `--connect` issuer under a `connect.retry.*` policy: its kernel, and a contract read
+/// (`Meta`) that the kernel answers with a transient failure (`Unavailable`, `Timeout`)
+/// re-issued ABOVE the kernel,
+/// under the policy's [`Retry`] (its backoff, jitter and overall limit), as every other call
+/// is re-issued in the slot below it (ledger #4084).
+///
+/// The slot cannot do it for a `Meta`: the kernel answers one from the endpoint's
+/// synchronous [`meta_failure`](ikigai_core::Endpoint::meta_failure), without invoking it,
+/// so throttle's `Retry` forwards that error at once. Without this, the engine routed a
+/// call's arguments without the contract the moment the hub was down (a `key=value` word
+/// went to `in` as text), and then the call itself was retried until the hub came back and
+/// answered the wrong thing. A refusal, or any error throttle would not repeat, comes back
+/// unchanged after one attempt; a final failure after retrying is the typed
+/// [`Error::GaveUp`], naming the attempts, the elapsed time and
+/// the transport's own error. Every other request goes to the kernel as it is.
+pub struct ConnectIssuer {
+    kernel: Arc<Kernel>,
+    policy: RetryPolicy,
+}
+
+impl ConnectIssuer {
+    /// A `Meta` through the kernel, under the policy's retry.
+    async fn meta(
+        &self,
+        request: Request,
+        capability: &Capability,
+        incoming: Option<Provenance>,
+        scope: Scope,
+    ) -> Answer {
+        let made = Arc::new(std::sync::Mutex::new(None));
+        let attempt = MetaAttempt {
+            kernel: Arc::clone(&self.kernel),
+            request,
+            capability: capability.clone(),
+            incoming,
+            scope,
+            made: Arc::clone(&made),
+        };
+        const META: &str = "urn:ikigai:connect:meta";
+        let space = ikigai_core::EndpointSpace::new().bind(ikigai_core::Exact::new(META), attempt);
+        #[allow(clippy::disallowed_methods)]
+        // internal: the contract-read slot, one argument-less read of its own attempt
+        let retrying =
+            Kernel::new(Arc::new(self.policy.retry(space))).with_cache_policy(Arc::new(NoCache));
+        let read = Request::new(
+            Verb::Source,
+            ikigai_core::Iri::parse(META).expect("a valid IRI"),
+        );
+        retrying.issue(read, &Capability::root()).await?;
+        let answer = made.lock().unwrap_or_else(|e| e.into_inner()).take();
+        answer.ok_or_else(|| Error::Endpoint("connect: the contract read left no answer".into()))
+    }
+
+    fn block_on_meta(&self, request: Request, capability: &Capability) -> Answer {
+        futures::executor::block_on(self.meta(request, capability, None, Scope::default()))
+    }
+}
+
+/// One attempt at a contract read: the kernel's own answer, kept whole (its cache outcome
+/// too) for the caller, so the retry around it only decides whether to ask again.
+struct MetaAttempt {
+    kernel: Arc<Kernel>,
+    request: Request,
+    capability: Capability,
+    incoming: Option<Provenance>,
+    scope: Scope,
+    made: Arc<std::sync::Mutex<Option<(Representation, CacheStatus)>>>,
+}
+
+#[async_trait::async_trait]
+impl ikigai_core::Endpoint for MetaAttempt {
+    async fn invoke(&self, _: &ikigai_core::Invocation<'_>) -> Result<Representation, Error> {
+        use ikigai_resolve::Resolver;
+        let answer = self
+            .kernel
+            .issue_as_async_in(
+                self.request.clone(),
+                &self.capability,
+                self.incoming.clone(),
+                self.scope.clone(),
+            )
+            .await?;
+        *self.made.lock().unwrap_or_else(|e| e.into_inner()) = Some(answer);
+        Ok(Representation::new(
+            ikigai_core::ReprType::new("text/plain"),
+            b"read".to_vec(),
+        ))
+    }
+
+    fn name(&self) -> &str {
+        "connect-meta"
+    }
+}
+
+/// Every request to the kernel, as [`Kernel`]'s own `Resolver` answers it, but a `Meta`
+/// (see [`ConnectIssuer`]).
+#[async_trait::async_trait]
+impl ikigai_resolve::Resolver for ConnectIssuer {
+    fn issue(&self, request: Request) -> Answer {
+        self.issue_as(request, &Capability::root())
+    }
+
+    fn issue_as(&self, request: Request, capability: &Capability) -> Answer {
+        if request.verb == Verb::Meta {
+            return self.block_on_meta(request, capability);
+        }
+        self.kernel.issue_as(request, capability)
+    }
+
+    fn issue_as_in_run(
+        &self,
+        request: Request,
+        capability: &Capability,
+        run: &ikigai_resolve::RunContext,
+    ) -> Answer {
+        if request.verb == Verb::Meta {
+            return self.block_on_meta(request, capability);
+        }
+        self.kernel.issue_as_in_run(request, capability, run)
+    }
+
+    async fn issue_as_async(&self, request: Request, capability: &Capability) -> Answer {
+        if request.verb == Verb::Meta {
+            return self.meta(request, capability, None, Scope::default()).await;
+        }
+        self.kernel.issue_as_async(request, capability).await
+    }
+
+    async fn issue_body_as_in_run(
+        &self,
+        request: Request,
+        capability: &Capability,
+        run: &ikigai_resolve::RunContext,
+    ) -> BodyAnswer {
+        if request.verb == Verb::Meta {
+            return self
+                .meta(request, capability, None, Scope::default())
+                .await
+                .map(|(representation, status)| (representation.into_body(), status));
+        }
+        self.kernel
+            .issue_body_as_in_run(request, capability, run)
+            .await
+    }
+
+    async fn issue_as_async_with_incoming(
+        &self,
+        request: Request,
+        capability: &Capability,
+        incoming: Provenance,
+    ) -> Answer {
+        if request.verb == Verb::Meta {
+            return self
+                .meta(request, capability, Some(incoming), Scope::default())
+                .await;
+        }
+        self.kernel
+            .issue_as_async_with_incoming(request, capability, incoming)
+            .await
+    }
+
+    async fn issue_as_async_in(
+        &self,
+        request: Request,
+        capability: &Capability,
+        incoming: Option<Provenance>,
+        scope: Scope,
+    ) -> Answer {
+        if request.verb == Verb::Meta {
+            return self.meta(request, capability, incoming, scope).await;
+        }
+        self.kernel
+            .issue_as_async_in(request, capability, incoming, scope)
+            .await
+    }
+
+    async fn issue_attached_in(
+        &self,
+        request: Request,
+        capability: &Capability,
+        incoming: Option<Provenance>,
+        scope: Scope,
+        attach: Option<(String, Body)>,
+    ) -> Answer {
+        self.kernel
+            .issue_attached_in(request, capability, incoming, scope, attach)
+            .await
+    }
+
+    async fn issue_body_attached_in(
+        &self,
+        request: Request,
+        capability: &Capability,
+        incoming: Option<Provenance>,
+        scope: Scope,
+        attach: Option<(String, Body)>,
+    ) -> BodyAnswer {
+        self.kernel
+            .issue_body_attached_in(request, capability, incoming, scope, attach)
+            .await
+    }
+
+    fn is_cached_in(&self, request: &Request, capability: &Capability, scope: &Scope) -> bool {
+        self.kernel.is_cached_in(request, capability, scope)
+    }
+
+    fn set_tracer(&self, tracer: Arc<dyn ikigai_core::Tracer>) {
+        ikigai_resolve::Resolver::set_tracer(&*self.kernel, tracer);
+    }
+
+    fn clear_tracer(&self) {
+        ikigai_resolve::Resolver::clear_tracer(&*self.kernel);
+    }
+
+    fn is_cached(&self, request: &Request, capability: &Capability) -> bool {
+        ikigai_resolve::Resolver::is_cached(&*self.kernel, request, capability)
+    }
+
+    fn entries(&self) -> Option<Vec<ikigai_core::SpaceEntry>> {
+        ikigai_resolve::Resolver::entries(&*self.kernel)
+    }
+
+    fn try_entries(&self) -> Result<Option<Vec<ikigai_core::SpaceEntry>>, Error> {
+        ikigai_resolve::Resolver::try_entries(&*self.kernel)
+    }
+
+    fn transport(&self) -> String {
+        ikigai_resolve::Resolver::transport(&*self.kernel)
+    }
 }
 
 /// Run `attempt` (a `--connect` dial and its admission check) under the policy's
@@ -228,7 +474,7 @@ pub fn connect_issuer(
 /// (`Unavailable`, `Timeout`, `GaveUp`) is tried again; a refusal such as `Denied` comes back at once,
 /// unchanged. The retry is throttle's, not a loop of this crate's: the attempt is an endpoint
 /// read through a `Retry` over it, and its final failure is the typed
-/// [`Error::GaveUp`](ikigai_core::Error::GaveUp).
+/// [`Error::GaveUp`].
 pub fn first_dial<T: Send + 'static>(
     policy: &RetryPolicy,
     attempt: impl Fn() -> Result<T, ikigai_core::Error> + Send + Sync + 'static,

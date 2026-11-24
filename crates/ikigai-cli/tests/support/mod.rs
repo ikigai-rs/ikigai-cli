@@ -158,3 +158,28 @@ pub fn connect(home: &Path, certs: &Path, address: &str, command: &str) -> Outpu
 
 pub const CONNECT_POLICY: &str =
     "connect.retry.limit_minutes = 1\nconnect.retry.initial_backoff_ms = 200\nconnect.retry.max_backoff_ms = 1000\n";
+
+/// Bring the hub back on `address` after `delay`, on its own thread; the door comes back on
+/// the channel (and dies when the receiver drops it).
+pub fn hub_back_after(
+    home: &Path,
+    certs: &Path,
+    address: &str,
+    delay: Duration,
+) -> mpsc::Receiver<Door> {
+    let (tx, rx) = mpsc::channel();
+    let (h, c, a) = (home.to_path_buf(), certs.to_path_buf(), address.to_string());
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        for _ in 0..50 {
+            if let Ok((door, _)) = peer(&h, &c, &a, "hub") {
+                let _ = tx.send(door);
+                return;
+            }
+            // The port may be a moment from free after the kill.
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("the hub never came back on {a}");
+    });
+    rx
+}

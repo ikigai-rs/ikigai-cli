@@ -20,15 +20,26 @@
 //!
 //! The modes run side by side, each with its own home and hub, and a failure lists EVERY cell
 //! (mode and shape) that answered wrong, not only the first.
+//!
+//! The peer down (ledger #4084): every mode with a peer (all but in-process) runs a named
+//! argument in one REPL session, the hub killed between two calls. A hub that stays down is
+//! the transport's error, in the call's `error:` line and in the contract note, never
+//! "declares no arguments"; under the policy, both after its attempts. A hub back within the
+//! policy answers the call routed by its contract, because the cli retries the contract read
+//! above the kernel (`ikigai_embedded::retry::ConnectIssuer`).
 #![cfg(all(feature = "embedded", feature = "quic", unix))]
 
 mod support;
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Output, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
 
-use support::{generate, peer, scratch, spawn, text_of, Door, CONNECT_POLICY};
+use support::{
+    generate, hub_back_after, peer, scratch, spawn, text_of, Door, CONNECT_POLICY, PATIENCE,
+};
 
 /// One call, as a person would make it, and the answer every mode must give.
 struct Shape {
@@ -169,7 +180,13 @@ struct Live {
 
 impl Live {
     fn start(mode: &'static Mode) -> Live {
-        let home = scratch(&format!("par-{}", mode.tag));
+        Live::start_in(mode, "par")
+    }
+
+    /// [`start`](Self::start), its home named `<case>-<tag>`, so cases running side by side
+    /// in one process never share one.
+    fn start_in(mode: &'static Mode, case: &str) -> Live {
+        let home = scratch(&format!("{case}-{}", mode.tag));
         std::fs::create_dir_all(home.join("files")).expect("scratch workspace");
         std::fs::write(
             home.join("config").join("ikigai").join("config.toml"),
@@ -205,9 +222,8 @@ impl Live {
             .replace("{mode}", self.mode.tag)
     }
 
-    /// Run `shape` through this mode's client.
-    fn call(&self, shape: &Shape) -> Output {
-        let address = self.hub.as_ref().map(|(_, address)| address.as_str());
+    /// The arguments that make the client reach the hub at `address` this mode's way.
+    fn reach_args(&self, address: Option<&str>) -> Vec<String> {
         let certs = self.certs.to_str().unwrap().to_string();
         let mut args: Vec<String> = Vec::new();
         match (self.mode.reach, address) {
@@ -223,6 +239,13 @@ impl Live {
             _ => unreachable!("a mode that reaches a hub has one"),
         }
         args.push("--plain".into());
+        args
+    }
+
+    /// Run `shape` through this mode's client.
+    fn call(&self, shape: &Shape) -> Output {
+        let address = self.hub.as_ref().map(|(_, address)| address.as_str());
+        let mut args = self.reach_args(address);
         match shape.script {
             Some((text, parameters)) => {
                 let script = self.home.join(format!("{}.iki", self.mode.tag));
@@ -315,5 +338,190 @@ fn every_mode_answers_every_shape_the_same() {
         wrong.len(),
         MODES.len() * SHAPES.len(),
         wrong.join("\n")
+    );
+}
+
+/// The call the peer-down case makes: a named argument, the shape whose routing needs the
+/// target's contract (with no contract, `in=hello` goes to `in` whole and the answer is
+/// `IN=HELLO`, ledger #4037).
+const NAMED: &str = "source {ns}iki:fn:toUpper in=hello";
+
+/// What the client wrote after the hub went down, and how it exited.
+struct Outage {
+    /// The client's stdout lines after the hub was killed.
+    after: Vec<String>,
+    /// Everything it wrote on stderr.
+    stderr: String,
+    status: std::process::ExitStatus,
+}
+
+impl Outage {
+    fn text(&self) -> String {
+        format!("{}\n{}", self.after.join("\n"), self.stderr)
+    }
+}
+
+/// One session of `mode`'s client, a `--quiet` REPL on a piped stdin: [`NAMED`] while the
+/// hub is up, then the hub killed and [`NAMED`] again, with the hub brought back on the same
+/// address after `back_after` (or never), and stdin closed so the client exits once it has
+/// answered.
+fn through_an_outage(mode: &'static Mode, back_after: Option<Duration>) -> Outage {
+    let case = if back_after.is_some() { "back" } else { "down" };
+    let mut live = Live::start_in(mode, case);
+    let (hub, address) = live.hub.take().expect("a mode that reaches a hub has one");
+    let mut args = live.reach_args(Some(&address));
+    args.push("--quiet".into());
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut client = spawn(&live.home, &args)
+        .current_dir(&live.home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the client starts");
+    let mut stdin = client.stdin.take().expect("piped stdin");
+    let stdout = client.stdout.take().expect("piped stdout");
+    let mut stderr = client.stderr.take().expect("piped stderr");
+    let (tx, lines) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+    let errors = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+    // Killed when the case ends, a panic included.
+    let mut client = Door(client);
+    let call = live.fill(NAMED);
+    writeln!(stdin, "{call}").expect("the first call");
+    loop {
+        match lines.recv_timeout(PATIENCE) {
+            Ok(line) if line.trim() == "HELLO" => break,
+            Ok(_) => continue,
+            Err(e) => panic!("mode `{}`: no answer while the hub was up ({e})", mode.tag),
+        }
+    }
+    drop(hub);
+    let back = back_after.map(|delay| hub_back_after(&live.home, &live.certs, &address, delay));
+    writeln!(stdin, "{call}").expect("the second call");
+    drop(stdin);
+    // The policy's limit is a minute for the contract read and a minute for the call: this
+    // is a watchdog, not a measurement.
+    let mut after = Vec::new();
+    loop {
+        match lines.recv_timeout(Duration::from_secs(240)) {
+            Ok(line) => after.push(line),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("mode `{}`: the client never finished: {after:?}", mode.tag)
+            }
+        }
+    }
+    let status = client.0.wait().expect("the client exits");
+    let stderr = errors.join().unwrap_or_default();
+    // The hub that came back, if it did, lives until here.
+    drop(back.map(|back| back.recv_timeout(PATIENCE)));
+    Outage {
+        after,
+        stderr,
+        status,
+    }
+}
+
+/// The modes with a peer to lose: every mode but in-process, which reaches no hub.
+fn modes_with_a_peer() -> impl Iterator<Item = &'static Mode> {
+    MODES
+        .iter()
+        .filter(|mode| !matches!(mode.reach, Reach::InProcess))
+}
+
+/// The peer down for good (ledger #4084): in every mode that has a peer, a named-argument
+/// call answers the transport's own error, the contract read too, and never "declares no
+/// arguments" or an answer routed without the contract. Under the policy that is after its
+/// attempts, as the typed `GaveUp`.
+#[test]
+fn a_peer_down_answers_the_transport_error_in_every_mode() {
+    let modes: Vec<_> = modes_with_a_peer()
+        .map(|mode| {
+            (
+                mode,
+                std::thread::spawn(move || through_an_outage(mode, None)),
+            )
+        })
+        .collect();
+    let mut wrong = Vec::new();
+    for (mode, outage) in modes {
+        let Ok(outage) = outage.join() else {
+            wrong.push(format!("- mode `{}` panicked before it answered", mode.tag));
+            continue;
+        };
+        let text = outage.text();
+        let mut fault = |what: &str| {
+            wrong.push(format!("- mode `{}`: {what}, got:\n{text}", mode.tag));
+        };
+        if outage.status.success() {
+            fault("the client exits nonzero after the failed call");
+        }
+        if text.contains("declares no arguments") {
+            fault("the contract read is never the empty placeholder");
+        }
+        if outage
+            .after
+            .iter()
+            .any(|line| matches!(line.trim(), "HELLO" | "IN=HELLO"))
+        {
+            fault("a call to a dead peer answers nothing");
+        }
+        if !text
+            .lines()
+            .any(|line| line.starts_with("error:") && line.contains("quic transport"))
+        {
+            fault("the call answers the transport's error");
+        }
+        if !text.lines().any(|line| {
+            line.contains("contract unavailable for") && line.contains("quic transport")
+        }) {
+            fault("the contract read answers the transport's error");
+        }
+        if !mode.config.is_empty()
+            && !text.lines().any(|line| {
+                line.contains("contract unavailable for") && line.contains("gave up after")
+            })
+        {
+            fault("under the policy, the contract read is retried before it fails");
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The peer down for longer than one contract read, then back within the policy (ledger
+/// #4084): the contract read is retried under `connect.retry.*` as the call is, so the named
+/// argument is routed by the contract and the call answers as if the hub had never left.
+/// Without that retry the contract read failed at once, the word went to `in` as text, and
+/// the retried call answered `IN=HELLO`.
+#[test]
+fn a_peer_back_within_the_policy_routes_the_named_argument() {
+    let mode = MODES
+        .iter()
+        .find(|mode| mode.tag == "cretry")
+        .expect("the --connect with retry mode");
+    // Longer than a dial's own timeout (5 s), so the first contract read fails.
+    let outage = through_an_outage(mode, Some(Duration::from_secs(20)));
+    let text = outage.text();
+    assert!(outage.status.success(), "the client exits 0: {text}");
+    assert!(
+        outage.after.iter().any(|line| line.trim() == "HELLO"),
+        "the call answers by its contract once the hub is back: {text}"
+    );
+    assert!(
+        !outage.after.iter().any(|line| line.trim() == "IN=HELLO"),
+        "never routed without the contract: {text}"
+    );
+    assert!(
+        !text.contains("contract unavailable for"),
+        "the contract was read: {text}"
     );
 }
