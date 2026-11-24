@@ -14,7 +14,7 @@
 
 pub mod server;
 
-use ikigai_core::{ActionSpec, ArgSpec, Description, Verb};
+use ikigai_core::{ActionSpec, ArgSpec, Description, Resend, Verb};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeSet;
 
@@ -856,9 +856,9 @@ pub fn input_schema(action: &ActionSpec) -> Value {
     Value::Object(schema)
 }
 
-/// Project one action into an MCP tool descriptor: `{ name, description,
-/// inputSchema }`. The description prefers the action's own summary, then the
-/// endpoint's, so the model reads what the verb does on this endpoint; under
+/// Project one action into an MCP tool descriptor with a name, description, input
+/// schema, and resend annotations for Sinks. The description prefers the action's own
+/// summary, then the endpoint's, so the model reads what the verb does on this endpoint. Under
 /// [`COMBINATORS`] it then states each of the action's [`relations`], so a group or a
 /// value dependency the schema cannot carry is read, never dropped.
 pub fn action_to_tool(description: &Description, action: &ActionSpec) -> Value {
@@ -877,11 +877,23 @@ pub fn action_to_tool(description: &Description, action: &ActionSpec) -> Value {
             summary.push_str(&sentence);
         }
     }
-    json!({
+    let mut tool = json!({
         "name": tool_name(&description.id, action.verb),
         "description": summary,
         "inputSchema": input_schema(action),
-    })
+    });
+    if action.verb == Verb::Sink {
+        // MCP's hint is unconditional. A keyed Sink can also be called without its key.
+        let mut annotations = json!({ "idempotentHint": action.resend_is_safe(|_| false) });
+        if let Some(key) = action.resend.as_ref().and_then(Resend::key) {
+            annotations["resendKey"] = json!(key);
+            if let Some(seconds) = action.resend_window_secs {
+                annotations["resendWindowSeconds"] = json!(seconds);
+            }
+        }
+        tool["annotations"] = annotations;
+    }
+    tool
 }
 
 /// Project every selectable action of an endpoint into MCP tools — the normalized
@@ -1559,6 +1571,63 @@ mod tests {
         assert_eq!(schema["properties"]["start"]["type"], "string"); // xsd:dateTime → string
         assert_eq!(schema["properties"]["all_day"]["type"], "boolean");
         assert_eq!(schema["required"], json!(["start"]));
+    }
+
+    #[test]
+    fn a_keyed_ledger_append_projects_conditional_resend_safety() {
+        let append = Description::new("ledger-append").action(
+            ActionSpec::new(Verb::Sink)
+                .input(ArgSpec::new("key").optional())
+                .resend_safe_with_key("key"),
+        );
+        let tools = endpoint_tools(&append);
+        assert_eq!(tools[0]["name"], "ledger-append__sink");
+        assert_eq!(
+            tools[0]["annotations"],
+            json!({"idempotentHint": false, "resendKey": "key"})
+        );
+        assert_eq!(
+            tools[0]["inputSchema"]["properties"]["key"]["type"],
+            "string"
+        );
+        assert_eq!(tools[0]["inputSchema"]["required"], json!([]));
+    }
+
+    #[test]
+    fn an_unkeyed_sink_without_a_resend_declaration_projects_no_safety() {
+        let say = Description::new("layer-say").verb(Verb::Sink);
+        assert_eq!(
+            endpoint_tools(&say)[0]["annotations"],
+            json!({"idempotentHint": false})
+        );
+    }
+
+    #[test]
+    fn an_unconditionally_resend_safe_sink_projects_idempotence() {
+        let import =
+            Description::new("ledger-history").action(ActionSpec::new(Verb::Sink).resend_safe());
+        assert_eq!(
+            endpoint_tools(&import)[0]["annotations"],
+            json!({"idempotentHint": true})
+        );
+    }
+
+    #[test]
+    fn a_keyed_sink_projects_its_declared_resend_window() {
+        let append = Description::new("ledger-append").action(
+            ActionSpec::new(Verb::Sink)
+                .input(ArgSpec::new("idempotency-key").optional())
+                .resend_safe_with_key("idempotency-key")
+                .resend_window(std::time::Duration::from_secs(86_400)),
+        );
+        assert_eq!(
+            endpoint_tools(&append)[0]["annotations"],
+            json!({
+                "idempotentHint": false,
+                "resendKey": "idempotency-key",
+                "resendWindowSeconds": 86_400
+            })
+        );
     }
 
     #[test]
