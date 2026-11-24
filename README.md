@@ -1307,3 +1307,11 @@ waits for it within the limit, while a refusal such as `Denied` still fails at o
 safe is resent: reads, calls the transport proved never ran, and Sinks whose contract declares a
 resend safe (with the declared key present). A final failure is the typed `GaveUp`, which names
 the attempts and the elapsed time.
+
+Under `--connect`, a call's contract read (the `Meta` the REPL routes named, piped and
+positional arguments by) is retried under the same policy when the hub cannot be reached
+(ledger #4084), so a call made while the hub is down is routed by its contract once the hub is
+back, and never as text. A hub that stays down answers the transport's error, as the typed
+`GaveUp`, in the contract note and in the call's own `error:` line. That contract read and the
+call each get the policy's whole limit, so a hub that stays down is reported after up to twice
+`connect.retry.limit_minutes`.

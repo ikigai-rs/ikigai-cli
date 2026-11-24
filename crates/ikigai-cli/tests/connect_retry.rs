@@ -22,7 +22,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use support::{
-    connect, door, generate, ok, peer, scratch, spawn, text_of, Door, CONNECT_POLICY, PATIENCE,
+    connect, door, generate, hub_back_after, ok, peer, scratch, spawn, text_of, Door,
+    CONNECT_POLICY, PATIENCE,
 };
 
 /// Ask the host `command` over its socket, retrying a refused first connect (the socket
@@ -154,31 +155,6 @@ fn a_dead_hub(case: &str, config: &str) -> (PathBuf, PathBuf, String) {
     let (hub, address) = peer(&home, &certs, "quic://127.0.0.1:0", "hub").expect("the hub serves");
     drop(hub);
     (home, certs, address)
-}
-
-/// Bring the hub back on `address` after `delay`, on its own thread; the door comes back on
-/// the channel (and dies when the receiver drops it).
-fn hub_back_after(
-    home: &Path,
-    certs: &Path,
-    address: &str,
-    delay: Duration,
-) -> mpsc::Receiver<Door> {
-    let (tx, rx) = mpsc::channel();
-    let (h, c, a) = (home.to_path_buf(), certs.to_path_buf(), address.to_string());
-    std::thread::spawn(move || {
-        std::thread::sleep(delay);
-        for _ in 0..50 {
-            if let Ok((door, _)) = peer(&h, &c, &a, "hub") {
-                let _ = tx.send(door);
-                return;
-            }
-            // The port may be a moment from free after the kill.
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        panic!("the hub never came back on {a}");
-    });
-    rx
 }
 
 #[test]
