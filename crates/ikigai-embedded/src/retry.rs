@@ -214,7 +214,7 @@ impl Space for Slot {
 /// named an argument was routed as text (ledger #4037).
 ///
 /// And it re-issues a contract read the hub could not answer under the same policy (ledger
-/// #4084): see [`ConnectIssuer`].
+/// #4084): see [`MetaRetry`].
 pub fn connect_issuer(
     policy: &RetryPolicy,
     resolver: Arc<dyn ikigai_resolve::Resolver>,
@@ -226,22 +226,25 @@ pub fn connect_issuer(
         origin.to_string(),
     ));
     let governed = policy.govern(vec![Arc::clone(&remote)]);
-    ConnectIssuer {
-        kernel: Arc::new(crate::user_kernel(governed.slot(remote), Arc::new(NoCache))),
-        policy: policy.clone(),
-    }
+    let kernel = Arc::new(crate::user_kernel(governed.slot(remote), Arc::new(NoCache)));
+    MetaRetry::new(policy, kernel)
 }
+
+/// The `--connect` issuer under a `connect.retry.*` policy: its kernel, under a
+/// [`MetaRetry`].
+pub type ConnectIssuer = MetaRetry;
 
 /// A request's answer as a [`Resolver`](ikigai_resolve::Resolver) gives it.
 type Answer = Result<(Representation, CacheStatus), Error>;
 /// [`Answer`], on the body face.
 type BodyAnswer = Result<(Representation<Body>, CacheStatus), Error>;
 
-/// The `--connect` issuer under a `connect.retry.*` policy: its kernel, and a contract read
-/// (`Meta`) that the kernel answers with a transient failure (`Unavailable`, `Timeout`)
-/// re-issued ABOVE the kernel,
-/// under the policy's [`Retry`] (its backoff, jitter and overall limit), as every other call
-/// is re-issued in the slot below it (ledger #4084).
+/// A resolver (a kernel whose remote mounts or `--connect` hub are governed by a
+/// `connect.retry.*` policy) with a contract read (`Meta`) that it answers with a transient
+/// failure (`Unavailable`, `Timeout`) re-issued ABOVE it, under the policy's [`Retry`] (its
+/// backoff, jitter and overall limit), as every other call is re-issued in the slot below it:
+/// for `--connect` (ledger #4084) and for the in-process kernel over `--mount`s (ledger
+/// #4161).
 ///
 /// The slot cannot do it for a `Meta`: the kernel answers one from the endpoint's
 /// synchronous [`meta_failure`](ikigai_core::Endpoint::meta_failure), without invoking it,
@@ -251,14 +254,24 @@ type BodyAnswer = Result<(Representation<Body>, CacheStatus), Error>;
 /// answered the wrong thing. A refusal, or any error throttle would not repeat, comes back
 /// unchanged after one attempt; a final failure after retrying is the typed
 /// [`Error::GaveUp`], naming the attempts, the elapsed time and
-/// the transport's own error. Every other request goes to the kernel as it is.
-pub struct ConnectIssuer {
-    kernel: Arc<Kernel>,
+/// the transport's own error. Every other request, and every other method of the
+/// [`Resolver`](ikigai_resolve::Resolver) trait (its presentation hooks
+/// `needs_request_contract` and `prepare_request` too), goes to the inner resolver as it is.
+pub struct MetaRetry {
+    inner: Arc<dyn ikigai_resolve::Resolver>,
     policy: RetryPolicy,
 }
 
-impl ConnectIssuer {
-    /// A `Meta` through the kernel, under the policy's retry.
+impl MetaRetry {
+    /// `inner`, its contract reads retried under `policy`.
+    pub fn new(policy: &RetryPolicy, inner: Arc<dyn ikigai_resolve::Resolver>) -> MetaRetry {
+        MetaRetry {
+            inner,
+            policy: policy.clone(),
+        }
+    }
+
+    /// A `Meta` through the inner resolver, under the policy's retry.
     async fn meta(
         &self,
         request: Request,
@@ -268,7 +281,7 @@ impl ConnectIssuer {
     ) -> Answer {
         let made = Arc::new(std::sync::Mutex::new(None));
         let attempt = MetaAttempt {
-            kernel: Arc::clone(&self.kernel),
+            inner: Arc::clone(&self.inner),
             request,
             capability: capability.clone(),
             incoming,
@@ -295,10 +308,10 @@ impl ConnectIssuer {
     }
 }
 
-/// One attempt at a contract read: the kernel's own answer, kept whole (its cache outcome
-/// too) for the caller, so the retry around it only decides whether to ask again.
+/// One attempt at a contract read: the inner resolver's own answer, kept whole (its cache
+/// outcome too) for the caller, so the retry around it only decides whether to ask again.
 struct MetaAttempt {
-    kernel: Arc<Kernel>,
+    inner: Arc<dyn ikigai_resolve::Resolver>,
     request: Request,
     capability: Capability,
     incoming: Option<Provenance>,
@@ -309,9 +322,8 @@ struct MetaAttempt {
 #[async_trait::async_trait]
 impl ikigai_core::Endpoint for MetaAttempt {
     async fn invoke(&self, _: &ikigai_core::Invocation<'_>) -> Result<Representation, Error> {
-        use ikigai_resolve::Resolver;
         let answer = self
-            .kernel
+            .inner
             .issue_as_async_in(
                 self.request.clone(),
                 &self.capability,
@@ -331,19 +343,34 @@ impl ikigai_core::Endpoint for MetaAttempt {
     }
 }
 
-/// Every request to the kernel, as [`Kernel`]'s own `Resolver` answers it, but a `Meta`
-/// (see [`ConnectIssuer`]).
+/// Every request to the inner resolver, as its own `Resolver` answers it, but a `Meta` (see
+/// [`MetaRetry`]).
 #[async_trait::async_trait]
-impl ikigai_resolve::Resolver for ConnectIssuer {
+impl ikigai_resolve::Resolver for MetaRetry {
+    fn needs_request_contract(&self, request: &Request, is_output: bool) -> bool {
+        self.inner.needs_request_contract(request, is_output)
+    }
+
+    fn prepare_request(
+        &self,
+        request: Request,
+        context: ikigai_resolve::RequestContext<'_>,
+    ) -> Request {
+        self.inner.prepare_request(request, context)
+    }
+
     fn issue(&self, request: Request) -> Answer {
-        self.issue_as(request, &Capability::root())
+        if request.verb == Verb::Meta {
+            return self.block_on_meta(request, &Capability::root());
+        }
+        self.inner.issue(request)
     }
 
     fn issue_as(&self, request: Request, capability: &Capability) -> Answer {
         if request.verb == Verb::Meta {
             return self.block_on_meta(request, capability);
         }
-        self.kernel.issue_as(request, capability)
+        self.inner.issue_as(request, capability)
     }
 
     fn issue_as_in_run(
@@ -355,14 +382,14 @@ impl ikigai_resolve::Resolver for ConnectIssuer {
         if request.verb == Verb::Meta {
             return self.block_on_meta(request, capability);
         }
-        self.kernel.issue_as_in_run(request, capability, run)
+        self.inner.issue_as_in_run(request, capability, run)
     }
 
     async fn issue_as_async(&self, request: Request, capability: &Capability) -> Answer {
         if request.verb == Verb::Meta {
             return self.meta(request, capability, None, Scope::default()).await;
         }
-        self.kernel.issue_as_async(request, capability).await
+        self.inner.issue_as_async(request, capability).await
     }
 
     async fn issue_body_as_in_run(
@@ -377,7 +404,7 @@ impl ikigai_resolve::Resolver for ConnectIssuer {
                 .await
                 .map(|(representation, status)| (representation.into_body(), status));
         }
-        self.kernel
+        self.inner
             .issue_body_as_in_run(request, capability, run)
             .await
     }
@@ -393,7 +420,7 @@ impl ikigai_resolve::Resolver for ConnectIssuer {
                 .meta(request, capability, Some(incoming), Scope::default())
                 .await;
         }
-        self.kernel
+        self.inner
             .issue_as_async_with_incoming(request, capability, incoming)
             .await
     }
@@ -408,7 +435,7 @@ impl ikigai_resolve::Resolver for ConnectIssuer {
         if request.verb == Verb::Meta {
             return self.meta(request, capability, incoming, scope).await;
         }
-        self.kernel
+        self.inner
             .issue_as_async_in(request, capability, incoming, scope)
             .await
     }
@@ -421,7 +448,7 @@ impl ikigai_resolve::Resolver for ConnectIssuer {
         scope: Scope,
         attach: Option<(String, Body)>,
     ) -> Answer {
-        self.kernel
+        self.inner
             .issue_attached_in(request, capability, incoming, scope, attach)
             .await
     }
@@ -434,37 +461,37 @@ impl ikigai_resolve::Resolver for ConnectIssuer {
         scope: Scope,
         attach: Option<(String, Body)>,
     ) -> BodyAnswer {
-        self.kernel
+        self.inner
             .issue_body_attached_in(request, capability, incoming, scope, attach)
             .await
     }
 
     fn is_cached_in(&self, request: &Request, capability: &Capability, scope: &Scope) -> bool {
-        self.kernel.is_cached_in(request, capability, scope)
+        self.inner.is_cached_in(request, capability, scope)
     }
 
     fn set_tracer(&self, tracer: Arc<dyn ikigai_core::Tracer>) {
-        ikigai_resolve::Resolver::set_tracer(&*self.kernel, tracer);
+        self.inner.set_tracer(tracer);
     }
 
     fn clear_tracer(&self) {
-        ikigai_resolve::Resolver::clear_tracer(&*self.kernel);
+        self.inner.clear_tracer();
     }
 
     fn is_cached(&self, request: &Request, capability: &Capability) -> bool {
-        ikigai_resolve::Resolver::is_cached(&*self.kernel, request, capability)
+        self.inner.is_cached(request, capability)
     }
 
     fn entries(&self) -> Option<Vec<ikigai_core::SpaceEntry>> {
-        ikigai_resolve::Resolver::entries(&*self.kernel)
+        self.inner.entries()
     }
 
     fn try_entries(&self) -> Result<Option<Vec<ikigai_core::SpaceEntry>>, Error> {
-        ikigai_resolve::Resolver::try_entries(&*self.kernel)
+        self.inner.try_entries()
     }
 
     fn transport(&self) -> String {
-        ikigai_resolve::Resolver::transport(&*self.kernel)
+        self.inner.transport()
     }
 }
 
