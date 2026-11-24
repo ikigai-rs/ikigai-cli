@@ -913,7 +913,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -1370,7 +1370,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 3.0.5",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -3813,9 +3813,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-shacl"
-version = "0.7.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a30cab5ef999ed95fc46d312abd59bcd6c8b3fd7ec63e9584d545405b4f5ae7"
+checksum = "9efa006806b9f87bcf492b200644b46d2269080d1c18d2d320a9d0c8bd7d2f56"
 dependencies = [
  "async-trait",
  "ikigai-core",
@@ -5440,9 +5440,9 @@ dependencies = [
 
 [[package]]
 name = "mie"
-version = "0.3.25"
+version = "0.3.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "738964020260aac2115e98491c12a79058baf2a9c0b9cdeda5afa847c443097a"
+checksum = "be1ab1efe6ed77af98870096eecc7a704fe6d0152e06bc3a6b9f1ee29b6818e2"
 dependencies = [
  "hashlink 0.10.0",
  "rudof_iri",
@@ -6036,20 +6036,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "oxhttp"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01d4ba13b109f473f649aa71dfc8a83c41cc0cd3eaf5f6adfe2a18046b985d8a"
-dependencies = [
- "http",
- "httparse",
- "rustls",
- "rustls-pki-types",
- "rustls-platform-verifier",
- "url",
-]
-
-[[package]]
 name = "oxigraph"
 version = "0.5.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6059,7 +6045,6 @@ dependencies = [
  "getrandom 0.3.4",
  "js-sys",
  "libc",
- "oxhttp",
  "oxiri 0.2.11",
  "oxrdf",
  "oxrdfio",
@@ -6071,7 +6056,7 @@ dependencies = [
  "sparesults",
  "spareval",
  "spargebra",
- "thiserror 2.0.20",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -6108,7 +6093,7 @@ dependencies = [
  "oxiri 0.2.11",
  "oxrdf",
  "ryu-js 1.0.3",
- "thiserror 2.0.20",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -6123,7 +6108,7 @@ dependencies = [
  "oxsdatatypes",
  "rand 0.9.5",
  "sha2 0.11.0",
- "thiserror 2.0.20",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -6136,7 +6121,7 @@ dependencies = [
  "oxrdf",
  "oxrdfxml",
  "oxttl",
- "thiserror 2.0.20",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -6149,7 +6134,7 @@ dependencies = [
  "oxiri 0.2.11",
  "oxrdf",
  "quick-xml 0.37.5",
- "thiserror 2.0.20",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -6169,7 +6154,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "034779b2d182d5069cd28b1f921ba334cad708ab1340db9776312464b6874b78"
 dependencies = [
  "js-sys",
- "thiserror 2.0.20",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -6182,7 +6167,7 @@ dependencies = [
  "oxilangtag",
  "oxiri 0.2.11",
  "oxrdf",
- "thiserror 2.0.20",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -6717,9 +6702,9 @@ dependencies = [
 
 [[package]]
 name = "prefixmap"
-version = "0.3.25"
+version = "0.3.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6da048db841ac92680671198e3e32b1a858393f00239708a3d74125025904ead"
+checksum = "b33ae5c95f6a01d93cb7e1ffc4707a978eca6ecefa57a6808b1f2673154a7447"
 dependencies = [
  "colored",
  "indexmap 2.14.2",
@@ -7370,6 +7355,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ref-cast"
+version = "1.0.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e440fb4e4b4147295338efb76001ab9e4efc0e5839df2c47fc5ac2381d365c3"
+dependencies = [
+ "ref-cast-impl",
+]
+
+[[package]]
+name = "ref-cast-impl"
+version = "1.0.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92ecd8964f8453721699a1ed72037b0db49ce2f5a5138486ee89bed6f67cdf3a"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.5",
+]
+
+[[package]]
 name = "regex"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7559,9 +7564,9 @@ dependencies = [
 
 [[package]]
 name = "rudof_config"
-version = "0.3.25"
+version = "0.3.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dfc9cfab2e6c1078588d1934fdbe34b5a47dc9a194096a667814198f8006b4a2"
+checksum = "ccc49a570da46861f2f9a6c2f0565e1eac80b45929388fe161638101fd779a46"
 dependencies = [
  "dirs",
  "serde",
@@ -7571,9 +7576,9 @@ dependencies = [
 
 [[package]]
 name = "rudof_iri"
-version = "0.3.25"
+version = "0.3.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "930abd3dcd341e45fbd39b3ab147ed6e3172a1334a4871df37ea4bd6a7974603"
+checksum = "47d1ca788f625249774fa5f8d58032c4379589e251453c8d012085717bad074c"
 dependencies = [
  "getrandom 0.3.4",
  "getrandom 0.4.3",
@@ -7589,13 +7594,14 @@ dependencies = [
 
 [[package]]
 name = "rudof_rdf"
-version = "0.3.24"
+version = "0.3.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "300359eb9033b3e3585de4d7010c64b4b38cb3e0e4e04a9c071fb5b35a060fec"
+checksum = "a5440966790b8574779ce5c4ed9f9c470813fd82d9a08e72e16142ad9bd632f6"
 dependencies = [
  "colored",
  "const_format",
  "csv",
+ "futures",
  "getrandom 0.3.4",
  "include_dir",
  "once_cell",
@@ -7616,6 +7622,7 @@ dependencies = [
  "rudof_iri",
  "rudof_viz",
  "rust_decimal",
+ "schemars",
  "serde",
  "serde_json",
  "sparesults",
@@ -7630,19 +7637,34 @@ dependencies = [
 ]
 
 [[package]]
-name = "rudof_typing"
-version = "0.3.25"
+name = "rudof_rdf_sink"
+version = "0.3.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6511160308002a9234facf1964e53bcbc455463f023a4f39da07a09be8e7fe39"
+checksum = "1f57d836dca16412f8f9172f2c19e89b11c426a1fd3aae92a5773e156ca4c27d"
+dependencies = [
+ "oxrdf",
+ "oxttl",
+ "prefixmap",
+ "rudof_iri",
+ "rudof_rdf",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
+name = "rudof_typing"
+version = "0.3.42"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b8dbb3db5b5742f7aed52fb915b3340235636b7ab029f329aa02dd7e7d29b80"
 dependencies = [
  "either",
 ]
 
 [[package]]
 name = "rudof_viz"
-version = "0.3.25"
+version = "0.3.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25f64d0eb07668daddbf6c58ba89be33a4010eff0d6866c38e6797194f3cc578"
+checksum = "b9dd8c4d8854edaee81beb90a2361017cd5268a3f1e6d77e13897ddfbe4726a9"
 dependencies = [
  "serde",
  "tempfile",
@@ -7802,33 +7824,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustls-platform-verifier"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26d1e2536ce4f35f4846aa13bff16bd0ff40157cdb14cc056c7b14ba41233ba0"
-dependencies = [
- "core-foundation 0.10.1",
- "core-foundation-sys",
- "jni 0.22.4",
- "log",
- "once_cell",
- "rustls",
- "rustls-native-certs",
- "rustls-platform-verifier-android",
- "rustls-webpki",
- "security-framework",
- "security-framework-sys",
- "webpki-root-certs",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "rustls-platform-verifier-android"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
-
-[[package]]
 name = "rustls-webpki"
 version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7906,6 +7901,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91c1b7e4904c873ef0710c1f407dde2e6287de2bebc1bbbf7d430bb7cbffd939"
 dependencies = [
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "schemars"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab508826f74a77ca9d5aba6ff19b522583ee3eaf28a19384ff3d0e5835fadf6e"
+dependencies = [
+ "dyn-clone",
+ "ref-cast",
+ "schemars_derive",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "schemars_derive"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1c3a92094fa7d61aa124645844facb6b554dfc797136d0f5fd1f890e2bffc69"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde_derive_internals",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -8029,6 +8049,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_derive_internals"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f852137cce035d6a4df67ccce505ff6b3e9fd3a10e3e52b24dc71e650bb1a9bd"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.5",
+]
+
+[[package]]
 name = "serde_json"
 version = "1.0.151"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8120,25 +8151,30 @@ dependencies = [
 
 [[package]]
 name = "shacl"
-version = "0.3.24"
+version = "0.3.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "686d8efa18fa0d43f540ce7f079e18dd39cb913f47d3ae7bbe7d584f340a65c9"
+checksum = "137729d0c6fb5fdb4e5d42ee38e0e09a0ac4edfd474010898274108b7553cb90"
 dependencies = [
  "anyhow",
  "dashmap",
  "either",
+ "indexmap 2.14.2",
  "indoc",
  "itertools 0.14.0",
+ "oxrdf",
  "petgraph",
  "prefixmap",
  "rayon",
  "rudof_config",
  "rudof_iri",
  "rudof_rdf",
+ "rudof_rdf_sink",
  "rudof_typing",
  "rust_decimal",
+ "schemars",
  "serde",
  "sparql_service",
+ "stacker",
  "thiserror 2.0.20",
  "toml 0.9.12+spec-1.1.0",
  "tracing",
@@ -8302,7 +8338,7 @@ dependencies = [
  "memchr",
  "oxrdf",
  "quick-xml 0.37.5",
- "thiserror 2.0.20",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -8325,7 +8361,7 @@ dependencies = [
  "sparesults",
  "spargebra",
  "sparopt",
- "thiserror 2.0.20",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -8339,7 +8375,7 @@ dependencies = [
  "oxrdf",
  "peg",
  "rand 0.9.5",
- "thiserror 2.0.20",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -8355,9 +8391,9 @@ dependencies = [
 
 [[package]]
 name = "sparql_service"
-version = "0.3.24"
+version = "0.3.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "310b50486bcbe276829a42b8facb3648df8a8dfa9d3416a20ed59a5cf0bdcddc"
+checksum = "2603dcfb4be1c1e1f63a4623f8a721ba26fff1a357f0b6249d79a99749867989"
 dependencies = [
  "colored",
  "const_format",
@@ -9640,15 +9676,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "webpki-root-certs"
-version = "1.0.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
-dependencies = [
- "rustls-pki-types",
-]
-
-[[package]]
 name = "webpki-roots"
 version = "0.26.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9775,7 +9802,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
