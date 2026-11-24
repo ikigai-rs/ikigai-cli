@@ -439,9 +439,9 @@ fn toggle_write(inv: &Invocation<'_>, cap: &str) -> ikigai_core::Result<Option<b
         return Ok(None);
     }
     if !inv.capability.allows(cap) {
-        return Err(Error::Denied(format!(
-            "changing this host's setting requires `{cap}`"
-        )));
+        return Err(Error::Denied(
+            format!("changing this host's setting requires `{cap}`").into(),
+        ));
     }
     let value = inv.inline_str("content")?;
     Ok(Some(matches!(
@@ -3637,9 +3637,9 @@ struct HostHeartbeat;
 impl Endpoint for HostHeartbeat {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         if !inv.capability.allows(CAP_KERNEL_INSPECT) {
-            return Err(Error::Denied(format!(
-                "writing a heartbeat requires `{CAP_KERNEL_INSPECT}`"
-            )));
+            return Err(Error::Denied(
+                format!("writing a heartbeat requires `{CAP_KERNEL_INSPECT}`").into(),
+            ));
         }
         let jobs = time_registry().health();
         let peers = BROWSER
@@ -3714,9 +3714,9 @@ struct KernelHealth;
 impl Endpoint for KernelHealth {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         if !inv.capability.allows(CAP_KERNEL_INSPECT) {
-            return Err(Error::Denied(format!(
-                "reading kernel health requires `{CAP_KERNEL_INSPECT}`"
-            )));
+            return Err(Error::Denied(
+                format!("reading kernel health requires `{CAP_KERNEL_INSPECT}`").into(),
+            ));
         }
         let jobs = time_registry().health();
         // Peers only if a browse is ALREADY running: health must not start a background
@@ -4220,9 +4220,9 @@ fn holds_cert_for_in(home: &std::path::Path, name: &str) -> bool {
 impl Endpoint for PeerList {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         if !inv.capability.allows(CAP_NET_DISCOVER) {
-            return Err(Error::Denied(format!(
-                "listing peers requires `{CAP_NET_DISCOVER}`"
-            )));
+            return Err(Error::Denied(
+                format!("listing peers requires `{CAP_NET_DISCOVER}`").into(),
+            ));
         }
         let (browser, fresh) = browse_in(&BROWSER, ikigai_discovery::Browser::start)?;
         if fresh {
@@ -6740,9 +6740,9 @@ impl ClientRegistry {
 impl Endpoint for ClientRegistry {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         if !inv.capability.allows(CAP_CLIENT_READ) {
-            return Err(Error::Denied(format!(
-                "reading a client record requires `{CAP_CLIENT_READ}`"
-            )));
+            return Err(Error::Denied(
+                format!("reading a client record requires `{CAP_CLIENT_READ}`").into(),
+            ));
         }
         if inv.request.verb != Verb::Source {
             return Err(Error::Endpoint(format!(
@@ -6851,9 +6851,9 @@ struct ClientIssue {
 impl Endpoint for ClientIssue {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         if !inv.capability.allows(CAP_CLIENT_ISSUE) {
-            return Err(Error::Denied(format!(
-                "issuing a client link requires `{CAP_CLIENT_ISSUE}`"
-            )));
+            return Err(Error::Denied(
+                format!("issuing a client link requires `{CAP_CLIENT_ISSUE}`").into(),
+            ));
         }
         if inv.request.verb != Verb::Sink {
             return Err(Error::Endpoint(format!(
@@ -9636,7 +9636,9 @@ mod tests {
     /// boundary into a suggestion.
     #[test]
     fn a_prefer_mount_does_not_swallow_a_denial() {
-        let (spec, _) = mount("urn:iki:fn:", MountKind::Prefer, ikigai_core::Error::Denied);
+        let (spec, _) = mount("urn:iki:fn:", MountKind::Prefer, |m| {
+            ikigai_core::Error::Denied(m.into())
+        });
         let space = root_space_with_mounts(vec![spec]);
         let err = probe(&space, "urn:iki:fn:toUpper").expect_err("a denial must propagate");
         assert!(matches!(err, ikigai_core::Error::Denied(_)), "{err:?}");

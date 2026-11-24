@@ -150,7 +150,7 @@ pub fn read_now(inv: &Invocation<'_>) -> Result<(DateTime<Utc>, NowSource)> {
     let Some(time) = inv.now() else {
         return Ok((Utc::now(), NowSource::Ambient));
     };
-    let source = if inv.scope().clock().is_some() {
+    let source = if inv.clock_pinned() {
         NowSource::Pinned
     } else {
         NowSource::Live

@@ -5433,7 +5433,7 @@ fn connect_quic(target: &str, certs: &Certs) -> Result<Engine, String> {
 fn dial_error(target: &str, e: std::io::Error) -> ikigai_core::Error {
     let text = format!("connect {target}: {e}");
     match e.kind() {
-        std::io::ErrorKind::PermissionDenied => ikigai_core::Error::Denied(text),
+        std::io::ErrorKind::PermissionDenied => ikigai_core::Error::Denied(text.into()),
         std::io::ErrorKind::InvalidData => ikigai_core::Error::Endpoint(text),
         std::io::ErrorKind::TimedOut => ikigai_core::Error::Timeout(text),
         _ => ikigai_core::Error::Unavailable(text),
@@ -8405,7 +8405,7 @@ mod prefer_mount_capability_tests {
                 Exact::new("urn:peer:scoped"),
                 FnEndpoint::new("scoped", |inv| {
                     if !inv.capability.allows(SECRET) {
-                        return Err(Error::Denied(format!("the peer wants {SECRET}")));
+                        return Err(Error::Denied(format!("the peer wants {SECRET}").into()));
                     }
                     let seen = inv.capability.scopes().map_or("root".to_string(), |s| {
                         s.iter().cloned().collect::<Vec<_>>().join(" ")

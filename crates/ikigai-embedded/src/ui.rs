@@ -141,14 +141,14 @@ struct ReadOnlyEndpoint(Arc<dyn Endpoint>);
 impl Endpoint for ReadOnlyEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         if !matches!(inv.request.verb, Verb::Source | Verb::Meta) {
-            return Err(Error::Denied("UI resources are read-only".to_string()));
+            return Err(Error::Denied("UI resources are read-only".into()));
         }
         self.0.invoke(inv).await
     }
 
     async fn invoke_body(&self, inv: &Invocation<'_>) -> Result<Representation<ikigai_core::Body>> {
         if !matches!(inv.request.verb, Verb::Source | Verb::Meta) {
-            return Err(Error::Denied("UI resources are read-only".to_string()));
+            return Err(Error::Denied("UI resources are read-only".into()));
         }
         self.0.invoke_body(inv).await
     }
@@ -170,7 +170,7 @@ struct PublishedDirectory {
 impl Endpoint for PublishedDirectory {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         if inv.request.verb != Verb::Source {
-            return Err(Error::Denied("UI overrides are read-only".to_string()));
+            return Err(Error::Denied("UI overrides are read-only".into()));
         }
         let mut published = inv.with_bindings(inv.bindings);
         published.capability = &self.read;
@@ -182,7 +182,7 @@ impl Endpoint for PublishedDirectory {
 
     async fn invoke_body(&self, inv: &Invocation<'_>) -> Result<Representation<ikigai_core::Body>> {
         if inv.request.verb != Verb::Source {
-            return Err(Error::Denied("UI overrides are read-only".to_string()));
+            return Err(Error::Denied("UI overrides are read-only".into()));
         }
         let mut published = inv.with_bindings(inv.bindings);
         published.capability = &self.read;

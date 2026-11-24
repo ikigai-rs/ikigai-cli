@@ -74,9 +74,9 @@ impl Endpoint for DecisionLog {
             // Append one decision.
             Verb::Sink => {
                 if !inv.capability.allows(CAP_DECISIONS_WRITE) {
-                    return Err(Error::Denied(format!(
-                        "recording a decision requires `{CAP_DECISIONS_WRITE}`"
-                    )));
+                    return Err(Error::Denied(
+                        format!("recording a decision requires `{CAP_DECISIONS_WRITE}`").into(),
+                    ));
                 }
                 let arg = |name: &str| crate::decide::param(inv, name);
                 let action = arg("action")?;
@@ -104,9 +104,9 @@ impl Endpoint for DecisionLog {
             // Read the log, or answer a query.
             Verb::Source => {
                 if !inv.capability.allows(CAP_DECISIONS_READ) {
-                    return Err(Error::Denied(format!(
-                        "reading decisions requires `{CAP_DECISIONS_READ}`"
-                    )));
+                    return Err(Error::Denied(
+                        format!("reading decisions requires `{CAP_DECISIONS_READ}`").into(),
+                    ));
                 }
                 let lines = read_lines(&self.path);
 

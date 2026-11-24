@@ -100,9 +100,9 @@ impl Endpoint for PeopleLedger {
             // Record one contact.
             Verb::Sink => {
                 if !inv.capability.allows(CAP_PEOPLE_WRITE) {
-                    return Err(Error::Denied(format!(
-                        "recording a contact requires `{CAP_PEOPLE_WRITE}`"
-                    )));
+                    return Err(Error::Denied(
+                        format!("recording a contact requires `{CAP_PEOPLE_WRITE}`").into(),
+                    ));
                 }
                 let arg = |name: &str| crate::decide::param(inv, name);
                 let email = arg("email")?;
@@ -131,9 +131,9 @@ impl Endpoint for PeopleLedger {
             // Read the roster, or one person's history.
             Verb::Source => {
                 if !inv.capability.allows(CAP_PEOPLE_READ) {
-                    return Err(Error::Denied(format!(
-                        "reading the people ledger requires `{CAP_PEOPLE_READ}`"
-                    )));
+                    return Err(Error::Denied(
+                        format!("reading the people ledger requires `{CAP_PEOPLE_READ}`").into(),
+                    ));
                 }
                 let lines = read_lines(&self.path);
                 // `email=<addr>` — one person's contact history.

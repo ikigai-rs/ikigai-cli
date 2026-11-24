@@ -838,7 +838,7 @@ impl Endpoint for PasskeyJs {
 /// On success the challenge is consumed (single-use) and any advanced signature counter persisted.
 /// Every failure is one `Denied` — a prober learns nothing from which check tripped.
 pub fn require_passkey(inv: &Invocation<'_>) -> Result<()> {
-    let denied = || Error::Denied("this action needs your passkey".to_string());
+    let denied = || Error::Denied("this action needs your passkey".into());
 
     // One lock from load to save, so a concurrent assertion cannot write back a stale copy.
     let held = credential_lock();
@@ -1015,9 +1015,9 @@ pub struct PasskeyEnrollOpen;
 impl Endpoint for PasskeyEnrollOpen {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         if !inv.capability.allows(CAP_PASSKEY_ENROLL) {
-            return Err(Error::Denied(format!(
-                "opening enrollment requires `{CAP_PASSKEY_ENROLL}`"
-            )));
+            return Err(Error::Denied(
+                format!("opening enrollment requires `{CAP_PASSKEY_ENROLL}`").into(),
+            ));
         }
         let code = enrollment_code()?;
         let window = EnrollWindow {
@@ -1246,7 +1246,7 @@ impl Endpoint for PasskeyRegister {
                 // is nothing correct to bind it to (the old default silently chose production).
                 if relying_party().is_none() {
                     return Err(Error::Denied(
-                        "this edge has no passkey relying party configured".to_string(),
+                        "this edge has no passkey relying party configured".into(),
                     ));
                 }
                 // ONE lock from judging the window to spending it, so two registrations in one
@@ -1263,12 +1263,12 @@ impl Endpoint for PasskeyRegister {
                         return Err(Error::Denied(
                             "this enrollment window has already been used — open a new one at \
                              the box"
-                                .to_string(),
+                                .into(),
                         ));
                     }
                     WindowState::Closed => {
                         return Err(Error::Denied(
-                            "no enrollment window is open — open one at the box first".to_string(),
+                            "no enrollment window is open — open one at the box first".into(),
                         ));
                     }
                 };
@@ -1284,7 +1284,7 @@ impl Endpoint for PasskeyRegister {
                     return Err(Error::Denied(
                         "a registration needs the one-time code shown at the box when the \
                          window was opened"
-                            .to_string(),
+                            .into(),
                     ));
                 }
                 let (id_b64, spki_b64) = (param(inv, "id")?, param(inv, "spki")?);

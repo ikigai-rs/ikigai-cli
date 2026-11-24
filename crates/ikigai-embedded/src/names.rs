@@ -478,9 +478,9 @@ impl Endpoint for NamesFile {
         match inv.request.verb {
             Verb::Sink => {
                 if !inv.capability.allows(CAP_WRITE) {
-                    return Err(Error::Denied(format!(
-                        "writing this host's names file requires `{CAP_WRITE}`"
-                    )));
+                    return Err(Error::Denied(
+                        format!("writing this host's names file requires `{CAP_WRITE}`").into(),
+                    ));
                 }
                 let text = inv.inline_str("content")?;
                 parse_names(text).map_err(|e| Error::InvalidArgument {

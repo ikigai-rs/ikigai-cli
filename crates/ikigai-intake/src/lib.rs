@@ -708,10 +708,13 @@ impl Endpoint for IntakeEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         let config = &self.config;
         if !inv.capability.allows(&config.requires) {
-            return Err(Error::Denied(format!(
-                "submitting to `{}` requires `{}`",
-                config.space, config.requires
-            )));
+            return Err(Error::Denied(
+                format!(
+                    "submitting to `{}` requires `{}`",
+                    config.space, config.requires
+                )
+                .into(),
+            ));
         }
         if inv.request.verb != Verb::Sink {
             return Err(Error::Endpoint(format!(

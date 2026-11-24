@@ -448,9 +448,9 @@ fn require_mint(inv: &Invocation<'_>, what: &str) -> Result<()> {
     if inv.capability.allows(CAP_CONTACTBLOCK_MINT) {
         Ok(())
     } else {
-        Err(Error::Denied(format!(
-            "minting a {what} link requires `{CAP_CONTACTBLOCK_MINT}`"
-        )))
+        Err(Error::Denied(
+            format!("minting a {what} link requires `{CAP_CONTACTBLOCK_MINT}`").into(),
+        ))
     }
 }
 
