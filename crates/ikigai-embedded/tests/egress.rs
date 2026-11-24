@@ -343,6 +343,12 @@ fn the_shacl_door_refuses_sparql_service_and_nothing_reaches_the_network() {
         }
         match answer {
             Err(Error::InvalidArgument { name, .. }) if name == input => {}
+            // Since ikigai-shacl 0.7.1 (rudof 0.3.42) the Turtle reader itself refuses `>` in a
+            // literal's datatype IRI, so the breakout never reaches the IRI check: a parse error
+            // of the named graph is the refusal, and the stub count above is the egress proof.
+            Err(Error::Endpoint(msg))
+                if msg.contains(&format!("{input} graph parse error"))
+                    && msg.contains("Invalid IRI code point '>'") => {}
             Err(other) => failures.push(format!(
                 "{what}: refused, but not as InvalidArgument naming `{input}`: {other:?}"
             )),
