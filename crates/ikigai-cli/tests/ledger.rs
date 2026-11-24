@@ -25,7 +25,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use futures::executor::block_on;
+use ikigai_core::{Capability, Kernel};
 use ikigai_engine::{Action, Engine};
+use ikigai_mcp::ToolFilter;
+use serde_json::json;
 
 /// Redirect every ambient path this binary reads, once, and name the dataset directory.
 ///
@@ -56,12 +59,15 @@ fn fixture_home() -> &'static Path {
 /// A fresh `Engine` per test keeps session authority independent. All sessions share
 /// one kernel, so a later test cannot bind a store space after an earlier cached read.
 fn engine() -> Engine {
-    static KERNEL: OnceLock<Arc<ikigai_core::Kernel>> = OnceLock::new();
-    let kernel = KERNEL.get_or_init(|| {
+    Engine::new(Arc::clone(kernel()))
+}
+
+fn kernel() -> &'static Arc<Kernel> {
+    static KERNEL: OnceLock<Arc<Kernel>> = OnceLock::new();
+    KERNEL.get_or_init(|| {
         fixture_home();
         Arc::new(ikigai_embedded::kernel())
-    });
-    Engine::new(Arc::clone(kernel))
+    })
 }
 
 /// Evaluate one typed line, expecting it to succeed, and return what the REPL printed.
@@ -91,6 +97,34 @@ fn refused(engine: &Engine, input: &str) -> String {
         // `source`/`sink`/`cap` — so the fact of it is the whole finding.
         _ => panic!("`{input}` produced a REPL control action rather than output"),
     }
+}
+
+#[test]
+fn mcp_lists_resend_annotations_from_the_live_contracts() {
+    let response = ikigai_mcp::server::handle(
+        kernel(),
+        &Capability::root(),
+        &ToolFilter::default(),
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+    )
+    .expect("tools/list returns a response");
+    let tools = response["result"]["tools"].as_array().expect("tool list");
+    let tool = |name: &str| {
+        tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("missing tool {name}"))
+    };
+    let append = tool("ledger-append__sink");
+    assert_eq!(
+        append["annotations"],
+        json!({"idempotentHint": false, "resendKey": "key"})
+    );
+    assert_eq!(append["inputSchema"]["properties"]["key"]["type"], "string");
+    assert_eq!(
+        tool("store-update__sink")["annotations"],
+        json!({"idempotentHint": false})
+    );
 }
 
 #[test]

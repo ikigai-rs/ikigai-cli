@@ -18,6 +18,13 @@ So this crate is a thin, runtime-free translator (newline-framed JSON-RPC over
 stdio — no tokio): each `ik:Action` becomes a tool, the tool name reverses to the
 `(endpoint, verb)` it came from, and a `tools/call` validates and invokes.
 
+For Sink tools, `annotations.idempotentHint` is true when the action contract declares
+unconditional resend safety. A keyed Sink has `idempotentHint: false` and an ikigai
+`annotations.resendKey` naming the input argument. To retry the same request, supply
+the same non-blank value for that argument on both calls. When the contract declares
+a time limit, `annotations.resendWindowSeconds` gives the limit in seconds. A Sink
+with no resend declaration has `idempotentHint: false` and no resend key.
+
 ## Run it
 
 ```bash
