@@ -3066,6 +3066,7 @@ fn build_engine(
                 ),
                 reloads: Vec::new(),
             });
+            let mounted = !mounts.is_empty();
             let kernel = if mounts.is_empty() {
                 if react {
                     ikigai_embedded::reactive_kernel_with_mounts(Vec::new())
@@ -3092,7 +3093,20 @@ fn build_engine(
             let names = ikigai_embedded::names::active().map(|_| {
                 ikigai_core::Iri::parse(ikigai_embedded::names::RESOURCE).expect("a constant IRI")
             });
-            let resolver = TerminalResolver::for_stdout(local_resolver::LocalResolver::new(kernel));
+            let local: std::sync::Arc<dyn ikigai_resolve::Resolver> =
+                std::sync::Arc::new(local_resolver::LocalResolver::new(kernel));
+            // `connect.retry.*` over the mounts (ledger #4161): the kernel governs every call
+            // to a remote mount, but answers a contract read (Meta) from the mount's
+            // synchronous failure, which the slot's retry cannot repeat. So a Meta is
+            // re-issued above the kernel under the same policy, as over `--connect` (ledger
+            // #4084); without it a named argument was routed as text while the hub was down.
+            let local = match ikigai_embedded::retry::RetryPolicy::from_config()? {
+                Some(policy) if mounted => {
+                    std::sync::Arc::new(ikigai_embedded::retry::MetaRetry::new(&policy, local))
+                }
+                _ => local,
+            };
+            let resolver = TerminalResolver::for_stdout(local);
             let engine = match names {
                 Some(atom) => Engine::new(resolver).with_names_atom(atom),
                 None => Engine::new(resolver),

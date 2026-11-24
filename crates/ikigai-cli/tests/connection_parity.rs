@@ -10,8 +10,8 @@
 //! - [`SHAPES`] are the calls: an argument-free Source, a named argument, a positional value,
 //!   a pipe into a Source, a Sink with content (read back), a saved script given named
 //!   parameters, and a `-c` batch whose stdin fills the one required argument.
-//! - [`MODES`] are the ways in: in-process, a `--mount` of the hub, `--connect` to the hub,
-//!   and `--connect` with `connect.retry.*` set.
+//! - [`MODES`] are the ways in: in-process, a `--mount` of the hub, the same mount with
+//!   `connect.retry.*` set, `--connect` to the hub, and `--connect` with `connect.retry.*` set.
 //!
 //! A new mode or transport is ONE row in [`MODES`]; it then runs every shape. A new shape is
 //! one row in [`SHAPES`]; every mode then runs it. A shape names its targets with `{ns}`,
@@ -25,8 +25,10 @@
 //! argument in one REPL session, the hub killed between two calls. A hub that stays down is
 //! the transport's error, in the call's `error:` line and in the contract note, never
 //! "declares no arguments"; under the policy, both after its attempts. A hub back within the
-//! policy answers the call routed by its contract, because the cli retries the contract read
-//! above the kernel (`ikigai_embedded::retry::ConnectIssuer`).
+//! policy answers the call routed by its contract, through a mount as over `--connect`,
+//! because the cli retries the contract read above the kernel
+//! (`ikigai_embedded::retry::MetaRetry`; ledger #4084 for `--connect`, ledger #4161 for a
+//! mount).
 #![cfg(all(feature = "embedded", feature = "quic", unix))]
 
 mod support;
@@ -157,6 +159,11 @@ const MODES: &[Mode] = &[
         tag: "mount",
         reach: Reach::Mount,
         config: "",
+    },
+    Mode {
+        tag: "mretry",
+        reach: Reach::Mount,
+        config: CONNECT_POLICY,
     },
     Mode {
         tag: "connect",
@@ -498,30 +505,46 @@ fn a_peer_down_answers_the_transport_error_in_every_mode() {
 }
 
 /// The peer down for longer than one contract read, then back within the policy (ledger
-/// #4084): the contract read is retried under `connect.retry.*` as the call is, so the named
-/// argument is routed by the contract and the call answers as if the hub had never left.
-/// Without that retry the contract read failed at once, the word went to `in` as text, and
-/// the retried call answered `IN=HELLO`.
+/// #4084 for `--connect`, ledger #4161 for a mount): the contract read is retried under
+/// `connect.retry.*` as the call is, so the named argument is routed by the contract and the
+/// call answers as if the hub had never left. Without that retry the contract read failed at
+/// once, the word went to `in` as text, and the retried call answered `IN=HELLO`.
 #[test]
 fn a_peer_back_within_the_policy_routes_the_named_argument() {
-    let mode = MODES
+    let modes: Vec<_> = MODES
         .iter()
-        .find(|mode| mode.tag == "cretry")
-        .expect("the --connect with retry mode");
-    // Longer than a dial's own timeout (5 s), so the first contract read fails.
-    let outage = through_an_outage(mode, Some(Duration::from_secs(20)));
-    let text = outage.text();
-    assert!(outage.status.success(), "the client exits 0: {text}");
-    assert!(
-        outage.after.iter().any(|line| line.trim() == "HELLO"),
-        "the call answers by its contract once the hub is back: {text}"
-    );
-    assert!(
-        !outage.after.iter().any(|line| line.trim() == "IN=HELLO"),
-        "never routed without the contract: {text}"
-    );
-    assert!(
-        !text.contains("contract unavailable for"),
-        "the contract was read: {text}"
-    );
+        .filter(|mode| !mode.config.is_empty())
+        .map(|mode| {
+            (
+                mode,
+                // Longer than a dial's own timeout (5 s), so the first contract read fails.
+                std::thread::spawn(move || through_an_outage(mode, Some(Duration::from_secs(20)))),
+            )
+        })
+        .collect();
+    assert_eq!(modes.len(), 2, "a mount and a --connect under the policy");
+    let mut wrong = Vec::new();
+    for (mode, outage) in modes {
+        let Ok(outage) = outage.join() else {
+            wrong.push(format!("- mode `{}` panicked before it answered", mode.tag));
+            continue;
+        };
+        let text = outage.text();
+        let mut fault = |what: &str| {
+            wrong.push(format!("- mode `{}`: {what}, got:\n{text}", mode.tag));
+        };
+        if !outage.status.success() {
+            fault("the client exits 0");
+        }
+        if !outage.after.iter().any(|line| line.trim() == "HELLO") {
+            fault("the call answers by its contract once the hub is back");
+        }
+        if outage.after.iter().any(|line| line.trim() == "IN=HELLO") {
+            fault("never routed without the contract");
+        }
+        if text.contains("contract unavailable for") {
+            fault("the contract was read");
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
