@@ -265,6 +265,8 @@ impl BlockKey {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
+            // ambient: fs: checks the owner and mode of the block_key_file supplied by host startup configuration, to reject unsafe permissions before reading it
+            #[allow(clippy::disallowed_methods)]
             let meta =
                 std::fs::metadata(path).map_err(|e| refuse(format!("cannot be read ({e})")))?;
             let mode = meta.mode() & 0o777;
@@ -276,6 +278,8 @@ impl BlockKey {
                 )));
             }
         }
+        // ambient: fs: reads only the block_key_file supplied by host startup configuration, after its permission check on Unix
+        #[allow(clippy::disallowed_methods)]
         let text =
             std::fs::read_to_string(path).map_err(|e| refuse(format!("cannot be read ({e})")))?;
         BlockKey::from_hex(&text).map_err(refuse)
