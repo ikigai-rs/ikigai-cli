@@ -646,6 +646,20 @@ enum MountKind {
     Prefer,
 }
 
+/// The refusal of a retired exec scope on the command line (`--cap`, `--scope`, `--load …
+/// --cap`). The embedded host's own check when it is built; without `embedded` the command
+/// line is still parsed (the stub binary answers `--version` from it), but no scope is ever
+/// used, so there is nothing to refuse.
+#[cfg(feature = "embedded")]
+use ikigai_embedded::check_retired_scopes;
+#[cfg(not(feature = "embedded"))]
+fn check_retired_scopes<S: AsRef<str>>(
+    _whose: &str,
+    _scopes: impl IntoIterator<Item = S>,
+) -> Result<(), String> {
+    Ok(())
+}
+
 /// One `--mount`: where it binds, what it connects to, and the certificates for
 /// THAT connection. Cert flags following a `--mount` attach to it; cert flags
 /// before any mount form the default set (used by `--connect`, and by a mount
@@ -1687,7 +1701,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 let cap = argv
                     .next()
                     .ok_or_else(|| "--cap needs a capability IRI".to_string())?;
-                ikigai_embedded::check_retired_scopes("--cap", [&cap])?;
+                check_retired_scopes("--cap", [&cap])?;
                 caps.push(cap);
                 continue;
             }
@@ -1891,7 +1905,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                     let scope = argv
                         .next()
                         .ok_or_else(|| "--scope needs a capability IRI".to_string())?;
-                    ikigai_embedded::check_retired_scopes("--scope", [&scope])?;
+                    check_retired_scopes("--scope", [&scope])?;
                     scopes.push(scope);
                 }
                 "--principal" => {
@@ -2084,7 +2098,7 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                     let scope = argv
                         .next()
                         .ok_or_else(|| "--cap requires a capability scope".to_string())?;
-                    ikigai_embedded::check_retired_scopes("--cap", [&scope])?;
+                    check_retired_scopes("--cap", [&scope])?;
                     command.push_str(&format!(" cap={scope}"));
                 }
                 repl.commands.push(command);
@@ -2158,7 +2172,6 @@ fn check_homes(mode: &Mode) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(feature = "embedded")]
 /// `ikigai space-reseal`: seal every space under the file root with the configured space key.
 #[cfg(feature = "embedded")]
 fn space_reseal() -> i32 {
@@ -2189,6 +2202,8 @@ fn space_reseal() -> i32 {
     }
 }
 
+/// The host's entry point. A build without `embedded` has the stub `main` further down.
+#[cfg(feature = "embedded")]
 fn main() {
     let mode = match parse_args() {
         Ok(Some(mode)) => mode,
