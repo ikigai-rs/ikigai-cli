@@ -1769,7 +1769,7 @@ ikigai-jsonld = "0.5.0" # 0.5.0 = core 0.4.0 cascade (ledger #4088): the only re
 # narrows on `ik:class`, and this host is the thing that serves that manifold — so the three
 # operators could not be narrowed to before matching fell through to the LLM residual.
 # jq and CSV as resources (urn:json:query/from-csv/to-csv, ledger #2481): bound in the local root only.
-ikigai-json = "0.5.0" # 0.5.0 = core 0.4.0 cascade (ledger #4088): the only release on ikigai-core 0.4.x. `"0.5.0"` is `<0.6.0`. Beneath it: 0.4.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.4.0"` is `<0.5.0`. Beneath it: 0.3.1 = the newest release, on ikigai-core 0.2.x. `"0.3.1"` is `<0.4.0`. The floor is
+ikigai-json = "0.5.1" # 0.5.1 = a caller's jq program can no longer name the sandbox's internal `__iki_*` definitions (ledger #4366); the embedded host mounts it. `"0.5.1"` is `<0.6.0`. Beneath it: 0.5.0 = core 0.4.0 cascade (ledger #4088): the only release on ikigai-core 0.4.x. Beneath it: 0.4.0 = core 0.3.0 cascade (ledger #2975): the newest release, on ikigai-core 0.3.x. `"0.4.0"` is `<0.5.0`. Beneath it: 0.3.1 = the newest release, on ikigai-core 0.2.x. `"0.3.1"` is `<0.4.0`. The floor is
 # the newest release, by choice: this host calls only `space()`, which 0.3.0 has too. 0.3.1 changes one
 # thing beneath it: the jq sandbox reads its deadline from the invocation's clock on every target
 # (ledger #2196). 0.3.0 streams jq results as NDJSON and CSV incrementally, and needs core 0.2.1.

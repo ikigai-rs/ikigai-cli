@@ -3482,9 +3482,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-json"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d5b83c2e70571a4b548b47dedda5874141deffe488ca532595aa7ebbe5273d5"
+checksum = "95aa18ea5c9692a05946dbf22cb4d8fe28e850547d3963786cceda1560c64285"
 dependencies = [
  "async-trait",
  "csv",
