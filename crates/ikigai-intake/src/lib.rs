@@ -727,10 +727,13 @@ impl Endpoint for IntakeEndpoint {
             )));
         }
 
-        let body = inv
-            .inline_str("content")
-            .or_else(|_| inv.inline_str("in"))
-            .map_err(|_| Error::MissingArgument("content".to_string()))?;
+        let body = match inv.optional_str("content")? {
+            Some(body) => body,
+            None => inv
+                .optional_str("in")?
+                .ok_or_else(|| Error::MissingArgument("content".to_string()))?,
+        };
+        let received = inv.optional_str("received")?;
         let fields = parse_body(body)?;
         let get = |name: &str| {
             if config.fixed_fields.contains_key(name) {
@@ -871,6 +874,7 @@ impl Endpoint for IntakeEndpoint {
         // leaves the submission anonymous rather than refusing it, so rotating a link
         // degrades a customer to an ordinary visitor instead of locking them out.
         if let Some(template) = &config.clients {
+            // optional-arg: deliberate: an unreadable link token leaves the visitor anonymous.
             if let Ok(token) = inv.inline_str(TOKEN_ARG) {
                 let token = token.trim();
                 if token_shaped(token) {
@@ -894,7 +898,7 @@ impl Endpoint for IntakeEndpoint {
         // so a stored submission carries no IP address. Abuse is handled at the door, whose
         // per-source rate limit (`ikigai-web`'s `source_limit`) holds an address in memory
         // only for its window and never writes it anywhere.
-        if let Ok(value) = inv.inline_str("received") {
+        if let Some(value) = received {
             let value = value.trim();
             if !value.is_empty() {
                 carried.push(("received".to_string(), value.to_string()));
@@ -1098,6 +1102,60 @@ mod tests {
 
     fn cap() -> Capability {
         Capability::scoped(["urn:cap:contact:submit"])
+    }
+
+    #[test]
+    fn optional_provenance_and_the_body_alias_do_not_hide_invalid_input() {
+        let (k, dropped) = kernel();
+        let cap = cap();
+        let bindings = ikigai_core::Bindings::new();
+        let endpoint = submit(config());
+        let issue = |request: &Request| {
+            // Invoke after kernel routing so non-inline arguments can be tested unchanged.
+            let inv = Invocation::with_issuer(request, &bindings, &cap, &k);
+            block_on(endpoint.invoke(&inv))
+        };
+        let body = "name=Ada&email=ada%40example.com&message=Hello";
+        let base = post(body);
+        issue(&base).unwrap();
+        let alias = Request::new(Verb::Sink, base.target.clone())
+            .with_arg("in", ArgRef::Inline(body.as_bytes().to_vec()));
+        issue(
+            &alias
+                .clone()
+                .with_arg("received", ArgRef::Inline(b"2026-11-25T12:00:00Z".to_vec())),
+        )
+        .unwrap();
+        {
+            let tuples = dropped.lock().unwrap();
+            assert!(!tuples[0].contains("received"));
+            assert!(tuples[1].contains(r#"(received "2026-11-25T12:00:00Z")"#));
+        }
+        for (name, request) in [
+            ("received", base),
+            ("content", alias.clone()),
+            ("in", alias),
+        ] {
+            for (arg, reason) in [
+                (ArgRef::Inline(vec![0xff]), "not valid UTF-8"),
+                (
+                    ArgRef::Reference(Iri::parse("urn:test:argument").unwrap()),
+                    "expected an inline value",
+                ),
+                (
+                    ArgRef::Content(ikigai_core::ContentId::of(b"body")),
+                    "expected an inline value",
+                ),
+            ] {
+                let err = issue(&request.clone().with_arg(name, arg)).expect_err(name);
+                assert!(
+                    matches!(&err, Error::InvalidArgument { name: actual, detail }
+                        if actual == name && detail.contains(reason)),
+                    "{err:?}"
+                );
+            }
+        }
+        assert_eq!(dropped.lock().unwrap().len(), 2);
     }
 
     #[test]

@@ -185,13 +185,32 @@ fn parse_duration(s: &str) -> std::result::Result<Duration, String> {
     Ok(d)
 }
 
-fn parse_verb(s: &str) -> Verb {
+fn optional_duration<T>(
+    inv: &Invocation<'_>,
+    name: &str,
+    parse: impl FnOnce(&str) -> Result<T, String>,
+) -> Result<Option<T>, Error> {
+    inv.optional_str(name)?
+        .map(|value| {
+            parse(value).map_err(|detail| Error::InvalidArgument {
+                name: name.to_string(),
+                detail,
+            })
+        })
+        .transpose()
+}
+
+fn parse_verb(s: &str) -> Result<Verb, Error> {
     match s.trim().to_ascii_lowercase().as_str() {
-        "sink" => Verb::Sink,
-        "exists" => Verb::Exists,
-        "delete" => Verb::Delete,
-        "meta" => Verb::Meta,
-        _ => Verb::Source,
+        "source" => Ok(Verb::Source),
+        "sink" => Ok(Verb::Sink),
+        "exists" => Ok(Verb::Exists),
+        "delete" => Ok(Verb::Delete),
+        "meta" => Ok(Verb::Meta),
+        _ => Err(Error::InvalidArgument {
+            name: "method".to_string(),
+            detail: "expected source, sink, exists, delete, or meta".to_string(),
+        }),
     }
 }
 
@@ -1203,7 +1222,7 @@ fn turtle(body: String) -> Representation {
 /// Whether `urn:time:jobs` was asked for its Turtle face: `as=text/turtle`, or the default
 /// text face when `as` is absent or `text/plain`. Anything else is refused, not guessed.
 fn wants_turtle(inv: &Invocation<'_>) -> Result<bool, Error> {
-    let Ok(face) = inv.inline_str("as") else {
+    let Some(face) = inv.optional_str("as")? else {
         return Ok(false);
     };
     match face.split(';').next().unwrap_or("").trim() {
@@ -1228,12 +1247,12 @@ pub fn space(registry: JobRegistry) -> EndpointSpace {
         .bind(
             Exact::new("urn:time:schedule"),
             FnEndpoint::new("time-schedule", move |inv: &Invocation<'_>| {
-                let target = inv.inline_str("target").map_err(|_| {
-                    Error::Endpoint("urn:time:schedule needs target=<iri>".to_string())
-                })?;
-                let (dur_str, recurring) = if let Ok(every) = inv.inline_str("every") {
+                let target = inv.inline_str("target")?;
+                let every = optional_duration(inv, "every", parse_schedule)?;
+                let after = optional_duration(inv, "after", parse_schedule)?;
+                let (schedule, recurring) = if let Some(every) = every {
                     (every, true)
-                } else if let Ok(after) = inv.inline_str("after") {
+                } else if let Some(after) = after {
                     (after, false)
                 } else {
                     return Err(Error::Endpoint(
@@ -1241,19 +1260,19 @@ pub fn space(registry: JobRegistry) -> EndpointSpace {
                             .to_string(),
                     ));
                 };
-                let schedule = parse_schedule(dur_str).map_err(Error::Endpoint)?;
-                let timeout = match inv.inline_str("timeout") {
-                    Ok(value) => parse_duration(value).map_err(Error::Endpoint)?,
-                    Err(_) => DEFAULT_JOB_TIMEOUT,
-                };
-                let verb = inv
-                    .inline_str("method")
+                let timeout = optional_duration(inv, "timeout", parse_duration)?
+                    .unwrap_or(DEFAULT_JOB_TIMEOUT);
+                let verb = inv.optional_str("method")?
                     .map(parse_verb)
+                    .transpose()?
                     .unwrap_or(Verb::Source);
                 // Validate the IRI before registering, so a bad target fails the call
                 // rather than every silent tick.
                 Iri::parse(target)
-                    .map_err(|e| Error::Endpoint(format!("bad target '{target}': {e}")))?;
+                    .map_err(|e| Error::InvalidArgument {
+                        name: "target".to_string(),
+                        detail: format!("expected a resource IRI: {e}"),
+                    })?;
                 let interval = schedule.interval();
                 // The job fires under THIS invocation's capability — the caller's own, as the
                 // kernel handed it here — clamped to the registry's ceiling at every tick.
@@ -1335,8 +1354,13 @@ pub fn space(registry: JobRegistry) -> EndpointSpace {
                 };
                 // `target=<iri>` cancels every job firing that resource — precise, and
                 // leaves other timers (e.g. the nav clock on urn:time:now) alone.
-                if let Ok(target) = inv.inline_str("target") {
+                let id_str = inv.optional_str("id")?;
+                if let Some(target) = inv.optional_str("target")? {
                     let target = target.trim();
+                    Iri::parse(target).map_err(|e| Error::InvalidArgument {
+                        name: "target".to_string(),
+                        detail: format!("expected a resource IRI: {e}"),
+                    })?;
                     let (n, kept) = cancel_reg.cancel_matching_as(caller, |job| job.target == target);
                     return Ok(text(format!(
                         "cancelled {n} job{} for {target}{}\n",
@@ -1344,7 +1368,7 @@ pub fn space(registry: JobRegistry) -> EndpointSpace {
                         withheld(kept)
                     )));
                 }
-                let id_str = inv.inline_str("id").map_err(|_| {
+                let id_str = id_str.ok_or_else(|| {
                     Error::Endpoint(
                         "urn:time:cancel needs id=<n>, id=all, or target=<iri>".to_string(),
                     )
@@ -1362,9 +1386,10 @@ pub fn space(registry: JobRegistry) -> EndpointSpace {
                     )));
                 }
                 let id: u64 = id_str.parse().map_err(|_| {
-                    Error::Endpoint(format!(
-                        "invalid job id '{id_str}' (expected a number, 'all', or target=<iri>)"
-                    ))
+                    Error::InvalidArgument {
+                        name: "id".to_string(),
+                        detail: "expected a job number or 'all'".to_string(),
+                    }
                 })?;
                 match cancel_reg.cancel_as(id, caller) {
                     CancelOutcome::Cancelled => Ok(text(format!("cancelled job #{id}\n"))),
@@ -2134,6 +2159,114 @@ mod tests {
         }
         Resolver::issue_as(kernel, request, capability)
             .map(|(rep, _)| String::from_utf8_lossy(&rep.bytes).into_owned())
+    }
+
+    fn assert_invalid_option(
+        kernel: &ikigai_core::Kernel,
+        base: &Request,
+        name: &str,
+        malformed: &str,
+    ) {
+        use ikigai_core::{ArgRef, ContentId};
+        for (arg, reason) in [
+            (ArgRef::Inline(vec![0xff]), "not valid UTF-8"),
+            (
+                ArgRef::Content(ContentId::of(b"body")),
+                "expected an inline value",
+            ),
+            (ArgRef::Inline(malformed.as_bytes().to_vec()), ""),
+        ] {
+            let result = Resolver::issue_as(
+                kernel,
+                base.clone().with_arg(name, arg),
+                &Capability::root(),
+            );
+            assert!(
+                matches!(&result, Err(Error::InvalidArgument { name: actual, detail })
+                    if actual == name && !detail.is_empty() && detail.contains(reason)),
+                "{name}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unreadable_schedule_options_do_not_register_a_job() {
+        use ikigai_core::ArgRef;
+        let reg = JobRegistry::new(Arc::new(ManualBackend::default()), Arc::new(SystemClock));
+        let kernel = kernel_with_time(&reg, Arc::new(AtomicU64::new(0)));
+        let base = Request::new(Verb::Source, Iri::parse("urn:time:schedule").unwrap())
+            .with_arg("target", ArgRef::Inline(b"urn:x".to_vec()))
+            .with_arg("after", ArgRef::Inline(b"1s".to_vec()));
+        for (name, malformed) in [
+            ("every", "bad delay"),
+            ("after", "bad delay"),
+            ("timeout", "0s"),
+            ("method", "bad verb"),
+        ] {
+            assert_invalid_option(&kernel, &base, name, malformed);
+        }
+        assert!(reg.render(&Capability::root()).contains("(none scheduled)"));
+        let default = Resolver::issue_as(&*kernel, base, &Capability::root())
+            .unwrap()
+            .0;
+        assert!(String::from_utf8_lossy(&default.bytes).contains("source urn:x after"));
+        let explicit = call(
+            &kernel,
+            "urn:time:schedule",
+            &[
+                ("target", "urn:x"),
+                ("every", "1s"),
+                ("timeout", "2s"),
+                ("method", "sink"),
+            ],
+            &Capability::root(),
+        )
+        .unwrap();
+        assert!(explicit.contains("sink urn:x every"), "{explicit}");
+    }
+
+    #[test]
+    fn unreadable_cancel_target_does_not_fall_back_to_cancel_all() {
+        use ikigai_core::ArgRef;
+        let reg = JobRegistry::new(Arc::new(ManualBackend::default()), Arc::new(SystemClock));
+        let kernel = kernel_with_time(&reg, Arc::new(AtomicU64::new(0)));
+        let root = Capability::root();
+        let schedule = || {
+            call(
+                &kernel,
+                "urn:time:schedule",
+                &[("target", "urn:x"), ("after", "1s")],
+                &root,
+            )
+            .unwrap()
+        };
+        schedule();
+        let base = Request::new(Verb::Source, Iri::parse("urn:time:cancel").unwrap())
+            .with_arg("id", ArgRef::Inline(b"all".to_vec()));
+        assert_invalid_option(&kernel, &base, "target", "not an IRI");
+        assert!(reg.render(&root).contains("urn:x"));
+        assert!(
+            call(&kernel, "urn:time:cancel", &[("target", "urn:x")], &root)
+                .unwrap()
+                .contains("cancelled 1")
+        );
+        schedule();
+        let answer = Resolver::issue_as(&*kernel, base, &root).unwrap().0;
+        assert!(String::from_utf8_lossy(&answer.bytes).contains("cancelled 1"));
+    }
+
+    #[test]
+    fn the_jobs_face_defaults_only_when_absent() {
+        let reg = JobRegistry::new(Arc::new(ManualBackend::default()), Arc::new(SystemClock));
+        let kernel = kernel_with_time(&reg, Arc::new(AtomicU64::new(0)));
+        let root = Capability::root();
+        let base = Request::new(Verb::Source, Iri::parse("urn:time:jobs").unwrap());
+        assert_eq!(jobs_face(&kernel, &[], &root).0, "text/plain;charset=utf-8");
+        assert_eq!(
+            jobs_face(&kernel, &[("as", "text/turtle")], &root).0,
+            "text/turtle;charset=utf-8"
+        );
+        assert_invalid_option(&kernel, &base, "as", "image/jpeg");
     }
 
     #[test]

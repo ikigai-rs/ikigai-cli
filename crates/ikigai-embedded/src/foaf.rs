@@ -257,9 +257,9 @@ impl Endpoint for Foaf {
 /// A value outside the set on either channel is a typed bad request naming that channel
 /// and the faces that exist.
 fn requested_face(inv: &Invocation<'_>) -> Result<&'static str> {
+    let as_type = inv.optional_str("as")?;
     if let Some(format) = inv
-        .inline_str("format")
-        .ok()
+        .optional_str("format")?
         .map(|s| s.trim().to_ascii_lowercase())
         .filter(|s| !s.is_empty())
     {
@@ -275,9 +275,7 @@ fn requested_face(inv: &Invocation<'_>) -> Result<&'static str> {
                 ),
             });
     }
-    let asked = inv
-        .inline_str("as")
-        .ok()
+    let asked = as_type
         .map(|s| media_base(s).to_ascii_lowercase())
         .unwrap_or_default();
     if asked.is_empty() || asked == "*/*" {
@@ -304,7 +302,7 @@ fn media_base(media: &str) -> &str {
 /// An optional boolean argument: absent is `false`; the usual spellings are accepted,
 /// anything else is a typed bad request.
 fn flag(inv: &Invocation<'_>, name: &str) -> Result<bool> {
-    let Ok(raw) = inv.inline_str(name) else {
+    let Some(raw) = inv.optional_str(name)? else {
         return Ok(false);
     };
     match raw.trim().to_ascii_lowercase().as_str() {
@@ -664,6 +662,20 @@ mod tests {
             }
             other => panic!("expected InvalidArgument (→ 400), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn unreadable_options_are_refused_before_fetching_the_document() {
+        let base = request(IDENTIFIER, &[]);
+        super::super::optional_arguments_tests::rejects_unreadable(
+            &base,
+            &["format", "as", "fragment"],
+            |req| {
+                let bindings = ikigai_core::Bindings::new();
+                let cap = Capability::root();
+                block_on(Foaf.invoke(&Invocation::detached(req, &bindings, &cap)))
+            },
+        );
     }
 
     #[test]

@@ -45,7 +45,8 @@ description = "The time transport: originates kernel resource-requests on a time
 # crate's API (`set_resolver`), so the move is a minor; the published 0.7.0 cannot take a 0.5 resolver.
 # 0.9.0 — on ikigai-core 0.4 and ikigai-resolve 0.7.1, the core 0.4.0 cascade (ledger #4088). Core's
 # types and `Resolver` are in this crate's API, so the move is a minor. No refusal reads differently.
-version = "0.9.0"
+# 0.9.1 — invalid optional job arguments are refused instead of silently defaulted (#4373).
+version = "0.9.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true

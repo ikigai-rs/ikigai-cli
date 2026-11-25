@@ -111,7 +111,16 @@ impl Endpoint for DecisionLog {
                 let lines = read_lines(&self.path);
 
                 // `blocked=<email>` — the membership check the booking handler makes.
-                if let Ok(email) = inv.inline_str("blocked") {
+                let action = inv.optional_str("action")?.map(str::trim);
+                if let Some(value) = action {
+                    if !["approve", "decline", "block"].contains(&value) {
+                        return Err(Error::InvalidArgument {
+                            name: "action".to_string(),
+                            detail: "expected approve, decline, or block".to_string(),
+                        });
+                    }
+                }
+                if let Some(email) = inv.optional_str("blocked")? {
                     let yes = is_blocked_at(&self.path, email);
                     return Ok(Representation::new(
                         ReprType::new("text/plain"),
@@ -120,11 +129,7 @@ impl Endpoint for DecisionLog {
                 }
 
                 // `action=block` — the blocklist, one address per line.
-                if inv
-                    .inline_str("action")
-                    .map(|a| a.trim() == "block")
-                    .unwrap_or(false)
-                {
+                if action == Some("block") {
                     let body = blocked_emails(&lines).join("\n");
                     return Ok(Representation::new(
                         ReprType::new("text/plain").with_param("charset", "utf-8"),

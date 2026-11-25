@@ -247,11 +247,11 @@ pub fn convert() -> FnEndpoint {
 pub fn now() -> FnEndpoint {
     FnEndpoint::new("tz-now", |inv: &Invocation<'_>| {
         let (now, source) = read_now(inv)?;
-        let body = match inv.inline_str("zone") {
-            Ok(z) => now
+        let body = match inv.optional_str("zone")? {
+            Some(z) => now
                 .with_timezone(&parse_zone(z.trim(), "zone")?)
                 .to_rfc3339(),
-            Err(_) => now.with_timezone(&Local).to_rfc3339(),
+            None => now.with_timezone(&Local).to_rfc3339(),
         };
         Ok(fresh(text(body), now, source))
     })
@@ -287,6 +287,51 @@ mod tests {
         ArgRef, Capability, Endpoint, Expiry, FixedClock, Iri, Kernel, Request, Scope,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn now_defaults_only_when_zone_is_absent() {
+        let at = DateTime::parse_from_rfc3339("2026-07-21T12:00:00Z")
+            .unwrap()
+            .to_utc();
+        let cap = Capability::root();
+        let bindings = ikigai_core::Bindings::new();
+        let endpoint = now();
+        let base = Request::new(Verb::Source, Iri::parse("urn:tz:now").unwrap());
+        let issue = |request: &Request| {
+            let clock = Arc::new(FixedClock::at(at.timestamp_millis() as u64));
+            let inv = Invocation::detached(request, &bindings, &cap).with_clock(clock);
+            block_on(endpoint.invoke(&inv))
+        };
+        assert_eq!(
+            issue(&base).unwrap().bytes,
+            at.with_timezone(&Local).to_rfc3339().into_bytes()
+        );
+        assert_eq!(
+            issue(
+                &base
+                    .clone()
+                    .with_arg("zone", ArgRef::Inline(b"UTC".to_vec()))
+            )
+            .unwrap()
+            .bytes,
+            at.to_rfc3339().into_bytes()
+        );
+        for (arg, reason) in [
+            (ArgRef::Inline(vec![0xff]), "not valid UTF-8"),
+            (
+                ArgRef::Reference(Iri::parse("urn:test:zone").unwrap()),
+                "expected an inline value",
+            ),
+            (ArgRef::Inline(b"not-a-zone".to_vec()), "not-a-zone"),
+        ] {
+            let result = issue(&base.clone().with_arg("zone", arg));
+            assert!(
+                matches!(&result, Err(Error::InvalidArgument { name, detail })
+                    if name == "zone" && detail.contains(reason)),
+                "{result:?}"
+            );
+        }
+    }
 
     /// Convert `input` with the given args through a real kernel; return the body text.
     fn convert_ok(input: &str, args: &[(&str, &str)]) -> String {

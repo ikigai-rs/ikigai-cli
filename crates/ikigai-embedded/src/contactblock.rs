@@ -302,13 +302,10 @@ fn read_signing_key(path: &std::path::Path) -> Result<SigningKey> {
 /// The id of the enquiry a minter was handed (`enquiry=`, the tuple as the reactor handed it),
 /// or `None` when it was handed none and `required` is false.
 fn enquiry_of(inv: &Invocation<'_>, required: bool) -> Result<Option<String>> {
-    let text = match inv.inline_arg("enquiry") {
-        Ok(bytes) => bytes,
-        Err(Error::MissingArgument(_)) if !required => return Ok(None),
-        Err(Error::MissingArgument(_)) => {
-            return Err(Error::MissingArgument("enquiry".to_string()))
-        }
-        Err(other) => return Err(other),
+    let text = match inv.optional_arg("enquiry")? {
+        Some(bytes) => bytes,
+        None if !required => return Ok(None),
+        None => return Err(Error::MissingArgument("enquiry".to_string())),
     };
     if text.is_empty() || text.len() > MAX_ENQUIRY_BYTES {
         return Err(Error::InvalidArgument {
@@ -393,11 +390,15 @@ impl<E> HandlerTupleIds<E> {
 #[async_trait::async_trait]
 impl<E: Endpoint> Endpoint for HandlerTupleIds<E> {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        // optional-arg: deliberate: this best-effort annotation leaves argument validation
+        // to the wrapped endpoint, which may accept input this wrapper cannot read inline.
         let stored = inv
             .inline_str("tuple")
             .ok()
             .filter(|id| enquiry_id_shaped(id))
             .map(str::to_string);
+        // optional-arg: deliberate: only inline bytes can be hashed here, and the wrapped
+        // endpoint still receives the original invocation, including any body or reference.
         let text = inv
             .inline_arg("content")
             .or_else(|_| inv.inline_arg("in"))
@@ -478,11 +479,7 @@ impl Default for ContactBlockLink {
 impl Endpoint for ContactBlockLink {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         require_mint(inv, "block")?;
-        let email = inv
-            .inline_str("email")
-            .map_err(|_| Error::MissingArgument("email".to_string()))?
-            .trim()
-            .to_string();
+        let email = inv.inline_str("email")?.trim().to_string();
         if !email_shaped(&email) {
             return Err(Error::InvalidArgument {
                 name: "email".to_string(),
@@ -565,11 +562,7 @@ impl Default for ContactLabelLink {
 impl Endpoint for ContactLabelLink {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         require_mint(inv, "label")?;
-        let label = inv
-            .inline_str("label")
-            .map_err(|_| Error::MissingArgument("label".to_string()))?
-            .trim()
-            .to_string();
+        let label = inv.inline_str("label")?.trim().to_string();
         if !LABELS.contains(&label.as_str()) {
             return Err(Error::InvalidArgument {
                 name: "label".to_string(),
@@ -578,8 +571,8 @@ impl Endpoint for ContactLabelLink {
         }
         // The class the filter gave the enquiry, optional. Given, it must be one of the set
         // (an empty value is not "none": a caller that has no class leaves the argument out).
-        let class = match inv.inline_str("class") {
-            Ok(c) => {
+        let class = match inv.optional_str("class")? {
+            Some(c) => {
                 let c = c.trim().to_string();
                 if !CLASSES.contains(&c.as_str()) {
                     return Err(Error::InvalidArgument {
@@ -589,7 +582,7 @@ impl Endpoint for ContactLabelLink {
                 }
                 c
             }
-            Err(_) => String::new(),
+            None => String::new(),
         };
         let enquiry = enquiry_of(inv, true)?.unwrap_or_default();
 
@@ -1892,6 +1885,31 @@ mod endpoint_tests {
         // Minted with no class: the link carries none and neither does its drop.
         assert!(!q.contains_key("class"), "{url}");
         assert_eq!(crate::decide::field(&dropped[0], "class"), None);
+    }
+
+    #[test]
+    fn a_label_link_never_drops_an_unreadable_class() {
+        let w = world("invalid-class");
+        let base = Request::new(Verb::Source, Iri::parse("urn:contactlabel:link").unwrap())
+            .with_arg("label", ArgRef::Inline(b"spam".to_vec()))
+            .with_arg("enquiry", ArgRef::Inline(ENQUIRY.as_bytes().to_vec()));
+        let endpoint = ContactLabelLink {
+            key_path: w._dir.join("contact-block.key"),
+        };
+        let bindings = ikigai_core::Bindings::new();
+        let cap = Capability::root();
+        let issue =
+            |req: &Request| block_on(endpoint.invoke(&Invocation::detached(req, &bindings, &cap)));
+        let unclassified = issue(&base).unwrap();
+        assert!(!String::from_utf8_lossy(&unclassified.bytes).contains("&class="));
+        let classified = issue(
+            &base
+                .clone()
+                .with_arg("class", ArgRef::Inline(b"spam".to_vec())),
+        )
+        .unwrap();
+        assert!(String::from_utf8_lossy(&classified.bytes).contains("&class=spam"));
+        crate::optional_arguments_tests::rejects_unreadable(&base, &["class"], issue);
     }
 
     /// Ledger #3868: a link minted with the filter's class signs it, shows it on, and drops it.

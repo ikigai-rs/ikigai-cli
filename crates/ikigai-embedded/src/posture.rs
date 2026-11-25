@@ -511,17 +511,14 @@ pub(crate) fn host_posture() -> FnEndpoint {
                 .into(),
             ));
         }
-        let turtle = inv
-            .inline_str("as")
-            .map(|v| v.contains("turtle"))
-            .unwrap_or(false);
+        let face = crate::optional_face(inv, "text/plain", "text/turtle")?;
         let recorded = posture();
-        let (body, repr) = if turtle {
-            (posture_turtle(recorded.as_ref()), "text/turtle")
+        let body = if face == "text/turtle" {
+            posture_turtle(recorded.as_ref())
         } else {
-            (posture_text(recorded.as_ref()), "text/plain")
+            posture_text(recorded.as_ref())
         };
-        Ok(Representation::new(ReprType::new(repr), body.into_bytes()))
+        Ok(Representation::new(ReprType::new(face), body.into_bytes()))
     })
     .with_description(
         Description::new("host-posture")
