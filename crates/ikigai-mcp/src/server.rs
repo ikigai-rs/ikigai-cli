@@ -13,15 +13,24 @@
 //! the manifold the model sees and the calls it can make never exceed the grant.
 
 use futures::executor::block_on;
-use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request};
+use ikigai_core::{ActionQuery, ArgRef, Capability, Iri, Kernel, Request, Verb};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::{action_to_tool, parse_tool_name, ToolFilter};
 
-/// The MCP protocol revision this server implements against.
-const PROTOCOL_VERSION: &str = "2024-11-05";
+/// The preferred revision, and the legacy revision without structured tool results.
+const PROTOCOL_VERSION: &str = "2025-06-18";
+const LEGACY_PROTOCOL_VERSION: &str = "2024-11-05";
+
+fn protocol_version(msg: &Value) -> &'static str {
+    match msg["params"]["protocolVersion"].as_str() {
+        Some(LEGACY_PROTOCOL_VERSION) => LEGACY_PROTOCOL_VERSION,
+        _ => PROTOCOL_VERSION,
+    }
+}
 
 /// JSON-RPC 2.0 §5.1: the input is not JSON at all.
 pub const PARSE_ERROR: i64 = -32700;
@@ -37,11 +46,11 @@ pub const METHOD_NOT_FOUND: i64 = -32601;
 /// Anything else that is not a valid Request gets `-32600 Invalid Request`, under the
 /// message's `id` when that is readable (a string, a number or null) and under `null`
 /// otherwise — never silence, which a client cannot tell from a hang.
+/// This stateless entry point uses the preferred revision for tool calls. The
+/// stdio loop remembers the revision agreed at initialization.
 ///
-/// A JSON array is a batch, and batching is not part of the MCP revision this server
-/// implements (2024-11-05: MCP added batches in 2025-03-26 and
-/// removed them again in 2025-06-18), so every array, empty or not, is one
-/// `-32600` under `null`.
+/// Neither supported MCP revision allows batches (added in 2025-03-26 and removed
+/// in 2025-06-18), so every array, empty or not, is one `-32600` under `null`.
 ///
 /// ```
 /// # use ikigai_core::{Capability, EndpointSpace, Kernel};
@@ -74,10 +83,13 @@ pub fn handle(
     };
 
     match method {
-        "initialize" => Some(ok(id, initialize_result())),
+        "initialize" => Some(ok(id, initialize_result(protocol_version(msg)))),
         "ping" => Some(ok(id, json!({}))),
         "tools/list" => Some(ok(id, tools_list(kernel, capability, filter))),
-        "tools/call" => Some(ok(id, tools_call(kernel, capability, msg.get("params")))),
+        "tools/call" => Some(ok(
+            id,
+            tools_call(kernel, capability, msg.get("params"), PROTOCOL_VERSION),
+        )),
         other => Some(err(
             id,
             METHOD_NOT_FOUND,
@@ -302,7 +314,7 @@ fn shape(msg: &Value) -> Shape<'_> {
         let reason = match msg {
             Value::Array(batch) if batch.is_empty() => "an empty batch".to_string(),
             Value::Array(_) => format!(
-                "a batch: JSON-RPC batching is not part of MCP {PROTOCOL_VERSION}; \
+                "a batch: JSON-RPC batching is not part of MCP {LEGACY_PROTOCOL_VERSION} or {PROTOCOL_VERSION}; \
                  send each message on its own line"
             ),
             _ => "a JSON-RPC message is an object".to_string(),
@@ -359,9 +371,9 @@ fn err(id: Value, code: i64, message: &str, data: Option<&str>) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": error })
 }
 
-fn initialize_result() -> Value {
+fn initialize_result(version: &str) -> Value {
     json!({
-        "protocolVersion": PROTOCOL_VERSION,
+        "protocolVersion": version,
         "capabilities": { "tools": { "listChanged": true } },
         "serverInfo": { "name": "ikigai", "version": env!("CARGO_PKG_VERSION") },
     })
@@ -554,7 +566,12 @@ fn tool_groups(matches: Vec<ikigai_core::ActionMatch>, report: bool) -> Vec<Tool
 /// request. Failures come back as an MCP tool result with `isError: true` and
 /// the reason as text — data the model can read and repair from — never a
 /// JSON-RPC protocol error.
-fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) -> Value {
+fn tools_call(
+    kernel: &Kernel,
+    capability: &Capability,
+    params: Option<&Value>,
+    version: &str,
+) -> Value {
     let params = params.cloned().unwrap_or_else(|| json!({}));
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let arguments = params
@@ -848,7 +865,7 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
             ));
         }
     }
-    let mut request = Request::new(verb, target_iri);
+    let mut request = Request::new(verb, target_iri.clone());
     for (k, v) in req_args {
         request = request.with_arg(k, ArgRef::Inline(v.into_bytes()));
     }
@@ -856,18 +873,94 @@ fn tools_call(kernel: &Kernel, capability: &Capability, params: Option<&Value>) 
     // session capability carries (minted by `ikigai mcp --principal`), or removes it, the rule
     // every door that builds a request applies.
     ikigai_resolve::stamp_principal(&mut request, capability.principal());
-    match block_on(kernel.issue(request, capability)) {
-        Ok(repr) => tool_representation(&target, repr),
-        Err(e) => tool_error(kernel_failure(&e)),
+    let answer = match block_on(kernel.issue(request, capability)) {
+        Ok(repr) => repr,
+        Err(e) => return tool_error(kernel_failure(&e)),
+    };
+    let evidence =
+        if version != LEGACY_PROTOCOL_VERSION && answer.bytes.len() <= MAX_TOOL_RESULT_BYTES {
+            tool_evidence(kernel, capability, &target_iri, &answer)
+        } else {
+            None
+        };
+    let mut result = tool_representation(&target, answer);
+    if let Some(evidence) = evidence {
+        // Keep the answer in its original first block. Also make the evidence
+        // available to clients that only pass text blocks on to the model.
+        result["content"].as_array_mut().unwrap().push(json!({
+            "type": "text",
+            "text": evidence.to_string(),
+        }));
+        result["structuredContent"] = evidence;
     }
+    result
+}
+
+/// Maximum number of readable provenance IRIs returned with one tool answer.
+const MAX_EVIDENCE_IRIS: usize = 32;
+
+fn tool_evidence(
+    kernel: &Kernel,
+    capability: &Capability,
+    target: &Iri,
+    answer: &ikigai_core::Representation,
+) -> Option<Value> {
+    if answer.threads().is_empty() {
+        return None;
+    }
+    // A cacheable read also hangs from its own canonical target. That is not a
+    // source of the answer. If alias canonicalization fails, omit the evidence.
+    let canonical = kernel.canonical(target).ok()?;
+    let canonical = canonical.as_ref().map(Iri::as_str);
+    let mut candidates = answer
+        .threads()
+        .iter()
+        .map(ikigai_core::Thread::as_str)
+        .filter(|iri| *iri != target.as_str() && Some(*iri) != canonical)
+        .peekable();
+    candidates.peek()?;
+
+    // Threads are invalidation keys, not proofs of access. Require a concrete
+    // Source offer in the caller's current manifold. A template offer cannot
+    // authorize an instance, and a scoped family grant is only a dispatch
+    // floor (the endpoint can still reject a particular path or host).
+    let readable: HashSet<_> = kernel
+        .select_actions(&ActionQuery {
+            capability: Some(capability),
+            verb: Some(Verb::Source),
+            ..Default::default()
+        })
+        .into_iter()
+        .filter(|row| {
+            capability.is_root() || row.requires.iter().all(|scope| !scope.ends_with('*'))
+        })
+        .map(|row| row.endpoint)
+        .collect();
+    let mut evidence = Vec::new();
+    let mut truncated = false;
+    for name in candidates {
+        if !readable.contains(name) {
+            continue;
+        }
+        let Ok(iri) = Iri::parse(name) else { continue };
+        // An offer under a logical name is not proof that the caller can
+        // read a different resource reached by rewriting that name.
+        if !matches!(kernel.canonical(&iri), Ok(None)) {
+            continue;
+        }
+        if evidence.len() == MAX_EVIDENCE_IRIS {
+            truncated = true;
+            break;
+        }
+        evidence.push(name);
+    }
+    (!evidence.is_empty()).then(|| json!({"evidence": evidence, "evidenceTruncated": truncated}))
 }
 
 /// The text a tool result carries for a kernel error (ledger #1546): core's own display,
 /// then one line naming the `kind` and the failure `class`, and the delay in whole
 /// milliseconds for a `RetryAfter`, so an agent reads "retry-after, 30000 ms" rather than
-/// parsing prose. It rides in the text because the protocol version this server declares
-/// (2024-11-05) gives a tool result no structured slot (`structuredContent` arrives with
-/// 2025-06-18; adopting it is a protocol move, not this change).
+/// parsing prose. Its text format is unchanged across protocol revisions.
 ///
 /// ```
 /// use std::time::Duration;
@@ -1032,6 +1125,7 @@ pub fn serve_concurrent<W: std::io::Write + Send>(
     max_calls: usize,
 ) -> std::io::Result<()> {
     let running = AtomicUsize::new(0);
+    let mut version = PROTOCOL_VERSION;
     // A call's thread that could not write: the client has gone. The reading thread stops at
     // the next line rather than serving nobody.
     let gone: Mutex<Option<std::io::Error>> = Mutex::new(None);
@@ -1064,6 +1158,14 @@ pub fn serve_concurrent<W: std::io::Write + Send>(
             let id = match shape(&msg) {
                 Shape::Request {
                     id,
+                    method: "initialize",
+                } => {
+                    version = protocol_version(&msg);
+                    write_line(output, &ok(id, initialize_result(version)))?;
+                    continue;
+                }
+                Shape::Request {
+                    id,
                     method: "tools/call",
                 } => id,
                 _ => {
@@ -1090,7 +1192,7 @@ pub fn serve_concurrent<W: std::io::Write + Send>(
                 .spawn_scoped(scope, move || {
                     let _slot = slot; // freed after the answer is written, never before
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        tools_call(kernel, &capability, msg.get("params"))
+                        tools_call(kernel, &capability, msg.get("params"), version)
                     }));
                     let reply = match result {
                         Ok(result) => ok(reply_id, result),
@@ -1204,6 +1306,170 @@ mod tests {
         );
         let space = EndpointSpace::new().bind(Exact::new("urn:demo:echo"), echo);
         Kernel::new(Arc::new(space))
+    }
+
+    fn evidence_call() -> Value {
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+               "params":{"name":"composite__source"}})
+    }
+
+    fn evidence_result(kernel: &Kernel, cap: &Capability) -> Value {
+        handle(kernel, cap, &ToolFilter::default(), &evidence_call()).unwrap()["result"].take()
+    }
+
+    // The composite actually reads each public source. It also declares an
+    // invalidation edge to a protected resource, whose name the caller need not know.
+    #[allow(clippy::disallowed_methods)] // internal: test fixture
+    fn evidence_kernel(count: usize) -> Kernel {
+        let source = |description: Description| {
+            FnEndpoint::new(description.id.clone(), |_| {
+                Ok(Representation::new(ReprType::new("text/plain"), b"part".to_vec()).cacheable())
+            })
+            .with_description(description.verb(Verb::Source))
+        };
+        let composite = ikigai_core::AsyncFnEndpoint::new("composite", move |inv| {
+            Box::pin(async move {
+                let mut answer = Vec::new();
+                for i in 0..count {
+                    let iri = Iri::parse(format!("urn:evidence:public:{i:02}")).unwrap();
+                    answer.extend(inv.source(&iri).await?.bytes);
+                }
+                Ok(Representation::new(ReprType::new("text/plain"), answer)
+                    .cacheable()
+                    .depends_on("urn:evidence:private")
+                    .depends_on("urn:evidence:unbound")
+                    .depends_on("not an IRI"))
+            })
+        })
+        .with_description(Description::new("composite").verb(Verb::Source));
+        let mut space = EndpointSpace::new()
+            .bind(Exact::new("urn:evidence:composite"), composite)
+            .bind(
+                Exact::new("urn:evidence:private"),
+                source(Description::new("private").requires("urn:cap:evidence:private")),
+            );
+        for i in 0..count {
+            space = space.bind(
+                Exact::new(format!("urn:evidence:public:{i:02}")),
+                source(Description::new(format!("part-{i}")).requires("urn:cap:evidence:read")),
+            );
+        }
+        Kernel::new(Arc::new(space))
+    }
+
+    #[test]
+    fn composite_tool_answer_names_its_sources_even_when_cached() {
+        let kernel = evidence_kernel(2);
+        let cap = Capability::scoped(["urn:cap:evidence:read"]);
+        let expected = json!({
+            "evidence": ["urn:evidence:public:00", "urn:evidence:public:01"],
+            "evidenceTruncated": false
+        });
+        for _ in 0..2 {
+            let result = evidence_result(&kernel, &cap);
+            assert_eq!(result["content"][0]["text"], "partpart");
+            assert_eq!(result["structuredContent"], expected);
+            let fallback: Value =
+                serde_json::from_str(result["content"][1]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(fallback, expected);
+            assert!(kernel.is_cached(
+                &Request::new(Verb::Source, Iri::parse("urn:evidence:composite").unwrap()),
+                &cap
+            ));
+        }
+    }
+
+    #[test]
+    fn evidence_does_not_name_resources_outside_the_caller_grant() {
+        let kernel = evidence_kernel(1);
+        let cap = Capability::scoped(["urn:cap:evidence:read"]);
+        let result = evidence_result(&kernel, &cap);
+        assert_eq!(result["isError"], false);
+        assert!(!result.to_string().contains("urn:evidence:private"));
+        assert_eq!(
+            result["structuredContent"]["evidence"],
+            json!(["urn:evidence:public:00"])
+        );
+
+        // The protected thread really is present and publishable with the right grant.
+        let wider = Capability::scoped(["urn:cap:evidence:read", "urn:cap:evidence:private"]);
+        assert_eq!(
+            evidence_result(&kernel, &wider)["structuredContent"]["evidence"],
+            json!(["urn:evidence:private", "urn:evidence:public:00"])
+        );
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)] // internal: test fixture
+    fn a_wildcard_family_offer_does_not_authorize_an_evidence_iri() {
+        let candidate = "urn:evidence:guarded";
+        let guarded = FnEndpoint::new("guarded", |_| panic!("evidence must not probe by invoking"))
+            .with_description(
+                Description::new("guarded")
+                    .verb(Verb::Source)
+                    .requires("urn:cap:evidence:path:*"),
+            );
+        let composite = FnEndpoint::new("composite", move |_| {
+            Ok(
+                Representation::new(ReprType::new("text/plain"), b"part".to_vec())
+                    .depends_on(candidate),
+            )
+        })
+        .with_description(Description::new("composite").verb(Verb::Source));
+        let kernel = Kernel::new(Arc::new(
+            EndpointSpace::new()
+                .bind(Exact::new("urn:evidence:composite"), composite)
+                .bind(Exact::new(candidate), guarded),
+        ));
+        let cap = Capability::scoped(["urn:cap:evidence:path:another"]);
+        assert!(cap.satisfies("urn:cap:evidence:path:*"));
+        assert_eq!(evidence_result(&kernel, &cap), tool_text("part".to_owned()));
+    }
+
+    #[test]
+    fn evidence_cap_counts_only_disclosable_iris_and_reports_truncation() {
+        let cap = Capability::scoped(["urn:cap:evidence:read"]);
+        let expected: Vec<_> = (0..MAX_EVIDENCE_IRIS)
+            .map(|i| format!("urn:evidence:public:{i:02}"))
+            .collect();
+        for extra in [0, 1] {
+            let kernel = evidence_kernel(MAX_EVIDENCE_IRIS + extra);
+            let result = evidence_result(&kernel, &cap);
+            assert_eq!(
+                result["structuredContent"],
+                json!({"evidence": expected, "evidenceTruncated": extra != 0})
+            );
+        }
+    }
+
+    #[test]
+    fn stdio_emits_evidence_only_in_a_revision_that_supports_structured_results() {
+        let kernel = evidence_kernel(1);
+        let cap = Capability::scoped(["urn:cap:evidence:read"]);
+        for version in [LEGACY_PROTOCOL_VERSION, PROTOCOL_VERSION] {
+            let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+                              "params":{"protocolVersion":version}});
+            let input = format!("{init}\n{}\n", evidence_call());
+            let mut output = Vec::new();
+            serve_io(&kernel, &cap, input.as_bytes(), &mut output).unwrap();
+            let replies: Vec<Value> = std::str::from_utf8(&output)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(replies.len(), 2);
+            assert_eq!(replies[0]["result"]["protocolVersion"], version);
+            let result = &replies[1]["result"];
+            assert_eq!(result["content"][0]["text"], "part");
+            if version == LEGACY_PROTOCOL_VERSION {
+                assert_eq!(*result, tool_text("part".to_owned()));
+            } else {
+                assert_eq!(
+                    result["structuredContent"]["evidence"],
+                    json!(["urn:evidence:public:00"])
+                );
+            }
+        }
     }
 
     /// An endpoint with an OPTIONAL by-value argument, echoing what reached it.
@@ -2583,8 +2849,7 @@ mod manifold_identity_948 {
     }
 
     /// Ledger #1546: a kernel error's tool result names the kind and the failure class (and
-    /// a RetryAfter's delay) on a line of its own, since the 2024-11-05 result has no
-    /// structured slot. The display stays the first line.
+    /// a RetryAfter's delay) on a line of its own. The display stays the first line.
     #[test]
     fn a_kernel_failure_names_its_kind_and_class_in_the_tool_result() {
         let limited = FnEndpoint::new("limited", |_| {
@@ -2786,7 +3051,7 @@ mod jsonrpc_1309 {
             replies[2]["error"]["data"]
                 .as_str()
                 .unwrap()
-                .contains("batching is not part of MCP 2024-11-05"),
+                .contains("batching is not part of MCP 2024-11-05 or 2025-06-18"),
             "{}",
             replies[2]
         );

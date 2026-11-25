@@ -139,21 +139,34 @@ forbids.
   as text or text with another declared charset, are embedded resource content:
   `resource.uri` is the invoked target IRI, `resource.mimeType` preserves the
   representation type and parameters, and `resource.blob` is standard padded
-  base64. This uses MCP 2024-11-05's
-  [embedded resources](https://modelcontextprotocol.io/specification/2024-11-05/server/tools#embedded-resources)
-  and [binary resource content](https://modelcontextprotocol.io/specification/2024-11-05/server/resources#resource-contents).
+  base64. This uses MCP
+  [embedded resources](https://modelcontextprotocol.io/specification/2025-06-18/server/tools#embedded-resources)
+  and [binary resource content](https://modelcontextprotocol.io/specification/2025-06-18/server/resources#resource-contents).
   Answers over `MAX_TOOL_RESULT_BYTES` (8 MiB of raw body bytes) return an
   `isError: true` refusal, with no truncated payload. The check runs before text
   conversion, base64 and JSON serialization; the kernel still allocates the
   complete representation before this check. Embedded answers do not add a
   `resources/read` service.
+- **Evidence references** — on MCP 2025-06-18, a successful tool result can
+  carry [structured content](https://modelcontextprotocol.io/specification/2025-06-18/server/tools#structured-content)
+  beside its original answer. `structuredContent.evidence` is a sorted list of
+  up to 32 distinct resource IRIs from the answer's golden threads, including
+  threads retained on cache hits. `evidenceTruncated` is true only if more
+  disclosable IRIs were left out because of the limit. The same object appears
+  as a second text block for clients that consume only `content`.
+  The projection requires a concrete Source offer under the caller's grant. It
+  skips the answer's own name, unbound threads and alias rewrites, and does not
+  treat a template offer or a scoped wildcard family grant as proof of access.
+  These are references, not an exhaustive execution trace. The field is absent
+  when there are no disclosable references. A client that negotiates MCP
+  2024-11-05 keeps the original result format without evidence.
 - **Protocol errors per JSON-RPC 2.0 §5.1** — a line that is not JSON gets
   `-32700 Parse error` under `"id": null`; JSON that is not a valid Request (no
   `"jsonrpc": "2.0"`, no `method`, an `id` that is not a string, number or null, a
-  scalar, or any array: batching is not part of MCP 2024-11-05, the revision this
-  server implements) gets `-32600 Invalid Request`, under the request's `id` when it
-  is readable. The reason rides in `error.data`. A notification, or a client's own
-  response (a `result` or an `error` with no `method`), is never answered.
+  scalar, or any array, because neither supported MCP revision allows batching)
+  gets `-32600 Invalid Request`, under the request's `id` when it is readable.
+  The reason rides in `error.data`. A notification, or a client's own response
+  (a `result` or an `error` with no `method`), is never answered.
 - **Concurrent calls** (0.1.64+) — each `tools/call` runs on its own thread and
   is answered when it finishes, so one long call (a feed's `wait=50`) holds no
   other tool up; responses to calls come back in the order they finish, matched
