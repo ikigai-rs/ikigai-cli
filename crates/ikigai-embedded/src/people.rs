@@ -137,7 +137,7 @@ impl Endpoint for PeopleLedger {
                 }
                 let lines = read_lines(&self.path);
                 // `email=<addr>` — one person's contact history.
-                let body = if let Ok(email) = inv.inline_str("email") {
+                let body = if let Some(email) = inv.optional_str("email")? {
                     history(&lines, email).join("\n")
                 } else {
                     // Otherwise the roster, folded to one entry per address.

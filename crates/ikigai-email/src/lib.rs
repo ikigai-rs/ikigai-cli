@@ -186,24 +186,25 @@ impl Endpoint for SendEndpoint {
             ));
         }
 
-        let to = address_like("to", inv.inline_str("to").unwrap_or_default())?;
-        let subject = header_safe("subject", inv.inline_str("subject").unwrap_or_default())?;
-        let reply_to = match inv.inline_str("reply_to") {
-            Ok(value) if !value.trim().is_empty() => Some(address_like("reply_to", value)?),
+        let to = address_like("to", inv.inline_str("to")?)?;
+        let subject = header_safe("subject", inv.inline_str("subject")?)?;
+        let reply_to = match inv.optional_str("reply_to")? {
+            Some(value) if !value.trim().is_empty() => Some(address_like("reply_to", value)?),
             _ => None,
         };
         // The body is the piped content (`content`, falling back to `in`) — a Sink's body.
-        let body = inv
-            .inline_str("content")
-            .or_else(|_| inv.inline_str("in"))
-            .map_err(|_| Error::MissingArgument("content".to_string()))?
-            .to_string();
+        let body = match inv.optional_str("content")? {
+            Some(body) => body,
+            None => inv
+                .optional_str("in")?
+                .ok_or_else(|| Error::MissingArgument("content".to_string()))?,
+        }
+        .to_string();
 
         // An optional calendar invite. Not header-checked (it is a body part, not a
         // header) but it must be non-empty to count.
         let ics = inv
-            .inline_str("ics")
-            .ok()
+            .optional_str("ics")?
             .map(str::to_string)
             .filter(|s| !s.trim().is_empty());
 
@@ -446,6 +447,79 @@ mod tests {
         assert_eq!(sent[0].from, "site@example.com", "the configured From");
         assert_eq!(sent[0].reply_to.as_deref(), Some("someone@example.com"));
         assert_eq!(sent[0].body, "Hello, I would like to talk.");
+    }
+
+    #[test]
+    fn a_send_refuses_unreadable_arguments_without_delivering() {
+        let mail = FakeMail::ok();
+        let endpoint = SendEndpoint {
+            config: EmailConfig {
+                host: "localhost".to_string(),
+                port: 25,
+                from: "site@example.com".to_string(),
+            },
+            transport: mail.clone(),
+        };
+        let base = send_request(&[
+            ("to", "owner@example.com"),
+            ("subject", "Hello"),
+            ("content", "Body"),
+        ]);
+        let bindings = ikigai_core::Bindings::new();
+        let cap = cap();
+        let issue =
+            |req: &Request| block_on(endpoint.invoke(&Invocation::detached(req, &bindings, &cap)));
+        issue(&base).unwrap();
+        let explicit = base
+            .clone()
+            .with_arg("reply_to", ArgRef::Inline(b"sender@example.com".to_vec()))
+            .with_arg(
+                "ics",
+                ArgRef::Inline(b"BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n".to_vec()),
+            );
+        issue(&explicit).unwrap();
+        {
+            let sent = mail.sent.lock().unwrap();
+            assert_eq!(sent[0].reply_to, None);
+            assert_eq!(sent[0].ics, None);
+            assert_eq!(sent[1].reply_to.as_deref(), Some("sender@example.com"));
+            assert!(sent[1]
+                .ics
+                .as_deref()
+                .unwrap()
+                .starts_with("BEGIN:VCALENDAR"));
+        }
+
+        // An alias is a fallback for absence, not for a broken explicit body.
+        let alias = send_request(&[
+            ("to", "owner@example.com"),
+            ("subject", "Hello"),
+            ("in", "Via alias"),
+        ]);
+        issue(&alias).unwrap();
+        assert_eq!(mail.sent.lock().unwrap()[2].body, "Via alias");
+        for name in ["reply_to", "ics", "to", "subject", "content", "in"] {
+            for (arg, reason) in [
+                (ArgRef::Inline(vec![0xff]), "not valid UTF-8"),
+                (
+                    ArgRef::Reference(Iri::parse("urn:test:argument").unwrap()),
+                    "expected an inline value",
+                ),
+                (
+                    ArgRef::Content(ikigai_core::ContentId::of(b"body")),
+                    "expected an inline value",
+                ),
+            ] {
+                let request = alias.clone().with_arg(name, arg);
+                let err = issue(&request).expect_err(name);
+                assert!(
+                    matches!(&err, Error::InvalidArgument { name: actual, detail }
+                        if actual == name && detail.contains(reason)),
+                    "{err:?}"
+                );
+            }
+        }
+        assert_eq!(mail.sent.lock().unwrap().len(), 3);
     }
 
     #[test]

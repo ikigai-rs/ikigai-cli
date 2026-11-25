@@ -73,6 +73,8 @@ pub mod jsonl;
 pub mod layers;
 pub mod lisp;
 pub mod names;
+#[cfg(test)]
+mod optional_arguments_tests;
 mod orgfile;
 pub mod passkey;
 pub mod people;
@@ -737,6 +739,35 @@ fn greeter() -> FnEndpoint {
     )
 }
 
+fn invalid_argument(name: &str, detail: impl Into<String>) -> Error {
+    Error::InvalidArgument {
+        name: name.to_string(),
+        detail: detail.into(),
+    }
+}
+
+/// Read one of two declared media types, ignoring case and media-type parameters.
+fn optional_face(
+    inv: &Invocation<'_>,
+    default: &'static str,
+    alternate: &'static str,
+) -> Result<&'static str> {
+    let Some(raw) = inv.optional_str("as")? else {
+        return Ok(default);
+    };
+    let face = raw.split(';').next().unwrap_or(raw).trim();
+    if face.eq_ignore_ascii_case(default) {
+        Ok(default)
+    } else if face.eq_ignore_ascii_case(alternate) {
+        Ok(alternate)
+    } else {
+        Err(invalid_argument(
+            "as",
+            format!("expected {default} or {alternate}"),
+        ))
+    }
+}
+
 /// `urn:time:now` — the current **OS-local** time as `HH:MM`, **cacheable** until the
 /// next minute boundary (`Expiry::At`, honoured by the injected `SystemClock`). The
 /// REPL tab-bar clock sources it every render tick, but within the minute every request
@@ -754,7 +785,11 @@ fn clock_now() -> FnEndpoint {
         // The VALUE decides, not the presence: the kernel fills the declared default
         // `html=false` before this runs (core 0.1.105, ledger #19), and a presence test read
         // that as `true` and served the HTML face to every plain read.
-        let html = inv.inline_str("html").is_ok_and(|v| v == "true");
+        let html = match inv.optional_str("html")? {
+            None | Some("false") => false,
+            Some("true") => true,
+            Some(_) => return Err(invalid_argument("html", "expected true or false")),
+        };
         let (instant, source) = ikigai_tz::read_now(inv)?;
         let now = instant.with_timezone(&chrono::Local);
         let (h, m) = (now.hour(), now.minute());
@@ -1670,6 +1705,8 @@ fn selection_turtle(
 /// agent pick that tool" stays auditable.
 struct AgentSelectEndpoint;
 
+const AGENT_SELECT_VERBS: [&str; 4] = ["source", "sink", "exists", "delete"];
+
 #[async_trait::async_trait]
 impl Endpoint for AgentSelectEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
@@ -1678,15 +1715,25 @@ impl Endpoint for AgentSelectEndpoint {
             Iri::parse("urn:kernel:actions").expect("valid IRI"),
         )
         .with_arg("as", ikigai_core::ArgRef::Inline(b"text/turtle".to_vec()));
+        let goal = inv.optional_str("goal")?;
         for axis in ["types", "verb", "want"] {
-            if let Ok(value) = inv.inline_str(axis) {
+            if let Some(value) = inv.optional_str(axis)? {
+                if axis == "verb"
+                    && !AGENT_SELECT_VERBS
+                        .iter()
+                        .any(|v| value.eq_ignore_ascii_case(v))
+                {
+                    return Err(invalid_argument(
+                        "verb",
+                        "expected source, sink, exists, or delete",
+                    ));
+                }
                 request =
                     request.with_arg(axis, ikigai_core::ArgRef::Inline(value.as_bytes().to_vec()));
             }
         }
         let manifold = inv.issue(request).await?;
         let candidates = parse_action_matches(&String::from_utf8_lossy(&manifold.bytes));
-        let goal = inv.inline_str("goal").ok();
 
         if candidates.is_empty() {
             return Ok(Representation::new(
@@ -1806,7 +1853,7 @@ Authorized candidate actions:
                 ArgSpec::new("verb")
                     .summary("only actions answering this verb")
                     .class(XSD_STRING)
-                    .one_of(["source", "sink", "exists", "delete"])
+                    .one_of(AGENT_SELECT_VERBS)
                     .optional(),
             )
             .input(
@@ -2886,6 +2933,8 @@ struct LispAliases;
 #[async_trait::async_trait]
 impl Endpoint for LispAliases {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let prefix = inv.optional_str("prefix")?.unwrap_or("");
+        let face = optional_face(inv, "text/x-scheme", "text/x-emacs-lisp")?;
         // THE MANIFOLD, not the raw catalog: `urn:kernel:actions` is already narrowed to
         // what THIS capability may invoke, already carries the RESOLVABLE IRI
         // (`ik:endpoint <urn:iki:fn:toUpper>`, not the skolem description IRI), and already
@@ -2909,19 +2958,13 @@ impl Endpoint for LispAliases {
             .await?;
         let described = catalog_descriptions(&String::from_utf8_lossy(&catalog.bytes));
         let targets = alias_targets(&candidates, &described);
-        let prefix = inv.inline_str("prefix").unwrap_or("").to_string();
-        // Two REPRESENTATIONS of one resource, not two endpoints: the same projection,
-        // emitted for whichever lisp is asking.
-        let elisp = inv
-            .inline_str("as")
-            .map(|v| v.contains("emacs"))
-            .unwrap_or(false);
-        let (body, repr) = if elisp {
-            (aliases_elisp(&targets, &prefix), "text/x-emacs-lisp")
+        // Two representations of the same projection, one for each Lisp.
+        let body = if face == "text/x-emacs-lisp" {
+            aliases_elisp(&targets, prefix)
         } else {
-            (aliases_scheme(&targets, &prefix), "text/x-scheme")
+            aliases_scheme(&targets, prefix)
         };
-        Ok(Representation::new(ReprType::new(repr), body.into_bytes()))
+        Ok(Representation::new(ReprType::new(face), body.into_bytes()))
     }
 
     fn name(&self) -> &str {
@@ -3718,6 +3761,7 @@ impl Endpoint for KernelHealth {
                 format!("reading kernel health requires `{CAP_KERNEL_INSPECT}`").into(),
             ));
         }
+        let face = optional_face(inv, "text/plain", "text/turtle")?;
         let jobs = time_registry().health();
         // Peers only if a browse is ALREADY running: health must not start a background
         // multicast listener as a side effect, and on a machine whose peers are away the
@@ -3728,17 +3772,13 @@ impl Endpoint for KernelHealth {
             .map(|browser| browser.peers())
             .unwrap_or_default();
 
-        let turtle = inv
-            .inline_str("as")
-            .map(|v| v.contains("turtle"))
-            .unwrap_or(false);
         let context = HealthContext::now();
-        let (body, repr) = if turtle {
-            (health_turtle(&jobs, &peers, &context), "text/turtle")
+        let body = if face == "text/turtle" {
+            health_turtle(&jobs, &peers, &context)
         } else {
-            (health_text(&jobs, &peers, &context), "text/plain")
+            health_text(&jobs, &peers, &context)
         };
-        Ok(Representation::new(ReprType::new(repr), body.into_bytes()))
+        Ok(Representation::new(ReprType::new(face), body.into_bytes()))
     }
 
     fn name(&self) -> &str {
@@ -4224,43 +4264,17 @@ impl Endpoint for PeerList {
                 format!("listing peers requires `{CAP_NET_DISCOVER}`").into(),
             ));
         }
-        let (browser, fresh) = browse_in(&BROWSER, ikigai_discovery::Browser::start)?;
-        if fresh {
-            std::thread::sleep(FIRST_LISTEN);
-        }
-
-        let mut peers = browser.peers();
-        for peer in &mut peers {
-            peer.trusted = holds_cert_for(&peer.name);
-        }
-        // `trusted=yes` narrows to peers this machine could actually dial. Deliberately NOT
-        // the default: seeing an unenrolled peer is how you know there is something to
-        // enrol. What must never happen is CONNECTING to one, and that is the mount's
-        // business, not the listing's.
-        if inv
-            .inline_str("trusted")
-            .map(|v| v == "yes")
-            .unwrap_or(false)
-        {
-            peers.retain(|p| p.trusted);
-        }
-
-        let turtle = inv
-            .inline_str("as")
-            .map(|v| v.contains("turtle"))
-            .unwrap_or(false);
-        let body = if turtle {
-            peers_turtle(&peers)
-        } else {
-            peers_text(&peers)
-        };
-        let repr_type = if turtle { "text/turtle" } else { "text/plain" };
-        // Uncacheable by default (no .cacheable()) — live platform state: the answer
-        // changes when a laptop closes.
-        Ok(Representation::new(
-            ReprType::new(repr_type),
-            body.into_bytes(),
-        ))
+        list_peers(inv, || {
+            let (browser, fresh) = browse_in(&BROWSER, ikigai_discovery::Browser::start)?;
+            if fresh {
+                std::thread::sleep(FIRST_LISTEN);
+            }
+            let mut peers = browser.peers();
+            for peer in &mut peers {
+                peer.trusted = holds_cert_for(&peer.name);
+            }
+            Ok(peers)
+        })
     }
 
     fn name(&self) -> &str {
@@ -4296,6 +4310,31 @@ impl Endpoint for PeerList {
                     .requires(CAP_NET_DISCOVER),
             )
     }
+}
+
+fn list_peers(
+    inv: &Invocation<'_>,
+    read_peers: impl FnOnce() -> Result<Vec<ikigai_discovery::Peer>>,
+) -> Result<Representation> {
+    let trusted = match inv.optional_str("trusted")? {
+        None | Some("no") => false,
+        Some("yes") => true,
+        Some(_) => return Err(invalid_argument("trusted", "expected yes or no")),
+    };
+    let face = optional_face(inv, "text/plain", "text/turtle")?;
+    let mut peers = read_peers()?;
+    // Unenrolled peers are visible unless the caller asks for only trusted peers.
+    // Seeing a peer does not grant permission to dial it.
+    if trusted {
+        peers.retain(|p| p.trusted);
+    }
+    let body = if face == "text/turtle" {
+        peers_turtle(&peers)
+    } else {
+        peers_text(&peers)
+    };
+    // Uncacheable: peers can come and go at any time.
+    Ok(Representation::new(ReprType::new(face), body.into_bytes()))
 }
 
 fn peers_text(peers: &[ikigai_discovery::Peer]) -> String {

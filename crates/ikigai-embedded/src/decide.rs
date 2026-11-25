@@ -199,13 +199,16 @@ pub(crate) use ikigai_fn::html::url_segment as urlencode;
 /// (a `400` at the door) whose sentence names the byte offset, never a literal `%` or a U+FFFD
 /// handed to the caller as if it had been sent.
 pub(crate) fn param(inv: &Invocation<'_>, name: &str) -> Result<String> {
-    if let Ok(v) = inv.inline_str(name) {
+    let value = inv.optional_str(name)?;
+    let body = inv.optional_str("content")?;
+    if let Some(v) = value {
+        // A blank form field is not an override of a value in the submitted body.
         let v = v.trim();
         if !v.is_empty() {
             return Ok(v.to_string());
         }
     }
-    if let Ok(body) = inv.inline_str("content") {
+    if let Some(body) = body {
         if let Some((_, v)) = ikigai_intake::form_pairs(body)?
             .into_iter()
             .find(|(k, _)| k == name)
@@ -265,11 +268,7 @@ impl Endpoint for DecideLink {
                 format!("minting a decide link requires `{CAP_DECIDE_MINT}`").into(),
             ));
         }
-        let id = inv
-            .inline_str("id")
-            .map_err(|_| Error::MissingArgument("id".to_string()))?
-            .trim()
-            .to_string();
+        let id = inv.inline_str("id")?.trim().to_string();
         if !id_shaped(&id) {
             return Err(Error::InvalidArgument {
                 name: "id".to_string(),
@@ -749,9 +748,7 @@ impl Endpoint for DecideAccept {
                 format!("acting on a decision requires `{CAP_DECIDE_ACCEPT}`").into(),
             ));
         }
-        let tuple = inv
-            .inline_str("content")
-            .map_err(|_| Error::MissingArgument("content".to_string()))?;
+        let tuple = inv.inline_str("content")?;
 
         let get = |name: &str| field(tuple, name).unwrap_or_default();
         let (action, id, token) = (get("decide"), get("id"), get("token"));
