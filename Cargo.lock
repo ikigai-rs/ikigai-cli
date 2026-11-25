@@ -3763,12 +3763,13 @@ dependencies = [
 
 [[package]]
 name = "ikigai-runbook"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5606845ae6cfc630a6d2994396ccafbfba2377e4adc4ed13f71597ffa7537983"
+checksum = "dac8d21946727633e1fb33aa5466b761534884aed9abf097e4cce83016b1928e"
 dependencies = [
  "ikigai-core",
  "ikigai-fn",
+ "percent-encoding",
  "serde",
  "serde_json",
 ]
