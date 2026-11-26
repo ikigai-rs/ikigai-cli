@@ -1,8 +1,14 @@
 //! `ikigai-email` — outbound email as a resource.
 //!
 //! `urn:email:send` is a **Sink**: sending is a side effect, so it takes the message body
-//! as the piped `content` and the envelope as named arguments (`to`, `subject`, optional
-//! `reply_to`). Gated by [`CAP_SEND`], because reaching the outside world on your behalf is
+//! as the piped `content` and named arguments (`to`, `subject`, optional `cc`, `bcc`, and
+//! `reply_to`). Each recipient field takes one or more comma-separated bare email addresses,
+//! ignoring surrounding whitespace. `to` is required and must not be empty. All recipients
+//! are validated before delivery. A bad recipient refuses the whole send and the diagnostic
+//! names the field and the offending entry’s position without quoting its value.
+//! `cc` goes in the Cc header and the SMTP envelope, while
+//! `bcc` goes only in the envelope and is not printed in the success receipt.
+//! Gated by [`CAP_SEND`], because reaching the outside world on your behalf is
 //! authority, not a convenience.
 //!
 //! **Deliverability shapes the design.** Submission goes to a *local* SMTP (Postfix on
@@ -19,7 +25,7 @@
 //!    `Endpoint` silently disables the `Retry`/`CircuitBreaker`/`Failover` overlays. Mail
 //!    is exactly the workload that wants them.
 //! 2. **Headers are guarded against injection.** The envelope fields are fed from a PUBLIC
-//!    contact form. A newline in `to`/`subject`/`reply_to` is classic SMTP header
+//!    contact form. A newline in `to`/`cc`/`bcc`/`subject`/`reply_to` is classic SMTP header
 //!    injection (smuggling a `Bcc:` to turn your contact form into an open relay), so any
 //!    control character in those fields is rejected before a message is built.
 //!
@@ -49,7 +55,7 @@ pub struct EmailConfig {
     pub host: String,
     /// The submission port (25 for a local Postfix, 587 for a submission service).
     pub port: u16,
-    /// The envelope `From` — a mailbox the relay is authorised to send as.
+    /// The envelope `From` — a mailbox the relay is authorized to send as.
     pub from: String,
 }
 
@@ -67,7 +73,12 @@ impl Default for EmailConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Outgoing {
     pub from: String,
-    pub to: String,
+    /// Primary recipients, also written to the To header.
+    pub to: Vec<String>,
+    /// Copy recipients, also written to the Cc header.
+    pub cc: Vec<String>,
+    /// Blind copy recipients, only used in the SMTP envelope.
+    pub bcc: Vec<String>,
     pub reply_to: Option<String>,
     pub subject: String,
     pub body: String,
@@ -138,7 +149,7 @@ const ADDRESS_SPECIALS: &[char] = &['<', '>', '(', ')', '[', ']', ':', ';', ',',
 /// A minimal address shape check — one `@`, something either side, no spaces and none of
 /// the [`ADDRESS_SPECIALS`]. Not RFC 5322 (that way lies madness); the transport is the real
 /// authority. This exists to turn obvious junk from a public form into a typed 400 instead of
-/// an SMTP round trip, and to keep `to`/`reply_to` ONE bare address: `Your Bank<a@x.example>`
+/// an SMTP round trip, and to require each mailbox to be a bare address: `Your Bank<a@x.example>`
 /// would otherwise go out with a display name whoever filled the form chose.
 fn address_like(name: &str, value: &str) -> Result<String> {
     let value = header_safe(name, value)?;
@@ -149,7 +160,7 @@ fn address_like(name: &str, value: &str) -> Result<String> {
     if !ok {
         return Err(Error::InvalidArgument {
             name: name.to_string(),
-            // Never the value: a public form fills `reply_to`, and a refusal's text can be
+            // Never the value: a public form can fill an address, and a refusal's text can be
             // written in the clear (a dead-lettered tuple's `.err` note). Name the argument
             // and the rule, so the sentence still says what to fix.
             detail: format!(
@@ -159,6 +170,36 @@ fn address_like(name: &str, value: &str) -> Result<String> {
         });
     }
     Ok(value)
+}
+
+/// Check each recipient individually, naming its position on refusal.
+fn recipient_list(name: &str, value: &str) -> Result<Vec<String>> {
+    value
+        .split(',')
+        .enumerate()
+        .map(|(index, entry)| {
+            let invalid = |reason| Error::InvalidArgument {
+                name: name.to_string(),
+                detail: format!("`{name}` entry {}: {reason}", index + 1),
+            };
+            // Do not let trimming hide line breaks, including at a list boundary.
+            if entry.contains(['\r', '\n']) {
+                return Err(invalid(
+                    "must not contain control characters (SMTP header injection)".to_string(),
+                ));
+            }
+            let address = address_like(name, entry).map_err(|err| match err {
+                Error::InvalidArgument { detail, .. } => invalid(detail),
+                err => err,
+            })?;
+            // The SMTP library has stricter syntax rules than the public-form shape check.
+            // Apply them here too, before handing even the valid recipients to a transport.
+            address
+                .parse::<lettre::Address>()
+                .map_err(|_| invalid("not a valid SMTP address".to_string()))?;
+            Ok(address)
+        })
+        .collect()
 }
 
 #[async_trait]
@@ -186,7 +227,13 @@ impl Endpoint for SendEndpoint {
             ));
         }
 
-        let to = address_like("to", inv.inline_str("to")?)?;
+        let to = recipient_list("to", inv.inline_str("to")?)?;
+        let optional_recipients = |name| match inv.optional_str(name)? {
+            Some(value) => recipient_list(name, value),
+            None => Ok(Vec::new()),
+        };
+        let cc = optional_recipients("cc")?;
+        let bcc = optional_recipients("bcc")?;
         let subject = header_safe("subject", inv.inline_str("subject")?)?;
         let reply_to = match inv.optional_str("reply_to")? {
             Some(value) if !value.trim().is_empty() => Some(address_like("reply_to", value)?),
@@ -211,6 +258,8 @@ impl Endpoint for SendEndpoint {
         let message = Outgoing {
             from: self.config.from.clone(),
             to,
+            cc,
+            bcc,
             reply_to,
             subject,
             body,
@@ -219,7 +268,7 @@ impl Endpoint for SendEndpoint {
         match self.transport.deliver(&message) {
             Ok(receipt) => Ok(Representation::new(
                 ReprType::new("text/plain").with_param("charset", "utf-8"),
-                format!("sent to {}: {receipt}\n", message.to).into_bytes(),
+                format!("sent to {}: {receipt}\n", message.to.join(", ")).into_bytes(),
             )),
             // TYPED failures: transient ones are retryable, so `is_transient` is true and
             // the Retry/CircuitBreaker overlays can actually engage.
@@ -241,7 +290,8 @@ impl Endpoint for SendEndpoint {
             .title("Send email")
             .summary(
                 "Submit a message over SMTP. The body is the `content` (piped or explicit); \
-                 `to` and `subject` are required, `reply_to` optional. An optional `ics` \
+                 `to` and `subject` are required, `cc`, `bcc`, and `reply_to` optional. \
+                 Recipient lists are comma-separated, and blind copies are envelope-only. An optional `ics` \
                  VCALENDAR makes it an iMIP calendar invitation. Envelope fields are rejected \
                  if they contain control characters (SMTP header injection). Submission \
                  goes to a local MTA that relays onward, so DKIM/SPF and relay credentials \
@@ -253,7 +303,19 @@ impl Endpoint for SendEndpoint {
                     .summary("send — submit the piped body as an email")
                     .input(
                         ArgSpec::new("to")
-                            .summary("the recipient address")
+                            .summary("one or more comma-separated primary recipient addresses")
+                            .class(XSD_STRING),
+                    )
+                    .input(
+                        ArgSpec::new("cc")
+                            .optional()
+                            .summary("comma-separated copy recipients for the Cc header")
+                            .class(XSD_STRING),
+                    )
+                    .input(
+                        ArgSpec::new("bcc")
+                            .optional()
+                            .summary("comma-separated blind copy recipients (SMTP envelope only)")
                             .class(XSD_STRING),
                     )
                     .input(
@@ -311,18 +373,38 @@ impl SmtpSubmission {
 /// carries an `.ics`. Split out from delivery so the MIME structure is provable without an
 /// SMTP server.
 fn build_message(message: &Outgoing) -> std::result::Result<lettre::Message, MailError> {
+    use lettre::{address::Envelope, message::Mailbox, Address};
+
+    let from: Mailbox = message
+        .from
+        .parse()
+        .map_err(|e| MailError::Permanent(format!("bad From address: {e}")))?;
     let mut builder = lettre::Message::builder()
-        .from(
-            message
-                .from
-                .parse()
-                .map_err(|e| MailError::Permanent(format!("bad From address: {e}")))?,
-        )
-        .to(message
-            .to
-            .parse()
-            .map_err(|e| MailError::Permanent(format!("bad To address: {e}")))?)
+        .from(from.clone())
         .subject(message.subject.clone());
+    let parse = |field, value: &str| {
+        value
+            .parse::<Address>()
+            .map_err(|e| MailError::Permanent(format!("bad {field} address: {e}")))
+    };
+    let mut recipients = Vec::new();
+    for value in &message.to {
+        let address = parse("To", value)?;
+        builder = builder.to(Mailbox::new(None, address.clone()));
+        recipients.push(address);
+    }
+    for value in &message.cc {
+        let address = parse("Cc", value)?;
+        builder = builder.cc(Mailbox::new(None, address.clone()));
+        recipients.push(address);
+    }
+    for value in &message.bcc {
+        recipients.push(parse("Bcc", value)?);
+    }
+    // Build the envelope directly so blind addresses never enter the header builder.
+    let envelope = Envelope::new(Some(from.email), recipients)
+        .map_err(|e| MailError::Permanent(format!("building the envelope: {e}")))?;
+    builder = builder.envelope(envelope);
     if let Some(reply_to) = &message.reply_to {
         builder = builder.reply_to(
             reply_to
@@ -450,6 +532,180 @@ mod tests {
     }
 
     #[test]
+    fn recipients_reach_the_envelope_and_only_visible_recipients_reach_headers() {
+        let mail = FakeMail::ok();
+        let receipt = block_on(kernel(mail.clone()).issue(
+            send_request(&[
+                ("to", " one@example.com , two@example.com "),
+                ("cc", " three@example.com , four@example.com "),
+                ("bcc", " five@example.com , six@example.com "),
+                ("subject", "Hello"),
+                ("content", "Body"),
+            ]),
+            &cap(),
+        ))
+        .unwrap();
+        assert_eq!(
+            receipt.bytes,
+            b"sent to one@example.com, two@example.com: 250\n"
+        );
+        let sent = mail.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let message = build_message(&sent[0]).unwrap();
+        let recipients: Vec<_> = message
+            .envelope()
+            .to()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            recipients,
+            [
+                "one@example.com",
+                "two@example.com",
+                "three@example.com",
+                "four@example.com",
+                "five@example.com",
+                "six@example.com",
+            ]
+        );
+
+        let wire = String::from_utf8(message.formatted()).unwrap();
+        let (headers, _) = wire.split_once("\r\n\r\n").unwrap();
+        assert!(
+            headers.contains("To: one@example.com, two@example.com"),
+            "{headers}"
+        );
+        assert!(
+            headers.contains("Cc: three@example.com, four@example.com"),
+            "{headers}"
+        );
+        assert!(!headers.to_ascii_lowercase().contains("bcc:"), "{headers}");
+        for address in ["five@example.com", "six@example.com"] {
+            assert!(!headers.contains(address), "{headers}");
+        }
+    }
+
+    #[test]
+    fn recipient_arguments_are_declared_on_the_sink_contract() {
+        let description = send(EmailConfig::default(), FakeMail::ok()).describe();
+        let sink = description
+            .actions
+            .iter()
+            .find(|action| action.verb == Verb::Sink)
+            .unwrap();
+        for (name, required) in [("to", true), ("cc", false), ("bcc", false)] {
+            let input = sink.inputs.iter().find(|input| input.name == name).unwrap();
+            assert_eq!(input.required, required);
+            assert_eq!(input.class.as_deref(), Some(XSD_STRING));
+            assert!(!input.summary.is_empty());
+        }
+    }
+
+    #[test]
+    fn copies_do_not_replace_the_required_to() {
+        let mail = FakeMail::ok();
+        let k = kernel(mail.clone());
+        let args = [
+            ("cc", "copy@example.com"),
+            ("bcc", "blind@example.com"),
+            ("subject", "Hello"),
+            ("content", "Body"),
+        ];
+        let err = block_on(k.issue(send_request(&args), &cap())).unwrap_err();
+        assert!(
+            matches!(err, Error::MissingArgument(ref name) if name == "to"),
+            "{err:?}"
+        );
+        assert!(mail.sent.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_refused_recipient_is_never_echoed() {
+        let mail = FakeMail::ok();
+        let k = kernel(mail.clone());
+        for field in ["to", "cc", "bcc"] {
+            let list = "valid@example.com,visitor-secret";
+            let mut args = [
+                ("to", "owner@example.com"),
+                ("cc", "copy@example.com"),
+                ("bcc", "blind@example.com"),
+                ("subject", "Hello"),
+                ("content", "Body"),
+            ];
+            args.iter_mut().find(|(name, _)| *name == field).unwrap().1 = list;
+            let err = block_on(k.issue(send_request(&args), &cap())).unwrap_err();
+            let text = format!("{err} {err:?}");
+            assert!(
+                !text.contains("visitor-secret"),
+                "refused value leaked: {text}"
+            );
+            assert!(text.contains(&format!("`{field}` entry 2")), "{text}");
+        }
+        assert!(mail.sent.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_bad_recipient_names_the_field_and_entry_without_delivering() {
+        let mail = FakeMail::ok();
+        let k = kernel(mail.clone());
+        for field in ["to", "cc", "bcc"] {
+            for bad in ["not-an-address", ".leading-dot@example.com", ""] {
+                let list = format!("valid@example.com,{bad}");
+                let mut args = [
+                    ("to", "owner@example.com"),
+                    ("cc", "copy@example.com"),
+                    ("bcc", "blind@example.com"),
+                    ("subject", "Hello"),
+                    ("content", "Body"),
+                ];
+                args.iter_mut().find(|(name, _)| *name == field).unwrap().1 = &list;
+                let err = block_on(k.issue(send_request(&args), &cap())).unwrap_err();
+                assert!(
+                    matches!(&err, Error::InvalidArgument { name, detail }
+                        if name == field && detail.contains(&format!("`{field}` entry 2"))
+                            && (bad.is_empty() || !detail.contains(bad))
+                            && !detail.contains("valid@example.com")),
+                    "{err:?}"
+                );
+            }
+        }
+        assert!(mail.sent.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn line_breaks_in_copy_lists_are_refused_even_next_to_a_separator() {
+        let mail = FakeMail::ok();
+        let k = kernel(mail.clone());
+        for field in ["cc", "bcc"] {
+            for (list, position) in [
+                ("copy@example.com\rInjected: value", 1),
+                ("copy@example.com,\nsecond@example.com", 2),
+            ] {
+                let err = block_on(k.issue(
+                    send_request(&[
+                        ("to", "owner@example.com"),
+                        (field, list),
+                        ("subject", "Hello"),
+                        ("content", "Body"),
+                    ]),
+                    &cap(),
+                ))
+                .unwrap_err();
+                assert!(
+                    matches!(&err, Error::InvalidArgument { name, detail }
+                        if name == field && detail.contains(&format!("`{field}` entry {position}"))
+                            && !detail.contains("example.com")
+                            && detail.contains("SMTP header injection")
+                            && !detail.contains(['\r', '\n'])),
+                    "{err:?}"
+                );
+            }
+        }
+        assert!(mail.sent.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn a_send_refuses_unreadable_arguments_without_delivering() {
         let mail = FakeMail::ok();
         let endpoint = SendEndpoint {
@@ -498,7 +754,9 @@ mod tests {
         ]);
         issue(&alias).unwrap();
         assert_eq!(mail.sent.lock().unwrap()[2].body, "Via alias");
-        for name in ["reply_to", "ics", "to", "subject", "content", "in"] {
+        for name in [
+            "reply_to", "ics", "to", "cc", "bcc", "subject", "content", "in",
+        ] {
             for (arg, reason) in [
                 (ArgRef::Inline(vec![0xff]), "not valid UTF-8"),
                 (
@@ -604,11 +862,11 @@ mod tests {
         }
     }
 
-    /// `to` and `reply_to` are ONE bare address. A display name, angle brackets, a group or a
-    /// list reached lettre before, which turned `Your Bank<a@x.example>` into
+    /// Recipients must be bare addresses and Reply-To must be a single bare address. A
+    /// display name, angle brackets, a group or a list reached lettre before, which turned `Your Bank<a@x.example>` into
     /// `Reply-To: Your Bank <a@x.example>`: text a form's submitter chose, in a header.
     #[test]
-    fn an_envelope_address_is_one_bare_address() {
+    fn each_recipient_and_reply_to_must_be_a_bare_address() {
         let mail = FakeMail::ok();
         let k = kernel(mail.clone());
         for bad in [
@@ -650,12 +908,12 @@ mod tests {
         assert_eq!(mail.sent.lock().unwrap().len(), 1);
     }
 
-    /// A refusal never echoes the value it refused. A contact form feeds `reply_to` from a
+    /// A Reply-To refusal never echoes the value it refused. A contact form feeds `reply_to` from a
     /// stranger; when the send fails the reactor dead-letters the tuple and the error text
     /// becomes a plaintext `.err` note, so whatever they typed would be written in the clear.
     /// The sentence names the argument and the rule instead.
     #[test]
-    fn a_refused_address_is_never_echoed() {
+    fn a_refused_reply_to_is_never_echoed() {
         let mail = FakeMail::ok();
         let k = kernel(mail.clone());
         let secret = "visitor-secret";
@@ -665,37 +923,38 @@ mod tests {
             "Your Bank<visitor-secret@x.example>",
             "visitor-secret @x.example",
         ] {
-            for field in ["to", "reply_to"] {
-                let mut args = vec![
+            let field = "reply_to";
+            let err = block_on(k.issue(
+                send_request(&[
                     ("to", "owner@example.com"),
                     ("subject", "Hi"),
                     ("content", "b"),
-                ];
-                args.retain(|(n, _)| *n != field);
-                args.push((field, bad));
-                let err = block_on(k.issue(send_request(&args), &cap())).unwrap_err();
-                let Error::InvalidArgument {
-                    ref name,
-                    ref detail,
-                } = err
-                else {
-                    panic!("`{field}` should be an invalid argument, got: {err:?}");
-                };
-                assert_eq!(name, field);
-                let text = format!("{err} {detail} {err:?}");
-                assert!(
-                    !text.contains(secret),
-                    "the refused value is echoed: {text}"
-                );
-                assert_eq!(
-                    detail,
-                    &format!(
-                        "`{field}` is not an email address: it needs one @ with a name before \
-                         it and a domain with a dot after it, and no spaces or any of \
-                         < > ( ) [ ] : ; , \" \\"
-                    )
-                );
-            }
+                    (field, bad),
+                ]),
+                &cap(),
+            ))
+            .unwrap_err();
+            let Error::InvalidArgument {
+                ref name,
+                ref detail,
+            } = err
+            else {
+                panic!("`{field}` should be an invalid argument, got: {err:?}");
+            };
+            assert_eq!(name, field);
+            let text = format!("{err} {detail} {err:?}");
+            assert!(
+                !text.contains(secret),
+                "the refused value is echoed: {text}"
+            );
+            assert_eq!(
+                detail,
+                &format!(
+                    "`{field}` is not an email address: it needs one @ with a name before \
+                     it and a domain with a dot after it, and no spaces or any of \
+                     < > ( ) [ ] : ; , \" \\"
+                )
+            );
         }
         assert!(mail.sent.lock().unwrap().is_empty());
     }
@@ -705,7 +964,9 @@ mod tests {
     fn a_transport_refusal_of_an_address_is_never_echoed() {
         let message = Outgoing {
             from: "site@example.com".to_string(),
-            to: "visitor-secret".to_string(),
+            to: vec!["visitor-secret".to_string()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
             reply_to: Some("visitor-secret".to_string()),
             subject: "Hi".to_string(),
             body: "b".to_string(),
@@ -716,7 +977,7 @@ mod tests {
         };
         assert!(!detail.contains("visitor-secret"), "To echoed: {detail}");
         let message = Outgoing {
-            to: "owner@example.com".to_string(),
+            to: vec!["owner@example.com".to_string()],
             ..message
         };
         let Err(MailError::Permanent(detail)) = build_message(&message) else {
@@ -800,7 +1061,9 @@ mod ics_tests {
     fn msg(ics: Option<&str>) -> Outgoing {
         Outgoing {
             from: "owner@example.com".to_string(),
-            to: "nigel@ukclient.example".to_string(),
+            to: vec!["nigel@ukclient.example".to_string()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
             reply_to: None,
             subject: "Your meeting is confirmed".to_string(),
             body: "We're on for tomorrow.".to_string(),
