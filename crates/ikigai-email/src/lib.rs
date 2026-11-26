@@ -5,7 +5,7 @@
 //! `reply_to`). Each recipient field takes one or more comma-separated bare email addresses,
 //! ignoring surrounding whitespace. `to` is required and must not be empty. All recipients
 //! are validated before delivery. A bad recipient refuses the whole send and the diagnostic
-//! names the field and quotes only the offending entry, escaping control characters.
+//! names the field and the offending entry’s position without quoting its value.
 //! `cc` goes in the Cc header and the SMTP envelope, while
 //! `bcc` goes only in the envelope and is not printed in the success receipt.
 //! Gated by [`CAP_SEND`], because reaching the outside world on your behalf is
@@ -160,7 +160,7 @@ fn address_like(name: &str, value: &str) -> Result<String> {
     if !ok {
         return Err(Error::InvalidArgument {
             name: name.to_string(),
-            // Never the value: a public form fills `reply_to`, and a refusal's text can be
+            // Never the value: a public form can fill an address, and a refusal's text can be
             // written in the clear (a dead-lettered tuple's `.err` note). Name the argument
             // and the rule, so the sentence still says what to fix.
             detail: format!(
@@ -172,14 +172,15 @@ fn address_like(name: &str, value: &str) -> Result<String> {
     Ok(value)
 }
 
-/// Check each recipient individually, naming the offending entry on refusal.
+/// Check each recipient individually, naming its position on refusal.
 fn recipient_list(name: &str, value: &str) -> Result<Vec<String>> {
     value
         .split(',')
-        .map(|entry| {
+        .enumerate()
+        .map(|(index, entry)| {
             let invalid = |reason| Error::InvalidArgument {
                 name: name.to_string(),
-                detail: format!("recipient {entry:?}: {reason}"),
+                detail: format!("`{name}` entry {}: {reason}", index + 1),
             };
             // Do not let trimming hide line breaks, including at a list boundary.
             if entry.contains(['\r', '\n']) {
@@ -620,6 +621,31 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_recipient_is_never_echoed() {
+        let mail = FakeMail::ok();
+        let k = kernel(mail.clone());
+        for field in ["to", "cc", "bcc"] {
+            let list = "valid@example.com,visitor-secret";
+            let mut args = [
+                ("to", "owner@example.com"),
+                ("cc", "copy@example.com"),
+                ("bcc", "blind@example.com"),
+                ("subject", "Hello"),
+                ("content", "Body"),
+            ];
+            args.iter_mut().find(|(name, _)| *name == field).unwrap().1 = list;
+            let err = block_on(k.issue(send_request(&args), &cap())).unwrap_err();
+            let text = format!("{err} {err:?}");
+            assert!(
+                !text.contains("visitor-secret"),
+                "refused value leaked: {text}"
+            );
+            assert!(text.contains(&format!("`{field}` entry 2")), "{text}");
+        }
+        assert!(mail.sent.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn a_bad_recipient_names_the_field_and_entry_without_delivering() {
         let mail = FakeMail::ok();
         let k = kernel(mail.clone());
@@ -637,7 +663,8 @@ mod tests {
                 let err = block_on(k.issue(send_request(&args), &cap())).unwrap_err();
                 assert!(
                     matches!(&err, Error::InvalidArgument { name, detail }
-                        if name == field && detail.contains(&format!("recipient {bad:?}"))
+                        if name == field && detail.contains(&format!("`{field}` entry 2"))
+                            && (bad.is_empty() || !detail.contains(bad))
                             && !detail.contains("valid@example.com")),
                     "{err:?}"
                 );
@@ -651,15 +678,9 @@ mod tests {
         let mail = FakeMail::ok();
         let k = kernel(mail.clone());
         for field in ["cc", "bcc"] {
-            for (list, entry) in [
-                (
-                    "copy@example.com\rInjected: value",
-                    "copy@example.com\rInjected: value",
-                ),
-                (
-                    "copy@example.com,\nsecond@example.com",
-                    "\nsecond@example.com",
-                ),
+            for (list, position) in [
+                ("copy@example.com\rInjected: value", 1),
+                ("copy@example.com,\nsecond@example.com", 2),
             ] {
                 let err = block_on(k.issue(
                     send_request(&[
@@ -673,7 +694,8 @@ mod tests {
                 .unwrap_err();
                 assert!(
                     matches!(&err, Error::InvalidArgument { name, detail }
-                        if name == field && detail.contains(&format!("recipient {entry:?}"))
+                        if name == field && detail.contains(&format!("`{field}` entry {position}"))
+                            && !detail.contains("example.com")
                             && detail.contains("SMTP header injection")
                             && !detail.contains(['\r', '\n'])),
                     "{err:?}"
