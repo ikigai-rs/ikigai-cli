@@ -468,8 +468,10 @@ fn action_of(inv: &Invocation<'_>) -> String {
 ///
 /// Every interpolated value is escaped (ledger #1516). The shape gate keeps markup out of a link
 /// that verifies today, but the page must not depend on a check that lives somewhere else.
-fn show_body(id: &str, exp: i64, token: &str, verb_word: &str, note: &str) -> String {
+fn show_body(id: &str, exp: i64, token: &str, verb_word: &str, note: &str, action: &str) -> String {
     use ikigai_fn::html::html_text as esc;
+    let js =
+        crate::passkey::decision_passkey_js(&crate::passkey::link_binding(SCOPE, action, token));
     let (id, token, verb_word, note) = (esc(id), esc(token), esc(verb_word), esc(note));
     format!(
         "<p>Booking <code>{id}</code>.</p>\
@@ -479,7 +481,6 @@ fn show_body(id: &str, exp: i64, token: &str, verb_word: &str, note: &str) -> St
          <input type=hidden name=t value=\"{token}\">\
          <button>{verb_word}</button>\
          </form><p class=muted>{note}</p>{js}",
-        js = crate::passkey::DECISION_PASSKEY_JS,
     )
 }
 
@@ -489,6 +490,10 @@ fn show_body(id: &str, exp: i64, token: &str, verb_word: &str, note: &str) -> St
 const RECORDED: &str = "recorded";
 const INVALID: &str = "invalid";
 const PASSKEY: &str = "passkey";
+const PASSKEY_STORE: &str = "passkey-store";
+
+/// The endpoint scope a calendar-request link's claim and passkey challenge are bound to.
+const SCOPE: &str = "calendar-request";
 
 /// One answer for every kind of bad link.
 fn bad_link_page() -> Representation {
@@ -524,6 +529,10 @@ fn outcome_page(action: &str, word: &str) -> Representation {
             "Your passkey is needed",
             "<p>This decision needs a tap on your registered device. Reopen the link and try \
              again.</p>",
+        ),
+        PASSKEY_STORE => page(
+            "Passkey file missing",
+            &format!("<p>{}</p>", crate::passkey::STORE_REFUSAL),
         ),
         _ => bad_link_page(),
     }
@@ -592,18 +601,29 @@ impl Endpoint for CalendarRequest {
                 };
                 Ok(page(
                     &format!("{verb_word} this request?"),
-                    &show_body(&id, exp, &token, verb_word, note),
+                    &show_body(&id, exp, &token, verb_word, note, &action),
                 ))
             }
             // ACT: record the intent. The Mac does the real work when it next drains.
             Verb::Sink => {
                 // Passkey second factor — inert until a credential is enrolled, then required.
                 // The assertion rides in the POST body (pk_* fields the glue-JS adds).
-                if crate::passkey::require_passkey(inv).is_err() {
-                    return Ok(prg::see_other(PASSKEY, outcome_page(&action, PASSKEY)));
+                // The challenge it was made over must be this link's (ledger #4545).
+                let link = crate::passkey::link_binding(SCOPE, &action, &token);
+                match crate::passkey::passkey_gate(inv, &link) {
+                    Ok(()) => {}
+                    Err(crate::passkey::Refusal::Store) => {
+                        return Ok(prg::see_other(
+                            PASSKEY_STORE,
+                            outcome_page(&action, PASSKEY_STORE),
+                        ));
+                    }
+                    Err(crate::passkey::Refusal::Assertion) => {
+                        return Ok(prg::see_other(PASSKEY, outcome_page(&action, PASSKEY)));
+                    }
                 }
                 // Once per link: a second POST of the same decision records nothing.
-                if !prg::claim("calendar-request", &self.key_path, &token, exp, now)? {
+                if !prg::claim(SCOPE, &self.key_path, &token, exp, now)? {
                     return Ok(prg::see_other(
                         prg::ALREADY,
                         outcome_page(&action, prg::ALREADY),
@@ -626,7 +646,7 @@ impl Endpoint for CalendarRequest {
                     )
                     .await;
                 if let Err(e) = dropped {
-                    prg::release("calendar-request", &self.key_path, &token);
+                    prg::release(SCOPE, &self.key_path, &token);
                     return Err(e);
                 }
                 Ok(prg::see_other(RECORDED, outcome_page(&action, RECORDED)))
@@ -685,7 +705,13 @@ impl Endpoint for CalendarRequest {
                     // On the ACTION: an explicit `ActionSpec` is taken WHOLE by
                     // `action_specs()`, which never folds the flat `.output()` below into
                     // it — so the flat declaration alone left both faces unannounced.
-                    .input(outcome_spec(&[RECORDED, prg::ALREADY, INVALID, PASSKEY]))
+                    .input(outcome_spec(&[
+                        RECORDED,
+                        prg::ALREADY,
+                        INVALID,
+                        PASSKEY,
+                        PASSKEY_STORE,
+                    ]))
                     .output("text/html; charset=utf-8"),
             )
             .action(
@@ -875,7 +901,7 @@ mod tests {
     fn the_page_shell_links_its_stylesheet_and_carries_no_inline_style() {
         for html in [
             String::from_utf8(page("Approve this request?", "<p>the body</p>").bytes).unwrap(),
-            show_body(ID, EXP, "tok", "Approve", "a note"),
+            show_body(ID, EXP, "tok", "Approve", "a note", "approve"),
         ] {
             assert_no_inline_style(&html);
         }
@@ -923,7 +949,14 @@ mod tests {
     /// a link that verifies today; this pins the page so it does not depend on that gate.
     #[test]
     fn the_show_page_renders_markup_in_its_fields_as_text() {
-        let body = show_body("<b>x</b>&y'", EXP, "t\"><i>z</i>", "Approve", "a note");
+        let body = show_body(
+            "<b>x</b>&y'",
+            EXP,
+            "t\"><i>z</i>",
+            "Approve",
+            "a note",
+            "approve",
+        );
         assert!(!body.contains("<b>"), "{body}");
         assert!(!body.contains("<i>"), "{body}");
         assert!(
@@ -952,6 +985,7 @@ mod tests {
             "javascript:alert(1)\"><script>alert('x')</script>",
             "Approve",
             "a note",
+            "approve",
         );
         assert!(
             body.contains("<code>a\u{FFFD}b\u{FFFD}c\td</code>"),

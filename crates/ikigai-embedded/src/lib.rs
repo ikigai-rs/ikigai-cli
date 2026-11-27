@@ -5524,6 +5524,12 @@ fn root_members(nature: &'static str) -> Vec<Arc<dyn Space>> {
                 Exact::new("urn:passkey:enroll-open"),
                 passkey::PasskeyEnrollOpen,
             )
+            // Lifting the passkey requirement is as deliberate (ledger #4545): the same cap,
+            // the same box-only binding.
+            .bind(
+                Exact::new("urn:passkey:unrequire"),
+                passkey::PasskeyUnrequire,
+            )
             .bind(
                 Exact::new("urn:decide:accept"),
                 decide::DecideAccept {

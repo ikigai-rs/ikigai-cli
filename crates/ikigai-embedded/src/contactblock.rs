@@ -663,6 +663,24 @@ fn bad_link() -> Representation {
 const BLOCKED: &str = "blocked";
 const INVALID: &str = "invalid";
 const PASSKEY: &str = "passkey";
+const PASSKEY_STORE: &str = "passkey-store";
+
+/// The page for a passkey refusal only the box can repair (ledger #4545).
+fn store_refused() -> Representation {
+    page(
+        "Passkey file missing",
+        &format!("<p>{}</p>", crate::passkey::STORE_REFUSAL),
+    )
+}
+
+/// The passkey gate for a link page's POST, as the outcome word to redirect with on refusal.
+fn gate(inv: &Invocation<'_>, link: &str) -> Option<&'static str> {
+    match crate::passkey::passkey_gate(inv, link) {
+        Ok(()) => None,
+        Err(crate::passkey::Refusal::Store) => Some(PASSKEY_STORE),
+        Err(crate::passkey::Refusal::Assertion) => Some(PASSKEY),
+    }
+}
 
 /// The page a block POST redirects to. Generic by design: its URL carries no address, so it
 /// says what happened and never to whom.
@@ -674,6 +692,7 @@ fn block_outcome(word: &str) -> Representation {
              usually at once.</p>",
         ),
         prg::ALREADY => already_page(),
+        PASSKEY_STORE => store_refused(),
         PASSKEY => page(
             "Your passkey is needed",
             "<p>Blocking this sender needs a tap on your registered device. Reopen the link \
@@ -695,6 +714,7 @@ fn label_outcome(word: &str) -> Representation {
             "<p>The filter learns this once the edge picks it up — usually at once.</p>",
         ),
         prg::ALREADY => already_page(),
+        PASSKEY_STORE => store_refused(),
         PASSKEY => page(
             "Your passkey is needed",
             "<p>Labeling this enquiry needs a tap on your registered device. Reopen the link \
@@ -820,7 +840,11 @@ impl Endpoint for ContactBlock {
                          still accepts. You can undo this on the box.</p>{js}",
                         shown = html_text(&email),
                         form = confirm_form(&fields, "Block"),
-                        js = crate::passkey::DECISION_PASSKEY_JS,
+                        js = crate::passkey::decision_passkey_js(&crate::passkey::link_binding(
+                            BLOCK_ACTION,
+                            "block",
+                            &token
+                        )),
                     ),
                 ))
             }
@@ -828,8 +852,9 @@ impl Endpoint for ContactBlock {
             Verb::Sink => {
                 // Passkey second factor — inert until a credential is enrolled, then required.
                 // The assertion rides in the POST body (pk_* fields the glue-JS adds).
-                if crate::passkey::require_passkey(inv).is_err() {
-                    return Ok(prg::see_other(PASSKEY, block_outcome(PASSKEY)));
+                let link = crate::passkey::link_binding(BLOCK_ACTION, "block", &token);
+                if let Some(word) = gate(inv, &link) {
+                    return Ok(prg::see_other(word, block_outcome(word)));
                 }
                 let named = if enquiry.is_empty() {
                     String::new()
@@ -906,7 +931,13 @@ impl Endpoint for ContactBlock {
                     ActionSpec::new(Verb::Source)
                         .summary("show — the address this link would block, or what a block did"),
                 )
-                .input(outcome_spec(&[BLOCKED, prg::ALREADY, INVALID, PASSKEY]))
+                .input(outcome_spec(&[
+                    BLOCKED,
+                    prg::ALREADY,
+                    INVALID,
+                    PASSKEY,
+                    PASSKEY_STORE,
+                ]))
                 .output("text/html; charset=utf-8"),
             )
             // Every POST answers Post/Redirect/Get: the outcome page in an ikigai-web entity
@@ -1012,13 +1043,18 @@ impl Endpoint for ContactLabel {
                          <p class=muted>The sender is told nothing. Clicking the other \
                          link in the email later changes the label.</p>{js}",
                         form = confirm_form(&fields, button),
-                        js = crate::passkey::DECISION_PASSKEY_JS,
+                        js = crate::passkey::decision_passkey_js(&crate::passkey::link_binding(
+                            LABEL_ACTION,
+                            &label,
+                            &token
+                        )),
                     ),
                 ))
             }
             Verb::Sink => {
-                if crate::passkey::require_passkey(inv).is_err() {
-                    return Ok(prg::see_other(PASSKEY, label_outcome(PASSKEY)));
+                let link = crate::passkey::link_binding(LABEL_ACTION, &label, &token);
+                if let Some(word) = gate(inv, &link) {
+                    return Ok(prg::see_other(word, label_outcome(word)));
                 }
                 // A link that carried the filter's class drops it too (ledger #3868), read by
                 // the apply program as `(get req 'class "")`. Only a verified class from the
@@ -1109,6 +1145,7 @@ impl Endpoint for ContactLabel {
                     prg::ALREADY,
                     INVALID,
                     PASSKEY,
+                    PASSKEY_STORE,
                 ]))
                 .output("text/html; charset=utf-8"),
             )
