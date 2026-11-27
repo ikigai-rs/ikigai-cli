@@ -13,7 +13,12 @@ fn run(case: &str, config: &str, command: &str) -> Output {
 
 /// [`run`] with `args` (`--name <instance>`, say) before `-c`.
 fn run_with(case: &str, config: &str, args: &[&str], command: &str) -> Output {
-    let home = std::env::temp_dir().join(format!("iki-config-toml-{}-{case}", std::process::id()));
+    let thread = std::thread::current();
+    let test = thread.name().expect("test thread has a name");
+    let home = std::env::temp_dir().join(format!(
+        "iki-config-toml-{}-{test}-{case}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(home.join("config")).unwrap();
     let root = home.join("root");
