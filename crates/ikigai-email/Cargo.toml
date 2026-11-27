@@ -20,3 +20,4 @@ lettre = { version = "0.11", default-features = false, features = [
 
 [dev-dependencies]
 futures = { workspace = true }
+mailparse = "0.19"

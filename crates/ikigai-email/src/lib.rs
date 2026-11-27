@@ -29,19 +29,47 @@
 //!    injection (smuggling a `Bcc:` to turn your contact form into an open relay), so any
 //!    control character in those fields is rejected before a message is built.
 //!
+//! **Attachments are NAMED, never inlined.** The optional `attach` argument takes one or
+//! more resource IRIs (newline-separated, the map convention). Each is SOURCED through the
+//! kernel under the CALLER's own capability, so an attachment is only ever something the
+//! caller could already read: a refused read refuses the whole send. Attaching is also its
+//! own authority, [`CAP_ATTACH`], checked before anything is read, so a holder of
+//! [`CAP_SEND`] alone (a contact form's handler) cannot turn mail into an exfiltration path.
+//! The part's media type is the representation's, its filename the IRI's last segment unless
+//! `attach_name` names it. The message becomes `multipart/mixed`: the body first (or the
+//! iMIP alternative, kept whole, when `ics` is given), then each attachment, built with
+//! lettre's own types. Bounds REFUSE, never truncate: at most [`MAX_ATTACHMENTS`] parts and
+//! [`MAX_ATTACHMENT_BYTES`] in total. A content holding a PEM private key block or an age
+//! secret key is refused, so a `.key` is never mailed by mistake.
+//!
 //! The transport is behind [`MailTransport`] — the same seam `ikigai-http` uses — so the
 //! validation, envelope, and error mapping are testable without an SMTP server.
 #![forbid(unsafe_code)]
 
 use async_trait::async_trait;
 use ikigai_core::{
-    ActionSpec, ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, Invocation, ReprType,
-    Representation, Result, Verb,
+    ActionSpec, ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, Invocation, Iri,
+    ReprType, Representation, Result, Verb,
 };
 use std::sync::Arc;
 
 /// Sending mail requires this capability.
 pub const CAP_SEND: &str = "urn:cap:email:send";
+
+/// Attaching a resource requires this capability as well as [`CAP_SEND`]: mailing out
+/// something the kernel can read is more authority than sending a message. Checked by the
+/// endpoint whenever `attach` is given, before any attachment is read.
+pub const CAP_ATTACH: &str = "urn:cap:email:attach";
+
+/// The most attachments one message may carry. More is refused, never truncated.
+pub const MAX_ATTACHMENTS: usize = 10;
+
+/// The most bytes all of one message's attachments may hold together: 10 MiB. More is
+/// refused, never truncated.
+pub const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+
+/// The class of the `attach` argument: each line is a resource IRI.
+const XSD_ANY_URI: &str = "http://www.w3.org/2001/XMLSchema#anyURI";
 
 /// The XSD `string` datatype IRI — the declared class of the envelope arguments.
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
@@ -87,6 +115,19 @@ pub struct Outgoing {
     /// `text/calendar; method=REQUEST` part — so a mail client shows an add-to-calendar /
     /// RSVP card. It carries its OWN `METHOD` line; the transport does not add one.
     pub ics: Option<String>,
+    /// Files to attach, in the order named. Empty for a message with none.
+    pub attachments: Vec<Attachment>,
+}
+
+/// One attachment, already read through the kernel and checked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attachment {
+    /// The filename the part carries (header-safe).
+    pub filename: String,
+    /// The media type of the representation it was read as, with its parameters.
+    pub media_type: String,
+    /// The representation's bytes, carried unchanged.
+    pub bytes: Vec<u8>,
 }
 
 /// Why a delivery failed, split the way the kernel's error taxonomy needs: a `Transient`
@@ -202,6 +243,170 @@ fn recipient_list(name: &str, value: &str) -> Result<Vec<String>> {
         .collect()
 }
 
+fn invalid(name: &str, detail: String) -> Error {
+    Error::InvalidArgument {
+        name: name.to_string(),
+        detail,
+    }
+}
+
+/// The non-blank lines of a newline-separated argument (the map convention), trimmed.
+fn lines(value: &str) -> Vec<&str> {
+    value
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+/// The filename an IRI names by default: its last segment, after the last `/` or `:`, with
+/// any query or fragment dropped.
+fn default_filename(iri: &str) -> &str {
+    let path = iri.split(['?', '#']).next().unwrap_or(iri);
+    path.rsplit(['/', ':']).next().unwrap_or(path)
+}
+
+/// Does `bytes` hold secret key material: a PEM private key block (`-----BEGIN … PRIVATE
+/// KEY-----`, which covers PKCS#8, its encrypted form, the RSA/EC/DSA forms, OpenSSH and a
+/// PGP private key block) or an age secret key (`AGE-SECRET-KEY-`)? Named, so the refusal
+/// can say which.
+fn secret_key_kind(bytes: &[u8]) -> Option<&'static str> {
+    const BEGIN: &[u8] = b"-----BEGIN ";
+    const DASHES: &[u8] = b"-----";
+    let mut rest = bytes;
+    while let Some(at) = find(rest, BEGIN) {
+        rest = &rest[at + BEGIN.len()..];
+        let label_end = find(rest, DASHES).unwrap_or(rest.len());
+        let label = &rest[..label_end];
+        if !label.contains(&b'\n') && find(&label.to_ascii_uppercase(), b"PRIVATE KEY").is_some() {
+            return Some("a PEM private key block");
+        }
+    }
+    find(&bytes.to_ascii_uppercase(), b"AGE-SECRET-KEY-").map(|_| "an age secret key")
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Read and check the `attach` argument's resources (see the [module docs](crate)).
+async fn attachments(inv: &Invocation<'_>) -> Result<Vec<Attachment>> {
+    let Some(attach) = inv.optional_str("attach")? else {
+        if inv.optional_str("attach_name")?.is_some() {
+            return Err(invalid(
+                "attach_name",
+                "`attach_name` names attachments, so it needs `attach`".to_string(),
+            ));
+        }
+        return Ok(Vec::new());
+    };
+    let iris = lines(attach);
+    if iris.is_empty() {
+        return Err(invalid(
+            "attach",
+            "`attach` must name at least one resource IRI".to_string(),
+        ));
+    }
+    // Authority before anything is read, so a caller without it learns nothing about the
+    // resources it named.
+    if !inv.capability.allows(CAP_ATTACH) {
+        return Err(Error::Denied(
+            format!("attaching a resource to mail requires `{CAP_ATTACH}`").into(),
+        ));
+    }
+    if iris.len() > MAX_ATTACHMENTS {
+        return Err(invalid(
+            "attach",
+            format!(
+                "`attach` names {} resources; a message may carry at most {MAX_ATTACHMENTS} \
+                 attachments",
+                iris.len()
+            ),
+        ));
+    }
+    let names = match inv.optional_str("attach_name")? {
+        None => None,
+        Some(value) => {
+            let names = lines(value);
+            if names.len() != iris.len() {
+                return Err(invalid(
+                    "attach_name",
+                    format!(
+                        "`attach_name` gives {} names for {} attachments; give one name per \
+                         line for each `attach` line, in the same order",
+                        names.len(),
+                        iris.len()
+                    ),
+                ));
+            }
+            Some(names)
+        }
+    };
+    let mut parsed = Vec::with_capacity(iris.len());
+    for (index, &iri) in iris.iter().enumerate() {
+        let entry = index + 1;
+        let target = Iri::parse(iri).map_err(|_| {
+            invalid(
+                "attach",
+                format!("`attach` entry {entry} is not a resource IRI"),
+            )
+        })?;
+        let (field, filename) = match &names {
+            Some(names) => ("attach_name", names[index]),
+            None => ("attach", default_filename(iri)),
+        };
+        let filename = header_safe(field, filename).map_err(|err| match err {
+            Error::InvalidArgument { detail, .. } => invalid(
+                field,
+                format!("the filename for attachment {entry}: {detail}"),
+            ),
+            err => err,
+        })?;
+        parsed.push((entry, target, filename));
+    }
+
+    let mut total = 0usize;
+    let mut out = Vec::with_capacity(parsed.len());
+    for (entry, target, filename) in parsed {
+        // Under the caller's own capability: a Denied read refuses the whole send.
+        let rep = inv.source(&target).await?;
+        total = total.saturating_add(rep.bytes.len());
+        if total > MAX_ATTACHMENT_BYTES {
+            return Err(invalid(
+                "attach",
+                format!(
+                    "the attachments come to more than {MAX_ATTACHMENT_BYTES} bytes (10 MiB), \
+                     the most one message may carry"
+                ),
+            ));
+        }
+        if let Some(kind) = secret_key_kind(&rep.bytes) {
+            return Err(invalid(
+                "attach",
+                format!(
+                    "attachment {entry} holds {kind}, and secret keys are never mailed; \
+                     attach the public certificate or key instead"
+                ),
+            ));
+        }
+        let media_type = rep.repr_type.canonical();
+        lettre::message::header::ContentType::parse(&media_type).map_err(|_| {
+            invalid(
+                "attach",
+                format!("attachment {entry} has a media type mail cannot carry"),
+            )
+        })?;
+        out.push(Attachment {
+            filename,
+            media_type,
+            bytes: rep.bytes,
+        });
+    }
+    Ok(out)
+}
+
 #[async_trait]
 impl Endpoint for SendEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
@@ -255,6 +460,9 @@ impl Endpoint for SendEndpoint {
             .map(str::to_string)
             .filter(|s| !s.trim().is_empty());
 
+        // Attachments last: every other argument is checked before anything is read.
+        let attachments = attachments(inv).await?;
+
         let message = Outgoing {
             from: self.config.from.clone(),
             to,
@@ -264,6 +472,7 @@ impl Endpoint for SendEndpoint {
             subject,
             body,
             ics,
+            attachments,
         };
         match self.transport.deliver(&message) {
             Ok(receipt) => Ok(Representation::new(
@@ -292,8 +501,15 @@ impl Endpoint for SendEndpoint {
                 "Submit a message over SMTP. The body is the `content` (piped or explicit); \
                  `to` and `subject` are required, `cc`, `bcc`, and `reply_to` optional. \
                  Recipient lists are comma-separated, and blind copies are envelope-only. An optional `ics` \
-                 VCALENDAR makes it an iMIP calendar invitation. Envelope fields are rejected \
-                 if they contain control characters (SMTP header injection). Submission \
+                 VCALENDAR makes it an iMIP calendar invitation. An optional `attach` names \
+                 one or more resources to attach (newline-separated IRIs, read under the \
+                 caller's own capability, never inlined bytes), for example a public \
+                 certificate (`urn:file:…/server.crt`), an Open Badges credential \
+                 (`application/ld+json`) or a certificate PDF; attaching also requires \
+                 `urn:cap:email:attach`. At most 10 attachments and 10 MiB in total; a \
+                 private key or age secret key is refused. Envelope fields and filenames \
+                 are rejected if they contain control characters (SMTP header injection). \
+                 Submission \
                  goes to a local MTA that relays onward, so DKIM/SPF and relay credentials \
                  stay in the MTA. A refused or greylisted submission is a TRANSIENT error, \
                  so Retry/CircuitBreaker overlays apply.",
@@ -344,6 +560,28 @@ impl Endpoint for SendEndpoint {
                                 "an iCalendar document (a VCALENDAR, e.g. METHOD:REQUEST) \
                                       sent as a text/calendar iMIP part, so the message is an \
                                       add-to-calendar / RSVP invitation",
+                            )
+                            .class(XSD_STRING),
+                    )
+                    .input(
+                        ArgSpec::new("attach")
+                            .optional()
+                            .summary(
+                                "resources to attach, one IRI per line: each is read under \
+                                 your own capability and sent with its media type, for \
+                                 example a public certificate, a credential (an Open \
+                                 Badges JSON-LD document) or a PDF. Needs \
+                                 `urn:cap:email:attach`; at most 10 attachments and 10 MiB \
+                                 in total; private keys and age secret keys are refused",
+                            )
+                            .class(XSD_ANY_URI),
+                    )
+                    .input(
+                        ArgSpec::new("attach_name")
+                            .optional()
+                            .summary(
+                                "filenames for the attachments, one per line in `attach` \
+                                 order (default: each IRI's last segment)",
                             )
                             .class(XSD_STRING),
                     )
@@ -412,27 +650,52 @@ fn build_message(message: &Outgoing) -> std::result::Result<lettre::Message, Mai
                 .map_err(|e| MailError::Permanent(format!("bad Reply-To address: {e}")))?,
         );
     }
-    match &message.ics {
-        None => builder
-            .body(message.body.clone())
-            .map_err(|e| MailError::Permanent(format!("building the message: {e}"))),
+    use lettre::message::{header, MultiPart, SinglePart};
+    // The message's own content: the plain body, or the iMIP alternative when it carries an
+    // invite. iMIP: the plain body and the invite as two alternatives of the same message. A
+    // client that understands calendars shows the RSVP card; one that does not falls back
+    // to the text. The `method=REQUEST` on the part is what makes it an invitation rather
+    // than a mere event to file.
+    let alternative = match &message.ics {
+        None => None,
         Some(ics) => {
-            use lettre::message::{header, MultiPart, SinglePart};
-            // iMIP: the plain body and the invite as two alternatives of the same
-            // message. A client that understands calendars shows the RSVP card; one that
-            // does not falls back to the text. The `method=REQUEST` on the part is what
-            // makes it an invitation rather than a mere event to file.
             let calendar =
                 header::ContentType::parse("text/calendar; charset=utf-8; method=REQUEST")
                     .map_err(|e| MailError::Permanent(format!("calendar content-type: {e}")))?;
-            let alternative = MultiPart::alternative()
-                .singlepart(SinglePart::plain(message.body.clone()))
-                .singlepart(SinglePart::builder().header(calendar).body(ics.clone()));
-            builder
-                .multipart(alternative)
-                .map_err(|e| MailError::Permanent(format!("building the invite: {e}")))
+            Some(
+                MultiPart::alternative()
+                    .singlepart(SinglePart::plain(message.body.clone()))
+                    .singlepart(SinglePart::builder().header(calendar).body(ics.clone())),
+            )
         }
+    };
+    if message.attachments.is_empty() {
+        return match alternative {
+            None => builder
+                .body(message.body.clone())
+                .map_err(|e| MailError::Permanent(format!("building the message: {e}"))),
+            Some(alternative) => builder
+                .multipart(alternative)
+                .map_err(|e| MailError::Permanent(format!("building the invite: {e}"))),
+        };
     }
+    // With attachments: multipart/mixed, the content first and each attachment after it.
+    let mut mixed = match alternative {
+        None => MultiPart::mixed().singlepart(SinglePart::plain(message.body.clone())),
+        Some(alternative) => MultiPart::mixed().multipart(alternative),
+    };
+    for (index, attachment) in message.attachments.iter().enumerate() {
+        let content_type = header::ContentType::parse(&attachment.media_type).map_err(|_| {
+            MailError::Permanent(format!("attachment {}: bad media type", index + 1))
+        })?;
+        mixed = mixed.singlepart(
+            lettre::message::Attachment::new(attachment.filename.clone())
+                .body(attachment.bytes.clone(), content_type),
+        );
+    }
+    builder
+        .multipart(mixed)
+        .map_err(|e| MailError::Permanent(format!("building the message: {e}")))
 }
 
 impl MailTransport for SmtpSubmission {
@@ -971,6 +1234,7 @@ mod tests {
             subject: "Hi".to_string(),
             body: "b".to_string(),
             ics: None,
+            attachments: Vec::new(),
         };
         let Err(MailError::Permanent(detail)) = build_message(&message) else {
             panic!("a bare word is not an address");
@@ -1068,6 +1332,7 @@ mod ics_tests {
             subject: "Your meeting is confirmed".to_string(),
             body: "We're on for tomorrow.".to_string(),
             ics: ics.map(str::to_string),
+            attachments: Vec::new(),
         }
     }
 
@@ -1139,5 +1404,434 @@ mod ics_tests {
             got[0].ics.as_deref().unwrap().contains("METHOD:REQUEST"),
             "ics threaded through"
         );
+    }
+}
+
+/// Attachments, through the [`MailTransport`] seam: named by resource, read under the
+/// caller's capability, bounded, and refused when they hold a secret key.
+#[cfg(test)]
+mod attach_tests {
+    use super::*;
+    use futures::executor::block_on;
+    use ikigai_core::{ArgRef, Capability, FnEndpoint, Kernel, Request};
+    use std::sync::Mutex;
+
+    /// Who may read `urn:test:private`: a scope the default test caller does not hold.
+    const CAP_PRIVATE: &str = "urn:cap:test:private";
+    const CERT: &[u8] =
+        b"-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU\n-----END CERTIFICATE-----\n";
+    const BADGE: &[u8] = br#"{"@context":["https://www.w3.org/ns/credentials/v2","https://purl.imsglobal.org/spec/ob/v3p0/context-3.0.3.json"],"type":["VerifiableCredential","OpenBadgeCredential"],"credentialSubject":{"achievement":{"name":"Rust I"}}}"#;
+    /// Not text: a NUL, high bytes and a bare CR, so "byte for byte" means something.
+    const PDF: &[u8] = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\x00\xff\xfe\r<< >>\nendobj\n%%EOF\n";
+
+    #[derive(Default)]
+    struct Rec(Mutex<Vec<Outgoing>>);
+    impl MailTransport for Rec {
+        fn deliver(&self, message: &Outgoing) -> std::result::Result<String, MailError> {
+            self.0.lock().unwrap().push(message.clone());
+            Ok("250".to_string())
+        }
+    }
+
+    fn fixed(media: &'static str, bytes: Vec<u8>) -> FnEndpoint {
+        FnEndpoint::new("fixture", move |_| {
+            Ok(Representation::new(ReprType::new(media), bytes.clone()))
+        })
+    }
+
+    #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel; it routes no user arguments
+    fn kernel(mail: Arc<Rec>, extra: &[(&'static str, &'static str, Vec<u8>)]) -> Kernel {
+        let config = EmailConfig {
+            from: "site@example.com".to_string(),
+            ..EmailConfig::default()
+        };
+        let mut space = space(config, mail)
+            .bind(
+                Exact::new("urn:test:server.crt"),
+                fixed("application/x-pem-file", CERT.to_vec()),
+            )
+            .bind(
+                Exact::new("urn:test:credentials/rust-1"),
+                fixed("application/ld+json", BADGE.to_vec()),
+            )
+            .bind(
+                Exact::new("urn:test:certificate.pdf"),
+                fixed("application/pdf", PDF.to_vec()),
+            )
+            .bind(
+                Exact::new("urn:test:private"),
+                FnEndpoint::new("private", |inv| {
+                    if !inv.capability.allows(CAP_PRIVATE) {
+                        return Err(Error::Denied(
+                            format!("reading this requires `{CAP_PRIVATE}`").into(),
+                        ));
+                    }
+                    Ok(Representation::new(
+                        ReprType::new("text/plain"),
+                        b"private".to_vec(),
+                    ))
+                }),
+            );
+        for (iri, media, bytes) in extra {
+            space = space.bind(Exact::new(*iri), fixed(media, bytes.clone()));
+        }
+        Kernel::new(Arc::new(space))
+    }
+
+    fn caller() -> Capability {
+        Capability::scoped([CAP_SEND, CAP_ATTACH])
+    }
+
+    fn request(extra: &[(&str, &str)]) -> Request {
+        let mut request = Request::new(Verb::Sink, Iri::parse("urn:email:send").unwrap())
+            .with_arg("to", ArgRef::Inline(b"learner@example.com".to_vec()))
+            .with_arg("subject", ArgRef::Inline(b"What you earned".to_vec()))
+            .with_arg("content", ArgRef::Inline(b"Attached.".to_vec()));
+        for (name, value) in extra {
+            request = request.with_arg(*name, ArgRef::Inline(value.as_bytes().to_vec()));
+        }
+        request
+    }
+
+    fn send(k: &Kernel, extra: &[(&str, &str)], cap: &Capability) -> Result<Representation> {
+        block_on(k.issue(request(extra), cap))
+    }
+
+    /// The wire bytes, for a MIME reader that is not lettre (the `mailparse`
+    /// dev-dependency) to check the structure and the decoded bytes independently.
+    fn parsed(message: &Outgoing) -> Vec<u8> {
+        build_message(message).unwrap().formatted()
+    }
+
+    fn refused(err: &Error, name: &str, needle: &str) -> bool {
+        matches!(err, Error::InvalidArgument { name: n, detail } if n == name && detail.contains(needle))
+    }
+
+    #[test]
+    fn one_attachment_is_named_by_its_resource_and_carried_as_mixed() {
+        let mail = Arc::new(Rec::default());
+        let k = kernel(mail.clone(), &[]);
+        send(&k, &[("attach", "urn:test:server.crt")], &caller()).unwrap();
+        let sent = mail.0.lock().unwrap();
+        assert_eq!(
+            sent[0].attachments,
+            [Attachment {
+                filename: "server.crt".to_string(),
+                media_type: "application/x-pem-file".to_string(),
+                bytes: CERT.to_vec(),
+            }]
+        );
+        let wire = parsed(&sent[0]);
+        let mail = mailparse::parse_mail(&wire).unwrap();
+        assert_eq!(mail.ctype.mimetype, "multipart/mixed");
+        assert_eq!(mail.subparts.len(), 2);
+        assert_eq!(mail.subparts[0].ctype.mimetype, "text/plain");
+        assert_eq!(mail.subparts[0].get_body().unwrap().trim_end(), "Attached.");
+        let part = &mail.subparts[1];
+        assert_eq!(part.ctype.mimetype, "application/x-pem-file");
+        let disposition = part.get_content_disposition();
+        assert_eq!(
+            disposition.disposition,
+            mailparse::DispositionType::Attachment
+        );
+        assert_eq!(
+            disposition.params.get("filename").map(String::as_str),
+            Some("server.crt")
+        );
+        assert_eq!(part.get_body_raw().unwrap(), CERT);
+    }
+
+    /// The learn use: a credential (Open Badges 3.0, JSON-LD) and a certificate PDF, each
+    /// carried byte for byte with its own media type, and `attach_name` naming them.
+    #[test]
+    fn two_attachments_a_credential_and_a_pdf_are_carried_byte_for_byte() {
+        let mail = Arc::new(Rec::default());
+        let k = kernel(mail.clone(), &[]);
+        send(
+            &k,
+            &[
+                (
+                    "attach",
+                    "urn:test:credentials/rust-1\n\n urn:test:certificate.pdf \n",
+                ),
+                ("attach_name", "rust-1.jsonld\nRust I certificate.pdf"),
+            ],
+            &caller(),
+        )
+        .unwrap();
+        let sent = mail.0.lock().unwrap();
+        let wire = parsed(&sent[0]);
+        let mail = mailparse::parse_mail(&wire).unwrap();
+        assert_eq!(mail.ctype.mimetype, "multipart/mixed");
+        assert_eq!(mail.subparts.len(), 3);
+        for (part, (media, name, bytes)) in mail.subparts[1..].iter().zip([
+            ("application/ld+json", "rust-1.jsonld", BADGE),
+            ("application/pdf", "Rust I certificate.pdf", PDF),
+        ]) {
+            assert_eq!(part.ctype.mimetype, media);
+            assert_eq!(
+                part.get_content_disposition()
+                    .params
+                    .get("filename")
+                    .map(String::as_str),
+                Some(name)
+            );
+            assert_eq!(part.get_body_raw().unwrap(), bytes, "{name}");
+        }
+    }
+
+    #[test]
+    fn with_ics_the_imip_alternative_is_kept_whole_before_the_attachment() {
+        let mail = Arc::new(Rec::default());
+        let k = kernel(mail.clone(), &[]);
+        let invite = "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nEND:VCALENDAR\r\n";
+        send(
+            &k,
+            &[("attach", "urn:test:certificate.pdf"), ("ics", invite)],
+            &caller(),
+        )
+        .unwrap();
+        let sent = mail.0.lock().unwrap();
+        let wire = parsed(&sent[0]);
+        let mail = mailparse::parse_mail(&wire).unwrap();
+        assert_eq!(mail.ctype.mimetype, "multipart/mixed");
+        assert_eq!(mail.subparts.len(), 2);
+        let alternative = &mail.subparts[0];
+        assert_eq!(alternative.ctype.mimetype, "multipart/alternative");
+        assert_eq!(alternative.subparts[0].ctype.mimetype, "text/plain");
+        assert_eq!(alternative.subparts[1].ctype.mimetype, "text/calendar");
+        assert_eq!(
+            alternative.subparts[1]
+                .ctype
+                .params
+                .get("method")
+                .map(String::as_str),
+            Some("REQUEST")
+        );
+        assert_eq!(mail.subparts[1].ctype.mimetype, "application/pdf");
+        assert_eq!(mail.subparts[1].get_body_raw().unwrap(), PDF);
+    }
+
+    /// The read runs under the CALLER's capability: what they cannot read, they cannot mail,
+    /// and the refusal stops the whole send.
+    #[test]
+    fn a_denied_read_refuses_the_whole_send() {
+        let mail = Arc::new(Rec::default());
+        let k = kernel(mail.clone(), &[]);
+        let err = send(
+            &k,
+            &[("attach", "urn:test:server.crt\nurn:test:private")],
+            &caller(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
+        assert!(mail.0.lock().unwrap().is_empty());
+        // The same caller holding the read scope sends it.
+        let reader = Capability::scoped([CAP_SEND, CAP_ATTACH, CAP_PRIVATE]);
+        send(&k, &[("attach", "urn:test:private")], &reader).unwrap();
+        assert_eq!(mail.0.lock().unwrap().len(), 1);
+    }
+
+    /// Sending alone is not attaching: a holder of `urn:cap:email:send` only (a contact
+    /// form's handler) is refused before anything is read.
+    #[test]
+    fn attaching_needs_its_own_capability() {
+        let mail = Arc::new(Rec::default());
+        let k = kernel(mail.clone(), &[]);
+        let send_only = Capability::scoped([CAP_SEND, CAP_PRIVATE]);
+        let err = send(&k, &[("attach", "urn:test:server.crt")], &send_only).unwrap_err();
+        assert!(
+            matches!(&err, Error::Denied(_)) && err.to_string().contains(CAP_ATTACH),
+            "{err:?}"
+        );
+        assert!(mail.0.lock().unwrap().is_empty());
+        // Without `attach` the same caller still sends a plain message.
+        send(&k, &[], &send_only).unwrap();
+        assert!(mail.0.lock().unwrap()[0].attachments.is_empty());
+    }
+
+    #[test]
+    fn more_than_the_count_cap_is_refused_naming_the_limit() {
+        let mail = Arc::new(Rec::default());
+        let k = kernel(mail.clone(), &[]);
+        let at_cap = ["urn:test:server.crt"; MAX_ATTACHMENTS].join("\n");
+        send(&k, &[("attach", &at_cap)], &caller()).unwrap();
+        assert_eq!(mail.0.lock().unwrap()[0].attachments.len(), MAX_ATTACHMENTS);
+        let over = ["urn:test:server.crt"; MAX_ATTACHMENTS + 1].join("\n");
+        let err = send(&k, &[("attach", &over)], &caller()).unwrap_err();
+        assert!(refused(&err, "attach", "at most 10 attachments"), "{err:?}");
+        assert_eq!(mail.0.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn more_than_the_size_cap_is_refused_naming_the_limit() {
+        let mail = Arc::new(Rec::default());
+        let half = MAX_ATTACHMENT_BYTES / 2;
+        let k = kernel(
+            mail.clone(),
+            &[
+                (
+                    "urn:test:half",
+                    "application/octet-stream",
+                    vec![b'a'; half],
+                ),
+                ("urn:test:one", "application/octet-stream", vec![b'b'; 1]),
+            ],
+        );
+        // Exactly the cap passes…
+        send(&k, &[("attach", "urn:test:half\nurn:test:half")], &caller()).unwrap();
+        // …one byte more is refused, not truncated.
+        let err = send(
+            &k,
+            &[("attach", "urn:test:half\nurn:test:half\nurn:test:one")],
+            &caller(),
+        )
+        .unwrap_err();
+        assert!(
+            refused(&err, "attach", "10485760 bytes (10 MiB)"),
+            "{err:?}"
+        );
+        assert_eq!(mail.0.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_private_key_or_age_secret_key_is_refused_with_the_reason() {
+        let keys: [&[u8]; 7] = [
+            b"-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----\n",
+            b"-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\n\nMIIE\n-----END RSA PRIVATE KEY-----\n",
+            b"-----BEGIN EC PRIVATE KEY-----\nMHc\n-----END EC PRIVATE KEY-----\n",
+            b"-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIF\n-----END ENCRYPTED PRIVATE KEY-----\n",
+            b"-----BEGIN OPENSSH PRIVATE KEY-----\nb3Bl\n-----END OPENSSH PRIVATE KEY-----\n",
+            // A bundle: a certificate first does not hide the key after it.
+            b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----\n",
+            b"# created: 2026-11-27\n# public key: age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p\nAGE-SECRET-KEY-1QYQSZQGPQYQSZQGPQYQSZQGPQYQSZQGPQYQSZQGPQYQSZQGPQYQSZQGPQYQS\n",
+        ];
+        let mail = Arc::new(Rec::default());
+        let extra: Vec<_> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| {
+                let iri: &'static str = Box::leak(format!("urn:test:key{i}").into_boxed_str());
+                (iri, "application/octet-stream", key.to_vec())
+            })
+            .collect();
+        let k = kernel(mail.clone(), &extra);
+        for (i, _) in keys.iter().enumerate() {
+            let iri = format!("urn:test:server.crt\nurn:test:key{i}");
+            let err = send(&k, &[("attach", &iri)], &caller()).unwrap_err();
+            let kind = if i == 6 {
+                "an age secret key"
+            } else {
+                "a PEM private key block"
+            };
+            assert!(
+                refused(
+                    &err,
+                    "attach",
+                    &format!("attachment 2 holds {kind}, and secret keys are never mailed")
+                ),
+                "key {i}: {err:?}"
+            );
+        }
+        assert!(mail.0.lock().unwrap().is_empty());
+        // A public certificate alone is not a key.
+        send(&k, &[("attach", "urn:test:server.crt")], &caller()).unwrap();
+    }
+
+    /// A filename is held to the envelope fields' header-injection rule, whether it comes
+    /// from `attach_name` or from the IRI's last segment.
+    #[test]
+    fn a_filename_with_a_control_character_is_refused() {
+        let mail = Arc::new(Rec::default());
+        let k = kernel(mail.clone(), &[]);
+        // A bare CR stays inside one line of `attach_name` (a LF would start the next name).
+        for name in [
+            "cert\rBcc: victim@example.com",
+            "cert\u{7}.crt",
+            "cert\t.crt",
+        ] {
+            let err = send(
+                &k,
+                &[("attach", "urn:test:server.crt"), ("attach_name", name)],
+                &caller(),
+            )
+            .unwrap_err();
+            assert!(
+                refused(&err, "attach_name", "SMTP header injection"),
+                "{name:?}: {err:?}"
+            );
+        }
+        // The default name is the IRI's last segment, without its query or fragment.
+        assert_eq!(
+            default_filename("urn:file:/a/b/server.crt?x=1#y"),
+            "server.crt"
+        );
+        assert_eq!(default_filename("urn:test:credentials/rust-1"), "rust-1");
+        assert!(mail.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_attach_arguments_are_refused_before_any_read() {
+        let mail = Arc::new(Rec::default());
+        let k = kernel(mail.clone(), &[]);
+        for (args, name, needle) in [
+            (
+                vec![("attach", " \n ")],
+                "attach",
+                "at least one resource IRI",
+            ),
+            (
+                vec![("attach", "not an iri")],
+                "attach",
+                "entry 1 is not a resource IRI",
+            ),
+            (
+                vec![("attach_name", "orphan.pdf")],
+                "attach_name",
+                "it needs `attach`",
+            ),
+            (
+                vec![
+                    ("attach", "urn:test:server.crt\nurn:test:certificate.pdf"),
+                    ("attach_name", "only-one.crt"),
+                ],
+                "attach_name",
+                "1 names for 2 attachments",
+            ),
+            (
+                vec![("attach", "urn:test:dir/")],
+                "attach",
+                "must not be empty",
+            ),
+        ] {
+            let err = send(&k, &args, &caller()).unwrap_err();
+            assert!(refused(&err, name, needle), "{args:?}: {err:?}");
+        }
+        assert!(mail.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn attach_arguments_are_declared_on_the_sink_contract() {
+        let description = send_endpoint().describe();
+        let sink = description
+            .actions
+            .iter()
+            .find(|action| action.verb == Verb::Sink)
+            .unwrap();
+        for (name, class) in [("attach", XSD_ANY_URI), ("attach_name", XSD_STRING)] {
+            let input = sink.inputs.iter().find(|input| input.name == name).unwrap();
+            assert!(!input.required, "{name} is optional");
+            assert_eq!(input.class.as_deref(), Some(class));
+            assert!(!input.summary.is_empty());
+        }
+        let attach = sink.inputs.iter().find(|i| i.name == "attach").unwrap();
+        assert!(attach.summary.contains("credential"), "{}", attach.summary);
+        assert!(description.summary.contains("Open Badges credential"));
+        // Attaching is not a verb-level requirement: a plain send needs only `email:send`.
+        assert_eq!(sink.requires, [CAP_SEND]);
+    }
+
+    fn send_endpoint() -> SendEndpoint {
+        super::send(EmailConfig::default(), Arc::new(Rec::default()))
     }
 }

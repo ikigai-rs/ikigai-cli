@@ -5346,7 +5346,9 @@ fn root_members(nature: &'static str) -> Vec<Arc<dyn Space>> {
         // Outbound mail (urn:email:send) — a cap-gated Sink submitting to the LOCAL MTA,
         // which relays onward through a transactional service (so DKIM/SPF and relay
         // credentials stay in the MTA, not here). The contact-request handler and the
-        // scheduling confirm-link both reach you through this.
+        // scheduling confirm-link both reach you through this. Its `attach` needs
+        // `urn:cap:email:attach` too, which the contact space's handler is never granted
+        // (`without_mail_attach`), so the public contact path cannot mail a resource out.
         Arc::new({
             let config = email_config();
             let transport = Arc::new(ikigai_email::SmtpSubmission::new(
@@ -6552,7 +6554,10 @@ fn host_space_authority(dir: &Path, space: &str) -> Option<ikigai_core::Capabili
     let path = dir.join(space);
     match std::fs::read_to_string(&path) {
         Ok(raw) => {
-            let scopes = ikigai_intray::parse_scopes(&raw);
+            let mut scopes = ikigai_intray::parse_scopes(&raw);
+            if space == contactblock::CONTACT_SPACE {
+                scopes = without_mail_attach(scopes);
+            }
             (!scopes.is_empty()).then(|| ikigai_core::Capability::scoped(scopes))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -6567,6 +6572,18 @@ fn host_space_authority(dir: &Path, space: &str) -> Option<ikigai_core::Capabili
             None
         }
     }
+}
+
+/// The public contact path never attaches: its handler mails an enquiry a stranger wrote,
+/// so `urn:email:send`'s `attach` (which reads a named resource and mails it out) stays out
+/// of its reach whatever the operator's `space-authority/contact` file lists. A host file
+/// mints a SCOPED capability, whose grants are exact (`Capability::allows`), so dropping the
+/// one scope [`ikigai_email::CAP_ATTACH`] is the whole of it; `urn:cap:email:send` stays.
+fn without_mail_attach(scopes: Vec<String>) -> Vec<String> {
+    scopes
+        .into_iter()
+        .filter(|scope| scope != ikigai_email::CAP_ATTACH)
+        .collect()
 }
 
 /// The host's space reactor over `root`, firing handlers through `resolver`.
@@ -11699,6 +11716,91 @@ mod space_authority_tests {
         // A file listing no scopes is no grant — the default applies, not an empty authority.
         std::fs::write(authority.join("jobs"), "# nothing yet\n\n").unwrap();
         assert_eq!(host_space_authority(&authority, "jobs"), None);
+    }
+
+    /// The public contact path never gains mail attachments (ledger #3027): whatever the
+    /// host's `contact` file lists, the handler's authority cannot attach, and an
+    /// `urn:email:send` it issues with `attach` is refused before anything is read or sent.
+    #[test]
+    fn the_contact_handler_can_send_mail_but_never_attach() {
+        use ikigai_core::{ArgRef, FnEndpoint, Representation};
+        let (_spaces, authority) = scratch("contact-attach");
+        let contact = contactblock::CONTACT_SPACE;
+        for listed in [
+            "urn:cap:email:send\nurn:cap:email:attach\nurn:cap:fs:read\n",
+            "urn:cap:email:attach\nurn:cap:email:send\n",
+        ] {
+            std::fs::write(authority.join(contact), listed).unwrap();
+            let granted = host_space_authority(&authority, contact).expect("a grant");
+            assert!(granted.allows(ikigai_email::CAP_SEND), "{listed}");
+            assert!(!granted.allows(ikigai_email::CAP_ATTACH), "{listed}");
+            // Another space's file is minted as it stands.
+            std::fs::write(authority.join("jobs"), listed).unwrap();
+            let jobs = host_space_authority(&authority, "jobs").unwrap();
+            assert!(jobs.allows(ikigai_email::CAP_ATTACH), "{listed}");
+        }
+
+        // Through the endpoint, under the contact handler's authority.
+        std::fs::write(
+            authority.join(contact),
+            "urn:cap:email:send\nurn:cap:email:attach\n",
+        )
+        .unwrap();
+        let granted = host_space_authority(&authority, contact).unwrap();
+        struct Rec(std::sync::Mutex<Vec<ikigai_email::Outgoing>>);
+        impl ikigai_email::MailTransport for Rec {
+            fn deliver(
+                &self,
+                message: &ikigai_email::Outgoing,
+            ) -> std::result::Result<String, ikigai_email::MailError> {
+                self.0.lock().unwrap().push(message.clone());
+                Ok("250".to_string())
+            }
+        }
+        let mail = Arc::new(Rec(std::sync::Mutex::new(Vec::new())));
+        let read = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let space = ikigai_email::space(
+            ikigai_email::EmailConfig {
+                from: "site@example.com".to_string(),
+                ..ikigai_email::EmailConfig::default()
+            },
+            mail.clone(),
+        )
+        .bind(Exact::new("urn:test:server.key"), {
+            let read = read.clone();
+            FnEndpoint::new("key", move |_| {
+                read.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    b"k".to_vec(),
+                ))
+            })
+        });
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
+        let kernel = Kernel::new(Arc::new(space));
+        let enquiry = |attach: Option<&str>| {
+            let mut request = Request::new(Verb::Sink, Iri::parse("urn:email:send").unwrap())
+                .with_arg("to", ArgRef::Inline(b"owner@example.com".to_vec()))
+                .with_arg("subject", ArgRef::Inline(b"Enquiry".to_vec()))
+                .with_arg("content", ArgRef::Inline(b"Hello".to_vec()));
+            if let Some(attach) = attach {
+                request = request.with_arg("attach", ArgRef::Inline(attach.as_bytes().to_vec()));
+            }
+            futures::executor::block_on(kernel.issue(request, &granted))
+        };
+        let err = enquiry(Some("urn:test:server.key")).unwrap_err();
+        assert!(
+            matches!(&err, Error::Denied(_)) && err.to_string().contains(ikigai_email::CAP_ATTACH),
+            "{err:?}"
+        );
+        assert!(
+            !read.load(std::sync::atomic::Ordering::SeqCst),
+            "nothing was read"
+        );
+        assert!(mail.0.lock().unwrap().is_empty(), "nothing was sent");
+        enquiry(None).expect("the enquiry itself still goes out");
+        assert_eq!(mail.0.lock().unwrap().len(), 1);
     }
 
     /// A name that is not a single path segment never becomes a filename, so nothing a
