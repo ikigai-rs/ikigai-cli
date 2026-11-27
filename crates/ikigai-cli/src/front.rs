@@ -19,6 +19,13 @@
 //! token, or a client the enrollment no longer holds: `401`, and nothing is resolved. The
 //! transport is TLS with the QUIC door's own server certificate, which a client pins.
 //!
+//! **A token's lifetime and its certificate** (ledger #4544, [`admit`]): a token past its
+//! `expires` is refused with a sentence naming when it expired and how to get a new one; so is
+//! one whose bound certificate is no longer on the door's client trust list (`clients/`, read
+//! on every request as the QUIC door reads it at every handshake) or is outside its validity
+//! window. The TLS asks for a client certificate and requires none: one presented must be the
+//! token's bound certificate, and a token minted `--require-cert` is refused without it.
+//!
 //! **Routes**, GET and POST only (a DELETE that answers with a body is not something every HTTP
 //! client can read, so `take` is a POST that answers 200 with what it took). A HEAD is a GET
 //! that answers with the head alone, as ikigai-web's routed adapter answers it: GET's status and
@@ -80,6 +87,9 @@ pub struct Front {
     pub minter: ikigai_quic::Minter,
     /// `layer-tokens.json`, read on every request.
     pub tokens: PathBuf,
+    /// The QUIC door's client trust list, read on every request: a token's bound certificate
+    /// must still be on it, and within its validity window (ledger #4544).
+    pub trust: ikigai_quic::TrustList,
     /// The bounds every request is read under (ikigai-web's own).
     pub edge: EdgeConfig,
 }
@@ -297,9 +307,113 @@ fn unauthenticated() -> Response {
     .with_header("WWW-Authenticate", "Bearer realm=\"layers\"")
 }
 
+/// The `401` for a token that resolved but may not be used now, with the sentence that says why.
+/// Only a caller holding a token the operator minted ever reads it.
+fn refused_token(why: &str) -> Response {
+    refusal(401, "denied", why).with_header(
+        "WWW-Authenticate",
+        "Bearer realm=\"layers\", error=\"invalid_token\"",
+    )
+}
+
+/// Whether a resolved token may be used at `now` (seconds since the Unix epoch), given the
+/// door's client trust list as it reads now and the fingerprint of the client certificate the
+/// connection presented, if any. `Err` is the sentence the caller is answered with.
+///
+/// In order: the token's own expiry; its bound certificate still trusted and inside its
+/// validity window (a token never outlives the certificate it stands for); and the
+/// connection's client certificate, which must be the bound one when presented and must be
+/// presented when the token was minted `--require-cert`.
+pub fn admit(
+    binding: &ikigai_embedded::tokens::Binding,
+    now: i64,
+    trusted: std::io::Result<Vec<String>>,
+    presented: Option<&str>,
+) -> Result<(), String> {
+    binding.check_expiry(now)?;
+    let mint = "Ask the operator to mint a new token with `ikigai layers-token mint`";
+    let trusted = trusted.map_err(|_| {
+        format!(
+            "token {} cannot be checked: this door's client trust list does not read. Try \
+             again later",
+            binding.id
+        )
+    })?;
+    let bound = trusted
+        .iter()
+        .find(|pem| ikigai_quic::fingerprint_of_pem(pem).is_ok_and(|fp| fp == binding.client))
+        .ok_or_else(|| {
+            format!(
+                "token {} is bound to a certificate this door no longer trusts. {mint} for a \
+                 trusted certificate",
+                binding.id
+            )
+        })?;
+    let (not_before, not_after) = ikigai_quic::certificate_window(bound).map_err(|_| {
+        format!(
+            "token {} is bound to a certificate this door cannot read. {mint}",
+            binding.id
+        )
+    })?;
+    if now < not_before {
+        return Err(format!(
+            "token {} is bound to a certificate that is not valid yet. Try again once it is",
+            binding.id
+        ));
+    }
+    if now > not_after {
+        let until = chrono_free_rfc3339(not_after);
+        return Err(format!(
+            "token {} is bound to a certificate that expired at {until}. {mint} for a \
+             current certificate",
+            binding.id
+        ));
+    }
+    match presented {
+        Some(fp) if fp != binding.client => Err(format!(
+            "token {} is bound to a different client certificate than this connection \
+             presented. Present the certificate the token was minted for, or none",
+            binding.id
+        )),
+        None if binding.require_cert => Err(format!(
+            "token {} must be presented with its client certificate, and this connection \
+             presented none. Connect with the certificate the token was minted for",
+            binding.id
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Seconds since the Unix epoch as RFC 3339 UTC (`2030-01-01T00:00:00Z`), for a refusal that
+/// names a certificate's `notAfter`. Civil-from-days, Howard Hinnant's algorithm.
+fn chrono_free_rfc3339(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
 impl Front {
     /// The session `req`'s token mints, through the QUIC door's minter; `Err` is the `401`.
-    fn session(&self, req: &HttpRequest) -> Result<ikigai_quic::Session, Response> {
+    /// `presented` is the fingerprint of the client certificate the connection presented.
+    fn session(
+        &self,
+        req: &HttpRequest,
+        presented: Option<&str>,
+    ) -> Result<ikigai_quic::Session, Response> {
         let Some(token) = bearer(req) else {
             return Err(unauthenticated());
         };
@@ -319,6 +433,14 @@ impl Front {
         let Some(binding) = tokens.binding_for(token) else {
             return Err(unauthenticated());
         };
+        let now = ikigai_embedded::tokens::now_unix();
+        if let Err(why) = admit(binding, now, (self.trust)(), presented) {
+            crate::diagnose(format_args!(
+                "ikigai: layers https: REFUSED token {} ({}): {why}",
+                binding.id, binding.label
+            ));
+            return Err(refused_token(&why));
+        }
         // The QUIC door keys a connection's file namespace by a hash of its certificate,
         // which a token does not carry. Nothing the front routes to is a file, so the
         // namespace is the token's own and never shared with the certificate's.
@@ -396,10 +518,11 @@ impl Front {
         serde_json::Value::Object(with).to_string().into_bytes()
     }
 
-    /// Answer one request: authenticate, route, resolve.
-    fn answer(&self, req: &HttpRequest) -> Response {
+    /// Answer one request: authenticate, route, resolve. `presented` is the fingerprint of the
+    /// client certificate the connection presented, if it presented one.
+    fn answer(&self, req: &HttpRequest, presented: Option<&str>) -> Response {
         // Authentication first, before anything about the routes is disclosed.
-        let session = match self.session(req) {
+        let session = match self.session(req, presented) {
             Ok(session) => session,
             Err(refused) => return refused,
         };
@@ -486,7 +609,15 @@ async fn connection(
     // A resolution is synchronous and a feed may wait up to a minute, so it runs on the
     // blocking pool, never on a runtime worker.
     let method = req.method.clone();
-    let answer = tokio::task::spawn_blocking(move || front.answer(&req))
+    // The client certificate the handshake proved the caller holds the key of, if any. The
+    // TLS config asks for one and requires none; `admit` decides what it means.
+    let presented = tls
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|chain| chain.first())
+        .map(|leaf| ikigai_quic::fingerprint(leaf.as_ref()));
+    let answer = tokio::task::spawn_blocking(move || front.answer(&req, presented.as_deref()))
         .await
         .unwrap_or_else(|_| refusal(500, "endpoint", "the front failed answering this request"));
     // The writer refuses a header it cannot write safely (a content type with a CR or LF from
@@ -515,6 +646,84 @@ async fn refuse_over_cap<S: AsyncRead + AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A client certificate valid from `from` to `until` (years, January 1st UTC).
+    fn cert_valid(from: i32, until: i32) -> String {
+        let mut params = rcgen::CertificateParams::new(vec!["ikigai".to_string()]).unwrap();
+        params.not_before = rcgen::date_time_ymd(from, 1, 1);
+        params.not_after = rcgen::date_time_ymd(until, 1, 1);
+        let key = rcgen::KeyPair::generate().unwrap();
+        params.self_signed(&key).unwrap().pem()
+    }
+
+    fn bound_to(pem: &str, expires: &str, require_cert: bool) -> ikigai_embedded::tokens::Binding {
+        let mut tokens = ikigai_embedded::tokens::Tokens::default();
+        let token = ikigai_embedded::tokens::generate().unwrap();
+        let client = ikigai_quic::fingerprint_of_pem(pem).unwrap();
+        tokens
+            .insert(
+                &token,
+                &client,
+                "relay",
+                "2026-11-01T00:00:00Z",
+                expires,
+                require_cert,
+            )
+            .unwrap()
+    }
+
+    /// 2026-11-27T00:00:00Z.
+    const NOW: i64 = 1_795_737_600;
+
+    /// Ledger #4544: an expired token, a removed certificate, a certificate past its
+    /// `notAfter`, a wrong client certificate and a missing one under `--require-cert` are each
+    /// refused, with a sentence; a valid token with and without a certificate is admitted
+    /// where its mint allows.
+    #[test]
+    fn a_token_is_admitted_only_inside_its_lifetime_and_its_certificates() {
+        assert_eq!(chrono_free_rfc3339(NOW), "2026-11-27T00:00:00Z");
+        let mine = cert_valid(2000, 2100);
+        let other = cert_valid(2000, 2100);
+        let fp = |pem: &str| ikigai_quic::fingerprint_of_pem(pem).unwrap();
+        let trust = || Ok(vec![other.clone(), mine.clone()]);
+        let open = bound_to(&mine, "2027-02-25T00:00:00Z", false);
+        let strict = bound_to(&mine, "2027-02-25T00:00:00Z", true);
+
+        // Admitted where allowed.
+        assert_eq!(admit(&open, NOW, trust(), None), Ok(()));
+        assert_eq!(admit(&open, NOW, trust(), Some(&fp(&mine))), Ok(()));
+        assert_eq!(admit(&strict, NOW, trust(), Some(&fp(&mine))), Ok(()));
+
+        // Expired.
+        let old = bound_to(&mine, "2026-11-26T23:59:59Z", false);
+        let why = admit(&old, NOW, trust(), None).unwrap_err();
+        assert!(why.contains("expired at 2026-11-26T23:59:59Z"), "{why}");
+        assert!(why.contains("ikigai layers-token mint"), "{why}");
+
+        // Its certificate removed from the trust list, or the list unreadable.
+        let why = admit(&open, NOW, Ok(vec![other.clone()]), None).unwrap_err();
+        assert!(why.contains("no longer trusts"), "{why}");
+        assert!(admit(&open, NOW, Err(std::io::Error::other("gone")), None).is_err());
+
+        // Its certificate past `notAfter` (2020-01-01), though still on the list.
+        let lapsed_pem = cert_valid(2000, 2020);
+        let lapsed = bound_to(&lapsed_pem, "2027-02-25T00:00:00Z", false);
+        let why = admit(&lapsed, NOW, Ok(vec![lapsed_pem.clone()]), None).unwrap_err();
+        assert!(why.contains("expired at 2020-01-01T00:00:00Z"), "{why}");
+        let early_pem = cert_valid(2030, 2040);
+        let early = bound_to(&early_pem, "2027-02-25T00:00:00Z", false);
+        assert!(admit(&early, NOW, Ok(vec![early_pem]), None).is_err());
+
+        // A wrong client certificate, under either mint.
+        for binding in [&open, &strict] {
+            let why = admit(binding, NOW, trust(), Some(&fp(&other))).unwrap_err();
+            assert!(why.contains("different client certificate"), "{why}");
+        }
+
+        // None presented under `--require-cert`.
+        let why = admit(&strict, NOW, trust(), None).unwrap_err();
+        assert!(why.contains("presented none"), "{why}");
+    }
 
     fn req(method: &str, path: &str, query: &[(&str, &str)], body: &[u8]) -> HttpRequest {
         HttpRequest {

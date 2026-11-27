@@ -143,6 +143,10 @@ dirs = "6.0"
 toml = "0.8"
 
 [dev-dependencies]
+# `src/front.rs`'s tests mint client certificates with a real validity window (one past its
+# `notAfter`), as ikigai-quic's own tests do. Already in the graph through ikigai-quic, with
+# the same requirement and features, so no second copy (ledger #4544).
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 # Export the HTTP regression fixture for the shared axe workflow.
 ikigai-ui = { workspace = true, features = ["testkit"] }
 # Read this workspace's own manifests back in `tests/lockstep_pins.rs`. A real TOML parse

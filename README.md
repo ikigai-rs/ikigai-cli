@@ -504,6 +504,13 @@ curl --cacert server.crt --resolve ikigai:4435:<door address> https://ikigai:443
   beside `clients.json` keeps their SHA-256 hashes, never the tokens, and is read on every
   request, so a revocation (or removing the participant's `clients.json` entry, whatever its
   `"default"` says) refuses its next request. No token, or one the file does not hold: `401`.
+- **A token has a lifetime and follows its certificate** (ledger #4544): `mint --lifetime
+  <n>d|<n>h` (default 90 days, at most 365) records `expires`, and an expired token is refused
+  with a sentence naming the expiry. A token whose certificate is no longer in `clients/`, or is
+  past its `notAfter`, is refused too. The front asks for a client certificate and requires
+  none: one presented must be the token's own, and `mint --require-cert` refuses a request that
+  presents none. Entries an older release wrote get an expiry 90 days from the first start of
+  this release (the old file is kept as `layer-tokens.json.bak-<time>`).
 - **TLS (1.3 or 1.2) with the door's server certificate**, the one a QUIC client pins; an
   HTTPS client pins the same file. ⚠ Its subject name is `ikigai`, not the host's, so a client
   that checks names either connects by that name (`--resolve` above) or pins the certificate

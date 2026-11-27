@@ -2465,6 +2465,113 @@ pub fn https_server_tls(identity: &Identity) -> io::Result<rustls::ServerConfig>
     Ok(tls)
 }
 
+/// [`https_server_tls`] that ASKS for a client certificate and does not require one (ledger
+/// #4544): a caller may present one, and the front that serves it decides what it means.
+///
+/// The handshake checks only that the client holds the private key of the certificate it
+/// presents (rustls verifies the CertificateVerify signature over it); it trusts nothing about
+/// the certificate itself. A front reads the presented leaf with [`fingerprint`] and compares
+/// it with what the caller's other credential is bound to, so a certificate this door has never
+/// seen proves nothing but possession of its own key.
+///
+/// ```
+/// let identity = ikigai_quic::generate();
+/// let tls = ikigai_quic::https_server_tls_asking_client_cert(&identity).unwrap();
+/// assert_eq!(tls.alpn_protocols, vec![b"http/1.1".to_vec()]);
+/// ```
+pub fn https_server_tls_asking_client_cert(
+    identity: &Identity,
+) -> io::Result<rustls::ServerConfig> {
+    let verifier = Arc::new(OptionalClientCert {
+        algorithms: provider().signature_verification_algorithms,
+    });
+    let mut tls = rustls::ServerConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .map_err(other)?
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(
+            vec![load_cert(&identity.cert_pem)?],
+            load_key(&identity.key_pem)?,
+        )
+        .map_err(other)?;
+    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(tls)
+}
+
+/// The verifier of [`https_server_tls_asking_client_cert`]: offers client authentication,
+/// does not require it, and accepts any certificate whose key signs the handshake.
+#[derive(Debug)]
+struct OptionalClientCert {
+    algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl ClientCertVerifier for OptionalClientCert {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        false
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.algorithms.supported_schemes()
+    }
+}
+
+/// The validity window of the first certificate in `pem`: its `notBefore` and `notAfter` as
+/// seconds since the Unix epoch (both inclusive, RFC 5280 section 4.1.2.5), the window a
+/// door's verifier checks at each handshake. A PEM that holds no parseable certificate is an
+/// error.
+///
+/// ```
+/// let identity = ikigai_quic::generate();
+/// let (from, until) = ikigai_quic::certificate_window(&identity.cert_pem).unwrap();
+/// assert!(from < until);
+/// assert!(ikigai_quic::certificate_window("not a certificate").is_err());
+/// ```
+pub fn certificate_window(pem: &str) -> io::Result<(i64, i64)> {
+    let der = load_cert(pem)?;
+    let (_, cert) = x509_parser::parse_x509_certificate(der.as_ref())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let validity = cert.validity();
+    Ok((
+        validity.not_before.timestamp(),
+        validity.not_after.timestamp(),
+    ))
+}
+
 /// The client half of [`https_server_tls`]: trust exactly the pinned server certificate (no
 /// CA, no name check: the certificate IS the identity, as on the QUIC transport), present no
 /// client certificate, offer ALPN `http/1.1`.
@@ -2483,6 +2590,35 @@ pub fn pinned_https_client_tls(trusted_server_cert_pem: &str) -> io::Result<rust
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
+    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(tls)
+}
+
+/// [`pinned_https_client_tls`] that PRESENTS `identity`'s certificate as its client
+/// certificate (ledger #4544): what a caller of a front built with
+/// [`https_server_tls_asking_client_cert`] uses to bind its token to the connection.
+///
+/// ```
+/// let server = ikigai_quic::generate();
+/// let client = ikigai_quic::generate();
+/// let tls = ikigai_quic::pinned_https_client_tls_presenting(&server.cert_pem, &client).unwrap();
+/// assert_eq!(tls.alpn_protocols, vec![b"http/1.1".to_vec()]);
+/// ```
+pub fn pinned_https_client_tls_presenting(
+    trusted_server_cert_pem: &str,
+    identity: &Identity,
+) -> io::Result<rustls::ClientConfig> {
+    let verifier = Arc::new(PinnedPeer::new(load_cert(trusted_server_cert_pem)?));
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .map_err(other)?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(
+            vec![load_cert(&identity.cert_pem)?],
+            load_key(&identity.key_pem)?,
+        )
+        .map_err(other)?;
     tls.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(tls)
 }
