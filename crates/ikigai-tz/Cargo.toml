@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-tz"
-description = "Timezone conversion module: urn:tz:convert (IANA/DST-correct) + urn:tz:now (zoned clock)."
+description = "Timezone module: urn:tz:convert (IANA/DST-correct), urn:tz:now (zoned clock) and urn:tz:expand (RFC 5545 recurrence)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,6 +13,9 @@ ikigai-core = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # The IANA time-zone database (bundled) — DST- and offset-correct conversions.
 chrono-tz = "0.10"
+# RFC 5545 recurrence rules (`urn:tz:expand`): the vetted implementation, never a private one.
+# No default features; on the same chrono 0.4 / chrono-tz 0.10 as above.
+rrule = "0.14"
 
 [dev-dependencies]
 futures = { workspace = true }

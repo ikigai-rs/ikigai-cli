@@ -5,6 +5,8 @@
 //!
 //! - `tz-convert` is `pure` and `cacheable`: a function of its inline arguments and the
 //!   static tz database, read through nothing that could change.
+//! - `tz-expand` is `pure` and `cacheable` for the same reason: a rule, a start, a zone and a
+//!   window in, occurrences out, on the static tz database and the `rrule` crate.
 //! - `tz-now` declares nothing and opts out of `CACHEABLE`, with the reason below: it reads
 //!   the invocation's clock, so it is not pure, and its answer is cacheable only until the
 //!   next minute (`Expiry::At`) or, under a temporal corridor, for as long as the corridor's
@@ -13,8 +15,8 @@
 //!   (`a_live_clock_reads_the_kernels_time_and_caches_to_the_minute`,
 //!   `a_temporal_corridor_pins_the_answer_and_makes_it_immutable`).
 //!
-//! One fixture: `tz-convert`'s minimal inputs (`x` for every string) are not a time zone, so
-//! the suite is handed a real instant and zone. One space declaration: `space()` is
+//! Two fixtures: `tz-convert`'s and `tz-expand`'s minimal inputs (`x` for every string) are
+//! not a time zone, a rule or a time, so the suite is handed real ones. One space declaration: `space()` is
 //! configuration-free, so it is self-named `urn:iki:space:tz`.
 //!
 //! BODIES (conformance 0.12.0) calls each endpoint's `invoke` and `invoke_body` directly, so
@@ -43,8 +45,18 @@ fn conforms() {
                 .arg("in", "2026-07-21T12:00:00-04:00")
                 .arg("to", "UTC"),
         )
+        .fixture(
+            Fixture::new("tz-expand", Verb::Source)
+                .arg("rule", "FREQ=WEEKLY;BYDAY=TU,TH;COUNT=10")
+                .arg("start", "2026-10-20 18:00")
+                .arg("zone", "America/New_York")
+                .arg("from", "2026-10-01 00:00")
+                .arg("until", "2026-12-01 00:00"),
+        )
         .pure("tz-convert")
         .cacheable("tz-convert")
+        .pure("tz-expand")
+        .cacheable("tz-expand")
         .opt_out_check(
             "tz-now",
             Check::Cacheable,
@@ -60,8 +72,8 @@ fn conforms() {
         .run_blocking(&kernel);
     assert!(report.is_clean(), "{report}");
     assert_eq!(
-        report.endpoints, 2,
-        "both urn:tz:* doors are declared: {report}"
+        report.endpoints, 3,
+        "all three urn:tz:* doors are declared: {report}"
     );
     // Everything deterministic was observed: the one unprobed action is the clock's BODIES.
     let unprobed: Vec<(&str, Check)> = report

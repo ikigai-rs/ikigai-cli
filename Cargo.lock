@@ -3942,6 +3942,7 @@ dependencies = [
  "futures",
  "ikigai-conformance",
  "ikigai-core",
+ "rrule",
 ]
 
 [[package]]
@@ -7543,6 +7544,19 @@ dependencies = [
  "robius-android-env",
  "windows 0.56.0",
  "windows-core 0.56.0",
+]
+
+[[package]]
+name = "rrule"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "720acfb4980b9d8a6a430f6d7a11933e701ebbeba5eee39cc9d8c5f932aaff74"
+dependencies = [
+ "chrono",
+ "chrono-tz",
+ "log",
+ "regex",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
