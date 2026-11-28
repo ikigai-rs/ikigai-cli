@@ -1057,6 +1057,13 @@ fn refuse_arrangement_flag(door: &str) {
 /// line on stderr; a `-c` batch and `--quiet` stay quiet.
 #[cfg(feature = "embedded")]
 fn arm_bayes(announce: bool) {
+    // The local root mounts the secret stores too: a configured `[secret]` section is said once
+    // here, with the names its inspection resources reserve (ledger #4487), under the same rule.
+    if announce {
+        if let Some(line) = ikigai_embedded::secrets::announcement() {
+            eprintln!("{line}");
+        }
+    }
     match ikigai_embedded::bayes::arm() {
         Ok(Some(line)) if announce => eprintln!("{line}"),
         Ok(_) => {}
@@ -2256,6 +2263,12 @@ fn main() {
             std::process::exit(2);
         }
         if let Err(e) = ikigai_embedded::cache::configure() {
+            eprintln!("ikigai: {e}");
+            std::process::exit(2);
+        }
+        // The `[secret]` section (ledger #4487): a malformed one stops every mode with
+        // ikigai-secret's sentence, before any store is built; nothing in it is half-applied.
+        if let Err(e) = ikigai_embedded::secrets::configure() {
             eprintln!("ikigai: {e}");
             std::process::exit(2);
         }
