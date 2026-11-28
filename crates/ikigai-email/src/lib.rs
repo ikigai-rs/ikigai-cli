@@ -49,7 +49,7 @@
 use async_trait::async_trait;
 use ikigai_core::{
     ActionSpec, ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, Invocation, Iri,
-    ReprType, Representation, Result, Verb,
+    ListSeparator, ReprType, Representation, Result, Verb,
 };
 use std::sync::Arc;
 
@@ -250,15 +250,6 @@ fn invalid(name: &str, detail: String) -> Error {
     }
 }
 
-/// The non-blank lines of a newline-separated argument (the map convention), trimmed.
-fn lines(value: &str) -> Vec<&str> {
-    value
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect()
-}
-
 /// The filename an IRI names by default: its last segment, after the last `/` or `:`, with
 /// any query or fragment dropped.
 fn default_filename(iri: &str) -> &str {
@@ -302,7 +293,7 @@ async fn attachments(inv: &Invocation<'_>) -> Result<Vec<Attachment>> {
         }
         return Ok(Vec::new());
     };
-    let iris = lines(attach);
+    let iris = ListSeparator::Newline.split(attach);
     if iris.is_empty() {
         return Err(invalid(
             "attach",
@@ -329,7 +320,7 @@ async fn attachments(inv: &Invocation<'_>) -> Result<Vec<Attachment>> {
     let names = match inv.optional_str("attach_name")? {
         None => None,
         Some(value) => {
-            let names = lines(value);
+            let names = ListSeparator::Newline.split(value);
             if names.len() != iris.len() {
                 return Err(invalid(
                     "attach_name",
@@ -371,18 +362,24 @@ async fn attachments(inv: &Invocation<'_>) -> Result<Vec<Attachment>> {
     let mut out = Vec::with_capacity(parsed.len());
     for (entry, target, filename) in parsed {
         // Under the caller's own capability: a Denied read refuses the whole send.
-        let rep = inv.source(&target).await?;
-        total = total.saturating_add(rep.bytes.len());
-        if total > MAX_ATTACHMENT_BYTES {
-            return Err(invalid(
+        let rep = inv.source_body(&target).await?;
+        // The running total is held to the cap AS each resource is read: a body whose
+        // declared length is already past what is left is refused before it is read, and a
+        // stream is refused at the first chunk past it, never read whole first.
+        let left = MAX_ATTACHMENT_BYTES - total;
+        let bytes = rep.bytes.collect(left).await.map_err(|err| match err {
+            Error::OverBudget { .. } => invalid(
                 "attach",
                 format!(
                     "the attachments come to more than {MAX_ATTACHMENT_BYTES} bytes (10 MiB), \
                      the most one message may carry"
                 ),
-            ));
-        }
-        if let Some(kind) = secret_key_kind(&rep.bytes) {
+            ),
+            err => err,
+        })?;
+        total += bytes.len();
+        let bytes = bytes.to_vec();
+        if let Some(kind) = secret_key_kind(&bytes) {
             return Err(invalid(
                 "attach",
                 format!(
@@ -401,7 +398,7 @@ async fn attachments(inv: &Invocation<'_>) -> Result<Vec<Attachment>> {
         out.push(Attachment {
             filename,
             media_type,
-            bytes: rep.bytes,
+            bytes,
         });
     }
     Ok(out)
@@ -574,6 +571,7 @@ impl Endpoint for SendEndpoint {
                                  `urn:cap:email:attach`; at most 10 attachments and 10 MiB \
                                  in total; private keys and age secret keys are refused",
                             )
+                            .list(ListSeparator::Newline)
                             .class(XSD_ANY_URI),
                     )
                     .input(
@@ -583,6 +581,8 @@ impl Endpoint for SendEndpoint {
                                 "filenames for the attachments, one per line in `attach` \
                                  order (default: each IRI's last segment)",
                             )
+                            .list(ListSeparator::Newline)
+                            .needs(["attach"])
                             .class(XSD_STRING),
                     )
                     .requires(CAP_SEND),
@@ -1829,6 +1829,170 @@ mod attach_tests {
         assert!(description.summary.contains("Open Badges credential"));
         // Attaching is not a verb-level requirement: a plain send needs only `email:send`.
         assert_eq!(sink.requires, [CAP_SEND]);
+    }
+
+    /// `attach` and `attach_name` are newline lists: `attach=a attach=b` is one call whose
+    /// `attach` holds both IRIs, the class applies to each item, and `attach_name` needs
+    /// `attach` on the contract too.
+    #[test]
+    fn attach_is_a_newline_list_and_attach_name_needs_it() {
+        use ikigai_core::ProposedArgs;
+        let description = send_endpoint().describe();
+        let sink = description
+            .actions
+            .iter()
+            .find(|action| action.verb == Verb::Sink)
+            .unwrap();
+        for name in ["attach", "attach_name"] {
+            let input = sink.inputs.iter().find(|i| i.name == name).unwrap();
+            assert_eq!(input.list, Some(ListSeparator::Newline), "{name}");
+        }
+        let name = sink
+            .inputs
+            .iter()
+            .find(|i| i.name == "attach_name")
+            .unwrap();
+        assert_eq!(name.needs, ["attach"]);
+
+        let base = ProposedArgs::new()
+            .with("to", "learner@example.com")
+            .with("subject", "What you earned")
+            .with("content", "Attached.");
+        let repeated = base
+            .clone()
+            .with("attach", "urn:test:credentials/rust-1")
+            .with("attach", "urn:test:certificate.pdf")
+            .with("attach_name", "rust-1.jsonld")
+            .with("attach_name", "certificate.pdf");
+        assert!(
+            sink.check(&repeated).is_empty(),
+            "{:?}",
+            sink.check(&repeated)
+        );
+        let joined = sink.join_repeats(&repeated).unwrap();
+        assert_eq!(
+            joined.get("attach"),
+            Some("urn:test:credentials/rust-1\nurn:test:certificate.pdf")
+        );
+        assert!(!sink
+            .check(&base.with("attach_name", "orphan.pdf"))
+            .is_empty());
+
+        // The joined call sends both, in order, with their names.
+        let mail = Arc::new(Rec::default());
+        let k = kernel(mail.clone(), &[]);
+        let args: Vec<(&str, &str)> = ["attach", "attach_name"]
+            .into_iter()
+            .map(|name| (name, joined.get(name).unwrap()))
+            .collect();
+        send(&k, &args, &caller()).unwrap();
+        let sent = mail.0.lock().unwrap();
+        let names: Vec<&str> = sent[0]
+            .attachments
+            .iter()
+            .map(|a| a.filename.as_str())
+            .collect();
+        assert_eq!(names, ["rust-1.jsonld", "certificate.pdf"]);
+    }
+
+    /// The size cap holds the RUNNING total as each resource is read: a stream past what is
+    /// left is refused at the first chunk over it, never read whole, and a body whose
+    /// declared length is already over is refused without being opened.
+    #[test]
+    fn the_size_cap_refuses_as_it_reads_not_after() {
+        use ikigai_core::{Body, ByteStream, Bytes, Replay};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        const CHUNK: usize = 1024 * 1024;
+        /// 64 MiB in 1 MiB chunks, counting each chunk handed out.
+        struct Endless(Arc<AtomicUsize>);
+        #[async_trait]
+        impl Endpoint for Endless {
+            async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
+                unreachable!("an attachment is read as a body")
+            }
+            async fn invoke_body(&self, _inv: &Invocation<'_>) -> Result<Representation<Body>> {
+                let pulled = self.0.clone();
+                let chunks = futures::stream::iter(0..64).map(move |_| {
+                    pulled.fetch_add(1, Ordering::SeqCst);
+                    Ok(Bytes::from(vec![b'a'; CHUNK]))
+                });
+                Ok(Representation::from_body(
+                    ReprType::new("application/octet-stream"),
+                    Body::once(chunks),
+                ))
+            }
+        }
+        /// Declares 11 MiB; records whether it was ever opened.
+        struct Declared(Arc<AtomicBool>);
+        impl Replay for Declared {
+            fn open(&self) -> ByteStream {
+                self.0.store(true, Ordering::SeqCst);
+                Box::pin(futures::stream::empty())
+            }
+            fn len_hint(&self) -> Option<u64> {
+                Some((MAX_ATTACHMENT_BYTES + CHUNK) as u64)
+            }
+        }
+        struct Big(Arc<AtomicBool>);
+        #[async_trait]
+        impl Endpoint for Big {
+            async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
+                unreachable!("an attachment is read as a body")
+            }
+            async fn invoke_body(&self, _inv: &Invocation<'_>) -> Result<Representation<Body>> {
+                Ok(Representation::from_body(
+                    ReprType::new("application/octet-stream"),
+                    Body::replay(Declared(self.0.clone())),
+                ))
+            }
+        }
+        use futures::StreamExt as _;
+
+        let mail = Arc::new(Rec::default());
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let opened = Arc::new(AtomicBool::new(false));
+        let config = EmailConfig {
+            from: "site@example.com".to_string(),
+            ..EmailConfig::default()
+        };
+        #[allow(clippy::disallowed_methods)] // internal: a test fixture's kernel
+        let k = Kernel::new(Arc::new(
+            space(config, mail.clone())
+                .bind(
+                    Exact::new("urn:test:server.crt"),
+                    fixed("application/x-pem-file", CERT.to_vec()),
+                )
+                .bind(Exact::new("urn:test:endless"), Endless(pulled.clone()))
+                .bind(Exact::new("urn:test:big"), Big(opened.clone())),
+        ));
+
+        let err = send(&k, &[("attach", "urn:test:endless")], &caller()).unwrap_err();
+        assert!(refused(&err, "attach", "10 MiB"), "{err:?}");
+        let read = pulled.load(Ordering::SeqCst);
+        assert!(
+            read <= 11,
+            "read {read} MiB of a 64 MiB stream before refusing"
+        );
+
+        // The running total counts what came before: after the certificate, less is left.
+        pulled.store(0, Ordering::SeqCst);
+        let err = send(
+            &k,
+            &[("attach", "urn:test:server.crt\nurn:test:endless")],
+            &caller(),
+        )
+        .unwrap_err();
+        assert!(refused(&err, "attach", "10 MiB"), "{err:?}");
+        assert!(pulled.load(Ordering::SeqCst) <= 11);
+
+        let err = send(&k, &[("attach", "urn:test:big")], &caller()).unwrap_err();
+        assert!(refused(&err, "attach", "10 MiB"), "{err:?}");
+        assert!(
+            !opened.load(Ordering::SeqCst),
+            "a declared length over the cap is never opened"
+        );
+        assert!(mail.0.lock().unwrap().is_empty());
     }
 
     fn send_endpoint() -> SendEndpoint {

@@ -6578,7 +6578,7 @@ fn host_space_authority(dir: &Path, space: &str) -> Option<ikigai_core::Capabili
     }
 }
 
-/// The public contact path never attaches: its handler mails an enquiry a stranger wrote,
+/// The public contact path never attaches: its handler mails an inquiry a stranger wrote,
 /// so `urn:email:send`'s `attach` (which reads a named resource and mails it out) stays out
 /// of its reach whatever the operator's `space-authority/contact` file lists. A host file
 /// mints a SCOPED capability, whose grants are exact (`Capability::allows`), so dropping the
@@ -11783,17 +11783,17 @@ mod space_authority_tests {
         #[allow(clippy::disallowed_methods)]
         // internal: a test fixture's kernel; it routes no user arguments
         let kernel = Kernel::new(Arc::new(space));
-        let enquiry = |attach: Option<&str>| {
+        let inquiry = |attach: Option<&str>| {
             let mut request = Request::new(Verb::Sink, Iri::parse("urn:email:send").unwrap())
                 .with_arg("to", ArgRef::Inline(b"owner@example.com".to_vec()))
-                .with_arg("subject", ArgRef::Inline(b"Enquiry".to_vec()))
+                .with_arg("subject", ArgRef::Inline(b"Inquiry".to_vec()))
                 .with_arg("content", ArgRef::Inline(b"Hello".to_vec()));
             if let Some(attach) = attach {
                 request = request.with_arg("attach", ArgRef::Inline(attach.as_bytes().to_vec()));
             }
             futures::executor::block_on(kernel.issue(request, &granted))
         };
-        let err = enquiry(Some("urn:test:server.key")).unwrap_err();
+        let err = inquiry(Some("urn:test:server.key")).unwrap_err();
         assert!(
             matches!(&err, Error::Denied(_)) && err.to_string().contains(ikigai_email::CAP_ATTACH),
             "{err:?}"
@@ -11803,7 +11803,7 @@ mod space_authority_tests {
             "nothing was read"
         );
         assert!(mail.0.lock().unwrap().is_empty(), "nothing was sent");
-        enquiry(None).expect("the enquiry itself still goes out");
+        inquiry(None).expect("the inquiry itself still goes out");
         assert_eq!(mail.0.lock().unwrap().len(), 1);
     }
 
