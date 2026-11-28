@@ -17,7 +17,9 @@
 //!     "<lowercase hex SHA-256 of the token>": {
 //!       "client": "<the clients.json key it is bound to>",
 //!       "label": "relay host",
-//!       "created": "2026-10-12T20:00:00Z"
+//!       "created": "2026-10-12T20:00:00Z",
+//!       "expires": "2027-01-10T20:00:00Z",
+//!       "require_cert": true
 //!     }
 //!   }
 //! }
@@ -33,6 +35,17 @@
 //!   enrollment the QUIC door reads.
 //! - **Fail closed.** A file that exists and does not parse refuses every token; an absent
 //!   file is no tokens at all.
+//!
+//! Since ledger #4544 a token also has a **lifetime** and follows its **certificate**:
+//!
+//! - `expires` is when it stops working (`layers-token mint --lifetime`, default
+//!   [`DEFAULT_LIFETIME_DAYS`] days, at most [`MAX_LIFETIME_DAYS`]). An entry with no
+//!   `expires` was written by an older release: [`upgrade_file`] gives it one when the new
+//!   release first starts, and the front refuses one it meets without.
+//! - The front refuses a token whose bound certificate is no longer in the door's trust list,
+//!   or is outside its validity window, as the QUIC door would refuse the certificate.
+//! - A request that presents a client certificate must present the bound one; with
+//!   `require_cert` (`mint --require-cert`) a request that presents none is refused.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -63,6 +76,102 @@ pub struct Binding {
     pub label: String,
     /// When it was minted (RFC 3339, UTC).
     pub created: String,
+    /// When it stops working (RFC 3339, UTC). `None` only for an entry an older release
+    /// wrote, which [`upgrade_file`] gives one and the front refuses until it has one.
+    pub expires: Option<String>,
+    /// Refuse a request that presents no client certificate (`mint --require-cert`).
+    pub require_cert: bool,
+}
+
+/// A token's lifetime when `mint` is given none.
+pub const DEFAULT_LIFETIME_DAYS: i64 = 90;
+
+/// The longest lifetime `mint` grants.
+pub const MAX_LIFETIME_DAYS: i64 = 365;
+
+/// A lifetime as `mint --lifetime` takes it: a whole number of days (`90d`) or hours
+/// (`12h`), more than zero and at most [`MAX_LIFETIME_DAYS`] days.
+///
+/// ```
+/// use ikigai_embedded::tokens::parse_lifetime;
+///
+/// assert_eq!(parse_lifetime("90d").unwrap(), chrono::Duration::days(90));
+/// assert_eq!(parse_lifetime("12h").unwrap(), chrono::Duration::hours(12));
+/// assert!(parse_lifetime("0d").is_err());
+/// assert!(parse_lifetime("366d").is_err());
+/// assert!(parse_lifetime("soon").is_err());
+/// ```
+pub fn parse_lifetime(text: &str) -> Result<chrono::Duration, String> {
+    let text = text.trim();
+    let bad = || {
+        format!(
+            "`{text}` is not a lifetime: give a whole number of days or hours, such as `90d` or \
+             `12h`, at most {MAX_LIFETIME_DAYS}d"
+        )
+    };
+    let (number, unit) = text.split_at(text.len().saturating_sub(1));
+    let n: i64 = number.parse().map_err(|_| bad())?;
+    let lifetime = match unit {
+        "d" => chrono::Duration::try_days(n),
+        "h" => chrono::Duration::try_hours(n),
+        _ => None,
+    }
+    .ok_or_else(bad)?;
+    if lifetime <= chrono::Duration::zero() {
+        return Err(bad());
+    }
+    if lifetime > chrono::Duration::days(MAX_LIFETIME_DAYS) {
+        return Err(format!(
+            "a token lives at most {MAX_LIFETIME_DAYS} days; `{text}` is longer: mint a new \
+             token when this one expires instead"
+        ));
+    }
+    Ok(lifetime)
+}
+
+/// [`DEFAULT_LIFETIME_DAYS`] as a duration: what `mint` grants when given no `--lifetime`.
+pub fn default_lifetime() -> chrono::Duration {
+    chrono::Duration::days(DEFAULT_LIFETIME_DAYS)
+}
+
+/// Now, in UTC: when a mint or an upgrade happens.
+pub fn now_utc() -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now()
+}
+
+/// Now, as seconds since the Unix epoch: the clock the front checks expiries by.
+pub fn now_unix() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// `at`, as RFC 3339 UTC to the second.
+pub fn rfc3339(at: chrono::DateTime<chrono::Utc>) -> String {
+    at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+impl Binding {
+    /// Whether the token may still be presented at `now` (seconds since the Unix epoch).
+    /// `Err` is the sentence the front answers with: when it expired and how to get a new one.
+    pub fn check_expiry(&self, now: i64) -> Result<(), String> {
+        let Some(expires) = &self.expires else {
+            return Err(format!(
+                "token {} has no expiry: an older release wrote it. Restart the layer door so \
+                 it gives every token an expiry, or ask the operator to mint a new token \
+                 (`ikigai layers-token mint`)",
+                self.id
+            ));
+        };
+        let at = chrono::DateTime::parse_from_rfc3339(expires)
+            .map_err(|_| format!("token {} has an unreadable expiry `{expires}`", self.id))?;
+        if now >= at.timestamp() {
+            return Err(format!(
+                "token {} expired at {expires}. Ask the operator to mint a new one with \
+                 `ikigai layers-token mint`",
+                self.id
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The parsed token file: token hash → binding.
@@ -88,6 +197,17 @@ pub fn hash(token: &str) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+/// Seconds since the Unix epoch as RFC 3339 UTC to the second (`2030-01-01T00:00:00Z`), or
+/// `None` outside the range chrono represents.
+///
+/// ```
+/// use ikigai_embedded::tokens::rfc3339_from_unix;
+/// assert_eq!(rfc3339_from_unix(1_795_737_600).as_deref(), Some("2026-11-27T00:00:00Z"));
+/// ```
+pub fn rfc3339_from_unix(secs: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp(secs, 0).map(rfc3339)
 }
 
 /// Now, as RFC 3339 UTC to the second: what a binding's `created` holds.
@@ -135,6 +255,8 @@ impl Tokens {
         client: &str,
         label: &str,
         created: &str,
+        expires: &str,
+        require_cert: bool,
     ) -> Result<Binding, String> {
         let key = hash(token);
         if self.by_hash.contains_key(&key) {
@@ -145,6 +267,8 @@ impl Tokens {
             client: client.to_string(),
             label: label.to_string(),
             created: created.to_string(),
+            expires: Some(expires.to_string()),
+            require_cert,
         };
         self.by_hash.insert(key, binding.clone());
         Ok(binding)
@@ -181,14 +305,18 @@ impl Tokens {
             .by_hash
             .iter()
             .map(|(key, b)| {
-                (
-                    key.clone(),
-                    serde_json::json!({
-                        "client": b.client,
-                        "label": b.label,
-                        "created": b.created,
-                    }),
-                )
+                let mut entry = serde_json::json!({
+                    "client": b.client,
+                    "label": b.label,
+                    "created": b.created,
+                });
+                if let Some(expires) = &b.expires {
+                    entry["expires"] = expires.clone().into();
+                }
+                if b.require_cert {
+                    entry["require_cert"] = true.into();
+                }
+                (key.clone(), entry)
             })
             .collect();
         let mut text = serde_json::to_string_pretty(&serde_json::json!({ "tokens": tokens }))
@@ -221,6 +349,30 @@ pub fn parse(text: &str) -> Result<Tokens, String> {
             let client = field("client")
                 .filter(|c| !c.trim().is_empty())
                 .ok_or_else(|| format!("token `{}` names no `client`", &key[..ID_LEN]))?;
+            let expires = match entry.get("expires") {
+                None => None,
+                Some(v) => {
+                    let text = v
+                        .as_str()
+                        .filter(|t| chrono::DateTime::parse_from_rfc3339(t).is_ok())
+                        .ok_or_else(|| {
+                            format!(
+                                "token `{}` has an `expires` that is not an RFC 3339 time",
+                                &key[..ID_LEN]
+                            )
+                        })?;
+                    Some(text.to_string())
+                }
+            };
+            let require_cert = match entry.get("require_cert") {
+                None => false,
+                Some(v) => v.as_bool().ok_or_else(|| {
+                    format!(
+                        "token `{}` has a `require_cert` that is not true or false",
+                        &key[..ID_LEN]
+                    )
+                })?,
+            };
             by_hash.insert(
                 key.clone(),
                 Binding {
@@ -228,6 +380,8 @@ pub fn parse(text: &str) -> Result<Tokens, String> {
                     client: client.trim().to_string(),
                     label: field("label").unwrap_or_default().to_string(),
                     created: field("created").unwrap_or_default().to_string(),
+                    expires,
+                    require_cert,
                 },
             );
         }
@@ -252,6 +406,7 @@ pub fn save_to(path: &Path, tokens: &Tokens) -> Result<(), String> {
     }
     let partial = path.with_extension("json.partial");
     std::fs::write(&partial, tokens.to_json())
+        .and_then(|()| std::fs::File::open(&partial)?.sync_all())
         .map_err(|e| format!("write {}: {e}", partial.display()))?;
     #[cfg(unix)]
     {
@@ -260,6 +415,114 @@ pub fn save_to(path: &Path, tokens: &Tokens) -> Result<(), String> {
             .map_err(|e| format!("restrict {}: {e}", partial.display()))?;
     }
     std::fs::rename(&partial, path).map_err(|e| format!("replace {}: {e}", path.display()))
+}
+
+/// Give every entry an older release wrote (one with no `expires`) an expiry, and return how
+/// many got one; zero leaves the token file untouched, so running it again changes nothing.
+///
+/// The expiry a missing `expires` gets is never later than the default lifetime counted from
+/// the later of two times: the token's recorded mint time (`created`), and the first start
+/// of this release ([`first_start`], recorded once beside the file and left alone by older
+/// releases). So on the first upgrade a token an older release minted gets
+/// [`DEFAULT_LIFETIME_DAYS`] days from that first start, and after a downgrade, a write by
+/// the older release and a re-upgrade, it gets exactly the same expiry again: an old token
+/// keeps its first-start expiry, and a token the older release minted meanwhile gets mint
+/// time + the default, expired if that has passed. Only an entry with no readable mint time
+/// is counted from `now`.
+///
+/// Before rewriting, the file as it was is copied to `<file>.bak-<now>` beside it (written
+/// beside and renamed, as the rewrite is by [`save_to`]), so a crash at any point leaves the
+/// original or the upgraded file in place, never half of either, and the next start
+/// finishes the upgrade. An absent file is zero entries.
+pub fn upgrade_file(path: &Path, now: chrono::DateTime<chrono::Utc>) -> Result<usize, String> {
+    let mut tokens = load_from(path)?;
+    let first = first_start(path, now)?;
+    let lifetime = default_lifetime();
+    let mut upgraded = 0;
+    for binding in tokens.by_hash.values_mut() {
+        if binding.expires.is_some() {
+            continue;
+        }
+        let base = match chrono::DateTime::parse_from_rfc3339(&binding.created) {
+            Ok(minted) => minted.with_timezone(&chrono::Utc).max(first),
+            Err(_) => now,
+        };
+        binding.expires = Some(rfc3339(base + lifetime));
+        upgraded += 1;
+    }
+    if upgraded == 0 {
+        return Ok(0);
+    }
+    let backup = backup_path(path, now);
+    let copying = partial_path(&backup);
+    std::fs::copy(path, &copying)
+        .and_then(|_| std::fs::File::open(&copying)?.sync_all())
+        .and_then(|()| std::fs::rename(&copying, &backup))
+        .map_err(|e| {
+            format!(
+                "back up {} to {} before giving its tokens an expiry: {e}",
+                path.display(),
+                backup.display()
+            )
+        })?;
+    save_to(path, &tokens)?;
+    Ok(upgraded)
+}
+
+/// When this release (one that gives tokens an expiry) first started beside the token file at
+/// `path`: read from `<file>.first-start`, or recorded there as `now` when it is absent.
+/// Older releases never touch that file, so it survives a downgrade. An unreadable one is an
+/// error (the start stops) rather than a fresh first start, which would extend every token.
+pub fn first_start(
+    path: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    let record = first_start_path(path);
+    match std::fs::read_to_string(&record) {
+        Ok(text) => chrono::DateTime::parse_from_rfc3339(text.trim())
+            .map(|at| at.with_timezone(&chrono::Utc))
+            .map_err(|_| {
+                format!(
+                    "{} does not hold an RFC 3339 time; it records when this release first \
+                     started, so restore it or write that time into it",
+                    record.display()
+                )
+            }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(dir) = record.parent() {
+                std::fs::create_dir_all(dir)
+                    .map_err(|e| format!("create {}: {e}", dir.display()))?;
+            }
+            let partial = partial_path(&record);
+            std::fs::write(&partial, rfc3339(now) + "\n")
+                .and_then(|()| std::fs::File::open(&partial)?.sync_all())
+                .and_then(|()| std::fs::rename(&partial, &record))
+                .map_err(|e| format!("record {}: {e}", record.display()))?;
+            Ok(now)
+        }
+        Err(e) => Err(format!("read {}: {e}", record.display())),
+    }
+}
+
+/// Where [`first_start`] records this release's first start: `<file>.first-start`.
+pub fn first_start_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".first-start");
+    path.with_file_name(name)
+}
+
+/// The scratch name a file is written under before it is renamed into place.
+fn partial_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".partial");
+    path.with_file_name(name)
+}
+
+/// Where [`upgrade_file`] keeps the file as it was: `<file>.bak-<now, compact UTC>`.
+pub fn backup_path(path: &Path, now: chrono::DateTime<chrono::Utc>) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".bak-{}", now.format("%Y%m%dT%H%M%SZ")));
+    path.with_file_name(name)
 }
 
 /// The `clients.json` key a mint binds to, from what the operator typed: a key the
@@ -299,7 +562,14 @@ mod tests {
         assert!(token.starts_with(PREFIX) && token.len() == PREFIX.len() + 64);
         let mut tokens = Tokens::default();
         let bound = tokens
-            .insert(&token, FP, "relay", "2026-10-12T00:00:00Z")
+            .insert(
+                &token,
+                FP,
+                "relay",
+                "2026-10-12T00:00:00Z",
+                "2027-01-10T00:00:00Z",
+                false,
+            )
             .unwrap();
         let text = tokens.to_json();
         assert!(!text.contains(&token), "the file never holds the token");
@@ -307,15 +577,21 @@ mod tests {
         let read = parse(&text).unwrap();
         assert_eq!(read.binding_for(&token), Some(&bound));
         assert_eq!(read.binding_for(&generate().unwrap()), None);
-        assert!(tokens.insert(&token, FP, "again", "x").is_err());
+        assert!(tokens
+            .insert(&token, FP, "again", "x", "2027-01-10T00:00:00Z", false)
+            .is_err());
     }
 
     #[test]
     fn revoking_by_id_removes_exactly_one() {
         let (a, b) = (generate().unwrap(), generate().unwrap());
         let mut tokens = Tokens::default();
-        let first = tokens.insert(&a, FP, "a", "t").unwrap();
-        tokens.insert(&b, FP, "b", "t").unwrap();
+        let first = tokens
+            .insert(&a, FP, "a", "t", "2027-01-10T00:00:00Z", false)
+            .unwrap();
+        tokens
+            .insert(&b, FP, "b", "t", "2027-01-10T00:00:00Z", true)
+            .unwrap();
         assert!(tokens.revoke("abc").is_err(), "too short to be an id");
         assert!(tokens.revoke("not-hex!").is_err());
         assert_eq!(tokens.revoke(&first.id.to_uppercase()).unwrap(), first);
@@ -367,6 +643,298 @@ mod tests {
         assert!(resolve_client(&enrolment, "urn:collab:participant:eve").is_err());
     }
 
+    /// The token file as every release from cli v0.1.63 (where the front landed) through
+    /// v0.6.2 wrote it: `tokens.rs` is byte-identical across those tags, so the two fixtures
+    /// are the first and the last tag's shape. No entry carries `expires` or `require_cert`.
+    const FIXTURES: [(&str, &str); 2] = [
+        (
+            "v0.1.63",
+            include_str!("fixtures/layer-tokens-v0.1.63.json"),
+        ),
+        ("v0.6.2", include_str!("fixtures/layer-tokens-v0.6.2.json")),
+    ];
+
+    fn at(text: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(text)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("iki-tokens-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// What an older release does to the file when it mints or revokes: it rewrites every
+    /// entry with `client`, `label` and `created` only (its `to_json`), dropping the rest.
+    fn as_an_older_release_rewrites_it(text: &str) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(text).unwrap();
+        for entry in v["tokens"].as_object_mut().unwrap().values_mut() {
+            let e = entry.as_object_mut().unwrap();
+            e.retain(|k, _| k == "client" || k == "label" || k == "created");
+        }
+        serde_json::to_string_pretty(&v).unwrap() + "\n"
+    }
+
+    #[test]
+    fn a_token_expires_and_says_when_and_how_to_get_a_new_one() {
+        let token = generate().unwrap();
+        let mut tokens = Tokens::default();
+        let b = tokens
+            .insert(
+                &token,
+                FP,
+                "relay",
+                "2026-10-12T00:00:00Z",
+                "2027-01-10T00:00:00Z",
+                false,
+            )
+            .unwrap();
+        assert!(b
+            .check_expiry(at("2027-01-09T23:59:59Z").timestamp())
+            .is_ok());
+        let why = b
+            .check_expiry(at("2027-01-10T00:00:00Z").timestamp())
+            .unwrap_err();
+        assert!(why.contains("expired at 2027-01-10T00:00:00Z"), "{why}");
+        assert!(why.contains("ikigai layers-token mint"), "{why}");
+        let legacy = Binding {
+            expires: None,
+            ..b.clone()
+        };
+        assert!(
+            legacy
+                .check_expiry(at("2026-10-13T00:00:00Z").timestamp())
+                .is_err(),
+            "no expiry, no entry"
+        );
+        let read = parse(&tokens.to_json()).unwrap();
+        assert_eq!(
+            read.binding_for(&token).unwrap().expires.as_deref(),
+            Some("2027-01-10T00:00:00Z")
+        );
+        let key = "a".repeat(64);
+        assert!(parse(&format!(
+            r#"{{"tokens": {{"{key}": {{"client": "x", "expires": "soon"}}}}}}"#
+        ))
+        .is_err());
+        assert!(parse(&format!(
+            r#"{{"tokens": {{"{key}": {{"client": "x", "require_cert": "yes"}}}}}}"#
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn upgrading_each_tags_file_gives_every_entry_an_expiry_once_with_a_backup() {
+        for (tag, fixture) in FIXTURES {
+            let dir = scratch(&format!("upgrade-{tag}"));
+            let path = dir.join(FILE);
+            std::fs::write(&path, fixture).unwrap();
+            let first_start = at("2026-11-27T12:00:00Z");
+            assert_eq!(upgrade_file(&path, first_start).unwrap(), 2, "{tag}");
+            let backup = backup_path(&path, first_start);
+            assert_eq!(
+                std::fs::read_to_string(&backup).unwrap(),
+                fixture,
+                "{tag}: backup"
+            );
+            let upgraded = load_from(&path).unwrap();
+            for b in upgraded.bindings() {
+                assert_eq!(b.expires.as_deref(), Some("2027-02-25T12:00:00Z"), "{tag}");
+                assert!(!b.require_cert);
+                assert_eq!(b.client, FP);
+            }
+            assert!(
+                !path.with_extension("json.partial").exists(),
+                "{tag}: renamed into place"
+            );
+            // Idempotent: a second start finds nothing to do and touches nothing.
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(
+                upgrade_file(&path, at("2026-12-01T00:00:00Z")).unwrap(),
+                0,
+                "{tag}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "{tag}");
+            assert!(
+                !backup_path(&path, at("2026-12-01T00:00:00Z")).exists(),
+                "{tag}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        assert_eq!(
+            upgrade_file(
+                &std::env::temp_dir().join("iki-no-such-dir/x.json"),
+                at("2026-11-27T12:00:00Z")
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    /// Ledger #4544 rework: upgrade, downgrade, a write by the older release (which drops
+    /// every `expires`, and mints a token of its own), then re-upgrade. No token gets fresh
+    /// days: the old tokens keep the expiry their first upgrade gave them, and the token the
+    /// older release minted 100 days before the re-upgrade gets mint + the default, already
+    /// past, so it is refused.
+    #[test]
+    fn a_downgrade_then_a_re_upgrade_never_extends_a_tokens_life() {
+        let dir = scratch("downgrade");
+        let path = dir.join(FILE);
+        std::fs::write(&path, FIXTURES[0].1).unwrap();
+        let first_start = at("2026-11-27T12:00:00Z");
+        assert_eq!(upgrade_file(&path, first_start).unwrap(), 2);
+        let upgraded = std::fs::read_to_string(&path).unwrap();
+        let expiry_of = |path: &Path| -> BTreeMap<String, Option<String>> {
+            load_from(path)
+                .unwrap()
+                .bindings()
+                .iter()
+                .map(|b| (b.id.clone(), b.expires.clone()))
+                .collect()
+        };
+        let after_first = expiry_of(&path);
+        assert!(after_first
+            .values()
+            .all(|e| e.as_deref() == Some("2027-02-25T12:00:00Z")));
+        // An older release READS the upgraded file: its parser takes client, label and created
+        // and ignores the rest, so every token still resolves to the same client under it.
+        let old_view: serde_json::Value = serde_json::from_str(&upgraded).unwrap();
+        for entry in old_view["tokens"].as_object().unwrap().values() {
+            assert_eq!(entry["client"], FP);
+        }
+        // Downgraded, the older release mints a token (100 days before the re-upgrade) and so
+        // rewrites the whole file without any expiry.
+        let restart = at("2027-03-20T00:00:00Z");
+        let mut v: serde_json::Value = serde_json::from_str(&upgraded).unwrap();
+        v["tokens"][hash("minted by the older release")] = serde_json::json!({
+            "client": FP,
+            "label": "minted while downgraded",
+            "created": rfc3339(restart - chrono::Duration::days(100)),
+        });
+        std::fs::write(
+            &path,
+            as_an_older_release_rewrites_it(&serde_json::to_string(&v).unwrap()),
+        )
+        .unwrap();
+        assert!(expiry_of(&path).values().all(Option::is_none));
+
+        // Re-upgrade, 113 days after the first start.
+        assert_eq!(upgrade_file(&path, restart).unwrap(), 3);
+        let after_re = load_from(&path).unwrap();
+        for b in after_re.bindings() {
+            if b.label == "minted while downgraded" {
+                assert_eq!(b.expires.as_deref(), Some("2027-03-10T00:00:00Z"));
+                let why = b.check_expiry(restart.timestamp()).unwrap_err();
+                assert!(why.contains("expired at 2027-03-10T00:00:00Z"), "{why}");
+            } else {
+                assert_eq!(b.expires, after_first[&b.id], "{}: not extended", b.label);
+                assert!(b.check_expiry(restart.timestamp()).is_err(), "{}", b.label);
+            }
+        }
+        assert!(backup_path(&path, restart).exists());
+        assert_eq!(upgrade_file(&path, restart).unwrap(), 0);
+
+        // An entry with no readable mint time is the one counted from now.
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"tokens": {{"{}": {{"client": "{FP}", "label": "no mint time"}}}}}}"#,
+                hash("undated")
+            ),
+        )
+        .unwrap();
+        assert_eq!(upgrade_file(&path, restart).unwrap(), 1);
+        assert_eq!(
+            load_from(&path).unwrap().bindings()[0].expires.as_deref(),
+            Some("2027-06-18T00:00:00Z")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ledger #4544 rework: a start killed mid-upgrade. Every state a kill can leave (after
+    /// recording the first start, during the backup copy, after the backup and during the
+    /// rewrite, before its rename) still holds the original file whole beside half-written
+    /// scratch files, and the next start finishes the upgrade from the original: the
+    /// upgraded file parses, the backup holds the original byte for byte, no scratch file is
+    /// left, and a later start changes nothing.
+    #[test]
+    fn a_start_killed_mid_upgrade_is_finished_by_the_next_start() {
+        let fixture = FIXTURES[1].1;
+        let killed_at = at("2026-11-27T12:00:00Z");
+        let next_start = at("2026-11-27T12:05:00Z");
+        let half = &fixture[..fixture.len() / 2];
+        for (state, leave) in [
+            ("after recording the first start", 0),
+            ("during the backup copy", 1),
+            ("after the backup, during the rewrite", 2),
+            ("after the backup, before the rename", 3),
+        ] {
+            let dir = scratch(&format!("killed-{leave}"));
+            let path = dir.join(FILE);
+            std::fs::write(&path, fixture).unwrap();
+            first_start(&path, killed_at).unwrap();
+            let backup = backup_path(&path, killed_at);
+            if leave >= 1 {
+                std::fs::write(partial_path(&backup), half).unwrap();
+            }
+            if leave >= 2 {
+                std::fs::rename(partial_path(&backup), &backup).unwrap();
+                std::fs::write(&backup, fixture).unwrap();
+                std::fs::write(path.with_extension("json.partial"), half).unwrap();
+            }
+            if leave >= 3 {
+                let mut whole = parse(fixture).unwrap();
+                for b in whole.by_hash.values_mut() {
+                    b.expires = Some("2027-02-25T12:00:00Z".into());
+                }
+                std::fs::write(path.with_extension("json.partial"), whole.to_json()).unwrap();
+            }
+            // The kill never touched the token file itself: the original, whole.
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), fixture, "{state}");
+
+            assert_eq!(upgrade_file(&path, next_start).unwrap(), 2, "{state}");
+            let done = load_from(&path).unwrap();
+            assert_eq!(done.len(), 2, "{state}");
+            for b in done.bindings() {
+                // Counted from the first start the killed run recorded, not the next one.
+                assert_eq!(
+                    b.expires.as_deref(),
+                    Some("2027-02-25T12:00:00Z"),
+                    "{state}"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(backup_path(&path, next_start)).unwrap(),
+                fixture,
+                "{state}: the backup is the original"
+            );
+            assert!(
+                !path.with_extension("json.partial").exists()
+                    && !partial_path(&backup_path(&path, next_start)).exists(),
+                "{state}: no scratch file left"
+            );
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(upgrade_file(&path, next_start).unwrap(), 0, "{state}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "{state}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn an_unreadable_first_start_record_stops_the_upgrade() {
+        let dir = scratch("bad-first-start");
+        let path = dir.join(FILE);
+        std::fs::write(&path, FIXTURES[0].1).unwrap();
+        std::fs::write(first_start_path(&path), "half").unwrap();
+        let why = upgrade_file(&path, at("2026-11-27T12:00:00Z")).unwrap_err();
+        assert!(why.contains("first started"), "{why}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FIXTURES[0].1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn save_then_load_round_trips_owner_only() {
         let dir = std::env::temp_dir().join(format!("iki-tokens-{}", std::process::id()));
@@ -375,7 +943,14 @@ mod tests {
         assert!(load_from(&path).unwrap().is_empty(), "absent is no tokens");
         let mut tokens = Tokens::default();
         tokens
-            .insert(&generate().unwrap(), FP, "relay", "t")
+            .insert(
+                &generate().unwrap(),
+                FP,
+                "relay",
+                "t",
+                "2027-01-10T00:00:00Z",
+                true,
+            )
             .unwrap();
         save_to(&path, &tokens).unwrap();
         assert_eq!(load_from(&path).unwrap(), tokens);

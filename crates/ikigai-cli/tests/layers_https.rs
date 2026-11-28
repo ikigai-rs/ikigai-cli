@@ -333,6 +333,23 @@ impl Host {
     fn https(&self, method: &str, path: &str, token: Option<&str>, body: &[u8]) -> Http {
         https(&self.https, &self.server_pem, method, path, token, body)
     }
+
+    /// `name`'s client identity, as `cert add-client` wrote it.
+    fn identity(&self, name: &str) -> ikigai_quic::Identity {
+        let read = |file: String| std::fs::read_to_string(self.certs.join(file)).unwrap();
+        ikigai_quic::Identity {
+            cert_pem: read(format!("clients/{name}.crt")),
+            key_pem: read(format!("clients/{name}.key")),
+        }
+    }
+
+    /// One HTTPS GET presenting `name`'s client certificate (ledger #4544).
+    fn https_presenting(&self, name: &str, path: &str, token: &str) -> Http {
+        let tls =
+            ikigai_quic::pinned_https_client_tls_presenting(&self.server_pem, &self.identity(name))
+                .unwrap();
+        https_over(&self.https, tls, "GET", path, Some(token), &[], b"")
+    }
 }
 
 impl Drop for Host {
@@ -390,12 +407,25 @@ fn https_full(
     extra: &[(&str, &str)],
     body: &[u8],
 ) -> Http {
+    let tls = ikigai_quic::pinned_https_client_tls(server_pem).unwrap();
+    https_over(addr, tls, method, path, token, extra, body)
+}
+
+/// One HTTPS request over `tls`, a client config that pins the door's certificate.
+fn https_over(
+    addr: &str,
+    tls: tokio_rustls::rustls::ClientConfig,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    extra: &[(&str, &str)],
+    body: &[u8],
+) -> Http {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     runtime.block_on(async {
-        let tls = ikigai_quic::pinned_https_client_tls(server_pem).unwrap();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(tls));
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let name = tokio_rustls::rustls::pki_types::ServerName::try_from("ikigai").unwrap();
@@ -843,6 +873,103 @@ fn no_token_a_revoked_token_and_an_unenrolled_client_are_refused() {
         &["layers-token", "mint", "urn:collab:participant:eve"],
     );
     assert!(!out.status.success());
+}
+
+/// Ledger #4544, through the real door: a token follows its certificate (removed from
+/// `clients/`, it is refused at its next request, and trusted again when it is back), a
+/// presented client certificate must be the token's, `--require-cert` refuses a request that
+/// presents none, and an expired token is refused with a sentence naming its expiry.
+#[test]
+fn a_token_follows_its_certificate_its_expiry_and_its_client_certificate() {
+    let host = host("cert");
+    let alice = host.mint(ALICE);
+    assert_eq!(
+        host.https("GET", "/layers/me", Some(&alice), b"").status,
+        200
+    );
+    assert_eq!(
+        host.https_presenting("alice", "/layers/me", &alice).status,
+        200
+    );
+
+    // A wrong client certificate: bob's, under alice's token.
+    let wrong = host.https_presenting("bob", "/layers/me", &alice);
+    assert_eq!(wrong.status, 401);
+    let message = wrong.json()["message"].as_str().unwrap().to_string();
+    assert!(
+        message.contains("different client certificate"),
+        "{message}"
+    );
+
+    // The certificate removed from the trust list: refused, then admitted once it is back.
+    let crt = host.certs.join("clients/alice.crt");
+    let aside = host.home.join("alice.crt.aside");
+    std::fs::rename(&crt, &aside).unwrap();
+    let removed = host.https("GET", "/layers/me", Some(&alice), b"");
+    assert_eq!(removed.status, 401);
+    let message = removed.json()["message"].as_str().unwrap().to_string();
+    assert!(message.contains("no longer trusts"), "{message}");
+    assert!(message.contains("ikigai layers-token mint"), "{message}");
+    std::fs::rename(&aside, &crt).unwrap();
+    assert_eq!(
+        host.https("GET", "/layers/me", Some(&alice), b"").status,
+        200
+    );
+
+    // `--require-cert`: none presented is refused, the bound one admitted.
+    let bob = ok(
+        run(
+            &host.home,
+            &[
+                "layers-token",
+                "mint",
+                BOB,
+                "--require-cert",
+                "--lifetime",
+                "7d",
+            ],
+        ),
+        "layers-token mint --require-cert",
+    )
+    .trim()
+    .to_string();
+    let bare = host.https("GET", "/layers/me", Some(&bob), b"");
+    assert_eq!(bare.status, 401);
+    let message = bare.json()["message"].as_str().unwrap().to_string();
+    assert!(message.contains("presented none"), "{message}");
+    assert_eq!(host.https_presenting("bob", "/layers/me", &bob).status, 200);
+    let listed = ok(
+        run(&host.home, &["layers-token", "list"]),
+        "layers-token list",
+    );
+    assert!(listed.contains("require-cert"), "{listed}");
+    assert!(listed.contains("expires 20"), "{listed}");
+
+    // A lifetime past the maximum mints nothing.
+    let long = run(
+        &host.home,
+        &["layers-token", "mint", CAROL, "--lifetime", "400d"],
+    );
+    assert!(!long.status.success());
+
+    // Expired: the file says it expired a second ago.
+    let file = config_home(&host.home).join("layer-tokens.json");
+    let mut held: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    for entry in held["tokens"].as_object_mut().unwrap().values_mut() {
+        if entry["client"] != Value::Null && entry.get("require_cert").is_none() {
+            entry["expires"] = json!("2026-01-01T00:00:00Z");
+        }
+    }
+    std::fs::write(&file, serde_json::to_string_pretty(&held).unwrap()).unwrap();
+    let expired = host.https("GET", "/layers/me", Some(&alice), b"");
+    assert_eq!(expired.status, 401);
+    let message = expired.json()["message"].as_str().unwrap().to_string();
+    assert!(
+        message.contains("expired at 2026-01-01T00:00:00Z"),
+        "{message}"
+    );
+    assert!(message.contains("ikigai layers-token mint"), "{message}");
+    assert_eq!(host.https_presenting("bob", "/layers/me", &bob).status, 200);
 }
 
 /// ledger #1593: HEAD is answered the way ikigai-web's routed adapter answers it (cli PR 516):

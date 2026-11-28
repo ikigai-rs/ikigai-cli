@@ -272,12 +272,18 @@ usage:
                                participant that has only an HTTP client and a JSON parser.
                                Same kernel, grants, principals and refusals as the QUIC door;
                                needs the `web` feature beside `quic`
-  ikigai layers-token mint <participant|fingerprint> [--label <l>]
+  ikigai layers-token mint <participant|fingerprint> [--label <l>] [--lifetime <n>d|<n>h]
+                          [--require-cert]
                                mint a bearer token for the HTTPS front, bound to ONE enrolled
                                clients.json entry (a participant IRI that names exactly one, or
                                its fingerprint). Printed once; layer-tokens.json in the config
-                               home stores its hash, re-read on every request
-  ikigai layers-token list     the tokens: id, the client each is bound to, label, minted
+                               home stores its hash, re-read on every request. It expires after
+                               --lifetime (default 90d, at most 365d), and is refused once its
+                               certificate leaves the trust list or passes its notAfter. A
+                               client certificate presented with it must be its own;
+                               --require-cert refuses a request that presents none
+  ikigai layers-token list     the tokens: id, the client each is bound to, minted, expiry,
+                               require-cert, label
   ikigai layers-token revoke <id>  remove one; its next request is refused (401)
   ikigai inquiry import-blocks --from <decisions log> [--days <n>]
                                write the log's legacy `block` lines (an address or a domain) as
@@ -582,6 +588,10 @@ enum TokenCommand {
     Mint {
         client: String,
         label: Option<String>,
+        /// `--lifetime <n>d|<n>h`; `None` is the default lifetime.
+        lifetime: Option<String>,
+        /// `--require-cert`: refuse a request that presents no client certificate.
+        require_cert: bool,
     },
     List,
     Revoke {
@@ -1425,12 +1435,15 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
 
     if argv.peek().map(String::as_str) == Some("layers-token") {
         argv.next();
-        let usage = "usage: `ikigai layers-token mint <participant|fingerprint> [--label <l>]` | \
+        let usage = "usage: `ikigai layers-token mint <participant|fingerprint> [--label <l>] \
+                     [--lifetime <n>d|<n>h] [--require-cert]` | \
                      `ikigai layers-token list` | `ikigai layers-token revoke <id>`";
         let command = match argv.next().as_deref() {
             Some("mint") => {
                 let mut client = None;
                 let mut label = None;
+                let mut lifetime = None;
+                let mut require_cert = false;
                 while let Some(arg) = argv.next() {
                     match arg.as_str() {
                         "--label" => {
@@ -1439,6 +1452,12 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                                     .ok_or_else(|| "--label needs a value".to_string())?,
                             )
                         }
+                        "--lifetime" => {
+                            lifetime = Some(argv.next().ok_or_else(|| {
+                                "--lifetime needs a value, such as `90d` or `12h`".to_string()
+                            })?)
+                        }
+                        "--require-cert" => require_cert = true,
                         other if other.starts_with('-') => {
                             return Err(format!(
                                 "unknown argument after `layers-token mint`: {other}"
@@ -1455,6 +1474,8 @@ fn parse_argv(args: impl Iterator<Item = String>) -> Result<Option<Mode>, String
                 TokenCommand::Mint {
                     client: client.ok_or_else(|| usage.to_string())?,
                     label,
+                    lifetime,
+                    require_cert,
                 }
             }
             Some("list") => match argv.next() {
@@ -5152,9 +5173,12 @@ fn serve_quic(
             })
         };
         match (front, front_minter) {
-            (Some(front), Some(front_minter)) => {
-                spawn_layers_front(front, std::sync::Arc::clone(&kernel), front_minter)?
-            }
+            (Some(front), Some(front_minter)) => spawn_layers_front(
+                front,
+                std::sync::Arc::clone(&kernel),
+                front_minter,
+                std::sync::Arc::clone(&trust),
+            )?,
             // Unreachable by the checks above (a layer door enrolls, and the front needs one),
             // and refused rather than served if it ever were: a front with no per-identity
             // minter would have no authority to give anyone.
@@ -5243,7 +5267,9 @@ struct BoundFront;
 /// print its banner line: it names the BOUND address, so port 0 announces the port taken.
 #[cfg(all(feature = "embedded", feature = "quic", feature = "web"))]
 fn bind_layers_front(addr: &str, identity: &ikigai_quic::Identity) -> Result<BoundFront, String> {
-    let tls = ikigai_quic::https_server_tls(identity)
+    // Asks for a client certificate and requires none: a token minted `--require-cert` is
+    // refused without one, and any presented certificate must be the token's (ledger #4544).
+    let tls = ikigai_quic::https_server_tls_asking_client_cert(identity)
         .map_err(|e| format!("the layers HTTPS front's TLS: {e}"))?;
     let listener = std::net::TcpListener::bind(addr)
         .map_err(|e| format!("the layers HTTPS front could not bind {addr}: {e}"))?;
@@ -5252,6 +5278,21 @@ fn bind_layers_front(addr: &str, identity: &ikigai_quic::Identity) -> Result<Bou
         .map_err(|e| format!("the layers HTTPS front's address: {e}"))?;
     let tokens = ikigai_embedded::tokens::tokens_path()
         .ok_or("the layers HTTPS front needs a config home to keep layer-tokens.json in")?;
+    // Entries an older release wrote carry no expiry: give each one the default lifetime from
+    // its mint time or this release's first start, whichever is later, backing the file up
+    // first (ledger #4544). Idempotent: none left, no write.
+    let upgraded =
+        ikigai_embedded::tokens::upgrade_file(&tokens, ikigai_embedded::tokens::now_utc())?;
+    if upgraded > 0 {
+        eprintln!(
+            "ikigai: layers https: gave {upgraded} token{} from an older release an expiry {} \
+             days after it was minted or after this release first started, whichever is later \
+             (the previous file is kept beside it as {}.bak-*)",
+            if upgraded == 1 { "" } else { "s" },
+            ikigai_embedded::tokens::DEFAULT_LIFETIME_DAYS,
+            tokens.display()
+        );
+    }
     // Read once here so a broken file stops the start, as a broken clients.json does; the
     // front reads it again on every request.
     let held = ikigai_embedded::tokens::load_from(&tokens)?;
@@ -5278,6 +5319,7 @@ fn spawn_layers_front(
     bound: BoundFront,
     kernel: std::sync::Arc<ikigai_core::Kernel>,
     minter: ikigai_quic::Minter,
+    trust: ikigai_quic::TrustList,
 ) -> Result<(), String> {
     let tokens = ikigai_embedded::tokens::tokens_path()
         .ok_or("the layers HTTPS front needs a config home to keep layer-tokens.json in")?;
@@ -5285,6 +5327,7 @@ fn spawn_layers_front(
         kernel,
         minter,
         tokens,
+        trust,
         edge: ikigai_web::EdgeConfig::default(),
     };
     std::thread::Builder::new()
@@ -5303,6 +5346,7 @@ fn spawn_layers_front(
     _bound: BoundFront,
     _kernel: std::sync::Arc<ikigai_core::Kernel>,
     _minter: ikigai_quic::Minter,
+    _trust: ikigai_quic::TrustList,
 ) -> Result<(), String> {
     Ok(())
 }
@@ -5350,7 +5394,17 @@ fn layers_token(command: TokenCommand) -> ! {
             .ok_or("no config home to keep layer-tokens.json in (set HOME or --config-home)")?;
         let mut held = tokens::load_from(&path)?;
         match command {
-            TokenCommand::Mint { client, label } => {
+            TokenCommand::Mint {
+                client,
+                label,
+                lifetime,
+                require_cert,
+            } => {
+                // Checked before anything is written, so a bad lifetime mints nothing.
+                let lifetime = match lifetime {
+                    Some(text) => tokens::parse_lifetime(&text)?,
+                    None => tokens::default_lifetime(),
+                };
                 let enrolment = ikigai_embedded::clients::enrolment()?.ok_or_else(|| {
                     format!(
                         "no clients.json ({}): a token is bound to an ENROLLED participant, so \
@@ -5364,25 +5418,41 @@ fn layers_token(command: TokenCommand) -> ! {
                 })?;
                 let key = tokens::resolve_client(&enrolment, &client)?;
                 let token = tokens::generate()?;
-                let created = tokens::now();
+                let minted = tokens::now_utc();
+                let created = tokens::rfc3339(minted);
+                let expires = tokens::rfc3339(minted + lifetime);
                 let label = label.unwrap_or_else(|| client.clone());
-                let binding = held.insert(&token, &key, &label, &created)?;
+                let binding =
+                    held.insert(&token, &key, &label, &created, &expires, require_cert)?;
                 tokens::save_to(&path, &held)?;
                 // The token on stdout ALONE, so `$(ikigai layers-token mint …)` captures it;
                 // everything else on stderr.
                 println!("{token}");
                 eprintln!(
-                    "ikigai: minted token {} for {} (client {}), stored as its hash in {}. This \
-                     is the only time it is shown.",
+                    "ikigai: minted token {} for {} (client {}), stored as its hash in {}. It \
+                     expires at {expires}{}. This is the only time it is shown.",
                     binding.id,
                     enrolment.principal_for(&key).unwrap_or(label.as_str()),
                     short_key(&key),
-                    path.display()
+                    path.display(),
+                    if require_cert {
+                        ", and every request must present the client certificate it is bound to"
+                    } else {
+                        ""
+                    }
                 );
             }
             TokenCommand::List => {
                 for b in held.bindings() {
-                    println!("{}  {}  {}  {}", b.id, b.client, b.created, b.label);
+                    println!(
+                        "{}  {}  {}  expires {}{}  {}",
+                        b.id,
+                        b.client,
+                        b.created,
+                        b.expires.as_deref().unwrap_or("(none yet)"),
+                        if b.require_cert { "  require-cert" } else { "" },
+                        b.label
+                    );
                 }
                 if held.is_empty() {
                     eprintln!("ikigai: no tokens in {}", path.display());
