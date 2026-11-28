@@ -1180,7 +1180,11 @@ mod endpoint_tests {
                         key_path: key_path.clone(),
                     },
                 )
-                .bind(Exact::new(DECISIONS_SPACE), recorder.clone()),
+                .bind(Exact::new(DECISIONS_SPACE), recorder.clone())
+                .bind(
+                    Exact::new("urn:passkey:challenge"),
+                    crate::passkey::PasskeyChallenge,
+                ),
         ));
         World {
             kernel,
@@ -1233,6 +1237,109 @@ mod endpoint_tests {
             .expect("the page should render");
             String::from_utf8(rep.bytes.clone()).unwrap()
         }
+    }
+
+    /// Ledger #4545, end to end, as the browser does it: GET the decision page, read the link
+    /// binding its ceremony script sends (`data-pk-link`), ask `urn:passkey:challenge` for a
+    /// challenge for that link, have the device sign it, and POST the form with the assertion.
+    /// The decision is recorded once; the same assertion on the other link of the booking (its
+    /// decline) approves nothing.
+    #[test]
+    fn a_decision_page_s_own_passkey_ceremony_approves_its_link_and_no_other() {
+        crate::passkey::tests::isolate("decide-e2e");
+        let device = crate::passkey::tests::Device::new();
+        device.register();
+        let w = world("passkey-e2e");
+        let (exp, token) = w.valid("approve");
+
+        let html = w.call(Verb::Source, "approve", ID, exp, &token);
+        let link = {
+            let at = html
+                .find("data-pk-link=\"")
+                .expect("the page carries its link")
+                + 14;
+            let end = at + html[at..].find('"').unwrap();
+            html[at..end]
+                .replace("&quot;", "\"")
+                .replace("&#39;", "'")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&amp;", "&")
+        };
+        assert!(link.contains(&token), "the binding names this link: {link}");
+
+        let challenge = block_on(
+            w.kernel.issue(
+                Request::new(Verb::Source, Iri::parse("urn:passkey:challenge").unwrap())
+                    .with_arg("link", ArgRef::Inline(link.into_bytes())),
+                &Capability::root(),
+            ),
+        )
+        .expect("a challenge for the page's link");
+        let challenge: serde_json::Value = serde_json::from_slice(&challenge.bytes).unwrap();
+        assert_eq!(challenge["enrolled"], true, "{challenge}");
+        let assertion = device.assert_fields(challenge["challenge"].as_str().unwrap(), 0x05, 1);
+
+        let post = |action: &str, token: &str| {
+            let body = format!("id={ID}&exp={exp}&t={token}&{assertion}");
+            let rep = block_on(
+                w.kernel.issue(
+                    Request::new(
+                        Verb::Sink,
+                        Iri::parse(format!("urn:calendar-request:{action}")).unwrap(),
+                    )
+                    .with_arg("content", ArgRef::Inline(body.into_bytes())),
+                    &Capability::root(),
+                ),
+            )
+            .expect("the page should render");
+            String::from_utf8(rep.bytes.to_vec()).unwrap()
+        };
+        // The same assertion on this booking's OTHER link: refused, and the challenge is spent.
+        let (_, decline) = w.valid("decline");
+        let other = post("decline", &decline);
+        assert!(
+            other.contains("\r\nLocation: ?outcome=passkey\r\n"),
+            "{other}"
+        );
+        assert!(
+            w.dropped().is_empty(),
+            "another link's assertion decided nothing"
+        );
+
+        // A fresh ceremony for the page's own link: recorded, once.
+        let link = {
+            let at = html.find("data-pk-link=\"").unwrap() + 14;
+            html[at..at + html[at..].find('"').unwrap()].replace("&amp;", "&")
+        };
+        let challenge = block_on(
+            w.kernel.issue(
+                Request::new(Verb::Source, Iri::parse("urn:passkey:challenge").unwrap())
+                    .with_arg("link", ArgRef::Inline(link.into_bytes())),
+                &Capability::root(),
+            ),
+        )
+        .unwrap();
+        let challenge: serde_json::Value = serde_json::from_slice(&challenge.bytes).unwrap();
+        let assertion = device.assert_fields(challenge["challenge"].as_str().unwrap(), 0x05, 2);
+        let body = format!("id={ID}&exp={exp}&t={token}&{assertion}");
+        let rep = block_on(
+            w.kernel.issue(
+                Request::new(
+                    Verb::Sink,
+                    Iri::parse("urn:calendar-request:approve").unwrap(),
+                )
+                .with_arg("content", ArgRef::Inline(body.into_bytes())),
+                &Capability::root(),
+            ),
+        )
+        .unwrap();
+        let first = String::from_utf8(rep.bytes.to_vec()).unwrap();
+        assert!(
+            first.contains("\r\nLocation: ?outcome=recorded\r\n"),
+            "{first}"
+        );
+        assert_eq!(w.dropped().len(), 1, "{:?}", w.dropped());
     }
 
     #[test]

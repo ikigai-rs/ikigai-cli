@@ -12,16 +12,19 @@
 //!   outcome page is therefore generic: it says what happened, not to whom.
 //! - **A decision acts once.** The same signed link POSTed twice (a double tap, a "post again"
 //!   on an older browser, a replayed request) records its intent once; the second answers
-//!   `?outcome=already`. What is remembered is the link's token, which is a signature only the
-//!   minting host can make, so only links that host minted ever enter the memory, and each is
+//!   `?outcome=already`. What is remembered is a digest of the link's token, which is a
+//!   signature only the minting host can make, so only links that host minted ever enter the
+//!   memory, and each is
 //!   forgotten when its link expires (seven days at most).
 //!
 //! The memory is a FILE (ledger #4545): `decision-claims.json` beside the verifying key the
 //! links are checked against, replaced whole on every change. A restart reads it back, so a link
 //! used before the restart stays used. A claim file that is present but unreadable refuses every
 //! decision until a person at the box repairs it: losing the memory must not reopen used links.
-//! Releases before this one (0.6.2 and older) kept the memory in the process only and wrote no file, so there is no
-//! older shape to migrate: an absent file is an empty memory.
+//! Each claim is named by a BLAKE3 digest of the endpoint and the token (never the token, never
+//! a path), so the file holds no usable link and a config home moved elsewhere keeps its claims.
+//! Releases before this one (0.6.2 and older) kept the memory in the process only and wrote no
+//! file, so there is no older shape to migrate: an absent file is an empty memory.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -51,9 +54,10 @@ const MAX_REMEMBERED: usize = 4096;
 const CLAIMS_VERSION: u32 = 1;
 
 /// The claim file: the decisions already acted on, each with its link's expiry (unix seconds),
-/// keyed by the endpoint, the verifying key its links are checked against, and the link's token.
-/// The key file is part of the name because a token means something only under the key that
-/// verifies it: two endpoints over two keys (as tests build) never share a memory.
+/// keyed by [`name`]: a BLAKE3 digest of the endpoint and the link's token, never the token
+/// itself (only membership is ever checked, so the file need not hold a usable link). The file
+/// lives beside the verifying key, so two endpoints over two keys in two places (as tests build)
+/// never share a memory, and the name holds no path, so moving the config home keeps it.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct Claims {
     version: u32,
@@ -138,7 +142,7 @@ pub(crate) fn claim(scope: &str, key: &Path, token: &str, exp: i64, now: i64) ->
     let path = claims_path(key);
     let mut file = load(&path)?;
     file.claims.retain(|_, until| *until > now);
-    let name = name(scope, key, token);
+    let name = name(scope, token);
     if file.claims.contains_key(&name) {
         return Ok(false);
     }
@@ -158,16 +162,18 @@ pub(crate) fn release(scope: &str, key: &Path, token: &str) {
     let _held = claims_lock();
     let path = claims_path(key);
     let Ok(mut file) = load(&path) else { return };
-    if file.claims.remove(&name(scope, key, token)).is_some() {
+    if file.claims.remove(&name(scope, token)).is_some() {
         if let Err(e) = save(&path, &file) {
             eprintln!("ikigai decide: could not give back a failed decision's claim: {e}");
         }
     }
 }
 
-/// What a decision is remembered by (see [`acted`]).
-fn name(scope: &str, key: &Path, token: &str) -> String {
-    format!("{scope}|{}|{token}", key.display())
+/// What a decision is remembered by in the claim file (see [`claim`]): `b3:<hex>`, the BLAKE3
+/// content id of the endpoint `scope` and the link's `token`. Stable across a config-home move
+/// (no path in it) and useless as a link if the file leaks (no token in it).
+fn name(scope: &str, token: &str) -> String {
+    ikigai_core::ContentId::of(format!("{scope}|{token}").as_bytes()).to_string()
 }
 
 /// The answer to a decision POST: `303 See Other` to this same page with `?outcome=<word>`, with
@@ -241,12 +247,19 @@ mod tests {
         let key = dir.join("decide.pub");
         assert!(claim("t", &key, "tok-a", 500, 100).unwrap());
         let on_disk = std::fs::read_to_string(dir.join("decision-claims.json")).unwrap();
-        assert!(on_disk.contains("tok-a"), "the claim is on disk: {on_disk}");
+        assert!(
+            on_disk.contains(&name("t", "tok-a")),
+            "the claim is on disk: {on_disk}"
+        );
+        assert!(
+            !on_disk.contains("tok-a"),
+            "as a digest, never the token: {on_disk}"
+        );
 
         // What another process (the one before a restart) wrote.
         let fixture = format!(
             r#"{{"version":1,"claims":{{"{}":500}}}}"#,
-            name("t", &key, "tok-b")
+            name("t", "tok-b")
         );
         std::fs::write(dir.join("decision-claims.json"), fixture).unwrap();
         assert!(
@@ -257,6 +270,39 @@ mod tests {
             claim("t", &key, "tok-c", 500, 100).unwrap(),
             "a fresh link still acts"
         );
+    }
+
+    /// The claim is keyed by the token's digest, not by where the key lives: a config home moved
+    /// (the directory renamed, as a machine move or a new `XDG_CONFIG_HOME` does) keeps its used
+    /// links used.
+    #[test]
+    fn a_used_link_stays_used_after_the_config_home_moves() {
+        let old = scratch("move-old");
+        let new = std::env::temp_dir().join(format!("ikigai-prg-{}-move-new", std::process::id()));
+        let _ = std::fs::remove_dir_all(&new);
+        assert!(claim("t", &old.join("decide.pub"), "tok-moved", 500, 100).unwrap());
+        std::fs::rename(&old, &new).unwrap();
+        assert!(
+            !claim("t", &new.join("decide.pub"), "tok-moved", 500, 100).unwrap(),
+            "the used link stays used in its new home"
+        );
+        assert!(claim("t", &new.join("decide.pub"), "tok-fresh", 500, 100).unwrap());
+    }
+
+    /// The name is the shared content id (`b3:` and 64 hex digits of BLAKE3), and holds neither
+    /// the token nor a path.
+    #[test]
+    fn a_claim_name_is_a_digest_of_scope_and_token() {
+        let n = name("calendar-request", "tok-secret");
+        let hex = n.strip_prefix("b3:").expect("a b3 content id");
+        assert_eq!(hex.len(), 64, "{n}");
+        assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()), "{n}");
+        assert!(!n.contains("tok-secret"), "{n}");
+        assert_eq!(
+            n,
+            ikigai_core::ContentId::of(b"calendar-request|tok-secret").to_string()
+        );
+        assert_ne!(name("a", "tok"), name("b", "tok"), "scoped by endpoint");
     }
 
     #[test]

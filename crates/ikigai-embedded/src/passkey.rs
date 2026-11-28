@@ -41,8 +41,9 @@
 //! [`ikigai_passkey::verify`] is stateless, so the freshness of a challenge is this module's job:
 //! `urn:passkey:challenge` mints a random challenge and remembers it briefly; the gate consumes it
 //! on use, so an assertion can be presented exactly once and only within the window. Each
-//! challenge is issued for ONE decision link ([`link_binding`]) and spent only on it, so an
-//! assertion made on one link's page cannot approve another (ledger #4545).
+//! challenge is issued for ONE decision link (its endpoint scope, action and signed token, the
+//! text a decision page carries in `data-pk-link`) and spent only on it, so an assertion made on
+//! one link's page cannot approve another (ledger #4545).
 //!
 //! ## Enrollment trust
 //!
@@ -959,8 +960,9 @@ impl Endpoint for PasskeyJs {
 /// On success the challenge is consumed (single-use) and any advanced signature counter persisted.
 /// Every failure is one `Denied` — a prober learns nothing from which check tripped.
 ///
-/// The assertion must be over a challenge issued for `link` (see [`link_binding`]): one made on
-/// another link's page, or presented a second time, is refused (ledger #4545). Once a passkey
+/// The assertion must be over a challenge issued for `link` (the decision link's endpoint scope,
+/// action and signed token, as its page carries them in `data-pk-link`): one made on another
+/// link's page, or presented a second time, is refused (ledger #4545). Once a passkey
 /// was enrolled here, a missing credential file refuses too, never reads as "not enrolled".
 pub fn require_passkey(inv: &Invocation<'_>, link: &str) -> Result<()> {
     passkey_gate(inv, link).map_err(|refusal| match refusal {
@@ -1234,7 +1236,8 @@ impl Endpoint for PasskeyEnrollOpen {
 // urn:passkey:unrequire — lift the passkey requirement (run from the box).
 // =====================================================================================
 
-/// Un-enrolls on purpose (ledger #4545): removes the credential file and the passkey-required
+/// Un-enrolls on purpose (ledger #4545): moves the credential file aside under a timestamped
+/// name (`passkey-credentials.json.removed-<unix seconds>`; never deleted) and removes the passkey-required
 /// marker, so decision links go back to bearer-only and every decision page says so. This is
 /// the ONLY way the requirement is lifted; a missing credential file never lifts it. Cap-gated
 /// like opening an enrollment window, and bound off the public face.
@@ -1249,27 +1252,60 @@ impl Endpoint for PasskeyUnrequire {
             ));
         }
         let _held = credential_lock();
-        for path in [credentials_path(), required_marker_path()] {
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(Error::Endpoint(format!(
-                        "cannot remove {}: {e}; the passkey requirement stands",
-                        path.display()
-                    )))
-                }
+        // The credential file is MOVED aside, never deleted: a person who lifted the requirement
+        // by mistake can move it back (with the marker) and nothing was lost.
+        let creds = credentials_path();
+        let set_aside = removed_credentials_path(&creds, now_secs());
+        let moved = match std::fs::rename(&creds, &set_aside) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
+                return Err(Error::Endpoint(format!(
+                    "cannot move {} aside to {}: {e}; the passkey requirement stands",
+                    creds.display(),
+                    set_aside.display()
+                )))
+            }
+        };
+        let marker = required_marker_path();
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(Error::Endpoint(format!(
+                    "cannot remove {}: {e}; the passkey requirement stands{}",
+                    marker.display(),
+                    if moved {
+                        format!(
+                            " (the credential file is already at {}: move it back to {})",
+                            set_aside.display(),
+                            creds.display()
+                        )
+                    } else {
+                        String::new()
+                    }
+                )))
             }
         }
+        let kept = if moved {
+            format!(
+                "the credential file was moved aside to {} (not deleted)",
+                set_aside.display()
+            )
+        } else {
+            "there was no credential file to move aside".to_string()
+        };
         eprintln!(
-            "ikigai passkey: the passkey requirement was LIFTED at the box: decision links are \
-             bearer-only until a passkey is enrolled again"
+            "ikigai passkey: the passkey requirement was LIFTED at the box ({kept}): decision \
+             links are bearer-only until a passkey is enrolled again"
         );
         Ok(Representation::new(
             ReprType::new("text/plain").with_param("charset", "utf-8"),
-            b"passkey requirement lifted: the credential file and the marker are removed, and \
-              decision links are bearer-only until you enroll a passkey again\n"
-                .to_vec(),
+            format!(
+                "passkey requirement lifted: {kept}, the passkey-required marker is removed, and \
+                 decision links are bearer-only until you enroll a passkey again\n"
+            )
+            .into_bytes(),
         ))
     }
     fn name(&self) -> &str {
@@ -1278,7 +1314,7 @@ impl Endpoint for PasskeyUnrequire {
     fn describe(&self) -> Description {
         Description::new("passkey-unrequire")
             .title("Lift the passkey requirement")
-            .summary("Removes the enrolled passkey and the record that one is required, so decision links are bearer-only again. Run from the box.")
+            .summary("Moves the enrolled passkey's credential file aside under a timestamped name (never deleting it) and removes the record that one is required, so decision links are bearer-only again. Run from the box.")
             .action(
                 ActionSpec::new(Verb::Sink)
                     .summary("lift the requirement")
@@ -1287,6 +1323,17 @@ impl Endpoint for PasskeyUnrequire {
             )
             .output("text/plain; charset=utf-8")
     }
+}
+
+/// Where `urn:passkey:unrequire` moves the credential file `creds`: beside it, named
+/// `passkey-credentials.json.removed-<unix seconds>`, so it can be moved back by hand.
+fn removed_credentials_path(creds: &std::path::Path, now: i64) -> std::path::PathBuf {
+    let mut name = creds
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".removed-{now}"));
+    creds.with_file_name(name)
 }
 
 /// An enrollment window as the box wrote it: when it closes, the SHA-256 of its one-time code
@@ -1609,7 +1656,7 @@ impl Endpoint for PasskeyRegister {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request};
     use p256::ecdsa::{signature::Signer, Signature, SigningKey, VerifyingKey};
@@ -1705,7 +1752,7 @@ mod tests {
     // Give this test its own workspace root — set on THIS thread only, so parallel tests never
     // collide on the credential/window files (a global env var would race across them) — and a
     // configured relying party, which a test that wants none removes with `unconfigure`.
-    fn isolate(name: &str) {
+    pub(crate) fn isolate(name: &str) {
         let dir =
             std::env::temp_dir().join(format!("ikigai-passkey-ep-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1719,11 +1766,11 @@ mod tests {
     }
 
     /// A stand-in authenticator: a fixed P-256 key that signs assertions as a device would.
-    struct Device {
+    pub(crate) struct Device {
         key: SigningKey,
     }
     impl Device {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 key: SigningKey::from_slice(&[0x33u8; 32]).unwrap(),
             }
@@ -1732,7 +1779,7 @@ mod tests {
             let der = VerifyingKey::from(&self.key).to_public_key_der().unwrap();
             b64().encode(der.as_bytes())
         }
-        fn register(&self) {
+        pub(crate) fn register(&self) {
             let creds = vec![StoredCredential {
                 id: b64().encode(b"cred-1"),
                 spki: self.spki_b64(),
@@ -1742,7 +1789,7 @@ mod tests {
         }
         /// Build the four base64url fields for a POST body, over the given challenge. `count` is
         /// the signature counter — a real authenticator advances it every assertion.
-        fn assert_fields(&self, challenge: &str, flags: u8, count: u32) -> String {
+        pub(crate) fn assert_fields(&self, challenge: &str, flags: u8, count: u32) -> String {
             let client = format!(
                 r#"{{"type":"webauthn.get","challenge":"{challenge}","origin":"{ORIGIN}"}}"#
             )
@@ -2060,8 +2107,24 @@ mod tests {
             "the cap is required"
         );
         assert!(required_marker_path().exists());
-        futures::executor::block_on(kernel.issue(req(), &Capability::root())).unwrap();
+        let before = std::fs::read(credentials_path()).unwrap();
+        let answer = futures::executor::block_on(kernel.issue(req(), &Capability::root())).unwrap();
+        let answer = String::from_utf8(answer.bytes.to_vec()).unwrap();
         assert!(!required_marker_path().exists() && !credentials_path().exists());
+        // Moved aside, not deleted, and the answer says where.
+        let aside: Vec<_> = std::fs::read_dir(credentials_path().parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("passkey-credentials.json.removed-"))
+            })
+            .collect();
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert_eq!(std::fs::read(&aside[0]).unwrap(), before, "the same bytes");
+        assert!(answer.contains("moved aside"), "{answer}");
+        assert!(answer.contains(&aside[0].display().to_string()), "{answer}");
         assert_eq!(
             run_gate_for(LINK, "id=abc&exp=1"),
             Ok(()),
