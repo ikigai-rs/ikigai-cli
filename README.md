@@ -349,7 +349,7 @@ and its keys are that program's to read and check. An instance named after anoth
 ### Secret stores (`[secret]`)
 
 `urn:secret:*` reads and writes the stores named by an optional `[secret]` section, the one
-TOML table `config.toml` may hold (ikigai-secret 0.5.2's design, `docs/storage-backends.md` in
+TOML table `config.toml` may hold (ikigai-secret 0.5.4's design, `docs/storage-backends.md` in
 `ikigai-rs/ikigai-secret`). It runs from its first `[secret]`, `[secret.…]` or
 `[[secret.route]]` header to the END of the file, so the flat settings go above it; any other
 table header still stops startup. A store's `path` is absolute or begins with `~/`.
@@ -361,7 +361,7 @@ files = "~/work"                 # flat settings first
 default = "main"                 # the store every name no route matches goes to
 
 [secret.store.main]
-kind = "file"                    # keychain and secure-enclave on a Mac; file anywhere
+kind = "file"                    # keychain and secure-enclave on a Mac; file and age-file anywhere
 path = "~/.ikigai/secrets"
 
 [secret.store.team]
@@ -374,9 +374,31 @@ match = "zoom.*"
 store = "team"
 ```
 
-With no section the host builds exactly the store it always has (the Keychain on a Mac, the file
-store at `IKIGAI_SECRETS` or `~/.ikigai/secrets` elsewhere) and every name is a secret's, as
-before. With a section, the LLM and meeting key readers read through the same routes, and four
+With no section the store follows what is already on the machine (ikigai-secret 0.5.4's
+`found_install` and `SecretConfig::for_host`), judged at start without reading any secret, and
+every name is a secret's, as before:
+
+- **An install from before** (Keychain items under `ikigai-secret` on a Mac, a file store
+  holding a secret in `~/.ikigai/secrets`, or `IKIGAI_SECRETS` set) keeps exactly the store it
+  had, unchanged; no secret moves. An interactive start says so once on stderr, in
+  ikigai-secret's own line: new installs now get an age-file store, how to move to one (a
+  `[secret]` section with an `age-file` store, then `urn:secret:store:name:{store}:copy` for
+  each secret), and that `IKIGAI_SECRETS` is deprecated. A `-c` batch and `--quiet` stay quiet.
+- **A new install** (none of those) gets one `age-file` store named `age-file` in
+  `~/.ikigai/secrets`: each secret is a binary age file, sealed to the host's key. Its first
+  write leaves the store's marker (`.ikigai-age-file`), so every later start keeps it an
+  age-file store. A host with no usable `HOME` has no data home to make it in, and keeps the
+  store it always had, as before, with no notice.
+
+The host's key is an age identity file, `secret.key`: `$CREDENTIALS_DIRECTORY/secret.key` when
+systemd passes it as a credential, else `secret.key` in the config home. The host makes it
+(`0600`) on a new install's first write; keep a copy somewhere safe, since without it no secret
+in the store opens (`age -d -i secret.key <file>` opens one at the box). It is never remade: a
+store whose key file is gone refuses every read and write, naming the file, until the key is put
+back. A section's `age-file` store may use the same key with `identity = "default"`; the host
+does not make the file for one, and any other `identity` stops startup with exit 2 for now.
+
+With a section, the LLM and meeting key readers read through the same routes, and four
 inspection resources are bound ahead of `urn:secret:{name}`: `urn:secret:store`,
 `urn:secret:store:name:{store}` and `urn:secret:route` under `urn:cap:secret:inspect`, and
 `urn:secret:route:secret:{name}` (where one name lives) under that name's read scope. They
