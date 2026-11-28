@@ -1063,6 +1063,11 @@ fn arm_bayes(announce: bool) {
         if let Some(line) = ikigai_embedded::secrets::announcement() {
             eprintln!("{line}");
         }
+        // An install from before with no section keeps its store, and is told once that new
+        // installs now get an age-file store and how to move to one (ledger #4548).
+        if let Some(line) = ikigai_embedded::secrets::notice() {
+            eprintln!("{line}");
+        }
     }
     match ikigai_embedded::bayes::arm() {
         Ok(Some(line)) if announce => eprintln!("{line}"),
