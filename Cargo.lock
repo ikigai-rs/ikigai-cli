@@ -3319,6 +3319,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "toml 0.8.23",
  "ureq",
  "xdg",
 ]
@@ -3785,18 +3786,21 @@ dependencies = [
 
 [[package]]
 name = "ikigai-secret"
-version = "0.5.0"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4730328b789dd86ad76d45e41b1aa991e2aa32da1b8083a97f54e128011713f0"
+checksum = "bcf296f03d7e3ecd71f58405d7c8768f09139133b2c681ef7b4c47a4d93b1e47"
 dependencies = [
  "age",
  "async-trait",
  "ed25519-dalek 2.2.0",
+ "glob",
  "ikigai-core",
  "libc",
  "rand_core 0.6.4",
  "robius-authentication",
  "security-framework",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3943,6 +3947,7 @@ dependencies = [
  "futures",
  "ikigai-conformance",
  "ikigai-core",
+ "rrule",
 ]
 
 [[package]]
@@ -7544,6 +7549,19 @@ dependencies = [
  "robius-android-env",
  "windows 0.56.0",
  "windows-core 0.56.0",
+]
+
+[[package]]
+name = "rrule"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "720acfb4980b9d8a6a430f6d7a11933e701ebbeba5eee39cc9d8c5f932aaff74"
+dependencies = [
+ "chrono",
+ "chrono-tz",
+ "log",
+ "regex",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

@@ -11,6 +11,12 @@
 //! rewrites the same file line by line. Each line is read the way TOML reads a `key = value`
 //! line, and anything outside that shape stops the host ([`check`]) rather than being skipped.
 //!
+//! One exception, the secret stores (ledger #4487): the file may END with a `[secret]` section,
+//! real TOML from its first `[secret]`, `[secret.…]` or `[[secret.route]]` header to the end of
+//! the file, which ikigai-secret's `SecretSection` reads ([`secret_section`]). The flat
+//! readers here stop at that header, so a store's `path` or a route's `store` is never read as
+//! one of the host's settings.
+//!
 //! Deliberately in the CONFIG dir, NOT `file_root()`: `IKIGAI_FILES` repoints the workspace
 //! *data* dir, but a *setting* like the mail sender shouldn't move with it. This is the shared
 //! ikigai config home — `grants.json` already lives beside it, and the CLI's own settings
@@ -337,10 +343,27 @@ fn check_keys() -> Result<(), String> {
 /// [`check`] over text already read, for the host running as `instance`; the error begins
 /// with the line it is about.
 pub(crate) fn check_text(text: &str, instance: &str) -> Result<(), String> {
+    let mut in_secret = false;
     for (index, line) in text.lines().enumerate() {
         let at = || format!("line {}", index + 1);
+        // From the first `[secret]` header on, the lines are the secret section's, which
+        // `secret_section_in` reads as TOML; any other table header there is still refused.
+        if is_secret_header(line) {
+            in_secret = true;
+            continue;
+        }
+        if in_secret && !line.trim_start().starts_with('[') {
+            continue;
+        }
         match parse_line(line) {
             Err(e) => return Err(format!("{}: {e}", at())),
+            Ok(Some((key, _))) if key == "secret" || key.starts_with("secret.") => {
+                return Err(format!(
+                    "{}: `{key}` is not read as a dotted key; the secret stores are configured \
+                     in a `[secret]` table at the end of the file",
+                    at()
+                ))
+            }
             Ok(Some((key, _))) if !is_known_key(&key) && is_host_family(&key, instance) => {
                 return Err(format!(
                     "{}: `{key}` is not a setting this host reads; check its spelling, or \
@@ -363,8 +386,8 @@ fn parse_line(line: &str) -> Result<Option<(String, String)>, String> {
     }
     if line.starts_with('[') {
         return Err(format!(
-            "`{line}`: table headers are not read here; write each setting as one \
-             `dotted.key = value` line"
+            "`{line}`: table headers are not read here, except the `[secret]` section's at \
+             the end of the file; write each setting as one `dotted.key = value` line"
         ));
     }
     let (key, value) = line
@@ -458,8 +481,107 @@ fn basic_string(text: &str) -> Option<(String, &str)> {
 /// Every readable assignment in `text`, in file order. A line [`check`] would refuse is
 /// passed over here; the host has already stopped on it before any setting is read.
 fn entries(text: &str) -> impl Iterator<Item = (String, String)> + '_ {
-    text.lines()
+    host_part(text)
+        .lines()
         .filter_map(|line| parse_line(line).ok().flatten())
+}
+
+/// Whether `line` is a header of the `[secret]` section: `[secret]`, `[secret.<…>]` or
+/// `[[secret.<…>]]`, with an optional `#` comment after it.
+fn is_secret_header(line: &str) -> bool {
+    let line = line.trim();
+    let (name, rest) = if let Some(inner) = line.strip_prefix("[[") {
+        match inner.split_once("]]") {
+            Some(split) => split,
+            None => return false,
+        }
+    } else if let Some(inner) = line.strip_prefix('[') {
+        match inner.split_once(']') {
+            Some(split) => split,
+            None => return false,
+        }
+    } else {
+        return false;
+    };
+    let name = name.trim();
+    let rest = rest.trim_start();
+    (name == "secret" || name.starts_with("secret.")) && (rest.is_empty() || rest.starts_with('#'))
+}
+
+/// The host's flat lines of `text`: everything before the first `[secret]` header (all of it
+/// when there is none).
+pub(crate) fn host_part(text: &str) -> &str {
+    let mut at = 0;
+    for line in text.split_inclusive('\n') {
+        if is_secret_header(line) {
+            return &text[..at];
+        }
+        at += line.len();
+    }
+    text
+}
+
+/// `config.toml` as far as the secret stores are concerned: the one table it may hold.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecretFile {
+    secret: Option<ikigai_secret::SecretSection>,
+}
+
+/// The `[secret]` section of `text`, deserialized but not yet checked (that is
+/// `ikigai_secret::SecretConfig::from_section`'s), or `None` when `text` has no `[secret]`
+/// header. A section TOML cannot read, or a key ikigai-secret does not know, is refused with
+/// the file's line number and the parser's sentence.
+pub(crate) fn secret_section_in(
+    text: &str,
+) -> Result<Option<ikigai_secret::SecretSection>, String> {
+    let host = host_part(text);
+    if host.len() == text.len() {
+        return Ok(None);
+    }
+    // The host's lines become blank ones, so a line the parser names is the file's own.
+    let section = format!(
+        "{}{}",
+        "\n".repeat(host.matches('\n').count()),
+        &text[host.len()..]
+    );
+    match toml::from_str::<SecretFile>(&section) {
+        Ok(file) => Ok(file.secret),
+        Err(e) => {
+            let line = e.span().map(|span| {
+                section[..span.start.min(section.len())]
+                    .matches('\n')
+                    .count()
+                    + 1
+            });
+            let message = e.message().trim_end_matches('\n').trim_end_matches('.');
+            let hint = if message.starts_with("unknown field") {
+                "; a setting outside [secret] goes above its first header"
+            } else {
+                ""
+            };
+            Err(match line {
+                Some(line) => {
+                    format!("line {line}: the [secret] section cannot be read: {message}{hint}")
+                }
+                None => format!("the [secret] section cannot be read: {message}{hint}"),
+            })
+        }
+    }
+}
+
+/// The `[secret]` section of the host's `config.toml` (read as `secret_section_in` reads it): `None` with
+/// no config home, no file or no section. A refusal begins with the file's path.
+pub fn secret_section() -> Result<Option<ikigai_secret::SecretSection>, String> {
+    let Some(path) = config_path() else {
+        return Ok(None);
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    secret_section_in(&text).map_err(|e| format!("{} {e}", path.display()))
 }
 
 /// The value of `key` in the host config, or `None` if the file or the key is absent.
@@ -754,6 +876,28 @@ mod tests {
                 "{unreadable:?} must not read"
             );
         }
+    }
+
+    /// The `[secret]` section runs from its first header to the end of the file (ledger #4487):
+    /// its lines are not the host's, the flat readers stop at it, and any other table header or a
+    /// flat `secret.*` key is still refused on its line.
+    #[test]
+    fn the_secret_section_is_the_one_table() {
+        let text = "files = \"/srv\"\n[secret] # stores\ndefault = \"main\"\n\
+                    [secret.store.main]\nkind = \"file\"\n[[secret.route]]\nmatch = \"z*\"\n\
+                    store = \"main\"\n";
+        assert_eq!(check_text(text, "repl"), Ok(()));
+        assert_eq!(values_for(text, "store"), Vec::<String>::new());
+        assert_eq!(value_for(text, "files").as_deref(), Some("/srv"));
+        let other = format!("{text}[mail]\nfrom = \"a@b.example\"\n");
+        assert!(check_text(&other, "repl")
+            .unwrap_err()
+            .starts_with("line 9: "));
+        let dotted = check_text("secret.default = \"main\"\n", "repl").unwrap_err();
+        assert!(
+            dotted.starts_with("line 1: ") && dotted.contains("`[secret]` table"),
+            "{dotted}"
+        );
     }
 
     /// A key is known as itself, as a member of a validated family, or after an instance

@@ -331,7 +331,8 @@ same file the host reads `mail.*`, `mount` and `scheduler` from).
 
 `config.toml` holds flat `key = value` lines, one setting per line; `mount` and the other
 repeating keys take one line each. A value is a `"basic"` or `'literal'` TOML string, or a
-bare number or word, and a `#` after it starts a comment. A `[table]` header, a line with no
+bare number or word, and a `#` after it starts a comment. A `[table]` header (other than the
+`[secret]` section's, below), a line with no
 `=`, an unclosed string, or anything after a string's closing quote stops startup with an
 `ikigai:` line naming the file and the line number, whichever program's key the line holds.
 
@@ -344,6 +345,49 @@ instance names are the one it runs under (`--name`) and the mode defaults `repl`
 `daemon` and `mcp`; any other first segment (`gonk.`, `web.`) is another program's namespace,
 and its keys are that program's to read and check. An instance named after another program
 (`--name gonk`) reads that program's keys as its own, so pick a name of its own.
+
+### Secret stores (`[secret]`)
+
+`urn:secret:*` reads and writes the stores named by an optional `[secret]` section, the one
+TOML table `config.toml` may hold (ikigai-secret 0.5.2's design, `docs/storage-backends.md` in
+`ikigai-rs/ikigai-secret`). It runs from its first `[secret]`, `[secret.…]` or
+`[[secret.route]]` header to the END of the file, so the flat settings go above it; any other
+table header still stops startup. A store's `path` is absolute or begins with `~/`.
+
+```toml
+files = "~/work"                 # flat settings first
+
+[secret]
+default = "main"                 # the store every name no route matches goes to
+
+[secret.store.main]
+kind = "file"                    # keychain and secure-enclave on a Mac; file anywhere
+path = "~/.ikigai/secrets"
+
+[secret.store.team]
+kind = "file"
+path = "~/team/secrets"
+write = false                    # refuse writes to names routed here
+
+[[secret.route]]                 # read in order; the first match wins, and there is no fallthrough
+match = "zoom.*"
+store = "team"
+```
+
+With no section the host builds exactly the store it always has (the Keychain on a Mac, the file
+store at `IKIGAI_SECRETS` or `~/.ikigai/secrets` elsewhere) and every name is a secret's, as
+before. With a section, the LLM and meeting key readers read through the same routes, and four
+inspection resources are bound ahead of `urn:secret:{name}`: `urn:secret:store`,
+`urn:secret:store:name:{store}` and `urn:secret:route` under `urn:cap:secret:inspect`, and
+`urn:secret:route:secret:{name}` (where one name lives) under that name's read scope. They
+reserve the names `store`, `route` and every name beginning `store:name:` or `route:secret:`,
+which the host says in one `ikigai: secrets:` line on stderr at start (a `-c` batch and
+`--quiet` stay quiet). A malformed section stops every mode with exit 2 and ikigai-secret's
+sentence, one line per problem, and nothing in it is applied. The section is read at start; an
+edit takes effect on restart. Adding one never moves a secret: a name newly routed elsewhere is
+not found there until it is copied. The REPL's `config key=value` appends a setting it does not find to the
+end of the file, inside the section; the next start refuses it on its line, and moving the line
+above the first `[secret]` header fixes it.
 
 `--config-home <dir>` names the config home outright, in every mode (REPL, `-c`, `serve`,
 `mcp`, `--daemon`, `--connect`, `cert`), so a scratch run needs no environment variable:
@@ -1244,7 +1288,7 @@ The modules and pieces the host composes, each published on crates.io from this 
 | `ikigai-passkey` | a minimal single-user WebAuthn (ES256) assertion verifier, the second factor on the edge's decision links |
 | `ikigai-scheduler` | the kernel's work scheduler: `single` or a threadpool (`pool`, `pool:N`) that parks rather than blocks on awaits |
 | `ikigai-time` | the time transport: originates resource requests on a timer, one-shot or recurring, under the scheduling capability |
-| `ikigai-tz` | `urn:tz:convert` (IANA/DST-correct) and `urn:tz:now` (a zoned clock) |
+| `ikigai-tz` | `urn:tz:convert` (IANA/DST-correct), `urn:tz:now` (a zoned clock) and `urn:tz:expand` (RFC 5545 RRULE/EXDATE occurrences in a zone over a window, DST-correct) |
 | `ikigai-view` | the org⊕calendar consolidated-view derivation, reconciled entirely through the kernel |
 
 `ikigai-time` is released on its own version line; the rest move in lockstep with the

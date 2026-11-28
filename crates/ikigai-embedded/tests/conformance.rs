@@ -146,6 +146,8 @@ const OWN: &[(&str, &str)] = &[
     ("time-jobs", "ikigai-time"),
     ("time-schedule", "ikigai-time"),
     ("tz-convert", "ikigai-tz"),
+    // ledger #4517: `urn:tz:expand`, RFC 5545 recurrence on the rrule crate.
+    ("tz-expand", "ikigai-tz"),
     ("tz-now", "ikigai-tz"),
     ("view-derive", "ikigai-view"),
     ("view-derive-tick", "ikigai-view"),
@@ -565,6 +567,14 @@ fn base() -> Suite {
                 .arg("from", "UTC")
                 .arg("to", "America/New_York"),
         )
+        .fixture(
+            Fixture::new("tz-expand", Verb::Source)
+                .arg("rule", "FREQ=WEEKLY;BYDAY=TU,TH;COUNT=10")
+                .arg("start", "2026-10-20 18:00")
+                .arg("zone", "America/New_York")
+                .arg("from", "2026-10-01 00:00")
+                .arg("until", "2026-12-01 00:00"),
+        )
         // ---- declared -------------------------------------------------------------
         // Constant documents compiled into the binary: `urn:data:page` / `:control` /
         // `:about` and the catalog stylesheet are `include_str!`-shaped resources with no
@@ -581,6 +591,9 @@ fn base() -> Suite {
         // cacheable". (`urn:tz:now` below is the sibling that is NOT this, and the two
         // declarations sitting next to each other is the point.)
         .pure("tz-convert")
+        // The same: a rule, a start, a zone and a window in, occurrences out, on the bundled
+        // tzdata and the rrule crate's arithmetic.
+        .pure("tz-expand")
         // ⚠ A STATED DEVIATION, not a claim of purity. `urn:time:now` and `urn:tz:now` read
         // the kernel's CLOCK, so by the wave's rule 3 they are not pure functions of their
         // inputs. They are `cacheable_until(next minute)` — `Expiry::At` — and since

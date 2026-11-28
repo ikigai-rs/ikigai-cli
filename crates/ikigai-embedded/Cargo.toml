@@ -98,6 +98,9 @@ ikigai-passkey = { workspace = true }
 # serde derive for the small passkey-credentials.json store.
 serde = { workspace = true }
 ikigai-secret = { workspace = true }
+# The config home's `[secret]` section is a real TOML table, read with the same parser the
+# binary's build script and lockstep test use (ledger #4487). Already in the graph.
+toml = "0.8"
 ikigai-xslt = { workspace = true }
 ikigai-jsonld = { workspace = true }
 # jq and CSV as resources (urn:json:*): the local root only, not the served kernels.
