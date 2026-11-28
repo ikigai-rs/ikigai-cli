@@ -468,8 +468,10 @@ fn action_of(inv: &Invocation<'_>) -> String {
 ///
 /// Every interpolated value is escaped (ledger #1516). The shape gate keeps markup out of a link
 /// that verifies today, but the page must not depend on a check that lives somewhere else.
-fn show_body(id: &str, exp: i64, token: &str, verb_word: &str, note: &str) -> String {
+fn show_body(id: &str, exp: i64, token: &str, verb_word: &str, note: &str, action: &str) -> String {
     use ikigai_fn::html::html_text as esc;
+    let js =
+        crate::passkey::decision_passkey_js(&crate::passkey::link_binding(SCOPE, action, token));
     let (id, token, verb_word, note) = (esc(id), esc(token), esc(verb_word), esc(note));
     format!(
         "<p>Booking <code>{id}</code>.</p>\
@@ -479,7 +481,6 @@ fn show_body(id: &str, exp: i64, token: &str, verb_word: &str, note: &str) -> St
          <input type=hidden name=t value=\"{token}\">\
          <button>{verb_word}</button>\
          </form><p class=muted>{note}</p>{js}",
-        js = crate::passkey::DECISION_PASSKEY_JS,
     )
 }
 
@@ -489,6 +490,10 @@ fn show_body(id: &str, exp: i64, token: &str, verb_word: &str, note: &str) -> St
 const RECORDED: &str = "recorded";
 const INVALID: &str = "invalid";
 const PASSKEY: &str = "passkey";
+const PASSKEY_STORE: &str = "passkey-store";
+
+/// The endpoint scope a calendar-request link's claim and passkey challenge are bound to.
+const SCOPE: &str = "calendar-request";
 
 /// One answer for every kind of bad link.
 fn bad_link_page() -> Representation {
@@ -524,6 +529,10 @@ fn outcome_page(action: &str, word: &str) -> Representation {
             "Your passkey is needed",
             "<p>This decision needs a tap on your registered device. Reopen the link and try \
              again.</p>",
+        ),
+        PASSKEY_STORE => page(
+            "Passkey file missing",
+            &format!("<p>{}</p>", crate::passkey::STORE_REFUSAL),
         ),
         _ => bad_link_page(),
     }
@@ -592,18 +601,29 @@ impl Endpoint for CalendarRequest {
                 };
                 Ok(page(
                     &format!("{verb_word} this request?"),
-                    &show_body(&id, exp, &token, verb_word, note),
+                    &show_body(&id, exp, &token, verb_word, note, &action),
                 ))
             }
             // ACT: record the intent. The Mac does the real work when it next drains.
             Verb::Sink => {
                 // Passkey second factor — inert until a credential is enrolled, then required.
                 // The assertion rides in the POST body (pk_* fields the glue-JS adds).
-                if crate::passkey::require_passkey(inv).is_err() {
-                    return Ok(prg::see_other(PASSKEY, outcome_page(&action, PASSKEY)));
+                // The challenge it was made over must be this link's (ledger #4545).
+                let link = crate::passkey::link_binding(SCOPE, &action, &token);
+                match crate::passkey::passkey_gate(inv, &link) {
+                    Ok(()) => {}
+                    Err(crate::passkey::Refusal::Store) => {
+                        return Ok(prg::see_other(
+                            PASSKEY_STORE,
+                            outcome_page(&action, PASSKEY_STORE),
+                        ));
+                    }
+                    Err(crate::passkey::Refusal::Assertion) => {
+                        return Ok(prg::see_other(PASSKEY, outcome_page(&action, PASSKEY)));
+                    }
                 }
                 // Once per link: a second POST of the same decision records nothing.
-                if !prg::claim("calendar-request", &self.key_path, &token, exp, now)? {
+                if !prg::claim(SCOPE, &self.key_path, &token, exp, now)? {
                     return Ok(prg::see_other(
                         prg::ALREADY,
                         outcome_page(&action, prg::ALREADY),
@@ -626,7 +646,7 @@ impl Endpoint for CalendarRequest {
                     )
                     .await;
                 if let Err(e) = dropped {
-                    prg::release("calendar-request", &self.key_path, &token);
+                    prg::release(SCOPE, &self.key_path, &token);
                     return Err(e);
                 }
                 Ok(prg::see_other(RECORDED, outcome_page(&action, RECORDED)))
@@ -685,7 +705,13 @@ impl Endpoint for CalendarRequest {
                     // On the ACTION: an explicit `ActionSpec` is taken WHOLE by
                     // `action_specs()`, which never folds the flat `.output()` below into
                     // it — so the flat declaration alone left both faces unannounced.
-                    .input(outcome_spec(&[RECORDED, prg::ALREADY, INVALID, PASSKEY]))
+                    .input(outcome_spec(&[
+                        RECORDED,
+                        prg::ALREADY,
+                        INVALID,
+                        PASSKEY,
+                        PASSKEY_STORE,
+                    ]))
                     .output("text/html; charset=utf-8"),
             )
             .action(
@@ -875,7 +901,7 @@ mod tests {
     fn the_page_shell_links_its_stylesheet_and_carries_no_inline_style() {
         for html in [
             String::from_utf8(page("Approve this request?", "<p>the body</p>").bytes).unwrap(),
-            show_body(ID, EXP, "tok", "Approve", "a note"),
+            show_body(ID, EXP, "tok", "Approve", "a note", "approve"),
         ] {
             assert_no_inline_style(&html);
         }
@@ -923,7 +949,14 @@ mod tests {
     /// a link that verifies today; this pins the page so it does not depend on that gate.
     #[test]
     fn the_show_page_renders_markup_in_its_fields_as_text() {
-        let body = show_body("<b>x</b>&y'", EXP, "t\"><i>z</i>", "Approve", "a note");
+        let body = show_body(
+            "<b>x</b>&y'",
+            EXP,
+            "t\"><i>z</i>",
+            "Approve",
+            "a note",
+            "approve",
+        );
         assert!(!body.contains("<b>"), "{body}");
         assert!(!body.contains("<i>"), "{body}");
         assert!(
@@ -952,6 +985,7 @@ mod tests {
             "javascript:alert(1)\"><script>alert('x')</script>",
             "Approve",
             "a note",
+            "approve",
         );
         assert!(
             body.contains("<code>a\u{FFFD}b\u{FFFD}c\td</code>"),
@@ -1146,7 +1180,11 @@ mod endpoint_tests {
                         key_path: key_path.clone(),
                     },
                 )
-                .bind(Exact::new(DECISIONS_SPACE), recorder.clone()),
+                .bind(Exact::new(DECISIONS_SPACE), recorder.clone())
+                .bind(
+                    Exact::new("urn:passkey:challenge"),
+                    crate::passkey::PasskeyChallenge,
+                ),
         ));
         World {
             kernel,
@@ -1199,6 +1237,109 @@ mod endpoint_tests {
             .expect("the page should render");
             String::from_utf8(rep.bytes.clone()).unwrap()
         }
+    }
+
+    /// Ledger #4545, end to end, as the browser does it: GET the decision page, read the link
+    /// binding its ceremony script sends (`data-pk-link`), ask `urn:passkey:challenge` for a
+    /// challenge for that link, have the device sign it, and POST the form with the assertion.
+    /// The decision is recorded once; the same assertion on the other link of the booking (its
+    /// decline) approves nothing.
+    #[test]
+    fn a_decision_page_s_own_passkey_ceremony_approves_its_link_and_no_other() {
+        crate::passkey::tests::isolate("decide-e2e");
+        let device = crate::passkey::tests::Device::new();
+        device.register();
+        let w = world("passkey-e2e");
+        let (exp, token) = w.valid("approve");
+
+        let html = w.call(Verb::Source, "approve", ID, exp, &token);
+        let link = {
+            let at = html
+                .find("data-pk-link=\"")
+                .expect("the page carries its link")
+                + 14;
+            let end = at + html[at..].find('"').unwrap();
+            html[at..end]
+                .replace("&quot;", "\"")
+                .replace("&#39;", "'")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&amp;", "&")
+        };
+        assert!(link.contains(&token), "the binding names this link: {link}");
+
+        let challenge = block_on(
+            w.kernel.issue(
+                Request::new(Verb::Source, Iri::parse("urn:passkey:challenge").unwrap())
+                    .with_arg("link", ArgRef::Inline(link.into_bytes())),
+                &Capability::root(),
+            ),
+        )
+        .expect("a challenge for the page's link");
+        let challenge: serde_json::Value = serde_json::from_slice(&challenge.bytes).unwrap();
+        assert_eq!(challenge["enrolled"], true, "{challenge}");
+        let assertion = device.assert_fields(challenge["challenge"].as_str().unwrap(), 0x05, 1);
+
+        let post = |action: &str, token: &str| {
+            let body = format!("id={ID}&exp={exp}&t={token}&{assertion}");
+            let rep = block_on(
+                w.kernel.issue(
+                    Request::new(
+                        Verb::Sink,
+                        Iri::parse(format!("urn:calendar-request:{action}")).unwrap(),
+                    )
+                    .with_arg("content", ArgRef::Inline(body.into_bytes())),
+                    &Capability::root(),
+                ),
+            )
+            .expect("the page should render");
+            String::from_utf8(rep.bytes.to_vec()).unwrap()
+        };
+        // The same assertion on this booking's OTHER link: refused, and the challenge is spent.
+        let (_, decline) = w.valid("decline");
+        let other = post("decline", &decline);
+        assert!(
+            other.contains("\r\nLocation: ?outcome=passkey\r\n"),
+            "{other}"
+        );
+        assert!(
+            w.dropped().is_empty(),
+            "another link's assertion decided nothing"
+        );
+
+        // A fresh ceremony for the page's own link: recorded, once.
+        let link = {
+            let at = html.find("data-pk-link=\"").unwrap() + 14;
+            html[at..at + html[at..].find('"').unwrap()].replace("&amp;", "&")
+        };
+        let challenge = block_on(
+            w.kernel.issue(
+                Request::new(Verb::Source, Iri::parse("urn:passkey:challenge").unwrap())
+                    .with_arg("link", ArgRef::Inline(link.into_bytes())),
+                &Capability::root(),
+            ),
+        )
+        .unwrap();
+        let challenge: serde_json::Value = serde_json::from_slice(&challenge.bytes).unwrap();
+        let assertion = device.assert_fields(challenge["challenge"].as_str().unwrap(), 0x05, 2);
+        let body = format!("id={ID}&exp={exp}&t={token}&{assertion}");
+        let rep = block_on(
+            w.kernel.issue(
+                Request::new(
+                    Verb::Sink,
+                    Iri::parse("urn:calendar-request:approve").unwrap(),
+                )
+                .with_arg("content", ArgRef::Inline(body.into_bytes())),
+                &Capability::root(),
+            ),
+        )
+        .unwrap();
+        let first = String::from_utf8(rep.bytes.to_vec()).unwrap();
+        assert!(
+            first.contains("\r\nLocation: ?outcome=recorded\r\n"),
+            "{first}"
+        );
+        assert_eq!(w.dropped().len(), 1, "{:?}", w.dropped());
     }
 
     #[test]

@@ -130,6 +130,8 @@ const OWN: &[(&str, &str)] = &[
     ("passkey-enroll-open", "ikigai-embedded"),
     ("passkey-js", "ikigai-embedded"),
     ("passkey-register", "ikigai-embedded"),
+    // ledger #4545: `urn:passkey:unrequire`, the deliberate way to lift the passkey requirement.
+    ("passkey-unrequire", "ikigai-embedded"),
     ("peer-list", "ikigai-embedded"),
     ("people", "ikigai-embedded"),
     // Sibling members of this workspace.

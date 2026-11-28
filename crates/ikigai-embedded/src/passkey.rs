@@ -11,6 +11,7 @@
 //! | [`require_passkey`] | — | the gate a decision POST calls before it acts |
 //! | `urn:passkey:enroll-open` | Sink | opens a short enrollment window (run from the box) |
 //! | `urn:passkey:register` | Source/Sink | GET shows the enrol page, POST stores the credential |
+//! | `urn:passkey:unrequire` | Sink | lifts the passkey requirement on purpose (run from the box) |
 //!
 //! The challenge and the register page declare `urn:cap:passkey:challenge` and
 //! `urn:cap:passkey:register`, so a door reaches them only under a ceiling that grants them (the
@@ -22,8 +23,13 @@
 //! the assertion rides in the decision POST body, so a Touch-ID tap is *per decision* (the right
 //! feel for a block or a decline) and nothing here touches the HTTP transport layer. And the gate
 //! is **inert until a credential is registered** — [`require_passkey`] returns `Ok` when the
-//! credential file is ABSENT, so deploying this cannot brick the working links; enrolling a
-//! passkey is what switches it on.
+//! credential file is ABSENT and no passkey was ever enrolled, so deploying this cannot brick the
+//! working links; enrolling a passkey is what switches it on. Such a host SAYS its links are
+//! bearer-only: one line at startup ([`preflight`]) and a notice on every decision page.
+//!
+//! Enrolling writes `passkey-required` beside the credential file (ledger #4545). From then on a
+//! missing credential file refuses every link (it was lost to a restore or a move, or deleted)
+//! and never reads as "not enrolled"; only `sink urn:passkey:unrequire` at the box lifts it.
 //!
 //! Once armed it **fails closed**: a credential file that is present but unreadable, or enrolled
 //! credentials on an edge with no [`RelyingParty`] configured, refuse every gated decision and
@@ -34,7 +40,10 @@
 //!
 //! [`ikigai_passkey::verify`] is stateless, so the freshness of a challenge is this module's job:
 //! `urn:passkey:challenge` mints a random challenge and remembers it briefly; the gate consumes it
-//! on use, so an assertion can be presented exactly once and only within the window.
+//! on use, so an assertion can be presented exactly once and only within the window. Each
+//! challenge is issued for ONE decision link (its endpoint scope, action and signed token, the
+//! text a decision page carries in `data-pk-link`) and spent only on it, so an assertion made on
+//! one link's page cannot approve another (ledger #4545).
 //!
 //! ## Enrollment trust
 //!
@@ -205,6 +214,35 @@ fn credentials_path() -> std::path::PathBuf {
 fn enroll_window_path() -> std::path::PathBuf {
     store_root().join("passkey-enroll.open")
 }
+/// The durable record that a passkey was enrolled here, so one is REQUIRED (ledger #4545): beside
+/// the credential file, written when a passkey enrolls (or, on upgrade, when a credential file
+/// from an older release is first read). While it exists a missing credential file refuses every
+/// decision link instead of reading as "never enrolled". Only `sink urn:passkey:unrequire` at
+/// the box removes it.
+fn required_marker_path() -> std::path::PathBuf {
+    store_root().join("passkey-required")
+}
+
+/// Whether a passkey is required: the marker is there. A marker whose presence cannot be read
+/// (a permission error on the directory, say) counts as present: fail closed.
+fn passkey_required() -> bool {
+    match std::fs::symlink_metadata(required_marker_path()) {
+        Ok(_) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Write the marker, whole and owner-only.
+fn write_required_marker() -> std::io::Result<()> {
+    write_atomic(
+        &required_marker_path(),
+        b"A passkey was enrolled on this host, so decision links require one. Without passkey-credentials.json beside this file every link is refused. Remove the requirement only with `ikigai -c 'sink urn:passkey:unrequire'`.\n",
+    )
+}
+
+/// How the person at the box enrolls a passkey again.
+const REENROLL: &str =
+    "enroll again at the box with `ikigai -c 'sink urn:passkey:enroll-open'` and the register page";
 
 // =====================================================================================
 // The challenge store — process-global, in-memory. A restart just invalidates outstanding
@@ -235,19 +273,21 @@ pub const MAX_CHALLENGES_KEY: &str = "passkey.max_challenges";
 /// The outstanding challenges, each with its expiry on the monotonic clock.
 #[derive(Default)]
 struct Challenges {
-    live: HashMap<String, Instant>,
+    /// Each challenge's expiry and the link it was issued for (see [`link_binding`]).
+    live: HashMap<String, (Instant, String)>,
 }
 
 impl Challenges {
     /// Remember `challenge` until `now + CHALLENGE_TTL`, unless `max` are already outstanding.
     /// Expired entries are reclaimed first, so only challenges still in date count.
-    fn issue(&mut self, challenge: String, now: Instant, max: usize) -> Result<()> {
-        self.live.retain(|_, exp| *exp > now);
+    fn issue(&mut self, challenge: String, link: &str, now: Instant, max: usize) -> Result<()> {
+        self.live.retain(|_, (exp, _)| *exp > now);
         if self.live.len() >= max {
             // When the soonest outstanding challenge expires and frees a place.
             let wait = self
                 .live
                 .values()
+                .map(|(exp, _)| exp)
                 .min()
                 .map_or(CHALLENGE_TTL, |exp| exp.saturating_duration_since(now));
             return Err(Error::Unavailable(format!(
@@ -256,15 +296,18 @@ impl Challenges {
                 wait.as_secs() + 1
             )));
         }
-        self.live.insert(challenge, now + CHALLENGE_TTL);
+        self.live
+            .insert(challenge, (now + CHALLENGE_TTL, link.to_string()));
         Ok(())
     }
 
-    /// Spend `challenge`: true when it was issued here and is still in date. It is removed
-    /// either way, so it cannot be presented twice.
-    fn consume(&mut self, challenge: &str, now: Instant) -> bool {
+    /// Spend `challenge` on `link`: true when it was issued here FOR THAT LINK and is still in
+    /// date (ledger #4545). It is removed either way, so it cannot be presented twice, nor tried
+    /// on one link after another. A challenge issued for no link (the register page's, or a page
+    /// served by an older release) approves nothing.
+    fn consume(&mut self, challenge: &str, link: &str, now: Instant) -> bool {
         match self.live.remove(challenge) {
-            Some(exp) => exp > now,
+            Some((exp, bound)) => exp > now && !link.is_empty() && bound == link,
             None => false,
         }
     }
@@ -348,35 +391,50 @@ fn monotonic_now() -> Instant {
     Instant::now()
 }
 
-/// Mint a fresh challenge, remember it with an expiry, and return its base64url text. Refused
-/// with a transient [`Error::Unavailable`] when [`max_challenges`] are already outstanding.
-fn issue_challenge() -> Result<String> {
-    issue_challenge_at(monotonic_now())
+/// What a decision link's passkey challenge is bound to (ledger #4545): the endpoint `scope`, the
+/// `action` the link decides, and its signed `token`, which the minting host made over exactly
+/// what the link decides (its id and action, and its expiry). The decision page carries this
+/// text in `data-pk-link`, the ceremony script asks for a challenge for it, and the gate spends
+/// that challenge only on the same link.
+pub(crate) fn link_binding(scope: &str, action: &str, token: &str) -> String {
+    format!("{scope}/{action}/{token}")
+}
+
+/// Mint a fresh challenge for `link`, remember it with an expiry and the link, and return its
+/// base64url text. The challenge's bytes commit to the link as well: 32 random bytes, then the
+/// SHA-256 of the binding, so what the authenticator signs names the one link it approves.
+/// Refused with a transient [`Error::Unavailable`] when [`max_challenges`] are already
+/// outstanding.
+fn issue_challenge(link: &str) -> Result<String> {
+    issue_challenge_at(link, monotonic_now())
 }
 
 /// [`issue_challenge`] at a given monotonic instant — the seam the expiry tests drive.
-fn issue_challenge_at(now: Instant) -> Result<String> {
+fn issue_challenge_at(link: &str, now: Instant) -> Result<String> {
+    use sha2::Digest;
     let mut raw = [0u8; 32];
     getrandom::getrandom(&mut raw)
         .map_err(|e| Error::Endpoint(format!("no OS randomness for a challenge: {e}")))?;
-    let challenge = b64().encode(raw);
+    let mut bytes = raw.to_vec();
+    bytes.extend_from_slice(&sha2::Sha256::digest(link.as_bytes()));
+    let challenge = b64().encode(bytes);
     let max = max_challenges();
     // Held across no await: every critical section on this lock is a few map operations.
     let mut store = challenges().lock().expect("challenge store poisoned");
-    store.issue(challenge.clone(), now, max)?;
+    store.issue(challenge.clone(), link, now, max)?;
     Ok(challenge)
 }
 
-/// Consume a challenge: it must be one we issued and still in date, and it is removed so it
-/// cannot be presented twice.
-fn consume_challenge(challenge: &str) -> bool {
-    consume_challenge_at(challenge, monotonic_now())
+/// Consume a challenge on `link`: it must be one we issued for that link and still in date, and
+/// it is removed so it cannot be presented twice.
+fn consume_challenge(challenge: &str, link: &str) -> bool {
+    consume_challenge_at(challenge, link, monotonic_now())
 }
 
 /// [`consume_challenge`] at a given monotonic instant.
-fn consume_challenge_at(challenge: &str, now: Instant) -> bool {
+fn consume_challenge_at(challenge: &str, link: &str, now: Instant) -> bool {
     let mut store = challenges().lock().expect("challenge store poisoned");
-    store.consume(challenge, now)
+    store.consume(challenge, link, now)
 }
 
 // =====================================================================================
@@ -444,12 +502,37 @@ fn load_credentials(
     guard_permissions(&path, &file, Remedy::CheckThenChmod)?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).map_err(unreadable)?;
-    serde_json::from_slice(&bytes).map_err(|e| {
+    let creds: Vec<StoredCredential> = serde_json::from_slice(&bytes).map_err(|e| {
         format!(
             "{} is present but not a credential list: {e}",
             path.display()
         )
-    })
+    })?;
+    // Upgrade (ledger #4545): a release before the marker enrolled without writing one. The
+    // first read of its credential file writes it, so that host becomes fail-closed rather
+    // than staying open to a later deletion of the file.
+    if !creds.is_empty() && !passkey_required() {
+        match write_required_marker() {
+            Ok(()) => eprintln!(
+                "ikigai passkey: a passkey is enrolled here, so {} now records that one is required: from now on a missing credential file refuses every decision link",
+                required_marker_path().display()
+            ),
+            Err(e) => eprintln!(
+                "ikigai passkey: could not write {}: {e}; the enrolled passkey is still required while its file is present",
+                required_marker_path().display()
+            ),
+        }
+    }
+    Ok(creds)
+}
+
+/// The refusal for a host that requires a passkey but has no credential file.
+fn missing_detail() -> String {
+    format!(
+        "a passkey is required here ({} exists) but the passkey file {} is missing; no decision link is approved until you {REENROLL}",
+        required_marker_path().display(),
+        credentials_path().display()
+    )
 }
 
 /// What the credential file's permission bits and owner allow.
@@ -625,16 +708,34 @@ fn guard_directory(_dir: &std::path::Path) -> std::result::Result<(), String> {
 /// someone taps. Absent is fine (not enrolled); a group/world-readable file is tightened here.
 /// The workspace DIRECTORY is judged first (ledger #850): one others could write refuses,
 /// naming it, whether or not a credential file is in it.
+///
+/// It also says, on one stderr line, how decision links are approved here (ledger #4545): a host
+/// that has never enrolled a passkey serves bearer-only links, and one whose passkey file is
+/// missing refuses every link. Neither stops the door: the register page is how a passkey is
+/// enrolled (again).
 pub fn preflight() -> std::result::Result<(), String> {
     let held = credential_lock();
-    load_credentials(&held).map(|_| ())
+    let creds = load_credentials(&held)?;
+    if creds.is_empty() {
+        if passkey_required() {
+            eprintln!(
+                "ikigai passkey: REFUSING every passkey-gated decision: {}",
+                missing_detail()
+            );
+        } else {
+            eprintln!(
+                "ikigai passkey: no passkey is enrolled, so decision links are bearer-only: whoever holds a link can act on it. Enroll one with `ikigai -c 'sink urn:passkey:enroll-open'`."
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The loud half of failing closed: one line on stderr per refused request, naming the file.
 fn store_unreadable(detail: &str) {
     eprintln!(
-        "ikigai passkey: REFUSING every passkey-gated decision: {detail}. Repair or remove the \
-         file at the box (removing it un-enrolls; enroll again with `sink urn:passkey:enroll-open`)."
+        "ikigai passkey: REFUSING every passkey-gated decision: {detail}. Repair the file at the \
+         box, or remove it and {REENROLL}; removing it does not lift the requirement."
     );
 }
 
@@ -648,7 +749,7 @@ fn save_credentials(creds: &[StoredCredential]) -> Result<()> {
 /// Replace `path` with `bytes` whole: write a sibling temp file (owner-only), fsync it, rename it
 /// over the target, then fsync the directory so the rename itself survives a crash. A reader —
 /// or a crash at any point — sees the old file or the new one, never a truncated one.
-fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let dir = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
@@ -684,10 +785,16 @@ fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 
 /// Whether the gate is armed. True when a credential is registered — and ALSO when the store is
 /// present but unreadable, because then the gate refuses everything (it fails closed).
+/// ALSO true when the passkey-required marker is there and the file is not: the gate refuses
+/// everything then too.
 pub fn is_enrolled() -> bool {
     let held = credential_lock();
-    load_credentials(&held).map_or(true, |c| !c.is_empty())
+    load_credentials(&held).map_or(true, |c| !c.is_empty()) || passkey_required()
 }
+
+/// The visible notice a decision page carries while no passkey was ever enrolled (ledger #4545):
+/// words, not color, saying the link alone approves.
+pub(crate) const BEARER_ONLY_NOTICE: &str = "<p><strong>Notice: this link works without a passkey.</strong> No passkey is enrolled on this host yet, so links are bearer-only: whoever holds this link can make this decision. Enroll a passkey at the box to require a tap on your device.</p>";
 
 // =====================================================================================
 // Browser glue. The one piece that runs on the device, not the edge.
@@ -706,8 +813,22 @@ pub fn is_enrolled() -> bool {
 /// The status line is a polite live region (WCAG 4.1.3, ledger #1624), empty in the served
 /// markup so it exists before the script writes a message into it: a screen reader announces a
 /// change to a region it already knows. `#666` on white is 5.7:1.
-pub(crate) const DECISION_PASSKEY_JS: &str = "<p id=pkstatus role=status aria-live=polite \
-     class=muted></p><script src=\"/passkey/app.js\"></script>";
+///
+/// `link` is the link's [`link_binding`], carried in `data-pk-link` so the script asks for a
+/// challenge bound to this one link. A host that never enrolled a passkey also shows
+/// [`BEARER_ONLY_NOTICE`].
+pub(crate) fn decision_passkey_js(link: &str) -> String {
+    let notice = if is_enrolled() {
+        ""
+    } else {
+        BEARER_ONLY_NOTICE
+    };
+    format!(
+        "{notice}<p id=pkstatus role=status aria-live=polite class=muted data-pk-link=\"{}\"></p>\
+         <script src=\"/passkey/app.js\"></script>",
+        ikigai_fn::html::html_text(link)
+    )
+}
 
 /// The registration page body: a labeled field for the window's one-time code, and a button
 /// (wired by `PASSKEY_APP_JS` via `id="reg"`) that runs `navigator.credentials.create`, then
@@ -740,7 +861,8 @@ const PASSKEY_APP_JS: &str = r#"(function(){
     var status=document.getElementById('pkstatus');
     form.addEventListener('submit', function(ev){ ev.preventDefault();
       status.textContent='';
-      fetch('/passkey/challenge',{headers:{accept:'application/json'}})
+      var link=status.getAttribute('data-pk-link')||'';
+      fetch('/passkey/challenge?link='+encodeURIComponent(link),{headers:{accept:'application/json'}})
         .then(function(r){return r.json();})
         .then(function(opt){
           if(!opt.enrolled){ form.submit(); return; }
@@ -837,8 +959,33 @@ impl Endpoint for PasskeyJs {
 ///
 /// On success the challenge is consumed (single-use) and any advanced signature counter persisted.
 /// Every failure is one `Denied` — a prober learns nothing from which check tripped.
-pub fn require_passkey(inv: &Invocation<'_>) -> Result<()> {
-    let denied = || Error::Denied("this action needs your passkey".into());
+///
+/// The assertion must be over a challenge issued for `link` (the decision link's endpoint scope,
+/// action and signed token, as its page carries them in `data-pk-link`): one made on another
+/// link's page, or presented a second time, is refused (ledger #4545). Once a passkey
+/// was enrolled here, a missing credential file refuses too, never reads as "not enrolled".
+pub fn require_passkey(inv: &Invocation<'_>, link: &str) -> Result<()> {
+    passkey_gate(inv, link).map_err(|refusal| match refusal {
+        Refusal::Store => Error::Denied(STORE_REFUSAL.into()),
+        Refusal::Assertion => Error::Denied("this action needs your passkey".into()),
+    })
+}
+
+/// Why [`passkey_gate`] refused: the assertion (missing, forged, stale, replayed or for another
+/// link; one answer for all), or the store (a passkey is required and its file is missing,
+/// unreadable or untrusted, or no relying party is configured), which only the box can repair.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    Assertion,
+    Store,
+}
+
+/// The sentence a decision page shows for [`Refusal::Store`].
+pub(crate) const STORE_REFUSAL: &str = "This host requires a passkey, but its passkey file is missing or cannot be read, so no link can be approved here. At the box, repair the file, or enroll your passkey again with ikigai -c 'sink urn:passkey:enroll-open' and the register page, then reopen the link.";
+
+/// [`require_passkey`], saying which kind of refusal it was.
+pub(crate) fn passkey_gate(inv: &Invocation<'_>, link: &str) -> std::result::Result<(), Refusal> {
+    let denied = || Refusal::Assertion;
 
     // One lock from load to save, so a concurrent assertion cannot write back a stale copy.
     let held = credential_lock();
@@ -846,26 +993,34 @@ pub fn require_passkey(inv: &Invocation<'_>) -> Result<()> {
         Ok(creds) => creds,
         Err(detail) => {
             store_unreadable(&detail);
-            return Err(denied());
+            return Err(Refusal::Store);
         }
     };
     if creds.is_empty() {
-        return Ok(()); // inert until enrolled
+        if passkey_required() {
+            eprintln!(
+                "ikigai passkey: REFUSING a passkey-gated decision: {}",
+                missing_detail()
+            );
+            return Err(Refusal::Store);
+        }
+        return Ok(()); // never enrolled: bearer-only, and the page and startup say so
     }
     let Some(rp) = relying_party() else {
         eprintln!(
             "ikigai passkey: REFUSING every passkey-gated decision: a credential is enrolled but \
              this edge has no relying party configured (start it with `--passkey-rp-id <domain>`)."
         );
-        return Err(denied());
+        return Err(Refusal::Store);
     };
 
     // Pull the four assertion fields the glue-JS attaches, all base64url.
+    let field = |name| param(inv, name).map_err(|_| denied());
     let (id_b64, auth_b64, client_b64, sig_b64) = (
-        param(inv, "pk_id")?,
-        param(inv, "pk_auth")?,
-        param(inv, "pk_client")?,
-        param(inv, "pk_sig")?,
+        field("pk_id")?,
+        field("pk_auth")?,
+        field("pk_client")?,
+        field("pk_sig")?,
     );
     if id_b64.is_empty() || auth_b64.is_empty() || client_b64.is_empty() || sig_b64.is_empty() {
         return Err(denied());
@@ -886,8 +1041,8 @@ pub fn require_passkey(inv: &Invocation<'_>) -> Result<()> {
         .and_then(|v| v.as_str())
         .ok_or_else(denied)?
         .to_string();
-    if !consume_challenge(&challenge) {
-        return Err(denied()); // stale, replayed, or never issued here
+    if !consume_challenge(&challenge, link) {
+        return Err(denied()); // stale, replayed, issued for another link, or never issued here
     }
 
     // The assertion must name a credential we registered; rebuild it for the verifier.
@@ -945,7 +1100,9 @@ pub struct PasskeyChallenge;
 
 #[async_trait::async_trait]
 impl Endpoint for PasskeyChallenge {
-    async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        // The link the challenge is for (see `link_binding`); empty for the register page.
+        let link = param(inv, "link")?;
         // The same fail-closed reading as the gate: a broken store or a missing relying party
         // with credentials enrolled is an error the page shows, not "nothing enrolled" (which
         // would tell the page to submit token-only into a gate that will refuse it anyway).
@@ -960,6 +1117,10 @@ impl Endpoint for PasskeyChallenge {
             store_unreadable(&detail);
             unavailable()
         })?;
+        if creds.is_empty() && passkey_required() {
+            eprintln!("ikigai passkey: {}", missing_detail());
+            return Err(unavailable());
+        }
         let rp = relying_party();
         if rp.is_none() && !creds.is_empty() {
             eprintln!(
@@ -968,7 +1129,7 @@ impl Endpoint for PasskeyChallenge {
             );
             return Err(unavailable());
         }
-        let challenge = issue_challenge()?;
+        let challenge = issue_challenge(&link)?;
         let allow: Vec<_> = creds
             .into_iter()
             .map(|c| json!({ "type": "public-key", "id": c.id }))
@@ -995,6 +1156,15 @@ impl Endpoint for PasskeyChallenge {
             .action(
                 ActionSpec::new(Verb::Source)
                     .summary("mint a challenge")
+                    .input(
+                        ikigai_core::ArgSpec::new("link")
+                            .optional()
+                            .class(crate::XSD_STRING)
+                            .summary(
+                                "the decision link the challenge is for (its page's \
+                                 `data-pk-link`); an assertion over it approves that link only",
+                            ),
+                    )
                     .output("application/json; charset=utf-8")
                     .requires(CAP_PASSKEY_CHALLENGE),
             )
@@ -1060,6 +1230,110 @@ impl Endpoint for PasskeyEnrollOpen {
             )
             .output("text/plain; charset=utf-8")
     }
+}
+
+// =====================================================================================
+// urn:passkey:unrequire — lift the passkey requirement (run from the box).
+// =====================================================================================
+
+/// Un-enrolls on purpose (ledger #4545): moves the credential file aside under a timestamped
+/// name (`passkey-credentials.json.removed-<unix seconds>`; never deleted) and removes the passkey-required
+/// marker, so decision links go back to bearer-only and every decision page says so. This is
+/// the ONLY way the requirement is lifted; a missing credential file never lifts it. Cap-gated
+/// like opening an enrollment window, and bound off the public face.
+pub struct PasskeyUnrequire;
+
+#[async_trait::async_trait]
+impl Endpoint for PasskeyUnrequire {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        if !inv.capability.allows(CAP_PASSKEY_ENROLL) {
+            return Err(Error::Denied(
+                format!("lifting the passkey requirement requires `{CAP_PASSKEY_ENROLL}`").into(),
+            ));
+        }
+        let _held = credential_lock();
+        // The credential file is MOVED aside, never deleted: a person who lifted the requirement
+        // by mistake can move it back (with the marker) and nothing was lost.
+        let creds = credentials_path();
+        let set_aside = removed_credentials_path(&creds, now_secs());
+        let moved = match std::fs::rename(&creds, &set_aside) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
+                return Err(Error::Endpoint(format!(
+                    "cannot move {} aside to {}: {e}; the passkey requirement stands",
+                    creds.display(),
+                    set_aside.display()
+                )))
+            }
+        };
+        let marker = required_marker_path();
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(Error::Endpoint(format!(
+                    "cannot remove {}: {e}; the passkey requirement stands{}",
+                    marker.display(),
+                    if moved {
+                        format!(
+                            " (the credential file is already at {}: move it back to {})",
+                            set_aside.display(),
+                            creds.display()
+                        )
+                    } else {
+                        String::new()
+                    }
+                )))
+            }
+        }
+        let kept = if moved {
+            format!(
+                "the credential file was moved aside to {} (not deleted)",
+                set_aside.display()
+            )
+        } else {
+            "there was no credential file to move aside".to_string()
+        };
+        eprintln!(
+            "ikigai passkey: the passkey requirement was LIFTED at the box ({kept}): decision \
+             links are bearer-only until a passkey is enrolled again"
+        );
+        Ok(Representation::new(
+            ReprType::new("text/plain").with_param("charset", "utf-8"),
+            format!(
+                "passkey requirement lifted: {kept}, the passkey-required marker is removed, and \
+                 decision links are bearer-only until you enroll a passkey again\n"
+            )
+            .into_bytes(),
+        ))
+    }
+    fn name(&self) -> &str {
+        "passkey-unrequire"
+    }
+    fn describe(&self) -> Description {
+        Description::new("passkey-unrequire")
+            .title("Lift the passkey requirement")
+            .summary("Moves the enrolled passkey's credential file aside under a timestamped name (never deleting it) and removes the record that one is required, so decision links are bearer-only again. Run from the box.")
+            .action(
+                ActionSpec::new(Verb::Sink)
+                    .summary("lift the requirement")
+                    .output("text/plain; charset=utf-8")
+                    .requires(CAP_PASSKEY_ENROLL),
+            )
+            .output("text/plain; charset=utf-8")
+    }
+}
+
+/// Where `urn:passkey:unrequire` moves the credential file `creds`: beside it, named
+/// `passkey-credentials.json.removed-<unix seconds>`, so it can be moved back by hand.
+fn removed_credentials_path(creds: &std::path::Path, now: i64) -> std::path::PathBuf {
+    let mut name = creds
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".removed-{now}"));
+    creds.with_file_name(name)
 }
 
 /// An enrollment window as the box wrote it: when it closes, the SHA-256 of its one-time code
@@ -1336,6 +1610,14 @@ impl Endpoint for PasskeyRegister {
                     sign_count: 0,
                 });
                 save_credentials(&creds)?;
+                // From now on a passkey is required: a lost credential file refuses, never opens.
+                if let Err(e) = write_required_marker() {
+                    eprintln!(
+                        "ikigai passkey: could not write {}: {e}; the passkey is required while \
+                         its file is present",
+                        required_marker_path().display()
+                    );
+                }
                 eprintln!(
                     "ikigai passkey: ENROLLED credential {logged} with the window's one-time \
                      code; the window is spent"
@@ -1374,7 +1656,7 @@ impl Endpoint for PasskeyRegister {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request};
     use p256::ecdsa::{signature::Signer, Signature, SigningKey, VerifyingKey};
@@ -1421,7 +1703,7 @@ mod tests {
     #[test]
     fn the_passkey_status_lines_are_live_regions_present_before_the_script() {
         for (id, html) in [
-            ("pkstatus", DECISION_PASSKEY_JS),
+            ("pkstatus", &*decision_passkey_js(LINK)),
             ("status", REGISTER_PAGE_BODY),
         ] {
             let open = format!("<p id={id} role=status aria-live=polite");
@@ -1442,15 +1724,21 @@ mod tests {
     /// linked stylesheet), so they render under an HTML door's `style-src 'self'` CSP.
     #[test]
     fn the_passkey_bodies_carry_no_inline_style() {
-        for html in [DECISION_PASSKEY_JS, REGISTER_PAGE_BODY, NOT_CONFIGURED_BODY] {
+        for html in [
+            &*decision_passkey_js(LINK),
+            REGISTER_PAGE_BODY,
+            NOT_CONFIGURED_BODY,
+        ] {
             crate::decide::assert_no_inline_style(html);
         }
         // The classes they use are the stylesheet's.
         assert!(REGISTER_PAGE_BODY.contains("class=field"));
-        assert!(DECISION_PASSKEY_JS.contains("class=muted"));
+        assert!(decision_passkey_js(LINK).contains("class=muted"));
     }
 
     const RP_ID: &str = "edge.test";
+    /// The decision link most tests run their ceremony for.
+    const LINK: &str = "calendar-request/approve/TOKEN-A";
     const ORIGIN: &str = "https://edge.test";
 
     fn test_relying_party() -> RelyingParty {
@@ -1464,7 +1752,7 @@ mod tests {
     // Give this test its own workspace root — set on THIS thread only, so parallel tests never
     // collide on the credential/window files (a global env var would race across them) — and a
     // configured relying party, which a test that wants none removes with `unconfigure`.
-    fn isolate(name: &str) {
+    pub(crate) fn isolate(name: &str) {
         let dir =
             std::env::temp_dir().join(format!("ikigai-passkey-ep-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1478,11 +1766,11 @@ mod tests {
     }
 
     /// A stand-in authenticator: a fixed P-256 key that signs assertions as a device would.
-    struct Device {
+    pub(crate) struct Device {
         key: SigningKey,
     }
     impl Device {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 key: SigningKey::from_slice(&[0x33u8; 32]).unwrap(),
             }
@@ -1491,7 +1779,7 @@ mod tests {
             let der = VerifyingKey::from(&self.key).to_public_key_der().unwrap();
             b64().encode(der.as_bytes())
         }
-        fn register(&self) {
+        pub(crate) fn register(&self) {
             let creds = vec![StoredCredential {
                 id: b64().encode(b"cred-1"),
                 spki: self.spki_b64(),
@@ -1501,7 +1789,7 @@ mod tests {
         }
         /// Build the four base64url fields for a POST body, over the given challenge. `count` is
         /// the signature counter — a real authenticator advances it every assertion.
-        fn assert_fields(&self, challenge: &str, flags: u8, count: u32) -> String {
+        pub(crate) fn assert_fields(&self, challenge: &str, flags: u8, count: u32) -> String {
             let client = format!(
                 r#"{{"type":"webauthn.get","challenge":"{challenge}","origin":"{ORIGIN}"}}"#
             )
@@ -1538,7 +1826,7 @@ mod tests {
         #[async_trait::async_trait]
         impl Endpoint for Gate {
             async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
-                require_passkey(inv)?;
+                require_passkey(inv, LINK)?;
                 Ok(Representation::new(
                     ReprType::new("text/plain"),
                     b"ok".to_vec(),
@@ -1572,12 +1860,12 @@ mod tests {
         isolate("valid");
         let d = Device::new();
         d.register();
-        let challenge = issue_challenge().unwrap();
+        let challenge = issue_challenge(LINK).unwrap();
         let body = d.assert_fields(&challenge, 0x05, 1); // UP | UV, counter 1
         assert!(run_gate(&body).is_ok(), "a valid assertion should pass");
 
         // A second ceremony (fresh challenge, advanced counter) also passes...
-        let challenge2 = issue_challenge().unwrap();
+        let challenge2 = issue_challenge(LINK).unwrap();
         let good = d.assert_fields(&challenge2, 0x05, 2);
         assert!(run_gate(&good).is_ok());
         // ...but replaying that exact assertion is refused — the challenge was consumed.
@@ -1603,7 +1891,7 @@ mod tests {
         let imposter = Device {
             key: SigningKey::from_slice(&[0x44u8; 32]).unwrap(),
         };
-        let challenge = issue_challenge().unwrap();
+        let challenge = issue_challenge(LINK).unwrap();
         let body = imposter.assert_fields(&challenge, 0x05, 1);
         assert!(
             run_gate(&body).is_err(),
@@ -1627,12 +1915,220 @@ mod tests {
     #[test]
     fn challenges_are_single_use_and_expire() {
         isolate("challenge");
-        let c = issue_challenge().unwrap();
-        assert!(consume_challenge(&c), "a fresh challenge consumes once");
-        assert!(!consume_challenge(&c), "and not twice");
+        let c = issue_challenge(LINK).unwrap();
         assert!(
-            !consume_challenge("never-issued"),
+            consume_challenge(&c, LINK),
+            "a fresh challenge consumes once"
+        );
+        assert!(!consume_challenge(&c, LINK), "and not twice");
+        assert!(
+            !consume_challenge("never-issued", LINK),
             "unknown challenge is refused"
+        );
+    }
+
+    // ---- Ledger #4545: the assertion is bound to its link; the requirement survives a lost file.
+
+    /// Run the gate for `link` (rather than [`LINK`]) and say which refusal it was.
+    fn run_gate_for(link: &str, body: &str) -> std::result::Result<(), Refusal> {
+        let (_k, req) = post_inv(body);
+        // Drive through the same tiny endpoint shape as `run_gate`.
+        thread_local! {
+            static GATE_LINK: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+            static GATE_OUT: std::cell::RefCell<Option<std::result::Result<(), Refusal>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        struct Gate;
+        #[async_trait::async_trait]
+        impl Endpoint for Gate {
+            async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+                let link = GATE_LINK.with(|l| l.borrow().clone());
+                let out = passkey_gate(inv, &link);
+                GATE_OUT.with(|o| *o.borrow_mut() = Some(out));
+                Ok(Representation::new(ReprType::new("text/plain"), Vec::new()))
+            }
+            fn name(&self) -> &str {
+                "gate-for"
+            }
+            fn describe(&self) -> Description {
+                Description::new("gate-for").verb(Verb::Sink)
+            }
+        }
+        GATE_LINK.with(|l| *l.borrow_mut() = link.to_string());
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
+        let kernel = Kernel::new(std::sync::Arc::new(
+            ikigai_core::EndpointSpace::new().bind(ikigai_core::Exact::new("urn:x"), Gate),
+        ));
+        futures::executor::block_on(kernel.issue(req, &Capability::root())).unwrap();
+        GATE_OUT
+            .with(|o| o.borrow_mut().take())
+            .expect("the gate ran")
+    }
+
+    #[test]
+    fn an_assertion_for_link_a_is_refused_on_link_b() {
+        isolate("bound-ab");
+        let d = Device::new();
+        d.register();
+        let link_b = "calendar-request/approve/TOKEN-B";
+        // The page for link A asked for this challenge, and the device signed it.
+        let challenge = issue_challenge(LINK).unwrap();
+        let assertion = d.assert_fields(&challenge, 0x05, 1);
+        assert_eq!(
+            run_gate_for(link_b, &assertion),
+            Err(Refusal::Assertion),
+            "an assertion made for link A must not approve link B"
+        );
+        // And the challenge is spent by the attempt: it cannot then be used on A either.
+        assert_eq!(run_gate_for(LINK, &assertion), Err(Refusal::Assertion));
+        // A challenge issued for no link (the register page's, or an older page) approves none.
+        let unbound = issue_challenge("").unwrap();
+        let assertion = d.assert_fields(&unbound, 0x05, 2);
+        assert_eq!(run_gate_for(LINK, &assertion), Err(Refusal::Assertion));
+    }
+
+    #[test]
+    fn the_challenge_commits_to_its_link() {
+        isolate("commits");
+        use sha2::Digest;
+        let c = issue_challenge(LINK).unwrap();
+        let bytes = b64().decode(&c).unwrap();
+        assert_eq!(bytes.len(), 64);
+        assert_eq!(&bytes[32..], &sha2::Sha256::digest(LINK.as_bytes())[..]);
+    }
+
+    #[test]
+    fn a_link_bound_assertion_passes_once_and_its_replay_is_refused() {
+        isolate("bound-replay");
+        let d = Device::new();
+        d.register();
+        let challenge = issue_challenge(LINK).unwrap();
+        let assertion = d.assert_fields(&challenge, 0x05, 1);
+        assert_eq!(run_gate_for(LINK, &assertion), Ok(()), "the normal path");
+        assert_eq!(
+            run_gate_for(LINK, &assertion),
+            Err(Refusal::Assertion),
+            "the replay is refused"
+        );
+    }
+
+    #[test]
+    fn enrolling_writes_the_marker_and_a_removed_credential_file_then_refuses() {
+        isolate("marker-removed");
+        open_window();
+        let d = Device::new();
+        let body = format!(
+            "code={TEST_CODE}&id={}&spki={}",
+            b64().encode(b"cred-1"),
+            d.spki_b64()
+        );
+        register_with(&body).expect("enrolls");
+        assert!(
+            required_marker_path().exists(),
+            "enrolling records the requirement"
+        );
+        std::fs::remove_file(credentials_path()).unwrap();
+        assert_eq!(
+            run_gate_for(LINK, "id=abc&exp=1"),
+            Err(Refusal::Store),
+            "a lost credential file must not reopen the link"
+        );
+        assert!(is_enrolled(), "the host still counts as enrolled");
+        assert!(
+            !decision_passkey_js(LINK).contains("bearer-only"),
+            "no bearer-only notice"
+        );
+        assert!(
+            preflight().is_ok(),
+            "the door still starts, so the person can enroll again"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_credential_file_refuses_the_link() {
+        isolate("marker-unreadable");
+        Device::new().register();
+        set_mode(0o000);
+        // Root reads anything; the check only means something for an ordinary user.
+        if std::fs::read(credentials_path()).is_ok() {
+            set_mode(0o600);
+            return;
+        }
+        assert_eq!(run_gate_for(LINK, "id=abc&exp=1"), Err(Refusal::Store));
+        set_mode(0o600);
+    }
+
+    #[test]
+    fn a_never_enrolled_host_approves_and_says_its_links_are_bearer_only() {
+        isolate("never");
+        assert_eq!(run_gate_for(LINK, "id=abc&exp=1"), Ok(()));
+        let html = decision_passkey_js(LINK);
+        assert!(html.contains(BEARER_ONLY_NOTICE), "{html}");
+        // Words, not color: the notice is text, with no style of its own.
+        assert!(BEARER_ONLY_NOTICE.contains("bearer-only"));
+        crate::decide::assert_no_inline_style(&html);
+        assert!(!required_marker_path().exists());
+    }
+
+    #[test]
+    fn upgrade_an_older_enrolled_host_gets_the_marker_on_first_read() {
+        isolate("upgrade");
+        // An older release enrolled: the credential file, no marker.
+        Device::new().register();
+        assert!(!required_marker_path().exists());
+        assert!(preflight().is_ok());
+        assert!(
+            required_marker_path().exists(),
+            "first start writes the marker"
+        );
+        std::fs::remove_file(credentials_path()).unwrap();
+        assert_eq!(run_gate_for(LINK, "id=abc&exp=1"), Err(Refusal::Store));
+    }
+
+    #[test]
+    fn only_unrequire_lifts_the_requirement() {
+        isolate("unrequire");
+        Device::new().register();
+        write_required_marker().unwrap();
+        #[allow(clippy::disallowed_methods)]
+        // internal: a test fixture's kernel; it routes no user arguments
+        let kernel = Kernel::new(std::sync::Arc::new(ikigai_core::EndpointSpace::new().bind(
+            ikigai_core::Exact::new("urn:passkey:unrequire"),
+            PasskeyUnrequire,
+        )));
+        let req = || Request::new(Verb::Sink, Iri::parse("urn:passkey:unrequire").unwrap());
+        assert!(
+            futures::executor::block_on(
+                kernel.issue(req(), &Capability::scoped(Vec::<String>::new()))
+            )
+            .is_err(),
+            "the cap is required"
+        );
+        assert!(required_marker_path().exists());
+        let before = std::fs::read(credentials_path()).unwrap();
+        let answer = futures::executor::block_on(kernel.issue(req(), &Capability::root())).unwrap();
+        let answer = String::from_utf8(answer.bytes.to_vec()).unwrap();
+        assert!(!required_marker_path().exists() && !credentials_path().exists());
+        // Moved aside, not deleted, and the answer says where.
+        let aside: Vec<_> = std::fs::read_dir(credentials_path().parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("passkey-credentials.json.removed-"))
+            })
+            .collect();
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert_eq!(std::fs::read(&aside[0]).unwrap(), before, "the same bytes");
+        assert!(answer.contains("moved aside"), "{answer}");
+        assert!(answer.contains(&aside[0].display().to_string()), "{answer}");
+        assert_eq!(
+            run_gate_for(LINK, "id=abc&exp=1"),
+            Ok(()),
+            "bearer-only again"
         );
     }
 
@@ -1730,7 +2226,7 @@ mod tests {
         let d = Device::new();
         d.register();
         set_mode(0o664);
-        let challenge = issue_challenge().unwrap();
+        let challenge = issue_challenge(LINK).unwrap();
         let body = d.assert_fields(&challenge, 0x05, 0); // a platform passkey: counter stays 0
         assert!(
             run_gate(&body).is_err(),
@@ -1783,7 +2279,7 @@ mod tests {
 
         // Once the person at the box has fixed it, the very same assertion's successor passes.
         set_mode(0o600);
-        let challenge = issue_challenge().unwrap();
+        let challenge = issue_challenge(LINK).unwrap();
         assert!(run_gate(&d.assert_fields(&challenge, 0x05, 0)).is_ok());
         assert!(preflight().is_ok());
     }
@@ -1795,7 +2291,7 @@ mod tests {
         let d = Device::new();
         d.register();
         set_mode(0o644);
-        let challenge = issue_challenge().unwrap();
+        let challenge = issue_challenge(LINK).unwrap();
         assert!(
             run_gate(&d.assert_fields(&challenge, 0x05, 0)).is_ok(),
             "readable-only discloses public keys and nothing else: the gate keeps working"
@@ -1868,8 +2364,8 @@ mod tests {
         let store = test_challenges();
         let d = Device::new();
         d.register();
-        let c_low = issue_challenge().unwrap();
-        let c_high = issue_challenge().unwrap();
+        let c_low = issue_challenge(LINK).unwrap();
+        let c_high = issue_challenge(LINK).unwrap();
         let low = d.assert_fields(&c_low, 0x05, 2);
         let high = d.assert_fields(&c_high, 0x05, 3);
 
@@ -1980,7 +2476,7 @@ mod tests {
         isolate("no-rp-enrolled");
         let d = Device::new();
         d.register();
-        let challenge = issue_challenge().unwrap();
+        let challenge = issue_challenge(LINK).unwrap();
         let body = d.assert_fields(&challenge, 0x05, 1);
         unconfigure();
         assert!(run_gate(&body).is_err(), "no RP to check against = refuse");
@@ -2058,11 +2554,11 @@ mod tests {
         let t0 = monotonic_now();
         for n in 0..3 {
             store
-                .issue(format!("c{n}"), t0 + Duration::from_secs(n), 3)
+                .issue(format!("c{n}"), LINK, t0 + Duration::from_secs(n), 3)
                 .expect("under the bound");
         }
         let refused = store
-            .issue("c3".into(), t0 + Duration::from_secs(10), 3)
+            .issue("c3".into(), LINK, t0 + Duration::from_secs(10), 3)
             .expect_err("the fourth outstanding challenge is refused");
         assert!(refused.is_transient(), "a retry can succeed: {refused}");
         assert!(matches!(refused, Error::Unavailable(_)), "{refused:?}");
@@ -2077,7 +2573,7 @@ mod tests {
         assert_eq!(store.live.len(), 3, "the refusal stored nothing");
         for n in 0..3 {
             assert!(
-                store.consume(&format!("c{n}"), t0 + Duration::from_secs(11)),
+                store.consume(&format!("c{n}"), LINK, t0 + Duration::from_secs(11)),
                 "c{n} was not evicted: an honest ceremony holding it still completes"
             );
         }
@@ -2089,21 +2585,25 @@ mod tests {
     fn expired_challenges_are_reclaimed_before_the_bound_is_judged() {
         let mut store = Challenges::default();
         let t0 = monotonic_now();
-        store.issue("a".into(), t0, 2).unwrap();
+        store.issue("a".into(), LINK, t0, 2).unwrap();
         store
-            .issue("b".into(), t0 + Duration::from_secs(60), 2)
+            .issue("b".into(), LINK, t0 + Duration::from_secs(60), 2)
             .unwrap();
         assert!(store
-            .issue("c".into(), t0 + Duration::from_secs(61), 2)
+            .issue("c".into(), LINK, t0 + Duration::from_secs(61), 2)
             .is_err());
         // At t0 + TTL, `a` has expired: its place is free again, and only `a`'s.
-        store.issue("c".into(), t0 + CHALLENGE_TTL, 2).unwrap();
+        store
+            .issue("c".into(), LINK, t0 + CHALLENGE_TTL, 2)
+            .unwrap();
         assert_eq!(store.live.len(), 2);
         assert!(
             !store.live.contains_key("a"),
             "the expired one was reclaimed"
         );
-        assert!(store.issue("d".into(), t0 + CHALLENGE_TTL, 2).is_err());
+        assert!(store
+            .issue("d".into(), LINK, t0 + CHALLENGE_TTL, 2)
+            .is_err());
     }
 
     /// The whole ceremony on a full store, through the endpoint and the gate: the challenge an
@@ -2116,12 +2616,13 @@ mod tests {
         TEST_MAX_CHALLENGES.with(|m| m.set(Some(8)));
         let d = Device::new();
         d.register();
+        // The honest page asks for a challenge for its own link (ledger #4545).
         let read = || {
             call(
                 "urn:passkey:challenge",
                 PasskeyChallenge,
                 Verb::Source,
-                None,
+                Some("link=calendar-request%2Fapprove%2FTOKEN-A"),
             )
         };
         let challenge_of = |repr: Representation| -> String {
@@ -2147,8 +2648,8 @@ mod tests {
         read().expect("the place the second sign-in spent");
         assert!(read().is_err(), "full again");
         let later = monotonic_now() + CHALLENGE_TTL;
-        let after = issue_challenge_at(later).expect("expired entries are reclaimed");
-        assert!(consume_challenge_at(&after, later));
+        let after = issue_challenge_at(LINK, later).expect("expired entries are reclaimed");
+        assert!(consume_challenge_at(&after, LINK, later));
         TEST_MAX_CHALLENGES.with(|m| m.set(None));
     }
 
@@ -2156,14 +2657,15 @@ mod tests {
     fn a_challenge_expires_on_the_monotonic_clock() {
         isolate("ttl");
         let t0 = monotonic_now();
-        let fresh = issue_challenge_at(t0).unwrap();
+        let fresh = issue_challenge_at(LINK, t0).unwrap();
         assert!(consume_challenge_at(
             &fresh,
+            LINK,
             t0 + CHALLENGE_TTL - Duration::from_secs(1)
         ));
-        let stale = issue_challenge_at(t0).unwrap();
+        let stale = issue_challenge_at(LINK, t0).unwrap();
         assert!(
-            !consume_challenge_at(&stale, t0 + CHALLENGE_TTL),
+            !consume_challenge_at(&stale, LINK, t0 + CHALLENGE_TTL),
             "a challenge is dead at its TTL"
         );
     }
@@ -2342,7 +2844,7 @@ mod tests {
         chmod(&root, 0o775);
         assert!(!enrollment_open(), "the window is not trusted");
         assert!(!public_registration_succeeds(), "so nothing registers");
-        let challenge = issue_challenge().unwrap();
+        let challenge = issue_challenge(LINK).unwrap();
         assert!(
             run_gate(&d.assert_fields(&challenge, 0x05, 0)).is_err(),
             "the store in it is not trusted either, even with a valid assertion"
@@ -2366,7 +2868,7 @@ mod tests {
         chmod(&root, 0o755);
         assert!(preflight().is_ok());
         assert!(enrollment_open());
-        let challenge = issue_challenge().unwrap();
+        let challenge = issue_challenge(LINK).unwrap();
         assert!(run_gate(&d.assert_fields(&challenge, 0x05, 0)).is_ok());
     }
 
