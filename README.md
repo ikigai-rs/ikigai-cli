@@ -1281,7 +1281,7 @@ The modules and pieces the host composes, each published on crates.io from this 
 | `ikigai-passkey` | a minimal single-user WebAuthn (ES256) assertion verifier, the second factor on the edge's decision links |
 | `ikigai-scheduler` | the kernel's work scheduler: `single` or a threadpool (`pool`, `pool:N`) that parks rather than blocks on awaits |
 | `ikigai-time` | the time transport: originates resource requests on a timer, one-shot or recurring, under the scheduling capability |
-| `ikigai-tz` | `urn:tz:convert` (IANA/DST-correct) and `urn:tz:now` (a zoned clock) |
+| `ikigai-tz` | `urn:tz:convert` (IANA/DST-correct), `urn:tz:now` (a zoned clock) and `urn:tz:expand` (RFC 5545 RRULE/EXDATE occurrences in a zone over a window, DST-correct) |
 | `ikigai-view` | the org⊕calendar consolidated-view derivation, reconciled entirely through the kernel |
 
 `ikigai-time` is released on its own version line; the rest move in lockstep with the
