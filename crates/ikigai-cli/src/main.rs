@@ -5279,13 +5279,15 @@ fn bind_layers_front(addr: &str, identity: &ikigai_quic::Identity) -> Result<Bou
     let tokens = ikigai_embedded::tokens::tokens_path()
         .ok_or("the layers HTTPS front needs a config home to keep layer-tokens.json in")?;
     // Entries an older release wrote carry no expiry: give each one the default lifetime from
-    // this start, backing the file up first (ledger #4544). Idempotent: none left, no write.
+    // its mint time or this release's first start, whichever is later, backing the file up
+    // first (ledger #4544). Idempotent: none left, no write.
     let upgraded =
         ikigai_embedded::tokens::upgrade_file(&tokens, ikigai_embedded::tokens::now_utc())?;
     if upgraded > 0 {
         eprintln!(
             "ikigai: layers https: gave {upgraded} token{} from an older release an expiry {} \
-             days from now (the previous file is kept beside it as {}.bak-*)",
+             days after it was minted or after this release first started, whichever is later \
+             (the previous file is kept beside it as {}.bak-*)",
             if upgraded == 1 { "" } else { "s" },
             ikigai_embedded::tokens::DEFAULT_LIFETIME_DAYS,
             tokens.display()

@@ -199,6 +199,17 @@ pub fn hash(token: &str) -> String {
         .collect()
 }
 
+/// Seconds since the Unix epoch as RFC 3339 UTC to the second (`2030-01-01T00:00:00Z`), or
+/// `None` outside the range chrono represents.
+///
+/// ```
+/// use ikigai_embedded::tokens::rfc3339_from_unix;
+/// assert_eq!(rfc3339_from_unix(1_795_737_600).as_deref(), Some("2026-11-27T00:00:00Z"));
+/// ```
+pub fn rfc3339_from_unix(secs: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp(secs, 0).map(rfc3339)
+}
+
 /// Now, as RFC 3339 UTC to the second: what a binding's `created` holds.
 pub fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
@@ -395,6 +406,7 @@ pub fn save_to(path: &Path, tokens: &Tokens) -> Result<(), String> {
     }
     let partial = path.with_extension("json.partial");
     std::fs::write(&partial, tokens.to_json())
+        .and_then(|()| std::fs::File::open(&partial)?.sync_all())
         .map_err(|e| format!("write {}: {e}", partial.display()))?;
     #[cfg(unix)]
     {
@@ -405,36 +417,105 @@ pub fn save_to(path: &Path, tokens: &Tokens) -> Result<(), String> {
     std::fs::rename(&partial, path).map_err(|e| format!("replace {}: {e}", path.display()))
 }
 
-/// Give every entry an older release wrote (one with no `expires`) an expiry
-/// [`DEFAULT_LIFETIME_DAYS`] days from `now`, the new release's first start. Returns how many
-/// got one; zero leaves the file untouched, so running it again changes nothing.
+/// Give every entry an older release wrote (one with no `expires`) an expiry, and return how
+/// many got one; zero leaves the token file untouched, so running it again changes nothing.
 ///
-/// Before rewriting, the file as it was is copied to `<file>.bak-<now>` beside it, and the
-/// rewrite is [`save_to`]'s (written beside and renamed), so a reader sees the old file or the
-/// new one, never half of either. An absent file is zero entries.
+/// The expiry a missing `expires` gets is never later than the default lifetime counted from
+/// the later of two times: the token's recorded mint time (`created`), and the first start
+/// of this release ([`first_start`], recorded once beside the file and left alone by older
+/// releases). So on the first upgrade a token an older release minted gets
+/// [`DEFAULT_LIFETIME_DAYS`] days from that first start, and after a downgrade, a write by
+/// the older release and a re-upgrade, it gets exactly the same expiry again: an old token
+/// keeps its first-start expiry, and a token the older release minted meanwhile gets mint
+/// time + the default, expired if that has passed. Only an entry with no readable mint time
+/// is counted from `now`.
+///
+/// Before rewriting, the file as it was is copied to `<file>.bak-<now>` beside it (written
+/// beside and renamed, as the rewrite is by [`save_to`]), so a crash at any point leaves the
+/// original or the upgraded file in place, never half of either, and the next start
+/// finishes the upgrade. An absent file is zero entries.
 pub fn upgrade_file(path: &Path, now: chrono::DateTime<chrono::Utc>) -> Result<usize, String> {
     let mut tokens = load_from(path)?;
-    let expires = rfc3339(now + chrono::Duration::days(DEFAULT_LIFETIME_DAYS));
+    let first = first_start(path, now)?;
+    let lifetime = default_lifetime();
     let mut upgraded = 0;
     for binding in tokens.by_hash.values_mut() {
-        if binding.expires.is_none() {
-            binding.expires = Some(expires.clone());
-            upgraded += 1;
+        if binding.expires.is_some() {
+            continue;
         }
+        let base = match chrono::DateTime::parse_from_rfc3339(&binding.created) {
+            Ok(minted) => minted.with_timezone(&chrono::Utc).max(first),
+            Err(_) => now,
+        };
+        binding.expires = Some(rfc3339(base + lifetime));
+        upgraded += 1;
     }
     if upgraded == 0 {
         return Ok(0);
     }
     let backup = backup_path(path, now);
-    std::fs::copy(path, &backup).map_err(|e| {
-        format!(
-            "back up {} to {} before giving its tokens an expiry: {e}",
-            path.display(),
-            backup.display()
-        )
-    })?;
+    let copying = partial_path(&backup);
+    std::fs::copy(path, &copying)
+        .and_then(|_| std::fs::File::open(&copying)?.sync_all())
+        .and_then(|()| std::fs::rename(&copying, &backup))
+        .map_err(|e| {
+            format!(
+                "back up {} to {} before giving its tokens an expiry: {e}",
+                path.display(),
+                backup.display()
+            )
+        })?;
     save_to(path, &tokens)?;
     Ok(upgraded)
+}
+
+/// When this release (one that gives tokens an expiry) first started beside the token file at
+/// `path`: read from `<file>.first-start`, or recorded there as `now` when it is absent.
+/// Older releases never touch that file, so it survives a downgrade. An unreadable one is an
+/// error (the start stops) rather than a fresh first start, which would extend every token.
+pub fn first_start(
+    path: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    let record = first_start_path(path);
+    match std::fs::read_to_string(&record) {
+        Ok(text) => chrono::DateTime::parse_from_rfc3339(text.trim())
+            .map(|at| at.with_timezone(&chrono::Utc))
+            .map_err(|_| {
+                format!(
+                    "{} does not hold an RFC 3339 time; it records when this release first \
+                     started, so restore it or write that time into it",
+                    record.display()
+                )
+            }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(dir) = record.parent() {
+                std::fs::create_dir_all(dir)
+                    .map_err(|e| format!("create {}: {e}", dir.display()))?;
+            }
+            let partial = partial_path(&record);
+            std::fs::write(&partial, rfc3339(now) + "\n")
+                .and_then(|()| std::fs::File::open(&partial)?.sync_all())
+                .and_then(|()| std::fs::rename(&partial, &record))
+                .map_err(|e| format!("record {}: {e}", record.display()))?;
+            Ok(now)
+        }
+        Err(e) => Err(format!("read {}: {e}", record.display())),
+    }
+}
+
+/// Where [`first_start`] records this release's first start: `<file>.first-start`.
+pub fn first_start_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".first-start");
+    path.with_file_name(name)
+}
+
+/// The scratch name a file is written under before it is renamed into place.
+fn partial_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".partial");
+    path.with_file_name(name)
 }
 
 /// Where [`upgrade_file`] keeps the file as it was: `<file>.bak-<now, compact UTC>`.
@@ -693,34 +774,164 @@ mod tests {
         );
     }
 
+    /// Ledger #4544 rework: upgrade, downgrade, a write by the older release (which drops
+    /// every `expires`, and mints a token of its own), then re-upgrade. No token gets fresh
+    /// days: the old tokens keep the expiry their first upgrade gave them, and the token the
+    /// older release minted 100 days before the re-upgrade gets mint + the default, already
+    /// past, so it is refused.
     #[test]
-    fn a_downgrade_then_a_re_upgrade_leaves_every_entry_with_an_expiry() {
+    fn a_downgrade_then_a_re_upgrade_never_extends_a_tokens_life() {
         let dir = scratch("downgrade");
         let path = dir.join(FILE);
         std::fs::write(&path, FIXTURES[0].1).unwrap();
-        assert_eq!(upgrade_file(&path, at("2026-11-27T12:00:00Z")).unwrap(), 2);
+        let first_start = at("2026-11-27T12:00:00Z");
+        assert_eq!(upgrade_file(&path, first_start).unwrap(), 2);
         let upgraded = std::fs::read_to_string(&path).unwrap();
+        let expiry_of = |path: &Path| -> BTreeMap<String, Option<String>> {
+            load_from(path)
+                .unwrap()
+                .bindings()
+                .iter()
+                .map(|b| (b.id.clone(), b.expires.clone()))
+                .collect()
+        };
+        let after_first = expiry_of(&path);
+        assert!(after_first
+            .values()
+            .all(|e| e.as_deref() == Some("2027-02-25T12:00:00Z")));
         // An older release READS the upgraded file: its parser takes client, label and created
         // and ignores the rest, so every token still resolves to the same client under it.
         let old_view: serde_json::Value = serde_json::from_str(&upgraded).unwrap();
         for entry in old_view["tokens"].as_object().unwrap().values() {
             assert_eq!(entry["client"], FP);
         }
-        // An older release that mints or revokes rewrites the file without the expiries; the
-        // next start of this release gives them one again, counted from that start.
-        std::fs::write(&path, as_an_older_release_rewrites_it(&upgraded)).unwrap();
-        assert!(load_from(&path)
-            .unwrap()
-            .bindings()
-            .iter()
-            .all(|b| b.expires.is_none()));
-        let restart = at("2026-12-10T00:00:00Z");
-        assert_eq!(upgrade_file(&path, restart).unwrap(), 2);
-        for b in load_from(&path).unwrap().bindings() {
-            assert_eq!(b.expires.as_deref(), Some("2027-03-10T00:00:00Z"));
+        // Downgraded, the older release mints a token (100 days before the re-upgrade) and so
+        // rewrites the whole file without any expiry.
+        let restart = at("2027-03-20T00:00:00Z");
+        let mut v: serde_json::Value = serde_json::from_str(&upgraded).unwrap();
+        v["tokens"][hash("minted by the older release")] = serde_json::json!({
+            "client": FP,
+            "label": "minted while downgraded",
+            "created": rfc3339(restart - chrono::Duration::days(100)),
+        });
+        std::fs::write(
+            &path,
+            as_an_older_release_rewrites_it(&serde_json::to_string(&v).unwrap()),
+        )
+        .unwrap();
+        assert!(expiry_of(&path).values().all(Option::is_none));
+
+        // Re-upgrade, 113 days after the first start.
+        assert_eq!(upgrade_file(&path, restart).unwrap(), 3);
+        let after_re = load_from(&path).unwrap();
+        for b in after_re.bindings() {
+            if b.label == "minted while downgraded" {
+                assert_eq!(b.expires.as_deref(), Some("2027-03-10T00:00:00Z"));
+                let why = b.check_expiry(restart.timestamp()).unwrap_err();
+                assert!(why.contains("expired at 2027-03-10T00:00:00Z"), "{why}");
+            } else {
+                assert_eq!(b.expires, after_first[&b.id], "{}: not extended", b.label);
+                assert!(b.check_expiry(restart.timestamp()).is_err(), "{}", b.label);
+            }
         }
         assert!(backup_path(&path, restart).exists());
         assert_eq!(upgrade_file(&path, restart).unwrap(), 0);
+
+        // An entry with no readable mint time is the one counted from now.
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"tokens": {{"{}": {{"client": "{FP}", "label": "no mint time"}}}}}}"#,
+                hash("undated")
+            ),
+        )
+        .unwrap();
+        assert_eq!(upgrade_file(&path, restart).unwrap(), 1);
+        assert_eq!(
+            load_from(&path).unwrap().bindings()[0].expires.as_deref(),
+            Some("2027-06-18T00:00:00Z")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ledger #4544 rework: a start killed mid-upgrade. Every state a kill can leave (after
+    /// recording the first start, during the backup copy, after the backup and during the
+    /// rewrite, before its rename) still holds the original file whole beside half-written
+    /// scratch files, and the next start finishes the upgrade from the original: the
+    /// upgraded file parses, the backup holds the original byte for byte, no scratch file is
+    /// left, and a later start changes nothing.
+    #[test]
+    fn a_start_killed_mid_upgrade_is_finished_by_the_next_start() {
+        let fixture = FIXTURES[1].1;
+        let killed_at = at("2026-11-27T12:00:00Z");
+        let next_start = at("2026-11-27T12:05:00Z");
+        let half = &fixture[..fixture.len() / 2];
+        for (state, leave) in [
+            ("after recording the first start", 0),
+            ("during the backup copy", 1),
+            ("after the backup, during the rewrite", 2),
+            ("after the backup, before the rename", 3),
+        ] {
+            let dir = scratch(&format!("killed-{leave}"));
+            let path = dir.join(FILE);
+            std::fs::write(&path, fixture).unwrap();
+            first_start(&path, killed_at).unwrap();
+            let backup = backup_path(&path, killed_at);
+            if leave >= 1 {
+                std::fs::write(partial_path(&backup), half).unwrap();
+            }
+            if leave >= 2 {
+                std::fs::rename(partial_path(&backup), &backup).unwrap();
+                std::fs::write(&backup, fixture).unwrap();
+                std::fs::write(path.with_extension("json.partial"), half).unwrap();
+            }
+            if leave >= 3 {
+                let mut whole = parse(fixture).unwrap();
+                for b in whole.by_hash.values_mut() {
+                    b.expires = Some("2027-02-25T12:00:00Z".into());
+                }
+                std::fs::write(path.with_extension("json.partial"), whole.to_json()).unwrap();
+            }
+            // The kill never touched the token file itself: the original, whole.
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), fixture, "{state}");
+
+            assert_eq!(upgrade_file(&path, next_start).unwrap(), 2, "{state}");
+            let done = load_from(&path).unwrap();
+            assert_eq!(done.len(), 2, "{state}");
+            for b in done.bindings() {
+                // Counted from the first start the killed run recorded, not the next one.
+                assert_eq!(
+                    b.expires.as_deref(),
+                    Some("2027-02-25T12:00:00Z"),
+                    "{state}"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(backup_path(&path, next_start)).unwrap(),
+                fixture,
+                "{state}: the backup is the original"
+            );
+            assert!(
+                !path.with_extension("json.partial").exists()
+                    && !partial_path(&backup_path(&path, next_start)).exists(),
+                "{state}: no scratch file left"
+            );
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(upgrade_file(&path, next_start).unwrap(), 0, "{state}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "{state}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn an_unreadable_first_start_record_stops_the_upgrade() {
+        let dir = scratch("bad-first-start");
+        let path = dir.join(FILE);
+        std::fs::write(&path, FIXTURES[0].1).unwrap();
+        std::fs::write(first_start_path(&path), "half").unwrap();
+        let why = upgrade_file(&path, at("2026-11-27T12:00:00Z")).unwrap_err();
+        assert!(why.contains("first started"), "{why}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FIXTURES[0].1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

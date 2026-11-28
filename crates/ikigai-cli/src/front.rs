@@ -362,7 +362,8 @@ pub fn admit(
         ));
     }
     if now > not_after {
-        let until = chrono_free_rfc3339(not_after);
+        let until = ikigai_embedded::tokens::rfc3339_from_unix(not_after)
+            .unwrap_or_else(|| format!("{not_after} seconds after 1970"));
         return Err(format!(
             "token {} is bound to a certificate that expired at {until}. {mint} for a \
              current certificate",
@@ -382,28 +383,6 @@ pub fn admit(
         )),
         _ => Ok(()),
     }
-}
-
-/// Seconds since the Unix epoch as RFC 3339 UTC (`2030-01-01T00:00:00Z`), for a refusal that
-/// names a certificate's `notAfter`. Civil-from-days, Howard Hinnant's algorithm.
-fn chrono_free_rfc3339(secs: i64) -> String {
-    let days = secs.div_euclid(86_400);
-    let rem = secs.rem_euclid(86_400);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        rem / 3600,
-        rem % 3600 / 60,
-        rem % 60
-    )
 }
 
 impl Front {
@@ -681,7 +660,6 @@ mod tests {
     /// where its mint allows.
     #[test]
     fn a_token_is_admitted_only_inside_its_lifetime_and_its_certificates() {
-        assert_eq!(chrono_free_rfc3339(NOW), "2026-11-27T00:00:00Z");
         let mine = cert_valid(2000, 2100);
         let other = cert_valid(2000, 2100);
         let fp = |pem: &str| ikigai_quic::fingerprint_of_pem(pem).unwrap();
