@@ -90,6 +90,7 @@ pub mod posture;
 pub mod retention;
 pub mod retry;
 pub mod scheduling;
+pub mod secrets;
 #[cfg(unix)]
 pub mod space_seal;
 pub mod spill;
@@ -2875,7 +2876,7 @@ fn llm_space() -> EndpointSpace {
     transport.timeout = transport.timeout.max(LLM_HTTP_TIMEOUT_FLOOR);
     ikigai_llm::space_with_secrets(
         Arc::new(transport),
-        Arc::new(HostSecrets(ikigai_secret::default_backend())),
+        Arc::new(HostSecrets(secrets::routing())),
         llm_registry(),
     )
 }
@@ -2886,13 +2887,13 @@ const LLM_HTTP_TIMEOUT_FLOOR: std::time::Duration = std::time::Duration::from_se
 
 /// The meeting module (`urn:meeting:schedule` + `urn:meeting:zoom:schedule`) on the native ureq
 /// transport. Reads the Zoom Server-to-Server OAuth credentials from the keystore through a
-/// [`HostSecrets`] reader (the same Keychain backend the `urn:secret:*` space uses), so the crate
+/// [`HostSecrets`] reader (the same stores the `urn:secret:*` space uses), so the crate
 /// links neither an HTTP client nor the keystore. Embedded-root only (not served over the wire),
 /// alongside the secret/sign/encrypt family.
 fn meeting_space() -> EndpointSpace {
     ikigai_meeting::space(
         Arc::new(UreqTransport::default()),
-        Arc::new(HostSecrets(ikigai_secret::default_backend())),
+        Arc::new(HostSecrets(secrets::routing())),
         ikigai_meeting::ZoomConfig::default(),
     )
 }
@@ -4400,8 +4401,9 @@ fn peers_turtle(peers: &[ikigai_discovery::Peer]) -> String {
     out
 }
 
-/// Bridges the keystore to the LLM and meeting readers, using the same backend as
-/// `urn:secret:*`. The LLM checks `urn:cap:llm:use:<provider>` before calling the reader.
+/// Bridges the keystore to the LLM and meeting readers, using the same routing backend as
+/// `urn:secret:*` ([`secrets::routing`]), so a name routed to another store is read from there.
+/// A reader only, not a `Backend` wrapper: it has no writes to forward. The LLM checks `urn:cap:llm:use:<provider>` before calling the reader.
 /// The meeting endpoint is embedded-only and checks its net capability.
 struct HostSecrets(Arc<dyn ikigai_secret::Backend>);
 
@@ -5387,11 +5389,12 @@ fn root_members(nature: &'static str) -> Vec<Arc<dyn Space>> {
         // resources (urn:secret:<id>.enc / .enc.pub). Embedded-only, with the crypto family.
         Arc::new(ikigai_encrypt::space()) as Arc<dyn Space>,
         // Secrets custody (urn:secret:{name} cap-gated read + urn:secret:generate/unlock
-        // — Ed25519 keygen behind `urn:cap:secret:generate` + Touch ID, macOS Keychain
-        // backend). Mounted in the embedded root only (this list is not in `served_space`),
-        // so keys are owner-only and never reachable over the wire. `key=urn:secret:<name>`
-        // then feeds `urn:sign:sign`.
-        Arc::new(ikigai_secret::space(ikigai_secret::default_backend())) as Arc<dyn Space>,
+        // — Ed25519 keygen behind `urn:cap:secret:generate` + Touch ID). The stores are the
+        // config home's `[secret]` section's (ledger #4487), else the platform default (the
+        // Keychain on a Mac, the file store elsewhere): see `secrets`. Mounted in the embedded
+        // root only (this list is not in `served_space`), so keys are owner-only and never
+        // reachable over the wire. `key=urn:secret:<name>` then feeds `urn:sign:sign`.
+        Arc::new(secrets::space()) as Arc<dyn Space>,
         Arc::new(ikigai_xslt::space()) as Arc<dyn Space>,
         // JSON-LD operators (urn:jsonld:expand/compact/flatten) — linked natively (the heavy
         // json-ld tree is a browser-wasm concern, lazy-loaded there; native links it).

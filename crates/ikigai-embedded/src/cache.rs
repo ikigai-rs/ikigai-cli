@@ -17,7 +17,7 @@ fn bound() -> &'static Result<CacheBound, String> {
             return Ok(CacheBound::default());
         };
         let result = match std::fs::read_to_string(&path) {
-            Ok(text) => bound_from(&text),
+            Ok(text) => bound_from(crate::config::host_part(&text)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(CacheBound::default()),
             Err(e) => Err(format!("cannot read cache settings: {e}")),
         };
