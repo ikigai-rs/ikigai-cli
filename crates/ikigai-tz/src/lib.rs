@@ -1,6 +1,7 @@
-//! `ikigai-tz` — timezone conversion as a parameterized transreptor, plus a zoned clock.
+//! `ikigai-tz` — timezone conversion as a parameterized transreptor, a zoned clock, and
+//! recurrence expansion.
 //!
-//! Two endpoints, backed by the IANA time-zone database (`chrono-tz`), so conversions
+//! Three endpoints, backed by the IANA time-zone database (`chrono-tz`), so conversions
 //! are **DST- and offset-correct for a real date** — not a fixed integer offset:
 //!
 //! - [`urn:tz:convert`](convert) — re-represent an instant in another zone. Pass a
@@ -11,8 +12,10 @@
 //! - [`urn:tz:now`](now) — the current instant as RFC 3339 in `zone=<IANA>` (default:
 //!   the host's local zone). A full *zoned* clock (date + time + offset), the companion
 //!   to `urn:time:now`'s bare `HH:MM`.
+//! - [`urn:tz:expand`](expand()) — the occurrences of an RFC 5545 recurrence rule (RRULE, with
+//!   EXDATE) in a zone over a window, DST-correct, on the `rrule` crate. See [`mod@expand`].
 //!
-//! `convert` is a pure function of its inputs (the tz database is static), so it is
+//! `convert` and `expand` are pure function of its inputs (the tz database is static), so it is
 //! cacheable. `now` reads time **through the invocation** ([`read_now`]) — never the OS
 //! clock behind the caller's back — so a temporal corridor (`Scope::with_named_at`, the
 //! engine's `as-of=`) pins it like any other resolution: cacheable until the next minute
@@ -21,6 +24,9 @@
 //!
 //! [`space`] names itself `urn:iki:space:tz` ([`SPACE_ID`]).
 #![forbid(unsafe_code)]
+
+pub mod expand;
+pub use expand::expand;
 
 use chrono::offset::LocalResult;
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
@@ -38,15 +44,16 @@ const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 /// The name [`space`] claims: `urn:iki:space:tz`.
 pub const SPACE_ID: &str = "urn:iki:space:tz";
 
-/// Mount the module: `urn:tz:convert` + `urn:tz:now`, named [`SPACE_ID`].
+/// Mount the module: `urn:tz:convert`, `urn:tz:expand` and `urn:tz:now`, named [`SPACE_ID`].
 ///
 /// Configuration-free (no parameters, nothing read while building it), so every call holds
-/// the same two doors and the name is a true claim. `urn:tz:now`'s default zone is the host's
+/// the same three doors and the name is a true claim. `urn:tz:now`'s default zone is the host's
 /// local zone, read when it ANSWERS, not here. A host that binds another door onto this space
 /// drops the name (core 0.1.89), so an extended copy never answers to `urn:iki:space:tz`.
 pub fn space() -> EndpointSpace {
     EndpointSpace::new()
         .bind(Exact::new("urn:tz:convert"), convert())
+        .bind(Exact::new("urn:tz:expand"), expand())
         .bind(Exact::new("urn:tz:now"), now())
         .named(space_iri("tz"))
 }
